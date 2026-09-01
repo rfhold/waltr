@@ -1,33 +1,59 @@
-//! Native application tracing with a bounded, fail-open OTLP exporter.
+//! Native application observability with bounded, fail-open OTLP exporters.
 
-use std::{panic::PanicHookInfo, time::Duration};
+use std::{panic::PanicHookInfo, sync::Once, time::Duration};
 
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{KeyValue, metrics::MeterProvider as _, trace::TracerProvider as _};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use opentelemetry_sdk::{
     Resource,
-    trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider},
+    logs::{LogExporter, SdkLoggerProvider},
+    metrics::{SdkMeterProvider, exporter::PushMetricExporter},
+    trace::SdkTracerProvider,
 };
 use tracing::Span;
-use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::{
+    Layer as _, filter::filter_fn, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
 
 const SERVICE_NAME: &str = "waltr-app-native";
 const OTLP_ENDPOINT: &str = "https://telemetry.holdenitdown.net:4318";
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_QUEUE_SIZE: usize = 256;
-const MAX_EXPORT_BATCH_SIZE: usize = 64;
+const TRACE_LOG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const STARTUP_METRIC: &str = "waltr.app.startups";
+const STARTUP_ATTRIBUTE_KEY: &str = "app.lifecycle";
+const STARTUP_ATTRIBUTE_VALUE: &str = "started";
+const SAFE_LOG_TARGETS: [&str; 3] = [
+    "waltr_app_lib",
+    "waltr_app_lib::bridge",
+    "waltr_app_lib::observability",
+];
+const SAFE_TRACE_TARGETS: [&str; 4] = [
+    "waltr_app_lib",
+    "waltr_app_lib::bridge",
+    "waltr_app_lib::observability",
+    "waltr_client::transport::native_trace",
+];
+static PANIC_HOOK: Once = Once::new();
 
-/// Process-lifetime owner of the native trace provider.
+/// Process-lifetime owner of all native telemetry providers.
 #[derive(Debug, Default)]
 pub(crate) struct ObservabilityGuard {
-    provider: Option<SdkTracerProvider>,
+    tracer: Option<SdkTracerProvider>,
+    logger: Option<SdkLoggerProvider>,
+    meter: Option<SdkMeterProvider>,
 }
 
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.provider.take() {
-            drop(provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT));
+        if let Some(provider) = self.tracer.take() {
+            drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+        }
+        if let Some(provider) = self.logger.take() {
+            drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+        }
+        if let Some(provider) = self.meter.take() {
+            shutdown_meter(&provider);
         }
     }
 }
@@ -38,12 +64,16 @@ enum ExportMode {
     Enabled,
 }
 
-/// Initialize release tracing without allowing telemetry failure to escape.
+const fn export_enabled(is_test: bool, _debug_assertions: bool) -> bool {
+    !is_test
+}
+
+/// Initialize native telemetry without allowing telemetry failure to escape.
 pub(crate) fn init() -> ObservabilityGuard {
-    let mode = if cfg!(any(test, debug_assertions)) {
-        ExportMode::Disabled
-    } else {
+    let mode = if export_enabled(cfg!(test), cfg!(debug_assertions)) {
         ExportMode::Enabled
+    } else {
+        ExportMode::Disabled
     };
     init_for_mode(mode)
 }
@@ -60,59 +90,161 @@ fn init_for_mode(mode: ExportMode) -> ObservabilityGuard {
 }
 
 fn try_init() -> Result<ObservabilityGuard, Box<dyn std::error::Error + Send + Sync>> {
-    let revision = sanitize_revision(revision()).unwrap_or_else(|| "unknown".to_owned());
-    let http_client = PrivacyHttpClient(
-        reqwest::blocking::Client::builder()
-            .timeout(EXPORT_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
-    );
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let http_client = PrivacyHttpClient::new()?;
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_http_client(http_client)
-        .with_endpoint(OTLP_ENDPOINT)
+        .with_http_client(http_client.clone())
+        .with_endpoint(signal_endpoint("traces"))
         .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
         .with_timeout(EXPORT_TIMEOUT)
         .build()?;
-    let batch = BatchSpanProcessor::builder(exporter)
-        .with_batch_config(
-            BatchConfigBuilder::default()
-                .with_max_queue_size(MAX_QUEUE_SIZE)
-                .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE)
-                .with_scheduled_delay(Duration::from_secs(5))
-                .build(),
-        )
-        .build();
-    let resource = Resource::builder()
-        .with_service_name(SERVICE_NAME)
-        .with_attribute(opentelemetry::KeyValue::new(
-            "service.version",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_attribute(opentelemetry::KeyValue::new("waltr.app.revision", revision))
-        .with_attribute(opentelemetry::KeyValue::new("waltr.app.target", target()))
-        .build();
-    let provider = SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_span_processor(batch)
-        .build();
-    let tracer = provider.tracer(SERVICE_NAME);
-    if let Err(error) = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
-        .try_init()
-    {
-        drop(provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT));
-        return Err(error.into());
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_http()
+        .with_http_client(http_client.clone())
+        .with_endpoint(signal_endpoint("logs"))
+        .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+        .with_timeout(EXPORT_TIMEOUT)
+        .build()?;
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_http_client(http_client)
+        .with_endpoint(signal_endpoint("metrics"))
+        .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+        .with_timeout(EXPORT_TIMEOUT)
+        .build()?;
+    let providers = build_providers(resource(), span_exporter, log_exporter, metric_exporter);
+    if let Err(error) = install_subscriber(&providers) {
+        shutdown_providers(&providers);
+        return Err(error);
     }
-
+    emit_startup_metric(&providers.meter);
     install_panic_hook();
-    Ok(ObservabilityGuard {
-        provider: Some(provider),
-    })
+    Ok(providers.into())
+}
+
+fn signal_endpoint(signal: &str) -> String {
+    format!("{OTLP_ENDPOINT}/v1/{signal}")
+}
+
+fn resource() -> Resource {
+    let revision = sanitize_revision(revision()).unwrap_or_else(|| "unknown".to_owned());
+    Resource::builder()
+        .with_service_name(SERVICE_NAME)
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .with_attribute(KeyValue::new("waltr.app.revision", revision))
+        .with_attribute(KeyValue::new("waltr.app.target", target()))
+        .build()
 }
 
 #[derive(Debug)]
+struct Providers {
+    tracer: SdkTracerProvider,
+    logger: SdkLoggerProvider,
+    meter: SdkMeterProvider,
+}
+
+fn build_providers<S, L, M>(resource: Resource, spans: S, logs: L, metrics: M) -> Providers
+where
+    S: opentelemetry_sdk::trace::SpanExporter + 'static,
+    L: LogExporter + 'static,
+    M: PushMetricExporter,
+{
+    let tracer = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(spans)
+        .build();
+    let logger = SdkLoggerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(logs)
+        .build();
+    let meter = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(metrics)
+        .build();
+    Providers {
+        tracer,
+        logger,
+        meter,
+    }
+}
+
+fn install_subscriber(
+    providers: &Providers,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tracer = providers.tracer.tracer(SERVICE_NAME);
+    let safe_spans = filter_fn(safe_trace_target);
+    let safe_events = filter_fn(safe_log_target);
+    tracing_subscriber::registry()
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(safe_spans),
+        )
+        .with(OpenTelemetryTracingBridge::new(&providers.logger).with_filter(safe_events.clone()))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_target(false)
+                .with_filter(safe_events),
+        )
+        .try_init()?;
+    Ok(())
+}
+
+fn safe_trace_target(metadata: &tracing::Metadata<'_>) -> bool {
+    SAFE_TRACE_TARGETS.contains(&metadata.target())
+}
+
+fn safe_log_target(metadata: &tracing::Metadata<'_>) -> bool {
+    SAFE_LOG_TARGETS.contains(&metadata.target())
+}
+
+fn emit_startup_metric(provider: &SdkMeterProvider) {
+    provider
+        .meter(SERVICE_NAME)
+        .u64_counter(STARTUP_METRIC)
+        .build()
+        .add(
+            1,
+            &[KeyValue::new(
+                STARTUP_ATTRIBUTE_KEY,
+                STARTUP_ATTRIBUTE_VALUE,
+            )],
+        );
+}
+
+fn shutdown_providers(providers: &Providers) {
+    drop(
+        providers
+            .tracer
+            .shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT),
+    );
+    drop(
+        providers
+            .logger
+            .shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT),
+    );
+    shutdown_meter(&providers.meter);
+}
+
+fn shutdown_meter(provider: &SdkMeterProvider) {
+    // SDK 0.32 ignores caller-provided meter timeouts and uses its fixed five-second bound.
+    drop(provider.shutdown());
+}
+
+#[derive(Clone, Debug)]
 struct PrivacyHttpClient(reqwest::blocking::Client);
+
+impl PrivacyHttpClient {
+    fn new() -> Result<Self, reqwest::Error> {
+        reqwest::blocking::Client::builder()
+            .timeout(EXPORT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map(Self)
+    }
+}
 
 #[async_trait::async_trait]
 impl opentelemetry_http::HttpClient for PrivacyHttpClient {
@@ -137,6 +269,16 @@ fn sanitize_export_headers(request: &mut opentelemetry_http::Request<opentelemet
             .parse()
             .expect("static OTLP content type"),
     );
+}
+
+impl From<Providers> for ObservabilityGuard {
+    fn from(providers: Providers) -> Self {
+        Self {
+            tracer: Some(providers.tracer),
+            logger: Some(providers.logger),
+            meter: Some(providers.meter),
+        }
+    }
 }
 
 pub(crate) fn operation_span(name: &'static str, class: &'static str) -> Span {
@@ -181,11 +323,13 @@ pub(crate) const fn target() -> &'static str {
 }
 
 fn install_panic_hook() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        emit_panic(info);
-        previous(info);
-    }));
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            emit_panic(info);
+            previous(info);
+        }));
+    });
 }
 
 fn emit_panic(info: &PanicHookInfo<'_>) {
@@ -250,6 +394,31 @@ pub(crate) fn sanitize_revision(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::{
+        future::Future,
+        io::{Read, Write},
+        net::TcpListener,
+        task::{Context, Poll, Waker},
+        thread,
+        time::Instant,
+    };
+
+    use opentelemetry::{
+        Key,
+        logs::AnyValue,
+        trace::{Span as _, Tracer as _},
+    };
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        logs::InMemoryLogExporter,
+        metrics::InMemoryMetricExporter,
+        trace::{InMemorySpanExporter, SpanData, SpanExporter},
+    };
+
     use super::*;
 
     #[test]
@@ -274,8 +443,18 @@ mod tests {
     #[test]
     fn disabled_initialization_is_fail_open_and_global_free() {
         let guard = init_for_mode(ExportMode::Disabled);
-        assert!(guard.provider.is_none());
+        assert!(guard.tracer.is_none());
+        assert!(guard.logger.is_none());
+        assert!(guard.meter.is_none());
         assert!(!tracing::dispatcher::has_been_set());
+    }
+
+    #[test]
+    fn only_tests_disable_export_even_for_debug_builds() {
+        assert!(!export_enabled(true, true));
+        assert!(!export_enabled(true, false));
+        assert!(export_enabled(false, true));
+        assert!(export_enabled(false, false));
     }
 
     #[test]
@@ -302,6 +481,140 @@ mod tests {
     }
 
     #[test]
+    fn providers_share_resources_and_guard_owns_shutdown() {
+        let spans = ResourceCaptureSpanExporter::default();
+        let logs = InMemoryLogExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let providers = build_providers(resource(), spans.clone(), logs.clone(), metrics.clone());
+
+        let mut span = providers.tracer.tracer("test").start("resource-test");
+        span.end();
+        providers.tracer.force_flush().unwrap();
+
+        let subscriber =
+            tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&providers.logger));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(event.name = "app.startup", outcome = "started");
+        });
+        providers.logger.force_flush().unwrap();
+
+        emit_startup_metric(&providers.meter);
+        providers.meter.force_flush().unwrap();
+
+        assert_resource(spans.resource.lock().unwrap().as_ref().unwrap());
+        let emitted_logs = logs.get_emitted_logs().unwrap();
+        assert_resource(&emitted_logs[0].resource);
+        let log_attributes: Vec<_> = emitted_logs[0].record.attributes_iter().collect();
+        assert_eq!(log_attributes.len(), 2);
+        for (key, value) in [("event.name", "app.startup"), ("outcome", "started")] {
+            assert!(log_attributes.iter().any(|(actual_key, actual_value)| {
+                actual_key.as_str() == key
+                    && *actual_value == AnyValue::String(value.to_owned().into())
+            }));
+        }
+
+        let finished_metrics = metrics.get_finished_metrics().unwrap();
+        assert_resource(finished_metrics[0].resource());
+        let startup = finished_metrics[0]
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == STARTUP_METRIC)
+            .unwrap();
+        let opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
+            opentelemetry_sdk::metrics::data::MetricData::Sum(startup),
+        ) = startup.data()
+        else {
+            panic!("startup metric must be a u64 sum");
+        };
+        let point = startup.data_points().next().unwrap();
+        assert_eq!(point.value(), 1);
+        let metric_attributes: Vec<_> = point
+            .attributes()
+            .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
+            .collect();
+        assert_eq!(
+            metric_attributes,
+            [(STARTUP_ATTRIBUTE_KEY, STARTUP_ATTRIBUTE_VALUE.to_owned())]
+        );
+
+        let guard: ObservabilityGuard = providers.into();
+        assert!(guard.tracer.is_some());
+        assert!(guard.logger.is_some());
+        assert!(guard.meter.is_some());
+        drop(guard);
+        assert!(spans.shutdown_called.load(Ordering::Relaxed));
+        assert!(logs.is_shutdown_called());
+    }
+
+    #[test]
+    fn trace_filter_exports_only_safe_app_and_native_client_targets() {
+        let spans = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let tracer = provider.tracer("test");
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(filter_fn(safe_trace_target)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            drop(tracing::info_span!(
+                target: "tauri::ipc",
+                "hostile.tauri",
+                ipc.argument = "SECRET_IPC_MARKER",
+            ));
+            drop(tracing::info_span!(
+                target: "dependency::client",
+                "hostile.dependency",
+                error = "SECRET_ERROR_MARKER",
+            ));
+            drop(tracing::info_span!(
+                target: "waltr_app_lib::observability",
+                "safe.app",
+                operation.outcome = "ok",
+            ));
+            drop(tracing::info_span!(
+                target: "waltr_client::transport::native_trace",
+                "safe.native.grpc",
+                rpc.system = "grpc",
+            ));
+        });
+        provider.force_flush().unwrap();
+
+        let exported = spans.get_finished_spans().unwrap();
+        let mut names: Vec<_> = exported.iter().map(|span| span.name.as_ref()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["safe.app", "safe.native.grpc"]);
+        let diagnostic = format!("{exported:?}");
+        assert!(!diagnostic.contains("SECRET_IPC_MARKER"));
+        assert!(!diagnostic.contains("SECRET_ERROR_MARKER"));
+        drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+    }
+
+    #[test]
+    fn startup_signals_and_endpoints_are_fixed_and_bounded() {
+        assert_eq!(
+            signal_endpoint("traces"),
+            format!("{OTLP_ENDPOINT}/v1/traces")
+        );
+        assert_eq!(signal_endpoint("logs"), format!("{OTLP_ENDPOINT}/v1/logs"));
+        assert_eq!(
+            signal_endpoint("metrics"),
+            format!("{OTLP_ENDPOINT}/v1/metrics")
+        );
+        assert_eq!(STARTUP_METRIC, "waltr.app.startups");
+        assert_eq!(STARTUP_ATTRIBUTE_KEY, "app.lifecycle");
+        assert_eq!(STARTUP_ATTRIBUTE_VALUE, "started");
+        let run_source = include_str!("lib.rs");
+        assert!(
+            run_source
+                .contains("tracing::info!(event.name = \"app.startup\", outcome = \"started\")")
+        );
+    }
+
+    #[test]
     fn exporter_strips_environment_or_injected_credentials() {
         let mut request = opentelemetry_http::Request::builder()
             .header("content-type", "application/x-protobuf")
@@ -312,5 +625,110 @@ mod tests {
         sanitize_export_headers(&mut request);
         assert_eq!(request.headers().len(), 1);
         assert_eq!(request.headers()["content-type"], "application/x-protobuf");
+    }
+
+    #[test]
+    fn privacy_http_client_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = connection.read(&mut request).unwrap();
+            write!(
+                connection,
+                "HTTP/1.1 302 Found\r\nLocation: http://{address}/followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("redirect fixture failed: {error}"),
+                }
+            }
+            false
+        });
+        let request = opentelemetry_http::Request::post(format!("http://{address}/v1/traces"))
+            .header("authorization", "Bearer SECRET_TOKEN_MARKER")
+            .body(opentelemetry_http::Bytes::new())
+            .unwrap();
+        let response = poll_blocking_client(opentelemetry_http::HttpClient::send_bytes(
+            &PrivacyHttpClient::new().unwrap(),
+            request,
+        ))
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        assert!(!server.join().unwrap());
+    }
+
+    #[test]
+    fn shutdown_bounds_match_sdk_behavior() {
+        assert_eq!(TRACE_LOG_SHUTDOWN_TIMEOUT, Duration::from_secs(2));
+        let production_source = include_str!("observability.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production_source.contains("fixed five-second bound"));
+        assert!(production_source.contains("provider.shutdown()"));
+    }
+
+    fn assert_resource(resource: &Resource) {
+        assert_eq!(
+            resource
+                .get(&Key::new("service.name"))
+                .map(|value| value.to_string()),
+            Some(SERVICE_NAME.to_owned())
+        );
+        assert_eq!(
+            resource
+                .get(&Key::new("service.version"))
+                .map(|value| value.to_string()),
+            Some(env!("CARGO_PKG_VERSION").to_owned())
+        );
+        assert_eq!(
+            resource
+                .get(&Key::new("waltr.app.target"))
+                .map(|value| value.to_string()),
+            Some(target().to_owned())
+        );
+        assert!(resource.get(&Key::new("waltr.app.revision")).is_some());
+    }
+
+    fn poll_blocking_client<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("blocking HTTP client future unexpectedly yielded"),
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ResourceCaptureSpanExporter {
+        resource: Arc<Mutex<Option<Resource>>>,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl SpanExporter for ResourceCaptureSpanExporter {
+        async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            self.shutdown_called.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            *self.resource.lock().unwrap() = Some(resource.clone());
+        }
     }
 }
