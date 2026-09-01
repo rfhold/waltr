@@ -4239,6 +4239,7 @@ dependencies = [
  "jni_fn",
  "waltr-client",
  "opentelemetry",
+ "opentelemetry-appender-tracing",
  "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

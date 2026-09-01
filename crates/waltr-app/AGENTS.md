@@ -3,7 +3,7 @@
 | Path | Info |
 | --- | --- |
 | [src/bridge.rs](src/bridge.rs) | Rust-owned client runtime, generation lifecycle, and bounded publication. |
-| [src/observability.rs](src/observability.rs) | Release-only native OTLP tracing, fail-open lifecycle, and privacy controls. |
+| [src/observability.rs](src/observability.rs) | All-build native OTLP traces, logs, and metrics, fail-open lifecycle, test isolation, and privacy controls. |
 | [src/policy.rs](src/policy.rs) | External URL and local navigation security policies. |
 | [capabilities/](capabilities/) | Minimal local main-WebView IPC grants. |
 | [tauri.conf.json](tauri.conf.json) | Desktop and Android shell configuration. |
@@ -31,4 +31,10 @@ Mark the Android browser handoff before opening the external browser. Only the f
 
 Only packaged local content may invoke IPC. Deny remote main-WebView navigation and all new windows; external opening must pass the Rust HTTPS URL policy.
 
-Keep WebView Faro separate from native Rust tracing. Tauri enables `waltr-client/native-tracing`, so Rust owns gRPC spans and W3C propagation. Telemetry must exclude credentials, callbacks, query strings, commands, snapshots, content, arbitrary error or panic text, bodies, and stable user or device IDs. Keep exporter setup fail-open and bounded. Do not synchronously flush native telemetry from Android suspend callbacks.
+Keep WebView Faro separate from native Rust telemetry. Faro retains its production/release gate. Native traces, logs, and metrics initialize in every non-test app build, including local and debug builds. Tauri enables `waltr-client/native-tracing`, so Rust owns gRPC spans and W3C propagation.
+
+Use standard OpenTelemetry SDK providers: batched span and log exporters plus a periodic metric exporter. Keep the fixed OTLP/HTTP protobuf URLs at `/v1/traces`, `/v1/logs`, and `/v1/metrics` under `https://telemetry.holdenitdown.net:4318`. Preserve service name `waltr-app-native` and resource version, sanitized revision, and target. Keep the bounded `app.startup` log and `waltr.app.startups` metric.
+
+Allow trace targets only from this app or `waltr_client::transport::native_trace`. Allow log targets only from this app. Use the shared blocking Rustls client for all exporters. Disable redirects and strip every inherited or environment-derived header except the canonical protobuf content type.
+
+Telemetry must exclude credentials, callbacks, query strings, commands, snapshots, content, arbitrary error or panic text, bodies, and stable user or device IDs. Keep provider setup and export fail-open. Bound trace and log shutdown requests to two seconds. Preserve the OpenTelemetry SDK 0.32 fixed five-second metric shutdown bound. Keep automated Rust tests isolated through disabled native initialization and deterministic in-memory exporters. Do not synchronously flush native telemetry from Android suspend callbacks.

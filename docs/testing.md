@@ -22,7 +22,7 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, privacy filtering, and platform-specific propagation. |
 | `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
 | `crates/waltr-app/src/bridge.rs` tests | Tauri generation ordering, bounded coalescing, FIFO dispatch, disposal, logout ordering, Android callback routing/handoff lifecycle, and secret-free serialization. |
-| `crates/waltr-app/src/observability.rs` tests | Native export disablement, revision validation, bounded outcomes, panic metadata, and exporter-header privacy. |
+| `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, startup signals, shutdown bounds, header privacy, redirect non-following, and in-memory exporters. |
 | `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
@@ -146,7 +146,7 @@ Run Tauri shell unit and policy tests:
 
 `cargo test -p waltr-app`
 
-This layer checks the explicit manifest callback shape, opaque Kotlin-to-JNI `Intent` transport, and absence of a callback Tauri event or WebView capability. Tests cover one-entry latest replacement, invalid-then-valid routing, generation fences, handoff-before-open order, one-shot pause preservation, callback release on resume, suspended terminal teardown, process-memory cleanup, secret-free IPC, CSP scope, and native exporter privacy. Cold and warm callback tests exercise Rust routing and source contracts, not Android's installed-app intent resolver.
+This layer checks the explicit manifest callback shape, opaque Kotlin-to-JNI `Intent` transport, and absence of a callback Tauri event or WebView capability. Tests cover one-entry latest replacement, invalid-then-valid routing, generation fences, handoff-before-open order, one-shot pause preservation, callback release on resume, suspended terminal teardown, process-memory cleanup, secret-free IPC, CSP scope, and native observability privacy. Cold and warm callback tests exercise Rust routing and source contracts, not Android's installed-app intent resolver.
 
 Run only native observability and exact Faro CSP tests:
 
@@ -154,17 +154,17 @@ Run only native observability and exact Faro CSP tests:
 
 `cargo test -p waltr-app csp_adds_only_the_exact_faro_collector_origin`
 
-These tests do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, or mobile process-exit delivery.
+The observability tests use deterministic in-memory span, log, and metric exporters. They verify target allowlists, shared resource identity, fixed signal URLs, startup signals, shutdown bounds, header sanitization, redirect non-following, provider ownership, and test isolation. They do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, or mobile process-exit delivery.
 
 Build the no-WASM Tauri web target:
 
 `pnpm build:tauri`
 
-Build the no-WASM, telemetry-disabled Tauri development assets:
+Build the no-WASM Tauri development assets with WebView Faro disabled:
 
 `pnpm --filter @rfhold/waltr-web build:tauri:dev`
 
-Both commands run the Tauri output contract. It requires release assets to enable Faro, development assets to disable Faro, relative asset paths in both modes, and no WASM output.
+Both commands run the Tauri output contract. It requires release assets to enable Faro, development assets to disable Faro, relative asset paths in both modes, and no WASM output. This asset-build gate does not disable native Rust telemetry in a non-test app build.
 
 Build the Android package through the generated project:
 
