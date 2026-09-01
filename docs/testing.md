@@ -19,8 +19,10 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-client/tests/` | UI-like tests for the shared client state machine over the server contract. |
 | `crates/waltr-client/tests/live.rs` and `crates/waltr-client/tests/live/session.rs` | Ignored client state-machine tests that run session commands through live providers. |
 | `crates/waltr-web/tests/` | Browser UI state, routing, forms, transitions, and component-level behavior. |
+| `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, privacy filtering, and platform-specific propagation. |
 | `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
 | `crates/waltr-app/src/bridge.rs` tests | Tauri generation ordering, bounded coalescing, FIFO dispatch, disposal, logout ordering, Android callback routing/handoff lifecycle, and secret-free serialization. |
+| `crates/waltr-app/src/observability.rs` tests | Native export disablement, revision validation, bounded outcomes, panic metadata, and exporter-header privacy. |
 | `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
@@ -96,6 +98,12 @@ Run shared native access protocol tests:
 
 This layer owns callback-policy separation, exact redirect/state/code/error validation, wrong-state or otherwise invalid callback followed by a valid callback, timeout/cancellation, PKCE exchange, credential leases, protected bearer delivery, refresh/expiry, and logout cleanup. It does not prove Android intent delivery.
 
+Run feature-gated native gRPC telemetry tests:
+
+`cargo test -p waltr-client --features native-tracing --lib transport::native_trace`
+
+This focused target checks bounded RPC classification, gRPC status handling, and W3C context injection without network export.
+
 Run client integration tests:
 
 `cargo test -p waltr-client --tests`
@@ -128,17 +136,35 @@ Run hosted browser and Tauri web-adapter tests:
 
 `pnpm --filter @rfhold/waltr-web test`
 
-The web suite includes `tests/access/` coverage for generated access bindings, safe browser return paths, login states, expiry, provider-OAuth separation, and same-origin logout. `tests/platform/` covers hosted WASM disposal and Tauri generation/sequence handling, recovery, disposal, and external URL delegation. It uses mocked browser/client boundaries; server cookie and OIDC validation belong to server access-auth tests.
+The web suite includes `tests/access/` coverage for generated access bindings, safe browser return paths, login states, expiry, provider-OAuth separation, and same-origin logout. `tests/platform/` covers hosted WASM disposal and Tauri generation/sequence handling, recovery, disposal, and external URL delegation. `tests/telemetry.test.ts` verifies the build-mode matrix, identities, propagation ownership, and hostile-payload filtering for routes, errors, traces, and Web Vitals measurements. It uses mocked browser/client boundaries; server cookie and OIDC validation belong to server access-auth tests.
+
+Run only deterministic Faro telemetry tests:
+
+`pnpm --filter @rfhold/waltr-web exec vitest run tests/telemetry.test.ts --environment happy-dom`
 
 Run Tauri shell unit and policy tests:
 
 `cargo test -p waltr-app`
 
-This layer checks the explicit manifest callback shape, opaque Kotlin-to-JNI `Intent` transport, and absence of a callback Tauri event or WebView capability. Tests cover one-entry latest replacement, invalid-then-valid routing, generation fences, handoff-before-open order, one-shot pause preservation, callback release on resume, suspended terminal teardown, process-memory cleanup, and secret-free IPC. Cold and warm callback tests exercise Rust routing and source contracts, not Android's installed-app intent resolver.
+This layer checks the explicit manifest callback shape, opaque Kotlin-to-JNI `Intent` transport, and absence of a callback Tauri event or WebView capability. Tests cover one-entry latest replacement, invalid-then-valid routing, generation fences, handoff-before-open order, one-shot pause preservation, callback release on resume, suspended terminal teardown, process-memory cleanup, secret-free IPC, CSP scope, and native exporter privacy. Cold and warm callback tests exercise Rust routing and source contracts, not Android's installed-app intent resolver.
+
+Run only native observability and exact Faro CSP tests:
+
+`cargo test -p waltr-app observability`
+
+`cargo test -p waltr-app csp_adds_only_the_exact_faro_collector_origin`
+
+These tests do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, or mobile process-exit delivery.
 
 Build the no-WASM Tauri web target:
 
 `pnpm build:tauri`
+
+Build the no-WASM, telemetry-disabled Tauri development assets:
+
+`pnpm --filter @rfhold/waltr-web build:tauri:dev`
+
+Both commands run the Tauri output contract. It requires release assets to enable Faro, development assets to disable Faro, relative asset paths in both modes, and no WASM output.
 
 Build the Android package through the generated project:
 

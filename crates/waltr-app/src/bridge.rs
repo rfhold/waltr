@@ -20,8 +20,9 @@ use waltr_client::{
 };
 use serde::Serialize;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tracing::Instrument as _;
 
-use crate::policy::external_https_url;
+use crate::{observability, policy::external_https_url};
 
 const ENDPOINT: &str = "https://preview-waltr.holdenitdown.net";
 const NATIVE_CLIENT_ID: &str = "waltr-preview-native";
@@ -472,6 +473,7 @@ impl RuntimeBridge {
 
     /// Replace any active generation and return its ordered event feed.
     pub fn start(&self) -> Result<EventFeed<BridgePayload>, String> {
+        let span = observability::operation_span("bridge.generation.start", "native_thread");
         self.stop();
         let generation = self
             .next_generation
@@ -495,6 +497,9 @@ impl RuntimeBridge {
         let thread = match thread::Builder::new()
             .name(format!("waltr-client-{generation}"))
             .spawn(move || {
+                let thread_span =
+                    observability::operation_span("bridge.generation.run", "native_thread");
+                let _entered = thread_span.enter();
                 run_thread(
                     receiver,
                     callback_admission,
@@ -505,10 +510,13 @@ impl RuntimeBridge {
                     open_url,
                     handoff,
                 );
+                observability::record_outcome(&thread_span, "stopped");
             }) {
             Ok(thread) => thread,
             Err(error) => {
                 self.active_generation.store(0, Ordering::Release);
+                observability::record_outcome(&span, "error");
+                observability::error_event("native_thread.spawn", "native_thread", "error");
                 return Err(format!("failed to start native client runtime: {error}"));
             }
         };
@@ -524,6 +532,7 @@ impl RuntimeBridge {
             recovery,
             thread,
         });
+        observability::record_outcome(&span, "ok");
         Ok(feed)
     }
 
@@ -596,6 +605,7 @@ impl RuntimeBridge {
 
     /// Invalidate and synchronously dispose the active generation.
     pub fn stop(&self) {
+        let span = observability::operation_span("bridge.generation.stop", "native_thread");
         if let Some(admission) = self.callback_admission.swap(None) {
             admission.clear();
             let detailed = self
@@ -614,11 +624,19 @@ impl RuntimeBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let Some(running) = running else {
+            observability::record_outcome(&span, "unchanged");
             return;
         };
         let _ = running.credentials.clear_bearer_token();
+        observability::lifecycle_event("credential.clear", "native_thread", "ok");
         running.stop.send_replace(true);
-        drop(running.thread.join());
+        let outcome = if running.thread.join().is_ok() {
+            "ok"
+        } else {
+            observability::error_event("native_thread.join", "native_thread", "panicked");
+            "panicked"
+        };
+        observability::record_outcome(&span, outcome);
     }
 
     fn requests(&self) -> Result<mpsc::Sender<HostRequest>, String> {
@@ -784,6 +802,7 @@ fn run_thread(
     open_url: OpenUrl,
     handoff: Arc<Mutex<BrowserHandoff>>,
 ) {
+    let runtime_span = observability::operation_span("native.runtime", "native_thread");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -800,8 +819,10 @@ fn run_thread(
             credentials,
             open_url,
             handoff,
-        ),
+        )
+        .instrument(runtime_span.clone()),
     );
+    observability::record_outcome(&runtime_span, "stopped");
 }
 
 #[allow(
@@ -864,6 +885,8 @@ async fn run_generation(
         match ready {
             Ready::Request(Some(HostRequest::Stop) | None) => break,
             Ready::Request(Some(HostRequest::Dispatch { command, reply })) => {
+                let operation =
+                    observability::operation_span("client.command.execute", "native_task");
                 let result = dispatch_and_publish(
                     &mut stream,
                     &mut publisher,
@@ -871,10 +894,14 @@ async fn run_generation(
                     None,
                     Publication::Latest,
                 )
+                .instrument(operation.clone())
                 .await;
+                observability::record_result(&operation, &result);
                 drop(reply.send(result));
             }
             Ready::Request(Some(HostRequest::Access { action, reply })) => {
+                let operation =
+                    observability::operation_span("access.action.execute", "native_task");
                 if matches!(
                     action,
                     NativeAccessAction::Cancel | NativeAccessAction::Logout
@@ -884,11 +911,13 @@ async fn run_generation(
                 }
                 if matches!(action, NativeAccessAction::Logout) {
                     if logout_reply.is_some() {
+                        observability::record_outcome(&operation, "rejected");
                         drop(reply.send(Err("native logout is already pending".to_owned())));
                         continue;
                     }
                     if !credentials.has_bearer_token() {
                         let result = publish_state_control(&stream, &mut publisher).await;
+                        observability::record_result(&operation, &result);
                         drop(reply.send(result.map(Some)));
                         continue;
                     }
@@ -898,9 +927,11 @@ async fn run_generation(
                             && let Some(reply) = logout_reply.take()
                         {
                             drop(reply.send(Err("native access coordinator stopped".to_owned())));
+                            observability::record_outcome(&operation, "stopped");
                         }
                     } else if let Some(reply) = logout_reply.take() {
                         drop(reply.send(Err("native access is unavailable".to_owned())));
+                        observability::record_outcome(&operation, "unavailable");
                     }
                 } else if let Some(coordinator) = &access {
                     let result = coordinator
@@ -909,9 +940,11 @@ async fn run_generation(
                         .await
                         .map(|()| None)
                         .map_err(|_| "native access coordinator stopped".to_owned());
+                    observability::record_result(&operation, &result);
                     drop(reply.send(result));
                 } else {
                     drop(reply.send(Err("native access is unavailable".to_owned())));
+                    observability::record_outcome(&operation, "unavailable");
                 }
             }
             Ready::Snapshot(snapshot) => {
@@ -931,6 +964,16 @@ async fn run_generation(
                 }
             }
             Ready::Access(Some(NativeAccessOutput::Progress(progress))) => {
+                let progress_class = access_progress_class(&progress);
+                let progress_span = observability::operation_span("access.progress", "native_task");
+                observability::record_outcome(&progress_span, access_progress_outcome(&progress));
+                progress_span.in_scope(|| {
+                    tracing::info!(
+                        event.name = "access.progress",
+                        access.stage = progress_class,
+                        outcome = access_progress_outcome(&progress),
+                    );
+                });
                 if let NativeAccessProgress::AwaitingBrowser {
                     authorization_url, ..
                 } = &progress
@@ -979,6 +1022,8 @@ async fn run_generation(
                 command,
                 logout_barrier,
             })) => {
+                let operation =
+                    observability::operation_span("access.client_command", "native_task");
                 if logout_barrier
                     && publisher
                         .publish_control(
@@ -1004,7 +1049,9 @@ async fn run_generation(
                         Publication::Latest
                     },
                 )
+                .instrument(operation.clone())
                 .await;
+                observability::record_result(&operation, &result);
                 if logout_barrier && let Some(reply) = logout_reply.take() {
                     drop(reply.send(result.clone().map(Some)));
                 }
@@ -1029,6 +1076,28 @@ async fn run_generation(
     clear_handoff(&handoff, &callback_admission, publisher.generation);
     stop_access(access).await;
     let _ = credentials.clear_bearer_token();
+}
+
+const fn access_progress_class(progress: &NativeAccessProgress) -> &'static str {
+    match progress {
+        NativeAccessProgress::Discovering => "discovering",
+        NativeAccessProgress::AwaitingBrowser { .. } => "awaiting_browser",
+        NativeAccessProgress::Exchanging => "exchanging",
+        NativeAccessProgress::Refreshing => "refreshing",
+        NativeAccessProgress::RefreshSucceeded => "refresh_succeeded",
+        NativeAccessProgress::Succeeded => "succeeded",
+        NativeAccessProgress::Failed { .. } => "failed",
+        NativeAccessProgress::Canceled => "canceled",
+    }
+}
+
+const fn access_progress_outcome(progress: &NativeAccessProgress) -> &'static str {
+    match progress {
+        NativeAccessProgress::Succeeded | NativeAccessProgress::RefreshSucceeded => "ok",
+        NativeAccessProgress::Failed { .. } => "error",
+        NativeAccessProgress::Canceled => "canceled",
+        _ => "in_progress",
+    }
 }
 
 fn native_access_config(external_callback: bool) -> NativeAccessConfig {
@@ -1238,6 +1307,55 @@ const fn is_native_access_command(command: &ClientCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_observability_classifications_are_bounded() {
+        let cases = [
+            (
+                NativeAccessProgress::Discovering,
+                "discovering",
+                "in_progress",
+            ),
+            (
+                NativeAccessProgress::AwaitingBrowser {
+                    authorization_url: "SECRET_CALLBACK_URL_MARKER".to_owned(),
+                    timeout_millis: 1,
+                },
+                "awaiting_browser",
+                "in_progress",
+            ),
+            (
+                NativeAccessProgress::Exchanging,
+                "exchanging",
+                "in_progress",
+            ),
+            (
+                NativeAccessProgress::Refreshing,
+                "refreshing",
+                "in_progress",
+            ),
+            (
+                NativeAccessProgress::RefreshSucceeded,
+                "refresh_succeeded",
+                "ok",
+            ),
+            (NativeAccessProgress::Succeeded, "succeeded", "ok"),
+            (
+                NativeAccessProgress::Failed {
+                    error: "SECRET_ERROR_MARKER".to_owned(),
+                },
+                "failed",
+                "error",
+            ),
+            (NativeAccessProgress::Canceled, "canceled", "canceled"),
+        ];
+        for (progress, stage, outcome) in cases {
+            assert_eq!(access_progress_class(&progress), stage);
+            assert_eq!(access_progress_outcome(&progress), outcome);
+            assert!(!stage.contains("SECRET_"));
+            assert!(!outcome.contains("SECRET_"));
+        }
+    }
 
     fn callback_test_bridge(generation: u64) -> (RuntimeBridge, NativeCredentialProvider) {
         let bridge = RuntimeBridge::new(|_| true);

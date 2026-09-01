@@ -220,6 +220,20 @@ Only the native client ID is required at login. The TUI discovers only the API-r
 
 Native tokens and refresh tokens are process-memory only. Restarting the TUI requires login again. The TUI refreshes before expiry when a refresh token is returned and returns to login-required state when refresh fails or no refresh token remains after expiry.
 
+## Client Observability
+
+Production web bundles initialize Grafana Faro at `https://faro.holdenitdown.net/collect`. Hosted browser bundles use application name `waltr-spa`; Tauri WebView release bundles use `waltr-tauri`. Both report the version from `crates/waltr-web/package.json` and use the fixed `production` environment. Vite development, Tauri development, and test builds do not initialize Faro. Tauri development uses the explicit `tauri-dev` asset mode because a normal `vite build` is production-form even when launched by `cargo tauri dev`. A locally served release bundle still has release behavior and attempts export.
+
+The Tauri CSP permits `connect-src` to exactly `https://faro.holdenitdown.net` in addition to the local IPC origins. It grants no other telemetry origin. The collector must provide valid public HTTPS and accept Faro browser requests from each deployed hosted origin and the packaged Tauri WebView. Collector DNS, TLS, CORS, retention, and availability remain operator concerns; Waltr has no runtime Faro endpoint override. Faro failure never blocks application startup or use.
+
+Native Rust release apps export traces as OTLP/HTTP protobuf to `https://telemetry.holdenitdown.net:4318` with service name `waltr-app-native`. The resource also includes the Cargo package version, sanitized app revision, and Rust target triple. Debug and test Rust builds disable native export. The native client enables `waltr-client`'s `native-tracing` feature, which adds bounded gRPC spans and W3C context propagation to native Waltr RPCs. Tauri Faro does not also propagate those RPCs.
+
+`WALTR_APP_REVISION` can set the native build revision. The build accepts 7 through 40 ASCII hexadecimal characters and normalizes them to lowercase. If the value is absent or invalid, `build.rs` tries the current Git `HEAD` under the same rules. If neither source yields a valid revision, telemetry uses `unknown`. Release automation should pass the verified full commit SHA when its build environment cannot expose `.git` reliably.
+
+Native exporter setup and delivery are fail-open. The app uses a bounded queue, short request and shutdown timeouts, no redirects, and no authorization or environment-derived exporter headers. The fixed collector must accept unauthenticated OTLP/HTTP protobuf. Operators must not treat application success as proof of trace delivery. Normal local debug runs and deterministic tests send no native telemetry. Android lifecycle suspension does not synchronously flush; abrupt process termination can discard queued spans.
+
+Client telemetry follows the privacy contract in [Clients](architecture/clients.md#client-observability-boundary). Operators must not add credentials or broaden capture at the collector to compensate for fields that Waltr intentionally excludes.
+
 ## Tauri Application
 
 `crates/waltr-app/` packages local `crates/waltr-web/` assets and runs the shared client and native access coordinator in Rust. Its Tauri configuration defines Linux and macOS desktop bundles plus Android packaging. It does not bundle a Waltr server or change server and protobuf contracts. Its fixed configuration is:
@@ -233,13 +247,14 @@ Native tokens and refresh tokens are process-memory only. Restarting the TUI req
 | Desktop callback | Ephemeral `http://127.0.0.1:<port>/callback` |
 | Android callback | Exact `dev.waltr.app:/oauth2redirect` |
 
-The app has no endpoint selector, updater, persistent credential store, or broad shell, filesystem, or HTTP capability. Its main WebView loads only packaged local assets. Remote navigation and new windows are denied; credential-free HTTPS URLs are validated in Rust and opened by the operating system. Native OAuth and bearer/refresh credentials remain in Rust and never cross IPC.
+The app has no Waltr endpoint selector, telemetry endpoint selector, updater, persistent credential store, or broad shell, filesystem, or HTTP capability. Its main WebView loads only packaged local assets. Remote navigation and new windows are denied; credential-free HTTPS URLs are validated in Rust and opened by the operating system. Native OAuth and bearer/refresh credentials remain in Rust and never cross IPC.
 
 Run these commands from the repository root. They map to current workspace scripts and manifests:
 
 | Target | Command | Purpose |
 | --- | --- | --- |
 | Tauri web | `pnpm build:tauri` | Type-check and build relative local assets with Vite `tauri` mode and no WASM build. |
+| Tauri development web | `pnpm --filter @rfhold/waltr-web build:tauri:dev` | Build relative no-WASM Tauri assets with real Faro export disabled. |
 | Linux desktop | `pnpm --filter @rfhold/waltr-app dev` | Build the Tauri web assets and start the desktop app. |
 | Linux packages | `pnpm --filter @rfhold/waltr-app build` | Build the configured Linux Tauri bundles. |
 | Android package | `pnpm --filter @rfhold/waltr-app android:build` | Build through the generated Android project under `crates/waltr-app/gen/android/`. |

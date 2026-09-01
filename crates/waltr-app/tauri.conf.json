@@ -5,13 +5,13 @@
   "identifier": "dev.waltr.app",
   "build": {
     "beforeBuildCommand": "pnpm --filter @rfhold/waltr-web build:tauri && node scripts/stage-web.mjs",
-    "beforeDevCommand": "pnpm --filter @rfhold/waltr-web build:tauri && node scripts/stage-web.mjs",
+    "beforeDevCommand": "pnpm --filter @rfhold/waltr-web build:tauri:dev && node scripts/stage-web.mjs",
     "frontendDist": "frontend-dist"
   },
   "app": {
     "windows": [],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-src 'none'; form-action 'none'",
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost https://faro.holdenitdown.net; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-src 'none'; form-action 'none'",
       "capabilities": ["main"]
     }
   },

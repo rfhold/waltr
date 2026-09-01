@@ -10,6 +10,15 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 native-access = ["dep:base64", "dep:rand", "dep:reqwest", "dep:sha2", "dep:tokio"]
+native-tracing = [
+    "dep:http-body",
+    "dep:http",
+    "dep:opentelemetry",
+    "dep:pin-project-lite",
+    "dep:tower",
+    "dep:tracing",
+    "dep:tracing-opentelemetry",
+]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 [dependencies]
@@ -30,12 +39,19 @@ wasm-bindgen-futures = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 base64 = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+pin-project-lite = { version = "0.2.16", optional = true }
 rand = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["form", "rustls"], optional = true }
 rustls.workspace = true
 sha2 = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-ring"] }
+tower = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tonic-web-wasm-client.workspace = true
@@ -44,7 +60,9 @@ tonic-web-wasm-client.workspace = true
 hyper-util.workspace = true
 waltr-agent.workspace = true
 waltr-server = { workspace = true, features = ["test"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

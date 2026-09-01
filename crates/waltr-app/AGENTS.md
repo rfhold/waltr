@@ -3,6 +3,7 @@
 | Path | Info |
 | --- | --- |
 | [src/bridge.rs](src/bridge.rs) | Rust-owned client runtime, generation lifecycle, and bounded publication. |
+| [src/observability.rs](src/observability.rs) | Release-only native OTLP tracing, fail-open lifecycle, and privacy controls. |
 | [src/policy.rs](src/policy.rs) | External URL and local navigation security policies. |
 | [capabilities/](capabilities/) | Minimal local main-WebView IPC grants. |
 | [tauri.conf.json](tauri.conf.json) | Desktop and Android shell configuration. |
@@ -29,3 +30,5 @@ Keep Android callback delivery nonblocking, one-entry latest-value bounded, and 
 Mark the Android browser handoff before opening the external browser. Only the first browser-away pause for a pending unauthenticated attempt preserves the generation. The first resume consumes that exception and releases any held callback. Every later pause, authenticated pause, or suspended terminal result clears the runtime and credentials. Process death fails closed.
 
 Only packaged local content may invoke IPC. Deny remote main-WebView navigation and all new windows; external opening must pass the Rust HTTPS URL policy.
+
+Keep WebView Faro separate from native Rust tracing. Tauri enables `waltr-client/native-tracing`, so Rust owns gRPC spans and W3C propagation. Telemetry must exclude credentials, callbacks, query strings, commands, snapshots, content, arbitrary error or panic text, bodies, and stable user or device IDs. Keep exporter setup fail-open and bounded. Do not synchronously flush native telemetry from Android suspend callbacks.

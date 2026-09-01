@@ -26,3 +26,9 @@ export type ClientAdapter = {
 };
 
 export type ClientAdapterLoader = () => Promise<ClientAdapter>;
+
+export type BuildPlatform = "browser" | "tauri";
+
+export function telemetryAppName(platform: BuildPlatform): "waltr-spa" | "waltr-tauri" {
+  return platform === "tauri" ? "waltr-tauri" : "waltr-spa";
+}

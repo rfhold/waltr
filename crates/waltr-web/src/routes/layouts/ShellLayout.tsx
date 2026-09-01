@@ -1,8 +1,9 @@
 import { A, useLocation } from "@solidjs/router";
-import { createMemo, createSignal, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, Show } from "solid-js";
 import type { ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { reportApplicationView } from "../../telemetry";
 
 export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   const app = useAppState();
@@ -10,6 +11,7 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   const snapshot = createMemo(() => app.snapshot());
   const [loggingOut, setLoggingOut] = createSignal(false);
   const [logoutError, setLogoutError] = createSignal<string>();
+  createEffect(() => reportApplicationView(location.pathname));
   const logout = async () => {
     setLoggingOut(true);
     setLogoutError(undefined);

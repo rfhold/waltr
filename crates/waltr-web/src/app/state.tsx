@@ -11,6 +11,7 @@ import { AppStateContextProvider, type AppPhase } from "./context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
 import type { AccessProgress, ClientAdapter, ClientAdapterLoader } from "../platform/client";
 import { FixtureAppStateProvider, fixtureSnapshotForPath } from "./fixtures";
+import { reportApplicationError } from "../telemetry";
 
 type AppStateProviderProps = ParentProps<{
   loadClientAdapter: ClientAdapterLoader;
@@ -35,6 +36,14 @@ export function AppStateProvider(props: AppStateProviderProps) {
     return true;
   });
   const systemReady = createMemo(() => snapshot()?.status.ready ?? false);
+  let clientLoadErrorReported = false;
+
+  createEffect(() => {
+    if (clientAdapter.error && !clientLoadErrorReported) {
+      clientLoadErrorReported = true;
+      reportApplicationError("startup", "load_failed");
+    }
+  });
 
   createEffect(() => {
     const explicitTarget = explicitAuthTarget();
@@ -67,6 +76,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
     void client.start().catch((error) => {
       if (!cancelled) {
+        reportApplicationError("startup", "start_failed");
         setClientError(error);
       }
     });
@@ -87,7 +97,10 @@ export function AppStateProvider(props: AppStateProviderProps) {
       if (!event.persisted) dispose();
     };
     const pageshow = (event: PageTransitionEvent) => {
-      if (event.persisted) void client.start().catch(setClientError);
+      if (event.persisted) void client.start().catch((error) => {
+        reportApplicationError("recovery", "resume_failed");
+        setClientError(error);
+      });
     };
     window.addEventListener("pagehide", pagehide);
     window.addEventListener("pageshow", pageshow);
@@ -108,7 +121,12 @@ export function AppStateProvider(props: AppStateProviderProps) {
   });
 
   const dispatch = async (command: ClientCommand) => {
-    return getLoadedClient(clientAdapter()).dispatch(command);
+    try {
+      return await getLoadedClient(clientAdapter()).dispatch(command);
+    } catch (error) {
+      reportApplicationError("dispatch", "failed");
+      throw error;
+    }
   };
 
   const dispatchConfigPatch = async (command: ClientCommand) => {
@@ -306,33 +324,38 @@ export function AppStateProvider(props: AppStateProviderProps) {
     missingKeyMessage: string;
     failureMessage: string;
   }) {
-    const immediate = await getLoadedClient(clientAdapter()).dispatch(options.command);
-    const key = options.key(immediate);
+    try {
+      const immediate = await getLoadedClient(clientAdapter()).dispatch(options.command);
+      const key = options.key(immediate);
 
-    if (!key) {
-      throw new Error(options.missingKeyMessage);
-    }
+      if (!key) {
+        throw new Error(options.missingKeyMessage);
+      }
 
-    const current = snapshot() ?? immediate;
-    const result = operationResult(current, key, options.kind);
-    if (result?.status === "ready") {
-      return current;
-    }
-    if (result?.status === "failed") {
-      throw new Error(result.error ?? options.failureMessage);
-    }
+      const current = snapshot() ?? immediate;
+      const result = operationResult(current, key, options.kind);
+      if (result?.status === "ready") {
+        return current;
+      }
+      if (result?.status === "failed") {
+        throw new Error(result.error ?? options.failureMessage);
+      }
 
-    return new Promise<ClientSnapshot>((resolve, reject) => {
-      const waiter: OperationWaiter = {
-        key,
-        kind: options.kind,
-        failureMessage: options.failureMessage,
-        resolve,
-        reject,
-      };
-      operationWaiters.add(waiter);
-      settleOperationWaiter(waiter, snapshot() ?? immediate, operationWaiters);
-    });
+      return await new Promise<ClientSnapshot>((resolve, reject) => {
+        const waiter: OperationWaiter = {
+          key,
+          kind: options.kind,
+          failureMessage: options.failureMessage,
+          resolve,
+          reject,
+        };
+        operationWaiters.add(waiter);
+        settleOperationWaiter(waiter, snapshot() ?? immediate, operationWaiters);
+      });
+    } catch (error) {
+      reportApplicationError("dispatch", "failed");
+      throw error;
+    }
   }
 
   return (
