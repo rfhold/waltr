@@ -583,7 +583,7 @@ type NativeChannel = tonic::transport::Channel;
 #[allow(clippy::large_enum_variant)]
 enum NativeEndpoint {
     Plaintext(tonic::transport::Endpoint),
-    NativeRootsTls {
+    WebPkiRootsTls {
         endpoint: tonic::transport::Endpoint,
         tls: tonic::transport::ClientTlsConfig,
     },
@@ -594,7 +594,7 @@ impl NativeEndpoint {
     fn into_tonic_endpoint(self) -> Result<tonic::transport::Endpoint, ClientError> {
         match self {
             Self::Plaintext(endpoint) => Ok(endpoint),
-            Self::NativeRootsTls { endpoint, tls } => endpoint
+            Self::WebPkiRootsTls { endpoint, tls } => endpoint
                 .tls_config(tls)
                 .map_err(|error| ClientError::new(error.to_string())),
         }
@@ -920,9 +920,9 @@ impl NativeGrpcTransport {
             .map_err(|error| ClientError::new(error.to_string()))?;
         if self.endpoint.starts_with("https://") {
             drop(rustls::crypto::ring::default_provider().install_default());
-            Ok(NativeEndpoint::NativeRootsTls {
+            Ok(NativeEndpoint::WebPkiRootsTls {
                 endpoint,
-                tls: tonic::transport::ClientTlsConfig::new().with_native_roots(),
+                tls: tonic::transport::ClientTlsConfig::new().with_webpki_roots(),
             })
         } else {
             Ok(NativeEndpoint::Plaintext(endpoint))
@@ -1527,7 +1527,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     #[allow(clippy::similar_names)]
-    async fn native_endpoint_connection_uses_native_root_tls_only_for_https() {
+    async fn native_endpoint_connection_uses_webpki_root_tls_only_for_https() {
         let http = NativeGrpcTransport::new("http://127.0.0.1:8080")
             .native_endpoint()
             .expect("HTTP endpoint should construct");
@@ -1540,8 +1540,8 @@ mod tests {
         };
         assert_eq!(http_endpoint.uri().scheme_str(), Some("http"));
 
-        let NativeEndpoint::NativeRootsTls { endpoint, tls } = &https else {
-            panic!("HTTPS endpoint must carry a native-root TLS configuration");
+        let NativeEndpoint::WebPkiRootsTls { endpoint, tls } = &https else {
+            panic!("HTTPS endpoint must carry a WebPKI-root TLS configuration");
         };
         assert_eq!(endpoint.uri().scheme_str(), Some("https"));
         let _ = tls;
@@ -1559,19 +1559,31 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_https_trusts_controlled_native_root() {
+    async fn native_https_ignores_controlled_native_root() {
         const CHILD_ENV: &str = "WALTR_CLIENT_NATIVE_TLS_CHILD_ENDPOINT";
         if let Ok(endpoint) = std::env::var(CHILD_ENV) {
             assert!(rustls::crypto::CryptoProvider::get_default().is_none());
-            let transport = NativeGrpcTransport::new(endpoint);
+            let transport = NativeGrpcTransport::new(endpoint.clone());
             transport
                 .native_endpoint()
                 .expect("HTTPS endpoint should initialize its crypto provider");
             assert!(rustls::crypto::CryptoProvider::get_default().is_some());
-            transport
+            let error = transport
                 .get_config()
                 .await
-                .expect("native-root TLS connection should succeed");
+                .expect_err("a certificate trusted only through SSL_CERT_FILE must be rejected");
+            assert!(
+                error.to_string().contains("certificate")
+                    || error.to_string().contains("tls")
+                    || error.to_string().contains("transport"),
+                "unexpected TLS rejection: {error}"
+            );
+            #[cfg(feature = "native-access")]
+            crate::native_access::test_http_client()
+                .get(endpoint)
+                .send()
+                .await
+                .expect_err("reqwest must reject a certificate absent from bundled WebPKI roots");
             return;
         }
 
@@ -1604,7 +1616,7 @@ mod tests {
             .join("tests/fixtures/native-tls-ca.pem");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("transport::tests::native_https_trusts_controlled_native_root")
+            .arg("transport::tests::native_https_ignores_controlled_native_root")
             .arg("--nocapture")
             .env(CHILD_ENV, format!("https://localhost:{}", address.port()))
             .env("SSL_CERT_FILE", ca_path)

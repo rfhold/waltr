@@ -22,7 +22,7 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, privacy filtering, and platform-specific propagation. |
 | `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
 | `crates/waltr-app/src/bridge.rs` tests | Tauri generation ordering, bounded coalescing, FIFO dispatch, disposal, logout ordering, Android callback routing/handoff lifecycle, and secret-free serialization. |
-| `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, startup signals, shutdown bounds, header privacy, redirect non-following, and in-memory exporters. |
+| `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, startup signals, shutdown bounds, header privacy, redirect non-following, bundled-root loading, untrusted TLS rejection, and in-memory exporters. |
 | `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
@@ -98,6 +98,12 @@ Run shared native access protocol tests:
 
 This layer owns callback-policy separation, exact redirect/state/code/error validation, wrong-state or otherwise invalid callback followed by a valid callback, timeout/cancellation, PKCE exchange, credential leases, protected bearer delivery, refresh/expiry, and logout cleanup. It does not prove Android intent delivery.
 
+The same command checks that native OAuth builds its bundled Mozilla root store with ISRG Root X1. Run the native transport trust rejection directly with:
+
+`cargo test -p waltr-client --features native-access --lib native_https_ignores_controlled_native_root`
+
+This test serves a local certificate trusted only through `SSL_CERT_FILE` and requires both tonic and native OAuth reqwest to reject it. It uses a local listener and does not contact a Waltr deployment or external collector.
+
 Run feature-gated native gRPC telemetry tests:
 
 `cargo test -p waltr-client --features native-tracing --lib transport::native_trace`
@@ -154,7 +160,7 @@ Run only native observability and exact Faro CSP tests:
 
 `cargo test -p waltr-app csp_adds_only_the_exact_faro_collector_origin`
 
-The observability tests use deterministic in-memory span, log, and metric exporters. They verify target allowlists, shared resource identity, fixed signal URLs, startup signals, shutdown bounds, header sanitization, redirect non-following, provider ownership, and test isolation. They do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, or mobile process-exit delivery.
+The observability tests use deterministic in-memory span, log, and metric exporters. They verify target allowlists, shared resource identity, fixed signal URLs, startup signals, shutdown bounds, header sanitization, redirect non-following, ring provider ownership, complete bundled-root loading with ISRG Root X1, rejection of an untrusted local TLS endpoint, and test isolation. They do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, mobile process-exit delivery, or Android runtime connectivity.
 
 Build the no-WASM Tauri web target:
 
@@ -174,7 +180,7 @@ Validate the Pulumi source registration and deployment shape without applying a 
 
 `bun run --cwd infra/pulumi build && bun run --cwd infra/pulumi test`
 
-The client and app tests prove protocol behavior, Rust ownership, bounded routing, and source/manifest configuration. The Pulumi test proves both stack files declare the exact private URI and the program retains strict Android plus regex desktop registration. The Android package command proves the generated project builds. None proves that Authentik has been reconciled, that an emulator/device routes cold or warm intents to Waltr, or that a live provider accepts the redirect.
+The client and app tests prove protocol behavior, Rust ownership, bounded routing, source/manifest configuration, and deterministic native TLS trust. The Pulumi test proves both stack files declare the exact private URI and the program retains strict Android plus regex desktop registration. The Android package command proves the generated project builds. None proves Android runtime connectivity; RC8 device verification must exercise the live public-root Waltr, OIDC, and OTLP endpoints before this fix is considered runtime-verified. These checks also do not prove that Authentik has been reconciled, that an emulator/device routes cold or warm intents to Waltr, or that a live provider accepts the redirect.
 
 Installed-app testing belongs at the Android host layer. Exercise warm and cold intents, browser pause/resume, cancel and five-minute timeout while suspended, ordinary and authenticated backgrounding, callback after process death, and private-scheme contention. A cold callback after process death must fail closed and a new login must be required. Authorized live-provider smoke testing additionally covers login, a protected request, refresh or expiry, logout, and subsequent credential rejection. These checks require explicit deployment authority and must not be folded into routine tests that mutate preview. Android app start and Linux desktop commands are documented once in [Deployment](deployment.md#tauri-application). macOS and iOS require macOS and were not verified.
 

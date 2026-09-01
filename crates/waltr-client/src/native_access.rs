@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     fmt, io,
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -1469,11 +1470,32 @@ fn parse_secure_url(value: &str, label: &str) -> Result<Url, NativeAuthError> {
 }
 
 fn http_client() -> Result<Client, NativeAuthError> {
+    let tls = webpki_tls_config()?;
     Client::builder()
+        .tls_backend_preconfigured(tls)
         .timeout(HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| NativeAuthError("could not initialize the OIDC HTTP client".to_owned()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_http_client() -> Client {
+    http_client().expect("native HTTP client should configure")
+}
+
+fn webpki_tls_config() -> Result<rustls::ClientConfig, NativeAuthError> {
+    let roots = webpki_root_store();
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| NativeAuthError("could not initialize the OIDC HTTP client".to_owned()))
+        .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+fn webpki_root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
 }
 
 async fn send_progress(outputs: &mpsc::Sender<NativeAccessOutput>, progress: NativeAccessProgress) {
@@ -1506,6 +1528,21 @@ mod tests {
             audience: None,
             callback: NativeCallbackPolicy::Loopback(NativeLoopbackPolicy::Ephemeral),
         }
+    }
+
+    #[test]
+    fn native_http_tls_uses_bundled_isrg_root_x1_compatible_roots() {
+        const ISRG_ROOT_X1_SUBJECT: &[u8] = b"1\x0b0\t\x06\x03U\x04\x06\x13\x02US1)0'\x06\x03U\x04\n\x13 Internet Security Research Group1\x150\x13\x06\x03U\x04\x03\x13\x0cISRG Root X1";
+
+        let roots = webpki_root_store();
+
+        assert!(
+            roots
+                .roots
+                .iter()
+                .any(|anchor| anchor.subject.as_ref() == ISRG_ROOT_X1_SUBJECT),
+            "Mozilla WebPKI roots must contain ISRG Root X1"
+        );
     }
 
     #[test]
