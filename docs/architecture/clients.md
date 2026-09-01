@@ -151,6 +151,24 @@ The Tauri bridge preserves these lifecycle invariants:
 - Android retains the current generation only across the first browser-away pause for a pending unauthenticated login. Rust marks the handoff before it opens the browser. The first resume consumes the exception and releases any held callback. A later pause, authenticated pause, or suspended terminal result invalidates the generation and clears credentials.
 - The hosted WASM adapter also stops polling, frees its Rust client, clears listeners, and rejects work after disposal.
 
+## Client Observability Boundary
+
+Client observability has separate WebView and native Rust paths:
+
+| Runtime | Export path | Stable identity | Enablement |
+| --- | --- | --- | --- |
+| Hosted browser production bundle | Grafana Faro to `https://faro.holdenitdown.net/collect` | `waltr-spa` | Vite production builds only. |
+| Tauri WebView release bundle | Grafana Faro to `https://faro.holdenitdown.net/collect` | `waltr-tauri` | Vite `tauri` release builds only. |
+| Tauri native Rust release app | OTLP/HTTP protobuf to `https://telemetry.holdenitdown.net:4318` | `waltr-app-native` | Rust release builds only. |
+
+Faro does not initialize in Vite development, Tauri `tauri-dev`, or test builds. Tauri development still uses the Tauri adapter and packaged relative assets; its explicit build-time telemetry gate remains disabled even though Vite emits a production-form asset bundle. Initialization and reporting failures never affect routing, rendering, or client commands. Hosted Faro injects W3C trace context only into requests to the page's own origin. Tauri Faro injects no request trace context because native Rust owns Tauri gRPC traffic.
+
+`waltr-app` enables the `waltr-client/native-tracing` feature. Under that feature, `NativeGrpcTransport` creates bounded connection and gRPC client spans, records allowlisted service and method names, records status and duration classes, and injects `traceparent` plus valid `tracestate` headers. Without that feature, `waltr-client` adds no native spans or W3C headers. This keeps propagation ownership with the native transport rather than the WebView or shared reducer.
+
+Native exporter initialization is fail-open. Release startup continues when subscriber, TLS client, or exporter setup fails. The exporter uses a 256-span queue, batches at most 64 spans, applies two-second request and shutdown timeouts, and follows no redirects. The process-lifetime guard requests bounded shutdown when the Tauri event loop returns. Android suspend and resume paths do not synchronously flush or recreate the exporter, so abrupt mobile process termination can lose queued spans.
+
+Both paths enforce a strict privacy boundary. Telemetry excludes credentials, authorization and callback values, query strings, commands, snapshots, user content, arbitrary error or panic text, request and response bodies, and stable user or device identifiers. Faro replaces route identifiers with fixed templates, removes user and session metadata, drops logs, reduces exceptions to a fixed message, allowlists trace attributes, and reduces Web Vitals measurements to recognized metric names, bounded numeric values, and documented enum context. It drops DOM attribution, generated identifiers, URLs, actions, and unknown measurements. Native spans use fixed operation classes and outcomes; panic telemetry contains only a fixed class, source location, thread name, build version, revision, and target. The native exporter strips all request headers except the OTLP protobuf content type.
+
 Effective timeline watches append and identity-dedupe projected events. A projection reset is authoritative and replaces stale projected entries plus projection metadata. Raw descriptors continue to process legacy durable event and truncation updates. Projection mode is part of the watch identity, so reconnect/open-generation guards cannot attach a stale raw stream to an effective detail watch.
 
 Agent discovery follows session watch interest and status readiness. The reducer tracks a request generation, ignores stale completions, sorts returned entries, and keeps failed discovery explicit rather than substituting the current or default agent. Create waits for a ready catalog and selected name. Agent switching is an independent keyed operation, so its success or failure does not reuse create state.
@@ -245,6 +263,8 @@ Browser, TUI, and Tauri implementations should follow these rules:
 - Register catalog watch interest while a UI surface needs live resource updates. Release interest when that surface no longer needs them.
 - Preserve feature parity across browser, TUI, and Tauri paths by changing shared reducer behavior in `waltr-client` when behavior is not platform-specific.
 - Keep Waltr access state distinct from provider/upstream-MCP `AuthTarget` state, and ignore stale login attempts, credential leases, and watch epochs.
+- Keep WebView telemetry and native Rust telemetry separate. The hosted WebView owns same-origin propagation; the native transport owns Tauri gRPC propagation.
+- Preserve the telemetry privacy boundary. Add only fixed operation classes, controlled outcomes, normalized routes, and allowlisted protocol attributes.
 - Keep native OAuth and bearer/refresh credentials in Rust. IPC may expose only shared snapshots, commands, opaque lifecycle data, safe errors, and secret-free access progress.
 - Keep remote content out of privileged WebViews. Tauri main-WebView navigation is restricted to packaged local content, new windows are denied, and Rust opens only credential-free HTTPS URLs that pass its external URL policy.
 - Keep provider and MCP catalog loading, mutation commands, operation keys, and snapshots in the shared reducer; browser bindings must not construct direct catalog transports.
@@ -284,8 +304,11 @@ The TUI opens create selection with `C-x s` and switches the open session with `
 | [../../crates/waltr-client/src/coordination/runtime.rs](../../crates/waltr-client/src/coordination/runtime.rs) | Runtime and state-stream orchestration. |
 | [../../crates/waltr-client/src/native_access.rs](../../crates/waltr-client/src/native_access.rs) | Shared native OIDC protocol and in-memory credential lifecycle. |
 | [../../crates/waltr-client/src/transport/mod.rs](../../crates/waltr-client/src/transport/mod.rs) | RPC transport boundary. |
+| [../../crates/waltr-client/src/transport/native_trace.rs](../../crates/waltr-client/src/transport/native_trace.rs) | Feature-gated native gRPC spans and W3C context injection. |
 | [../../crates/waltr-app/src/bridge.rs](../../crates/waltr-app/src/bridge.rs) | Tauri runtime generation, ordered IPC, and bounded publication. |
+| [../../crates/waltr-app/src/observability.rs](../../crates/waltr-app/src/observability.rs) | Native release OTLP exporter, bounded lifecycle, and privacy controls. |
 | [../../crates/waltr-app/src/policy.rs](../../crates/waltr-app/src/policy.rs) | Packaged navigation and external HTTPS URL policies. |
+| [../../crates/waltr-web/src/telemetry.ts](../../crates/waltr-web/src/telemetry.ts) | Hosted and Tauri WebView Faro setup, normalization, and privacy controls. |
 | [../../crates/waltr-web/src/platform/tauri.ts](../../crates/waltr-web/src/platform/tauri.ts) | Tauri frontend adapter and stale-output recovery. |
 | [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |
 | [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC contract. |

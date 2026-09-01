@@ -3,6 +3,8 @@
 mod auth;
 mod catalog;
 mod config;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
+mod native_trace;
 mod routine;
 mod session;
 mod status;
@@ -37,6 +39,10 @@ use std::sync::{Arc, RwLock};
 use tonic::metadata::AsciiMetadataValue;
 #[cfg(not(target_arch = "wasm32"))]
 use tonic::service::{Interceptor, interceptor::InterceptedService};
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
+use tower::Layer as _;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
+use tracing::Instrument as _;
 
 use crate::{
     ClientError, ClientRoutineInvocationDetail, ClientRoutineInvocationPage,
@@ -568,6 +574,11 @@ pub struct NativeGrpcTransport {
     credentials: NativeCredentialProvider,
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
+type NativeChannel = native_trace::NativeTraceService<tonic::transport::Channel>;
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native-tracing")))]
+type NativeChannel = tonic::transport::Channel;
+
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::large_enum_variant)]
 enum NativeEndpoint {
@@ -885,9 +896,20 @@ impl NativeGrpcTransport {
             .clear_bearer_token_if_current(lease, credential_revision)
     }
 
-    async fn channel(&self) -> Result<tonic::transport::Channel, ClientError> {
-        self.native_endpoint()?
-            .into_tonic_endpoint()?
+    async fn channel(&self) -> Result<NativeChannel, ClientError> {
+        let endpoint = self.native_endpoint()?.into_tonic_endpoint()?;
+        #[cfg(feature = "native-tracing")]
+        {
+            let span = native_trace::connection_span();
+            let started = std::time::Instant::now();
+            let channel = endpoint.connect().instrument(span.clone()).await;
+            native_trace::finish_connection(&span, channel.is_ok(), started);
+            channel
+                .map(|channel| native_trace::NativeTraceLayer.layer(channel))
+                .map_err(|error| ClientError::new(error.to_string()))
+        }
+        #[cfg(not(feature = "native-tracing"))]
+        endpoint
             .connect()
             .await
             .map_err(|error| ClientError::new(error.to_string()))
@@ -923,7 +945,7 @@ impl NativeGrpcTransport {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RemoteTransport for NativeGrpcTransport {
-    type Inner = InterceptedService<tonic::transport::Channel, NativeBearerInterceptor>;
+    type Inner = InterceptedService<NativeChannel, NativeBearerInterceptor>;
 
     fn request_credentials(&self) -> RequestCredentials {
         self.credentials.request_credentials()

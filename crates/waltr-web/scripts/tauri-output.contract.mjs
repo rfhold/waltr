@@ -6,8 +6,11 @@ const dist = new URL("dist/", root);
 const index = await readFile(new URL("index.html", dist), "utf8");
 const manifest = JSON.parse(await readFile(new URL("site.webmanifest", dist), "utf8"));
 const config = await readFile(new URL("../waltr-app/tauri.conf.json", root), "utf8");
+const telemetry = process.argv.find((argument) => argument.startsWith("--telemetry="))?.split("=", 2)[1];
 
 assert.match(index, /<base href="\/">/);
+assert.ok(telemetry === "enabled" || telemetry === "disabled", "expected telemetry contract selection");
+assert.match(index, new RegExp(`<meta name="waltr-telemetry" content="${telemetry}">`));
 assert.match(config, /base-uri 'self'/);
 
 const references = [...index.matchAll(/(?:href|src)="([^"#]+)"/g)]
