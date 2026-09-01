@@ -1,6 +1,13 @@
 import { check, sleep } from "k6";
 
-import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
+import {
+  baseUrl,
+  options as browserOptions,
+  responsiveViewports,
+  screenshotMatrix,
+  setResponsiveViewport,
+  withPage,
+} from "../support/browser.js";
 import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
@@ -10,12 +17,10 @@ const PRIMARY_PROVIDER = "k6-openai";
 const PRIMARY_MODEL = "gpt-5-nano";
 const SECONDARY_PROVIDER = "k6-anthropic";
 const SECONDARY_MODEL = "claude";
-const DESKTOP = { width: 1440, height: 900 };
-const MOBILE = { width: 390, height: 1100 };
 
 export default async function () {
   await withPage(async (page) => {
-    await page.setViewportSize(DESKTOP);
+    await setResponsiveViewport(page, responsiveViewports.desktop);
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await waitForText(page, "#landing-title", "Waltr is ready.");
 
@@ -23,7 +28,7 @@ export default async function () {
     await waitForPathname(page, "/sessions");
     await waitForText(page, "#sessions-title", "Sessions");
     await waitForText(page, "#sessions-list-title", "Recent sessions");
-    await screenshot(page, "sessions-list-empty");
+    await screenshotMatrix(page, "sessions-list-empty");
 
     await createSession(page);
     await waitForText(page, '[aria-label="Session detail"]', "");
@@ -40,14 +45,25 @@ export default async function () {
       if (!shellContent || !detail) return false;
       return Math.abs(shellContent.getBoundingClientRect().height - detail.getBoundingClientRect().height) < 1;
     });
-    await screenshot(page, "sessions-detail-thinking-default");
-    await page.setViewportSize(MOBILE);
-    await screenshot(page, "sessions-context-mobile");
-    await page.setViewportSize(DESKTOP);
+    await screenshotMatrix(page, "sessions-detail-empty");
+    await setResponsiveViewport(page, responsiveViewports.phone);
+    const mobileGeometry = await page.evaluate(() => {
+      const shell = document.querySelector(".shell");
+      const context = document.querySelector(".sessions__context-disclosure");
+      const composer = document.querySelector(".sessions__composer");
+      if (!(shell instanceof HTMLElement) || !(context instanceof HTMLDetailsElement) || !(composer instanceof HTMLElement)) return null;
+      return {
+        contextOpen: context.open,
+        shellWithinViewport: shell.getBoundingClientRect().width <= window.innerWidth + 1,
+        composerReachable: composer.getBoundingClientRect().bottom <= window.innerHeight + 1,
+        horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      };
+    });
+    await setResponsiveViewport(page, responsiveViewports.desktop);
 
     await typeAndKeepFocus(page, '[aria-label="Session message"]', "@read");
     const resourceSuggestions = await waitForText(page, '[aria-label="Resource suggestions"]', "read");
-    await screenshot(page, "sessions-resource-search-popover");
+    await screenshotMatrix(page, "sessions-resource-search-popover");
     await page.keyboard.press("Enter");
     const resourceFilled = await waitForTextareaValueChange(page, '[aria-label="Session message"]', "@read");
     await clearTextarea(page, '[aria-label="Session message"]');
@@ -55,28 +71,46 @@ export default async function () {
     await setSelectValue(page, '[aria-label="Session thinking level"]', "high");
     const thinkingRuntime = await waitForText(page, '[aria-label="Session status summary"]', `${PRIMARY_PROVIDER}/${PRIMARY_MODEL} (high)`);
     const thinkingSelectValue = await waitForSelectValue(page, '[aria-label="Session thinking level"]', "high");
-    await screenshot(page, "sessions-detail-thinking-high");
+    await screenshotMatrix(page, "sessions-detail-thinking-high", {
+      prepareViewport: async (page, { viewportName }) => {
+        if (viewportName === "phone" || viewportName === "compact") {
+          await openSessionDetailSettings(page);
+        }
+      },
+    });
 
     await clickButtonByLabel(page, "Edit provider/model");
     await waitForText(page, '[role="dialog"]', "Edit inference settings");
     const providerDialogThinking = await waitForLabeledSelectValue(page, "Thinking level", "high");
-    await screenshot(page, "sessions-provider-runtime-thinking-dialog");
+    await screenshotMatrix(page, "sessions-provider-runtime-thinking-dialog");
     await clickRuntimeProviderOption(page, SECONDARY_PROVIDER);
     await clickButtonByText(page, "Save inference settings");
     const providerRuntime = await waitForText(page, '[aria-label="Session status summary"]', `Provider ${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`);
-    await screenshot(page, "sessions-detail-created");
+    await screenshotMatrix(page, "sessions-detail-created");
 
     await page.locator('.shell__nav a[href="/sessions"]').click();
     await waitForPathname(page, "/sessions");
     const listedSession = await waitForText(page, '[aria-label="Session list"]', sessionId);
-    await screenshot(page, "sessions-list-with-session");
+    await screenshotMatrix(page, "sessions-list-with-session");
 
     await page.locator(`button[aria-label="Open session ${sessionId}"]`).click();
     await waitForPathname(page, `/sessions/${encodeURIComponent(sessionId)}`);
     const reopenedDetail = await waitForText(page, '[aria-label="Session status summary"]', `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`);
 
     await clickButtonByLabel(page, `Delete session ${sessionId}`);
-    await screenshot(page, "sessions-delete-confirmation");
+    await screenshotMatrix(page, "sessions-delete-confirmation", {
+      prepareViewport: async (page, { viewportName }) => {
+        if (viewportName === "phone") {
+          await openSessionDetailSettings(page);
+          await ensureResponsiveDeleteConfirmation(page, sessionId, true);
+        }
+        if (viewportName === "compact") {
+          await openSessionDetailSettings(page);
+          await ensureResponsiveDeleteConfirmation(page, sessionId, false);
+        }
+      },
+    });
+    await page.locator(`[aria-label="Delete session ${sessionId} confirmation"]`).waitFor();
     await clickButtonByLabel(page, `Confirm delete session ${sessionId}`);
     await waitForPathname(page, "/sessions");
     const listAfterDelete = await waitForMissingText(page, ".sessions__list-panel", sessionId);
@@ -91,7 +125,7 @@ export default async function () {
     await waitForPathname(page, "/sessions/data");
     const wipeCopy = await waitForText(page, ".sessions__data-panel", "does not affect configuration, authentication, OAuth credentials, or MCP/Waltr SQL state");
     await clickButtonByText(page, "Delete all sessions");
-    await screenshot(page, "sessions-wipe-confirmation");
+    await screenshotMatrix(page, "sessions-wipe-confirmation");
     await clickButtonByLabel(page, "Confirm delete all sessions");
     const wipeSuccess = await waitForText(page, ".sessions__data-panel", "All agent sessions deleted.");
     await waitForPathname(page, "/sessions/data");
@@ -104,6 +138,9 @@ export default async function () {
       "session detail shows empty timeline": () => includesText(detailTimeline, "No messages yet."),
       "session detail shows empty context": () => includesText(sessionContext, "Usage Ctx 0 Cache 0% / 0% Cost - Subtasks No subtasks. Routines No Routine invocations."),
       "session detail fills the scroll viewport": () => detailFillsShell,
+      "mobile context starts collapsed": () => mobileGeometry?.contextOpen === false,
+      "mobile detail avoids viewport overflow": () => mobileGeometry?.shellWithinViewport === true && mobileGeometry.horizontalOverflow <= 1,
+      "mobile composer remains reachable": () => mobileGeometry?.composerReachable === true,
       "session resource search shows suggestions": () => includesText(resourceSuggestions, "read"),
       "session resource search fills composer": () => resourceFilled.startsWith("@tool(") && resourceFilled !== "@read",
       "session thinking select is enabled": () => thinkingSelectEnabled,
@@ -127,6 +164,40 @@ async function createSession(page) {
   const dialog = page.locator('[role="dialog"][aria-label="Create session dialog"]');
   await dialog.waitFor();
   await dialog.locator('button[type="submit"]').click();
+}
+
+async function openSessionDetailSettings(page) {
+  const settings = page.locator(".sessions__detail-settings");
+  await settings.waitFor();
+  const open = await page.evaluate(() => {
+    const details = document.querySelector(".sessions__detail-settings");
+    if (!(details instanceof HTMLDetailsElement)) {
+      throw new Error("Session settings disclosure not found");
+    }
+    return details.open;
+  });
+
+  if (!open) {
+    await settings.locator("summary").click();
+  }
+  await page.locator(".sessions__detail-settings[open]").waitFor();
+}
+
+async function ensureResponsiveDeleteConfirmation(page, sessionId, activate) {
+  const confirmationSelector = `[aria-label="Delete session ${sessionId} confirmation"]`;
+  const confirmation = page.locator(confirmationSelector);
+
+  if (await confirmation.count() === 0) {
+    if (!activate) {
+      throw new Error(`Responsive delete confirmation was not preserved for ${sessionId}`);
+    }
+    await page
+      .locator(`.sessions__detail-settings button[aria-label="Delete session ${sessionId}"]`)
+      .click();
+  }
+
+  await confirmation.waitFor();
+  await page.locator(`button[aria-label="Confirm delete session ${sessionId}"]`).waitFor();
 }
 
 async function waitForTextareaValueChange(page, selector, previousValue) {

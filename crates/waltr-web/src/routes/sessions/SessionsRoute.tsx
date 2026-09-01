@@ -462,6 +462,7 @@ function SessionRouteAlerts() {
 function SessionDetail(props: { session: SessionView }) {
   const app = useAppState();
   const sessions = useSessionsRoute();
+  const phone = useMediaQuery("(max-width: 700px)");
   const [editingInferenceSettings, setEditingInferenceSettings] = createSignal(false);
   const [editingAgent, setEditingAgent] = createSignal(false);
   const [draft, setDraft] = createSignal("");
@@ -1188,6 +1189,7 @@ function SessionDetail(props: { session: SessionView }) {
       </form>
       <SessionDetailStatusBar
         session={props.session}
+        phone={phone()}
         onEditInferenceSettings={() => setEditingInferenceSettings(true)}
         onEditAgent={() => {
           setEditingAgent(true);
@@ -1197,6 +1199,7 @@ function SessionDetail(props: { session: SessionView }) {
       </div>
       <SessionContextSidebar
         session={props.session}
+        phone={phone()}
         contextTokens={latestContextTokens(latestMetrics())}
         subtasks={subtasks()}
         routineInvocations={routineInvocations()}
@@ -3014,13 +3017,13 @@ type QuestionModel = {
 
 function SessionContextSidebar(props: {
   session: SessionView;
+  phone: boolean;
   contextTokens: bigint;
   subtasks: SessionView[];
   routineInvocations: ClientRoutineInvocationSummary[];
 }) {
-  return (
-    <aside class="sessions__context" aria-label="Session context">
-      <h2>Context</h2>
+  const content = () => (
+    <div class="sessions__context-content">
       <section aria-labelledby="session-context-usage">
         <h3 id="session-context-usage">Usage</h3>
         <dl class="sessions__context-usage" aria-label="Session token and cost totals">
@@ -3055,6 +3058,17 @@ function SessionContextSidebar(props: {
           </ul>
         </Show>
       </section>
+    </div>
+  );
+
+  return (
+    <aside class="sessions__context" aria-label="Session context">
+      <Show when={props.phone} fallback={<><h2>Context</h2>{content()}</>}>
+        <details class="sessions__context-disclosure">
+          <summary>Context</summary>
+          {content()}
+        </details>
+      </Show>
     </aside>
   );
 }
@@ -3124,6 +3138,7 @@ function normalizeQuestion(value: unknown): QuestionModel {
 
 function SessionDetailStatusBar(props: {
   session: SessionView;
+  phone: boolean;
   onEditInferenceSettings: () => void;
   onEditAgent: () => void;
 }) {
@@ -3162,8 +3177,8 @@ function SessionDetailStatusBar(props: {
     });
   };
 
-  return (
-    <footer class="sessions__detail-status" aria-label="Session status summary">
+  const content = () => (
+    <>
       <span class="sessions__detail-status-item">
         <strong>Agent</strong> {props.session.agentName}
         <button
@@ -3205,8 +3220,34 @@ function SessionDetailStatusBar(props: {
       </Show>
       <SessionCommandPalette sessionId={props.session.id} />
       <SessionDeleteAction session={props.session} compact />
+    </>
+  );
+
+  return (
+    <footer class="sessions__detail-status" aria-label="Session status summary">
+      <Show when={props.phone} fallback={content()}>
+        <details class="sessions__detail-settings">
+          <summary>Session settings</summary>
+          <div class="sessions__detail-settings-content">{content()}</div>
+        </details>
+      </Show>
     </footer>
   );
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = createSignal(false);
+
+  createEffect(() => {
+    const mediaQuery = window.matchMedia?.(query);
+    if (!mediaQuery) return;
+    const update = () => setMatches(mediaQuery.matches);
+    update();
+    mediaQuery.addEventListener("change", update);
+    onCleanup(() => mediaQuery.removeEventListener("change", update));
+  });
+
+  return matches;
 }
 
 function SessionAgentDialog(props: { session: SessionView; active: boolean; onClose: () => void }) {

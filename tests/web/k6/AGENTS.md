@@ -25,6 +25,8 @@ Compose profiles, Dex users, MCP endpoints, TLS names, and credentials are stati
 
 Screenshot snapshots are validated with `pnpm test:web:screenshots`. Actual PNGs are written to ignored `.dev/web-screenshots/current/` and compared against local snapshot baselines in ignored `tests/web/k6/snapshots/screenshots/`.
 
+Access-disabled semantic screenshot states use the shared responsive matrix: desktop 1440x900, tablet 768x1024, phone 390x844, and compact phone 320x700. Capture them through `screenshotMatrix`; generated filenames end in `--desktop.png`, `--tablet.png`, `--phone.png`, and `--compact.png`.
+
 Use `pnpm test:web:screenshots:update` after intentional visual changes to refresh those local snapshot baselines.
 
 # Hints

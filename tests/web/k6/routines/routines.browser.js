@@ -1,19 +1,24 @@
 import { check, sleep } from "k6";
 
-import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
+import {
+  baseUrl,
+  options as browserOptions,
+  responsiveViewports,
+  screenshotMatrix,
+  setResponsiveViewport,
+  withPage,
+} from "../support/browser.js";
 import { typeAndKeepFocus, waitForPathname, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
 export const options = browserOptions;
 
-const DESKTOP = { width: 1440, height: 900 };
-const MOBILE = { width: 390, height: 1100 };
 const ROUTINE_NAME = "screenshot-metadata";
 const ROUTINE_DISPLAY_NAME = "Prepare screenshot metadata";
 
 export default async function () {
   await withPage(async (page) => {
-    await page.setViewportSize(DESKTOP);
+    await setResponsiveViewport(page, responsiveViewports.desktop);
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, "/sessions");
     await waitForText(page, "#sessions-title", "Sessions");
@@ -36,32 +41,26 @@ export default async function () {
     const detailHasList = await page.locator("#routine-definitions-title").count();
     const collapsed = await disclosureState(page);
     await normalizeScreenshotValues(page);
-    await screenshot(page, "routines-detail-desktop-collapsed");
+    await screenshotMatrix(page, "routines-detail-collapsed");
 
     await page.locator(".routine-task:first-child summary").click();
     const expanded = await disclosureState(page);
     await waitForText(page, '[aria-label="mark-screenshot-ready results"]', "true");
     await normalizeScreenshotValues(page);
-    await screenshot(page, "routines-detail-desktop-expanded");
+    await screenshotMatrix(page, "routines-detail-expanded");
 
     await page.locator(".routine-task:first-child summary").click();
-    await page.setViewportSize(MOBILE);
+    await setResponsiveViewport(page, responsiveViewports.phone);
     const mobileCollapsed = await disclosureState(page);
-    await normalizeScreenshotValues(page);
-    await screenshot(page, "routines-detail-mobile");
+    await setResponsiveViewport(page, responsiveViewports.desktop);
 
-    await page.setViewportSize(DESKTOP);
     await page.locator(".routine-invocation__back").click();
     await waitForPathname(page, "/routines");
     await waitForText(page, ".routine-definitions", ROUTINE_DISPLAY_NAME);
     const listText = await waitForText(page, '[aria-label="Routine invocation history"]', ROUTINE_NAME);
     const listHasDetail = await page.locator('[aria-label="Routine invocation detail"]').count();
     await normalizeScreenshotValues(page);
-    await screenshot(page, "routines-list-desktop");
-
-    await page.setViewportSize(MOBILE);
-    await normalizeScreenshotValues(page);
-    await screenshot(page, "routines-list-mobile");
+    await screenshotMatrix(page, "routines-list");
 
     check(null, {
       "Routine View invocation reaches detail-only route": () => detailPath.startsWith("/routines/") && detailHasList === 0,

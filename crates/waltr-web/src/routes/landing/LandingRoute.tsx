@@ -4,7 +4,7 @@ export function LandingRoute() {
       <p class="eyebrow">Connected</p>
       <h1 id="landing-title">Waltr is ready.</h1>
       <p class="landing__copy">
-        Use the sidebar to manage configuration and start shaping the local
+        Use the navigation to manage configuration and start shaping the local
         assistant workspace.
       </p>
     </section>
