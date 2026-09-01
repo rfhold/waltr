@@ -1,6 +1,6 @@
 import { check, sleep } from "k6";
 
-import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
+import { baseUrl, options as browserOptions, screenshotMatrix, withPage } from "../support/browser.js";
 import { typeAndKeepFocus, waitForButton, waitForMissingText, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
@@ -20,11 +20,11 @@ export default async function () {
     await page.locator('a[href="/config/provider"]').click();
     await waitForText(page, "#config-title", "Settings");
     await waitForText(page, '[aria-label="Provider actions"]', "Create");
-    await screenshot(page, "config-provider-list-empty");
+    await screenshotMatrix(page, "config-provider-list-empty");
 
     await page.locator('[aria-label="Provider actions"] button').click();
     await waitForText(page, 'form[aria-label="Create provider"]', "Name");
-    await screenshot(page, "config-provider-create-form-empty");
+    await screenshotMatrix(page, "config-provider-create-form-empty");
     await typeAndKeepFocus(
       page,
       'form[aria-label="Create provider"] input[name="name"]',
@@ -43,7 +43,7 @@ export default async function () {
     const createModelRoute = await waitForPathname(page, "/config/provider/create/models/create");
     const createModelSeparate = await separateModelFormExists(page, modelsSelector, "Create model");
     const createModelActionsReachable = await modelFormActionsReachable(page, "Create model");
-    await screenshot(page, "config-provider-model-create-dialog-empty");
+    await screenshotMatrix(page, "config-provider-model-create-dialog-empty");
     await typeAndKeepFocus(
       page,
       'form[aria-label="Create model"] input[name="key"]',
@@ -61,7 +61,7 @@ export default async function () {
       "Catalog search results",
       CATALOG_MODEL,
     );
-    await screenshot(page, "config-provider-model-catalog-search-results");
+    await screenshotMatrix(page, "config-provider-model-catalog-search-results");
     await clickCatalogResultByCode(page, "Catalog search results", CATALOG_MODEL);
     const catalogApplied = await waitForText(page, 'form[aria-label="Create model"]', CATALOG_MODEL);
     const catalogReasoningEfforts = await waitForInputValue(
@@ -77,10 +77,10 @@ export default async function () {
       "Suggested catalog matches",
       CATALOG_MODEL,
     );
-    await screenshot(page, "config-provider-model-catalog-suggested");
+    await screenshotMatrix(page, "config-provider-model-catalog-suggested");
     await clickCatalogResultByCode(page, "Suggested catalog matches", CATALOG_MODEL);
     await waitForText(page, 'form[aria-label="Create model"]', CATALOG_MODEL);
-    await screenshot(page, "config-provider-model-catalog-applied");
+    await screenshotMatrix(page, "config-provider-model-catalog-applied");
     await submitForm(page, 'form[aria-label="Create model"]');
     const stagedCreateModel = await waitForText(page, modelsSelector, MODEL_NAME);
     const stagedCreateModelKind = await waitForText(page, modelsSelector, "llm");
@@ -88,11 +88,11 @@ export default async function () {
     const createdProvider = await waitForText(page, '[aria-label="Provider list"]', PROVIDER);
     const createdUrl = await waitForText(page, '[aria-label="Provider list"]', "https://api.openai.com/v1");
     await waitForButton(page, `Edit ${PROVIDER}`);
-    await screenshot(page, "config-provider-list-created");
+    await screenshotMatrix(page, "config-provider-list-created");
 
     await page.locator(`button[aria-label="Edit ${PROVIDER}"]`).click();
     const persistedCreatedModel = await waitForText(page, modelsSelector, MODEL_NAME);
-    await screenshot(page, "config-provider-edit-form-with-model");
+    await screenshotMatrix(page, "config-provider-edit-form-with-model");
     await page.locator(`button[aria-label="Edit model ${MODEL}"]`).click();
     const editModelRoute = await waitForPathname(page, `/config/provider/edit/${PROVIDER}/models/edit/${MODEL}`);
     const editModelSeparate = await separateModelFormExists(page, modelsSelector, "Edit model");
@@ -102,7 +102,7 @@ export default async function () {
       'form[aria-label="Edit model"] input[name="reasoningEfforts"]',
       "high, low, medium",
     );
-    await screenshot(page, "config-provider-model-edit-dialog");
+    await screenshotMatrix(page, "config-provider-model-edit-dialog");
     await setInputValue(
       page,
       'form[aria-label="Edit model"] input[name="name"]',
@@ -125,7 +125,7 @@ export default async function () {
       `[aria-label="Delete model ${MODEL} confirmation"]`,
       "Delete?",
     );
-    await screenshot(page, "config-provider-model-delete-confirmation");
+    await screenshotMatrix(page, "config-provider-model-delete-confirmation");
     await page.locator(`button[aria-label="Cancel delete model ${MODEL}"]`).click();
     const cancelledDeleteModel = await waitForText(page, modelsSelector, EDITED_MODEL_NAME);
     await page.locator(`button[aria-label="Delete model ${MODEL}"]`).click();
@@ -149,7 +149,7 @@ export default async function () {
       `[aria-label="Delete ${PROVIDER} confirmation"]`,
       "Delete?",
     );
-    await screenshot(page, "config-provider-delete-confirmation");
+    await screenshotMatrix(page, "config-provider-delete-confirmation");
     await page.locator(`button[aria-label="Confirm delete ${PROVIDER}"]`).click();
     await waitForMissingText(page, '[aria-label="Provider list"]', PROVIDER);
 

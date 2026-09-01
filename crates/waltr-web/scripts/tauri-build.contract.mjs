@@ -38,6 +38,22 @@ test("packaged assets are relative and the app declares SPA fallback", async () 
   }
 });
 
+test("the shared document scopes browser safe areas away from Tauri", async () => {
+  const index = await read("index.html");
+  const main = await read("src/main.tsx");
+  const globalCss = await read("src/styles/global.css");
+  const appCss = await read("src/styles/app.css");
+
+  assert.match(index, /viewport-fit=cover/);
+  assert.match(main, /dataset\.waltrPlatform = __WALTR_BUILD_PLATFORM__/);
+  assert.match(globalCss, /html\[data-waltr-platform="browser"\]/);
+  assert.match(globalCss, /env\(safe-area-inset-top, 0px\)/);
+  assert.doesNotMatch(globalCss, /html\[data-waltr-platform="tauri"\][^{]*\{[^}]*safe-area-inset/s);
+  assert.match(appCss, /\.sessions__detail-main\s*\{[^}]*--safe-area-top/s);
+  assert.match(appCss, /\.sessions__context\s*\{[^}]*--safe-area-right[^}]*--safe-area-bottom/s);
+  assert.match(appCss, /\.sessions__detail-status\s*\{[^}]*--safe-area-bottom/s);
+});
+
 test("telemetry is enabled only for release asset builds", async () => {
   const vite = await read("vite.config.ts");
   const telemetry = await read("src/telemetry.ts");

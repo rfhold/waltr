@@ -437,6 +437,58 @@ mod configuration_tests {
     }
 
     #[test]
+    fn android_webview_uses_native_safe_area_insets() {
+        let activity =
+            include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
+        let edge_to_edge = activity.find("enableEdgeToEdge()").expect("edge-to-edge call");
+        let super_create = activity
+            .find("super.onCreate(savedInstanceState)")
+            .expect("super onCreate call");
+        let webview_callback = activity
+            .find("override fun onWebViewCreate(webView: WebView)")
+            .expect("Wry WebView callback");
+        let callback_body = &activity[webview_callback..edge_to_edge];
+        let capture_webview = callback_body
+            .find("wryWebView = webView")
+            .expect("Wry WebView capture");
+        let install_insets = callback_body
+            .find("installWebViewInsets()")
+            .expect("WebView inset installation");
+
+        assert!(edge_to_edge < super_create);
+        assert!(capture_webview < install_insets);
+        assert_eq!(activity.matches("installWebViewInsets()").count(), 2);
+        assert!(activity.contains("override fun onWebViewCreate(webView: WebView)"));
+        assert!(activity.contains("wryWebView = webView"));
+        assert!(activity.contains("val webView = wryWebView ?: return"));
+        assert!(activity.contains("ViewCompat.setOnApplyWindowInsetsListener(webView)"));
+        assert!(activity.contains("WindowInsetsCompat.Type.systemBars()"));
+        assert!(activity.contains("WindowInsetsCompat.Type.displayCutout()"));
+        assert!(activity.contains("ViewCompat.requestApplyInsets(webView)"));
+        for (padding, inset) in [
+            ("Left", "left"),
+            ("Top", "top"),
+            ("Right", "right"),
+            ("Bottom", "bottom"),
+        ] {
+            assert!(activity.contains(&format!("initialPadding{padding} + safeInsets.{inset}")));
+        }
+        assert!(!activity.contains("view.paddingLeft + safeInsets.left"));
+    }
+
+    #[test]
+    fn android_safe_area_keeps_intent_and_lifecycle_forwarding() {
+        let activity =
+            include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
+
+        assert_eq!(activity.matches("nativeReceiveIntent(intent)").count(), 2);
+        assert_eq!(activity.matches("nativeSuspend()").count(), 2);
+        assert_eq!(activity.matches("nativeResume()").count(), 2);
+        assert!(activity.contains("nativeSuspend()\n    super.onPause()"));
+        assert!(activity.contains("super.onResume()\n    nativeResume()"));
+    }
+
+    #[test]
     fn csp_adds_only_the_exact_faro_collector_origin() {
         let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
             .expect("valid Tauri configuration");

@@ -212,7 +212,7 @@ Run web server-backed k6 tests and validate screenshot snapshots:
 
 `pnpm test:web:screenshots`
 
-The screenshot workflow runs the unauthenticated phase so each visual baseline is produced once. Actual screenshot PNGs are written under `.dev/web-screenshots/current/`, which is ignored by git, and compared against local snapshot baselines under ignored `tests/web/k6/snapshots/screenshots/`.
+The screenshot workflow runs the unauthenticated phase so each semantic visual state is captured at desktop (1440x900), tablet (768x1024), phone (390x844), and compact phone (320x700) sizes. Filenames end in `--desktop.png`, `--tablet.png`, `--phone.png`, or `--compact.png`. Actual screenshot PNGs are written under `.dev/web-screenshots/current/`, which is ignored by git, and compared against local snapshot baselines under ignored `tests/web/k6/snapshots/screenshots/`.
 
 Update the local screenshot snapshots after an intentional visual change:
 

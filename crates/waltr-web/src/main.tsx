@@ -6,6 +6,8 @@ import "./styles/index.css";
 
 initializeTelemetry();
 
+document.documentElement.dataset.waltrPlatform = __WALTR_BUILD_PLATFORM__;
+
 const root = document.getElementById("root");
 
 if (!(root instanceof HTMLElement)) {

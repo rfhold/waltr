@@ -287,6 +287,81 @@ describe("sessions route", () => {
     expect(screen.getByText("No Routine invocations.")).toBeTruthy();
   });
 
+  test("collapses Session Context by default at phone width without dropping content", () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 700px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    });
+
+    try {
+      const snapshot = snapshotWithSessions([sessionView({ id: "phone-context" })]);
+      snapshot.sessions.timelines["phone-context"] = readySessionTimeline();
+      renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/phone-context", snapshot });
+
+      const context = screen.getByLabelText("Session context");
+      const disclosure = within(context).getByText("Context").closest("details");
+      expect(disclosure).toBeInstanceOf(HTMLDetailsElement);
+      expect(disclosure?.hasAttribute("open")).toBe(false);
+      expect(within(context).getByText("No subtasks.")).toBeTruthy();
+      expect(within(context).getByText("No Routine invocations.")).toBeTruthy();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  test("collapses Session settings by default at phone width without dropping controls", () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 700px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    });
+
+    try {
+      const snapshot = snapshotWithSessions([sessionWithInferenceSettings("phone-settings")]);
+      snapshot.sessions.timelines["phone-settings"] = readySessionTimeline();
+      renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/phone-settings", snapshot });
+
+      const status = screen.getByLabelText("Session status summary");
+      const disclosure = within(status).getByText("Session settings").closest("details");
+      expect(disclosure).toBeInstanceOf(HTMLDetailsElement);
+      expect(disclosure?.hasAttribute("open")).toBe(false);
+      expect(status.querySelector('[aria-label="Switch agent"]')).toBeTruthy();
+      expect(status.querySelector('[aria-label="Edit provider/model"]')).toBeTruthy();
+      expect(status.querySelector('[aria-label="Session thinking level"]')).toBeTruthy();
+      expect([...status.querySelectorAll("button")].some((button) => button.textContent === "Commands")).toBe(true);
+      expect(status.querySelector('[aria-label="Delete session phone-settings"]')).toBeTruthy();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  test("keeps Session settings always visible above phone width", () => {
+    const snapshot = snapshotWithSessions([sessionWithInferenceSettings("desktop-settings")]);
+    snapshot.sessions.timelines["desktop-settings"] = readySessionTimeline();
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/desktop-settings", snapshot });
+
+    const status = screen.getByLabelText("Session status summary");
+    expect(status.querySelector("details")).toBeNull();
+    expect(within(status).getByLabelText("Switch agent")).toBeTruthy();
+    expect(within(status).getByLabelText("Edit provider/model")).toBeTruthy();
+    expect(within(status).getByLabelText("Session thinking level")).toBeTruthy();
+    expect(within(status).getByRole("button", { name: "Commands" })).toBeTruthy();
+    expect(within(status).getByLabelText("Delete session desktop-settings")).toBeTruthy();
+  });
+
   test("creating a session routes to the created session", async () => {
     const commands: ClientCommand[] = [];
 

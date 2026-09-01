@@ -209,7 +209,7 @@ Context statuses use three semantic tones with exact status text beside every do
 | Red or error | Failed or interrupted sessions and Routine invocations. |
 | Grey or muted | Idle, finished, succeeded, unspecified, unknown, and other inactive states. |
 
-Responsive layouts preserve this content, its links, and its metric semantics. Web places a right sidebar above 900 pixels and a bounded scrollable stacked panel at smaller widths. TUI uses a right 72/28 split at widths of at least 110 columns and a capped six-row summary below that width.
+Responsive layouts preserve this content, its links, and its metric semantics. Web places a right sidebar above 900 pixels, a bounded scrollable stacked panel through tablet widths, and an accessible Context disclosure collapsed by default at phone widths. TUI uses a right 72/28 split at widths of at least 110 columns and a capped six-row summary below that width.
 
 The session detail registers its source-session Routine watch only while open and releases it when closed. Its timeline watch independently owns the latest-turn context source. Other session-scoped watches and the singleton global Routine history have independent interests and remain active when their consumers still need them.
 
@@ -275,6 +275,8 @@ Browser, TUI, and Tauri implementations should follow these rules:
 - Preserve the telemetry privacy boundary. Add only fixed operation classes, controlled outcomes, normalized routes, and allowlisted protocol attributes.
 - Keep native OAuth and bearer/refresh credentials in Rust. IPC may expose only shared snapshots, commands, opaque lifecycle data, safe errors, and secret-free access progress.
 - Keep remote content out of privileged WebViews. Tauri main-WebView navigation is restricted to packaged local content, new windows are denied, and Rust opens only credential-free HTTPS URLs that pass its external URL policy.
+- Mark the shared document with the build-time browser or Tauri platform. Hosted browser CSS consumes `env(safe-area-inset-*)`; Tauri CSS keeps those values at zero because the Android native host insets the whole WebView.
+- Use dynamic viewport units with legacy viewport fallbacks, keep short-height access and dialog surfaces scrollable, and preserve keyboard access and complete content in compact navigation and Context disclosures.
 - Keep provider and MCP catalog loading, mutation commands, operation keys, and snapshots in the shared reducer; browser bindings must not construct direct catalog transports.
 - Keep outbound OAuth attempt state in shared commands/snapshots while credentials, refresh claims, callback validation, discovery, and registration remain server/agent concerns.
 - Render provider and MCP credential status from the shared auth snapshot and reconcile authorize, refresh, and reset through their keyed operation results.

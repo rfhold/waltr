@@ -4,15 +4,20 @@
   z-index: 100;
   display: grid;
   min-height: 100vh;
+  min-height: 100dvh;
   align-content: center;
   gap: 1.5rem;
-  place-items: center;
+  place-items: safe center;
   background:
     radial-gradient(circle at center, rgba(190, 132, 242, 0.2), transparent 34rem),
     var(--color-bg);
+  overflow: auto;
+  padding: calc(var(--safe-area-top) + 1rem) calc(var(--safe-area-right) + 1rem) calc(var(--safe-area-bottom) + 1rem) calc(var(--safe-area-left) + 1rem);
 }
 
 .splash__logo {
+  max-width: 100%;
+  overflow-x: auto;
   margin: 0;
   color: var(--color-accent);
   font-family: var(--font-mono);
@@ -37,8 +42,10 @@
   z-index: 110;
   display: grid;
   min-height: 100vh;
-  place-items: center;
-  padding: clamp(1rem, 5vw, 4rem);
+  min-height: 100dvh;
+  place-items: safe center;
+  overflow: auto;
+  padding: calc(var(--safe-area-top) + clamp(1rem, 5vw, 4rem)) calc(var(--safe-area-right) + clamp(1rem, 5vw, 4rem)) calc(var(--safe-area-bottom) + clamp(1rem, 5vw, 4rem)) calc(var(--safe-area-left) + clamp(1rem, 5vw, 4rem));
   background:
     linear-gradient(135deg, transparent 48%, rgba(190, 132, 242, 0.08) 48%, rgba(190, 132, 242, 0.08) 52%, transparent 52%),
     radial-gradient(circle at 65% 35%, rgba(190, 132, 242, 0.2), transparent 30rem),

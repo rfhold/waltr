@@ -1,6 +1,6 @@
 import { check, sleep } from "k6";
 
-import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
+import { baseUrl, options as browserOptions, screenshotMatrix, withPage } from "../support/browser.js";
 import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
@@ -41,7 +41,7 @@ export default async function () {
     await setSelectValue(page, "#inference-default-model", MODEL);
     await submitForm(page, 'section[aria-labelledby="inference-defaults-title"] form');
     await waitForText(page, 'section[aria-labelledby="inference-defaults-title"]', "Clear defaults");
-    await screenshot(page, "config-defaults-saved");
+    await screenshotMatrix(page, "config-defaults-saved");
 
     await page.locator(".config__header button").click();
     const resetConfirmation = await waitForText(

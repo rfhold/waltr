@@ -9,6 +9,7 @@ const config = await readFile(new URL("../waltr-app/tauri.conf.json", root), "ut
 const telemetry = process.argv.find((argument) => argument.startsWith("--telemetry="))?.split("=", 2)[1];
 
 assert.match(index, /<base href="\/">/);
+assert.match(index, /viewport-fit=cover/);
 assert.ok(telemetry === "enabled" || telemetry === "disabled", "expected telemetry contract selection");
 assert.match(index, new RegExp(`<meta name="waltr-telemetry" content="${telemetry}">`));
 assert.match(config, /base-uri 'self'/);

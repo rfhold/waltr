@@ -1,6 +1,6 @@
 import { check, sleep } from "k6";
 
-import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
+import { baseUrl, options as browserOptions, screenshotMatrix, withPage } from "../support/browser.js";
 import { typeAndKeepFocus, waitForButton, waitForMissingText, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
@@ -16,13 +16,13 @@ export default async function () {
     await page.locator('a[href="/config/mcp"]').click();
     const mcpTabSelected = await mcpTabContextPreserved(page);
     await waitForText(page, '[aria-label="MCP server actions"]', "Create");
-    await screenshot(page, "config-mcp-list-empty");
+    await screenshotMatrix(page, "config-mcp-list-empty");
 
     await page.locator('[aria-label="MCP server actions"] button').click();
     const createServerRoute = await waitForPathname(page, "/config/mcp/create");
     const createServerTabSelected = await mcpTabContextPreserved(page);
     await waitForText(page, 'form[aria-label="Create MCP server"]', "Name");
-    await screenshot(page, "config-mcp-create-form-empty");
+    await screenshotMatrix(page, "config-mcp-create-form-empty");
     await typeAndKeepFocus(
       page,
       'form[aria-label="Create MCP server"] input[name="name"]',
@@ -40,13 +40,13 @@ export default async function () {
     const createdServer = await waitForText(page, ".config__list", "localstdio");
     const createdCommand = await waitForText(page, ".config__list", "npx local-mcp");
     await waitForButton(page, "Edit localstdio");
-    await screenshot(page, "config-mcp-list-created");
+    await screenshotMatrix(page, "config-mcp-list-created");
 
     await page.locator('button[aria-label="Edit localstdio"]').click();
     const editServerRoute = await waitForPathname(page, "/config/mcp/edit/localstdio");
     const editServerTabSelected = await mcpTabContextPreserved(page);
     await waitForText(page, 'form[aria-label="Edit MCP server"]', "Name");
-    await screenshot(page, "config-mcp-edit-form-stdio");
+    await screenshotMatrix(page, "config-mcp-edit-form-stdio");
     await page.locator('form[aria-label="Edit MCP server"] select[name="kind"]').selectOption("streamableHttp");
     await setInputValue(
       page,
@@ -65,7 +65,7 @@ export default async function () {
       '[aria-label="Delete localstdio confirmation"]',
       "Delete?",
     );
-    await screenshot(page, "config-mcp-delete-confirmation");
+    await screenshotMatrix(page, "config-mcp-delete-confirmation");
     await page.locator('button[aria-label="Confirm delete localstdio"]').click();
     const deletedServer = await waitForMissingText(page, ".config__list", "localstdio");
 
