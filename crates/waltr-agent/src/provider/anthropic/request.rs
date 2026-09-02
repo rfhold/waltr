@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     CompletionReplayItem, CompletionRequest, ThinkingBlockKind, ToolDefinition, ToolResult,
@@ -7,13 +8,34 @@ use crate::{
 
 use super::thinking::{AnthropicThinkingConfig, anthropic_thinking};
 
+const BILLING_SALT: &str = "59cf53e54c78";
+
+#[derive(Clone, Copy)]
+pub(super) struct MessagesRequestOptions<'a> {
+    prompt_cache: bool,
+    oauth_billing_version: Option<&'a str>,
+}
+
+impl<'a> MessagesRequestOptions<'a> {
+    pub(super) const fn new(prompt_cache: bool, oauth_billing_version: Option<&'a str>) -> Self {
+        Self {
+            prompt_cache,
+            oauth_billing_version,
+        }
+    }
+}
+
 pub(super) fn messages_request(
     model: &str,
     max_tokens: u32,
     thinking: Option<&AnthropicThinkingConfig>,
-    prompt_cache: bool,
+    options: MessagesRequestOptions<'_>,
     request: &CompletionRequest<'_>,
 ) -> Value {
+    let MessagesRequestOptions {
+        prompt_cache,
+        oauth_billing_version,
+    } = options;
     let static_breakpoint =
         prompt_cache && (!request.tools.is_empty() || request.system_prompt.is_some());
     let mut body = json!({
@@ -29,7 +51,67 @@ pub(super) fn messages_request(
     if let Some(thinking) = thinking {
         body["thinking"] = anthropic_thinking(thinking);
     }
+    if let Some(version) = oauth_billing_version {
+        prepend_oauth_billing_marker(&mut body, version);
+    }
     body
+}
+
+fn prepend_oauth_billing_marker(body: &mut Value, version: &str) {
+    let marker = billing_marker(first_user_text(&body["messages"]), version);
+    let marker = json!({ "type": "text", "text": marker });
+    match body.get_mut("system") {
+        None => body["system"] = Value::Array(vec![marker]),
+        Some(Value::String(system)) => {
+            let system = std::mem::take(system);
+            body["system"] = Value::Array(vec![marker, json!({ "type": "text", "text": system })]);
+        }
+        Some(Value::Array(system)) => system.insert(0, marker),
+        Some(_) => unreachable!("Anthropic request builder emits only supported system shapes"),
+    }
+}
+
+fn first_user_text(messages: &Value) -> &str {
+    for message in messages.as_array().into_iter().flatten() {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        match message.get("content") {
+            Some(Value::String(text)) => return text,
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("text")
+                        && let Some(text) = block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                    {
+                        return text;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
+}
+
+fn billing_marker(first_user_message: &str, version: &str) -> String {
+    let code_units = first_user_message.encode_utf16().collect::<Vec<_>>();
+    let sampled = [4, 7, 20]
+        .into_iter()
+        .map(|index| {
+            code_units
+                .get(index)
+                .map_or_else(|| "30".to_owned(), |unit| format!("{unit:x}"))
+        })
+        .collect::<String>();
+    let digest = Sha256::digest(format!("{BILLING_SALT}{sampled}{version}"));
+    let hash = format!("{:02x}{:02x}", digest[0], digest[1]);
+    format!(
+        "x-anthropic-billing-header: cc_version={version}.{}; cc_entrypoint=cli; cch=00000;",
+        &hash[..3]
+    )
 }
 
 fn anthropic_messages(
@@ -221,7 +303,10 @@ mod tests {
         ToolResult, ToolResultContent, ToolResultContentBlock, ToolResultImage, TurnItem,
     };
 
-    use super::{AnthropicThinkingConfig, messages_request};
+    use super::{
+        AnthropicThinkingConfig, MessagesRequestOptions, billing_marker, first_user_text,
+        messages_request,
+    };
     use crate::provider::anthropic::AnthropicThinkingDisplay;
 
     #[test]
@@ -229,7 +314,13 @@ mod tests {
         let mut request = CompletionRequest::new("hello");
         request.system_prompt = Some("system text");
 
-        let body = messages_request("claude-test", 256, None, true, &request);
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(true, None),
+            &request,
+        );
 
         assert_eq!(body["system"][0]["text"], "system text");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
@@ -242,9 +333,108 @@ mod tests {
         let mut request = CompletionRequest::new("hello");
         request.system_prompt = Some("system text");
 
-        let body = messages_request("claude-test", 256, None, false, &request);
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, None),
+            &request,
+        );
 
         assert_eq!(body["system"], "system text");
+    }
+
+    #[test]
+    fn non_oauth_request_does_not_add_a_system_marker() {
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(true, None),
+            &CompletionRequest::new("hello"),
+        );
+
+        assert!(body.get("system").is_none());
+        assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn oauth_request_prepends_billing_marker_to_each_system_shape() {
+        let absent = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, Some("2.1.76")),
+            &CompletionRequest::new("Hello from Claude Code"),
+        );
+        assert_eq!(
+            absent["system"],
+            json!([{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.76.ad6; cc_entrypoint=cli; cch=00000;"
+            }])
+        );
+
+        let mut with_string = CompletionRequest::new("Hello from Claude Code");
+        with_string.system_prompt = Some("instructions");
+        let string = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, Some("2.1.76")),
+            &with_string,
+        );
+        assert_eq!(string["system"][0], absent["system"][0]);
+        assert_eq!(
+            string["system"][1],
+            json!({ "type": "text", "text": "instructions" })
+        );
+
+        let cached = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(true, Some("2.1.76")),
+            &with_string,
+        );
+        assert_eq!(cached["system"][0], absent["system"][0]);
+        assert_eq!(cached["system"][1]["text"], "instructions");
+        assert_eq!(cached["system"][1]["cache_control"]["type"], "ephemeral");
+
+        let alternate_version = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, Some("9.8.7")),
+            &CompletionRequest::new("Hello from Claude Code"),
+        );
+        assert_eq!(
+            alternate_version["system"][0]["text"],
+            "x-anthropic-billing-header: cc_version=9.8.7.069; cc_entrypoint=cli; cch=00000;"
+        );
+    }
+
+    #[test]
+    fn oauth_billing_marker_samples_utf16_and_first_nonempty_user_text_block() {
+        let messages = json!([
+            { "role": "assistant", "content": "ignored" },
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "" },
+                    { "type": "image", "source": {} },
+                    { "type": "text", "text": "abcd😀xyZ0123456789uvw" }
+                ]
+            },
+            { "role": "user", "content": "later" }
+        ]);
+
+        assert_eq!(first_user_text(&messages), "abcd😀xyZ0123456789uvw");
+        assert_eq!(
+            billing_marker(first_user_text(&messages), "2.1.76"),
+            "x-anthropic-billing-header: cc_version=2.1.76.af9; cc_entrypoint=cli; cch=00000;"
+        );
+        assert!(billing_marker("", "2.1.76").contains("cc_version=2.1.76.62d;"));
     }
 
     #[test]
@@ -258,7 +448,7 @@ mod tests {
                 budget_tokens: 1024,
                 display: Some(AnthropicThinkingDisplay::Summarized),
             }),
-            true,
+            MessagesRequestOptions::new(true, None),
             &request,
         );
 
@@ -268,6 +458,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn request_replays_turns_as_alternating_assistant_and_user_messages() {
         let mut request = CompletionRequest::new("follow up");
         request.prompt_turns = vec![
@@ -324,7 +515,13 @@ mod tests {
             },
         ];
 
-        let body = messages_request("claude-test", 256, None, false, &request);
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, None),
+            &request,
+        );
         let messages = body["messages"].as_array().expect("messages array");
 
         assert_eq!(messages.len(), 5);
@@ -380,7 +577,13 @@ mod tests {
             },
         ];
 
-        let body = messages_request("claude-test", 256, None, false, &request);
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, None),
+            &request,
+        );
         let messages = body["messages"].as_array().expect("messages array");
 
         assert_eq!(messages.len(), 5);
@@ -423,7 +626,13 @@ mod tests {
             items: vec![TurnItem::AssistantText("answer".to_owned())],
         }];
 
-        let body = messages_request("claude-test", 256, None, true, &request);
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(true, None),
+            &request,
+        );
 
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(
@@ -456,7 +665,13 @@ mod tests {
             ],
         }];
 
-        let body = messages_request("claude-test", 256, None, false, &request);
+        let body = messages_request(
+            "claude-test",
+            256,
+            None,
+            MessagesRequestOptions::new(false, None),
+            &request,
+        );
         let tool_result = &body["messages"][2]["content"][0];
 
         assert_eq!(tool_result["type"], "tool_result");

@@ -3,7 +3,11 @@ use tracing::Instrument as _;
 
 use crate::{BoxCompletionStream, CompletionEvent, CompletionRequest, LlmError, Result};
 
-use super::{AnthropicMessages, PROVIDER, parser::AnthropicParser, request::messages_request};
+use super::{
+    AnthropicMessages, PROVIDER,
+    parser::AnthropicParser,
+    request::{MessagesRequestOptions, messages_request},
+};
 
 pub(super) async fn send_request(
     provider: &AnthropicMessages,
@@ -24,7 +28,10 @@ pub(super) async fn send_request(
             &provider.model,
             provider.max_tokens,
             provider.thinking.as_ref(),
-            provider.prompt_cache,
+            MessagesRequestOptions::new(
+                provider.prompt_cache,
+                provider.oauth_billing_version.as_deref(),
+            ),
             &request,
         ));
     for (name, value) in &provider.headers {

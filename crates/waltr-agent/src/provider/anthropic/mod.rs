@@ -25,6 +25,7 @@ pub struct AnthropicMessages {
     max_tokens: u32,
     thinking: Option<AnthropicThinkingConfig>,
     prompt_cache: bool,
+    oauth_billing_version: Option<String>,
     client: reqwest::Client,
 }
 
@@ -38,6 +39,7 @@ impl AnthropicMessages {
             max_tokens: DEFAULT_MAX_TOKENS,
             thinking: None,
             prompt_cache: true,
+            oauth_billing_version: None,
             client: reqwest::Client::new(),
         }
     }
@@ -76,6 +78,11 @@ impl AnthropicMessages {
         self.prompt_cache = false;
         self
     }
+
+    pub(crate) fn with_oauth_billing_version(mut self, version: Option<String>) -> Self {
+        self.oauth_billing_version = version;
+        self
+    }
 }
 
 impl LlmStream for AnthropicMessages {
@@ -90,7 +97,10 @@ impl LlmStream for AnthropicMessages {
             &self.model,
             self.max_tokens,
             self.thinking.as_ref(),
-            self.prompt_cache,
+            request::MessagesRequestOptions::new(
+                self.prompt_cache,
+                self.oauth_billing_version.as_deref(),
+            ),
             &request,
         ))
     }

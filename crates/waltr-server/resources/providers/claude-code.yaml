@@ -6,8 +6,8 @@ spec:
   transport: anthropicMessages
   url: https://api.anthropic.com/v1/messages?beta=true
   headers:
-    anthropic-beta: claude-code-20250219,oauth-2025-04-20
-    user-agent: claude-cli/2.1.75
+    anthropic-beta: oauth-2025-04-20
+    user-agent: claude-code/2.1.76
     x-app: cli
   oauth:
     name: Claude Code

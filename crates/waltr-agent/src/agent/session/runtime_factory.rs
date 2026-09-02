@@ -724,10 +724,16 @@ impl AgentSessionRuntimeFactory {
             ModelApi::AnthropicMessages => {
                 ensure_no_reasoning_effort(settings, "Anthropic Messages")?;
                 let oauth_active = oauth.is_some();
+                let oauth_billing_version = if oauth_active {
+                    configured_claude_code_version(&headers)?.map(ToOwned::to_owned)
+                } else {
+                    None
+                };
                 let mut provider_impl = AnthropicMessages::new(model_id.clone());
                 if let Some(oauth) = oauth.as_ref() {
                     provider_impl = apply_oauth_headers(provider_impl, oauth);
                 }
+                provider_impl = provider_impl.with_oauth_billing_version(oauth_billing_version);
                 if let Some(endpoint_url) = endpoint_url {
                     provider_impl = provider_impl.with_url(endpoint_url);
                 }
@@ -1218,6 +1224,31 @@ where
     provider
 }
 
+fn configured_claude_code_version(
+    headers: &BTreeMap<String, String>,
+) -> Result<Option<&str>, AgentSessionRuntimeError> {
+    let mut user_agents = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"));
+    let Some((_, user_agent)) = user_agents.next() else {
+        return Ok(None);
+    };
+    if user_agents.next().is_some() {
+        return Err(AgentSessionRuntimeError::FailedPrecondition(
+            "Anthropic OAuth provider must not configure more than one user-agent header"
+                .to_owned(),
+        ));
+    }
+    let Some(version) = user_agent.strip_prefix("claude-code/") else {
+        return Ok(None);
+    };
+    Ok((!version.is_empty()
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_')))
+    .then_some(version))
+}
+
 fn apply_oauth_headers<T>(mut provider: T, oauth: &OAuthCredential) -> T
 where
     T: ConfigurableHeaders,
@@ -1287,7 +1318,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::State,
-        http::{StatusCode, header},
+        http::{HeaderMap, StatusCode, header},
         response::IntoResponse,
         routing::post,
     };
@@ -2182,6 +2213,40 @@ spec:
         token_server_with_status(status, response, Duration::ZERO).await
     }
 
+    #[derive(Clone, Default)]
+    struct MessagesServerState {
+        requests: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>>,
+    }
+
+    async fn messages_handler(
+        State(state): State<MessagesServerState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        state.requests.lock().await.push((headers, body));
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
+    }
+
+    async fn messages_server() -> (String, MessagesServerState) {
+        let state = MessagesServerState::default();
+        let app = Router::new()
+            .route("/v1/messages", post(messages_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind messages server");
+        let address = listener.local_addr().expect("messages server address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve messages endpoint");
+        });
+        (format!("http://{address}/v1/messages?beta=true"), state)
+    }
+
     async fn malicious_token_server(oversized: bool) -> (String, Arc<AtomicUsize>) {
         let redirected_requests = Arc::new(AtomicUsize::new(0));
         let redirected = Arc::clone(&redirected_requests);
@@ -2366,6 +2431,26 @@ spec:
         )
     }
 
+    fn anthropic_settings(
+        key: &str,
+        url: String,
+        headers: BTreeMap<String, String>,
+        oauth: Option<SessionOAuthProviderSettings>,
+    ) -> InferenceSettings {
+        InferenceSettings {
+            provider: InferenceProviderSettings {
+                key: key.to_owned(),
+                api: ModelApi::AnthropicMessages,
+                url,
+                model_id: "claude-test".to_owned(),
+                model_cost: None,
+                headers,
+                oauth,
+                reasoning_effort: None,
+            },
+        }
+    }
+
     fn jwt(claims: &serde_json::Value) -> String {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
@@ -2438,6 +2523,248 @@ spec:
                 .to_string()
                 .contains("provider header 'Authorization' references unset env var")
         );
+    }
+
+    #[test]
+    fn claude_code_version_accepts_one_safe_case_insensitive_user_agent() {
+        assert_eq!(
+            configured_claude_code_version(&BTreeMap::from([(
+                "User-Agent".to_owned(),
+                "claude-code/9.8.7".to_owned(),
+            )]))
+            .expect("single header is valid"),
+            Some("9.8.7")
+        );
+        let duplicate = BTreeMap::from([
+            ("User-Agent".to_owned(), "claude-code/9.8.7".to_owned()),
+            ("user-agent".to_owned(), "claude-code/2.1.76".to_owned()),
+        ]);
+        assert!(matches!(
+            configured_claude_code_version(&duplicate),
+            Err(AgentSessionRuntimeError::FailedPrecondition(_))
+        ));
+        assert_eq!(
+            configured_claude_code_version(&BTreeMap::from([(
+                "uSeR-aGeNt".to_owned(),
+                "claude-code/3.4.5-beta_1+local".to_owned(),
+            )]))
+            .expect("single header is valid"),
+            Some("3.4.5-beta_1+local")
+        );
+        for headers in [
+            BTreeMap::new(),
+            BTreeMap::from([("user-agent".to_owned(), "waltr/1.0".to_owned())]),
+            BTreeMap::from([("user-agent".to_owned(), "claude-code/2.1;bad".to_owned())]),
+        ] {
+            assert_eq!(
+                configured_claude_code_version(&headers).expect("header set is unambiguous"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_oauth_runtime_sends_its_projected_billing_marker() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let (url, server) = messages_server().await;
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
+        );
+        factory
+            .credential_store
+            .modify(
+                &AuthTarget::provider("anthropic-oauth").credential_key(),
+                |_| {
+                    Some(StoredCredential::OAuth(make_provider_credential(
+                        "oauth-access",
+                        Some("oauth-refresh"),
+                        Some(now_ms() + 60 * 60 * 1000),
+                        BTreeMap::new(),
+                    )))
+                },
+            )
+            .await
+            .expect("store OAuth credential");
+        let settings = anthropic_settings(
+            "anthropic-oauth",
+            url,
+            BTreeMap::from([
+                ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
+                ("user-agent".to_owned(), "claude-code/2.1.76".to_owned()),
+                ("x-app".to_owned(), "cli".to_owned()),
+            ]),
+            Some(SessionOAuthProviderSettings {
+                token_url: "https://example.test/token".to_owned(),
+                client_id: "client".to_owned(),
+                redirect_uri: "http://localhost/callback".to_owned(),
+                token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+                token_fields: Vec::new(),
+                jwt_metadata: Vec::new(),
+            }),
+        );
+        let runtime = factory
+            .provider_builder(&settings)
+            .await
+            .expect("build OAuth provider")
+            .build();
+        let request = CompletionRequest::new("Hello from Claude Code");
+        let projected = runtime
+            .provider
+            .project_request(&request)
+            .expect("project request");
+
+        let _stream = runtime
+            .provider
+            .stream_request(request)
+            .await
+            .expect("send request");
+        let (headers, sent) = server
+            .requests
+            .lock()
+            .await
+            .first()
+            .cloned()
+            .expect("captured request");
+
+        assert_eq!(sent, projected);
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer oauth-access");
+        assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+        assert_eq!(headers[header::USER_AGENT], "claude-code/2.1.76");
+        assert_eq!(headers["x-app"], "cli");
+        assert_eq!(
+            sent["system"][0]["text"],
+            "x-anthropic-billing-header: cc_version=2.1.76.ad6; cc_entrypoint=cli; cch=00000;"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_api_key_runtime_sends_projection_without_billing_marker() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let (url, server) = messages_server().await;
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
+        );
+        let settings = anthropic_settings(
+            "anthropic-api-key",
+            url,
+            BTreeMap::from([
+                ("user-agent".to_owned(), "claude-code/2.1.76".to_owned()),
+                ("x-api-key".to_owned(), "api-key-value".to_owned()),
+            ]),
+            Some(SessionOAuthProviderSettings {
+                token_url: "https://example.test/token".to_owned(),
+                client_id: "client".to_owned(),
+                redirect_uri: "http://localhost/callback".to_owned(),
+                token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+                token_fields: Vec::new(),
+                jwt_metadata: Vec::new(),
+            }),
+        );
+        let runtime = factory
+            .provider_builder(&settings)
+            .await
+            .expect("build API-key provider")
+            .build();
+        let request = CompletionRequest::new("Hello from Claude Code");
+        let projected = runtime
+            .provider
+            .project_request(&request)
+            .expect("project request");
+
+        let _stream = runtime
+            .provider
+            .stream_request(request)
+            .await
+            .expect("send request");
+        let (headers, sent) = server
+            .requests
+            .lock()
+            .await
+            .first()
+            .cloned()
+            .expect("captured request");
+
+        assert_eq!(sent, projected);
+        assert_eq!(headers["x-api-key"], "api-key-value");
+        assert_eq!(headers[header::USER_AGENT], "claude-code/2.1.76");
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+        assert!(sent.get("system").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_oauth_without_claude_code_user_agent_omits_billing_marker() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
+        );
+        factory
+            .credential_store
+            .modify(
+                &AuthTarget::provider("anthropic-oauth").credential_key(),
+                |_| {
+                    Some(StoredCredential::OAuth(make_provider_credential(
+                        "oauth-access",
+                        Some("oauth-refresh"),
+                        Some(now_ms() + 60 * 60 * 1000),
+                        BTreeMap::new(),
+                    )))
+                },
+            )
+            .await
+            .expect("store OAuth credential");
+        let oauth = SessionOAuthProviderSettings {
+            token_url: "https://example.test/token".to_owned(),
+            client_id: "client".to_owned(),
+            redirect_uri: "http://localhost/callback".to_owned(),
+            token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+            token_fields: Vec::new(),
+            jwt_metadata: Vec::new(),
+        };
+
+        for headers in [
+            BTreeMap::new(),
+            BTreeMap::from([("user-agent".to_owned(), "waltr/1.0".to_owned())]),
+        ] {
+            let runtime = factory
+                .provider_builder(&anthropic_settings(
+                    "anthropic-oauth",
+                    "https://example.test/v1/messages".to_owned(),
+                    headers,
+                    Some(oauth.clone()),
+                ))
+                .await
+                .expect("build OAuth provider")
+                .build();
+            let projected = runtime
+                .provider
+                .project_request(&CompletionRequest::new("Hello from Claude Code"))
+                .expect("project request");
+
+            assert!(projected.get("system").is_none());
+        }
+
+        let error = factory
+            .provider_builder(&anthropic_settings(
+                "anthropic-oauth",
+                "https://example.test/v1/messages".to_owned(),
+                BTreeMap::from([
+                    ("User-Agent".to_owned(), "claude-code/9.8.7".to_owned()),
+                    ("user-agent".to_owned(), "claude-code/2.1.76".to_owned()),
+                ]),
+                Some(oauth),
+            ))
+            .await
+            .expect_err("ambiguous user-agent configuration must fail");
+        assert!(matches!(
+            error,
+            AgentSessionRuntimeError::FailedPrecondition(_)
+        ));
     }
 
     #[tokio::test]
