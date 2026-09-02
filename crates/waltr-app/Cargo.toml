@@ -46,8 +46,14 @@ webpki-roots.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "=1.0.0"
 jni = "0.21.1"
 jni_fn = "0.1.2"
+keyring-core = "=1.0.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring-core = "=1.0.0"
+zbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
 
 [lints]
 workspace = true

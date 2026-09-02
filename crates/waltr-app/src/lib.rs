@@ -1,6 +1,7 @@
 //! Tauri shell and IPC surface for the Waltr native application.
 
 mod bridge;
+mod credential_store;
 mod observability;
 mod policy;
 
@@ -395,6 +396,9 @@ mod configuration_tests {
         let config = include_str!("../tauri.conf.json");
         let capability = include_str!("../capabilities/main.json");
         let android_manifest = include_str!("../gen/android/app/src/main/AndroidManifest.xml");
+        let backup_rules = include_str!("../gen/android/app/src/main/res/xml/backup_rules.xml");
+        let data_extraction_rules =
+            include_str!("../gen/android/app/src/main/res/xml/data_extraction_rules.xml");
         let android_plugins = include_str!("../gen/android/app/build.gradle.kts");
         let android_activity =
             include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
@@ -411,6 +415,15 @@ mod configuration_tests {
         assert!(android_manifest.contains("android:sspPrefix=\"/oauth2redirect?\""));
         assert!(android_manifest.contains("android.intent.category.BROWSABLE"));
         assert_eq!(android_manifest.matches("<uses-permission").count(), 1);
+        assert!(android_manifest.contains("@xml/backup_rules"));
+        assert!(android_manifest.contains("@xml/data_extraction_rules"));
+        assert!(backup_rules.contains("keyring-waltr-refresh.xml"));
+        assert_eq!(
+            data_extraction_rules
+                .matches("keyring-waltr-refresh.xml")
+                .count(),
+            2
+        );
         assert!(!android_plugins.contains(&removed_plugin));
         assert!(rust_source.contains("getDataString"));
         assert!(android_activity.contains("override fun onCreate"));
@@ -437,43 +450,27 @@ mod configuration_tests {
     }
 
     #[test]
-    fn android_webview_uses_native_safe_area_insets() {
+    fn android_webview_leaves_safe_area_insets_to_css() {
         let activity =
             include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
-        let edge_to_edge = activity.find("enableEdgeToEdge()").expect("edge-to-edge call");
+        let edge_to_edge = activity
+            .find("enableEdgeToEdge()")
+            .expect("edge-to-edge call");
         let super_create = activity
             .find("super.onCreate(savedInstanceState)")
             .expect("super onCreate call");
-        let webview_callback = activity
-            .find("override fun onWebViewCreate(webView: WebView)")
-            .expect("Wry WebView callback");
-        let callback_body = &activity[webview_callback..edge_to_edge];
-        let capture_webview = callback_body
-            .find("wryWebView = webView")
-            .expect("Wry WebView capture");
-        let install_insets = callback_body
-            .find("installWebViewInsets()")
-            .expect("WebView inset installation");
 
         assert!(edge_to_edge < super_create);
-        assert!(capture_webview < install_insets);
-        assert_eq!(activity.matches("installWebViewInsets()").count(), 2);
-        assert!(activity.contains("override fun onWebViewCreate(webView: WebView)"));
-        assert!(activity.contains("wryWebView = webView"));
-        assert!(activity.contains("val webView = wryWebView ?: return"));
-        assert!(activity.contains("ViewCompat.setOnApplyWindowInsetsListener(webView)"));
-        assert!(activity.contains("WindowInsetsCompat.Type.systemBars()"));
-        assert!(activity.contains("WindowInsetsCompat.Type.displayCutout()"));
-        assert!(activity.contains("ViewCompat.requestApplyInsets(webView)"));
-        for (padding, inset) in [
-            ("Left", "left"),
-            ("Top", "top"),
-            ("Right", "right"),
-            ("Bottom", "bottom"),
+        for forbidden in [
+            "onWebViewCreate",
+            "installWebViewInsets",
+            "setOnApplyWindowInsetsListener",
+            "WindowInsetsCompat",
+            "requestApplyInsets",
+            "setPadding",
         ] {
-            assert!(activity.contains(&format!("initialPadding{padding} + safeInsets.{inset}")));
+            assert!(!activity.contains(forbidden));
         }
-        assert!(!activity.contains("view.paddingLeft + safeInsets.left"));
     }
 
     #[test]

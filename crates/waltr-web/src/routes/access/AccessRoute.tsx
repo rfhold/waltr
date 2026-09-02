@@ -57,6 +57,10 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
     const progress = app.accessProgress();
     return progress?.type === "unavailable" ? progress.message : undefined;
   };
+  const accessProgressWarning = () => {
+    const progress = app.accessProgress();
+    return progress?.type === "warning" ? progress.message : undefined;
+  };
   const loginUrl = () => waltrLoginUrl(window.location);
   const login = async (event: MouseEvent) => {
     event.preventDefault();
@@ -122,6 +126,10 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
 
         <Show when={accessProgressError()}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
+        </Show>
+
+        <Show when={accessProgressWarning()}>
+          {(message) => <InlineAlert tone="warning">{message()}</InlineAlert>}
         </Show>
 
         <Show when={access()?.status === "loginInProgress"} fallback={

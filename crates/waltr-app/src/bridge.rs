@@ -13,16 +13,17 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use waltr_client::{
-    ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot, ClientStateStream,
-    ClientStateStreamEvent, NativeAccessAction, NativeAccessConfig, NativeAccessCoordinator,
-    NativeAccessOutput, NativeAccessProgress, NativeAuthorizationCallback, NativeCallbackPolicy,
-    NativeCredentialProvider, NativeGrpcTransport, NativeLoopbackPolicy,
+    AccessStatus, ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot,
+    ClientStateStream, ClientStateStreamEvent, NativeAccessAction, NativeAccessConfig,
+    NativeAccessCoordinator, NativeAccessOutput, NativeAccessProgress, NativeAuthorizationCallback,
+    NativeCallbackPolicy, NativeCredentialProvider, NativeGrpcTransport, NativeLoopbackPolicy,
+    NativeRefreshTokenStore,
 };
 use serde::Serialize;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
-use crate::{observability, policy::external_https_url};
+use crate::{credential_store, observability, policy::external_https_url};
 
 const ENDPOINT: &str = "https://preview-waltr.holdenitdown.net";
 const NATIVE_CLIENT_ID: &str = "waltr-preview-native";
@@ -85,6 +86,8 @@ pub enum AccessPresentation {
     Refreshing,
     /// Refresh completed.
     RefreshSucceeded,
+    /// Secure persistence is unavailable; process-memory access may continue.
+    Warning { warning: String },
     /// Credentials were installed.
     Succeeded,
     /// The flow failed with safe presentation text.
@@ -103,6 +106,7 @@ impl From<NativeAccessProgress> for AccessPresentation {
             NativeAccessProgress::Exchanging => Self::Exchanging,
             NativeAccessProgress::Refreshing => Self::Refreshing,
             NativeAccessProgress::RefreshSucceeded => Self::RefreshSucceeded,
+            NativeAccessProgress::Warning { warning } => Self::Warning { warning },
             NativeAccessProgress::Succeeded => Self::Succeeded,
             NativeAccessProgress::Failed { error } => Self::Failed { error },
             NativeAccessProgress::Canceled => Self::Canceled,
@@ -442,6 +446,7 @@ pub struct RuntimeBridge {
     callback_admission: Arc<ArcSwapOption<CallbackAdmission>>,
     callback_notify: Arc<Notify>,
     open_url: OpenUrl,
+    refresh_store: Arc<dyn NativeRefreshTokenStore>,
 }
 
 impl fmt::Debug for RuntimeBridge {
@@ -468,6 +473,7 @@ impl RuntimeBridge {
             callback_admission: Arc::new(ArcSwapOption::empty()),
             callback_notify: Arc::new(Notify::new()),
             open_url: Arc::new(open_url),
+            refresh_store: credential_store::refresh_token_store(),
         }
     }
 
@@ -491,6 +497,7 @@ impl RuntimeBridge {
         let credentials = NativeCredentialProvider::new();
         let thread_credentials = credentials.clone();
         let open_url = Arc::clone(&self.open_url);
+        let refresh_store = Arc::clone(&self.refresh_store);
         let handoff = Arc::clone(&self.handoff);
         let callback_admission = Arc::clone(&self.callback_admission);
         let callback_notify = Arc::clone(&self.callback_notify);
@@ -508,6 +515,7 @@ impl RuntimeBridge {
                     publisher,
                     thread_credentials,
                     open_url,
+                    refresh_store,
                     handoff,
                 );
                 observability::record_outcome(&thread_span, "stopped");
@@ -800,6 +808,7 @@ fn run_thread(
     publisher: Publisher<BridgePayload>,
     credentials: NativeCredentialProvider,
     open_url: OpenUrl,
+    refresh_store: Arc<dyn NativeRefreshTokenStore>,
     handoff: Arc<Mutex<BrowserHandoff>>,
 ) {
     let runtime_span = observability::operation_span("native.runtime", "native_thread");
@@ -818,6 +827,7 @@ fn run_thread(
             publisher,
             credentials,
             open_url,
+            refresh_store,
             handoff,
         )
         .instrument(runtime_span.clone()),
@@ -839,6 +849,7 @@ async fn run_generation(
     mut publisher: Publisher<BridgePayload>,
     credentials: NativeCredentialProvider,
     open_url: OpenUrl,
+    refresh_store: Arc<dyn NativeRefreshTokenStore>,
     handoff: Arc<Mutex<BrowserHandoff>>,
 ) {
     let transport = NativeGrpcTransport::with_credential_provider(ENDPOINT, credentials.clone());
@@ -847,13 +858,15 @@ async fn run_generation(
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
     });
     let external_callback = cfg!(target_os = "android");
-    let mut access = Some(NativeAccessCoordinator::spawn(
+    let mut access = Some(NativeAccessCoordinator::spawn_with_store(
         native_access_config(external_callback),
         credentials.clone(),
+        refresh_store,
         CHANNEL_CAPACITY,
     ));
     let mut logout_reply = None;
     let mut deferred_teardown = false;
+    let mut observed_credential_lease = None;
 
     if !publisher
         .publish_initial(BridgePayload::State {
@@ -867,6 +880,9 @@ async fn run_generation(
     }
 
     loop {
+        if credentials.has_bearer_token() {
+            observed_credential_lease = Some(credentials.credential_lease());
+        }
         enum Ready {
             Request(Option<HostRequest>),
             Snapshot(Box<ClientSnapshot>),
@@ -915,12 +931,6 @@ async fn run_generation(
                         drop(reply.send(Err("native logout is already pending".to_owned())));
                         continue;
                     }
-                    if !credentials.has_bearer_token() {
-                        let result = publish_state_control(&stream, &mut publisher).await;
-                        observability::record_result(&operation, &result);
-                        drop(reply.send(result.map(Some)));
-                        continue;
-                    }
                     logout_reply = Some(reply);
                     if let Some(coordinator) = &access {
                         if coordinator.action_sender().send(action).await.is_err()
@@ -948,6 +958,20 @@ async fn run_generation(
                 }
             }
             Ready::Snapshot(snapshot) => {
+                if is_terminal_credential_rejection(
+                    observed_credential_lease,
+                    credentials.credential_lease(),
+                    snapshot.access.status,
+                ) && let Some(coordinator) = &access
+                {
+                    observed_credential_lease = None;
+                    drop(
+                        coordinator
+                            .action_sender()
+                            .send(NativeAccessAction::CredentialRejected)
+                            .await,
+                    );
+                }
                 publisher.publish_state(BridgePayload::State { snapshot });
             }
             Ready::Callback => {
@@ -1038,6 +1062,12 @@ async fn run_generation(
                     continue;
                 }
                 let action_sender = access.as_ref().map(NativeAccessCoordinator::action_sender);
+                if matches!(
+                    command.as_ref(),
+                    ClientCommand::LogoutWaltr | ClientCommand::WaltrAccessExpired { .. }
+                ) {
+                    observed_credential_lease = None;
+                }
                 let result = dispatch_and_publish(
                     &mut stream,
                     &mut publisher,
@@ -1078,6 +1108,15 @@ async fn run_generation(
     let _ = credentials.clear_bearer_token();
 }
 
+fn is_terminal_credential_rejection(
+    observed_lease: Option<waltr_client::NativeCredentialLease>,
+    current_lease: waltr_client::NativeCredentialLease,
+    access_status: AccessStatus,
+) -> bool {
+    observed_lease.is_some_and(|lease| lease.generation() != current_lease.generation())
+        && matches!(access_status, AccessStatus::LoginRequired)
+}
+
 const fn access_progress_class(progress: &NativeAccessProgress) -> &'static str {
     match progress {
         NativeAccessProgress::Discovering => "discovering",
@@ -1085,6 +1124,7 @@ const fn access_progress_class(progress: &NativeAccessProgress) -> &'static str 
         NativeAccessProgress::Exchanging => "exchanging",
         NativeAccessProgress::Refreshing => "refreshing",
         NativeAccessProgress::RefreshSucceeded => "refresh_succeeded",
+        NativeAccessProgress::Warning { .. } => "store_warning",
         NativeAccessProgress::Succeeded => "succeeded",
         NativeAccessProgress::Failed { .. } => "failed",
         NativeAccessProgress::Canceled => "canceled",
@@ -1254,17 +1294,6 @@ enum Publication {
     Control,
 }
 
-#[allow(
-    clippy::future_not_send,
-    reason = "the ClientStateStream is intentionally read only on its LocalSet"
-)]
-async fn publish_state_control(
-    stream: &ClientStateStream,
-    publisher: &mut Publisher<BridgePayload>,
-) -> Result<BridgeEvent<BridgePayload>, String> {
-    publish_snapshot_control(stream.snapshot(), publisher).await
-}
-
 async fn publish_snapshot_control(
     snapshot: ClientSnapshot,
     publisher: &mut Publisher<BridgePayload>,
@@ -1355,6 +1384,39 @@ mod tests {
             assert!(!stage.contains("SECRET_"));
             assert!(!outcome.contains("SECRET_"));
         }
+    }
+
+    #[test]
+    fn durable_rejection_requires_login_required_and_a_cleared_credential_lease() {
+        let credentials = NativeCredentialProvider::new();
+        let installed = credentials.begin_credential_lease();
+        assert!(
+            credentials
+                .replace_bearer_token_if_current(installed, "access-token")
+                .unwrap()
+        );
+        let cleared = credentials.clear_bearer_token();
+
+        assert!(is_terminal_credential_rejection(
+            Some(installed),
+            cleared,
+            AccessStatus::LoginRequired,
+        ));
+        assert!(!is_terminal_credential_rejection(
+            Some(installed),
+            installed,
+            AccessStatus::LoginRequired,
+        ));
+        assert!(!is_terminal_credential_rejection(
+            Some(installed),
+            cleared,
+            AccessStatus::Authenticated,
+        ));
+        assert!(!is_terminal_credential_rejection(
+            None,
+            cleared,
+            AccessStatus::LoginRequired,
+        ));
     }
 
     fn callback_test_bridge(generation: u64) -> (RuntimeBridge, NativeCredentialProvider) {

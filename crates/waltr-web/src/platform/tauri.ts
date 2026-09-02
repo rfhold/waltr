@@ -9,6 +9,8 @@ import type {
 } from "./client";
 
 const BRIDGE_EVENT = "waltr://bridge";
+const SECURE_STORAGE_WARNING = "Secure credential storage is unavailable; login lasts only until the app stops";
+const DELETE_UNCONFIRMED = "Waltr credentials were rejected, but secure credential deletion could not be confirmed";
 
 type BridgeEvent = {
   generation: number;
@@ -204,6 +206,19 @@ function presentationProgress(progress: unknown): AccessProgress {
   if (isRecord(progress) && progress.type === "loggingOut") return { type: "loggingOut" };
   if (isRecord(progress) && progress.type === "unavailable" && typeof progress.message === "string") {
     return { type: "unavailable", message: progress.message };
+  }
+  if (isRecord(progress)
+    && progress.type === "native"
+    && isRecord(progress.progress)
+    && progress.progress.type === "warning") {
+    return { type: "warning", message: SECURE_STORAGE_WARNING };
+  }
+  if (isRecord(progress)
+    && progress.type === "native"
+    && isRecord(progress.progress)
+    && progress.progress.type === "failed"
+    && progress.progress.error === DELETE_UNCONFIRMED) {
+    return { type: "unavailable", message: DELETE_UNCONFIRMED };
   }
   return { type: "native" };
 }

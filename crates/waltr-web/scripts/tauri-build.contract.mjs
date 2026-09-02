@@ -38,7 +38,7 @@ test("packaged assets are relative and the app declares SPA fallback", async () 
   }
 });
 
-test("the shared document scopes browser safe areas away from Tauri", async () => {
+test("the shared document exposes CSS safe areas to browser and Tauri", async () => {
   const index = await read("index.html");
   const main = await read("src/main.tsx");
   const globalCss = await read("src/styles/global.css");
@@ -46,9 +46,11 @@ test("the shared document scopes browser safe areas away from Tauri", async () =
 
   assert.match(index, /viewport-fit=cover/);
   assert.match(main, /dataset\.waltrPlatform = __WALTR_BUILD_PLATFORM__/);
-  assert.match(globalCss, /html\[data-waltr-platform="browser"\]/);
+  assert.match(globalCss, /html\[data-waltr-platform="browser"\],\s*html\[data-waltr-platform="tauri"\]/);
   assert.match(globalCss, /env\(safe-area-inset-top, 0px\)/);
-  assert.doesNotMatch(globalCss, /html\[data-waltr-platform="tauri"\][^{]*\{[^}]*safe-area-inset/s);
+  for (const side of ["top", "right", "bottom", "left"]) {
+    assert.match(globalCss, new RegExp(`--safe-area-${side}: env\\(safe-area-inset-${side}, 0px\\)`));
+  }
   assert.match(appCss, /\.sessions__detail-main\s*\{[^}]*--safe-area-top/s);
   assert.match(appCss, /\.sessions__context\s*\{[^}]*--safe-area-right[^}]*--safe-area-bottom/s);
   assert.match(appCss, /\.sessions__detail-status\s*\{[^}]*--safe-area-bottom/s);

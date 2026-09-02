@@ -50,7 +50,8 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-html[data-waltr-platform="browser"] {
+html[data-waltr-platform="browser"],
+html[data-waltr-platform="tauri"] {
   --safe-area-top: env(safe-area-inset-top, 0px);
   --safe-area-right: env(safe-area-inset-right, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);

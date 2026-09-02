@@ -99,6 +99,62 @@ describe("Tauri client adapter", () => {
     expect(adapter.snapshot()).toBe(resumed);
   });
 
+  test("decodes native secure-store warnings to fixed secret-free presentation text", async () => {
+    let emit!: (event: unknown) => void;
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(3, 0, namedSnapshot("initial")));
+        return { generation: 3 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
+    const seen: unknown[] = [];
+    adapter.access!.subscribe((progress) => seen.push(progress));
+    await adapter.start();
+
+    emit({
+      generation: 3,
+      sequence: 1,
+      payload: {
+        type: "access",
+        progress: {
+          type: "native",
+          progress: { type: "warning", warning: "BACKEND_SECRET_MUST_NOT_PASS" },
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(seen).toEqual([{
+      type: "warning",
+      message: "Secure credential storage is unavailable; login lasts only until the app stops",
+    }]));
+    expect(JSON.stringify(seen)).not.toContain("BACKEND_SECRET_MUST_NOT_PASS");
+
+    emit({
+      generation: 3,
+      sequence: 2,
+      payload: {
+        type: "access",
+        progress: {
+          type: "native",
+          progress: {
+            type: "failed",
+            error: "Waltr credentials were rejected, but secure credential deletion could not be confirmed",
+          },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(seen.at(-1)).toEqual({
+      type: "unavailable",
+      message: "Waltr credentials were rejected, but secure credential deletion could not be confirmed",
+    }));
+  });
+
   test("invokes native access/navigation and unlistens before disposal", async () => {
     const order: string[] = [];
     let emit!: (event: unknown) => void;
