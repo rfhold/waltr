@@ -186,6 +186,7 @@ async fn publish_progress(
         NativeAccessProgress::Exchanging => NativeLoginEvent::Exchanging,
         NativeAccessProgress::Refreshing => NativeLoginEvent::Refreshing,
         NativeAccessProgress::RefreshSucceeded => NativeLoginEvent::RefreshSucceeded,
+        NativeAccessProgress::Warning { .. } => return None,
         NativeAccessProgress::Succeeded => NativeLoginEvent::Succeeded,
         NativeAccessProgress::Failed { error } => NativeLoginEvent::Failed {
             error: config_error.unwrap_or(&error).to_owned(),
@@ -270,5 +271,22 @@ mod tests {
             Some("must use http://127.0.0.1:<port> without query or fragment")
         );
         assert_eq!(loopback_url_error("http://127.0.0.1:9000/callback"), None);
+    }
+
+    #[tokio::test]
+    async fn persistence_warning_is_ignored_by_intentionally_nonpersistent_tui() {
+        let (events, mut event_receiver) = mpsc::channel(1);
+
+        let task = publish_progress(
+            &events,
+            NativeAccessProgress::Warning {
+                warning: "must-not-be-presented".to_owned(),
+            },
+            None,
+        )
+        .await;
+
+        assert!(task.is_none());
+        assert!(event_receiver.try_recv().is_err());
     }
 }

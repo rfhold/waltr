@@ -87,6 +87,7 @@ pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use native_access::{
     NativeAccessAction, NativeAccessConfig, NativeAccessCoordinator, NativeAccessOutput,
     NativeAccessProgress, NativeAuthorizationCallback, NativeCallbackPolicy, NativeLoopbackPolicy,
+    NativeRefreshTokenStore, NativeRefreshTokenStoreError, NonPersistentNativeRefreshTokenStore,
 };
 pub use routine::{
     ClientManualRoutineDefinition, ClientRoutineAdmission, ClientRoutineDefinitionSnapshot,

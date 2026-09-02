@@ -69,7 +69,7 @@ Status traffic uses the status service to watch system readiness. Catalog watch 
 
 | Runtime | Transport |
 | --- | --- |
-| TUI and Tauri native hosts | `NativeGrpcTransport`, backed by rustls-verified tonic channels, bundled Mozilla WebPKI roots, and an in-memory credential provider. |
+| TUI and Tauri native hosts | `NativeGrpcTransport`, backed by rustls-verified tonic channels, bundled Mozilla WebPKI roots, and an in-memory bearer provider. Tauri additionally supplies secure refresh-token persistence. |
 | Hosted browser/WASM | `WasmGrpcTransport`, backed by same-origin gRPC-web over `fetch`. |
 
 Transport code converts RPC messages into `ResourceCatalog`, effective `Configuration`, and `SystemStatus` values. UI code uses shared client commands instead of generated clients.
@@ -147,7 +147,7 @@ The Tauri bridge preserves these lifecycle invariants:
 - Exactly one active generation-stamped runtime exists. Starting another runtime synchronously disposes the prior generation.
 - The uncoalesced initial snapshot is delivered before later updates. Eligible later snapshots use bounded latest-value coalescing; logout barriers and their resulting cleared snapshots use a bounded uncoalesced control lane.
 - Commands enter one bounded FIFO and are dispatched in order. Events have monotonic sequences, gaps recover through current state, and stale-generation output is rejected in Rust and TypeScript.
-- Disposal invalidates publication, stops and joins the runtime, clears credentials, removes listeners, and rejects later native output. Rust performs this teardown on document reload, main-window destruction, process exit, and ordinary or authenticated Android suspension; Android resume starts a fresh generation.
+- Disposal invalidates publication, stops and joins the runtime, clears process-memory credentials, removes listeners, and rejects later native output. It does not delete the durable Tauri refresh token. Rust performs this teardown on document reload, main-window destruction, process exit, and ordinary or authenticated Android suspension; Android resume starts a fresh generation and restores through current discovery.
 - Android retains the current generation only across the first browser-away pause for a pending unauthenticated login. Rust marks the handoff before it opens the browser. The first resume consumes the exception and releases any held callback. A later pause, authenticated pause, or suspended terminal result invalidates the generation and clears credentials.
 - The hosted WASM adapter also stops polling, frees its Rust client, clears listeners, and rejects work after disposal.
 
@@ -225,11 +225,11 @@ The transport decodes version-1 `AuthenticationFailure` protobuf status details.
 
 Expiry or failed native refresh clears protected config, status, sessions, timelines, streams, and in-flight protected operation state. It preserves watch interests and reload intent, but invalidates the status watch epoch so late events from an old credential cannot reauthenticate the client. Login completion starts a new status epoch. A current-epoch protected status event establishes authentication, then child watches reopen according to interest and config/session collections reload. Explicit logout also clears watch interests.
 
-Native transports attach the current in-memory bearer credential to each unary request and newly opened stream. Credential leases are monotonic generations: stale login and refresh tasks cannot overwrite or clear credentials owned by a newer flow. Browser gRPC-web relies on same-origin cookie behavior and does not inject bearer tokens.
+Native transports attach the current in-memory bearer credential to each unary request and newly opened stream. Credential leases are monotonic generations: stale login, restoration, and refresh tasks cannot overwrite or clear credentials owned by a newer flow. Tauri's coordinator serializes secure-store mutation with those generations and persists refresh rotation before installing its bearer. Browser gRPC-web relies on same-origin cookie behavior and does not inject bearer tokens.
 
 Native HTTPS has one deterministic trust policy across the tonic Waltr API transport, native OAuth reqwest requests, and app OTLP reqwest export. Each uses rustls with the ring crypto provider, TLS 1.2 or 1.3, and the bundled `webpki_roots` Mozilla root set. Normal certificate-chain and hostname verification remain enabled. Android therefore does not depend on reqwest platform-verifier Java-context initialization or tonic searches of Unix native certificate files. HTTPS endpoints must chain to a root in the bundled public set; private enterprise CAs, user-added roots, platform trust additions, and `SSL_CERT_FILE` are not accepted. Native access keeps its existing local-development exception for HTTP URLs whose host is exactly `127.0.0.1`, `localhost`, or `::1`; the desktop callback policy remains exact `http://127.0.0.1:<port>`. This policy does not affect hosted browser or WebView Faro traffic.
 
-Explicit logout clears the credential and performs an anonymous status reprobe so access-disabled servers can return to `Authenticated`; credential generations prevent results from the prior lease from mutating the new state.
+Explicit logout clears the in-memory credential, attempts durable refresh-token deletion, and performs an anonymous status reprobe so access-disabled servers can return to `Authenticated`; credential generations prevent results from the prior lease from mutating the new state. Exact terminal Waltr credential rejection also deletes durable state. Transient failures and ordinary runtime stop retain it.
 
 The hosted browser route sends the browser to `/oidc/login` with a validated local return path and calls `/oidc/logout` with same-origin credentials. The TUI supplies environment-derived native configuration, browser launching, copyable URL behavior, and terminal events. The Tauri host supplies fixed preview configuration, system HTTPS opening, secret-free IPC progress, desktop/Android runtime ownership, and Android callback delivery. See [Access Authentication](access-authentication.md).
 

@@ -8,6 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use reqwest::{Client, Response};
@@ -32,6 +33,49 @@ const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_CALLBACK_BYTES: usize = 8 * 1024;
 const EXTERNAL_REDIRECT_URI: &str = "dev.waltr.app:/oauth2redirect";
 const EXTERNAL_CALLBACK_CAPACITY: usize = 1;
+const STORE_WARNING: &str =
+    "Secure credential storage is unavailable; login lasts only until the app stops";
+const DELETE_UNCONFIRMED: &str =
+    "Waltr credentials were rejected, but secure credential deletion could not be confirmed";
+
+/// Secret persistence used by native hosts. Implementations must store only these opaque bytes.
+#[async_trait]
+pub trait NativeRefreshTokenStore: Send + Sync {
+    /// Load a refresh token, returning `None` when no credential exists.
+    async fn load(&self) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError>;
+    /// Atomically replace the durable refresh token.
+    async fn store(&self, token: &[u8]) -> Result<(), NativeRefreshTokenStoreError>;
+    /// Delete the durable refresh token. Missing credentials count as success.
+    async fn delete(&self) -> Result<(), NativeRefreshTokenStoreError>;
+}
+
+/// Bounded, secret-free secure-store failure classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeRefreshTokenStoreError {
+    /// The platform secure store could not be accessed.
+    Unavailable,
+    /// Stored data could not be decrypted or decoded.
+    Malformed,
+}
+
+/// Intentional process-memory-only store used by non-persistent native hosts.
+#[derive(Debug, Default)]
+pub struct NonPersistentNativeRefreshTokenStore;
+
+#[async_trait]
+impl NativeRefreshTokenStore for NonPersistentNativeRefreshTokenStore {
+    async fn load(&self) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
+        Ok(None)
+    }
+
+    async fn store(&self, _token: &[u8]) -> Result<(), NativeRefreshTokenStoreError> {
+        Ok(())
+    }
+
+    async fn delete(&self) -> Result<(), NativeRefreshTokenStoreError> {
+        Ok(())
+    }
+}
 
 /// Action accepted by the native access coordinator.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +86,8 @@ pub enum NativeAccessAction {
     Cancel,
     /// Remove in-memory Waltr credentials.
     Logout,
+    /// The server terminally rejected the current Waltr bearer credential.
+    CredentialRejected,
     /// Shared client accepted a login start and assigned its attempt ID.
     AttemptStarted {
         /// Reducer-issued generation that must accompany terminal commands.
@@ -121,6 +167,11 @@ pub enum NativeAccessProgress {
     Refreshing,
     /// Refresh completed and credentials were atomically replaced.
     RefreshSucceeded,
+    /// Secure persistence is unavailable, but process-memory access may continue.
+    Warning {
+        /// Bounded secret-free warning text.
+        warning: String,
+    },
     /// Credentials were installed before client reconnection.
     Succeeded,
     /// The flow failed with safe user-facing text.
@@ -144,6 +195,10 @@ impl fmt::Debug for NativeAccessProgress {
             Self::Exchanging => formatter.write_str("Exchanging"),
             Self::Refreshing => formatter.write_str("Refreshing"),
             Self::RefreshSucceeded => formatter.write_str("RefreshSucceeded"),
+            Self::Warning { warning } => formatter
+                .debug_struct("Warning")
+                .field("warning", warning)
+                .finish(),
             Self::Succeeded => formatter.write_str("Succeeded"),
             Self::Failed { error } => formatter
                 .debug_struct("Failed")
@@ -185,6 +240,22 @@ impl NativeAccessCoordinator {
         credentials: NativeCredentialProvider,
         capacity: usize,
     ) -> Self {
+        Self::spawn_with_store(
+            config,
+            credentials,
+            Arc::new(NonPersistentNativeRefreshTokenStore),
+            capacity,
+        )
+    }
+
+    /// Spawn a coordinator with a host-owned secure refresh-token store.
+    #[must_use]
+    pub fn spawn_with_store(
+        config: NativeAccessConfig,
+        credentials: NativeCredentialProvider,
+        refresh_store: Arc<dyn NativeRefreshTokenStore>,
+        capacity: usize,
+    ) -> Self {
         let capacity = capacity.max(1);
         let (actions, action_receiver) = mpsc::channel(capacity);
         let (outputs, output_receiver) = mpsc::channel(capacity);
@@ -196,6 +267,7 @@ impl NativeAccessCoordinator {
                 outputs,
                 config,
                 credentials: credentials.clone(),
+                refresh_store,
                 results,
             },
         ));
@@ -261,6 +333,16 @@ impl fmt::Display for NativeAuthError {
 
 impl std::error::Error for NativeAuthError {}
 
+impl NativeAuthError {
+    fn invalid_grant() -> Self {
+        Self("authorization server rejected the refresh credential".to_owned())
+    }
+
+    fn is_invalid_grant(&self) -> bool {
+        self.0 == "authorization server rejected the refresh credential"
+    }
+}
+
 impl From<io::Error> for NativeAuthError {
     fn from(error: io::Error) -> Self {
         Self(format!("loopback callback failed: {error}"))
@@ -299,6 +381,11 @@ struct TokenResponse {
     token_type: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    error: String,
+}
+
 struct AuthorizationRequest {
     url: Url,
     state: String,
@@ -307,6 +394,10 @@ struct AuthorizationRequest {
 }
 
 enum CoordinatorResult {
+    Restore {
+        lease: NativeCredentialLease,
+        result: RestoreResult,
+    },
     Login {
         attempt_id: AccessAttemptId,
         lease: NativeCredentialLease,
@@ -323,10 +414,18 @@ enum LifecycleResult {
     Expired,
 }
 
+enum RestoreResult {
+    None,
+    Refreshed(Result<Box<LoginTokens>, NativeAuthError>),
+    Malformed,
+    Unavailable,
+}
+
 struct CoordinatorContext {
     outputs: mpsc::Sender<NativeAccessOutput>,
     config: NativeAccessConfig,
     credentials: NativeCredentialProvider,
+    refresh_store: Arc<dyn NativeRefreshTokenStore>,
     results: mpsc::Sender<CoordinatorResult>,
 }
 
@@ -372,8 +471,28 @@ async fn coordinate(
         outputs,
         config,
         credentials,
+        refresh_store,
         results,
     } = context;
+    let restore_lease = credentials.begin_credential_lease();
+    let restore_results = results.clone();
+    let restore_config = config.clone();
+    let restore_outputs = outputs.clone();
+    let restore_store = Arc::clone(&refresh_store);
+    let mut restore_task = Some(OwnedTask::new(
+        restore_lease,
+        tokio::spawn(async move {
+            let result = restore(restore_config, restore_outputs, restore_store).await;
+            drop(
+                restore_results
+                    .send(CoordinatorResult::Restore {
+                        lease: restore_lease,
+                        result,
+                    })
+                    .await,
+            );
+        }),
+    ));
     let mut login_task: Option<OwnedTask<AccessAttemptId>> = None;
     let mut lifecycle_task: Option<OwnedTask<NativeCredentialLease>> = None;
     let mut pending_lease = None;
@@ -396,6 +515,7 @@ async fn coordinate(
                         ) {
                             continue;
                         }
+                        abort_owned(&mut restore_task).await;
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         pending_lease = Some(credentials.begin_credential_lease());
@@ -423,33 +543,32 @@ async fn coordinate(
                         }
                     }
                     NativeAccessAction::Logout => {
-                        let had_credential = credentials.has_bearer_token();
-                        let had_login = waiting_for_attempt
-                            || active_attempt.is_some()
-                            || login_task.is_some();
-                        if !had_credential && !had_login {
-                            continue;
-                        }
+                        abort_owned(&mut restore_task).await;
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         pending_lease = None;
                         active_callback = None;
                         let _ = credentials.clear_bearer_token();
-                        if had_credential {
-                            waiting_for_attempt = false;
-                            cancel_pending = false;
-                            active_attempt = None;
-                            if send_command(&outputs, ClientCommand::LogoutWaltr, true).await.is_err() {
-                                break;
-                            }
-                        } else if let Some((attempt_id, _)) = active_attempt.take() {
-                            waiting_for_attempt = false;
-                            cancel_pending = false;
-                            if send_command(&outputs, ClientCommand::CancelWaltrLogin { attempt_id }, false).await.is_err() {
-                                break;
-                            }
-                        } else {
-                            cancel_pending = true;
+                        if refresh_store.delete().await.is_err() {
+                            send_progress(&outputs, NativeAccessProgress::Failed {
+                                error: "Waltr signed out in memory, but secure credential deletion could not be confirmed".to_owned(),
+                            }).await;
+                        }
+                        waiting_for_attempt = false;
+                        cancel_pending = false;
+                        active_attempt = None;
+                        if send_command(&outputs, ClientCommand::LogoutWaltr, true).await.is_err() {
+                            break;
+                        }
+                    }
+                    NativeAccessAction::CredentialRejected => {
+                        abort_owned(&mut restore_task).await;
+                        abort_owned(&mut lifecycle_task).await;
+                        let _ = credentials.clear_bearer_token();
+                        if refresh_store.delete().await.is_err() {
+                            send_progress(&outputs, NativeAccessProgress::Failed {
+                                error: "Waltr access was rejected, but secure credential deletion could not be confirmed".to_owned(),
+                            }).await;
                         }
                     }
                     NativeAccessAction::AttemptStarted { attempt_id } => {
@@ -498,6 +617,47 @@ async fn coordinate(
             result = result_receiver.recv() => {
                 let Some(result) = result else { break };
                 match result {
+                    CoordinatorResult::Restore { lease, result } => {
+                        if restore_task.as_ref().is_none_or(|task| task.owner != lease)
+                            || credentials.credential_lease() != lease
+                        {
+                            continue;
+                        }
+                        restore_task = None;
+                        match result {
+                            RestoreResult::None => {}
+                            RestoreResult::Unavailable => {
+                                send_store_warning(&outputs).await;
+                            }
+                            RestoreResult::Malformed => {
+                                if refresh_store.delete().await.is_err() {
+                                    send_progress(&outputs, NativeAccessProgress::Failed {
+                                        error: "Malformed secure credentials could not be deleted".to_owned(),
+                                    }).await;
+                                }
+                            }
+                            RestoreResult::Refreshed(Ok(tokens)) => {
+                                persist_refresh_token(&outputs, refresh_store.as_ref(), tokens.refresh_token.as_deref()).await;
+                                if credentials.replace_bearer_token_if_current(lease, &tokens.access_token).unwrap_or(false)
+                                {
+                                    send_progress(&outputs, NativeAccessProgress::RefreshSucceeded).await;
+                                    if send_command(&outputs, ClientCommand::ReprobeWaltrAccess, false).await.is_err() { break; }
+                                    lifecycle_task = Some(OwnedTask::new(lease, spawn_lifecycle(
+                                        *tokens, lease, results.clone(), outputs.clone(),
+                                    )));
+                                }
+                            }
+                            RestoreResult::Refreshed(Err(error)) => {
+                                let error = terminal_refresh_error(
+                                    refresh_store.as_ref(),
+                                    error,
+                                ).await;
+                                send_progress(&outputs, NativeAccessProgress::Failed {
+                                    error,
+                                }).await;
+                            }
+                        }
+                    }
                     CoordinatorResult::Login { attempt_id, lease, result } => {
                         if active_attempt.as_ref() != Some(&(attempt_id.clone(), lease)) {
                             continue;
@@ -509,6 +669,11 @@ async fn coordinate(
                         }
                         match result {
                             Ok(tokens) => {
+                                persist_refresh_token(
+                                    &outputs,
+                                    refresh_store.as_ref(),
+                                    tokens.refresh_token.as_deref(),
+                                ).await;
                                 match credentials.replace_bearer_token_if_current(lease, &tokens.access_token) {
                                     Ok(true) => {}
                                     Ok(false) => continue,
@@ -540,6 +705,11 @@ async fn coordinate(
                         lifecycle_task = None;
                         match result {
                                 LifecycleResult::Refreshed(Ok(tokens)) => {
+                                persist_refresh_token(
+                                    &outputs,
+                                    refresh_store.as_ref(),
+                                    tokens.refresh_token.as_deref(),
+                                ).await;
                                 match credentials.replace_bearer_token_if_current(lease, &tokens.access_token) {
                                     Ok(true) => {
                                         send_progress(&outputs, NativeAccessProgress::RefreshSucceeded).await;
@@ -557,7 +727,11 @@ async fn coordinate(
                                 }
                             }
                             LifecycleResult::Refreshed(Err(error)) => {
-                                expire_access(&outputs, &credentials, lease, error.to_string()).await;
+                                let error = terminal_refresh_error(
+                                    refresh_store.as_ref(),
+                                    error,
+                                ).await;
+                                expire_access(&outputs, &credentials, lease, error).await;
                             }
                             LifecycleResult::Expired => {
                                 expire_access(
@@ -573,6 +747,7 @@ async fn coordinate(
             }
         }
     }
+    abort_owned(&mut restore_task).await;
     abort_owned(&mut login_task).await;
     abort_owned(&mut lifecycle_task).await;
     let _ = credentials.clear_bearer_token();
@@ -638,6 +813,87 @@ async fn expire_access(
     )
     .await;
     drop(send_command(outputs, ClientCommand::WaltrAccessExpired { error }, false).await);
+}
+
+async fn send_store_warning(outputs: &mpsc::Sender<NativeAccessOutput>) {
+    send_progress(
+        outputs,
+        NativeAccessProgress::Warning {
+            warning: STORE_WARNING.to_owned(),
+        },
+    )
+    .await;
+}
+
+async fn terminal_refresh_error(
+    store: &dyn NativeRefreshTokenStore,
+    error: NativeAuthError,
+) -> String {
+    if error.is_invalid_grant() && store.delete().await.is_err() {
+        DELETE_UNCONFIRMED.to_owned()
+    } else {
+        error.to_string()
+    }
+}
+
+async fn persist_refresh_token(
+    outputs: &mpsc::Sender<NativeAccessOutput>,
+    store: &dyn NativeRefreshTokenStore,
+    refresh_token: Option<&str>,
+) {
+    let result = match refresh_token {
+        Some(token) => store.store(token.as_bytes()).await,
+        None => store.delete().await,
+    };
+    if result.is_err() {
+        send_store_warning(outputs).await;
+    }
+}
+
+async fn restore(
+    config: NativeAccessConfig,
+    outputs: mpsc::Sender<NativeAccessOutput>,
+    store: Arc<dyn NativeRefreshTokenStore>,
+) -> RestoreResult {
+    let bytes = match store.load().await {
+        Ok(None) => return RestoreResult::None,
+        Ok(Some(bytes)) => bytes,
+        Err(NativeRefreshTokenStoreError::Unavailable) => return RestoreResult::Unavailable,
+        Err(NativeRefreshTokenStoreError::Malformed) => return RestoreResult::Malformed,
+    };
+    if bytes.is_empty() || bytes.len() > MAX_TOKEN_BYTES {
+        return RestoreResult::Malformed;
+    }
+    let Ok(refresh_token) = String::from_utf8(bytes) else {
+        return RestoreResult::Malformed;
+    };
+    if config.client_id.trim().is_empty() {
+        return RestoreResult::Refreshed(Err(NativeAuthError(
+            "native OIDC client ID is required".to_owned(),
+        )));
+    }
+    send_progress(&outputs, NativeAccessProgress::Discovering).await;
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => return RestoreResult::Refreshed(Err(error)),
+    };
+    let discovered = match discover(&client, &config.endpoint).await {
+        Ok(discovered) => discovered,
+        Err(error) => return RestoreResult::Refreshed(Err(error)),
+    };
+    send_progress(&outputs, NativeAccessProgress::Refreshing).await;
+    let tokens = LoginTokens {
+        access_token: String::new(),
+        refresh_token: None,
+        expires_in: Duration::ZERO,
+        token_endpoint: discovered.token_endpoint,
+        client_id: config.client_id,
+    };
+    RestoreResult::Refreshed(
+        refresh_token_request(&tokens, &refresh_token)
+            .await
+            .map(Box::new),
+    )
 }
 
 async fn login(
@@ -1327,7 +1583,7 @@ async fn refresh_token_request(
         access_token: refreshed.access_token,
         refresh_token: refreshed
             .refresh_token
-            .or_else(|| tokens.refresh_token.clone()),
+            .or_else(|| Some(refresh_token.to_owned())),
         expires_in,
         token_endpoint: tokens.token_endpoint.clone(),
         client_id: tokens.client_id.clone(),
@@ -1335,13 +1591,18 @@ async fn refresh_token_request(
 }
 
 async fn parse_token_response(response: Response) -> Result<TokenResponse, NativeAuthError> {
-    if !response.status().is_success() {
+    let status = response.status();
+    let bytes = bounded_body(response, MAX_TOKEN_BYTES).await?;
+    if !status.is_success() {
+        if serde_json::from_slice::<OAuthErrorResponse>(&bytes)
+            .is_ok_and(|error| error.error == "invalid_grant")
+        {
+            return Err(NativeAuthError::invalid_grant());
+        }
         return Err(NativeAuthError(format!(
-            "token endpoint rejected the request ({})",
-            response.status()
+            "token endpoint rejected the request ({status})"
         )));
     }
-    let bytes = bounded_body(response, MAX_TOKEN_BYTES).await?;
     let token: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| NativeAuthError("token endpoint returned an invalid response".to_owned()))?;
     validate_token_response(token)
@@ -1518,7 +1779,52 @@ async fn send_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tokio::sync::oneshot;
+
+    #[derive(Debug, Default)]
+    struct MockRefreshStore {
+        token: Mutex<Option<Vec<u8>>>,
+        operations: Mutex<Vec<&'static str>>,
+        fail: std::sync::atomic::AtomicBool,
+        credential_probe: Mutex<Option<NativeCredentialProvider>>,
+        bearer_seen_during_store: Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl NativeRefreshTokenStore for MockRefreshStore {
+        async fn load(&self) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
+            self.operations.lock().unwrap().push("load");
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(NativeRefreshTokenStoreError::Unavailable);
+            }
+            Ok(self.token.lock().unwrap().clone())
+        }
+
+        async fn store(&self, token: &[u8]) -> Result<(), NativeRefreshTokenStoreError> {
+            self.operations.lock().unwrap().push("store");
+            *self.bearer_seen_during_store.lock().unwrap() = self
+                .credential_probe
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(NativeCredentialProvider::has_bearer_token);
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(NativeRefreshTokenStoreError::Unavailable);
+            }
+            *self.token.lock().unwrap() = Some(token.to_vec());
+            Ok(())
+        }
+
+        async fn delete(&self) -> Result<(), NativeRefreshTokenStoreError> {
+            self.operations.lock().unwrap().push("delete");
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(NativeRefreshTokenStoreError::Unavailable);
+            }
+            *self.token.lock().unwrap() = None;
+            Ok(())
+        }
+    }
 
     fn test_config() -> NativeAccessConfig {
         NativeAccessConfig {
@@ -2273,6 +2579,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_without_rotation_retains_and_persists_current_refresh_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            Url::parse(&format!("http://{}/token", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(request.contains("refresh_token=current-refresh"));
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                r#"{"access_token":"new-secret","expires_in":3600,"token_type":"Bearer"}"#,
+            )
+            .await;
+        });
+        let refreshed = refresh_token_request(
+            &LoginTokens {
+                access_token: "old-secret".to_owned(),
+                refresh_token: Some("current-refresh".to_owned()),
+                expires_in: Duration::from_mins(1),
+                token_endpoint: endpoint,
+                client_id: "native-client".to_owned(),
+            },
+            "current-refresh",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("current-refresh"));
+
+        let store = MockRefreshStore::default();
+        let (outputs, mut output_receiver) = mpsc::channel(1);
+        persist_refresh_token(&outputs, &store, refreshed.refresh_token.as_deref()).await;
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"current-refresh".as_slice())
+        );
+        assert!(output_receiver.try_recv().is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn lifecycle_without_refresh_expires() {
         let credentials = NativeCredentialProvider::new();
         let lease = credentials.begin_credential_lease();
@@ -2406,10 +2753,16 @@ mod tests {
                     Some(NativeAccessOutput::Progress(NativeAccessProgress::Canceled))
                 );
             }
+            let expected = if terminal_action == NativeAccessAction::Logout {
+                ClientCommand::LogoutWaltr
+            } else {
+                ClientCommand::CancelWaltrLogin {
+                    attempt_id: "attempt".to_owned(),
+                }
+            };
             assert!(matches!(
                 coordinator.next_output().await,
-                Some(NativeAccessOutput::ClientCommand { command, .. })
-                    if *command == ClientCommand::CancelWaltrLogin { attempt_id: "attempt".to_owned() }
+                Some(NativeAccessOutput::ClientCommand { command, .. }) if *command == expected
             ));
             assert!(
                 time::timeout(Duration::from_millis(20), coordinator.next_output())
@@ -2541,16 +2894,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_without_native_credential_is_a_no_op() {
+    async fn logout_without_native_credential_still_clears_durable_state() {
         let credentials = NativeCredentialProvider::new();
         let mut coordinator = NativeAccessCoordinator::spawn(test_config(), credentials, 1);
         let actions = coordinator.action_sender();
 
         actions.send(NativeAccessAction::Logout).await.unwrap();
-        assert!(
-            time::timeout(Duration::from_millis(20), coordinator.next_output())
-                .await
-                .is_err()
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::ClientCommand {
+                command: Box::new(ClientCommand::LogoutWaltr),
+                logout_barrier: true,
+            })
         );
         coordinator.stop().await;
     }
@@ -2805,6 +3160,246 @@ mod tests {
             assert!(!output.contains(marker));
         }
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn persistence_stores_rotation_deletes_omission_and_warns_on_failure() {
+        let store = MockRefreshStore::default();
+        let (outputs, mut output_receiver) = mpsc::channel(2);
+
+        persist_refresh_token(&outputs, &store, Some("rotated-refresh")).await;
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"rotated-refresh".as_slice())
+        );
+        persist_refresh_token(&outputs, &store, None).await;
+        assert!(store.token.lock().unwrap().is_none());
+        assert_eq!(*store.operations.lock().unwrap(), ["store", "delete"]);
+
+        store.fail.store(true, std::sync::atomic::Ordering::Release);
+        persist_refresh_token(&outputs, &store, Some("never-persisted")).await;
+        assert!(matches!(
+            output_receiver.recv().await,
+            Some(NativeAccessOutput::Progress(NativeAccessProgress::Warning { warning }))
+                if warning == STORE_WARNING
+        ));
+    }
+
+    #[tokio::test]
+    async fn intentional_nonpersistent_store_never_reports_unavailability() {
+        let store = NonPersistentNativeRefreshTokenStore;
+
+        assert_eq!(store.load().await, Ok(None));
+        assert_eq!(store.store(b"process-only-refresh").await, Ok(()));
+        assert_eq!(store.delete().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_delete_failure_is_reported_without_backend_details() {
+        let store = MockRefreshStore::default();
+        store.fail.store(true, std::sync::atomic::Ordering::Release);
+
+        let error = terminal_refresh_error(&store, NativeAuthError::invalid_grant()).await;
+
+        assert_eq!(error, DELETE_UNCONFIRMED);
+        assert!(!error.contains("invalid_grant"));
+    }
+
+    #[tokio::test]
+    async fn startup_restoration_rediscovers_rotates_and_stop_retains_durable_token() {
+        let (endpoint, mut token_requests, server) = spawn_test_oauth_server().await;
+        let store = Arc::new(MockRefreshStore::default());
+        *store.token.lock().unwrap() = Some(b"stored-refresh".to_vec());
+        let credentials = NativeCredentialProvider::new();
+        *store.credential_probe.lock().unwrap() = Some(credentials.clone());
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            config,
+            credentials.clone(),
+            store.clone(),
+            8,
+        );
+
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::Discovering
+            ))
+        );
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::Refreshing
+            ))
+        );
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::RefreshSucceeded
+            ))
+        );
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::ClientCommand {
+                command: Box::new(ClientCommand::ReprobeWaltrAccess),
+                logout_barrier: false,
+            })
+        );
+        assert!(credentials.has_bearer_token());
+        assert_eq!(*store.bearer_seen_during_store.lock().unwrap(), Some(false));
+        let request = token_requests.recv().await.unwrap();
+        assert!(request.contains("refresh_token=stored-refresh"));
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"test-refresh".as_slice())
+        );
+
+        coordinator.stop().await;
+        assert!(!credentials.has_bearer_token());
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"test-refresh".as_slice())
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_storage_and_terminal_rejection_delete_durable_state() {
+        let store = Arc::new(MockRefreshStore::default());
+        *store.token.lock().unwrap() = Some(vec![0xff]);
+        let coordinator = NativeAccessCoordinator::spawn_with_store(
+            test_config(),
+            NativeCredentialProvider::new(),
+            store.clone(),
+            4,
+        );
+        time::timeout(Duration::from_secs(1), async {
+            while store.token.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        coordinator.stop().await;
+
+        *store.token.lock().unwrap() = Some(b"terminal-refresh".to_vec());
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            test_config(),
+            NativeCredentialProvider::new(),
+            store.clone(),
+            4,
+        );
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::Discovering
+            ))
+        );
+        coordinator
+            .action_sender()
+            .send(NativeAccessAction::CredentialRejected)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while store.token.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    async fn exact_invalid_grant_is_terminal_but_other_oauth_errors_are_transient() {
+        for (body, terminal) in [
+            (
+                r#"{"error":"invalid_grant","error_description":"secret"}"#,
+                true,
+            ),
+            (r#"{"error":"temporarily_unavailable"}"#, false),
+            ("not-json", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint =
+                Url::parse(&format!("http://{}/token", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                drop(read_http_request(&mut stream).await);
+                write_json_response(&mut stream, "400 Bad Request", body).await;
+            });
+            let response = http_client().unwrap().post(endpoint).send().await.unwrap();
+            let error = match parse_token_response(response).await {
+                Ok(_) => panic!("error response must not produce tokens"),
+                Err(error) => error,
+            };
+            assert_eq!(error.is_invalid_grant(), terminal);
+            assert!(!error.to_string().contains("secret"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_invalid_grant_deletes_durable_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = match path {
+                    "/.well-known/oauth-protected-resource" => (
+                        "200 OK",
+                        format!(
+                            r#"{{"resource":"{server_endpoint}","authorization_servers":["{server_endpoint}"]}}"#
+                        ),
+                    ),
+                    "/.well-known/openid-configuration" => (
+                        "200 OK",
+                        format!(
+                            r#"{{"issuer":"{server_endpoint}","authorization_endpoint":"{server_endpoint}/authorize","token_endpoint":"{server_endpoint}/token","code_challenge_methods_supported":["S256"]}}"#
+                        ),
+                    ),
+                    "/token" => ("400 Bad Request", r#"{"error":"invalid_grant"}"#.to_owned()),
+                    _ => panic!("unexpected OAuth test request: {path}"),
+                };
+                write_json_response(&mut stream, status, &body).await;
+            }
+        });
+        let store = Arc::new(MockRefreshStore::default());
+        *store.token.lock().unwrap() = Some(b"rejected-refresh".to_vec());
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            config,
+            NativeCredentialProvider::new(),
+            store.clone(),
+            4,
+        );
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::Discovering
+            ))
+        );
+        assert_eq!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::Refreshing
+            ))
+        );
+        assert!(matches!(
+            coordinator.next_output().await,
+            Some(NativeAccessOutput::Progress(
+                NativeAccessProgress::Failed { .. }
+            ))
+        ));
+        assert!(store.token.lock().unwrap().is_none());
+        coordinator.stop().await;
+        server.await.unwrap();
     }
 
     async fn begin_external_attempt(

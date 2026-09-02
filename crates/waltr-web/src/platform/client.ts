@@ -5,6 +5,7 @@ export type ClientSnapshotListener = (snapshot: ClientSnapshot) => void;
 export type AccessProgress =
   | { type: "native" }
   | { type: "loggingOut" }
+  | { type: "warning"; message: string }
   | { type: "unavailable"; message: string };
 
 export type NativeAccessOperations = {

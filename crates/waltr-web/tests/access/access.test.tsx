@@ -146,6 +146,18 @@ describe("Waltr access", () => {
     expect(commands).toEqual([]);
   });
 
+  test("renders secure-store degradation as a warning alert", () => {
+    const message = "Secure credential storage is unavailable; login lasts only until the app stops";
+    renderWithAppState(() => <AccessRoute />, {
+      snapshot: accessSnapshot("loginRequired"),
+      accessProgress: { type: "warning", message },
+    });
+
+    const warning = screen.getByRole("status");
+    expect(warning.textContent).toBe(message);
+    expect(warning.classList.contains("ui-alert--warning")).toBe(true);
+  });
+
   test("validates encoded return paths through bounded decoding", () => {
     expect(safeLocalReturnPath(locationParts("/config/provider", "?edit=1", "#model"))).toBe("/config/provider?edit=1#model");
     expect(safeLocalReturnPath(locationParts("//evil.example/path"))).toBe("/");
