@@ -21,6 +21,7 @@
 #-renamesourcefileattribute SourceFile
 
 -keep class dev.waltr.app.WaltrForegroundService { *; }
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
 -keepclasseswithmembernames class dev.waltr.app.MainActivity {
     native <methods>;
 }

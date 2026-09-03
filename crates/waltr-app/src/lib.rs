@@ -402,38 +402,45 @@ fn clear_mobile_client_requested() -> (Option<u64>, Option<u64>) {
 
 #[cfg(target_os = "android")]
 fn java_path(
-    env: &mut jni::JNIEnv<'_>,
+    env: &mut jni::Env<'_>,
     value: jni::objects::JString<'_>,
 ) -> Option<std::path::PathBuf> {
-    env.get_string(&value)
+    value
+        .mutf8_chars(env)
         .ok()
-        .map(|value| std::path::PathBuf::from(String::from(value)))
+        .map(|value| std::path::PathBuf::from(value.to_str().into_owned()))
 }
 
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
 /// Start or join the process-owned mobile embedded server generation.
 pub fn nativeStartServer(
-    mut env: jni::JNIEnv<'_>,
-    _class: jni::objects::JClass<'_>,
+    mut env: jni::EnvUnowned<'_>,
+    service: jni::objects::JObject<'_>,
     data_root: jni::objects::JString<'_>,
     config_root: jni::objects::JString<'_>,
 ) -> jni::sys::jint {
     let span = observability::operation_span("android.server.start", "lifecycle");
-    let result = java_path(&mut env, data_root)
-        .zip(java_path(&mut env, config_root))
-        .ok_or(server_controller::ServerStartError::Paths)
-        .and_then(|(data, config)| server_controller::android_roots(&data, &config))
-        .and_then(|roots| android_server().start(roots));
-    let outcome = if result.is_ok() { "ok" } else { "error" };
+    let result = env
+        .with_env(|env| -> jni::errors::Result<_> {
+            rustls_platform_verifier::android::init_with_env(env, service)?;
+            Ok(java_path(env, data_root)
+                .zip(java_path(env, config_root))
+                .ok_or(server_controller::ServerStartError::Paths)
+                .and_then(|(data, config)| server_controller::android_roots(&data, &config))
+                .and_then(|roots| android_server().start(roots)))
+        })
+        .into_outcome();
+    let succeeded = matches!(result, jni::Outcome::Ok(Ok(_)));
+    let outcome = if succeeded { "ok" } else { "error" };
     observability::record_outcome(&span, outcome);
-    i32::from(result.is_ok())
+    i32::from(succeeded)
 }
 
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
 /// Stop the process-owned mobile embedded server and clear its local credential.
-pub fn nativeStopServer(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
+pub fn nativeStopServer(_env: jni::EnvUnowned<'_>, _service: jni::objects::JObject<'_>) {
     android_server().stop_nonblocking();
 }
 
@@ -441,8 +448,8 @@ pub fn nativeStopServer(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>)
 #[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
 /// Return only the fixed embedded server lifecycle phase code.
 pub fn nativeServerStatus(
-    _env: jni::JNIEnv<'_>,
-    _class: jni::objects::JClass<'_>,
+    _env: jni::EnvUnowned<'_>,
+    _service: jni::objects::JObject<'_>,
 ) -> jni::sys::jint {
     use server_controller::ServerPhase;
     match android_server().phase() {
@@ -458,8 +465,8 @@ pub fn nativeServerStatus(
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Record the notification gate without starting server work.
 pub fn nativeNotificationPermissionRequired(
-    _env: jni::JNIEnv<'_>,
-    _class: jni::objects::JClass<'_>,
+    _env: jni::EnvUnowned<'_>,
+    _activity: jni::objects::JObject<'_>,
     required: jni::sys::jboolean,
 ) {
     if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
@@ -467,14 +474,14 @@ pub fn nativeNotificationPermissionRequired(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .bridge
-            .notification_permission_required(required != 0);
+            .notification_permission_required(required);
     }
 }
 
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Stop only the activity-owned client generation during backgrounding.
-pub fn nativeClientSuspend(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
+pub fn nativeClientSuspend(_env: jni::EnvUnowned<'_>, _activity: jni::objects::JObject<'_>) {
     let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
         return;
     };
@@ -499,7 +506,7 @@ pub fn nativeClientSuspend(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Start a fresh client generation only after an already-active activity resumes.
-pub fn nativeClientResume(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
+pub fn nativeClientResume(_env: jni::EnvUnowned<'_>, _activity: jni::objects::JObject<'_>) {
     let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
         return;
     };
@@ -674,7 +681,9 @@ mod configuration_tests {
         let service = include_str!(
             "../gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt"
         );
+        let gradle = include_str!("../gen/android/app/build.gradle.kts");
         let proguard = include_str!("../gen/android/app/proguard-rules.pro");
+        let rust = include_str!("lib.rs");
         for permission in [
             "android.permission.FOREGROUND_SERVICE",
             "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
@@ -693,6 +702,9 @@ mod configuration_tests {
         assert!(service.contains("startForeground("));
         assert!(service.contains("START_STICKY"));
         assert!(service.contains("System.loadLibrary(\"waltr_app_lib\")"));
+        assert!(service.contains(
+            "try {\n          nativeStartServer(filesDir.absolutePath, File(filesDir, \"config\").absolutePath)\n        } finally {\n          workerStarted.set(false)\n        }"
+        ));
         let foreground = service.find("promote()").expect("foreground promotion");
         let native_load = service
             .find("loadNativeLibrary()")
@@ -703,6 +715,17 @@ mod configuration_tests {
             activity.contains("ensureNotificationPermissionAndServer()\n    nativeClientResume()")
         );
         assert!(proguard.contains("WaltrForegroundService"));
+        assert!(proguard.contains("org.rustls.platformverifier.**"));
+        assert!(gradle.contains("cargo\",\n            \"metadata"));
+        assert!(gradle.contains("rustls-platform-verifier-android"));
+        assert!(gradle.contains("rustls:rustls-platform-verifier:"));
+        let verifier_init = rust
+            .find("rustls_platform_verifier::android::init_with_env")
+            .expect("Android platform verifier initialization");
+        let server_start = rust
+            .find("android_server().start(roots)")
+            .expect("Android embedded server start");
+        assert!(verifier_init < server_start);
         for forbidden in ["endpoint", "bearer", "token", "127.0.0.1"] {
             assert!(
                 !format!("{activity}\n{service}")

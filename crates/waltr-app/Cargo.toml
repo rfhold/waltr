@@ -47,8 +47,9 @@ webpki-roots.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21.1"
+jni = "0.22.4"
 jni_fn = "0.1.2"
+rustls-platform-verifier = "0.7.0"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 waltr-server = { path = "../waltr-server", version = "0.1.0", default-features = false, features = ["shell"] }
