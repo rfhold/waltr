@@ -56,9 +56,7 @@ impl SessionCreateRequest {
         let mut metadata = SessionMetadata::now();
         metadata.values = metadata_values;
         let (mut journal, mut cursor, turn, messages) = match start {
-            SessionStart::Fresh { messages } => {
-                (Vec::new(), TimelineCursor::ZERO, 0, messages)
-            }
+            SessionStart::Fresh { messages } => (Vec::new(), TimelineCursor::ZERO, 0, messages),
             SessionStart::Copy { copy, messages } => {
                 let cursor = copy.boundary();
                 let turn = copy.next_turn();

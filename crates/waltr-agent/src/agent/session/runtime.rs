@@ -790,7 +790,6 @@ where
             );
         }
     }
-
 }
 
 fn validate_permission_patterns(
