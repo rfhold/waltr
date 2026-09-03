@@ -793,6 +793,8 @@ mod tests {
 
     #[tonic::async_trait]
     impl SessionHost for UnusedSessionHost {
+        async fn shutdown(&self) {}
+
         fn set_completion_admission_handler(
             &self,
             _: Option<Arc<dyn waltr_agent::SessionCompletionCoordinationHandler>>,
@@ -1135,7 +1137,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_server_error(&stale_error, -32602, "failed precondition:", &["sha256:"]);
+        assert_server_error(&stale_error, -32602, "inspect and retry", &["sha256:"]);
 
         let read = agent_definition_error(&AgentDefinitionLoadError::Read {
             path: PathBuf::from("/private/tmp/secret.yaml"),

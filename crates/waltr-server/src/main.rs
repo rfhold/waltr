@@ -2,13 +2,14 @@
 
 mod build_info;
 
-use waltr_server::{DEFAULT_LISTEN_ADDR, build_app, observability, profiling};
+use waltr_server::{DEFAULT_LISTEN_ADDR, build_app, observability};
 use std::{env, net::SocketAddr};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _observability = observability::init()?;
-    let _profiling = profiling::init()?;
+    #[cfg(feature = "profiling")]
+    let _profiling = waltr_server::profiling::init()?;
     tracing::info!(
         version = build_info::VERSION,
         revision = build_info::revision(),

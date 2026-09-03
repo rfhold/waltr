@@ -469,6 +469,68 @@ pub(super) fn atomic_write(
     Ok(())
 }
 
+pub(crate) fn provision_persisted_resource(
+    root: &Path,
+    relative: &str,
+    source: &str,
+) -> Result<(), AgentDefinitionLoadError> {
+    drop(validate_resource_source(relative, source)?);
+    ensure_provision_directory(root, Path::new("."))?;
+    let waltr_root = root.join(".waltr");
+    ensure_provision_directory(&waltr_root, Path::new(".waltr"))?;
+    let resources_root = waltr_root.join("resources");
+    ensure_provision_directory(&resources_root, Path::new(".waltr/resources"))?;
+    let target = resource_disk_path(&resources_root, relative);
+    ensure_provision_directory(
+        target
+            .parent()
+            .expect("validated resource path has a category parent"),
+        &Path::new(".waltr/resources").join(
+            Path::new(relative)
+                .parent()
+                .expect("validated resource path has a category"),
+        ),
+    )?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(AgentDefinitionLoadError::UnsupportedResourcePath(
+                Path::new(".waltr/resources").join(relative),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(AgentDefinitionLoadError::Inspect {
+                path: Path::new(".waltr/resources").join(relative),
+                source,
+            });
+        }
+    }
+    atomic_write(&resources_root, relative, source.as_bytes())
+}
+
+fn ensure_provision_directory(
+    path: &Path,
+    error_path: &Path,
+) -> Result<(), AgentDefinitionLoadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+            AgentDefinitionLoadError::UnsupportedResourcePath(error_path.to_owned()),
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|source| AgentDefinitionLoadError::Write {
+                path: error_path.to_owned(),
+                source,
+            })
+        }
+        Err(source) => Err(AgentDefinitionLoadError::Inspect {
+            path: error_path.to_owned(),
+            source,
+        }),
+    }
+}
+
 pub(super) fn resource_disk_path(root: &Path, relative: &str) -> PathBuf {
     let (category, file) = relative
         .split_once('/')

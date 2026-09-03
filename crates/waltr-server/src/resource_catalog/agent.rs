@@ -1,8 +1,8 @@
-//! Agent registry compilation and compiled-feature validation.
+//! Agent registry compilation.
 
 use waltr_agent::{
     AgentDefinitionCatalog, AgentDefinitionError, AgentDefinitionRegistry,
-    AgentDefinitionResourceKind, ResolvedAgent,
+    AgentDefinitionResourceKind,
 };
 
 use super::error::AgentDefinitionLoadError;
@@ -20,10 +20,7 @@ pub(super) fn compile_catalog(
     let agents = registry
         .resolve_agents()
         .map_err(|source| AgentDefinitionLoadError::ResolveAll { source })?;
-    for agent in &agents {
-        validate_compiled_features(agent)?;
-    }
-    let resolved = agents
+    agents
         .iter()
         .find(|agent| agent.name == default_agent)
         .ok_or_else(|| AgentDefinitionLoadError::Resolve {
@@ -34,24 +31,6 @@ pub(super) fn compile_catalog(
                 field: None,
             },
         })?;
-    validate_compiled_features(resolved)?;
     AgentDefinitionCatalog::from_resolved_agents(sources.to_vec(), default_agent, agents)
         .map_err(|source| AgentDefinitionLoadError::ResolveAll { source })
-}
-
-#[cfg(not(feature = "shell"))]
-fn validate_compiled_features(agent: &ResolvedAgent) -> Result<(), AgentDefinitionLoadError> {
-    if agent.features.shell.is_some() {
-        return Err(AgentDefinitionLoadError::UnsupportedFeature {
-            name: agent.name.clone(),
-            feature: "shell",
-        });
-    }
-    Ok(())
-}
-
-#[cfg(feature = "shell")]
-#[allow(clippy::unnecessary_wraps)]
-const fn validate_compiled_features(_: &ResolvedAgent) -> Result<(), AgentDefinitionLoadError> {
-    Ok(())
 }

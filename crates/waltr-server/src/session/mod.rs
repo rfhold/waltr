@@ -12,7 +12,7 @@ use waltr_agent::{
     SessionMaskMutation, SessionMaskMutationOutcome, SessionPauseError, SessionPauseLease,
     SessionStore, SessionSummary, TimelineCursor,
 };
-use std::{pin::Pin, sync::Arc};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 use tonic::service::RoutesBuilder;
 
 pub mod service;
@@ -106,6 +106,8 @@ pub trait SessionHost: Send + Sync {
     ) -> Result<MetadataSetOutcome, waltr_agent::LlmError>;
     /// Subscribe to coordinator-local session updates.
     fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>>;
+    /// Permanently stop run admission and cancel process-local session work.
+    async fn shutdown(&self);
 }
 
 /// Add the configured session service to the gRPC routes builder.
@@ -516,4 +518,29 @@ where
         agent_state,
         event_sink,
     )
+}
+
+/// Add a filesystem-backed session service from an explicit host-owned root.
+pub(crate) fn add_filesystem_service_with_agent_state_and_event_sink(
+    routes: &mut RoutesBuilder,
+    session_root: PathBuf,
+    workspace_root: PathBuf,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_state: AgentDefinitionState,
+    event_sink: Arc<dyn SessionEventSink>,
+) -> Arc<dyn SessionHost> {
+    let service = SessionService::new_with_explicit_root_and_agent_state(
+        FilesystemSessionStore::new(session_root),
+        workspace_root,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origins,
+        agent_state,
+        event_sink,
+    );
+    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
+    let host: Arc<dyn SessionHost> = service;
+    host
 }

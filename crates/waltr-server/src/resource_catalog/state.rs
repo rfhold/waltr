@@ -414,6 +414,47 @@ impl AgentDefinitionState {
         })
     }
 
+    /// Load the unified catalog with an explicit default agent without consulting process state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bundled or persisted resources cannot be materialized.
+    pub(crate) fn load_unified_explicit(
+        root: impl Into<PathBuf>,
+        materializer: CatalogMaterializer,
+        default_agent: impl Into<String>,
+    ) -> Result<Self, AgentDefinitionLoadError> {
+        let default_agent = default_agent.into();
+        validate_default_agent(&default_agent)?;
+        let resources_root = root.into().join(".waltr/resources");
+        let persisted = discover_persisted_for(&resources_root, true)?;
+        let bundled = unified_bundled_resources();
+        let snapshot = build_snapshot(
+            bundled.clone(),
+            &persisted,
+            &[],
+            &default_agent,
+            Some(&materializer),
+        )?;
+        let (updates, _) = tokio::sync::broadcast::channel(32);
+        Ok(Self {
+            inner: Arc::new(AgentDefinitionStateInner {
+                resources_root,
+                external_sources: Vec::new(),
+                default_agent,
+                published: RwLock::new(PublishedState {
+                    snapshot: Arc::new(snapshot),
+                    reload_error: None,
+                    persisted: Arc::new(persisted),
+                }),
+                maintenance: tokio::sync::Mutex::new(()),
+                bundled,
+                materializer: Some(materializer),
+                updates,
+            }),
+        })
+    }
+
     /// Load using the process definition-path and default-agent environment variables.
     ///
     /// # Errors
@@ -912,15 +953,17 @@ fn inspect_summary(
 ) -> DefinitionResourceSummary {
     let (kind, name) = validate_resource_path(path).expect("stored resource paths are canonical");
     let persisted_source = persisted.get(path);
-    let effective_source = persisted_source.or_else(|| bundled.get(path));
+    let effective_source = persisted_source
+        .map(String::as_str)
+        .or_else(|| bundled.get(path).map(String::as_str));
     DefinitionResourceSummary {
         path: path.to_owned(),
         kind: kind.to_string(),
         name,
-        origin: if persisted_source.is_some() {
-            ResourceOrigin::Filesystem
-        } else {
+        origin: if persisted_source.is_none() {
             ResourceOrigin::Bundled
+        } else {
+            ResourceOrigin::Filesystem
         },
         persisted: persisted_source.is_some(),
         persisted_etag: slot_etag(persisted_source.map(String::as_bytes)),
@@ -943,7 +986,9 @@ fn inspect_resource(
 ) -> DefinitionResourceDetail {
     let (kind, name) = validate_resource_path(path).expect("inspected resource path is canonical");
     let persisted_source = persisted.get(path);
-    let effective_source = persisted_source.or_else(|| bundled.get(path));
+    let effective_source = persisted_source
+        .map(String::as_str)
+        .or_else(|| bundled.get(path).map(String::as_str));
     let active = active.entries.get(path);
     DefinitionResourceDetail {
         path: path.to_owned(),
@@ -960,7 +1005,7 @@ fn inspect_resource(
         persisted: persisted_source.is_some(),
         effective: effective_source.is_some(),
         active: active.is_some(),
-        source: effective_source.cloned(),
+        source: effective_source.map(str::to_owned),
         persisted_source: persisted_source.cloned(),
         active_source: active.map(|entry| entry.source.clone()),
         persisted_etag: slot_etag(persisted_source.map(String::as_bytes)),
@@ -1000,7 +1045,6 @@ fn build_snapshot(
     for (path, source) in persisted {
         effective.insert(path.clone(), source.clone());
     }
-
     let mut identities = BTreeSet::new();
     let mut entries = BTreeMap::new();
     let mut sources = Vec::new();

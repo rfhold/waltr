@@ -45,6 +45,380 @@ async fn unified_state(directory: &TestDirectory) -> AgentDefinitionState {
     AgentDefinitionState::load_unified(&directory.0, materializer).unwrap()
 }
 
+async fn explicit_embedded_state(
+    directory: &TestDirectory,
+) -> Result<AgentDefinitionState, AgentDefinitionLoadError> {
+    let source = mcp_server("http://127.0.0.1:43123/mcp");
+    crate::resource_catalog::provision_persisted_resource(
+        &directory.0,
+        "mcp-servers/waltr.yaml",
+        &source,
+    )?;
+    let materializer =
+        crate::catalog::CatalogMaterializer::load(&crate::test_support::default_catalog_loader())
+            .await
+            .unwrap();
+    AgentDefinitionState::load_unified_explicit(&directory.0, materializer, "coding")
+}
+
+#[cfg(unix)]
+#[test]
+fn provisioning_rejects_symlinked_catalog_components_without_external_writes() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TestDirectory::new("provision-symlinks");
+    let source = mcp_server("http://127.0.0.1:43123/mcp");
+
+    let external_root = directory.0.join("external-root");
+    let external_root_target = external_root.join(".waltr/resources/mcp-servers/waltr.yaml");
+    fs::create_dir_all(external_root_target.parent().unwrap()).unwrap();
+    fs::write(&external_root_target, "external root").unwrap();
+    let linked_root = directory.0.join("linked-root");
+    symlink(&external_root, &linked_root).unwrap();
+    assert!(matches!(
+        crate::resource_catalog::provision_persisted_resource(
+            &linked_root,
+            "mcp-servers/waltr.yaml",
+            &source
+        ),
+        Err(AgentDefinitionLoadError::UnsupportedResourcePath(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(external_root_target).unwrap(),
+        "external root"
+    );
+
+    let resources_root = directory.0.join("resources-root");
+    let external_resources = directory.0.join("external-resources");
+    fs::create_dir_all(resources_root.join(".waltr")).unwrap();
+    fs::create_dir_all(external_resources.join("mcp-servers")).unwrap();
+    let external_resources_target = external_resources.join("mcp-servers/waltr.yaml");
+    fs::write(&external_resources_target, "external resources").unwrap();
+    symlink(&external_resources, resources_root.join(".waltr/resources")).unwrap();
+    assert!(matches!(
+        crate::resource_catalog::provision_persisted_resource(
+            &resources_root,
+            "mcp-servers/waltr.yaml",
+            &source
+        ),
+        Err(AgentDefinitionLoadError::UnsupportedResourcePath(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(external_resources_target).unwrap(),
+        "external resources"
+    );
+
+    let category_root = directory.0.join("category-root");
+    let external_category = directory.0.join("external-category");
+    fs::create_dir_all(category_root.join(".waltr/resources")).unwrap();
+    fs::create_dir(&external_category).unwrap();
+    let external_category_target = external_category.join("waltr.yaml");
+    fs::write(&external_category_target, "external category").unwrap();
+    symlink(
+        &external_category,
+        category_root.join(".waltr/resources/mcp-servers"),
+    )
+    .unwrap();
+    assert!(matches!(
+        crate::resource_catalog::provision_persisted_resource(
+            &category_root,
+            "mcp-servers/waltr.yaml",
+            &source
+        ),
+        Err(AgentDefinitionLoadError::UnsupportedResourcePath(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(external_category_target).unwrap(),
+        "external category"
+    );
+
+    let path_root = directory.0.join("path-root");
+    let external_file = directory.0.join("external-file.yaml");
+    fs::create_dir_all(path_root.join(".waltr/resources/mcp-servers")).unwrap();
+    fs::write(&external_file, "external path").unwrap();
+    symlink(
+        &external_file,
+        path_root.join(".waltr/resources/mcp-servers/waltr.yaml"),
+    )
+    .unwrap();
+    assert!(matches!(
+        crate::resource_catalog::provision_persisted_resource(
+            &path_root,
+            "mcp-servers/waltr.yaml",
+            &source
+        ),
+        Err(AgentDefinitionLoadError::UnsupportedResourcePath(_))
+    ));
+    assert_eq!(fs::read_to_string(external_file).unwrap(), "external path");
+}
+
+#[tokio::test]
+async fn embedded_catalog_loads_ordinary_shell_and_stdio_resources() {
+    let directory = TestDirectory::new("embedded-ordinary-resources");
+    directory.resource(
+        "mcp-servers/process.yaml",
+        "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: process\nspec:\n  transport: stdio\n  command: helper --stdio\n",
+    );
+    let state = explicit_embedded_state(&directory).await.unwrap();
+    let snapshot = state.snapshot();
+    let coding = snapshot
+        .entries
+        .get("features/coding.yaml")
+        .expect("ordinary coding feature");
+    assert!(coding.source.contains("  shell:"));
+    assert!(
+        snapshot
+            .catalog()
+            .resolved("coding")
+            .expect("coding agent")
+            .features
+            .shell
+            .is_some()
+    );
+    let process = snapshot
+        .configuration()
+        .mcp_servers
+        .get("process")
+        .expect("stdio MCP server");
+    assert_eq!(process.r#type, config_proto::McpServerType::Stdio as i32);
+    assert_eq!(process.command, "helper --stdio");
+    let self_mcp = snapshot
+        .configuration()
+        .mcp_servers
+        .get("waltr")
+        .expect("self MCP");
+    assert_eq!(self_mcp.url, "http://127.0.0.1:43123/mcp");
+}
+
+#[tokio::test]
+async fn provisioned_self_mcp_is_an_ordinary_filesystem_resource() {
+    let directory = TestDirectory::new("provisioned-self-mcp");
+    directory.resource(
+        "mcp-servers/waltr.yaml",
+        "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: waltr\nspec:\n  transport: stdio\n  command: hostile-override\n",
+    );
+    let state = explicit_embedded_state(&directory).await.unwrap();
+    let configured = state
+        .snapshot()
+        .configuration()
+        .mcp_servers
+        .get("waltr")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        configured.r#type,
+        config_proto::McpServerType::StreamableHttp as i32
+    );
+    assert_eq!(configured.url, "http://127.0.0.1:43123/mcp");
+    assert!(configured.command.is_empty());
+
+    let expected_source = mcp_server("http://127.0.0.1:43123/mcp");
+    assert_eq!(
+        fs::read_to_string(directory.0.join(".waltr/resources/mcp-servers/waltr.yaml")).unwrap(),
+        expected_source
+    );
+    let expected_etag = source_etag(expected_source.as_bytes());
+    let AgentDefinitionInspection::Resource(detail) = state
+        .inspect(Some("mcp-servers/waltr.yaml"))
+        .expect("inspect provisioned self MCP")
+    else {
+        panic!("path inspection must return resource detail");
+    };
+    assert_eq!(detail.source.as_deref(), Some(expected_source.as_str()));
+    assert_eq!(
+        detail.persisted_source.as_deref(),
+        Some(expected_source.as_str())
+    );
+    assert_eq!(
+        detail.effective_etag.as_deref(),
+        Some(expected_etag.as_str())
+    );
+    assert_eq!(detail.origin, Some(ResourceOrigin::Filesystem));
+    let AgentDefinitionInspection::Catalog { entries, .. } = state.inspect(None).unwrap() else {
+        panic!("catalog inspection must return summaries");
+    };
+    let summary = entries
+        .iter()
+        .find(|entry| entry.path == "mcp-servers/waltr.yaml")
+        .expect("self MCP summary");
+    assert_eq!(summary.effective_etag, expected_etag);
+    assert_eq!(summary.origin, ResourceOrigin::Filesystem);
+
+    let public = state
+        .resource_inspections(Some("mcp-servers/waltr.yaml"))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        public.active_source.as_deref(),
+        Some(expected_source.as_str())
+    );
+    assert!(public.persisted_source.is_some());
+
+    let replacement = mcp_server("https://override.example/mcp");
+    let replaced = state
+        .replace(
+            "mcp-servers/waltr.yaml",
+            replacement.clone(),
+            &public.persisted_etag,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.source.as_deref(), Some(replacement.as_str()));
+    assert_eq!(replaced.origin, Some(ResourceOrigin::Filesystem));
+    assert!(matches!(
+        state
+            .replace(
+                "mcp-servers/waltr.yaml",
+                expected_source,
+                &public.persisted_etag
+            )
+            .await,
+        Err(AgentDefinitionLoadError::StaleEtag { .. })
+    ));
+
+    let path = "agents/ordinary.yaml";
+    let inspection = state.resource_inspections(Some(path)).unwrap().remove(0);
+    state
+        .replace(
+            path,
+            agent("ordinary", "ordinary resources remain writable"),
+            &inspection.persisted_etag,
+        )
+        .await
+        .unwrap();
+    assert!(state.snapshot().catalog().resolved("ordinary").is_some());
+}
+
+#[tokio::test]
+async fn direct_self_mcp_edits_follow_ordinary_reload_behavior() {
+    let directory = TestDirectory::new("self-mcp-direct-edit");
+    let state = explicit_embedded_state(&directory).await.unwrap();
+    let watcher = state.spawn_watcher().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let replacement = mcp_server("https://direct.example/mcp");
+    directory.resource("mcp-servers/waltr.yaml", &replacement);
+    wait_until(|| {
+        state.snapshot().configuration().mcp_servers["waltr"].url == "https://direct.example/mcp"
+    })
+    .await;
+    let active = state.snapshot();
+
+    directory.resource("mcp-servers/waltr.yaml", "kind: [");
+    wait_until(|| state.reload_error().is_some()).await;
+    assert!(Arc::ptr_eq(&active, &state.snapshot()));
+    assert_eq!(
+        state.snapshot().configuration().mcp_servers["waltr"].url,
+        "https://direct.example/mcp"
+    );
+    watcher.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_self_mcp_resource_remains_mutable() {
+    let directory = TestDirectory::new("standalone-self-mcp-mutable");
+    let state = unified_state(&directory).await;
+    let inspection = state
+        .resource_inspections(Some("mcp-servers/waltr.yaml"))
+        .unwrap()
+        .remove(0);
+    let replacement = "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: waltr\nspec:\n  transport: streamableHttp\n  url: https://standalone.example/mcp\n";
+    let replaced = state
+        .replace(
+            "mcp-servers/waltr.yaml",
+            replacement.to_owned(),
+            &inspection.persisted_etag,
+        )
+        .await
+        .expect("standalone self MCP replacement");
+    assert_eq!(replaced.source.as_deref(), Some(replacement));
+    assert!(replaced.persisted);
+    assert_eq!(replaced.origin, Some(ResourceOrigin::Filesystem));
+    assert_eq!(
+        state.snapshot().configuration().mcp_servers["waltr"].url,
+        "https://standalone.example/mcp"
+    );
+}
+
+fn mcp_server(url: &str) -> String {
+    let url = serde_json::to_string(url).unwrap();
+    format!(
+        "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: waltr\nspec:\n  transport: streamableHttp\n  url: {url}\n"
+    )
+}
+
+#[tokio::test]
+async fn reset_validates_the_complete_fallback_candidate_before_removal() {
+    let directory = TestDirectory::new("reset-full-candidate-validation");
+    directory.resource(
+        "agents/only.yaml",
+        &agent("only", "required explicit default"),
+    );
+    let state = AgentDefinitionState::load(&directory.0, &[], "only").unwrap();
+    let inspection = state
+        .resource_inspections(Some("agents/only.yaml"))
+        .unwrap()
+        .remove(0);
+
+    assert!(matches!(
+        state
+            .reset("agents/only.yaml", &inspection.persisted_etag)
+            .await,
+        Err(AgentDefinitionLoadError::Resolve { .. })
+    ));
+    assert!(
+        directory
+            .0
+            .join(".waltr/resources/agents/only.yaml")
+            .is_file()
+    );
+    assert!(state.snapshot().catalog().resolved("only").is_some());
+}
+
+#[test]
+fn self_mcp_reset_without_public_url_keeps_persisted_and_active_state() {
+    const CHILD: &str = "WALTR_TEST_SELF_MCP_RESET_CHILD";
+    if env::var_os(CHILD).is_none() {
+        let status = process::Command::new(env::current_exe().unwrap())
+            .arg("resource_catalog::state::tests::self_mcp_reset_without_public_url_keeps_persisted_and_active_state")
+            .arg("--exact")
+            .env(CHILD, "1")
+            .env_remove("WALTR_PUBLIC_URL")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let directory = TestDirectory::new("self-mcp-reset-no-public-url");
+            let state = explicit_embedded_state(&directory).await.unwrap();
+            let before = state.snapshot();
+            let inspection = state
+                .resource_inspections(Some("mcp-servers/waltr.yaml"))
+                .unwrap()
+                .remove(0);
+
+            assert!(matches!(
+                state
+                    .reset("mcp-servers/waltr.yaml", &inspection.persisted_etag)
+                    .await,
+                Err(AgentDefinitionLoadError::InvalidResourceValue { path, .. })
+                    if path == "mcp-servers/waltr.yaml"
+            ));
+            assert!(Arc::ptr_eq(&before, &state.snapshot()));
+            assert_eq!(
+                fs::read_to_string(directory.0.join(".waltr/resources/mcp-servers/waltr.yaml"))
+                    .unwrap(),
+                inspection.persisted_source.unwrap()
+            );
+        });
+}
+
 fn agent(name: &str, description: &str) -> String {
     format!(
         "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: {name}\nspec:\n  description: {description}\n"
