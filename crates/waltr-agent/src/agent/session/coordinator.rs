@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -19,7 +19,7 @@ use crate::{
 };
 use futures_util::StreamExt as _;
 use serde_json::Value;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -54,12 +54,17 @@ where
     runtime_factory: Option<AgentSessionRuntimeFactory>,
     mcp_sessions: Arc<StdMutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
     mcp_preparation_guards: McpPreparationGuards,
+    mcp_lifecycle: Arc<RwLock<McpLifecycle>>,
+    retired_mcp_runtimes: Arc<StdMutex<Vec<Arc<McpRuntimeRetirement>>>>,
     active_runs: Arc<Mutex<RunCoordination>>,
+    run_drain: Arc<RunDrain>,
     next_run_id: Arc<AtomicU64>,
     next_pause_id: Arc<AtomicU64>,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
     completion_handler: Arc<StdMutex<Option<Arc<dyn super::SessionCompletionCoordinationHandler>>>>,
     shutdown_token: CancellationToken,
+    shutdown_completion: Arc<AsyncCompletion>,
+    shutdown_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
     #[cfg(test)]
     list_registration_barrier:
         Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
@@ -90,6 +95,143 @@ struct RunCoordination {
     sessions: BTreeMap<SessionId, SessionRunState>,
     wiping: bool,
     shutdown: bool,
+}
+
+#[derive(Debug, Default)]
+struct McpLifecycle {
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct McpRuntimeRetirement {
+    session_id: SessionId,
+    runtime: StdMutex<Option<Arc<McpClientRuntime>>>,
+    completion: AsyncCompletion,
+    task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl McpRuntimeRetirement {
+    fn start(session_id: SessionId, runtime: Arc<McpClientRuntime>) -> Arc<Self> {
+        let retirement = Arc::new(Self {
+            session_id,
+            runtime: StdMutex::new(Some(runtime)),
+            completion: AsyncCompletion::default(),
+            task: StdMutex::new(None),
+        });
+        let background = Arc::clone(&retirement);
+        let task = tokio::spawn(async move {
+            background.run().await;
+        });
+        *retirement
+            .task
+            .lock()
+            .expect("MCP retirement task lock poisoned") = Some(task);
+        retirement
+    }
+
+    async fn run(&self) {
+        let runtime = self
+            .runtime
+            .lock()
+            .expect("retired MCP runtime lock poisoned")
+            .take()
+            .expect("retired MCP runtime owned by its task");
+        if let Err(error) = shutdown_when_unused(runtime).await {
+            tracing::warn!(
+                session_id = %self.session_id.as_str(),
+                %error,
+                "failed to shut down retired MCP runtime"
+            );
+        }
+        self.completion.finish();
+    }
+
+    async fn wait(&self) {
+        self.completion.wait().await;
+    }
+
+    async fn wait_and_join(&self) {
+        self.wait().await;
+        let task = self
+            .task
+            .lock()
+            .expect("MCP retirement task lock poisoned")
+            .take();
+        if let Some(task) = task
+            && let Err(error) = task.await
+        {
+            tracing::warn!(
+                session_id = %self.session_id.as_str(),
+                %error,
+                "MCP retirement task failed"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AsyncCompletion {
+    complete: AtomicBool,
+    completed: Notify,
+}
+
+impl AsyncCompletion {
+    fn finish(&self) {
+        self.complete.store(true, Ordering::Release);
+        self.completed.notify_waiters();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.completed.notified();
+            if self.is_complete() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunDrain {
+    active: AtomicU64,
+    idle: Notify,
+}
+
+impl RunDrain {
+    fn begin(self: &Arc<Self>) -> RunActivity {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        RunActivity {
+            drain: Arc::clone(self),
+        }
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunActivity {
+    drain: Arc<RunDrain>,
+}
+
+impl Drop for RunActivity {
+    fn drop(&mut self) {
+        if self.drain.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drain.idle.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +317,7 @@ struct SessionRunStart {
     input: AgentSessionRunInput,
     outcome_txs: Vec<(u64, RunOutcomeSender)>,
     limits: AgentRunLimits,
+    activity: RunActivity,
 }
 
 struct PreparedCompletionAdmission {
@@ -206,12 +349,17 @@ where
             runtime_factory: None,
             mcp_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
             mcp_preparation_guards: Arc::new(StdMutex::new(BTreeMap::new())),
+            mcp_lifecycle: Arc::new(RwLock::new(McpLifecycle::default())),
+            retired_mcp_runtimes: Arc::new(StdMutex::new(Vec::new())),
             active_runs: Arc::new(Mutex::new(RunCoordination::default())),
+            run_drain: Arc::new(RunDrain::default()),
             next_run_id: Arc::new(AtomicU64::new(0)),
             next_pause_id: Arc::new(AtomicU64::new(0)),
             event_sink: None,
             completion_handler: Arc::new(StdMutex::new(None)),
             shutdown_token: CancellationToken::new(),
+            shutdown_completion: Arc::new(AsyncCompletion::default()),
+            shutdown_task: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             list_registration_barrier: Arc::new(StdMutex::new(None)),
         }
@@ -307,22 +455,28 @@ where
             self.unblock_session(id).await;
             return Err(error);
         }
-        let runtime = self
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .remove(id);
-        self.mcp_preparation_guards
-            .lock()
-            .expect("MCP preparation guard map lock poisoned")
-            .remove(id);
+        let retirement = {
+            let lifecycle = self.mcp_lifecycle.read().await;
+            if lifecycle.shutdown {
+                None
+            } else {
+                let runtime = self
+                    .mcp_sessions
+                    .lock()
+                    .expect("MCP runtime cache lock poisoned")
+                    .remove(id);
+                self.mcp_preparation_guards
+                    .lock()
+                    .expect("MCP preparation guard map lock poisoned")
+                    .remove(id);
+                runtime.map(|runtime| self.retire_mcp_runtime(id.clone(), runtime.runtime))
+            }
+        };
         operation.publish_deleted();
         drop(operation);
-        let shutdown = match runtime {
-            Some(runtime) => shutdown_when_unused(runtime.runtime).await,
-            None => Ok(()),
-        };
-        shutdown?;
+        if let Some(retirement) = retirement {
+            retirement.wait().await;
+        }
         Ok(())
     }
 
@@ -348,33 +502,58 @@ where
             self.end_wipe().await;
             return wipe;
         }
-        let runtimes = std::mem::take(
-            &mut *self
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned"),
-        );
-        self.mcp_preparation_guards
-            .lock()
-            .expect("MCP preparation guard map lock poisoned")
-            .clear();
+        let retirements = {
+            let lifecycle = self.mcp_lifecycle.read().await;
+            if lifecycle.shutdown {
+                Vec::new()
+            } else {
+                let runtimes = std::mem::take(
+                    &mut *self
+                        .mcp_sessions
+                        .lock()
+                        .expect("MCP runtime cache lock poisoned"),
+                );
+                self.mcp_preparation_guards
+                    .lock()
+                    .expect("MCP preparation guard map lock poisoned")
+                    .clear();
+                runtimes
+                    .into_iter()
+                    .map(|(session_id, cached)| self.retire_mcp_runtime(session_id, cached.runtime))
+                    .collect::<Vec<_>>()
+            }
+        };
         lifecycle.publish_cleared();
         self.end_wipe().await;
-        drop(tokio::spawn(async move {
-            for (session_id, cached) in runtimes {
-                if shutdown_when_unused(cached.runtime).await.is_err() {
-                    tracing::warn!(
-                        session_id = %session_id.as_str(),
-                        "failed to shut down cached MCP runtime after session wipe"
-                    );
-                }
-            }
-        }));
+        drop(retirements);
         Ok(())
     }
 
     /// Permanently stop new run admission and cancel process-local coordinated work.
     pub async fn shutdown(&self) {
+        self.start_shutdown();
+        self.shutdown_completion.wait().await;
+    }
+
+    fn start_shutdown(&self) {
+        if self.shutdown_completion.is_complete() {
+            return;
+        }
+        let mut task = self
+            .shutdown_task
+            .lock()
+            .expect("session shutdown task lock poisoned");
+        if task.is_some() {
+            return;
+        }
+        let coordinator = self.clone();
+        *task = Some(tokio::spawn(async move {
+            coordinator.perform_shutdown().await;
+            coordinator.shutdown_completion.finish();
+        }));
+    }
+
+    async fn perform_shutdown(&self) {
         self.shutdown_token.cancel();
         self.clear_completion_admission_handler();
         let mut coordination = self.active_runs.lock().await;
@@ -388,6 +567,36 @@ where
         for session_id in invalidated {
             self.control
                 .publish_coordination(&session_id, SessionCoordinationState::default());
+        }
+        self.run_drain.wait_until_idle().await;
+        let (runtimes, mut retirements) = {
+            let mut lifecycle = self.mcp_lifecycle.write().await;
+            lifecycle.shutdown = true;
+            self.mcp_preparation_guards
+                .lock()
+                .expect("MCP preparation guard map lock poisoned")
+                .clear();
+            let runtimes = std::mem::take(
+                &mut *self
+                    .mcp_sessions
+                    .lock()
+                    .expect("MCP runtime cache lock poisoned"),
+            );
+            let retirements = std::mem::take(
+                &mut *self
+                    .retired_mcp_runtimes
+                    .lock()
+                    .expect("retired MCP runtime lock poisoned"),
+            );
+            (runtimes, retirements)
+        };
+        retirements.extend(
+            runtimes.into_iter().map(|(session_id, cached)| {
+                McpRuntimeRetirement::start(session_id, cached.runtime)
+            }),
+        );
+        for retirement in retirements {
+            retirement.wait_and_join().await;
         }
     }
 
@@ -778,9 +987,9 @@ where
             );
             None
         } else if let Some(continuation) = pause.continuation {
-            Some(start_queued(state, continuation))
+            Some(start_queued(state, continuation, &self.run_drain))
         } else {
-            pop_next_start(state)
+            pop_next_start(state, &self.run_drain)
         };
         if state.active.is_none() && state.queued.is_empty() && !state.blocked {
             coordination.sessions.remove(&lease.session_id);
@@ -1427,6 +1636,7 @@ where
                             input,
                             outcome_txs: vec![(id, outcome_tx)],
                             limits,
+                            activity: self.run_drain.begin(),
                         });
                         disposition = AgentSessionRunDisposition::ReplacedActive;
                     }
@@ -1446,6 +1656,7 @@ where
                     input,
                     outcome_txs: vec![(id, outcome_tx)],
                     limits,
+                    activity: self.run_drain.begin(),
                 });
                 disposition = AgentSessionRunDisposition::Started;
             }
@@ -1538,6 +1749,7 @@ where
         tracing::info!(session_id = %session_id.as_str(), run_id, run_kind, "session run started");
         tokio::spawn(
             async move {
+                let _activity = start.activity;
                 let outcome = drain_run(
                     coordinator.clone(),
                     start.runtime,
@@ -1579,7 +1791,7 @@ where
             self.control.publish_coordination(session_id, projected);
             return None;
         }
-        let next = pop_next_start(current);
+        let next = pop_next_start(current, &self.run_drain);
         if next.is_none() {
             coordination.sessions.remove(session_id);
         }
@@ -1847,7 +2059,7 @@ where
             );
             None
         } else {
-            pop_next_start(state)
+            pop_next_start(state, &self.run_drain)
         };
         if state.active.is_none() && state.queued.is_empty() && !state.blocked {
             coordination.sessions.remove(session_id);
@@ -1922,7 +2134,7 @@ where
             return None;
         }
         state.active = None;
-        let next = pop_next_start(state);
+        let next = pop_next_start(state, &self.run_drain);
         if next.is_none() && state.pause.is_none() && !state.blocked {
             coordination.sessions.remove(session_id);
         }
@@ -2231,6 +2443,12 @@ where
         incarnation: super::SessionIncarnation,
         factory: &AgentSessionRuntimeFactory,
     ) -> std::result::Result<Option<Arc<McpClientRuntime>>, super::AgentSessionRuntimeError> {
+        let lifecycle = self.mcp_lifecycle.read().await;
+        if lifecycle.shutdown || self.shutdown_token.is_cancelled() {
+            return Err(super::AgentSessionRuntimeError::FailedPrecondition(
+                "session coordinator is shut down".to_owned(),
+            ));
+        }
         let preparation_guard = self
             .mcp_preparation_guards
             .lock()
@@ -2311,7 +2529,7 @@ where
             );
         drop(operation);
         if let Some(replaced) = replaced {
-            spawn_runtime_shutdown(replaced.runtime);
+            self.retire_mcp_runtime(session_id.clone(), replaced.runtime);
         }
         Ok(Some(runtime))
     }
@@ -2323,8 +2541,23 @@ where
             .expect("MCP runtime cache lock poisoned")
             .remove(session_id);
         if let Some(evicted) = evicted {
-            spawn_runtime_shutdown(evicted.runtime);
+            self.retire_mcp_runtime(session_id.clone(), evicted.runtime);
         }
+    }
+
+    fn retire_mcp_runtime(
+        &self,
+        session_id: SessionId,
+        runtime: Arc<McpClientRuntime>,
+    ) -> Arc<McpRuntimeRetirement> {
+        let retirement = McpRuntimeRetirement::start(session_id, runtime);
+        let mut retirements = self
+            .retired_mcp_runtimes
+            .lock()
+            .expect("retired MCP runtime lock poisoned");
+        retirements.retain(|retirement| !retirement.completion.is_complete());
+        retirements.push(Arc::clone(&retirement));
+        retirement
     }
 
     async fn validate_pause_owner(
@@ -2446,7 +2679,11 @@ fn pause_store_error(
     }
 }
 
-fn start_queued(state: &mut SessionRunState, queued: QueuedSessionRun) -> SessionRunStart {
+fn start_queued(
+    state: &mut SessionRunState,
+    queued: QueuedSessionRun,
+    run_drain: &Arc<RunDrain>,
+) -> SessionRunStart {
     let token = CancellationToken::new();
     let id = queued.id;
     state.active = Some(ActiveSessionRun {
@@ -2462,10 +2699,14 @@ fn start_queued(state: &mut SessionRunState, queued: QueuedSessionRun) -> Sessio
         input: queued.input,
         outcome_txs: vec![(queued.id, queued.outcome_tx)],
         limits: queued.limits,
+        activity: run_drain.begin(),
     }
 }
 
-fn pop_next_start(state: &mut SessionRunState) -> Option<SessionRunStart> {
+fn pop_next_start(
+    state: &mut SessionRunState,
+    run_drain: &Arc<RunDrain>,
+) -> Option<SessionRunStart> {
     let queued = state.queued.pop_front()?;
     let token = CancellationToken::new();
     let id = queued.id;
@@ -2509,6 +2750,7 @@ fn pop_next_start(state: &mut SessionRunState) -> Option<SessionRunStart> {
         input,
         outcome_txs,
         limits,
+        activity: run_drain.begin(),
     })
 }
 
@@ -2576,14 +2818,6 @@ fn mcp_start_error(
         }
         error => super::AgentSessionRuntimeError::from(error),
     }
-}
-
-fn spawn_runtime_shutdown(runtime: Arc<McpClientRuntime>) {
-    drop(tokio::spawn(async move {
-        if shutdown_when_unused(runtime).await.is_err() {
-            tracing::warn!("failed to shut down replaced MCP runtime");
-        }
-    }));
 }
 
 async fn shutdown_when_unused(runtime: Arc<McpClientRuntime>) -> Result<()> {
@@ -3699,6 +3933,135 @@ spec: {}
                 .is_err(),
             "wipe should publish exactly one event"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_atomically_drains_cached_mcp_runtimes() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let session_id = SessionId::new("shutdown-mcp-cache");
+        let runtime = McpClientRuntime::start(
+            crate::mcp::McpConfig::new(),
+            "file:///tmp".to_owned(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        sessions
+            .mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .insert(
+                session_id,
+                CachedMcpRuntime {
+                    runtime,
+                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
+                        trace_propagation: false,
+                        connections: Vec::new(),
+                    },
+                    credentialed_servers: BTreeSet::new(),
+                },
+            );
+
+        sessions.shutdown().await;
+
+        assert!(
+            sessions
+                .mcp_sessions
+                .lock()
+                .expect("MCP runtime cache lock poisoned")
+                .is_empty()
+        );
+        assert!(
+            sessions
+                .mcp_preparation_guards
+                .lock()
+                .expect("MCP preparation guard map lock poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_callers_wait_for_the_same_runtime_drain() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let session_id = SessionId::new("concurrent-shutdown-mcp-cache");
+        let runtime = McpClientRuntime::start(
+            crate::mcp::McpConfig::new(),
+            "file:///tmp".to_owned(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let held = Arc::clone(&runtime);
+        sessions
+            .mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .insert(
+                session_id,
+                CachedMcpRuntime {
+                    runtime,
+                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
+                        trace_propagation: false,
+                        connections: Vec::new(),
+                    },
+                    credentialed_servers: BTreeSet::new(),
+                },
+            );
+
+        let first = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let second = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_a_runtime_retired_before_cache_drain() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let runtime = McpClientRuntime::start(
+            crate::mcp::McpConfig::new(),
+            "file:///tmp".to_owned(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let held = Arc::clone(&runtime);
+        let retirement =
+            sessions.retire_mcp_runtime(SessionId::new("retired-before-shutdown"), runtime);
+        let waiter = tokio::spawn({
+            let retirement = Arc::clone(&retirement);
+            async move { retirement.wait().await }
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        let shutdown = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5100,6 +5463,39 @@ spec: {}"
             shutdown_sessions.release_pause(&shutdown_lease).await,
             Err(SessionPauseError::OwnershipLost { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_active_run_cleanup() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let session_id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        let submission = sessions
+            .submit_prompt(
+                session_id.clone(),
+                "active",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+
+        sessions.shutdown().await;
+
+        let _outcome = tokio::time::timeout(Duration::from_millis(10), submission.handle.wait())
+            .await
+            .expect("shutdown must resolve the active run handle before returning");
+        assert!(sessions.active_state(&session_id).await.is_none());
+        assert_eq!(sessions.run_drain.active.load(AtomicOrdering::Acquire), 0);
     }
 
     #[tokio::test]
