@@ -20,22 +20,23 @@ path = "src/main.rs"
 tauri-build = { version = "=2.5.4", features = [] }
 
 [dependencies]
-arc-swap.workspace = true
 async-trait = "0.1.89"
 futures-channel.workspace = true
-waltr-client = { workspace = true, features = ["native-access", "native-tracing"] }
+waltr-client = { workspace = true, features = ["native-tracing"] }
+waltr-server = { path = "../waltr-server", version = "0.1.0", default-features = false }
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-http = "0.32.0"
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rand.workspace = true
 rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tauri = { version = "=2.10.1", features = [] }
 tauri-plugin-opener = "=2.5.0"
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -46,14 +47,11 @@ webpki-roots.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-native-keyring-store = "=1.0.0"
 jni = "0.21.1"
 jni_fn = "0.1.2"
-keyring-core = "=1.0.0"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring-core = "=1.0.0"
-zbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+waltr-server = { path = "../waltr-server", version = "0.1.0", default-features = false, features = ["shell"] }
 
 [lints]
 workspace = true

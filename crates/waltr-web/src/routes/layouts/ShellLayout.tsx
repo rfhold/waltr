@@ -89,29 +89,20 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
     setLoggingOut(true);
     setLogoutError(undefined);
 
-    const nativeAccess = app.nativeAccess();
-    if (nativeAccess) {
-      try {
-        await nativeAccess.logout();
-      } catch {
-        setLogoutError("Waltr could not sign you out. Try again.");
-      } finally {
-        setLoggingOut(false);
-      }
-      return;
-    }
-
-    let response: Response;
-    try {
-      response = await fetch("/oidc/logout", { method: "POST", credentials: "same-origin" });
-    } catch {
-      setLogoutError("Unable to reach Waltr to sign out. Check your connection and try again.");
+    const accessOperations = app.accessOperations();
+    if (!accessOperations) {
       setLoggingOut(false);
       return;
     }
 
-    if (!response.ok) {
-      setLogoutError("Waltr could not sign you out. Try again.");
+    try {
+      if (!await accessOperations.logout()) {
+        setLogoutError("Waltr could not sign you out. Try again.");
+        setLoggingOut(false);
+        return;
+      }
+    } catch {
+      setLogoutError("Unable to reach Waltr to sign out. Check your connection and try again.");
       setLoggingOut(false);
       return;
     }
@@ -216,11 +207,13 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
           >
             Config
           </A>
-          <button class="shell__logout" type="button" disabled={loggingOut()} onClick={logout}>
-            {loggingOut() ? "Signing out..." : "Sign out"}
-          </button>
-          <Show when={logoutError()}>
-            {(message) => <p class="shell__logout-error" role="alert">{message()}</p>}
+          <Show when={app.accessOperations()}>
+            <button class="shell__logout" type="button" disabled={loggingOut()} onClick={logout}>
+              {loggingOut() ? "Signing out..." : "Sign out"}
+            </button>
+            <Show when={logoutError()}>
+              {(message) => <p class="shell__logout-error" role="alert">{message()}</p>}
+            </Show>
           </Show>
           <section class="shell__status" aria-label="Global system status" role="status" aria-live="polite">
             <div class="shell__status-details">

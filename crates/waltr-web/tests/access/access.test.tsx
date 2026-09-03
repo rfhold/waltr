@@ -2,7 +2,7 @@ import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { AuthAttemptSnapshot, ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
-import type { NativeAccessOperations } from "../../src/platform/client";
+import type { AccessOperations } from "../../src/platform/client";
 import { AccessRoute, waltrLoginUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
 import { ShellRouteWithChildren, testHistory } from "../support/routes";
@@ -120,42 +120,103 @@ describe("Waltr access", () => {
     await waitFor(() => expect(commands).toContainEqual({ type: "cancelWaltrLogin", attemptId: "attempt-cancel" }));
   });
 
-  test("native login and cancel use access IPC without browser navigation", async () => {
-    const nativeAccess = nativeAccessMock();
-    const navigate = vi.fn();
+  test("cancels the active attempt without access operations", async () => {
     const commands: ClientCommand[] = [];
-    const view = renderWithAppState(() => <AccessRoute navigate={navigate} />, {
+    renderWithAppState(() => <AccessRoute />, {
+      snapshot: accessSnapshot("loginInProgress", "attempt-without-operations"),
+      commands,
+      accessOperations: null,
+    });
+
+    expect(screen.getByRole("status").textContent).toBe("Login in progress");
+    expect(screen.queryByText("Waltr access operations are unavailable in this client.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel login" }));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "cancelWaltrLogin",
+      attemptId: "attempt-without-operations",
+    }));
+  });
+
+  test("shows cancellation failure without access operations", async () => {
+    const commands: ClientCommand[] = [];
+    renderWithAppState(() => <AccessRoute />, {
+      snapshot: accessSnapshot("loginInProgress", "attempt-cancel-failed"),
+      commands,
+      accessOperations: null,
+      onDispatch: (command) => {
+        if (command.type === "cancelWaltrLogin") {
+          throw new Error("Unable to cancel this login attempt.");
+        }
+        throw new Error("Unexpected command.");
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel login" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Unable to cancel this login attempt."));
+    expect(commands).toContainEqual({ type: "cancelWaltrLogin", attemptId: "attempt-cancel-failed" });
+    expect(screen.getByRole("button", { name: "Cancel login" })).toBeTruthy();
+  });
+
+  test("generic access opening uses the adapter capability while cancellation stays snapshot-driven", async () => {
+    const accessOperations = accessOperationsMock();
+    const commands: ClientCommand[] = [];
+    const started = accessSnapshot("loginInProgress", "attempt-capability");
+    const view = renderWithAppState(() => <AccessRoute />, {
       snapshot: accessSnapshot("loginRequired"),
       commands,
-      nativeAccess,
+      accessOperations,
+      onDispatch: (command, snapshot, setSnapshot) => {
+        if (command.type === "startWaltrLogin") {
+          setSnapshot(started);
+          return started;
+        }
+        return snapshot!;
+      },
     });
 
     fireEvent.click(screen.getByRole("link", { name: "Sign in" }));
-    await waitFor(() => expect(nativeAccess.start).toHaveBeenCalledOnce());
-    expect(navigate).not.toHaveBeenCalled();
-    expect(commands).toEqual([]);
+    await waitFor(() => expect(accessOperations.openLogin).toHaveBeenCalledWith("/oidc/login?return_to=%2F"));
+    expect(commands).toContainEqual({ type: "startWaltrLogin" });
 
     view.unmount();
-    renderWithAppState(() => <AccessRoute navigate={navigate} />, {
-      snapshot: accessSnapshot("loginInProgress", "native-attempt"),
+    renderWithAppState(() => <AccessRoute />, {
+      snapshot: accessSnapshot("loginInProgress", "capability-attempt"),
       commands,
-      nativeAccess,
+      accessOperations,
     });
     fireEvent.click(screen.getByRole("button", { name: "Cancel login" }));
-    await waitFor(() => expect(nativeAccess.cancel).toHaveBeenCalledOnce());
-    expect(commands).toEqual([]);
+    await waitFor(() => expect(commands).toContainEqual({ type: "cancelWaltrLogin", attemptId: "capability-attempt" }));
   });
 
-  test("renders secure-store degradation as a warning alert", () => {
-    const message = "Secure credential storage is unavailable; login lasts only until the app stops";
-    renderWithAppState(() => <AccessRoute />, {
+  test("login-required snapshot remains authoritative without access operations", () => {
+    renderWithAppState(() => <ShellRouteWithChildren />, {
       snapshot: accessSnapshot("loginRequired"),
-      accessProgress: { type: "warning", message },
+      accessOperations: null,
     });
 
-    const warning = screen.getByRole("status");
-    expect(warning.textContent).toBe(message);
-    expect(warning.classList.contains("ui-alert--warning")).toBe(true);
+    expect(screen.getByRole("heading", { name: "Sign in to continue" })).toBeTruthy();
+    expect(screen.getByText("Waltr access operations are unavailable in this client.")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Sign in" })).toBeNull();
+    expect(screen.queryByLabelText("Primary navigation")).toBeNull();
+  });
+
+  test("authenticated snapshot enters the shell without access operations", () => {
+    const snapshot = snapshotWithConfig(
+      { etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null },
+      { ready: true },
+    );
+    snapshot.access = { status: "authenticated", error: null, activeAttemptId: null };
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/",
+      snapshot,
+      accessOperations: null,
+    });
+
+    expect(screen.getByLabelText("Primary navigation")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Sign in" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
   });
 
   test("validates encoded return paths through bounded decoding", () => {
@@ -332,16 +393,78 @@ describe("Waltr access", () => {
 
   test("native OAuth opening prevents WebView navigation and uses the narrow opener", () => {
     const openExternalUrl = vi.fn().mockResolvedValue(undefined);
+    const openAuthorizationAttempt = vi.fn().mockResolvedValue(undefined);
     renderWithAppState(() => <ShellRouteWithChildren />, {
       routePath: "/config/provider",
       snapshot: outboundAuthSnapshot(),
       explicitAuthTarget: { kind: "mcpServer", key: "remote" },
       openExternalUrl,
+      openAuthorizationAttempt,
     });
 
     const link = screen.getByRole("link", { name: "Open authorization URL" });
     expect(fireEvent.click(link)).toBe(false);
     expect(openExternalUrl).toHaveBeenCalledWith("https://auth.example/authorize");
+    expect(openAuthorizationAttempt).not.toHaveBeenCalled();
+  });
+
+  test("a pending opaque OAuth attempt uses the available narrow opener", async () => {
+    const openAuthorizationAttempt = vi.fn().mockResolvedValue(undefined);
+    const openExternalUrl = vi.fn().mockResolvedValue(undefined);
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      snapshot: outboundAuthSnapshot({ authUrl: "" }),
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+      openAuthorizationAttempt,
+      openExternalUrl,
+    });
+
+    expect(screen.queryByText("Authorization URL unavailable.")).toBeNull();
+    expect(screen.queryByText(/https?:\/\//)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open authorization" }));
+
+    await waitFor(() => expect(openAuthorizationAttempt).toHaveBeenCalledWith("attempt-1"));
+    expect(openExternalUrl).not.toHaveBeenCalled();
+  });
+
+  test("a completing opaque OAuth attempt cannot use the cleared narrow opener", () => {
+    const openAuthorizationAttempt = vi.fn().mockResolvedValue(undefined);
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      snapshot: outboundAuthSnapshot({ authUrl: "", lifecycle: "completing" }),
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+      openAuthorizationAttempt,
+    });
+
+    expect(screen.getByText("Authorization URL unavailable.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open authorization" })).toBeNull();
+    expect(openAuthorizationAttempt).not.toHaveBeenCalled();
+  });
+
+  test("renders a bounded opaque opener error", async () => {
+    const openAuthorizationAttempt = vi.fn().mockRejectedValue(new Error("stale attempt at http://private.invalid"));
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      snapshot: outboundAuthSnapshot({ authUrl: "" }),
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+      openAuthorizationAttempt,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open authorization" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Authorization could not be opened. Try again."));
+    expect(screen.queryByText(/private\.invalid/)).toBeNull();
+  });
+
+  test("shows the generic unavailable state when an opaque attempt has no opener", () => {
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      snapshot: outboundAuthSnapshot({ authUrl: "" }),
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+    });
+
+    expect(screen.getByText("Authorization URL unavailable.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open authorization" })).toBeNull();
   });
 
   test("does not flash the protected shell while access is unresolved", () => {
@@ -418,28 +541,51 @@ describe("Waltr access", () => {
     await waitFor(() => expect(screen.queryByLabelText("Primary navigation")).toBeNull());
   });
 
-  test("native logout uses access IPC without fetch, reducer dispatch, or reload", async () => {
+  test("logout uses the generic access capability before reducer dispatch", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     const reload = vi.fn();
     const commands: ClientCommand[] = [];
     let completeLogout!: () => void;
-    const logout = new Promise<void>((resolve) => { completeLogout = resolve; });
-    const nativeAccess = { ...nativeAccessMock(), logout: vi.fn(() => logout) };
+    const logout = new Promise<boolean>((resolve) => { completeLogout = () => resolve(true); });
+    const accessOperations = { ...accessOperationsMock(), logout: vi.fn(() => logout) };
+    const signedOut = accessSnapshot("loginRequired");
     renderWithAppState(() => <ShellRouteWithChildren reload={reload} />, {
       snapshot: accessSnapshot("authenticated"),
       commands,
-      nativeAccess,
+      accessOperations,
+      onDispatch: (command, snapshot, setSnapshot) => {
+        if (command.type === "logoutWaltr") {
+          setSnapshot(signedOut);
+          return signedOut;
+        }
+        return snapshot!;
+      },
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
-    await waitFor(() => expect(nativeAccess.logout).toHaveBeenCalledOnce());
+    await waitFor(() => expect(accessOperations.logout).toHaveBeenCalledOnce());
     expect(screen.getByRole("button", { name: "Signing out..." })).toHaveProperty("disabled", true);
     completeLogout();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Sign out" })).toBeTruthy());
+    await waitFor(() => expect(commands).toContainEqual({ type: "logoutWaltr" }));
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(commands.some((command) => command.type === "logoutWaltr")).toBe(false);
     expect(reload).not.toHaveBeenCalled();
+  });
+
+  test("an absent access capability suppresses sign out without suppressing provider OAuth", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      snapshot: outboundAuthSnapshot({ target: { kind: "provider", key: "claude" } }),
+      explicitAuthTarget: { kind: "provider", key: "claude" },
+      accessOperations: null,
+    });
+
+    expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "OAuth authorization" })).toBeTruthy();
+    expect(screen.getByText("Authenticate provider claude.")).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   test("reloads after local logout fails behind successful server logout", async () => {
@@ -504,12 +650,9 @@ function outboundAuthSnapshot(overrides: Partial<AuthAttemptSnapshot> = {}) {
   return snapshot;
 }
 
-function nativeAccessMock(): NativeAccessOperations {
+function accessOperationsMock(): AccessOperations {
   return {
-    progress: () => undefined,
-    subscribe: () => () => undefined,
-    start: vi.fn().mockResolvedValue(undefined),
-    cancel: vi.fn().mockResolvedValue(undefined),
-    logout: vi.fn().mockResolvedValue(undefined),
+    openLogin: vi.fn().mockResolvedValue(undefined),
+    logout: vi.fn().mockResolvedValue(true),
   };
 }

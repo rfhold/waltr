@@ -4,7 +4,7 @@ import { afterEach } from "vitest";
 
 import { AppStateContextProvider } from "../../src/app/context";
 import type { AuthenticationFailureSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
-import type { AccessProgress, NativeAccessOperations } from "../../src/platform/client";
+import type { AccessOperations } from "../../src/platform/client";
 import { resetTestHistory } from "./routes";
 import { emptyConfig, snapshotWithConfig } from "./snapshots";
 
@@ -23,8 +23,8 @@ export function renderWithAppState(
     minimumSplashElapsed?: boolean;
     routePath?: string;
     explicitAuthTarget?: ClientAuthTarget;
-    nativeAccess?: NativeAccessOperations;
-    accessProgress?: AccessProgress;
+    accessOperations?: AccessOperations | null;
+    openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
     openExternalUrl?: (url: string) => Promise<void>;
     configPatchError?: string;
     sessionCreateError?: string;
@@ -63,6 +63,13 @@ export function renderWithAppState(
         return options.onDispatch(command, snapshot(), setSnapshot);
       }
       return snapshot() ?? snapshotWithConfig(emptyConfig(""));
+    };
+    const browserAccessOperations: AccessOperations = {
+      openLogin: (url) => window.location.assign(url),
+      logout: async () => {
+        const response = await fetch("/oidc/logout", { method: "POST", credentials: "same-origin" });
+        return response.ok;
+      },
     };
 
     const dispatchConfigPatch = async (command: ClientCommand) => {
@@ -436,8 +443,10 @@ export function renderWithAppState(
           clientLoaded: () => options.clientLoaded ?? true,
           systemReady,
           explicitAuthTarget,
-          nativeAccess: () => options.nativeAccess,
-          accessProgress: () => options.accessProgress,
+          accessOperations: () => options.accessOperations === null
+            ? undefined
+            : options.accessOperations ?? browserAccessOperations,
+          openAuthorizationAttempt: () => options.openAuthorizationAttempt,
           openExternalUrl: () => options.openExternalUrl,
           dispatch,
           dispatchBeginExplicitAuth: async (target) => {

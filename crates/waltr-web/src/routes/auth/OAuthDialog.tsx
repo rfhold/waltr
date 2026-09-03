@@ -84,6 +84,9 @@ export function OAuthDialog() {
   const cancellable = createMemo(() => ["pending", "completing"].includes(attempt()?.lifecycle ?? ""));
   const manualInput = createMemo(() => attempt()?.completionMode === "manual" && attempt()?.lifecycle === "pending");
   const authorizationUrl = createMemo(() => safeAuthorizationUrl(attempt()?.authUrl ?? ""));
+  const opaqueAuthorization = createMemo(() => (
+    Boolean(attemptId() && app.openAuthorizationAttempt()) && attempt()?.lifecycle === "pending" && !authorizationUrl()
+  ));
   const busy = createMemo(() => {
     const auth = app.snapshot()?.auth;
 
@@ -154,6 +157,20 @@ export function OAuthDialog() {
       setLocalError(displayText(error instanceof Error ? error.message : "Authorization URL could not be opened."));
     });
   };
+  const openOpaqueAuthorization = async () => {
+    const currentAttemptId = attemptId();
+    const openAttempt = app.openAuthorizationAttempt();
+    setLocalError(undefined);
+    if (!currentAttemptId || !openAttempt) {
+      setLocalError("Authorization opener unavailable.");
+      return;
+    }
+    try {
+      await openAttempt(currentAttemptId);
+    } catch {
+      setLocalError("Authorization could not be opened. Try again.");
+    }
+  };
 
   return (
     <Show when={target()}>
@@ -184,7 +201,9 @@ export function OAuthDialog() {
                   </Show>
                   <Show
                     when={authorizationUrl()}
-                    fallback={<InlineAlert tone="danger">Authorization URL unavailable.</InlineAlert>}
+                    fallback={opaqueAuthorization()
+                      ? null
+                      : <InlineAlert tone="danger">Authorization URL unavailable.</InlineAlert>}
                   >
                     {(url) => (
                       <code class="oauth-dialog__url">{url()}</code>
@@ -217,7 +236,11 @@ export function OAuthDialog() {
             </Show>
 
             <div class="config__form-actions oauth-dialog__actions">
-              <Show when={!terminal() ? authorizationUrl() : undefined}>
+              <Show when={!terminal() ? authorizationUrl() : undefined} fallback={
+                <Show when={opaqueAuthorization()}>
+                  <button type="button" class="ui-button oauth-dialog__open" disabled={busy()} onClick={openOpaqueAuthorization}>Open authorization</button>
+                </Show>
+              }>
                 {(url) => <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer" onClick={(event) => openAuthorization(url(), event)}>Open authorization URL</a>}
               </Show>
               <Show when={manualInput()}>

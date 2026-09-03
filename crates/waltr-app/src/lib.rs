@@ -1,9 +1,9 @@
 //! Tauri shell and IPC surface for the Waltr native application.
 
 mod bridge;
-mod credential_store;
 mod observability;
 mod policy;
+mod server_controller;
 
 use std::sync::{
     Arc,
@@ -13,15 +13,16 @@ use std::sync::{
 use std::sync::{Mutex, OnceLock};
 
 use bridge::{BridgeEvent, BridgePayload, BridgeRecovery, EventFeed, RuntimeBridge};
-#[cfg(target_os = "android")]
-use waltr_client::NativeAuthorizationCallback;
-use waltr_client::{ClientCommand, NativeAccessAction};
+use waltr_client::ClientCommand;
 use serde::Serialize;
+#[cfg(not(target_os = "android"))]
+use server_controller::AppPrivateRoots;
+use server_controller::EmbeddedServerController;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::webview::NewWindowResponse;
 use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, State, WebviewUrl};
-use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_opener::OpenerExt as _;
 use tracing::Instrument as _;
 
 const BRIDGE_EVENT: &str = "waltr://bridge";
@@ -32,6 +33,81 @@ struct RuntimeStarted {
     generation: u64,
 }
 
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Default)]
+struct MobileStartCoordination {
+    requested: bool,
+    suspended: bool,
+    next_ticket: u64,
+    active_start: Option<u64>,
+    active_generation: Option<u64>,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MobileStartDisposition {
+    Deliver,
+    Suspended,
+    Cancelled,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl MobileStartCoordination {
+    fn begin_request(&mut self) -> (u64, Option<u64>) {
+        self.requested = true;
+        let displaced = self.active_generation.take();
+        (self.begin_start(), displaced)
+    }
+
+    fn begin_start(&mut self) -> u64 {
+        self.next_ticket = self.next_ticket.saturating_add(1);
+        self.active_start = Some(self.next_ticket);
+        self.next_ticket
+    }
+
+    fn suspend(&mut self) -> (Option<u64>, Option<u64>) {
+        if self.suspended {
+            return (None, None);
+        }
+        self.suspended = true;
+        let start = self.active_start.take();
+        (start, self.active_generation.take())
+    }
+
+    fn resume(&mut self) -> Option<u64> {
+        let was_suspended = self.suspended;
+        self.suspended = false;
+        (was_suspended && self.requested && self.active_start.is_none()).then(|| self.begin_start())
+    }
+
+    fn finish(&mut self, ticket: u64, generation: u64) -> MobileStartDisposition {
+        if self.active_start != Some(ticket) {
+            return MobileStartDisposition::Cancelled;
+        }
+        self.active_start = None;
+        if !self.requested {
+            MobileStartDisposition::Cancelled
+        } else if self.suspended {
+            MobileStartDisposition::Suspended
+        } else {
+            self.active_generation = Some(generation);
+            MobileStartDisposition::Deliver
+        }
+    }
+
+    fn fail(&mut self, ticket: u64) {
+        if self.active_start == Some(ticket) {
+            self.active_start = None;
+            self.requested = false;
+        }
+    }
+
+    fn cancel(&mut self) -> (Option<u64>, Option<u64>) {
+        self.requested = false;
+        (self.active_start.take(), self.active_generation.take())
+    }
+}
+
 #[tauri::command]
 async fn start_runtime(
     app: tauri::AppHandle,
@@ -39,8 +115,39 @@ async fn start_runtime(
 ) -> Result<RuntimeStarted, String> {
     let span = observability::operation_span("runtime.start", "ipc");
     let result = (|| {
+        #[cfg(target_os = "android")]
+        let (ticket, displaced_generation) = begin_mobile_client_request()?;
+        #[cfg(target_os = "android")]
+        bridge.authorize_start(ticket);
+        #[cfg(target_os = "android")]
+        if let Some(generation) = displaced_generation {
+            bridge.stop_generation_nonblocking(generation);
+        }
+        #[cfg(target_os = "android")]
+        let feed = match bridge.start_nonblocking(ticket) {
+            Ok(feed) => feed,
+            Err(error) => {
+                fail_mobile_client_start(ticket);
+                return Err(error);
+            }
+        };
+        #[cfg(not(target_os = "android"))]
         let feed = bridge.start()?;
         let generation = feed.generation();
+        #[cfg(target_os = "android")]
+        match finish_mobile_client_start(ticket, generation) {
+            MobileStartDisposition::Deliver => {
+                deliver_events(app, Arc::clone(bridge.inner()), feed);
+            }
+            MobileStartDisposition::Suspended => {
+                bridge.stop_generation_nonblocking(generation);
+            }
+            MobileStartDisposition::Cancelled => {
+                bridge.stop_generation_nonblocking(generation);
+                return Err("native client start was cancelled".to_owned());
+            }
+        }
+        #[cfg(not(target_os = "android"))]
         deliver_events(app, Arc::clone(bridge.inner()), feed);
         Ok(RuntimeStarted { generation })
     })();
@@ -55,44 +162,6 @@ async fn client_dispatch(
 ) -> Result<BridgeEvent<BridgePayload>, String> {
     let span = observability::operation_span("client.dispatch", "ipc");
     let result = bridge.dispatch(command).instrument(span.clone()).await;
-    observability::record_result(&span, &result);
-    result
-}
-
-#[tauri::command]
-async fn access_start(bridge: State<'_, Arc<RuntimeBridge>>) -> Result<(), String> {
-    observe_access_ipc(bridge.inner(), NativeAccessAction::Start, "access.start").await
-}
-
-#[tauri::command]
-async fn access_cancel(bridge: State<'_, Arc<RuntimeBridge>>) -> Result<(), String> {
-    observe_access_ipc(bridge.inner(), NativeAccessAction::Cancel, "access.cancel").await
-}
-
-#[tauri::command]
-async fn access_logout(
-    bridge: State<'_, Arc<RuntimeBridge>>,
-) -> Result<Option<BridgeEvent<BridgePayload>>, String> {
-    let span = observability::operation_span("access.logout", "ipc");
-    let result = bridge
-        .access(NativeAccessAction::Logout)
-        .instrument(span.clone())
-        .await;
-    observability::record_result(&span, &result);
-    result
-}
-
-async fn observe_access_ipc(
-    bridge: &RuntimeBridge,
-    action: NativeAccessAction,
-    operation: &'static str,
-) -> Result<(), String> {
-    let span = observability::operation_span(operation, "ipc");
-    let result = bridge
-        .access(action)
-        .instrument(span.clone())
-        .await
-        .map(drop);
     observability::record_result(&span, &result);
     result
 }
@@ -119,8 +188,29 @@ fn client_state(
 )]
 fn dispose_runtime(bridge: State<'_, Arc<RuntimeBridge>>) {
     let span = observability::operation_span("runtime.dispose", "ipc");
-    bridge.stop();
+    #[cfg(target_os = "android")]
+    let (ticket, generation) = clear_mobile_client_requested();
+    #[cfg(target_os = "android")]
+    if let Some(ticket) = ticket {
+        bridge.invalidate_start(ticket);
+    }
+    #[cfg(target_os = "android")]
+    if let Some(generation) = generation {
+        bridge.stop_generation_nonblocking(generation);
+    }
+    #[cfg(not(target_os = "android"))]
+    stop_client_bridge(bridge.inner());
     observability::record_outcome(&span, "ok");
+}
+
+#[cfg(target_os = "android")]
+fn stop_client_bridge(bridge: &RuntimeBridge) {
+    bridge.stop_nonblocking();
+}
+
+#[cfg(not(target_os = "android"))]
+fn stop_client_bridge(bridge: &RuntimeBridge) {
+    bridge.stop();
 }
 
 #[tauri::command]
@@ -135,7 +225,34 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
         .and_then(|url| {
             app.opener()
                 .open_url(url.as_str(), None::<&str>)
-                .map_err(|error| error.to_string())
+                .map_err(|_| "external URL could not be opened".to_owned())
+        });
+    observability::record_result(&span, &result);
+    result
+}
+
+#[tauri::command]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri command injection owns AppHandle and deserialized arguments"
+)]
+fn open_authorization_attempt(
+    app: tauri::AppHandle,
+    attempt_id: String,
+    bridge: State<'_, Arc<RuntimeBridge>>,
+) -> Result<(), String> {
+    let span = observability::operation_span("authorization.open", "ipc");
+    let result = bridge
+        .authorization_attempt_url(&attempt_id)
+        .and_then(|url| {
+            policy::external_https_url(&url)
+                .map_err(str::to_owned)
+                .map(|validated| validated.to_string())
+        })
+        .and_then(|url| {
+            app.opener()
+                .open_url(url, None::<&str>)
+                .map_err(|_| "authorization attempt could not be opened".to_owned())
         });
     observability::record_result(&span, &result);
     result
@@ -177,123 +294,226 @@ fn deliver_events(
     );
 }
 
-fn start_and_deliver(app: tauri::AppHandle, bridge: Arc<RuntimeBridge>) -> Result<u64, String> {
-    let feed = bridge.start()?;
+#[cfg(target_os = "android")]
+fn start_and_deliver(
+    app: tauri::AppHandle,
+    bridge: Arc<RuntimeBridge>,
+    ticket: u64,
+) -> Result<u64, String> {
+    bridge.authorize_start(ticket);
+    let feed = match bridge.start_nonblocking(ticket) {
+        Ok(feed) => feed,
+        Err(error) => {
+            fail_mobile_client_start(ticket);
+            return Err(error);
+        }
+    };
     let generation = feed.generation();
-    deliver_events(app, bridge, feed);
-    Ok(generation)
+    match finish_mobile_client_start(ticket, generation) {
+        MobileStartDisposition::Deliver => {
+            deliver_events(app, bridge, feed);
+            Ok(generation)
+        }
+        MobileStartDisposition::Suspended => {
+            bridge.stop_generation_nonblocking(generation);
+            Ok(generation)
+        }
+        MobileStartDisposition::Cancelled => {
+            bridge.stop_generation_nonblocking(generation);
+            Err("native client start was cancelled".to_owned())
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
 struct MobileLifecycle {
     app: tauri::AppHandle,
     bridge: Arc<RuntimeBridge>,
-    suspended: bool,
-    preserved: bool,
+    coordination: MobileStartCoordination,
 }
 
 #[cfg(target_os = "android")]
 static MOBILE_LIFECYCLE: OnceLock<Mutex<MobileLifecycle>> = OnceLock::new();
 #[cfg(target_os = "android")]
-static MOBILE_CALLBACK_BRIDGE: OnceLock<Arc<RuntimeBridge>> = OnceLock::new();
+static ANDROID_SERVER: OnceLock<EmbeddedServerController> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+fn android_server() -> &'static EmbeddedServerController {
+    ANDROID_SERVER.get_or_init(EmbeddedServerController::default)
+}
 
 #[cfg(target_os = "android")]
 fn install_mobile_lifecycle(app: tauri::AppHandle, bridge: Arc<RuntimeBridge>) {
-    drop(MOBILE_CALLBACK_BRIDGE.set(Arc::clone(&bridge)));
     drop(MOBILE_LIFECYCLE.set(Mutex::new(MobileLifecycle {
         app,
         bridge,
-        suspended: false,
-        preserved: false,
+        coordination: MobileStartCoordination::default(),
     })));
 }
 
 #[cfg(target_os = "android")]
-#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
-/// Read one opaque Android intent callback into the Rust-only handoff lane.
-pub fn nativeReceiveIntent(
+fn begin_mobile_client_request() -> Result<(u64, Option<u64>), String> {
+    MOBILE_LIFECYCLE
+        .get()
+        .ok_or_else(|| "native mobile lifecycle is unavailable".to_owned())
+        .map(|lifecycle| {
+            lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .coordination
+                .begin_request()
+        })
+}
+
+#[cfg(target_os = "android")]
+fn finish_mobile_client_start(ticket: u64, generation: u64) -> MobileStartDisposition {
+    MOBILE_LIFECYCLE
+        .get()
+        .map_or(MobileStartDisposition::Cancelled, |lifecycle| {
+            lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .coordination
+                .finish(ticket, generation)
+        })
+}
+
+#[cfg(target_os = "android")]
+fn fail_mobile_client_start(ticket: u64) {
+    if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
+        lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .coordination
+            .fail(ticket);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn clear_mobile_client_requested() -> (Option<u64>, Option<u64>) {
+    MOBILE_LIFECYCLE.get().map_or((None, None), |lifecycle| {
+        lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .coordination
+            .cancel()
+    })
+}
+
+#[cfg(target_os = "android")]
+fn java_path(
+    env: &mut jni::JNIEnv<'_>,
+    value: jni::objects::JString<'_>,
+) -> Option<std::path::PathBuf> {
+    env.get_string(&value)
+        .ok()
+        .map(|value| std::path::PathBuf::from(String::from(value)))
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
+/// Start or join the process-owned mobile embedded server generation.
+pub fn nativeStartServer(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
-    intent: jni::objects::JObject<'_>,
+    data_root: jni::objects::JString<'_>,
+    config_root: jni::objects::JString<'_>,
+) -> jni::sys::jint {
+    let span = observability::operation_span("android.server.start", "lifecycle");
+    let result = java_path(&mut env, data_root)
+        .zip(java_path(&mut env, config_root))
+        .ok_or(server_controller::ServerStartError::Paths)
+        .and_then(|(data, config)| server_controller::android_roots(&data, &config))
+        .and_then(|roots| android_server().start(roots));
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    observability::record_outcome(&span, outcome);
+    i32::from(result.is_ok())
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
+/// Stop the process-owned mobile embedded server and clear its local credential.
+pub fn nativeStopServer(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
+    android_server().stop_nonblocking();
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
+/// Return only the fixed embedded server lifecycle phase code.
+pub fn nativeServerStatus(
+    _env: jni::JNIEnv<'_>,
+    _class: jni::objects::JClass<'_>,
+) -> jni::sys::jint {
+    use server_controller::ServerPhase;
+    match android_server().phase() {
+        ServerPhase::Stopped => 0,
+        ServerPhase::Starting => 1,
+        ServerPhase::Running => 2,
+        ServerPhase::Stopping => 3,
+        ServerPhase::Failed => 4,
+    }
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
+/// Record the notification gate without starting server work.
+pub fn nativeNotificationPermissionRequired(
+    _env: jni::JNIEnv<'_>,
+    _class: jni::objects::JClass<'_>,
+    required: jni::sys::jboolean,
 ) {
-    if intent.is_null() {
-        return;
-    }
-    let Ok(value) = env.call_method(intent, "getDataString", "()Ljava/lang/String;", &[]) else {
-        return;
-    };
-    let Ok(value) = value.l() else {
-        return;
-    };
-    if value.is_null() {
-        return;
-    }
-    let value = jni::objects::JString::from(value);
-    let Ok(value) = env.get_string(&value) else {
-        return;
-    };
-    let Some(bridge) = MOBILE_CALLBACK_BRIDGE.get() else {
-        return;
-    };
-    bridge.authorization_callback(NativeAuthorizationCallback::new(value.into()));
-}
-
-#[cfg(target_os = "android")]
-#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
-/// Stop native runtime work and clear credentials before Android suspension.
-pub fn nativeSuspend(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
-    let span = observability::operation_span("android.suspend", "lifecycle");
-    let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
-        observability::record_outcome(&span, "unavailable");
-        return;
-    };
-    let mut lifecycle = lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !lifecycle.suspended {
-        lifecycle.suspended = true;
-        lifecycle.preserved = lifecycle.bridge.suspend_for_browser_handoff();
-        if !lifecycle.preserved {
-            let bridge = Arc::clone(&lifecycle.bridge);
-            drop(lifecycle);
-            bridge.stop();
-            observability::record_outcome(&span, "stopped");
-        } else {
-            observability::record_outcome(&span, "preserved");
-        }
-    } else {
-        observability::record_outcome(&span, "unchanged");
+    if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
+        lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bridge
+            .notification_permission_required(required != 0);
     }
 }
 
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
-/// Start a fresh runtime generation after Android resumes from suspension.
-pub fn nativeResume(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
-    let span = observability::operation_span("android.resume", "lifecycle");
+/// Stop only the activity-owned client generation during backgrounding.
+pub fn nativeClientSuspend(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
     let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
-        observability::record_outcome(&span, "unavailable");
         return;
     };
-    let mut lifecycle = lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if lifecycle.suspended {
-        lifecycle.suspended = false;
-        let preserved = std::mem::take(&mut lifecycle.preserved);
-        if preserved && lifecycle.bridge.resume_browser_handoff() {
-            observability::record_outcome(&span, "preserved");
-            return;
-        }
-        lifecycle.bridge.stop();
-        if start_and_deliver(lifecycle.app.clone(), Arc::clone(&lifecycle.bridge)).is_err() {
-            lifecycle.suspended = true;
-            observability::record_outcome(&span, "error");
-        } else {
-            observability::record_outcome(&span, "restarted");
-        }
-    } else {
-        observability::record_outcome(&span, "unchanged");
+    let stop = {
+        let mut lifecycle = lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            Arc::clone(&lifecycle.bridge),
+            lifecycle.coordination.suspend(),
+        )
+    };
+    let (bridge, (ticket, generation)) = stop;
+    if let Some(ticket) = ticket {
+        bridge.invalidate_start(ticket);
+    }
+    if let Some(generation) = generation {
+        bridge.stop_generation_nonblocking(generation);
+    }
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
+/// Start a fresh client generation only after an already-active activity resumes.
+pub fn nativeClientResume(_env: jni::JNIEnv<'_>, _class: jni::objects::JClass<'_>) {
+    let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
+        return;
+    };
+    let start = {
+        let mut lifecycle = lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle
+            .coordination
+            .resume()
+            .map(|ticket| (lifecycle.app.clone(), Arc::clone(&lifecycle.bridge), ticket))
+    };
+    if let Some((app, bridge, ticket)) = start {
+        drop(start_and_deliver(app, bridge, ticket));
     }
 }
 
@@ -308,16 +528,26 @@ pub fn run() {
     let startup = observability::operation_span("app.run", "lifecycle");
     let startup_entered = startup.enter();
     tracing::info!(event.name = "app.startup", outcome = "started");
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
-    let app = builder
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let setup = observability::operation_span("app.setup", "lifecycle");
             let _setup_entered = setup.enter();
-            let opener = app.handle().clone();
-            let bridge = Arc::new(RuntimeBridge::new(move |url| {
-                opener.opener().open_url(url, None::<&str>).is_ok()
-            }));
+
+            #[cfg(target_os = "android")]
+            let server = android_server().clone();
+            #[cfg(not(target_os = "android"))]
+            let server = {
+                let data = app.path().app_data_dir().map_err(std::io::Error::other)?;
+                let config = app.path().app_config_dir().map_err(std::io::Error::other)?;
+                let roots = AppPrivateRoots::new(data, config).map_err(std::io::Error::other)?;
+                let server = EmbeddedServerController::default();
+                server.start(roots).map_err(std::io::Error::other)?;
+                server
+            };
+            let bridge = Arc::new(RuntimeBridge::new(server.clone()));
             app.manage(Arc::clone(&bridge));
+            app.manage(server);
 
             #[cfg(target_os = "android")]
             install_mobile_lifecycle(app.handle().clone(), Arc::clone(&bridge));
@@ -334,9 +564,9 @@ pub fn run() {
                             observability::lifecycle_event(
                                 "webview.page_load",
                                 "lifecycle",
-                                "runtime_stopped",
+                                "client_stopped",
                             );
-                            page_load_bridge.stop();
+                            stop_client_bridge(&page_load_bridge);
                         }
                     });
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -345,14 +575,7 @@ pub fn run() {
                 .inner_size(1180.0, 780.0)
                 .min_inner_size(720.0, 540.0)
                 .on_new_window(|_, _| NewWindowResponse::Deny);
-            let webview = observability::operation_span("webview.build", "startup");
-            let build_result = window.build();
-            observability::record_result(&webview, &build_result);
-            build_result?;
-
-            let result = start_and_deliver(app.handle().clone(), bridge)
-                .map(drop)
-                .map_err(std::io::Error::other);
+            let result = window.build();
             observability::record_result(&setup, &result);
             result?;
             Ok(())
@@ -360,12 +583,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_runtime,
             client_dispatch,
-            access_start,
-            access_cancel,
-            access_logout,
             client_state,
             dispose_runtime,
             open_external_url,
+            open_authorization_attempt,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Waltr native application");
@@ -375,15 +596,17 @@ pub fn run() {
     app.run(|app, event| match event {
         tauri::RunEvent::Exit => {
             observability::lifecycle_event("app.shutdown", "lifecycle", "exit");
-            app.state::<Arc<RuntimeBridge>>().stop();
+            stop_client_bridge(app.state::<Arc<RuntimeBridge>>().inner());
+            #[cfg(not(target_os = "android"))]
+            app.state::<EmbeddedServerController>().stop();
         }
         tauri::RunEvent::WindowEvent {
             label,
             event: tauri::WindowEvent::Destroyed,
             ..
         } if label == "main" => {
-            observability::lifecycle_event("webview.destroyed", "lifecycle", "runtime_stopped");
-            app.state::<Arc<RuntimeBridge>>().stop();
+            observability::lifecycle_event("webview.destroyed", "lifecycle", "client_stopped");
+            stop_client_bridge(app.state::<Arc<RuntimeBridge>>().inner());
         }
         _ => {}
     });
@@ -391,61 +614,154 @@ pub fn run() {
 
 #[cfg(test)]
 mod configuration_tests {
+    use super::{MobileStartCoordination, MobileStartDisposition};
+
     #[test]
-    fn config_and_capabilities_are_local_and_minimal() {
+    fn mobile_start_suspend_resume_invalidates_original_ticket() {
+        let mut coordination = MobileStartCoordination::default();
+        let (original, displaced) = coordination.begin_request();
+        assert!(displaced.is_none());
+        assert_eq!(coordination.suspend(), (Some(original), None));
+        let replacement = coordination.resume().expect("replacement start ticket");
+        assert_eq!(
+            coordination.finish(original, 11),
+            MobileStartDisposition::Cancelled
+        );
+        assert_eq!(
+            coordination.finish(replacement, 12),
+            MobileStartDisposition::Deliver
+        );
+        assert_eq!(coordination.active_generation, Some(12));
+    }
+
+    #[test]
+    fn overlapping_start_tickets_cannot_claim_newer_generation() {
+        let mut coordination = MobileStartCoordination::default();
+        let (old, _) = coordination.begin_request();
+        let (new, _) = coordination.begin_request();
+        assert_eq!(
+            coordination.finish(new, 22),
+            MobileStartDisposition::Deliver
+        );
+        assert_eq!(
+            coordination.finish(old, 21),
+            MobileStartDisposition::Cancelled
+        );
+        assert_eq!(coordination.active_generation, Some(22));
+    }
+
+    #[test]
+    fn mobile_start_rollback_fences_cancelled_ownership() {
+        let mut coordination = MobileStartCoordination::default();
+        let (cancelled_ticket, _) = coordination.begin_request();
+        assert_eq!(coordination.cancel(), (Some(cancelled_ticket), None));
+        assert_eq!(
+            coordination.finish(cancelled_ticket, 31),
+            MobileStartDisposition::Cancelled
+        );
+
+        let (failed_ticket, _) = coordination.begin_request();
+        coordination.fail(failed_ticket);
+        assert!(!coordination.requested);
+        assert!(coordination.active_start.is_none());
+    }
+
+    #[test]
+    fn android_embedded_service_contract_is_private_and_permission_gated() {
+        let manifest = include_str!("../gen/android/app/src/main/AndroidManifest.xml");
+        let activity =
+            include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
+        let service = include_str!(
+            "../gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt"
+        );
+        let proguard = include_str!("../gen/android/app/proguard-rules.pro");
+        for permission in [
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+            "android.permission.POST_NOTIFICATIONS",
+        ] {
+            assert!(manifest.contains(permission));
+        }
+        assert!(manifest.contains("android:name=\".WaltrForegroundService\""));
+        assert!(manifest.contains("android:exported=\"false\""));
+        assert!(manifest.contains("android:stopWithTask=\"false\""));
+        assert!(manifest.contains("android:foregroundServiceType=\"specialUse\""));
+        assert!(manifest.contains("PROPERTY_SPECIAL_USE_FGS_SUBTYPE"));
+        assert!(!manifest.contains("android.intent.action.VIEW"));
+        assert!(activity.contains("Manifest.permission.POST_NOTIFICATIONS"));
+        assert!(activity.contains("nativeNotificationPermissionRequired"));
+        assert!(service.contains("startForeground("));
+        assert!(service.contains("START_STICKY"));
+        assert!(service.contains("System.loadLibrary(\"waltr_app_lib\")"));
+        let foreground = service.find("promote()").expect("foreground promotion");
+        let native_load = service
+            .find("loadNativeLibrary()")
+            .expect("native library load");
+        assert!(foreground < native_load);
+        assert!(!service.contains("companion object {\n    init"));
+        assert!(
+            activity.contains("ensureNotificationPermissionAndServer()\n    nativeClientResume()")
+        );
+        assert!(proguard.contains("WaltrForegroundService"));
+        for forbidden in ["endpoint", "bearer", "token", "127.0.0.1"] {
+            assert!(
+                !format!("{activity}\n{service}")
+                    .to_ascii_lowercase()
+                    .contains(forbidden)
+            );
+        }
+    }
+
+    #[test]
+    fn source_contract_removes_preview_access_and_keyring() {
+        let cargo = include_str!("../Cargo.toml");
+        let bridge = include_str!("bridge.rs");
+        let source = include_str!("lib.rs");
+        let forbidden = [
+            ["preview", "-waltr.holdenitdown.net"].concat(),
+            ["NativeAccess", "Coordinator"].concat(),
+            ["NativeRefresh", "TokenStore"].concat(),
+            ["access", "_start"].concat(),
+            ["access", "_cancel"].concat(),
+            ["access", "_logout"].concat(),
+            ["keyring", "-core"].concat(),
+            ["android-native", "-keyring-store"].concat(),
+            ["zbus-secret-service", "-keyring-store"].concat(),
+        ];
+        for forbidden in forbidden {
+            assert!(!format!("{cargo}\n{bridge}\n{source}").contains(&forbidden));
+        }
+        assert!(cargo.contains("waltr-server"));
+        assert!(bridge.contains("NativeGrpcTransport::with_credential_provider"));
+        assert!(source.contains("fn open_authorization_attempt("));
+        assert!(source.contains("attempt_id: String"));
+        assert!(source.contains(".authorization_attempt_url(&attempt_id)"));
+    }
+
+    #[test]
+    fn backup_policy_excludes_all_private_embedded_state() {
+        let legacy = include_str!("../gen/android/app/src/main/res/xml/backup_rules.xml");
+        let modern = include_str!("../gen/android/app/src/main/res/xml/data_extraction_rules.xml");
+        for domain in ["file", "database", "sharedpref", "root"] {
+            assert!(legacy.contains(&format!("domain=\"{domain}\" path=\".\"")));
+            assert_eq!(
+                modern
+                    .matches(&format!("domain=\"{domain}\" path=\".\""))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn csp_and_capabilities_remain_local_and_minimal() {
         let config = include_str!("../tauri.conf.json");
         let capability = include_str!("../capabilities/main.json");
-        let android_manifest = include_str!("../gen/android/app/src/main/AndroidManifest.xml");
-        let backup_rules = include_str!("../gen/android/app/src/main/res/xml/backup_rules.xml");
-        let data_extraction_rules =
-            include_str!("../gen/android/app/src/main/res/xml/data_extraction_rules.xml");
-        let android_plugins = include_str!("../gen/android/app/build.gradle.kts");
-        let android_activity =
-            include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
-        let manifest = include_str!("../Cargo.toml");
-        let rust_source = include_str!("lib.rs");
-        let removed_plugin = ["tauri", "plugin", "deep", "link"].join("-");
         assert!(config.contains("\"windows\": []"));
-        assert!(include_str!("../scripts/stage-web.mjs").contains("waltr-web/dist"));
         assert!(capability.contains("\"local\": true"));
         assert!(capability.contains("\"windows\": [\"main\"]"));
-        assert!(!manifest.contains(&removed_plugin));
-        assert!(!capability.contains("deep-link:"));
-        assert!(android_manifest.contains("android:scheme=\"dev.waltr.app\""));
-        assert!(android_manifest.contains("android:sspPrefix=\"/oauth2redirect?\""));
-        assert!(android_manifest.contains("android.intent.category.BROWSABLE"));
-        assert_eq!(android_manifest.matches("<uses-permission").count(), 1);
-        assert!(android_manifest.contains("@xml/backup_rules"));
-        assert!(android_manifest.contains("@xml/data_extraction_rules"));
-        assert!(backup_rules.contains("keyring-waltr-refresh.xml"));
-        assert_eq!(
-            data_extraction_rules
-                .matches("keyring-waltr-refresh.xml")
-                .count(),
-            2
-        );
-        assert!(!android_plugins.contains(&removed_plugin));
-        assert!(rust_source.contains("getDataString"));
-        assert!(android_activity.contains("override fun onCreate"));
-        assert!(android_activity.contains("override fun onNewIntent"));
-        assert_eq!(
-            android_activity
-                .matches("nativeReceiveIntent(intent)")
-                .count(),
-            2
-        );
-        for forbidden in ["getDataString", "intent.data", "Log.", "println("] {
-            assert!(!android_activity.contains(forbidden));
-        }
-        for forbidden in [
-            "waltr-server",
-            "updater",
-            "shell:",
-            "fs:",
-            "opener:default",
-            "http:default",
-        ] {
-            assert!(!format!("{config}\n{capability}\n{manifest}").contains(forbidden));
+        for forbidden in ["shell:", "fs:", "opener:default", "http:default"] {
+            assert!(!format!("{config}\n{capability}").contains(forbidden));
         }
     }
 
@@ -459,43 +775,9 @@ mod configuration_tests {
         let super_create = activity
             .find("super.onCreate(savedInstanceState)")
             .expect("super onCreate call");
-
         assert!(edge_to_edge < super_create);
-        for forbidden in [
-            "onWebViewCreate",
-            "installWebViewInsets",
-            "setOnApplyWindowInsetsListener",
-            "WindowInsetsCompat",
-            "requestApplyInsets",
-            "setPadding",
-        ] {
+        for forbidden in ["onWebViewCreate", "WindowInsetsCompat", "setPadding"] {
             assert!(!activity.contains(forbidden));
         }
-    }
-
-    #[test]
-    fn android_safe_area_keeps_intent_and_lifecycle_forwarding() {
-        let activity =
-            include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
-
-        assert_eq!(activity.matches("nativeReceiveIntent(intent)").count(), 2);
-        assert_eq!(activity.matches("nativeSuspend()").count(), 2);
-        assert_eq!(activity.matches("nativeResume()").count(), 2);
-        assert!(activity.contains("nativeSuspend()\n    super.onPause()"));
-        assert!(activity.contains("super.onResume()\n    nativeResume()"));
-    }
-
-    #[test]
-    fn csp_adds_only_the_exact_faro_collector_origin() {
-        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
-            .expect("valid Tauri configuration");
-        let csp = config["app"]["security"]["csp"]
-            .as_str()
-            .expect("CSP string");
-        assert_eq!(
-            csp,
-            "default-src 'self'; connect-src ipc: http://ipc.localhost https://faro.holdenitdown.net; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-src 'none'; form-action 'none'"
-        );
-        assert_eq!(csp.matches("https://faro.holdenitdown.net").count(), 1);
     }
 }

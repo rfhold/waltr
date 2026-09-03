@@ -3,14 +3,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 import type {
-  AccessProgress,
   ClientAdapter,
   ClientSnapshotListener,
 } from "./client";
 
 const BRIDGE_EVENT = "waltr://bridge";
-const SECURE_STORAGE_WARNING = "Secure credential storage is unavailable; login lasts only until the app stops";
-const DELETE_UNCONFIRMED = "Waltr credentials were rejected, but secure credential deletion could not be confirmed";
 
 type BridgeEvent = {
   generation: number;
@@ -25,7 +22,15 @@ type BridgeRecovery = {
 
 type BridgePayload =
   | { type: "state"; snapshot: ClientSnapshot }
-  | { type: "access"; progress: unknown };
+  | { type: "platform"; startup: unknown };
+
+type BridgeStartupState =
+  | "starting"
+  | "notificationPermissionRequired"
+  | "firstCatalogDownload"
+  | "ready"
+  | "recoverableFailure"
+  | "stopped";
 
 type TauriApi = {
   invoke: typeof invoke;
@@ -34,7 +39,6 @@ type TauriApi = {
 
 export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promise<ClientAdapter> {
   let currentSnapshot: ClientSnapshot | undefined;
-  let currentProgress: AccessProgress | undefined;
   let generation: number | undefined;
   let announcedGeneration: number | undefined;
   let sequence = -1;
@@ -45,22 +49,15 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
   let eventQueue = Promise.resolve();
   const pendingEvents: BridgeEvent[] = [];
   const snapshotListeners = new Set<ClientSnapshotListener>();
-  const progressListeners = new Set<(progress: AccessProgress) => void>();
 
   const publishSnapshot = (snapshot: ClientSnapshot) => {
     currentSnapshot = snapshot;
     for (const listener of snapshotListeners) listener(snapshot);
   };
-  const publishProgress = (progress: AccessProgress) => {
-    currentProgress = progress;
-    for (const listener of progressListeners) listener(progress);
-  };
   const accept = (event: BridgeEvent) => {
     sequence = event.sequence;
     if (event.payload.type === "state") {
       publishSnapshot(event.payload.snapshot);
-    } else {
-      publishProgress(presentationProgress(event.payload.progress));
     }
   };
   const recover = async () => {
@@ -88,13 +85,11 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
       const resumesFreshGeneration = runtimeReady
         && generation !== undefined
         && event.generation > generation
-        && event.sequence === 0
-        && event.payload.type === "state";
+        && canAnnounceGeneration(event);
       if (!resumesFreshGeneration) return;
       generation = event.generation;
       announcedGeneration = event.generation;
       sequence = -1;
-      currentProgress = undefined;
     }
     if (event.sequence <= sequence) return;
 
@@ -117,8 +112,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
     try {
       unlisten = await api.listen<BridgeEvent>(BRIDGE_EVENT, ({ payload }) => {
         if (runtimeReady
-          && payload.payload.type === "state"
-          && payload.sequence === 0
+          && canAnnounceGeneration(payload)
           && (announcedGeneration === undefined || payload.generation > announcedGeneration)) {
           announcedGeneration = payload.generation;
         }
@@ -161,7 +155,6 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
     unlisten?.();
     unlisten = undefined;
     snapshotListeners.clear();
-    progressListeners.clear();
     await api.invoke("dispose_runtime");
   };
 
@@ -182,47 +175,24 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
       return currentSnapshot;
     },
     dispose,
-    access: {
-      progress: () => currentProgress,
-      subscribe: (listener) => {
-        progressListeners.add(listener);
-        if (currentProgress) listener(currentProgress);
-        return () => progressListeners.delete(listener);
-      },
-      start: () => api.invoke("access_start"),
-      cancel: () => api.invoke("access_cancel"),
-      logout: async () => {
-        const event = await api.invoke<BridgeEvent | null>("access_logout");
-        if (event) await enqueue(event);
-      },
-    },
+    openAuthorizationAttempt: (attemptId) => api.invoke("open_authorization_attempt", { attemptId }),
     openExternalUrl: (url) => api.invoke("open_external_url", { url }),
   };
 }
 
 export const loadClientAdapter = loadTauriClient;
 
-function presentationProgress(progress: unknown): AccessProgress {
-  if (isRecord(progress) && progress.type === "loggingOut") return { type: "loggingOut" };
-  if (isRecord(progress) && progress.type === "unavailable" && typeof progress.message === "string") {
-    return { type: "unavailable", message: progress.message };
-  }
-  if (isRecord(progress)
-    && progress.type === "native"
-    && isRecord(progress.progress)
-    && progress.progress.type === "warning") {
-    return { type: "warning", message: SECURE_STORAGE_WARNING };
-  }
-  if (isRecord(progress)
-    && progress.type === "native"
-    && isRecord(progress.progress)
-    && progress.progress.type === "failed"
-    && progress.progress.error === DELETE_UNCONFIRMED) {
-    return { type: "unavailable", message: DELETE_UNCONFIRMED };
-  }
-  return { type: "native" };
+function canAnnounceGeneration(event: BridgeEvent) {
+  return event.sequence === 0
+    && (event.payload.type === "state"
+      || isBridgeStartupState(event.payload.startup));
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+function isBridgeStartupState(startup: unknown): startup is BridgeStartupState {
+  return startup === "starting"
+    || startup === "notificationPermissionRequired"
+    || startup === "firstCatalogDownload"
+    || startup === "ready"
+    || startup === "recoverableFailure"
+    || startup === "stopped";
 }

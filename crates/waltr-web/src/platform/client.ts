@@ -2,18 +2,9 @@ import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 
 export type ClientSnapshotListener = (snapshot: ClientSnapshot) => void;
 
-export type AccessProgress =
-  | { type: "native" }
-  | { type: "loggingOut" }
-  | { type: "warning"; message: string }
-  | { type: "unavailable"; message: string };
-
-export type NativeAccessOperations = {
-  progress: () => AccessProgress | undefined;
-  subscribe: (listener: (progress: AccessProgress) => void) => () => void;
-  start: () => Promise<void>;
-  cancel: () => Promise<void>;
-  logout: () => Promise<void>;
+export type AccessOperations = {
+  openLogin: (url: string) => void | Promise<void>;
+  logout: () => Promise<boolean>;
 };
 
 export type ClientAdapter = {
@@ -22,7 +13,8 @@ export type ClientAdapter = {
   subscribe: (listener: ClientSnapshotListener) => () => void;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispose: () => void | Promise<void>;
-  access?: NativeAccessOperations;
+  access?: AccessOperations;
+  openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
   openExternalUrl?: (url: string) => Promise<void>;
 };
 

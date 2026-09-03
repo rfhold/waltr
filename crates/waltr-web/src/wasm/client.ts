@@ -115,6 +115,13 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
       };
     },
     dispatch,
+    access: {
+      openLogin: (url) => window.location.assign(url),
+      logout: async () => {
+        const response = await fetch("/oidc/logout", { method: "POST", credentials: "same-origin" });
+        return response.ok;
+      },
+    },
     dispose: () => {
       if (disposed) {
         return;

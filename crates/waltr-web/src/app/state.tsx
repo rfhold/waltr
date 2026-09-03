@@ -9,7 +9,7 @@ import {
 
 import { AppStateContextProvider, type AppPhase } from "./context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
-import type { AccessProgress, ClientAdapter, ClientAdapterLoader } from "../platform/client";
+import type { ClientAdapter, ClientAdapterLoader } from "../platform/client";
 import { FixtureAppStateProvider, fixtureSnapshotForPath } from "./fixtures";
 import { reportApplicationError } from "../telemetry";
 
@@ -26,7 +26,6 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
-  const [accessProgress, setAccessProgress] = createSignal<AccessProgress>();
   const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Extract<ClientCommand, { type: "beginAuth" }>["target"]>();
   const [ignoredTerminalAttemptId, setIgnoredTerminalAttemptId] = createSignal<string>();
   const operationWaiters = new Set<OperationWaiter>();
@@ -71,7 +70,6 @@ export function AppStateProvider(props: AppStateProviderProps) {
     const unsubscribe = client.subscribe((snapshot) => {
       publishSnapshot(snapshot, setSnapshot, operationWaiters);
     });
-    const unsubscribeAccess = client.access?.subscribe(setAccessProgress);
     let cancelled = false;
 
     void client.start().catch((error) => {
@@ -84,7 +82,6 @@ export function AppStateProvider(props: AppStateProviderProps) {
     onCleanup(() => {
       cancelled = true;
       unsubscribe();
-      unsubscribeAccess?.();
       void client.dispose();
     });
   });
@@ -369,8 +366,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         clientLoaded: () => Boolean(clientAdapter()),
         systemReady,
         explicitAuthTarget,
-        nativeAccess: () => clientAdapter()?.access,
-        accessProgress,
+        accessOperations: () => clientAdapter()?.access,
+        openAuthorizationAttempt: () => clientAdapter()?.openAuthorizationAttempt,
         openExternalUrl: () => clientAdapter()?.openExternalUrl,
         dispatch,
         dispatchBeginExplicitAuth,
