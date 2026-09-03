@@ -127,6 +127,7 @@ struct CachedCatalog {
 pub struct CatalogLoader {
     source: CatalogSource,
     cache_path: PathBuf,
+    fallback: Option<&'static str>,
     client: reqwest::Client,
     cached: Arc<Mutex<Option<CachedCatalog>>>,
     refresh: Arc<CatalogRefreshCoordinator>,
@@ -213,12 +214,18 @@ impl CatalogLoader {
         Self {
             source,
             cache_path,
+            fallback: None,
             client,
             cached: Arc::new(Mutex::new(None)),
             refresh: Arc::new(CatalogRefreshCoordinator::default()),
             #[cfg(test)]
             refresh_barrier: None,
         }
+    }
+
+    pub(crate) fn with_fallback_catalog(mut self, fallback: &'static str) -> Self {
+        self.fallback = Some(fallback);
+        self
     }
 
     /// Load the catalog, refreshing stale in-memory entries on demand.
@@ -289,7 +296,9 @@ impl CatalogLoader {
             Ok(loaded) => Ok(loaded),
             Err(fetch_error) => match self.load_cached_file().await {
                 Ok(Some(loaded)) => Ok(loaded),
-                Ok(None) => Err(fetch_error),
+                Ok(None) => self
+                    .fallback
+                    .map_or(Err(fetch_error), |fallback| parse_catalog(fallback, true)),
                 Err(cache_error) => Err(fetch_error.with_fallback(cache_error)),
             },
         }
@@ -606,6 +615,13 @@ mod loader_tests {
             }
         }
     }"#;
+    const FALLBACK_CATALOG: &str = r#"{
+        "fallback": {
+            "id": "fallback",
+            "name": "Fallback Provider",
+            "models": {"seed": {"id": "seed", "name": "Seed Model"}}
+        }
+    }"#;
 
     #[derive(Clone)]
     struct CatalogHttpState {
@@ -919,7 +935,8 @@ mod loader_tests {
             .await
             .expect("write stale catalog cache");
         let arrivals = Arc::new(Barrier::new(CALLERS + 1));
-        let mut loader = CatalogLoader::new(CatalogSource::Url(server.url.clone()), cache_path);
+        let mut loader = CatalogLoader::new(CatalogSource::Url(server.url.clone()), cache_path)
+            .with_fallback_catalog(FALLBACK_CATALOG);
         loader.refresh_barrier = Some(Arc::clone(&arrivals));
 
         let loads = tokio::spawn({
@@ -969,6 +986,73 @@ mod loader_tests {
     }
 
     #[tokio::test]
+    async fn successful_request_precedes_configured_builtin_fallback() {
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::OK,
+            body: CATALOG,
+            release: None,
+        }])
+        .await;
+        let loader = CatalogLoader::from_url_with_cache(
+            server.url.clone(),
+            crate::test_support::temp_root().join("missing/catalog.json"),
+        )
+        .with_fallback_catalog(FALLBACK_CATALOG);
+
+        let loaded = loader.load().await.expect("network catalog should load");
+
+        assert!(!loaded.stale());
+        assert!(loaded.catalog().provider("test").is_some());
+        assert!(loaded.catalog().provider("fallback").is_none());
+        assert_eq!(server.entered.recv().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn valid_cache_precedes_configured_builtin_fallback() {
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "failed",
+            release: None,
+        }])
+        .await;
+        let root = crate::test_support::temp_root();
+        let cache_path = root.join("catalog.json");
+        tokio::fs::write(&cache_path, CATALOG)
+            .await
+            .expect("write valid catalog cache");
+        let loader = CatalogLoader::from_url_with_cache(server.url.clone(), cache_path)
+            .with_fallback_catalog(FALLBACK_CATALOG);
+
+        let loaded = loader.load().await.expect("cache catalog should load");
+
+        assert!(loaded.stale());
+        assert!(loaded.catalog().provider("test").is_some());
+        assert!(loaded.catalog().provider("fallback").is_none());
+        assert_eq!(server.entered.recv().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn missing_cache_uses_configured_builtin_fallback_as_stale() {
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "failed",
+            release: None,
+        }])
+        .await;
+        let loader = CatalogLoader::from_url_with_cache(
+            server.url.clone(),
+            crate::test_support::temp_root().join("missing/catalog.json"),
+        )
+        .with_fallback_catalog(FALLBACK_CATALOG);
+
+        let loaded = loader.load().await.expect("builtin catalog should load");
+
+        assert!(loaded.stale());
+        assert!(loaded.catalog().provider("fallback").is_some());
+        assert_eq!(server.entered.recv().await, Some(1));
+    }
+
+    #[tokio::test]
     async fn failed_request_rejects_malformed_cache_fallback() {
         let mut server = start_catalog_server(vec![CatalogHttpResponse {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -981,7 +1065,8 @@ mod loader_tests {
         tokio::fs::write(&cache_path, r#"{"SENTINEL_CACHE_BODY": }"#)
             .await
             .expect("write malformed catalog cache");
-        let loader = CatalogLoader::from_url_with_cache(server.url.clone(), cache_path);
+        let loader = CatalogLoader::from_url_with_cache(server.url.clone(), cache_path)
+            .with_fallback_catalog(FALLBACK_CATALOG);
 
         let error = loader
             .load()
@@ -994,6 +1079,31 @@ mod loader_tests {
             "{error}"
         );
         assert!(!error.contains("SENTINEL_CACHE_BODY"), "{error}");
+        assert_eq!(server.entered.recv().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn missing_cache_rejects_malformed_configured_builtin_fallback() {
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "failed",
+            release: None,
+        }])
+        .await;
+        let loader = CatalogLoader::from_url_with_cache(
+            server.url.clone(),
+            crate::test_support::temp_root().join("missing/catalog.json"),
+        )
+        .with_fallback_catalog(r#"{"SENTINEL_BUILTIN_BODY": }"#);
+
+        let error = loader
+            .load()
+            .await
+            .expect_err("malformed builtin catalog must fail")
+            .to_string();
+
+        assert_eq!(error, "failed to decode catalog (decode)");
+        assert!(!error.contains("SENTINEL_BUILTIN_BODY"));
         assert_eq!(server.entered.recv().await, Some(1));
     }
 
@@ -1042,7 +1152,8 @@ mod loader_tests {
             .await
             .expect("create cache directory");
         let arrivals = Arc::new(Barrier::new(CALLERS + 1));
-        let mut loader = CatalogLoader::new(CatalogSource::Url(server.url.clone()), cache_path);
+        let mut loader = CatalogLoader::new(CatalogSource::Url(server.url.clone()), cache_path)
+            .with_fallback_catalog(FALLBACK_CATALOG);
         loader.refresh_barrier = Some(Arc::clone(&arrivals));
 
         let loads = tokio::spawn({

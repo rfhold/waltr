@@ -15,7 +15,8 @@ use std::{
 use waltr_server::{
     LocalBearer,
     embedded::{
-        EmbeddedCatalogSource, EmbeddedOutboundPolicy, EmbeddedServerConfig, build_embedded_server,
+        EmbeddedBuildError, EmbeddedCatalogFallback, EmbeddedCatalogSource, EmbeddedOutboundPolicy,
+        EmbeddedServerConfig, build_embedded_server,
     },
 };
 use rand::TryRngCore as _;
@@ -148,6 +149,7 @@ impl AppPrivateRoots {
             workspace_root: self.data.join("workspace"),
             catalog_source: EmbeddedCatalogSource::Url(MODELS_DEV_URL.to_owned()),
             catalog_cache_path: server_data.join("models/api.json"),
+            catalog_fallback: Some(EmbeddedCatalogFallback::BuiltIn),
             default_agent: "coding".to_owned(),
             local_bearer: bearer,
             outbound_policy: EmbeddedOutboundPolicy::default(),
@@ -185,7 +187,7 @@ pub(crate) enum ServerStartError {
     Paths,
     Entropy,
     Thread,
-    Build,
+    Build(EmbeddedBuildError),
     Readiness,
 }
 
@@ -195,13 +197,31 @@ impl fmt::Display for ServerStartError {
             Self::Paths => "embedded server paths are unavailable",
             Self::Entropy => "embedded server credential initialization failed",
             Self::Thread => "embedded server thread could not start",
-            Self::Build => "embedded server initialization failed",
+            Self::Build(error) => return error.fmt(formatter),
             Self::Readiness => "embedded server readiness timed out",
         })
     }
 }
 
 impl std::error::Error for ServerStartError {}
+
+impl ServerStartError {
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) const fn telemetry_category(self) -> &'static str {
+        match self {
+            Self::Paths => "paths",
+            Self::Entropy => "entropy",
+            Self::Thread => "thread",
+            Self::Build(EmbeddedBuildError::Paths) => "build_paths",
+            Self::Build(EmbeddedBuildError::Listener) => "build_listener",
+            Self::Build(EmbeddedBuildError::Persistence) => "build_persistence",
+            Self::Build(EmbeddedBuildError::Catalog) => "build_catalog",
+            Self::Build(EmbeddedBuildError::Resources) => "build_resources",
+            Self::Build(EmbeddedBuildError::Application) => "build_application",
+            Self::Readiness => "readiness",
+        }
+    }
+}
 
 impl EmbeddedServerController {
     pub(crate) fn start(
@@ -634,8 +654,8 @@ fn run_server_thread(
     let succeeded = runtime.block_on(async move {
         let server = match build_embedded_server(config).await {
             Ok(server) => server,
-            Err(_) => {
-                drop(ready.send(Err(ServerStartError::Build)));
+            Err(error) => {
+                drop(ready.send(Err(ServerStartError::Build(error))));
                 return false;
             }
         };
@@ -830,6 +850,22 @@ mod tests {
             AppPrivateRoots::new(PathBuf::from("data"), PathBuf::from("config")).unwrap_err(),
             ServerStartError::Paths
         );
+    }
+
+    #[test]
+    fn embedded_build_categories_survive_controller_mapping() {
+        for (embedded, category) in [
+            (EmbeddedBuildError::Paths, "build_paths"),
+            (EmbeddedBuildError::Listener, "build_listener"),
+            (EmbeddedBuildError::Persistence, "build_persistence"),
+            (EmbeddedBuildError::Catalog, "build_catalog"),
+            (EmbeddedBuildError::Resources, "build_resources"),
+            (EmbeddedBuildError::Application, "build_application"),
+        ] {
+            let error = ServerStartError::Build(embedded);
+            assert_eq!(error.telemetry_category(), category);
+            assert_eq!(error.to_string(), embedded.to_string());
+        }
     }
 
     #[test]

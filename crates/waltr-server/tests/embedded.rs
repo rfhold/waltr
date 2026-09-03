@@ -6,7 +6,8 @@ use waltr::grpc::waltr::resource::v1::{
 use waltr_server::{
     LocalBearer,
     embedded::{
-        EmbeddedCatalogSource, EmbeddedOutboundPolicy, EmbeddedServerConfig, build_embedded_server,
+        EmbeddedCatalogFallback, EmbeddedCatalogSource, EmbeddedOutboundPolicy,
+        EmbeddedServerConfig, build_embedded_server,
     },
 };
 
@@ -22,6 +23,7 @@ fn config(root: &std::path::Path, bearer: &str) -> EmbeddedServerConfig {
                 .join("tests/fixtures/models-dev-defaults.json"),
         ),
         catalog_cache_path: root.join("cache/models.json"),
+        catalog_fallback: None,
         default_agent: "coding".to_owned(),
         local_bearer: LocalBearer::new(bearer).unwrap(),
         outbound_policy: EmbeddedOutboundPolicy::default(),
@@ -38,6 +40,90 @@ async fn embedded_server_rejects_relative_workspace_root() {
         error.to_string(),
         "embedded server paths are invalid or unavailable"
     );
+}
+
+#[tokio::test]
+async fn embedded_server_materializes_bundled_resources_from_explicit_builtin_catalog() {
+    let seed: serde_json::Value =
+        serde_json::from_str(include_str!("../resources/models-dev-defaults.json"))
+            .expect("production seed must remain valid models.dev JSON");
+    for synthetic in [
+        "claude-sonnet-4-5-20250929",
+        "gpt-5.3-mini",
+        "gpt-5.4-old",
+        "gpt-5.10",
+        "gpt-5.x",
+        "gpt-6.3",
+    ] {
+        assert!(
+            seed.as_object()
+                .unwrap()
+                .values()
+                .all(|provider| provider["models"]
+                    .as_object()
+                    .is_some_and(|models| !models.contains_key(synthetic))),
+            "production seed contains synthetic model {synthetic}"
+        );
+    }
+    assert!(seed["openai"]["models"].get("gpt-5.6-sol").is_some());
+    let mut anthropic_ids = seed["anthropic"]["models"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    anthropic_ids.sort_unstable();
+    assert_eq!(
+        anthropic_ids,
+        [
+            "claude-fable-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ]
+    );
+    let mut openai_ids = seed["openai"]["models"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    openai_ids.sort_unstable();
+    assert_eq!(openai_ids, ["gpt-5.2", "gpt-5.6", "gpt-5.6-sol"]);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let root = waltr_server::test_support::temp_root();
+    let mut config = config(&root, "builtin-fallback-secret");
+    config.catalog_source = EmbeddedCatalogSource::Url(format!("http://{address}/catalog"));
+    config.catalog_fallback = Some(EmbeddedCatalogFallback::BuiltIn);
+    assert!(!config.catalog_cache_path.exists());
+
+    let server = build_embedded_server(config)
+        .await
+        .expect("the builtin catalog should materialize every bundled resource");
+
+    assert!(!root.join("cache/models.json").exists());
+    server.shutdown().await;
+    upstream.await.unwrap();
 }
 
 #[tokio::test]

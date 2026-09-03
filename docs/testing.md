@@ -15,7 +15,7 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-agent/tests/live.rs` and `crates/waltr-agent/tests/live/` | Ignored live-provider and external-service agent tests. |
 | `crates/waltr-server/tests/` | Server contract, coordination, watch, validation, health, persistence, access-auth, and system flows. |
 | `crates/waltr-server/tests/embedded.rs` | Embedded composition, local admission, explicit callback metadata, public routes, and workspace isolation. |
-| `crates/waltr-server/src/catalog/mod.rs` tests | Bounded models.dev requests plus valid-cache fallback after request failure or timeout. |
+| `crates/waltr-server/src/catalog/mod.rs` tests | Bounded network-first models.dev loading, disk-cache and explicit built-in precedence, stale semantics, and fallback validation. |
 | `crates/waltr-server/src/resource_catalog/state/tests.rs` | Persisted self-MCP provisioning and ordinary resource administration. |
 | `crates/waltr-server/tests/mcp_oauth_server.rs` | Hosted Waltr issuer, browser authentication bridge, consent, token lifecycle, direct-Authentik rejection, disabled-mode behavior, and restart. |
 | `crates/waltr-server/tests/live.rs` and `crates/waltr-server/tests/live/session.rs` | Ignored server contract tests that run session commands through live providers. |
@@ -24,9 +24,9 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-web/tests/` | Browser UI state, routing, forms, transitions, and component-level behavior. |
 | `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, privacy filtering, and platform-specific propagation. |
 | `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
-| `crates/waltr-app/src/server_controller.rs` tests | App-private paths, random local bearer generation, redaction, and process-owned server state. |
+| `crates/waltr-app/src/server_controller.rs` tests | App-private paths, random local bearer generation, redaction, exact embedded-build error mapping, and process-owned server state. |
 | `crates/waltr-app/src/bridge.rs` tests | Tauri generation order, permission gates, snapshot redaction, opaque authorization opening, and nonblocking replacement. |
-| `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, startup signals, shutdown bounds, header privacy, redirect non-following, bundled-root loading, untrusted TLS rejection, and in-memory exporters. |
+| `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, bounded categorical Android startup failures and panic event cardinality, shutdown bounds, header privacy, redirect non-following, bundled-root loading, untrusted TLS rejection, and in-memory exporters. |
 | `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
@@ -92,9 +92,11 @@ Run access-auth tests including embedded-web navigation and restart coverage gat
 
 Server library tests include SQLite persistence and OIDC store behavior. The container-backed PostgreSQL targets are ignored by default, so `cargo test -p waltr-server --lib` does not require Docker.
 
-Server library tests require valid-cache fallback after fixed bounded models.dev request failure or timeout, and must reject a malformed cache rather than treating it as fallback.
+Server library tests require network, valid-cache, and explicitly configured built-in precedence after fixed bounded models.dev request failure or timeout. Both disk and built-in fallbacks are stale. A malformed or unreadable configured cache must fail rather than reaching the built-in seed, and malformed seed content must fail validation.
 
 Embedded resource coverage must prove that startup prebinds loopback, atomically overwrites `mcp-servers/waltr.yaml` with the generation URL before catalog load, reports filesystem origin, and refreshes the durable file for each generation. Inspection, replace, watcher, reset, and persisted-slot ETag assertions must use the ordinary resource contract. Reset must exercise ordinary candidate validation, including failure when the bundled fallback cannot resolve `WALTR_PUBLIC_URL`; no embedded immutability or reset-special-case assertion belongs in this coverage.
+
+Embedded fallback coverage must parse the packaged production seed, reject known synthetic fixture IDs, and materialize the complete ordinary bundled catalog including its default agent. General server tests retain their separate synthetic models.dev fixture for selector edge cases.
 
 Outbound OAuth unit coverage must verify explicit callback propagation and one-time standalone environment snapshots, including the private-test boolean.
 

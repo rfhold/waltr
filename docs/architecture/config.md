@@ -84,6 +84,8 @@ The catalog materializes providers, MCP servers, and defaults into `waltr.config
 
 Environment-owned servers and embedded desktop and Android servers load one ordinary bundled catalog plus persisted overrides. There is no host-specific catalog variant or alternate Android resource tree.
 
+Models.dev loading remains network-first. A failed network request uses a valid configured disk cache and marks the catalog stale. If the cache file is absent, an embedding host may explicitly opt into the curated catalog seed bundled under `crates/waltr-server/resources`; that result is also stale. A malformed or unreadable configured cache fails closed before the seed is considered. Standalone server composition does not opt into the seed.
+
 Shell-bearing agent, feature, and permission resources remain valid, inspectable, and loadable when the server is compiled without the `shell` feature. Runtime construction then omits the unavailable shell tool and any permissions derived by selecting the shell feature. Shell-enabled builds install the configured shell tool and its applicable permissions normally.
 
 The Tauri host passes app config `server` as the catalog root. Persisted overrides therefore live exactly at app config `server/.waltr/resources`.
