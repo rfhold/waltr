@@ -7,8 +7,7 @@ use waltr_agent::{
     AgentRunBuilder, AgentRuntime, AgentTimelineEvent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT,
     LlmStream, MemorySessionStore, ModelRef, PermissionCommandPattern, PermissionEffect,
     PermissionPolicy, PermissionToolSelector, SessionCoordinator, SessionId, SessionStatus,
-    Suspension,
-    TimelineContent, tools::shell::ShellConfig,
+    Suspension, TimelineContent, tools::shell::ShellConfig,
 };
 use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;

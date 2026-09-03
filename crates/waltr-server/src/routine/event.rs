@@ -90,20 +90,18 @@ pub(super) fn session_event_envelope(event: SessionEvent) -> EventEnvelope {
             text,
             metadata,
             ..
-        } => {
-            EventEnvelope {
-                id,
-                r#type: USER_MESSAGE_CREATED.to_owned(),
-                source_session_id: Some(session_id.as_str().to_owned()),
-                data: json!({
-                    "message": { "text": text },
-                    "userMessageCount": user_message_count,
-                    "session": {
-                        "id": session_id.as_str(),
-                        "metadata": metadata,
-                    }
-                }),
-            }
-        }
+        } => EventEnvelope {
+            id,
+            r#type: USER_MESSAGE_CREATED.to_owned(),
+            source_session_id: Some(session_id.as_str().to_owned()),
+            data: json!({
+                "message": { "text": text },
+                "userMessageCount": user_message_count,
+                "session": {
+                    "id": session_id.as_str(),
+                    "metadata": metadata,
+                }
+            }),
+        },
     }
 }

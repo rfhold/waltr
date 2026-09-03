@@ -720,7 +720,9 @@ mod tests {
         let store = MemorySessionStore::new();
         let id = session_id();
         let mut request = SessionCreateRequest::new(id.clone());
-        request.metadata_values.insert("other".to_owned(), json!(true));
+        request
+            .metadata_values
+            .insert("other".to_owned(), json!(true));
         store.create(request).await.unwrap();
         store
             .append_journal(

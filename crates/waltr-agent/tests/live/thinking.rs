@@ -3,8 +3,8 @@
 use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, SessionCoordinator, SessionId, SessionStore, TimelineContent,
-    TimelineEventKind, TimelineStatus,
+    MemorySessionStore, ModelApi, ModelRef, SessionCoordinator, SessionId, SessionStore,
+    TimelineContent, TimelineEventKind, TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,

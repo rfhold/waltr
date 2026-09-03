@@ -5,8 +5,8 @@ use std::{sync::Arc, time::Duration};
 use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_USER_TEXT, LlmError, LlmStream,
-    MemorySessionStore, ModelRef, SessionCoordinator, SessionId, SessionTimelineEvent, TimelineContent,
-    TimelineEventKind, TimelineQuery, TimelineStatus,
+    MemorySessionStore, ModelRef, SessionCoordinator, SessionId, SessionTimelineEvent,
+    TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
 };
 
 use crate::live_provider;
