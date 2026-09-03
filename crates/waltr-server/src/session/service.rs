@@ -231,12 +231,35 @@ where
         trusted_mcp_oauth_origins: Vec<reqwest::Url>,
         agent_catalog: AgentCatalogSource,
     ) -> Arc<Self> {
+        Self::from_sessions_with_catalog_source_and_root(
+            sessions,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            agent_catalog,
+            default_root(),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "runtime construction receives independent session and host policy dependencies"
+    )]
+    fn from_sessions_with_catalog_source_and_root(
+        sessions: SessionCoordinator<S>,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_catalog: AgentCatalogSource,
+        workspace_root: PathBuf,
+    ) -> Arc<Self> {
         let current_catalog = agent_catalog.catalog();
         let default_agent_definition = current_catalog
             .resolved(current_catalog.default_agent_name())
             .expect("catalog default agent must be present")
             .clone();
         let runtime_factory = runtime_factory(
+            workspace_root.clone(),
             credential_store,
             trusted_mcp_oauth_origins,
             default_agent_definition,
@@ -249,6 +272,25 @@ where
             config,
             agent_catalog,
         })
+    }
+
+    pub(crate) fn new_with_explicit_root_and_agent_state(
+        store: S,
+        workspace_root: PathBuf,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_state: AgentDefinitionState,
+        event_sink: Arc<dyn waltr_agent::SessionEventSink>,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_catalog_source_and_root(
+            SessionCoordinator::new(store).with_session_event_sink(event_sink),
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            AgentCatalogSource::Dynamic(agent_state),
+            workspace_root,
+        )
     }
 
     async fn load_config(&self) -> Configuration {
@@ -307,6 +349,10 @@ impl<S> super::SessionHost for SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    async fn shutdown(&self) {
+        self.sessions.shutdown().await;
+    }
+
     fn set_completion_admission_handler(
         &self,
         handler: Option<Arc<dyn waltr_agent::SessionCompletionCoordinationHandler>>,
@@ -1337,6 +1383,7 @@ fn default_root() -> PathBuf {
     reason = "runtime factory policy is supplied by independent server-owned capabilities"
 )]
 fn runtime_factory(
+    workspace_root: PathBuf,
     credential_store: CredentialStore,
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
     default_agent_definition: ResolvedAgent,
@@ -1344,7 +1391,7 @@ fn runtime_factory(
     config: ConfigHandle,
 ) -> AgentSessionRuntimeFactory {
     let factory =
-        AgentSessionRuntimeFactory::new(default_root(), credential_store, default_agent_definition);
+        AgentSessionRuntimeFactory::new(workspace_root, credential_store, default_agent_definition);
     let factory = match agent_catalog {
         AgentCatalogSource::Static(catalog) => factory.with_agent_catalog(catalog.clone()),
         AgentCatalogSource::Dynamic(state) => {

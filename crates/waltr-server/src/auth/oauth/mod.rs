@@ -124,6 +124,10 @@ impl McpOAuthAttempt {
         &self.registration.redirect_uri
     }
 
+    pub(super) fn set_redirect_uri(&mut self, redirect_uri: String) {
+        self.registration.redirect_uri = redirect_uri;
+    }
+
     pub(super) fn resource(&self) -> &str {
         &self.resource
     }
@@ -238,7 +242,7 @@ pub fn begin_manual(
         target,
         definition,
         now_ms,
-        &OutboundHttpPolicy::production(Vec::new(), None),
+        &OutboundHttpPolicy::production(Vec::new(), None, false),
     )
 }
 
@@ -358,7 +362,7 @@ pub async fn complete_mcp(
         attempt,
         input,
         now_ms,
-        OutboundHttpPolicy::production(Vec::new(), None),
+        OutboundHttpPolicy::production(Vec::new(), None, false),
     )
     .await
 }
@@ -468,7 +472,7 @@ pub async fn complete_manual(
         attempt,
         input,
         now_ms,
-        OutboundHttpPolicy::production(Vec::new(), None),
+        OutboundHttpPolicy::production(Vec::new(), None, false),
     )
     .await
 }

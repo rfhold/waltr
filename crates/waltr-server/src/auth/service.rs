@@ -59,10 +59,189 @@ pub struct AuthService {
     outbound_store: Arc<OutboundOAuthStore>,
     attempts: Mutex<HashMap<String, PendingOAuthAttempt>>,
     outbound_policy: OutboundHttpPolicy,
-    #[cfg(test)]
-    outbound_redirect_uri: Option<String>,
+    outbound_oauth: OutboundOAuthConfig,
+    self_mcp_credential_ownership: CredentialOwnership,
     #[cfg(test)]
     refresh_outcomes: Mutex<HashMap<String, TestRefreshOutcome>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialOwnership {
+    Durable,
+    EmbeddedHost,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct OutboundOAuthConfig {
+    server_callback_uri: Option<String>,
+    client_metadata_uri: Option<String>,
+    environment: Arc<HashMap<std::ffi::OsString, std::ffi::OsString>>,
+    allow_private_test_destinations: bool,
+    durable_callback_marker: Option<String>,
+}
+
+impl OutboundOAuthConfig {
+    pub(crate) fn durable_callback_marker(&self) -> Option<&str> {
+        self.durable_callback_marker.as_deref()
+    }
+
+    pub(crate) fn from_env() -> Self {
+        Self::from_environment(std::env::vars_os().collect())
+    }
+
+    fn from_environment(environment: HashMap<std::ffi::OsString, std::ffi::OsString>) -> Self {
+        let allow_private_test_destinations = environment
+            .get(std::ffi::OsStr::new(
+                "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS",
+            ))
+            .and_then(|value| value.to_str())
+            == Some("true");
+        let environment = Arc::new(
+            environment
+                .into_iter()
+                .filter(|(name, _)| name.to_str().is_some_and(outbound_oauth_environment_name))
+                .collect::<HashMap<_, _>>(),
+        );
+        let public_url = environment
+            .get(std::ffi::OsStr::new("WALTR_PUBLIC_URL"))
+            .and_then(|value| value.to_str());
+        Self {
+            server_callback_uri: public_url
+                .and_then(|url| public_url_with_path(url, "/outbound-oauth/callback")),
+            client_metadata_uri: public_url
+                .and_then(|url| public_url_with_path(url, "/.well-known/oauth-client/waltr")),
+            environment,
+            allow_private_test_destinations,
+            durable_callback_marker: None,
+        }
+    }
+
+    pub(crate) fn for_server_callback(callback: String) -> Self {
+        Self {
+            server_callback_uri: Some(callback),
+            client_metadata_uri: None,
+            environment: Arc::default(),
+            allow_private_test_destinations: false,
+            durable_callback_marker: Some(format!(
+                "urn:waltr:outbound-oauth-callback:{}",
+                Uuid::new_v4()
+            )),
+        }
+    }
+
+    fn variable(&self, name: &str) -> Option<String> {
+        self.environment
+            .get(std::ffi::OsStr::new(name))
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn redirect_uri(&self, server_key: &str) -> Result<String, Status> {
+        if let Some(callback) = &self.server_callback_uri {
+            return Ok(callback.clone());
+        }
+        self.variable(&format!(
+            "WALTR_MCP_{}_OAUTH_REDIRECT_URI",
+            environment_server_key(server_key)
+        ))
+        .ok_or_else(|| missing_redirect_uri(server_key))
+    }
+
+    fn attempt_for_persistence(&self, attempt: &oauth::McpOAuthAttempt) -> oauth::McpOAuthAttempt {
+        let mut persisted = attempt.clone();
+        if self.server_callback_uri.as_deref() == Some(attempt.redirect_uri())
+            && let Some(marker) = &self.durable_callback_marker
+        {
+            persisted.set_redirect_uri(marker.clone());
+        }
+        persisted
+    }
+
+    fn rehydrate_attempt(&self, attempt: &mut oauth::McpOAuthAttempt) -> Result<(), Status> {
+        let Some(marker) = &self.durable_callback_marker else {
+            return Ok(());
+        };
+        if attempt.redirect_uri() != marker {
+            return Err(Status::failed_precondition(
+                "OAuth attempt belongs to a different server generation",
+            ));
+        }
+        let callback = self
+            .server_callback_uri
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("OAuth server callback is unavailable"))?;
+        attempt.set_redirect_uri(callback);
+        Ok(())
+    }
+
+    fn persisted_attempt_matches_callback(&self, attempt: &oauth::McpOAuthAttempt) -> bool {
+        match &self.durable_callback_marker {
+            Some(marker) => attempt.redirect_uri() == marker,
+            None => self.server_callback_uri.as_deref() == Some(attempt.redirect_uri()),
+        }
+    }
+
+    fn credential_for_persistence(&self, mut credential: OAuthCredential) -> OAuthCredential {
+        if let (Some(callback), Some(marker), Some(context)) = (
+            self.server_callback_uri.as_deref(),
+            self.durable_callback_marker.as_ref(),
+            credential.mcp_context_mut(),
+        ) && context.registration.redirect_uri == callback
+        {
+            context.registration.redirect_uri.clone_from(marker);
+        }
+        credential
+    }
+
+    fn durable_attempt_for_current_generation(
+        &self,
+        record: &DurableAttemptRecord,
+    ) -> Result<oauth::McpOAuthAttempt, Status> {
+        let attempt = serde_json::from_str::<oauth::McpOAuthAttempt>(&record.attempt_json)
+            .map_err(|_| Status::data_loss("stored OAuth attempt is invalid"))?;
+        if self
+            .durable_callback_marker
+            .as_ref()
+            .is_some_and(|marker| attempt.redirect_uri() != marker)
+        {
+            return Err(Status::not_found("OAuth attempt does not exist"));
+        }
+        Ok(attempt)
+    }
+}
+
+impl std::fmt::Debug for OutboundOAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutboundOAuthConfig")
+            .field(
+                "server_callback_configured",
+                &self.server_callback_uri.is_some(),
+            )
+            .field(
+                "client_metadata_configured",
+                &self.client_metadata_uri.is_some(),
+            )
+            .field("target_environment_entries", &self.environment.len())
+            .field(
+                "private_test_destinations_enabled",
+                &self.allow_private_test_destinations,
+            )
+            .field(
+                "durable_callback_marker_configured",
+                &self.durable_callback_marker.is_some(),
+            )
+            .finish()
+    }
+}
+
+fn outbound_oauth_environment_name(name: &str) -> bool {
+    name == "WALTR_PUBLIC_URL"
+        || (name.starts_with("WALTR_MCP_")
+            && ["_OAUTH_CLIENT_ID", "_OAUTH_ISSUER", "_OAUTH_REDIRECT_URI"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)))
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +290,15 @@ impl AuthService {
         outbound_store: Arc<OutboundOAuthStore>,
         configured_private_origins: Vec<reqwest::Url>,
         automatic_self_resource: Option<reqwest::Url>,
+        outbound_oauth: OutboundOAuthConfig,
     ) -> Arc<Self> {
+        let self_mcp_credential_ownership = if outbound_oauth.durable_callback_marker.is_some()
+            && automatic_self_resource.is_some()
+        {
+            CredentialOwnership::EmbeddedHost
+        } else {
+            CredentialOwnership::Durable
+        };
         Arc::new(Self {
             resources,
             credential_store,
@@ -120,28 +307,11 @@ impl AuthService {
             outbound_policy: OutboundHttpPolicy::production(
                 configured_private_origins,
                 automatic_self_resource,
+                outbound_oauth.allow_private_test_destinations,
             ),
+            outbound_oauth,
+            self_mcp_credential_ownership,
             #[cfg(test)]
-            outbound_redirect_uri: None,
-            #[cfg(test)]
-            refresh_outcomes: Mutex::new(HashMap::new()),
-        })
-    }
-
-    #[cfg(test)]
-    fn new_for_tests(
-        resources: AgentDefinitionState,
-        credential_store: CredentialStore,
-        outbound_store: Arc<OutboundOAuthStore>,
-        outbound_redirect_uri: Option<String>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            resources,
-            credential_store,
-            outbound_store,
-            attempts: Mutex::new(HashMap::new()),
-            outbound_policy: OutboundHttpPolicy::loopback_test(),
-            outbound_redirect_uri,
             refresh_outcomes: Mutex::new(HashMap::new()),
         })
     }
@@ -305,13 +475,7 @@ impl AuthService {
         let discovery = discover_mcp_auth(&target, &server.url, policy.clone()).await?;
         let auth_server = discovery.authorization_server;
         let (authorize_url, token_url) = required_authorization_endpoints(&target, &auth_server)?;
-        #[cfg(not(test))]
-        let redirect_uri = outbound_redirect_uri(&server_key)?;
-        #[cfg(test)]
-        let redirect_uri = self
-            .outbound_redirect_uri
-            .clone()
-            .map_or_else(|| outbound_redirect_uri(&server_key), Ok)?;
+        let redirect_uri = self.outbound_oauth.redirect_uri(&server_key)?;
         let registration = self
             .resolve_mcp_registration(McpRegistrationRequest {
                 server_key: &server_key,
@@ -473,20 +637,22 @@ impl AuthService {
         attempt: &oauth::McpOAuthAttempt,
     ) -> Result<(String, AuthCompletionMode, i32), Status> {
         let attempt_id = Uuid::new_v4().to_string();
-        let completion_mode = if attempt.redirect_uri() == server_callback_uri().unwrap_or_default()
-        {
-            AuthCompletionMode::ServerCallback
-        } else {
-            AuthCompletionMode::Manual
-        };
+        let completion_mode =
+            if self.outbound_oauth.server_callback_uri.as_deref() == Some(attempt.redirect_uri()) {
+                AuthCompletionMode::ServerCallback
+            } else {
+                AuthCompletionMode::Manual
+            };
         let registration_method = proto_registration_method(attempt.registration_method()) as i32;
         self.outbound_store
             .save_attempt(
                 &DurableAttemptRecord {
                     attempt_id: attempt_id.clone(),
                     target_key: target.credential_key(),
-                    attempt_json: serde_json::to_string(attempt)
-                        .map_err(|_| Status::internal("failed to encode MCP OAuth attempt"))?,
+                    attempt_json: serde_json::to_string(
+                        &self.outbound_oauth.attempt_for_persistence(attempt),
+                    )
+                    .map_err(|_| Status::internal("failed to encode MCP OAuth attempt"))?,
                     registration_method: registration_method_name(attempt.registration_method())
                         .to_owned(),
                     completion_mode: completion_mode_name(completion_mode).to_owned(),
@@ -505,8 +671,9 @@ impl AuthService {
         &self,
         request: McpRegistrationRequest<'_>,
     ) -> Result<McpOAuthRegistration, Status> {
-        let persisted = self.persisted_mcp_registration(&request).await?;
+        let persisted = self.reusable_mcp_registration(&request).await?;
         if let Some(registration) = configured_mcp_registration(
+            &self.outbound_oauth,
             request.server_key,
             request.redirect_uri,
             &request.authorization_server.issuer,
@@ -528,7 +695,7 @@ impl AuthService {
             .authorization_server
             .client_id_metadata_document_supported
             == Some(true)
-            && let Some(client_id) = client_metadata_uri()
+            && let Some(client_id) = self.outbound_oauth.client_metadata_uri.clone()
         {
             return Ok(McpOAuthRegistration {
                 method: McpOAuthRegistrationMethod::ClientMetadata,
@@ -547,7 +714,7 @@ impl AuthService {
         self.register_mcp_client(&request).await
     }
 
-    async fn persisted_mcp_registration(
+    async fn reusable_mcp_registration(
         &self,
         request: &McpRegistrationRequest<'_>,
     ) -> Result<Option<McpOAuthRegistration>, Status> {
@@ -561,14 +728,17 @@ impl AuthService {
             && let Some(current) = current.credential.mcp_context()
             && current.issuer == request.authorization_server.issuer
             && current.resource == request.resource
-            && current.registration.redirect_uri == request.redirect_uri
             && current
                 .registration
                 .expires_at_ms
                 .is_none_or(|expiry| expiry > now_ms())
             && !current.registration.client_id.is_empty()
         {
-            Ok(Some(current.registration.clone()))
+            let registration = current.registration.clone();
+            if registration.redirect_uri != request.redirect_uri {
+                return Ok(None);
+            }
+            Ok(Some(registration))
         } else {
             Ok(None)
         }
@@ -692,6 +862,9 @@ impl AuthService {
             .await
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("OAuth attempt does not exist"))?;
+        let mut attempt: oauth::McpOAuthAttempt = serde_json::from_str(&record.attempt_json)
+            .map_err(|_| Status::data_loss("stored OAuth attempt is invalid"))?;
+        self.outbound_oauth.rehydrate_attempt(&mut attempt)?;
         if record.expires_at_ms < now_ms() {
             let expired = self
                 .outbound_store
@@ -709,8 +882,6 @@ impl AuthService {
             }
             return Err(Status::deadline_exceeded("OAuth attempt expired"));
         }
-        let attempt: oauth::McpOAuthAttempt = serde_json::from_str(&record.attempt_json)
-            .map_err(|_| Status::data_loss("stored OAuth attempt is invalid"))?;
         let target = attempt.target().clone();
         if target.credential_key() != record.target_key {
             return Err(Status::data_loss("stored OAuth attempt target is invalid"));
@@ -744,6 +915,7 @@ impl AuthService {
                 return Err(outbound_oauth_status(&target, &status));
             }
         };
+        let credential = self.outbound_oauth.credential_for_persistence(credential);
         self.outbound_store
             .complete_attempt_with_credential(
                 attempt_id,
@@ -837,6 +1009,8 @@ impl GeneratedAuthService for AuthService {
             .await
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("OAuth attempt does not exist"))?;
+        self.outbound_oauth
+            .durable_attempt_for_current_generation(&record)?;
         let lifecycle = attempt_lifecycle(&record);
         let target = target_from_credential_key(&record.target_key)?;
         let status = if lifecycle == AuthAttemptLifecycle::Succeeded {
@@ -868,6 +1042,15 @@ impl GeneratedAuthService for AuthService {
     ) -> Result<Response<CancelAuthResponse>, Status> {
         let attempt_id = request.into_inner().attempt_id;
         self.attempts.lock().await.remove(&attempt_id);
+        if let Some(record) = self
+            .outbound_store
+            .attempt(&attempt_id)
+            .await
+            .map_err(Status::internal)?
+        {
+            self.outbound_oauth
+                .durable_attempt_for_current_generation(&record)?;
+        }
         self.outbound_store
             .transition_pending_attempt(&attempt_id, "canceled", None)
             .await
@@ -880,6 +1063,13 @@ impl GeneratedAuthService for AuthService {
         request: Request<LogoutRequest>,
     ) -> Result<Response<LogoutResponse>, Status> {
         let target = auth_target_from_proto(request.into_inner().target)?;
+        if self.self_mcp_credential_ownership == CredentialOwnership::EmbeddedHost
+            && matches!(&target, AuthTarget::McpServer { key } if key == "waltr")
+        {
+            return Err(Status::failed_precondition(
+                "embedded self-MCP credential is host-owned",
+            ));
+        }
         let mcp_credential = if matches!(target, AuthTarget::McpServer { .. }) {
             match self
                 .credential_store
@@ -965,6 +1155,13 @@ async fn outbound_callback_with_policy(
                 .into_response();
         }
     };
+    if !serde_json::from_str::<oauth::McpOAuthAttempt>(&record.attempt_json).is_ok_and(|attempt| {
+        service
+            .outbound_oauth
+            .persisted_attempt_matches_callback(&attempt)
+    }) {
+        return (StatusCode::NOT_FOUND, "Authorization attempt not found").into_response();
+    }
     if !callback_response_issuer_is_valid(&record, query.iss.as_deref()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1048,11 +1245,11 @@ fn callback_completion_input(code: &str, state: &str, issuer: Option<&str>) -> S
     input.finish()
 }
 
-async fn client_metadata(State(_service): State<Arc<AuthService>>) -> AxumResponse {
-    let Some(client_id) = client_metadata_uri() else {
+async fn client_metadata(State(service): State<Arc<AuthService>>) -> AxumResponse {
+    let Some(client_id) = service.outbound_oauth.client_metadata_uri.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(redirect_uri) = server_callback_uri() else {
+    let Some(redirect_uri) = service.outbound_oauth.server_callback_uri.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let document = mcp::McpClientMetadataDocument {
@@ -1348,34 +1545,20 @@ async fn revoke_mcp_credential_with_policy(
 }
 
 fn configured_mcp_registration(
+    outbound_oauth: &OutboundOAuthConfig,
     server_key: &str,
     default_redirect_uri: &str,
     discovered_issuer: &str,
 ) -> Result<Option<McpOAuthRegistration>, Status> {
-    let key = server_key
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    let key = environment_server_key(server_key);
     let prefix = format!("WALTR_MCP_{key}_OAUTH");
-    let Some(client_id) = std::env::var(format!("{prefix}_CLIENT_ID"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(client_id) = outbound_oauth.variable(&format!("{prefix}_CLIENT_ID")) else {
         return Ok(None);
     };
-    let redirect_uri = std::env::var(format!("{prefix}_REDIRECT_URI"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let redirect_uri = outbound_oauth
+        .variable(&format!("{prefix}_REDIRECT_URI"))
         .unwrap_or_else(|| default_redirect_uri.to_owned());
-    let configured_issuer = std::env::var(format!("{prefix}_ISSUER"))
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let configured_issuer = outbound_oauth.variable(&format!("{prefix}_ISSUER"));
     if redirect_uri.trim().is_empty() || configured_issuer.as_deref() != Some(discovered_issuer) {
         return Err(outbound_failure_status(
             &AuthTarget::mcp_server(server_key),
@@ -1396,11 +1579,8 @@ fn configured_mcp_registration(
     }))
 }
 
-fn outbound_redirect_uri(server_key: &str) -> Result<String, Status> {
-    if let Some(callback) = server_callback_uri() {
-        return Ok(callback);
-    }
-    let key = server_key
+fn environment_server_key(server_key: &str) -> String {
+    server_key
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -1409,30 +1589,20 @@ fn outbound_redirect_uri(server_key: &str) -> Result<String, Status> {
                 '_'
             }
         })
-        .collect::<String>();
-    std::env::var(format!("WALTR_MCP_{key}_OAUTH_REDIRECT_URI"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            outbound_failure_status(
-                &AuthTarget::mcp_server(server_key),
-                tonic::Code::FailedPrecondition,
-                AuthenticationFailureReason::ConfigurationRequired,
-                "WALTR_PUBLIC_URL or an MCP OAuth redirect URI is required".to_owned(),
-            )
-        })
+        .collect()
 }
 
-fn server_callback_uri() -> Option<String> {
-    public_url_with_path("/outbound-oauth/callback")
+fn missing_redirect_uri(server_key: &str) -> Status {
+    outbound_failure_status(
+        &AuthTarget::mcp_server(server_key),
+        tonic::Code::FailedPrecondition,
+        AuthenticationFailureReason::ConfigurationRequired,
+        "WALTR_PUBLIC_URL or an MCP OAuth redirect URI is required".to_owned(),
+    )
 }
 
-fn client_metadata_uri() -> Option<String> {
-    public_url_with_path("/.well-known/oauth-client/waltr")
-}
-
-fn public_url_with_path(path: &str) -> Option<String> {
-    let mut url = url::Url::parse(&std::env::var("WALTR_PUBLIC_URL").ok()?).ok()?;
+fn public_url_with_path(public_url: &str, path: &str) -> Option<String> {
+    let mut url = url::Url::parse(public_url).ok()?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -1779,18 +1949,84 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::persistence::{DatabaseConfig, Persistence};
+    use crate::{
+        local_admission::{LocalBearer, LocalCredentialStore},
+        persistence::{DatabaseConfig, Persistence},
+    };
 
     #[test]
     fn missing_per_server_mcp_registration_allows_discovery_mechanisms() {
         let key = "registration-definitely-not-configured-7f4332";
         let registration = configured_mcp_registration(
+            &OutboundOAuthConfig::default(),
             key,
             "https://waltr.example/callback",
             "https://issuer.example",
         )
         .expect("missing preregistration is not an error");
         assert!(registration.is_none());
+    }
+
+    #[test]
+    fn environment_oauth_config_preserves_public_and_per_target_redirects() {
+        let public = OutboundOAuthConfig::from_environment(HashMap::from([(
+            "WALTR_PUBLIC_URL".into(),
+            "https://waltr.example/base".into(),
+        )]));
+        assert_eq!(
+            public.redirect_uri("remote").unwrap(),
+            "https://waltr.example/base/outbound-oauth/callback"
+        );
+        assert_eq!(
+            public.client_metadata_uri.as_deref(),
+            Some("https://waltr.example/base/.well-known/oauth-client/waltr")
+        );
+
+        let target = OutboundOAuthConfig::from_environment(HashMap::from([(
+            "WALTR_MCP_REMOTE_SERVER_OAUTH_REDIRECT_URI".into(),
+            "http://127.0.0.1/manual-callback".into(),
+        )]));
+        assert_eq!(
+            target.redirect_uri("remote-server").unwrap(),
+            "http://127.0.0.1/manual-callback"
+        );
+        assert!(target.server_callback_uri.is_none());
+    }
+
+    #[test]
+    fn hostile_environment_is_redacted_and_embedded_private_policy_stays_off() {
+        let config = OutboundOAuthConfig::from_environment(HashMap::from([
+            ("WALTR_PUBLIC_URL".into(), "https://waltr.example".into()),
+            (
+                "WALTR_MCP_REMOTE_OAUTH_CLIENT_ID".into(),
+                "SENTINEL_ALLOWED_VALUE".into(),
+            ),
+            (
+                "UNRELATED_SECRET".into(),
+                "SENTINEL_UNRELATED_SECRET".into(),
+            ),
+            (
+                "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS".into(),
+                "true".into(),
+            ),
+        ]));
+        assert!(config.allow_private_test_destinations);
+        assert!(config.variable("UNRELATED_SECRET").is_none());
+        assert_eq!(
+            config
+                .variable("WALTR_MCP_REMOTE_OAUTH_CLIENT_ID")
+                .as_deref(),
+            Some("SENTINEL_ALLOWED_VALUE")
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("SENTINEL_ALLOWED_VALUE"));
+        assert!(!debug.contains("SENTINEL_UNRELATED_SECRET"));
+        assert!(!debug.contains("https://waltr.example"));
+
+        let embedded = OutboundOAuthConfig::for_server_callback(
+            "http://127.0.0.1:43123/outbound-oauth/callback".to_owned(),
+        );
+        assert!(!embedded.allow_private_test_destinations);
     }
 
     #[test]
@@ -1949,6 +2185,7 @@ mod tests {
             outbound_store,
             Vec::new(),
             None,
+            OutboundOAuthConfig::default(),
         )
     }
 
@@ -1990,7 +2227,11 @@ mod tests {
         assert!(status.message.contains("requires reauthorization"));
     }
 
-    fn successful_oauth_router(base: &str, resource: &str) -> Router {
+    fn successful_oauth_router(
+        base: &str,
+        resource: &str,
+        registration_requests: Arc<AtomicUsize>,
+    ) -> Router {
         use axum::{http::header, routing::get};
 
         let resource_metadata = format!("{base}/resource-metadata");
@@ -2038,6 +2279,7 @@ mod tests {
                             "authorization_endpoint": format!("{issuer}/authorize"),
                             "token_endpoint": format!("{issuer}/token"),
                             "registration_endpoint": registration,
+                            "client_id_metadata_document_supported": true,
                             "response_types_supported": ["code"],
                             "grant_types_supported": ["authorization_code", "refresh_token"],
                             "code_challenge_methods_supported": ["S256"],
@@ -2048,17 +2290,23 @@ mod tests {
             )
             .route(
                 "/register",
-                post(|| async {
-                    Json(serde_json::json!({
-                        "client_id": "local-public-client",
-                        "application_type": "native",
-                        "redirect_uris": ["http://127.0.0.1/callback"],
-                        "grant_types": ["authorization_code", "refresh_token"],
-                        "response_types": ["code"],
-                        "token_endpoint_auth_method": "none",
-                        "client_name": "Waltr outbound MCP client"
-                    }))
-                }),
+                post(
+                    move |Json(request): Json<McpPublicClientRegistrationRequest>| {
+                        let registration_requests = Arc::clone(&registration_requests);
+                        async move {
+                            registration_requests.fetch_add(1, Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "client_id": "local-public-client",
+                                "application_type": request.application_type,
+                                "redirect_uris": request.redirect_uris,
+                                "grant_types": request.grant_types,
+                                "response_types": request.response_types,
+                                "token_endpoint_auth_method": request.token_endpoint_auth_method,
+                                "client_name": request.client_name
+                            }))
+                        }
+                    },
+                ),
             )
             .route(
                 "/token",
@@ -2076,11 +2324,13 @@ mod tests {
     async fn successful_lifecycle_service() -> (
         Arc<AuthService>,
         tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        Arc<AtomicUsize>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let resource = format!("{base}/mcp");
-        let app = successful_oauth_router(&base, &resource);
+        let registration_requests = Arc::new(AtomicUsize::new(0));
+        let app = successful_oauth_router(&base, &resource, Arc::clone(&registration_requests));
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
         let codex = format!(
@@ -2098,13 +2348,22 @@ mod tests {
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
         let credentials = CredentialStore::shared(outbound_store.clone());
-        let service = AuthService::new_for_tests(
+        let service = Arc::new(AuthService {
             resources,
-            credentials,
+            credential_store: credentials,
             outbound_store,
-            Some("http://127.0.0.1/callback".to_owned()),
-        );
-        (service, server)
+            attempts: Mutex::new(HashMap::new()),
+            outbound_policy: OutboundHttpPolicy::loopback_test(),
+            outbound_oauth: OutboundOAuthConfig {
+                server_callback_uri: Some(
+                    "http://127.0.0.1:43123/outbound-oauth/callback".to_owned(),
+                ),
+                ..OutboundOAuthConfig::default()
+            },
+            self_mcp_credential_ownership: CredentialOwnership::Durable,
+            refresh_outcomes: Mutex::new(HashMap::new()),
+        });
+        (service, server, registration_requests)
     }
 
     fn state_from_auth_url(auth_url: &str) -> String {
@@ -2113,6 +2372,35 @@ mod tests {
             .query_pairs()
             .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
             .unwrap()
+    }
+
+    fn embedded_auth_service(
+        resources: AgentDefinitionState,
+        outbound_store: Arc<OutboundOAuthStore>,
+        base: &str,
+        bearer_value: &str,
+    ) -> Arc<AuthService> {
+        let self_mcp_url = format!("{base}/mcp");
+        let outbound_oauth =
+            OutboundOAuthConfig::for_server_callback(format!("{base}/outbound-oauth/callback"));
+        let credential_store = CredentialStore::new(LocalCredentialStore::new(
+            Arc::clone(&outbound_store),
+            &LocalBearer::new(bearer_value).unwrap(),
+            &self_mcp_url,
+            outbound_oauth
+                .durable_callback_marker()
+                .map(ToOwned::to_owned),
+        ));
+        Arc::new(AuthService {
+            resources,
+            credential_store,
+            outbound_store,
+            attempts: Mutex::new(HashMap::new()),
+            outbound_policy: OutboundHttpPolicy::loopback_test(),
+            outbound_oauth,
+            self_mcp_credential_ownership: CredentialOwnership::EmbeddedHost,
+            refresh_outcomes: Mutex::new(HashMap::new()),
+        })
     }
 
     async fn assert_non_destructive_mcp_reauthorization(service: &AuthService) {
@@ -2233,7 +2521,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_provider_and_mcp_begin_and_complete_succeed() {
-        let (service, server) = successful_lifecycle_service().await;
+        let (service, server, registration_requests) = successful_lifecycle_service().await;
         let provider_target = proto_provider_target("codex");
         let provider_begin = GeneratedAuthService::begin_auth(
             service.as_ref(),
@@ -2272,11 +2560,38 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
+        assert_eq!(
+            mcp_begin.completion_mode,
+            AuthCompletionMode::ServerCallback as i32
+        );
+        assert_eq!(
+            mcp_begin.registration_method,
+            proto_registration_method(McpOAuthRegistrationMethod::Dynamic) as i32
+        );
+        let attempt_id = mcp_begin.attempt_id.clone();
+        let durable_attempt = service
+            .outbound_store
+            .attempt(&attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            durable_attempt
+                .attempt_json
+                .contains("http://127.0.0.1:43123/outbound-oauth/callback")
+        );
+        let mcp_authorize_url = url::Url::parse(&mcp_begin.auth_url).unwrap();
+        assert_eq!(
+            mcp_authorize_url
+                .query_pairs()
+                .find_map(|(key, value)| (key == "redirect_uri").then(|| value.into_owned())),
+            Some("http://127.0.0.1:43123/outbound-oauth/callback".to_owned())
+        );
         let mcp_state = state_from_auth_url(&mcp_begin.auth_url);
         let mcp_status = GeneratedAuthService::complete_auth(
             service.as_ref(),
             Request::new(CompleteAuthRequest {
-                attempt_id: mcp_begin.attempt_id,
+                attempt_id,
                 input: format!("code=mcp-code&state={mcp_state}"),
             }),
         )
@@ -2287,12 +2602,294 @@ mod tests {
         .unwrap();
         assert_eq!(mcp_status.kind, AuthStatusKind::OauthConfigured as i32);
         assert!(mcp_status.can_refresh);
+        let credential = service
+            .credential_store
+            .read(&AuthTarget::mcp_server("remote").credential_key())
+            .await
+            .unwrap()
+            .unwrap()
+            .credential;
+        let durable_credential = serde_json::to_string(&credential).unwrap();
+        assert!(durable_credential.contains("http://127.0.0.1:43123/outbound-oauth/callback"));
+
+        let reauthorization = GeneratedAuthService::begin_auth(
+            service.as_ref(),
+            Request::new(BeginAuthRequest {
+                target: Some(proto_mcp_target("remote")),
+                method: AuthMethod::OauthManual as i32,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            reauthorization.registration_method,
+            proto_registration_method(McpOAuthRegistrationMethod::Dynamic) as i32
+        );
+        assert_eq!(registration_requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 
     #[tokio::test]
+    async fn embedded_dcr_reuses_only_current_generation_registration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let resource = format!("{base}/mcp");
+        let registration_requests = Arc::new(AtomicUsize::new(0));
+        let app = successful_oauth_router(&base, &resource, Arc::clone(&registration_requests));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let remote = format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: remote\nspec:\n  transport: streamableHttp\n  url: {resource}\n"
+        );
+        let resources = crate::test_support::resource_state_with_overrides(&[(
+            "mcp-servers/remote.yaml",
+            remote.as_str(),
+        )]);
+        let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
+            .await
+            .unwrap();
+        let outbound_store = persistence.outbound_oauth_store();
+        let generation_one = embedded_auth_service(
+            resources.clone(),
+            Arc::clone(&outbound_store),
+            &base,
+            "generation-one-bearer",
+        );
+
+        let first = GeneratedAuthService::begin_auth(
+            generation_one.as_ref(),
+            Request::new(BeginAuthRequest {
+                target: Some(proto_mcp_target("remote")),
+                method: AuthMethod::OauthManual as i32,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let state = state_from_auth_url(&first.auth_url);
+        GeneratedAuthService::complete_auth(
+            generation_one.as_ref(),
+            Request::new(CompleteAuthRequest {
+                attempt_id: first.attempt_id,
+                input: format!("code=mcp-code&state={state}"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registration_requests.load(Ordering::SeqCst), 1);
+
+        let target_key = AuthTarget::mcp_server("remote").credential_key();
+        let durable = OAuthCredentialStore::read(outbound_store.as_ref(), target_key.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .credential;
+        assert!(
+            durable
+                .mcp_context()
+                .unwrap()
+                .registration
+                .redirect_uri
+                .starts_with("urn:waltr:outbound-oauth-callback:")
+        );
+        assert!(
+            !serde_json::to_string(&durable)
+                .unwrap()
+                .contains(&format!("{base}/outbound-oauth/callback"))
+        );
+        let current = generation_one
+            .credential_store
+            .read(&target_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential;
+        assert_eq!(
+            current.mcp_context().unwrap().registration.redirect_uri,
+            format!("{base}/outbound-oauth/callback")
+        );
+
+        GeneratedAuthService::begin_auth(
+            generation_one.as_ref(),
+            Request::new(BeginAuthRequest {
+                target: Some(proto_mcp_target("remote")),
+                method: AuthMethod::OauthManual as i32,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registration_requests.load(Ordering::SeqCst), 1);
+
+        let generation_two = embedded_auth_service(
+            resources.clone(),
+            Arc::clone(&outbound_store),
+            &base,
+            "generation-two-bearer",
+        );
+        GeneratedAuthService::begin_auth(
+            generation_two.as_ref(),
+            Request::new(BeginAuthRequest {
+                target: Some(proto_mcp_target("remote")),
+                method: AuthMethod::OauthManual as i32,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registration_requests.load(Ordering::SeqCst), 2);
+
+        let mut pre_marker_credential = durable;
+        pre_marker_credential
+            .mcp_context_mut()
+            .unwrap()
+            .registration
+            .redirect_uri = format!("{base}/outbound-oauth/callback");
+        OAuthCredentialStore::write(outbound_store.as_ref(), target_key, pre_marker_credential)
+            .await
+            .unwrap();
+        let repeated_port_generation = embedded_auth_service(
+            resources,
+            Arc::clone(&outbound_store),
+            &base,
+            "generation-three-bearer",
+        );
+        GeneratedAuthService::begin_auth(
+            repeated_port_generation.as_ref(),
+            Request::new(BeginAuthRequest {
+                target: Some(proto_mcp_target("remote")),
+                method: AuthMethod::OauthManual as i32,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registration_requests.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_embedded_attempt_status_and_cancel_are_not_found_and_non_mutating() {
+        let resources = crate::test_support::resource_state_with_overrides(&[]);
+        let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
+            .await
+            .unwrap();
+        let outbound_store = persistence.outbound_oauth_store();
+        let generation_one = embedded_auth_service(
+            resources.clone(),
+            Arc::clone(&outbound_store),
+            "http://127.0.0.1:43123",
+            "generation-one-bearer",
+        );
+        let callback = generation_one
+            .outbound_oauth
+            .server_callback_uri
+            .clone()
+            .unwrap();
+        let (attempt, _) = oauth::begin_mcp(
+            AuthTarget::mcp_server("remote"),
+            "https://auth.example".to_owned(),
+            "https://auth.example/authorize",
+            "https://auth.example/token".to_owned(),
+            None,
+            McpOAuthRegistration {
+                method: McpOAuthRegistrationMethod::Dynamic,
+                client_id: "generation-one-client".to_owned(),
+                redirect_uri: callback,
+                token_endpoint_auth_method: "none".to_owned(),
+                ..McpOAuthRegistration::default()
+            },
+            Vec::new(),
+            "https://mcp.example/resource".to_owned(),
+            false,
+            now_ms(),
+        )
+        .unwrap();
+        let (attempt_id, _, _) = generation_one
+            .save_mcp_attempt(&AuthTarget::mcp_server("remote"), &attempt)
+            .await
+            .unwrap();
+        let current = GeneratedAuthService::get_auth_attempt_status(
+            generation_one.as_ref(),
+            Request::new(GetAuthAttemptStatusRequest {
+                attempt_id: attempt_id.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            current.attempt.unwrap().lifecycle,
+            AuthAttemptLifecycle::Pending as i32
+        );
+
+        let generation_two = embedded_auth_service(
+            resources,
+            Arc::clone(&outbound_store),
+            "http://127.0.0.1:43123",
+            "generation-two-bearer",
+        );
+        let status = GeneratedAuthService::get_auth_attempt_status(
+            generation_two.as_ref(),
+            Request::new(GetAuthAttemptStatusRequest {
+                attempt_id: attempt_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        let cancel = GeneratedAuthService::cancel_auth(
+            generation_two.as_ref(),
+            Request::new(CancelAuthRequest {
+                attempt_id: attempt_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cancel.code(), tonic::Code::NotFound);
+        assert_eq!(
+            outbound_store
+                .attempt(&attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_self_mcp_logout_is_failed_precondition_and_preserves_credential() {
+        let resources = crate::test_support::resource_state_with_overrides(&[]);
+        let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
+            .await
+            .unwrap();
+        let service = embedded_auth_service(
+            resources,
+            persistence.outbound_oauth_store(),
+            "http://127.0.0.1:43123",
+            "host-owned-bearer",
+        );
+        let error = GeneratedAuthService::logout(
+            service.as_ref(),
+            Request::new(LogoutRequest {
+                target: Some(proto_mcp_target("waltr")),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let credential = service
+            .credential_store
+            .read(&AuthTarget::mcp_server("waltr").credential_key())
+            .await
+            .unwrap()
+            .expect("host-owned credential remains installed")
+            .credential;
+        assert_eq!(credential.token.access_token.secret(), "host-owned-bearer");
+        assert!(!error.message().contains("host-owned-bearer"));
+    }
+
+    #[tokio::test]
     async fn generic_provider_and_mcp_forced_refresh_succeed_with_sanitized_status() {
-        let (service, server) = successful_lifecycle_service().await;
+        let (service, server, _) = successful_lifecycle_service().await;
         service.refresh_outcomes.lock().await.insert(
             AuthTarget::provider("codex").credential_key(),
             TestRefreshOutcome::Success(Box::new(OAuthCredential::provider(
@@ -2697,6 +3294,9 @@ mod tests {
             outbound_store,
             Vec::new(),
             None,
+            OutboundOAuthConfig::for_server_callback(
+                "https://waltr.example/outbound-oauth/callback".to_owned(),
+            ),
         );
         let router = Router::new()
             .route(

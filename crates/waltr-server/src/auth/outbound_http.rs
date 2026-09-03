@@ -20,11 +20,11 @@ impl OutboundHttpPolicy {
     pub(super) fn production(
         configured_private_origins: Vec<Url>,
         automatic_self_resource: Option<Url>,
+        allow_private_https: bool,
     ) -> Self {
         Self {
             allow_loopback_http: false,
-            allow_private_https: std::env::var("WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS")
-                .is_ok_and(|value| value == "true"),
+            allow_private_https,
             active_private_origins: configured_private_origins.clone(),
             configured_private_origins,
             automatic_self_resource,
@@ -316,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_policy_rejects_private_metadata_and_loopback_destinations() {
-        let policy = OutboundHttpPolicy::production(Vec::new(), None);
+        let policy = OutboundHttpPolicy::production(Vec::new(), None, false);
         for endpoint in [
             "http://127.0.0.1/token",
             "https://10.0.0.1/token",
@@ -341,7 +341,7 @@ mod tests {
     async fn trusted_https_origin_accepts_only_private_addresses_on_that_origin() {
         let self_resource = Url::parse("https://preview-waltr.example/mcp").expect("trusted URL");
         let configured = Url::parse("https://configured.example").expect("configured origin");
-        let policy = OutboundHttpPolicy::production(vec![configured], Some(self_resource));
+        let policy = OutboundHttpPolicy::production(vec![configured], Some(self_resource), false);
         let policy = policy.for_mcp_resource("https://preview-waltr.example/mcp");
         let trusted = Url::parse("https://preview-waltr.example/token").expect("endpoint URL");
         let other_host = Url::parse("https://other.example/token").expect("endpoint URL");

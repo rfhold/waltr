@@ -18,3 +18,4 @@ pub use state::{
 pub use watcher::{AgentDefinitionWatcher, DefinitionWatcherHealth};
 
 pub(crate) use state::PublishedState;
+pub(crate) use store::provision_persisted_resource;

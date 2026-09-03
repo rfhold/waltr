@@ -19,6 +19,8 @@ const ENV_MODELS_DEV_PATH: &str = "WALTR_MODELS_DEV_PATH";
 const ENV_MODELS_DEV_CACHE_PATH: &str = "WALTR_MODELS_DEV_CACHE_PATH";
 const CACHE_RELATIVE_PATH: &[&str] = &[".local", "share", "waltr", "cache", "models-dev-api.json"];
 const CATALOG_FRESHNESS: Duration = Duration::from_hours(24);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 
@@ -132,6 +134,23 @@ pub struct CatalogLoader {
     refresh_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CatalogRequestTimeouts {
+    connect: Duration,
+    request: Duration,
+}
+
+#[cfg(test)]
+impl Default for CatalogRequestTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: DEFAULT_CONNECT_TIMEOUT,
+            request: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+}
+
 impl CatalogLoader {
     /// Create a loader from `WALTR_MODELS_DEV_PATH`, `WALTR_MODELS_DEV_URL`, or defaults.
     #[must_use]
@@ -154,12 +173,47 @@ impl CatalogLoader {
         Self::new(CatalogSource::Path(path.into()), default_cache_path())
     }
 
+    /// Create a network-first loader with an explicit cache fallback path.
+    #[must_use]
+    pub fn from_url_with_cache(url: impl Into<String>, cache_path: impl Into<PathBuf>) -> Self {
+        Self::new(CatalogSource::Url(url.into()), cache_path.into())
+    }
+
+    #[cfg(test)]
+    fn from_url_with_cache_and_timeouts(
+        url: impl Into<String>,
+        cache_path: impl Into<PathBuf>,
+        timeouts: CatalogRequestTimeouts,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self::new_with_client(
+            CatalogSource::Url(url.into()),
+            cache_path.into(),
+            catalog_client_with_timeouts(timeouts)?,
+        ))
+    }
+
+    /// Create a fixture loader with an explicit cache path.
+    #[must_use]
+    pub fn from_path_with_cache(path: impl Into<PathBuf>, cache_path: impl Into<PathBuf>) -> Self {
+        Self::new(CatalogSource::Path(path.into()), cache_path.into())
+    }
+
     #[must_use]
     fn new(source: CatalogSource, cache_path: PathBuf) -> Self {
+        let client =
+            catalog_client().expect("static catalog HTTP client configuration should be valid");
+        Self::new_with_client(source, cache_path, client)
+    }
+
+    fn new_with_client(
+        source: CatalogSource,
+        cache_path: PathBuf,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             source,
             cache_path,
-            client: reqwest::Client::new(),
+            client,
             cached: Arc::new(Mutex::new(None)),
             refresh: Arc::new(CatalogRefreshCoordinator::default()),
             #[cfg(test)]
@@ -293,6 +347,23 @@ impl CatalogLoader {
             .await
             .map_err(|_| CatalogLoadError::new("replace catalog cache", CatalogFailureKind::Io))
     }
+}
+
+fn catalog_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .build()
+}
+
+#[cfg(test)]
+fn catalog_client_with_timeouts(
+    timeouts: CatalogRequestTimeouts,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .timeout(timeouts.request)
+        .build()
 }
 
 fn configured_catalog_model(
@@ -863,6 +934,67 @@ mod loader_tests {
         let snapshots = successful_snapshots(loads.await.expect("join fallback loads"));
         assert_same_snapshot(&snapshots, true);
         assert_eq!(server.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_reaches_valid_cache_fallback() {
+        let release = Arc::new(Semaphore::new(0));
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::OK,
+            body: CATALOG,
+            release: Some(release),
+        }])
+        .await;
+        let root = crate::test_support::temp_root();
+        let cache_path = root.join("catalog.json");
+        tokio::fs::write(&cache_path, CATALOG)
+            .await
+            .expect("write valid catalog cache");
+        let loader = CatalogLoader::from_url_with_cache_and_timeouts(
+            server.url.clone(),
+            cache_path,
+            CatalogRequestTimeouts {
+                connect: Duration::from_millis(25),
+                request: Duration::from_millis(25),
+            },
+        )
+        .expect("build bounded catalog client");
+
+        let loaded = tokio::time::timeout(Duration::from_secs(1), loader.load())
+            .await
+            .expect("catalog request remains bounded")
+            .expect("valid cache is used after timeout");
+        assert!(loaded.stale());
+        assert_eq!(server.entered.recv().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn failed_request_rejects_malformed_cache_fallback() {
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "failed",
+            release: None,
+        }])
+        .await;
+        let root = crate::test_support::temp_root();
+        let cache_path = root.join("catalog.json");
+        tokio::fs::write(&cache_path, r#"{"SENTINEL_CACHE_BODY": }"#)
+            .await
+            .expect("write malformed catalog cache");
+        let loader = CatalogLoader::from_url_with_cache(server.url.clone(), cache_path);
+
+        let error = loader
+            .load()
+            .await
+            .expect_err("malformed cache must not satisfy fallback")
+            .to_string();
+        assert!(error.contains("HTTP 500"), "{error}");
+        assert!(
+            error.contains("cache fallback failed: failed to decode catalog (decode)"),
+            "{error}"
+        );
+        assert!(!error.contains("SENTINEL_CACHE_BODY"), "{error}");
+        assert_eq!(server.entered.recv().await, Some(1));
     }
 
     #[tokio::test]

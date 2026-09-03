@@ -8,11 +8,13 @@ use crate::{
     },
     agent_definition::{AgentDefinitionState, AgentDefinitionWatcher, DefinitionWatcherHealth},
     auth::{
-        AuthService, CredentialStore, TrustedPrivateOriginsError, trusted_private_origins_from_env,
+        AuthService, CredentialStore, OutboundOAuthConfig, TrustedPrivateOriginsError,
+        trusted_private_origins_from_env,
     },
     catalog::{CatalogLoader, CatalogService},
     config::ConfigHandle,
     config_service::ConfigService,
+    local_admission::{LocalBearer, LocalCredentialStore, require_local_protocol_bearer},
     mcp_oauth::{McpOAuthConfig, McpOAuthConfigError, McpOAuthError, McpOAuthServer},
     mcp_service::WaltrMcpServer,
     persistence::{Persistence, PersistenceError},
@@ -22,7 +24,6 @@ use crate::{
     session,
     status_service::StatusService,
 };
-#[cfg(feature = "web")]
 use axum::middleware;
 use axum::{
     Json, Router,
@@ -47,6 +48,12 @@ use tower_http::trace::TraceLayer;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
+pub(crate) struct LocalAdmission {
+    pub(crate) bearer: LocalBearer,
+    pub(crate) self_mcp_url: String,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -61,16 +68,19 @@ struct Readiness {
 }
 
 impl Readiness {
-    async fn response(self) -> axum::response::Response {
+    async fn is_ready(&self) -> bool {
         let definitions_ready = definition_watcher_ready(&self.definitions);
-        let ready = definitions_ready
+        definitions_ready
             && routine_engine_ready(&self.routines)
             && self.persistence.ready().await.is_ok()
-            && match self.oauth {
+            && match &self.oauth {
                 Some(oauth) => oauth.ready().await.is_ok(),
                 None => true,
-            };
-        if ready {
+            }
+    }
+
+    async fn response(self) -> axum::response::Response {
+        if self.is_ready().await {
             Json(HealthResponse { status: "ready" }).into_response()
         } else {
             axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -94,6 +104,8 @@ pub struct ServerApplication {
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
     routine_engine: Option<RoutineEngine>,
+    session_host: Option<Arc<dyn session::SessionHost>>,
+    readiness: Option<Readiness>,
     test_background: Option<TestBackgroundTask>,
 }
 
@@ -111,12 +123,16 @@ impl ServerApplication {
         definition_watcher: AgentDefinitionWatcher,
         oauth: Option<McpOAuthServer>,
         routine_engine: RoutineEngine,
+        session_host: Arc<dyn session::SessionHost>,
+        readiness: Readiness,
     ) -> Self {
         Self {
             router,
             definition_watcher: Some(definition_watcher),
             oauth_maintenance: oauth.map(McpOAuthMaintenanceTask::spawn),
             routine_engine: Some(routine_engine),
+            session_host: Some(session_host),
+            readiness: Some(readiness),
             test_background: None,
         }
     }
@@ -126,6 +142,24 @@ impl ServerApplication {
         self.router.clone()
     }
 
+    /// Check all server-owned readiness dependencies directly.
+    async fn ready(&self) -> bool {
+        let Some(readiness) = self.readiness.clone() else {
+            return false;
+        };
+        readiness.is_ready().await
+    }
+
+    /// Wait until all server-owned readiness dependencies are ready.
+    pub async fn wait_until_ready(&self) {
+        loop {
+            if self.ready().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Cancel and join all server-owned background work.
     pub async fn shutdown(self) {
         let Self {
@@ -133,6 +167,8 @@ impl ServerApplication {
             definition_watcher,
             oauth_maintenance,
             routine_engine,
+            session_host,
+            readiness: _,
             test_background,
         } = self;
         drop(router);
@@ -140,6 +176,7 @@ impl ServerApplication {
             definition_watcher,
             oauth_maintenance,
             routine_engine,
+            session_host,
             test_background,
         )
         .await;
@@ -164,6 +201,8 @@ impl ServerApplication {
             definition_watcher: None,
             oauth_maintenance: None,
             routine_engine: None,
+            session_host: None,
+            readiness: None,
             test_background: Some(TestBackgroundTask { cancellation, task }),
         }
     }
@@ -212,6 +251,8 @@ impl ServerApplication {
             definition_watcher,
             oauth_maintenance,
             routine_engine,
+            session_host,
+            readiness: _,
             test_background,
         } = self;
         let result = {
@@ -240,6 +281,7 @@ impl ServerApplication {
             definition_watcher,
             oauth_maintenance,
             routine_engine,
+            session_host,
             test_background,
         )
         .await;
@@ -251,10 +293,14 @@ async fn shutdown_background_tasks(
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
     routine_engine: Option<RoutineEngine>,
+    session_host: Option<Arc<dyn session::SessionHost>>,
     test_background: Option<TestBackgroundTask>,
 ) {
     if let Some(routine_engine) = routine_engine {
         routine_engine.shutdown().await;
+    }
+    if let Some(session_host) = session_host {
+        session_host.shutdown().await;
     }
     if let Some(definition_watcher) = definition_watcher
         && let Err(error) = definition_watcher.shutdown().await
@@ -474,8 +520,10 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
             &access_authenticator,
             mcp_oauth,
             outbound_private_origins.clone(),
+            OutboundOAuthConfig::from_env(),
             automatic_self_mcp_resource,
             Some(agent_state),
+            None,
             |grpc_routes, config, credential_store, agent_state, event_sink| {
                 match session::add_service_from_env_with_oauth_policy_agent_state_and_event_sink(
                     grpc_routes,
@@ -538,7 +586,7 @@ fn build_access_auth_client() -> Result<AccessAuthHttpClient, BuildAppError> {
     .map_err(BuildAppError::AccessAuthClient)
 }
 
-fn agent_trusted_origins(
+pub(crate) fn agent_trusted_origins(
     mut configured: Vec<reqwest::Url>,
     server_resource: Option<&reqwest::Url>,
 ) -> Vec<reqwest::Url> {
@@ -761,7 +809,9 @@ where
             &access_authenticator,
             mcp_oauth,
             Vec::new(),
+            OutboundOAuthConfig::from_env(),
             automatic_self_mcp_resource,
+            None,
             None,
             add_session_service,
         ),
@@ -774,15 +824,17 @@ where
     clippy::too_many_lines,
     reason = "router assembly consumes initialized services and OAuth policy in dependency order"
 )]
-fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy<F>(
+pub(crate) fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     catalog_loader: CatalogLoader,
     access_authenticator: &AccessAuthenticator,
     mcp_oauth: Option<McpOAuthServer>,
     outbound_private_origins: Vec<reqwest::Url>,
+    outbound_oauth: OutboundOAuthConfig,
     automatic_self_mcp_resource: Option<reqwest::Url>,
     agent_state: Option<AgentDefinitionState>,
+    local_admission: Option<LocalAdmission>,
     add_session_service: F,
 ) -> Result<ServerApplication, ResourceError>
 where
@@ -798,13 +850,24 @@ where
     let agent_state = agent_state.unwrap_or_else(|| config_service.state().clone());
     let config = ConfigHandle::from_resources(agent_state.clone());
     let outbound_oauth_store = persistence.outbound_oauth_store();
-    let credential_store = CredentialStore::shared(outbound_oauth_store.clone());
+    let credential_store = match &local_admission {
+        Some(local) => CredentialStore::new(LocalCredentialStore::new(
+            outbound_oauth_store.clone(),
+            &local.bearer,
+            &local.self_mcp_url,
+            outbound_oauth
+                .durable_callback_marker()
+                .map(ToOwned::to_owned),
+        )),
+        None => CredentialStore::shared(outbound_oauth_store.clone()),
+    };
     let auth_service = AuthService::new(
         agent_state.clone(),
         credential_store.clone(),
         outbound_oauth_store,
         outbound_private_origins,
         automatic_self_mcp_resource,
+        outbound_oauth,
     );
     let outbound_oauth_router = auth_service.router();
     let catalog_service = CatalogService::new(agent_state.clone(), catalog_loader);
@@ -860,6 +923,7 @@ where
         definitions: definition_watcher.health(),
         routines: routine_engine.health(),
     };
+    let readiness_route = readiness.clone();
     let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
         Router::new()
             .route("/mcp", any(service_unavailable))
@@ -889,7 +953,7 @@ where
         .route(
             "/ready",
             get(move || {
-                let readiness = readiness.clone();
+                let readiness = readiness_route.clone();
                 async move { readiness.response().await }
             }),
         )
@@ -930,11 +994,20 @@ where
     let router = router
         .fallback_service(grpc)
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
+    let router = match local_admission {
+        Some(local) => router.layer(middleware::from_fn_with_state(
+            local.bearer,
+            require_local_protocol_bearer,
+        )),
+        None => router,
+    };
     Ok(ServerApplication::new(
         router,
         definition_watcher,
         mcp_oauth,
         routine_engine,
+        session_host,
+        readiness,
     ))
 }
 
@@ -1019,8 +1092,10 @@ mod tests {
             &AccessAuthenticator::disabled(),
             None,
             Vec::new(),
+            OutboundOAuthConfig::default(),
             None,
             Some(state),
+            None,
             move |routes, config, credentials, callback_state, event_sink| {
                 assert!(Arc::ptr_eq(&expected_snapshot, &callback_state.snapshot()));
                 session::add_store_service_with_agent_state_and_event_sink(

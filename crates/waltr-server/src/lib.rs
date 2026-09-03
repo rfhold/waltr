@@ -7,10 +7,13 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod config_service;
+pub mod embedded;
+mod local_admission;
 pub mod mcp_oauth;
 pub mod mcp_service;
 pub mod observability;
 pub mod persistence;
+#[cfg(feature = "profiling")]
 pub mod profiling;
 pub mod resource_catalog;
 pub mod resource_error;
@@ -33,6 +36,7 @@ pub use app::{
     build_app_with_access_authenticator_and_mcp_oauth, build_app_with_catalog_loader,
     build_app_with_services,
 };
+pub use local_admission::{LocalBearer, LocalBearerError};
 pub use resource_error::ResourceError;
 /// Default address the server listens on when `WALTR_SERVER_ADDR` is unset.
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:14333";

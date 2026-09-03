@@ -5,7 +5,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ["shell"]
+default = ["profiling", "shell"]
+profiling = ["dep:pyroscope"]
 shell = ["waltr-agent/shell"]
 test = []
 web = []
@@ -33,7 +34,7 @@ opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
-pyroscope.workspace = true
+pyroscope = { workspace = true, optional = true }
 rand.workspace = true
 prost-types.workspace = true
 prost.workspace = true

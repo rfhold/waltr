@@ -101,13 +101,6 @@ pub enum AgentDefinitionLoadError {
         /// Definition resolution failure.
         source: AgentDefinitionError,
     },
-    /// An agent requires an omitted compiled feature.
-    UnsupportedFeature {
-        /// Agent requiring the feature.
-        name: String,
-        /// Feature omitted from this build.
-        feature: &'static str,
-    },
     /// The configured default agent was empty.
     EmptyDefaultAgent,
     /// The configured default agent was not Unicode.
@@ -165,7 +158,6 @@ impl AgentDefinitionLoadError {
                 | Self::DefinitionSource(_)
                 | Self::Resolve { .. }
                 | Self::ResolveAll { .. }
-                | Self::UnsupportedFeature { .. }
                 | Self::EmptyDefaultAgent
                 | Self::DefaultAgentNotUnicode
                 | Self::MissingExpectedEtag
@@ -195,9 +187,6 @@ impl AgentDefinitionLoadError {
             Self::Resolve { .. } | Self::ResolveAll { .. } => {
                 "agent definitions could not be resolved"
             }
-            Self::UnsupportedFeature { .. } => {
-                "agent definition requires support not compiled into this server"
-            }
             Self::EmptyDefaultAgent => "default agent must be nonempty",
             Self::DefaultAgentNotUnicode => "default agent must be valid Unicode",
             Self::MissingExpectedEtag => "expected_etag must not be empty",
@@ -226,7 +215,6 @@ impl fmt::Display for AgentDefinitionLoadError {
             Self::DefinitionSource(error) => write!(formatter, "invalid composed agent-definition source: {error}"),
             Self::Resolve { name, source } => write!(formatter, "failed to resolve default agent `{name}`: {source}"),
             Self::ResolveAll { source } => write!(formatter, "failed to resolve loaded agent definitions: {source}"),
-            Self::UnsupportedFeature { name, feature } => write!(formatter, "agent `{name}` requires `{feature}` support not compiled into this server"),
             Self::EmptyDefaultAgent => formatter.write_str("WALTR_DEFAULT_AGENT must be nonempty"),
             Self::DefaultAgentNotUnicode => formatter.write_str("WALTR_DEFAULT_AGENT must be valid Unicode"),
             Self::MissingExpectedEtag => formatter.write_str("expected_etag must not be empty"),

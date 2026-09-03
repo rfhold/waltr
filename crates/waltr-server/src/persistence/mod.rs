@@ -101,6 +101,25 @@ impl fmt::Debug for DatabaseConfig {
 }
 
 impl DatabaseConfig {
+    /// Configure two explicit, independent SQLite files without URL or process-state resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either path is relative or both paths identify the same file.
+    pub fn from_sqlite_paths(
+        waltr_path: impl Into<PathBuf>,
+        mcp_path: impl Into<PathBuf>,
+    ) -> Result<Self, PersistenceError> {
+        let waltr_path = waltr_path.into();
+        let mcp_path = mcp_path.into();
+        if !waltr_path.is_absolute() || !mcp_path.is_absolute() {
+            return Err(PersistenceError::Configuration(
+                "explicit SQLite database paths must be absolute",
+            ));
+        }
+        Self::new(sqlite_file_target(waltr_path), sqlite_file_target(mcp_path))
+    }
+
     /// Read `WALTR_DATABASE_URL` and optional `WALTR_MCP_DATABASE_URL`, defaulting to durable
     /// storage under `$XDG_DATA_HOME/waltr` or `$HOME/.local/share/waltr`.
     ///
