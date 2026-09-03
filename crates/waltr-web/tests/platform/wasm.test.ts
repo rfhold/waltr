@@ -34,6 +34,31 @@ import { loadBrowserClient } from "../../src/wasm/client";
 describe("browser WASM client adapter", () => {
   beforeEach(() => {
     wasm.clients.length = 0;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  test("provides hosted browser access operations", async () => {
+    const assign = vi.spyOn(window.location, "assign").mockImplementation(() => undefined);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false });
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = await loadBrowserClient();
+
+    await adapter.access!.openLogin("/oidc/login?return_to=%2Fsessions");
+    await expect(adapter.access!.logout()).resolves.toBe(true);
+    await expect(adapter.access!.logout()).resolves.toBe(false);
+
+    expect(assign).toHaveBeenCalledWith("/oidc/login?return_to=%2Fsessions");
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/oidc/logout", {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/oidc/logout", {
+      method: "POST",
+      credentials: "same-origin",
+    });
   });
 
   test("disposal releases pending state delivery and is terminal", async () => {

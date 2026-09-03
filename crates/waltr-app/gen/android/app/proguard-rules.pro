@@ -19,3 +19,11 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+-keep class dev.waltr.app.WaltrForegroundService { *; }
+-keepclasseswithmembernames class dev.waltr.app.MainActivity {
+    native <methods>;
+}
+-keepclasseswithmembernames class dev.waltr.app.WaltrForegroundService {
+    native <methods>;
+}

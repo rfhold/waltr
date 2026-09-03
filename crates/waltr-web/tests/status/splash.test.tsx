@@ -18,4 +18,14 @@ describe("splash status", () => {
     expect(logo.textContent).toContain("LLLLLLL   T");
     expect(screen.getByText("Connecting to Waltr...")).toBeTruthy();
   });
+
+  test("keeps startup presentation generic when no client snapshot is available", () => {
+    renderWithAppState(() => <SplashRouteWithRouter />, {
+      clientLoaded: false,
+      snapshot: undefined,
+    });
+
+    expect(screen.getByText("Preparing client...")).toBeTruthy();
+    expect(screen.queryByText(/embedded|local Waltr|server endpoint/i)).toBeNull();
+  });
 });

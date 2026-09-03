@@ -53,25 +53,14 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
   const app = useAppState();
   const [localError, setLocalError] = createSignal<string>();
   const access = () => app.snapshot()?.access;
-  const accessProgressError = () => {
-    const progress = app.accessProgress();
-    return progress?.type === "unavailable" ? progress.message : undefined;
-  };
-  const accessProgressWarning = () => {
-    const progress = app.accessProgress();
-    return progress?.type === "warning" ? progress.message : undefined;
-  };
   const loginUrl = () => waltrLoginUrl(window.location);
   const login = async (event: MouseEvent) => {
     event.preventDefault();
     setLocalError(undefined);
 
     try {
-      const nativeAccess = app.nativeAccess();
-      if (nativeAccess) {
-        await nativeAccess.start();
-        return;
-      }
+      const accessOperations = app.accessOperations();
+      if (!accessOperations) throw new Error("Sign-in is unavailable in this client.");
 
       const started = await app.dispatch({ type: "startWaltrLogin" });
       const attemptId = started.access.activeAttemptId;
@@ -80,7 +69,7 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
       }
 
       try {
-        await (props.navigate ?? ((url) => window.location.assign(url)))(loginUrl());
+        await (props.navigate ?? accessOperations.openLogin)(loginUrl());
       } catch {
         if (app.snapshot()?.access.activeAttemptId !== attemptId) {
           return;
@@ -99,9 +88,7 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
 
     setLocalError(undefined);
     try {
-      const nativeAccess = app.nativeAccess();
-      if (nativeAccess) await nativeAccess.cancel();
-      else await app.dispatch({ type: "cancelWaltrLogin", attemptId });
+      await app.dispatch({ type: "cancelWaltrLogin", attemptId });
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "Unable to cancel login.");
     }
@@ -124,18 +111,14 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
 
-        <Show when={accessProgressError()}>
-          {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
-        </Show>
-
-        <Show when={accessProgressWarning()}>
-          {(message) => <InlineAlert tone="warning">{message()}</InlineAlert>}
-        </Show>
-
         <Show when={access()?.status === "loginInProgress"} fallback={
-          <a class="ui-button access__login" href={loginUrl()} onClick={login}>
-            {access()?.status === "loginFailed" || localError() ? "Try again" : "Sign in"}
-          </a>
+          <Show when={app.accessOperations()} fallback={
+            <InlineAlert tone="info">Waltr access operations are unavailable in this client.</InlineAlert>
+          }>
+            <a class="ui-button access__login" href={loginUrl()} onClick={login}>
+              {access()?.status === "loginFailed" || localError() ? "Try again" : "Sign in"}
+            </a>
+          </Show>
         }>
           <div class="access__progress-actions">
             <p class="access__progress" role="status" aria-live="polite">Login in progress</p>

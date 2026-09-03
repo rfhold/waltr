@@ -78,7 +78,7 @@ mod tests {
         }
 
         for rejected in [
-            "https://preview-waltr.holdenitdown.net",
+            "https://provider.example/authorize",
             "https://tauri.localhost.evil.example",
             "https://user@tauri.localhost",
             "file:///tmp/index.html",

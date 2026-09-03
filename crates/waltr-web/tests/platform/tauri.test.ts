@@ -5,6 +5,37 @@ import { loadTauriClient } from "../../src/platform/tauri";
 import { emptyConfig, snapshotWithConfig } from "../support/snapshots";
 
 describe("Tauri client adapter", () => {
+  test("keeps platform control events and access topology adapter-private", async () => {
+    let emit!: (event: unknown) => void;
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(1, 0, namedSnapshot("initial")));
+        return { generation: 1 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
+
+    expect("platform" in adapter).toBe(false);
+    expect(adapter.access).toBeUndefined();
+    await adapter.start();
+    const initial = adapter.snapshot();
+
+    emit({ generation: 1, sequence: 1, payload: { type: "platform", startup: "firstCatalogDownload" } });
+    emit({
+      generation: 1,
+      sequence: 2,
+      payload: { type: "platform", startup: { type: "recoverableFailure", endpoint: "SECRET_ENDPOINT" } },
+    });
+    await Promise.resolve();
+    expect(adapter.snapshot()).toBe(initial);
+    expect(JSON.stringify(adapter)).not.toContain("SECRET_ENDPOINT");
+  });
+
   test("listens before start, accepts the returned generation, and recovers sequence gaps", async () => {
     const calls: string[] = [];
     let emit!: (event: unknown) => void;
@@ -72,7 +103,7 @@ describe("Tauri client adapter", () => {
     await expect(adapter.dispatch({ type: "requestAuthStatuses" })).rejects.toThrow("dispatch rejected");
   });
 
-  test("accepts only a post-start fresh generation snapshot on native resume", async () => {
+  test("accepts a sequence-zero state generation on native resume", async () => {
     let emit!: (event: unknown) => void;
     const initial = namedSnapshot("initial");
     const resumed = namedSnapshot("resumed");
@@ -99,7 +130,41 @@ describe("Tauri client adapter", () => {
     expect(adapter.snapshot()).toBe(resumed);
   });
 
-  test("decodes native secure-store warnings to fixed secret-free presentation text", async () => {
+  test("accepts a bounded platform-first generation without fabricating client state", async () => {
+    let emit!: (event: unknown) => void;
+    const initial = namedSnapshot("initial");
+    const resumed = namedSnapshot("resumed");
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(6, 0, initial));
+        return { generation: 6 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
+    await adapter.start();
+
+    emit(bridgePlatform(7, 0, "starting"));
+    await Promise.resolve();
+    expect(adapter.snapshot()).toBe(initial);
+
+    emit(bridgeState(7, 1, resumed));
+    await vi.waitFor(() => expect(adapter.snapshot()).toBe(resumed));
+    emit(bridgePlatform(6, 2, "recoverableFailure"));
+    await Promise.resolve();
+    expect(adapter.snapshot()).toBe(resumed);
+
+    emit({ generation: 8, sequence: 0, payload: { type: "platform", startup: { endpoint: "not-bounded" } } });
+    emit(bridgeState(8, 1, namedSnapshot("invalid-announcement")));
+    await Promise.resolve();
+    expect(adapter.snapshot()).toBe(resumed);
+  });
+
+  test("consumes current-generation platform events for state sequencing", async () => {
     let emit!: (event: unknown) => void;
     const listen = vi.fn(async (_name, handler) => {
       emit = (payload) => handler({ payload });
@@ -113,49 +178,40 @@ describe("Tauri client adapter", () => {
       throw new Error(`unexpected command ${command}`);
     });
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
-    const seen: unknown[] = [];
-    adapter.access!.subscribe((progress) => seen.push(progress));
     await adapter.start();
 
-    emit({
-      generation: 3,
-      sequence: 1,
-      payload: {
-        type: "access",
-        progress: {
-          type: "native",
-          progress: { type: "warning", warning: "BACKEND_SECRET_MUST_NOT_PASS" },
-        },
-      },
-    });
-
-    await vi.waitFor(() => expect(seen).toEqual([{
-      type: "warning",
-      message: "Secure credential storage is unavailable; login lasts only until the app stops",
-    }]));
-    expect(JSON.stringify(seen)).not.toContain("BACKEND_SECRET_MUST_NOT_PASS");
-
-    emit({
-      generation: 3,
-      sequence: 2,
-      payload: {
-        type: "access",
-        progress: {
-          type: "native",
-          progress: {
-            type: "failed",
-            error: "Waltr credentials were rejected, but secure credential deletion could not be confirmed",
-          },
-        },
-      },
-    });
-    await vi.waitFor(() => expect(seen.at(-1)).toEqual({
-      type: "unavailable",
-      message: "Waltr credentials were rejected, but secure credential deletion could not be confirmed",
-    }));
+    emit(bridgePlatform(3, 1, "notificationPermissionRequired"));
+    const next = namedSnapshot("after-platform");
+    emit(bridgeState(3, 2, next));
+    await vi.waitFor(() => expect(adapter.snapshot()).toBe(next));
   });
 
-  test("invokes native access/navigation and unlistens before disposal", async () => {
+  test("recovers private platform events when filling a state sequence gap", async () => {
+    let emit!: (event: unknown) => void;
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(4, 0, namedSnapshot("initial")));
+        return { generation: 4 };
+      }
+      if (command === "client_state") {
+        return { generation: 4, events: [bridgePlatform(4, 1, "notificationPermissionRequired")] };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
+    await adapter.start();
+
+    const next = namedSnapshot("after-recovery");
+    emit(bridgeState(4, 2, next));
+    await vi.waitFor(() => expect(adapter.snapshot()).toBe(next));
+    expect(invoke).toHaveBeenCalledWith("client_state", { afterSequence: 0 });
+  });
+
+  test("opens authorization attempts opaquely, opens external URLs, and unlistens before disposal", async () => {
     const order: string[] = [];
     let emit!: (event: unknown) => void;
     const unlisten = vi.fn(() => order.push("unlisten"));
@@ -173,94 +229,16 @@ describe("Tauri client adapter", () => {
     });
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
     await adapter.start();
-    await adapter.access!.start();
-    await adapter.access!.cancel();
-    await adapter.access!.logout();
+    await adapter.openAuthorizationAttempt!("attempt-private");
     await adapter.openExternalUrl!("https://auth.example/authorize");
     await adapter.dispose();
 
-    expect(invoke.mock.calls).toContainEqual(["access_start"]);
-    expect(invoke.mock.calls).toContainEqual(["access_cancel"]);
-    expect(invoke.mock.calls).toContainEqual(["access_logout"]);
+    expect(adapter.access).toBeUndefined();
+    expect(invoke.mock.calls).toContainEqual(["open_authorization_attempt", { attemptId: "attempt-private" }]);
     expect(invoke.mock.calls).toContainEqual(["open_external_url", { url: "https://auth.example/authorize" }]);
     expect(order).toEqual(["unlisten", "dispose"]);
     await adapter.dispose();
     expect(unlisten).toHaveBeenCalledOnce();
-  });
-
-  test("native logout resolves only after its cleared state is accepted", async () => {
-    let emit!: (event: unknown) => void;
-    let completeLogout!: () => void;
-    const logoutGate = new Promise<void>((resolve) => { completeLogout = resolve; });
-    const initial = namedSnapshot("initial");
-    const signedOut = {
-      ...namedSnapshot("signed-out"),
-      access: { status: "loginRequired", error: null, activeAttemptId: null },
-    } satisfies ClientSnapshot;
-    const listen = vi.fn(async (_name, handler) => {
-      emit = (payload) => handler({ payload });
-      return vi.fn();
-    });
-    const invoke = vi.fn(async (command) => {
-      if (command === "start_runtime") {
-        emit(bridgeState(5, 0, initial));
-        return { generation: 5 };
-      }
-      if (command === "access_logout") {
-        await logoutGate;
-        return bridgeState(5, 2, signedOut);
-      }
-      if (command === "client_state") return { generation: 5, events: [bridgeState(5, 2, signedOut)] };
-      throw new Error(`unexpected command ${command}`);
-    });
-    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
-    await adapter.start();
-
-    let settled = false;
-    const logout = adapter.access!.logout().then(() => { settled = true; });
-    await Promise.resolve();
-    expect(settled).toBe(false);
-    expect(adapter.snapshot()).toBe(initial);
-    completeLogout();
-    await logout;
-    expect(adapter.snapshot()).toBe(signedOut);
-  });
-
-  test("gap recovery presents logout control before authoritative signed-out state", async () => {
-    let emit!: (event: unknown) => void;
-    const presentation: string[] = [];
-    const initial = namedSnapshot("initial");
-    const signedOut = {
-      ...namedSnapshot("signed-out"),
-      access: { status: "loginRequired", error: null, activeAttemptId: null },
-    } satisfies ClientSnapshot;
-    const barrier = {
-      generation: 8,
-      sequence: 2,
-      payload: { type: "access", progress: { type: "loggingOut" } },
-    };
-    const cleared = bridgeState(8, 3, signedOut);
-    const listen = vi.fn(async (_name, handler) => {
-      emit = (payload) => handler({ payload });
-      return vi.fn();
-    });
-    const invoke = vi.fn(async (command) => {
-      if (command === "start_runtime") {
-        emit(bridgeState(8, 0, initial));
-        return { generation: 8 };
-      }
-      if (command === "client_state") return { generation: 8, events: [barrier, cleared] };
-      throw new Error(`unexpected command ${command}`);
-    });
-    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
-    adapter.access!.subscribe((progress) => presentation.push(progress.type));
-    adapter.subscribe((snapshot) => presentation.push(snapshot.access.status));
-    await adapter.start();
-
-    emit(barrier);
-    await vi.waitFor(() => expect(adapter.snapshot()).toBe(signedOut));
-    expect(presentation.slice(-2)).toEqual(["loggingOut", "loginRequired"]);
-    expect(invoke).toHaveBeenCalledWith("client_state", { afterSequence: 0 });
   });
 
   test("replacement during recovery rejects the triggering stale-generation event", async () => {
@@ -305,4 +283,8 @@ function namedSnapshot(etag: string) {
 
 function bridgeState(generation: number, sequence: number, snapshot: ClientSnapshot) {
   return { generation, sequence, payload: { type: "state", snapshot } };
+}
+
+function bridgePlatform(generation: number, sequence: number, startup: string) {
+  return { generation, sequence, payload: { type: "platform", startup } };
 }
