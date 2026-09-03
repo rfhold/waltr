@@ -65,6 +65,8 @@ The coordinator caches one MCP runtime per durable session. Its structural finge
 
 An equal fingerprint reuses the cached runtime after credential preflight. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. After a successful swap, current `Arc` users finish with the old runtime. Waltr shuts it down after those users release it.
 
+Coordinator shutdown rejects new work, cancels active and queued work, waits for run ownership to drain, and atomically takes MCP preparation guards and cached runtimes under the MCP lifecycle write gate. It then awaits every `McpClientRuntime::shutdown`; each runtime awaits each server's generic client shutdown, including the explicit stdio shutdown and child-reap path. No additional bounded termination guarantee exists beyond that MCP shutdown contract.
+
 ## Tool Discovery
 
 For each configured server, the session MCP runtime:
@@ -188,7 +190,7 @@ The generic MCP client opens `subscriptions/listen` for the list-change filters 
 | `notifications/resources/list_changed` | Refreshes that server's concrete resource and resource URI template registries in the background. Template searches see the refreshed resources. |
 | `notifications/message` | Publishes an internal MCP log event and writes a tracing event when the originating request opted into a log level. |
 | `notifications/progress` | Publishes an internal MCP progress event. |
-| MRTR `roots/list` input request | Retries the originating tool, prompt, or resource request with the coordinator runtime root as a single `file://` root response. |
+| MRTR `roots/list` input request | Retries the originating tool, prompt, or resource request with the host-injected coordinator runtime root as a single `file://` root response. Production code does not introspect a workspace root from process state. |
 
 The internal MCP event stream is not yet exposed as a public client or UI contract.
 
@@ -209,7 +211,15 @@ The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.opera
 
 ## Outbound OAuth
 
-The bundled `mcp-servers/waltr.yaml` resource uses the same target-scoped credentials as every other Streamable HTTP MCP server. Public hosted `/mcp` OAuth remains a separate inbound authorization boundary.
+Bundled `mcp-servers/waltr.yaml` uses the same ordinary resource contract as other Streamable HTTP servers. Embedded startup prebinds loopback, atomically overwrites the ordinary persisted slot with that generation's URL, and then loads the bundled-plus-persisted catalog. The resulting resource has filesystem origin and ordinary inspect, replace, watcher, reset, and ETag behavior.
+
+Reset can fail normal candidate validation when the bundled fallback requires `WALTR_PUBLIC_URL`; embedded mode adds no reset rule. The embedded generation credential remains host-owned and memory-only. Its exact initialized-resource URL binding prevents transport from sending the bearer to an endpoint introduced by a later resource edit.
+
+Public hosted `/mcp` OAuth remains a separate inbound authorization boundary.
+
+Embedded composition derives its outbound callback as `<prebound-loopback-origin>/outbound-oauth/callback`. It supplies that exact value without ambient OAuth redirect variables.
+
+Embedded mode advertises no CIMD client metadata URI because an upstream server cannot fetch device loopback. Its local metadata route returns `404 Not Found`.
 
 Streamable HTTP authentication failures preserve the parsed bearer challenge instead of flattening it into a display string. Session errors carry the server endpoint, HTTP status, protected-resource metadata URL, scope, bearer `error`, sanitized `error_description`, `error_uri`, and realm through `McpAuthorizationContext`; the server exposes that context in typed `AuthenticationFailure` gRPC status details under the outbound-MCP domain.
 
@@ -223,11 +233,27 @@ A Streamable HTTP bearer challenge becomes an ordinary target-scoped session fai
 
 Configured preregistration is optional, target-scoped, and issuer-bound. Normalize the server key by uppercasing ASCII letters/digits and replacing every other character with `_`; `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_CLIENT_ID` supplies the public client ID, required `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_ISSUER` must exactly match discovered authorization-server metadata, and optional `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_REDIRECT_URI` overrides the default server callback. There is no global registration, registration-specific `self` branch, or deployment-owned `WALTR_MCP_SELF_OAUTH_*` contract. If no mechanism is available, authorization returns typed `CONFIGURATION_REQUIRED` in the outbound-MCP domain.
 
-The default redirect is the server-owned `/outbound-oauth/callback`. Callback attempts, state, PKCE material, registration method, completion mode, and expiry are durable in Waltr SQL so another replica can claim completion. Completion requires the exact state for both callback and manual input. When the authorization server advertises RFC 9207, the response must also contain its exact issuer; a supplied issuer is always checked. Completion claims carry an opaque identity and expiry, use compare-and-swap for every terminal write, and can be reclaimed after a worker crashes. A configured nondefault redirect uses manual completion. Shared clients receive only the authorization URL and sanitized attempt lifecycle; web polls callback attempts and TUI can submit a final redirect URL for manual completion.
+The default redirect is the server-owned `/outbound-oauth/callback`. Callback attempts, state, PKCE material, registration method, completion mode, and expiry are durable in Waltr SQL so another replica can claim completion. Completion requires the exact state for both callback and manual input. When the authorization server advertises RFC 9207, the response must also contain its exact issuer; a supplied issuer is always checked. Completion claims carry an opaque identity and expiry, use compare-and-swap for every terminal write, and can be reclaimed after a worker crashes. A configured nondefault redirect uses manual completion.
 
-Target-scoped durable credential state preserves the exact resource, issuer, selected registration, authorization/token/revocation endpoints, access and refresh tokens, granted scopes, expiry, and refresh generation. Expiry distinguishes a known deadline, a true non-expiring token, and a token whose successful response omitted `expires_in`; omitted expiry does not retain the replaced token's deadline. The Waltr SQL backend uses a 30-second identity-bound compare-and-swap refresh lease across sessions/replicas. A claimant commits only against its generation and claim identity. An indeterminate exchange or an expired refresh lease requires reauthorization rather than risking reuse of a rotated token family. Code-exchange and refresh responses must be JSON and fit within 64 KiB. Authorization, token, refresh, and revocation requests preserve the discovered resource. Debug output for attempts, claims, durable OAuth state, and token values is redacted.
+For embedded mode, the explicit callback drives registration, server-callback attempt classification, and callback completion validation.
 
-Agent transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each stateless POST, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. The same refresh coordinator supports an explicit target-scoped forced refresh while preserving generation/claim coordination and resource binding. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Config clients expose sanitized MCP credential status and authorize, force-refresh, and reset actions, while registration remains discovery- and environment-owned. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes local state unconditionally. External MCP expiration or rejection is an ordinary outbound-MCP failure carrying the exact server key and sanitized challenge context; it never starts OAuth, replays work, or clears Waltr access credentials.
+Embedded selection skips CIMD even when an upstream server also offers DCR. It can select preregistration or DCR. Same-generation reauthorization reuses a valid dynamic registration; a replacement generation performs fresh DCR because the old marker cannot be rehydrated.
+
+Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots the private-test switch once.
+
+Embedded composition ignores the ambient private-test switch. Its explicit trusted-origin list solely controls private HTTPS OAuth destinations.
+
+Embedded attempts and credentials persist an opaque per-generation callback marker, not the callback endpoint. Only the matching active generation rehydrates the exact callback.
+
+An embedded server restart rejects stale attempts and credentials. Status and cancel return not found for stale attempts without mutating them. Each affected target requires reauthorization and cannot reuse generation-specific DCR registration.
+
+The snapshot excludes unrelated process environment. Its redacted `Debug` output contains no URL, client ID, issuer, redirect, or unrelated secret value.
+
+Hosted web and TUI receive the generic authorization URL and sanitized lifecycle. Tauri redacts URLs that contain its local endpoint and opens them by opaque attempt ID.
+
+Standalone target-scoped durable credentials preserve the exact resource, issuer, selected registration, authorization/token/revocation endpoints, redirect, tokens, scopes, expiry, and refresh generation. Embedded credentials replace the redirect with their generation marker. Expiry distinguishes a known deadline, a true non-expiring token, and a token whose successful response omitted `expires_in`; omitted expiry does not retain the replaced token's deadline. The Waltr SQL backend uses a 30-second identity-bound compare-and-swap refresh lease across sessions/replicas. A claimant commits only against its generation and claim identity. An indeterminate exchange or an expired refresh lease requires reauthorization rather than risking reuse of a rotated token family. Code-exchange and refresh responses must be JSON and fit within 64 KiB. Authorization, token, refresh, and revocation requests preserve the discovered resource. Debug output for attempts, claims, durable OAuth state, and token values is redacted.
+
+Agent transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each stateless POST, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. The same refresh coordinator supports an explicit target-scoped forced refresh while preserving generation/claim coordination and resource binding. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Config clients expose sanitized MCP credential status and authorize, force-refresh, and reset actions, while registration remains discovery- and environment-owned. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes ordinary local state unconditionally. Embedded self-MCP logout instead returns failed precondition and preserves its host-owned generation credential. External MCP expiration or rejection is an ordinary outbound-MCP failure carrying the exact server key and sanitized challenge context; it never starts OAuth, replays work, or clears Waltr access credentials.
 
 ## Boundaries
 
@@ -256,6 +282,8 @@ Focused coverage:
 | [../../crates/waltr-agent/tests/live/agent/mcp.rs](../../crates/waltr-agent/tests/live/agent/mcp.rs) | Ignored live-provider MCP coverage. |
 | [../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs](../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs) | Test MCP server binary. |
 | [../../crates/waltr-server/tests/mcp_oauth_server.rs](../../crates/waltr-server/tests/mcp_oauth_server.rs) | Waltr-hosted issuer, browser bridge/consent, token lifecycle, direct-upstream rejection, and restart behavior. |
+
+Current deterministic coverage exercises stdio behavior but does not provide a real child-process integration assertion for coordinator shutdown and child reaping. Do not cite such an integration test until one exists.
 
 ## References
 

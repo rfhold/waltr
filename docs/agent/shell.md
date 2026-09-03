@@ -2,6 +2,10 @@
 
 The shell tool gives an agent controlled access to local shell command execution. It is an optional `waltr-agent` feature and is not available unless the crate is built with the `shell` feature and the host enables the tool through `AgentBuilder`.
 
+The standalone server and embedded desktop app retain this feature. Their shell has no operating-system sandbox. Android is compiled without it.
+
+Every host loads the same ordinary catalog. A no-shell build accepts, exposes, and resolves shell-bearing definitions, but runtime construction does not install the shell tool or feature-derived shell tool permissions.
+
 ## Entry Points
 
 | API | Purpose |
@@ -50,6 +54,8 @@ Some shell constructs cannot be safely inferred. Dynamic paths containing shell 
 The shell tool is a local command runner, not a sandbox.
 
 - There is no chroot, container, seccomp, or PTY sandbox.
+- The embedded desktop server runs shell commands with the app process's operating-system authority.
+- Android exposes no shell tool. Shell-bearing resource source remains valid and inspectable, but shell feature selectors produce no runtime tool permission rules.
 - Interactive command handling is not implemented.
 - Shell output progress is display-only timeline data; provider replay still receives the final tool result.
 - Environment configuration is not exposed through `ShellConfig` today.

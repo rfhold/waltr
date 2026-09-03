@@ -6,6 +6,8 @@ Waltr server persistence initializes separately owned Waltr and MCP database tar
 
 This database is separate from agent session storage selected by `WALTR_SESSION_STORE`.
 
+Embedded Tauri composition does not read these environment defaults. The host supplies explicit absolute app-private paths for every durable store.
+
 ## Configuration
 
 `WALTR_DATABASE_URL` selects the Waltr target. Optional `WALTR_MCP_DATABASE_URL` overrides the MCP target. Each accepts:
@@ -19,6 +21,37 @@ When `WALTR_DATABASE_URL` is absent, Waltr uses `waltr/waltr.sqlite3` under `XDG
 Without `WALTR_MCP_DATABASE_URL`, or when it is empty, a file-backed SQLite Waltr target derives `mcp.sqlite3` in the same directory while preserving safe parsed SQLite options. A PostgreSQL target derives the same logical database, opened through a separate pool. An explicit MCP URL can select another supported target. Configuration rejects physical aliases for the same file-backed SQLite target and equal named shared in-memory targets; separate private `sqlite::memory:` targets remain valid.
 
 Tests inject independent in-memory databases or temporary file-backed SQLite databases instead of reading the process environment. The static Compose `dev` profile keeps `/data/waltr.sqlite3` and `/data/mcp.sqlite3` on the local `waltr-dev-data` volume. The `test` and `test-auth` Waltr services mount `/data` as tmpfs so integration runs cannot retain or reuse persistence.
+
+## Embedded Tauri Layout
+
+`crates/waltr-app/src/server_controller.rs` derives this layout from Tauri's app data and app config directories:
+
+| State | Relative path |
+| --- | --- |
+| Waltr SQL | App data `server/waltr.sqlite3` |
+| MCP SQL | App data `server/mcp.sqlite3` |
+| Filesystem sessions | App data `server/sessions/` |
+| Agent workspace | App data `workspace/` |
+| models.dev cache | App data `server/models/api.json` |
+| Resource overrides | App config `server/.waltr/resources/` |
+
+The embedded builder requires absolute paths. It never derives these stores from the current directory, `HOME`, XDG variables, or server persistence variables.
+
+The app uses separate Waltr and MCP SQLite files plus filesystem sessions. Provider and upstream-MCP OAuth credentials remain in Waltr SQL.
+
+The process-generation local bearer stays in private Rust memory. The loopback endpoint is also retained in private runtime configuration, but it is not memory-only: before catalog load, startup atomically writes it into app config `server/.waltr/resources/mcp-servers/waltr.yaml`. Each generation overwrites the durable file with its current endpoint.
+
+The persisted self-MCP resource has ordinary filesystem origin and catalog behavior. Neither the endpoint nor bearer enters published WebView snapshots, and the bearer never enters durable storage.
+
+Embedded outbound OAuth replaces its callback endpoint with an opaque per-generation marker before it persists attempts or MCP credentials.
+
+Only the matching active server generation rehydrates its marker into the exact callback endpoint. That generation can reuse a still-valid dynamic registration during reauthorization. A replacement generation rejects stale attempts, excludes stale marked credentials, and returns not found for status or cancel against an old attempt.
+
+Every embedded server restart therefore requires outbound MCP reauthorization. A generation-specific DCR registration cannot seed registration reuse in the replacement generation, so DCR runs again when it is the selected mechanism.
+
+Android backup rules exclude all private files, databases, shared preferences, and root data. Cloud backup and device transfer therefore exclude embedded state.
+
+After process death, startup reopens durable stores and runs normal migrations. Routine startup reconciliation marks unfinished invocations with the existing restart outcome.
 
 SQLite settings must use a direct `sqlite:` path. Nested `file:` URI filenames are rejected for both Waltr and MCP targets because they can obscure target identity and collision checks.
 

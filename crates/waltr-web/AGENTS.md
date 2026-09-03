@@ -14,6 +14,12 @@ Web behavior should stay feature-equivalent with TUI while keeping browser-speci
 
 Waltr access login navigates to server-owned `/oidc/login` with a safe local return path; the browser never handles provider tokens or the HttpOnly Waltr session cookie. Logout is same-origin POST before dispatching shared protected-state clearing. Keep this UI separate from provider/upstream-MCP `OAuthDialog`; server-callback MCP attempts poll shared lifecycle state and never expose token or PKCE material.
 
+Route access and readiness only from authoritative shared snapshots; do not add an embedded or topology bypass. `ClientAdapter.access` is a generic optional capability: the browser adapter supplies `openLogin` and same-origin `logout`, while the Tauri adapter supplies neither. A login-required snapshot without access operations shows no sign-in action, and an authenticated shell without them shows no sign-out action.
+
+Treat native `platform` startup events as adapter-private IPC sequencing inputs, not app context or route presentation. Never expose the loopback endpoint, local bearer, paths, or native failures through WebView state.
+
+Use the generic optional `openAuthorizationAttempt(attemptId)` operation when Rust redacts an outbound authorization URL. Send only the current opaque attempt ID; never reconstruct or request the URL.
+
 Non-persisted unload disposes the active adapter. Persisted `pagehide` keeps it alive for BFCache restoration on `pageshow`.
 
 # Hints

@@ -14,6 +14,9 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-agent/tests/agent.rs` and `crates/waltr-agent/tests/agent/` | Deterministic agent library tests using scripted/shared providers. |
 | `crates/waltr-agent/tests/live.rs` and `crates/waltr-agent/tests/live/` | Ignored live-provider and external-service agent tests. |
 | `crates/waltr-server/tests/` | Server contract, coordination, watch, validation, health, persistence, access-auth, and system flows. |
+| `crates/waltr-server/tests/embedded.rs` | Embedded composition, local admission, explicit callback metadata, public routes, and workspace isolation. |
+| `crates/waltr-server/src/catalog/mod.rs` tests | Bounded models.dev requests plus valid-cache fallback after request failure or timeout. |
+| `crates/waltr-server/src/resource_catalog/state/tests.rs` | Persisted self-MCP provisioning and ordinary resource administration. |
 | `crates/waltr-server/tests/mcp_oauth_server.rs` | Hosted Waltr issuer, browser authentication bridge, consent, token lifecycle, direct-Authentik rejection, disabled-mode behavior, and restart. |
 | `crates/waltr-server/tests/live.rs` and `crates/waltr-server/tests/live/session.rs` | Ignored server contract tests that run session commands through live providers. |
 | `crates/waltr-client/tests/` | UI-like tests for the shared client state machine over the server contract. |
@@ -21,7 +24,8 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-web/tests/` | Browser UI state, routing, forms, transitions, and component-level behavior. |
 | `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, privacy filtering, and platform-specific propagation. |
 | `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
-| `crates/waltr-app/src/bridge.rs` tests | Tauri generation ordering, bounded coalescing, FIFO dispatch, disposal, logout ordering, Android callback routing/handoff lifecycle, and secret-free serialization. |
+| `crates/waltr-app/src/server_controller.rs` tests | App-private paths, random local bearer generation, redaction, and process-owned server state. |
+| `crates/waltr-app/src/bridge.rs` tests | Tauri generation order, permission gates, snapshot redaction, opaque authorization opening, and nonblocking replacement. |
 | `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, startup signals, shutdown bounds, header privacy, redirect non-following, bundled-root loading, untrusted TLS rejection, and in-memory exporters. |
 | `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
@@ -66,6 +70,14 @@ Run server integration tests:
 
 `cargo test -p waltr-server --tests`
 
+Run the embedded server contract:
+
+`cargo test -p waltr-server --test embedded`
+
+This target requires exact local bearer admission on `/waltr.*` and `/mcp`. It leaves health and outbound callback routes outside that bearer.
+
+Without a public metadata URI, the local client metadata route must return `404`.
+
 Run focused server access-auth integration tests:
 
 `cargo test -p waltr-server --test access_auth`
@@ -79,6 +91,24 @@ Run access-auth tests including embedded-web navigation and restart coverage gat
 `cargo test -p waltr-server --features web --test access_auth`
 
 Server library tests include SQLite persistence and OIDC store behavior. The container-backed PostgreSQL targets are ignored by default, so `cargo test -p waltr-server --lib` does not require Docker.
+
+Server library tests require valid-cache fallback after fixed bounded models.dev request failure or timeout, and must reject a malformed cache rather than treating it as fallback.
+
+Embedded resource coverage must prove that startup prebinds loopback, atomically overwrites `mcp-servers/waltr.yaml` with the generation URL before catalog load, reports filesystem origin, and refreshes the durable file for each generation. Inspection, replace, watcher, reset, and persisted-slot ETag assertions must use the ordinary resource contract. Reset must exercise ordinary candidate validation, including failure when the bundled fallback cannot resolve `WALTR_PUBLIC_URL`; no embedded immutability or reset-special-case assertion belongs in this coverage.
+
+Outbound OAuth unit coverage must verify explicit callback propagation and one-time standalone environment snapshots, including the private-test boolean.
+
+It must verify that embedded mode skips CIMD when upstream also offers DCR, then selects DCR.
+
+It must verify that embedded policy ignores the ambient private-test switch and honors only explicit trusted origins.
+
+Persistence assertions must prove that attempts and credentials contain a per-generation marker, not the callback endpoint.
+
+OAuth assertions must count one DCR across initial authorization and same-generation reauthorization, then a second DCR for a replacement generation. Restart assertions must reject stale markers and credentials; stale attempt status and cancel must return not found without mutating the old attempt. Self-MCP credential logout must return failed precondition and preserve the host-owned credential. A resource edit away from the initialized URL must prove that the generation bearer is not sent to the edited endpoint.
+
+Environment tests must retain only supported names. They must exclude unrelated secrets and redact all retained values from `Debug`.
+
+Embedded `Debug` tests must exclude endpoints, bearers, app-private paths, and task or thread handles.
 
 Run the ignored server PostgreSQL migration and OIDC store targets, which require Docker:
 
@@ -142,23 +172,63 @@ Run hosted browser and Tauri web-adapter tests:
 
 `pnpm --filter @rfhold/waltr-web test`
 
-The web suite includes `tests/access/` coverage for generated access bindings, safe browser return paths, login states, expiry, provider-OAuth separation, and same-origin logout. `tests/platform/` covers hosted WASM disposal and Tauri generation/sequence handling, recovery, disposal, and external URL delegation. `tests/telemetry.test.ts` verifies the build-mode matrix, identities, propagation ownership, and hostile-payload filtering for routes, errors, traces, and Web Vitals measurements. It uses mocked browser/client boundaries; server cookie and OIDC validation belong to server access-auth tests.
+The web suite covers hosted access, provider-OAuth separation, same-origin logout, and capability-driven access controls. It verifies that authoritative login-required and authenticated snapshots remain authoritative when an adapter supplies no access operations. Platform tests cover browser-provided access operations, hosted WASM disposal, and Tauri adapter-private startup event sequencing, sequence recovery, disposal, and opaque authorization or external URL delegation. Telemetry tests cover build modes, identities, propagation ownership, and privacy filters. Server tests own cookie and OIDC validation.
+
+Build the hosted web client:
+
+`pnpm --filter @rfhold/waltr-web build`
+
+This command must complete TypeScript checks, the WASM build, and the hosted Vite bundle.
 
 Run only deterministic Faro telemetry tests:
 
 `pnpm --filter @rfhold/waltr-web exec vitest run tests/telemetry.test.ts --environment happy-dom`
 
-Run Tauri shell unit and policy tests:
+Run Tauri host tests:
 
 `cargo test -p waltr-app`
 
-This layer checks the explicit manifest callback shape, opaque Kotlin-to-JNI `Intent` transport, and absence of a callback Tauri event or WebView capability. Tests cover one-entry latest replacement, invalid-then-valid routing, generation fences, handoff-before-open order, one-shot pause preservation, callback release on resume, suspended terminal teardown, process-memory cleanup, secret-free IPC, CSP scope, and native observability privacy. Cold and warm callback tests exercise Rust routing and source contracts, not Android's installed-app intent resolver.
+This layer checks embedded paths, source and manifest policy, bridge generations, and native observability privacy.
 
-Run only native observability and exact Faro CSP tests:
+It must remove endpoint and bearer values from every serialized snapshot. An authorization URL that contains the private callback endpoint must also disappear.
+
+The full authorization URL must remain Rust-only. The opener must require the active generation's current opaque attempt ID.
+
+Android checks must cover off-callback joins, foreground promotion, and permission updates for active and fresh generations.
+
+Fresh permission-required generations must ignore an existing server connection. Permission transitions must release the same generation.
+
+Ticket tests must cover pause/start, resume/start, cancellation, failed starts, and overlapping starts.
+
+Each stale completion must stop only its own generation. It must not stop or claim a newer generation.
+
+Server lifecycle tests must leave nonblocking stop in `Stopping`, detach the exact current generation under lock, and prove replacement reservation waits for the old thread/reaper to finish. They must also prove a delayed old-generation exit cannot affect a later running generation.
+
+Check the host Rust graph without packaging:
+
+`cargo check -p waltr-app`
+
+The host check must compile desktop embedded composition with server-side shell support.
+
+Inspect the Android feature graph without compiling Android Rust code:
+
+`cargo tree -p waltr-app --target aarch64-linux-android -e features`
+
+The tree must omit `waltr-server/shell`, `waltr-agent/shell`, and `waltr-server/profiling`. It must contain no Pyroscope dependency.
+
+Check the standalone binary without profiling:
+
+`cargo check -p waltr-server --no-default-features --features shell --bin waltr-server`
+
+This check proves profiling is optional for the executable; default builds still enable it.
+
+No-shell runtime-factory coverage must keep shell-bearing definitions loadable while omitting the shell tool and feature-derived shell permissions. Unified catalog coverage must materialize ordinary shell-bearing and stdio resources for embedded composition; stdio uses the normal session runtime rather than a host-specific rejection path.
+
+Coordinator tests must prove shutdown rejects new work, cancels active and queued work, waits for active run ownership to drain, atomically empties MCP preparation/cache state, and awaits each cached runtime's explicit shutdown. Existing deterministic stdio coverage does not constitute a real child-process shutdown/reap integration test; do not claim that test exists.
+
+Run only native observability tests:
 
 `cargo test -p waltr-app observability`
-
-`cargo test -p waltr-app csp_adds_only_the_exact_faro_collector_origin`
 
 The observability tests use deterministic in-memory span, log, and metric exporters. They verify target allowlists, shared resource identity, fixed signal URLs, startup signals, shutdown bounds, header sanitization, redirect non-following, ring provider ownership, complete bundled-root loading with ISRG Root X1, rejection of an untrusted local TLS endpoint, and test isolation. They do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, mobile process-exit delivery, or Android runtime connectivity.
 
@@ -176,13 +246,45 @@ Build the Android package through the generated project:
 
 `pnpm --filter @rfhold/waltr-app android:build`
 
+This command requires the Android NDK Rust linker, including `aarch64-linux-android-clang`, for the selected targets. A missing linker blocks the Rust package build.
+
+Build the configured desktop packages:
+
+`pnpm --filter @rfhold/waltr-app build`
+
+On Linux, this command requests the configured bundle formats. Each format requires its host packaging tools, including AppImage `linuxdeploy` support.
+
+Run Android JVM tests from `crates/waltr-app/gen/android/`:
+
+`./gradlew :app:testUniversalDebugUnitTest -x rustBuildUniversalDebug`
+
+Compile the Android manifest and Kotlin host layer without the Rust cross-build:
+
+`./gradlew :app:processUniversalDebugMainManifest :app:compileUniversalDebugKotlin -x rustBuildUniversalDebug`
+
+These Gradle checks validate Android source and manifest integration. They do not validate native linking or installed-device behavior.
+
 Validate the Pulumi source registration and deployment shape without applying a stack:
 
 `bun run --cwd infra/pulumi build && bun run --cwd infra/pulumi test`
 
-The client and app tests prove protocol behavior, Rust ownership, bounded routing, source/manifest configuration, and deterministic native TLS trust. The Pulumi test proves both stack files declare the exact private URI and the program retains strict Android plus regex desktop registration. The Android package command proves the generated project builds. None proves Android runtime connectivity; RC8 device verification must exercise the live public-root Waltr, OIDC, and OTLP endpoints before this fix is considered runtime-verified. These checks also do not prove that Authentik has been reconciled, that an emulator/device routes cold or warm intents to Waltr, or that a live provider accepts the redirect.
+Package, feature-tree, and Gradle checks do not prove Android runtime behavior. Installed-device validation remains a separate required gate.
 
-Installed-app testing belongs at the Android host layer. Exercise warm and cold intents, browser pause/resume, cancel and five-minute timeout while suspended, ordinary and authenticated backgrounding, callback after process death, and private-scheme contention. A cold callback after process death must fail closed and a new login must be required. Authorized live-provider smoke testing additionally covers login, a protected request, refresh or expiry, logout, and subsequent credential rejection. These checks require explicit deployment authority and must not be folded into routine tests that mutate preview. Android app start and Linux desktop commands are documented once in [Deployment](deployment.md#tauri-application). macOS and iOS require macOS and were not verified.
+On an installed Android build, verify these outcomes:
+
+1. Deny notification permission. Confirm that no server starts and the adapter-private startup sequence remains at the permission gate without changing route presentation.
+2. Grant notification permission. Confirm the foreground notification and local client readiness.
+3. Create durable session and Routine state. Confirm that activity pause stops only the client runtime.
+4. Resume the activity. Confirm a fresh client generation reconnects to the same server state.
+5. Remove the task. Confirm best-effort service continuity without treating survival as guaranteed.
+6. Kill the process, then reopen the app. Confirm durable state reopens and unfinished Routines receive restart reconciliation.
+7. Force-stop the app. Confirm that documentation and UI make no survival guarantee.
+8. Exercise provider and upstream-MCP OAuth. Confirm that opaque authorization-attempt opening still works without Waltr access operations.
+9. Load persisted shell-bearing resources. Confirm that they remain inspectable while no shell tool or feature-derived shell permission is installed.
+10. Load and select a stdio MCP resource. Confirm that it materializes and follows ordinary runtime behavior.
+11. Inspect app backup and transfer behavior. Confirm that private databases, files, preferences, and root data remain excluded.
+
+Installed-device validation must cover a supported Android version before release. Current local Rust and Gradle checks do not satisfy this gate.
 
 Run web server-backed k6 tests:
 
@@ -297,7 +399,7 @@ Use direct provider credentials:
 
 MCP and server PostgreSQL store tests require Docker because they start `postgres:16-alpine` through testcontainers. These targets are ignored and must be selected with `-- --ignored`. Some ignored live session storage tests also start container-backed services. Prefer in-memory, filesystem, SQLite, or scripted fixtures for behavior that does not require an external service.
 
-The commands above are the implemented focused gates. Deterministic and SQLite suites, container-backed PostgreSQL conformance, aggregate workspace checks, complete hosted browser OAuth verification, Pulumi shape/policy tests, and static pipeline-definition checks have passed. Live Pulumi/Tekton deployment, multi-replica revocation/rotation, database failover, backup restoration, Authentik-outage, independent third-party client hosted-OAuth interoperability, and performance/load exercises were not run and remain workstream 07/08 gaps. Do not infer production deployment or successful restoration from deterministic, container-backed, browser, Pulumi-mock, or pipeline-definition checks.
+The commands above define reproducible gates and expected outcomes. They do not record one local run or establish production readiness.
 
 Web server-backed integration tests require Docker Compose. Every test Waltr service uses tmpfs `/data`; test services communicate on an internal-only network and publish no host port. Long-running dependencies have health checks and startup uses `docker compose up --wait`. The runner preserves the first failure exit code, captures diagnostics, and treats failed teardown as a test failure while retrying cleanup. Caddy terminates HTTPS for the browser and OIDC issuer, and its ephemeral CA is trusted only inside the test stack.
 
