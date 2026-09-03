@@ -28,8 +28,11 @@ class WaltrForegroundService : Service() {
     promote()
     if (nativeServerStatus() != RUNNING && workerStarted.compareAndSet(false, true)) {
       Thread({
-        nativeStartServer(filesDir.absolutePath, File(filesDir, "config").absolutePath)
-        workerStarted.set(false)
+        try {
+          nativeStartServer(filesDir.absolutePath, File(filesDir, "config").absolutePath)
+        } finally {
+          workerStarted.set(false)
+        }
       }, "waltr-server-start").start()
     }
     return START_STICKY
