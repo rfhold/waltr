@@ -7,10 +7,10 @@ Waltr client architecture keeps server data coordination in `crates/waltr-client
 | Layer | Owns |
 | --- | --- |
 | `crates/waltr-server/` | Shared server state, RPC services, persistence, watches, validation, and concurrency checks. |
-| `crates/waltr-client/` | Shell-neutral reducer state, server-facing commands, effect intents, transport adapters, stable view models, runtime orchestration, and the feature-gated shared native access protocol. |
+| `crates/waltr-client/` | Shell-neutral reducer state, server-facing commands, effect intents, transport adapters, stable view models, runtime orchestration, and optional native access for remote hosts. |
 | `crates/waltr-web/` | Shared Solid routes, forms, transitions, and DOM state; build-time platform selection between hosted browser WASM and Tauri IPC adapters. |
 | `crates/waltr-tui/` | Terminal routes, input handling, rendering, snapshots, environment configuration, and terminal effects around shared native access. |
-| `crates/waltr-app/` | Tauri lifecycle, fixed native configuration, Rust client and credential runtime, ordered IPC bridge, local navigation policy, external URL opening, and desktop/Android packaging. |
+| `crates/waltr-app/` | Embedded server lifecycle, local credentials, Rust client runtime, ordered IPC bridge, navigation policy, external URL opening, and platform packaging. |
 
 Client shells should not duplicate server data state machines. They consume `waltr-client` snapshots and dispatch `waltr-client` commands, then adapt the resulting state to their UI surfaces.
 
@@ -19,10 +19,11 @@ flowchart LR
     Browser[Hosted browser<br/>WASM adapter and cookies]
     Web[crates/waltr-web<br/>routes, forms, DOM state]
     Tui[crates/waltr-tui<br/>routing, input, rendering]
-    App[crates/waltr-app<br/>Tauri IPC and native host]
+    App[crates/waltr-app<br/>embedded server, Tauri IPC, native host]
     Client[crates/waltr-client<br/>reducer, runtime, view models]
     Transport[WaltrTransport<br/>gRPC-web or tonic]
-    Server[crates/waltr-server<br/>RPC, state, watches]
+    Embedded[embedded waltr-server<br/>ephemeral loopback and local bearer]
+    Server[remote waltr-server<br/>RPC, state, watches]
 
     Browser --> Web
     Web -->|hosted build| Client
@@ -30,12 +31,15 @@ flowchart LR
     Web -->|Tauri IPC commands| App
     App -->|Tauri IPC snapshots| Web
     App -->|ClientCommand| Client
+    App -->|owns| Embedded
     Client -->|ClientSnapshot| App
     Tui -->|ClientCommand| Client
     Client -->|ClientSnapshot| Tui
     Client -->|ClientEffect| Transport
     Transport -->|RPC requests and streams| Server
+    Transport -->|Tauri local bearer requests| Embedded
     Server -->|RPC responses and watch events| Transport
+    Embedded -->|RPC responses and watch events| Transport
     Transport -->|ClientEvent| Client
 ```
 
@@ -49,9 +53,11 @@ Resource traffic uses `waltr.resource.v1.ResourceService`:
 | --- | --- |
 | `GetResourceCatalog` | Load the complete current catalog snapshot. |
 | `WatchResourceCatalog` | Receive complete initial and later catalog snapshots. |
-| `InspectResource` | Read one persisted slot and its ETag. |
+| `InspectResource` | Read one effective resource plus persisted-slot source and ETag details. |
 | `ReplaceResource` | Replace one complete YAML resource. |
 | `ResetResource` | Remove one persisted override. |
+
+Embedded startup provisions its generation URL into the ordinary persisted `mcp-servers/waltr.yaml` slot before the client loads the catalog. Clients inspect, replace, watch, and reset it through the same ETag contract as any other persisted resource. A reset can fail ordinary candidate validation when the bundled fallback requires an unavailable `WALTR_PUBLIC_URL`.
 
 Manual Routine traffic uses `waltr.routine.v1.RoutineService`:
 
@@ -69,7 +75,8 @@ Status traffic uses the status service to watch system readiness. Catalog watch 
 
 | Runtime | Transport |
 | --- | --- |
-| TUI and Tauri native hosts | `NativeGrpcTransport`, backed by rustls-verified tonic channels, bundled Mozilla WebPKI roots, and an in-memory bearer provider. Tauri additionally supplies secure refresh-token persistence. |
+| TUI remote host | `NativeGrpcTransport`, backed by rustls-verified tonic channels, bundled Mozilla WebPKI roots, and native access credentials. |
+| Tauri local host | `NativeGrpcTransport` to an ephemeral HTTP loopback endpoint, with a random process-generation bearer held only in Rust. |
 | Hosted browser/WASM | `WasmGrpcTransport`, backed by same-origin gRPC-web over `fetch`. |
 
 Transport code converts RPC messages into `ResourceCatalog`, effective `Configuration`, and `SystemStatus` values. UI code uses shared client commands instead of generated clients.
@@ -140,16 +147,44 @@ The runtime loop:
 
 The stream form coordinates startup and long-lived watches. It waits for status readiness, maintains watch streams, applies watch events as they arrive, and dispatches shell commands into the same reducer-owned state.
 
-The hosted browser build compiles `waltr-client` to WASM and owns a deterministic adapter disposal path. Vite `tauri` mode instead selects `crates/waltr-web/src/platform/tauri.ts`, emits relative local assets, and does not build or import WASM. `crates/waltr-app` hosts one Rust `ClientStateStream` and native access coordinator for that UI.
+The hosted browser build compiles `waltr-client` to WASM and owns a deterministic adapter disposal path. Vite `tauri` mode selects `crates/waltr-web/src/platform/tauri.ts`, emits relative local assets, and does not build or import WASM. `crates/waltr-app` hosts one Rust `ClientStateStream` for its embedded server.
+
+Tauri starts `waltr-server` on an ephemeral IPv4 loopback port. Rust keeps the endpoint and random 256-bit bearer outside IPC and WebView state.
+
+Before publication, Rust removes the exact endpoint and bearer from every serialized client snapshot. This projection does not mutate shared client state.
+
+Web routes use the authoritative shared access and readiness snapshots without a topology override. `ClientAdapter.access` is an optional generic capability: the hosted browser adapter supplies `openLogin` and same-origin `logout`, while the Tauri adapter supplies no access operations. A login-required Tauri snapshot therefore renders the unavailable-access notice without a sign-in action, and an authenticated Tauri shell renders no sign-out action. Provider and upstream-MCP authorization remains available independently.
 
 The Tauri bridge preserves these lifecycle invariants:
 
-- Exactly one active generation-stamped runtime exists. Starting another runtime synchronously disposes the prior generation.
-- The uncoalesced initial snapshot is delivered before later updates. Eligible later snapshots use bounded latest-value coalescing; logout barriers and their resulting cleared snapshots use a bounded uncoalesced control lane.
+- Exactly one active generation-stamped runtime exists. Desktop replacement joins the prior generation; Android replacement signals stop and reaps it asynchronously.
+- The uncoalesced initial event arrives before later updates. Eligible snapshots use bounded latest-value coalescing; native `platform` startup controls use a bounded ordered lane and remain adapter-private sequencing inputs rather than app context or route presentation.
 - Commands enter one bounded FIFO and are dispatched in order. Events have monotonic sequences, gaps recover through current state, and stale-generation output is rejected in Rust and TypeScript.
-- Disposal invalidates publication, stops and joins the runtime, clears process-memory credentials, removes listeners, and rejects later native output. It does not delete the durable Tauri refresh token. Rust performs this teardown on document reload, main-window destruction, process exit, and ordinary or authenticated Android suspension; Android resume starts a fresh generation and restores through current discovery.
-- Android retains the current generation only across the first browser-away pause for a pending unauthenticated login. Rust marks the handoff before it opens the browser. The first resume consumes the exception and releases any held callback. A later pause, authenticated pause, or suspended terminal result invalidates the generation and clears credentials.
+- Disposal invalidates publication, stops the client runtime, clears its local bearer provider, removes listeners, and rejects later native output.
+- Android activity pause stops only the client runtime. The same-process foreground service keeps the embedded server alive best effort.
+- Android activity resume creates a fresh client generation against the current embedded server generation.
+- Android lifecycle callbacks signal client or server stop and delegate thread joins to reaper threads.
+- A fresh Android generation applies current notification permission before it considers an existing server connection.
+- A permission-required generation remains disconnected until a permission transition permits connection.
+- Notification permission changes publish an adapter-private startup control event to active generations.
+- Each Android lifecycle ticket owns one exact bridge generation after successful start.
+- Suspend invalidates the active start ticket and exact active generation. Resume creates a replacement ticket.
+- A stale or suspended completion stops only its own generation. It cannot stop or claim a replacement generation.
 - The hosted WASM adapter also stops polling, frees its Rust client, clears listeners, and rejects work after disposal.
+
+The embedded server has an independent process-owned lifecycle. Desktop setup starts it before the WebView client connects and stops it at app exit.
+
+A nonblocking server stop moves the exact current generation to `Stopping` and detaches its thread while holding the controller lock. Its reaper joins only that detached generation and publishes `Stopped` or `Failed` only after the join completes.
+
+Start reservation waits while the controller is `Stopping`; a replacement cannot start until the detached generation exits. Old and new embedded servers therefore never overlap their shared app-private roots. Android lifecycle callbacks remain nonblocking because the reaper, not the callback, owns the join.
+
+Android starts the server through a non-exported, same-process `specialUse` foreground service. Notification permission gates service startup on Android 13 and later.
+
+`android:stopWithTask="false"` and `START_STICKY` provide best-effort continuity after task removal. They do not guarantee survival after force-stop, process kill, reboot, or user termination.
+
+Every server restart creates a new endpoint, bearer, and outbound callback marker. Startup atomically refreshes the durable self-MCP resource file with the new endpoint before catalog load. Durable databases and sessions reopen, and normal Routine restart reconciliation handles unfinished work.
+
+Generation-bound outbound MCP attempts and credentials do not reopen. Same-generation reauthorization can reuse its valid DCR registration; a replacement generation requires reauthorization and fresh DCR when applicable. Status and cancel report not found for an attempt from an older generation.
 
 ## Client Observability Boundary
 
@@ -219,25 +254,29 @@ Session Context remains a presentation projection over shared-client state. Rout
 
 Waltr access authentication is separate from provider and upstream-MCP credential management. `AccessStatus` is `UnknownChecking`, `LoginRequired`, `LoginInProgress`, `Authenticated`, or `LoginFailed`. Outbound authentication failures remain ordinary operation or failed-session results with structured `AuthenticationFailure` data; they do not change access state or create pending authorization state.
 
-Shared access commands are `StartWaltrLogin`, `CompleteWaltrLogin`, `FailWaltrLogin`, `CancelWaltrLogin`, `LogoutWaltr`, and `WaltrAccessExpired`. `AccessEvent` applies the corresponding facts to deterministic reducer state. Browser navigation and cookie logout stay in the hosted browser runtime. Native discovery, PKCE, callback-policy selection and validation, token exchange, refresh, expiry, and generation-safe credential replacement live in `waltr-client` behind `native-access`; native hosts provide configuration, bounded callback delivery, and presentation effects.
+Shared access commands are `StartWaltrLogin`, `CompleteWaltrLogin`, `FailWaltrLogin`, `CancelWaltrLogin`, `LogoutWaltr`, and `WaltrAccessExpired`. `AccessEvent` applies the corresponding facts to deterministic reducer state. Browser navigation and cookie logout stay in the hosted browser runtime. Remote native hosts can use `waltr-client` native access.
 
 The transport decodes version-1 `AuthenticationFailure` protobuf status details. A valid outbound-provider or outbound-MCP failure preserves its domain, reason, nonempty `AuthTarget`, safe message, and sanitized MCP context on the ordinary operation error. Failed session status carries the same optional structure for asynchronous and queued failures. Only an `Unauthenticated` response explicitly classified as the `WALTR_ACCESS` domain becomes Waltr login required and clears the current native bearer lease. Missing, malformed, unknown-version, or otherwise unmatched details remain ordinary errors rather than guessing an authentication domain.
 
 Expiry or failed native refresh clears protected config, status, sessions, timelines, streams, and in-flight protected operation state. It preserves watch interests and reload intent, but invalidates the status watch epoch so late events from an old credential cannot reauthenticate the client. Login completion starts a new status epoch. A current-epoch protected status event establishes authentication, then child watches reopen according to interest and config/session collections reload. Explicit logout also clears watch interests.
 
-Native transports attach the current in-memory bearer credential to each unary request and newly opened stream. Credential leases are monotonic generations: stale login, restoration, and refresh tasks cannot overwrite or clear credentials owned by a newer flow. Tauri's coordinator serializes secure-store mutation with those generations and persists refresh rotation before installing its bearer. Browser gRPC-web relies on same-origin cookie behavior and does not inject bearer tokens.
+Native transports attach the current in-memory bearer credential to each unary request and newly opened stream. Remote native credential leases use monotonic generations. Tauri installs its process-generation local bearer before it starts the client stream. Browser gRPC-web relies on same-origin cookies.
 
-Native HTTPS has one deterministic trust policy across the tonic Waltr API transport, native OAuth reqwest requests, and app OTLP reqwest export. Each uses rustls with the ring crypto provider, TLS 1.2 or 1.3, and the bundled `webpki_roots` Mozilla root set. Normal certificate-chain and hostname verification remain enabled. Android therefore does not depend on reqwest platform-verifier Java-context initialization or tonic searches of Unix native certificate files. HTTPS endpoints must chain to a root in the bundled public set; private enterprise CAs, user-added roots, platform trust additions, and `SSL_CERT_FILE` are not accepted. Native access keeps its existing local-development exception for HTTP URLs whose host is exactly `127.0.0.1`, `localhost`, or `::1`; the desktop callback policy remains exact `http://127.0.0.1:<port>`. This policy does not affect hosted browser or WebView Faro traffic.
+Remote native HTTPS uses rustls with the ring provider, TLS 1.2 or 1.3, and bundled Mozilla roots. The Tauri Waltr transport uses host-created HTTP loopback instead. Native OTLP export keeps the bundled-root policy. This policy does not affect hosted browser or WebView Faro traffic.
 
-Explicit logout clears the in-memory credential, attempts durable refresh-token deletion, and performs an anonymous status reprobe so access-disabled servers can return to `Authenticated`; credential generations prevent results from the prior lease from mutating the new state. Exact terminal Waltr credential rejection also deletes durable state. Transient failures and ordinary runtime stop retain it.
+Remote native logout clears its in-memory credential and follows the native access store contract. Tauri exposes no Waltr logout because local admission lasts for one server generation.
 
-The hosted browser route sends the browser to `/oidc/login` with a validated local return path and calls `/oidc/logout` with same-origin credentials. The TUI supplies environment-derived native configuration, browser launching, copyable URL behavior, and terminal events. The Tauri host supplies fixed preview configuration, system HTTPS opening, secret-free IPC progress, desktop/Android runtime ownership, and Android callback delivery. See [Access Authentication](access-authentication.md).
+The hosted browser adapter sends the browser to `/oidc/login` with a validated local return path and calls `/oidc/logout` with same-origin credentials. The TUI supplies environment-derived native configuration, browser launch, copyable URL behavior, and terminal events. The Tauri host supplies embedded server ownership and external HTTPS launch for outbound OAuth; its native startup control events are private to adapter IPC sequencing. See [Access Authentication](access-authentication.md).
 
-The Tauri app uses identifier `dev.waltr.app`, endpoint `https://preview-waltr.holdenitdown.net`, public client ID `waltr-preview-native`, and audience `waltr-preview-api`. Desktop selects an ephemeral `http://127.0.0.1:<port>/callback` policy; Android selects the external policy with exact callback `dev.waltr.app:/oauth2redirect`. Both are public Authorization Code with PKCE flows and send no app secret.
+Outbound provider/MCP authorization remains separate from Waltr access and begins only through an explicit Config action. One generic target-scoped command family lists and reads sanitized status, begins and completes authorization, inspects or cancels attempts, forces refresh, and resets credentials for either target kind. The shared reducer exports statuses and keyed operation results alongside an opaque attempt ID, authorization URL, expiry, completion mode, registration method, lifecycle, and sanitized failure reason. For server-callback attempts the shared runtime polls `PollAuthAttempt`; shells render snapshots and can cancel the explicit attempt. Manual attempts submit the final redirect URL or code. Session surfaces require an explicit retry after authentication.
 
-On Android, `MainActivity` passes cold and warm `Intent` objects opaquely to JNI after the superclass callback. Kotlin does not read, retain, parse, or log callback content. Rust calls `Intent.getDataString()`, immediately wraps the value as a redacted callback, and routes no callback through Tauri events or IPC. The host keeps one latest callback for the active generation; a newer input replaces an unprocessed value. A callback received during preserved suspension remains held until resume. The coordinator validates each forwarded callback in order and accepts a valid callback after invalid input. Process death clears attempt state, so a cold callback fails closed.
+Hosted browser and TUI surfaces retain the generic authorization URL behavior. The web adapter contract also offers optional `openAuthorizationAttempt(attemptId)` for hosts that must open a redacted URL by opaque attempt identity. Tauri uses this operation when the URL contains its private loopback endpoint.
 
-Outbound provider/MCP authorization remains separate from Waltr access and begins only through an explicit Config action. One generic target-scoped command family lists and reads sanitized status, begins and completes authorization, inspects or cancels attempts, forces refresh, and resets credentials for either target kind. The shared reducer exports statuses and keyed operation results alongside only an opaque attempt ID, authorization URL, expiry, completion mode, registration method, lifecycle, and sanitized failure reason. For server-callback attempts the shared runtime polls `PollAuthAttempt`; shells render snapshots and may cancel the explicit attempt. Manual attempts submit the final redirect URL or code. Browser, Tauri, and TUI surfaces never receive provider or MCP access tokens, refresh tokens, PKCE verifiers, registration responses, or callback state. Session surfaces render outbound failures with Config navigation and require an explicit resend or rerun after authentication; they never begin OAuth or replay work automatically.
+For that case, the bridge blanks the snapshot URL and retains the full URL only in Rust. WebView sends the current opaque attempt ID to `open_authorization_attempt`.
+
+Rust accepts only the active generation's current pending attempt. It validates the retained URL with the external HTTPS policy before launch.
+
+Browser, Tauri, and TUI surfaces never receive provider or MCP tokens, PKCE verifiers, registration responses, or callback state.
 
 ```mermaid
 sequenceDiagram
@@ -273,7 +312,9 @@ Browser, TUI, and Tauri implementations should follow these rules:
 - Keep Waltr access state distinct from provider/upstream-MCP `AuthTarget` state, and ignore stale login attempts, credential leases, and watch epochs.
 - Keep WebView telemetry and native Rust telemetry separate. The hosted WebView owns same-origin propagation; the native transport owns Tauri gRPC propagation.
 - Preserve the telemetry privacy boundary. Add only fixed operation classes, controlled outcomes, normalized routes, and allowlisted protocol attributes.
-- Keep native OAuth and bearer/refresh credentials in Rust. IPC may expose only shared snapshots, commands, opaque lifecycle data, safe errors, and secret-free access progress.
+- Keep Tauri's endpoint and local bearer in Rust. IPC may expose only shared snapshots, commands, adapter-private bounded startup controls, and safe errors; startup controls must not become app context or route presentation.
+- Redact the endpoint and bearer from every Tauri snapshot. Redact any authorization URL that contains the endpoint.
+- Open a redacted authorization URL only through the opaque current attempt-ID command. Keep the full URL in Rust.
 - Keep remote content out of privileged WebViews. Tauri main-WebView navigation is restricted to packaged local content, new windows are denied, and Rust opens only credential-free HTTPS URLs that pass its external URL policy.
 - Mark the shared document with the build-time browser or Tauri platform. Hosted browser CSS consumes `env(safe-area-inset-*)`; Tauri CSS keeps those values at zero because the Android native host insets the whole WebView.
 - Use dynamic viewport units with legacy viewport fallbacks, keep short-height access and dialog surfaces scrollable, and preserve keyboard access and complete content in compact navigation and Context disclosures.
@@ -316,8 +357,11 @@ The TUI opens create selection with `C-x s` and switches the open session with `
 | [../../crates/waltr-client/src/transport/mod.rs](../../crates/waltr-client/src/transport/mod.rs) | RPC transport boundary. |
 | [../../crates/waltr-client/src/transport/native_trace.rs](../../crates/waltr-client/src/transport/native_trace.rs) | Feature-gated native gRPC spans and W3C context injection. |
 | [../../crates/waltr-app/src/bridge.rs](../../crates/waltr-app/src/bridge.rs) | Tauri runtime generation, ordered IPC, and bounded publication. |
+| [../../crates/waltr-app/src/server_controller.rs](../../crates/waltr-app/src/server_controller.rs) | Process-owned embedded server, app-private roots, endpoint, bearer, and build capabilities. |
 | [../../crates/waltr-app/src/observability.rs](../../crates/waltr-app/src/observability.rs) | Native OTLP trace, log, and metric providers, bounded lifecycle, and privacy controls. |
 | [../../crates/waltr-app/src/policy.rs](../../crates/waltr-app/src/policy.rs) | Packaged navigation and external HTTPS URL policies. |
+| [../../crates/waltr-server/src/embedded.rs](../../crates/waltr-server/src/embedded.rs) | Explicit embedded server composition and lifecycle. |
+| [../../crates/waltr-server/src/local_admission.rs](../../crates/waltr-server/src/local_admission.rs) | Local bearer middleware and self-MCP credential adapter. |
 | [../../crates/waltr-web/src/telemetry.ts](../../crates/waltr-web/src/telemetry.ts) | Hosted and Tauri WebView Faro setup, normalization, and privacy controls. |
 | [../../crates/waltr-web/src/platform/tauri.ts](../../crates/waltr-web/src/platform/tauri.ts) | Tauri frontend adapter and stale-output recovery. |
 | [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |

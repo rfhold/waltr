@@ -20,6 +20,10 @@ Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migration
 
 The repository `Dockerfile` produces the supported production `runtime` image as well as test-only stages. The runtime contains the release server with embedded web assets, runs as nonroot UID/GID `65532`, listens on `0.0.0.0:14333`, and uses `/data` as its home, working directory, and default writable persistence root. Mount writable storage at `/data` for filesystem-backed settings, or configure external PostgreSQL and S3 services.
 
+The server's default Cargo feature set includes `shell` and `profiling`. The optional `profiling` feature adds Pyroscope initialization, but the standalone server binary remains available and functional when that feature is disabled.
+
+Embedded Tauri builds use `waltr-server` with `default-features = false`. Desktop adds only `shell`; Android adds neither shell nor Pyroscope.
+
 The build installs pnpm dependencies from workspace manifests before copying Rust and web sources. It then copies only the Cargo workspace files and `crates/` into the shared builder, so documentation, infrastructure, and repository tooling changes do not invalidate application compilation. BuildKit cache mounts retain the pnpm store and Cargo registry, Git, and target data under architecture-specific IDs. Those mutable caches are local to the selected BuildKit worker; the repository pipelines do not import or export a registry-backed build cache. Persistent cluster workers and daemon-configured package or registry mirrors can accelerate builds transparently, but their availability and retention are infrastructure concerns rather than repository guarantees.
 
 `compose.yml` remains fixed local development and integration-test infrastructure. It intentionally exposes only static `dev`, `test`, and `test-auth` profiles; bare `docker compose up` starts nothing.
@@ -81,7 +85,7 @@ The server always registers bundled `routines/title.yaml` and `routines/fork.yam
 
 Waltr validates the complete catalog before startup. Invalid YAML, identity mismatches, unresolved references, invalid models.dev selectors, and invalid environment templates fail startup.
 
-The bundled self-MCP resource requires `WALTR_PUBLIC_URL` in every access-auth mode. It consumes the variable independently of OIDC, joins `/mcp` through URL parsing, and preserves a deployment path prefix. With access auth disabled, actual partial browser, API, or hosted-MCP OIDC settings still fail startup.
+The environment-owned bundled self-MCP resource requires `WALTR_PUBLIC_URL` in every access-auth mode. It consumes the variable independently of OIDC, joins `/mcp` through URL parsing, and preserves a deployment path prefix. With access auth disabled, actual partial browser, API, or hosted-MCP OIDC settings still fail startup.
 
 The server watches `.waltr/resources` after startup. An invalid reload preserves the last-known-good snapshot and exposes the reload error.
 
@@ -97,9 +101,11 @@ Public `/mcp` actions provide resource administration:
 
 Replace and reset require the latest persisted-slot ETag. They validate the complete candidate catalog before filesystem mutation.
 
+Embedded startup prebinds loopback and atomically overwrites app config `server/.waltr/resources/mcp-servers/waltr.yaml` with the generation URL before catalog load. This is an ordinary persisted resource with filesystem origin; the same inspection, replace, watcher, reset, and ETag behavior applies. Reset can fail candidate validation when the bundled fallback needs `WALTR_PUBLIC_URL`, without any embedded-specific reset rule.
+
 `waltr.resource.v1.ResourceService` provides equivalent gRPC reads, watches, inspection, replace, and reset operations. Reads and watch events contain complete catalog snapshots.
 
-Provider resources can materialize models.dev selectors with optional `keyPrefix` and aliases. MCP resources select `streamableHttp` or `stdio`.
+Provider resources can materialize models.dev selectors with optional `keyPrefix` and aliases. MCP resources select `streamableHttp` or `stdio`; stdio resources materialize and use ordinary runtime semantics in standalone and embedded builds.
 
 `defaults/default.yaml` stores inference defaults. Agent definitions own MCP selection.
 
@@ -183,7 +189,7 @@ Private OAuth destinations are denied by default. Two optional, comma-separated 
 
 Each entry must be only `https://host[:port]`, without credentials, a path, query, or fragment. Matching includes the effective port, duplicate origins are rejected, and the lists do not grant trust across directions. Waltr automatically trusts its initialized deployment origin for hosted self-CIMD. Server-owned outbound authorization gates automatic trust to the exact initialized self-MCP resource, and the server supplies that origin to agent session refresh. The Pulumi settings `mcpOAuthCimdTrustedPrivateOrigins` and `mcpOutboundOAuthTrustedPrivateOrigins` project nonempty lists into the corresponding environment variables.
 
-`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. It is required in every auth mode because the bundled self-MCP resource consumes it independently of access authentication. It must use HTTPS except for loopback development and is not inferred from the browser callback. Disabling access auth permits this variable but still rejects actual partial browser, API, or hosted-MCP OIDC settings. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly. `WALTR_API_OIDC_CLIENT_ID` enables provider-generic `JWT` access tokens by requiring their `azp` claim to exactly match the configured native client; RFC 9068 `at+jwt` access tokens remain supported without that claim.
+`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. Environment-owned servers require it in every auth mode because the bundled self-MCP resource consumes it independently. It must use HTTPS except for loopback development and is not inferred from the browser callback. Disabling access auth permits this variable but still rejects actual partial browser, API, or hosted-MCP OIDC settings. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly. `WALTR_API_OIDC_CLIENT_ID` enables provider-generic `JWT` access tokens by requiring their `azp` claim to exactly match the configured native client; RFC 9068 `at+jwt` access tokens remain supported without that claim.
 
 `WALTR_OIDC_CLIENT_SECRET` is optional only when browser-provider metadata supports token endpoint auth method `none`. `WALTR_AUTH_SESSION_TTL` optionally sets browser-session seconds and defaults to eight hours. `WALTR_TRUSTED_PROXIES` is optional; when set it is a comma-separated CIDR allowlist for trusting forwarded client addresses. Omit it unless a known reverse proxy overwrites forwarding headers.
 
@@ -204,7 +210,9 @@ The callback and every HTTP OIDC endpoint must then be loopback. These flags are
 
 ## Native Client Registration
 
-Register a separate public native client at the effective API authorization server. It must allow Authorization Code with PKCE S256 and the selected native redirects. Desktop and Android use the same public native client within a deployment: desktop needs the loopback redirect pattern, while Android needs the strict URI `dev.waltr.app:/oauth2redirect`. The shared native protocol always sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery may advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not create an app secret or reuse or distribute the browser confidential-client secret.
+Register a separate public native client for remote native clients such as the TUI. It must allow Authorization Code with PKCE S256 and the selected loopback redirects. The shared native protocol sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery can advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not create an app secret or reuse the browser secret.
+
+The bundled Tauri app does not use this registration. It admits its Rust client to the embedded server with a process-generation local bearer.
 
 Configure the TUI process with:
 
@@ -238,24 +246,64 @@ Native telemetry uses standard service-style OpenTelemetry SDK providers: a batc
 
 Native provider setup and export remain fail-open. All three exporters share a blocking Rustls client that disables redirects. The client strips inherited or environment-derived request headers and retains only the canonical OTLP protobuf content type. Trace and log shutdown requests use a two-second bound; OpenTelemetry SDK 0.32 metric shutdown uses its fixed five-second bound. Subscriber, TLS, exporter, request, or shutdown failures do not block app startup or use. Operators must not treat application success as proof of telemetry delivery. Local and debug app runs attempt export, but deterministic Rust tests use in-memory exporters and do not contact collectors. Android lifecycle suspension remains nonblocking and does not synchronously flush. Abrupt process termination can discard queued telemetry.
 
-The tonic Waltr API transport, native OAuth reqwest client, and app OTLP reqwest client all use rustls with the ring provider, TLS 1.2 or 1.3, and bundled `webpki_roots`. Certificate-chain and hostname verification remain enabled. This avoids Android dependencies on Java platform-verifier initialization and Unix native certificate files, but narrows deployment compatibility: every native HTTPS Waltr, OIDC, and OTLP endpoint must chain to a Mozilla/WebPKI public root. Private enterprise CAs, user-added roots, platform trust additions, and `SSL_CERT_FILE` do not extend native trust. Native access still allows HTTP only for local development when the URL host is exactly `127.0.0.1`, `localhost`, or `::1`; the desktop callback remains exact `http://127.0.0.1:<port>`. Hosted browser and WebView Faro trust remain platform-owned and are unaffected.
+Remote native Waltr and OAuth clients use rustls with the ring provider, TLS 1.2 or 1.3, and bundled `webpki_roots`. Native OTLP uses the same roots. Certificate-chain and hostname checks remain active. The Tauri Waltr client connects only to its host-created HTTP loopback endpoint. Hosted browser and WebView Faro trust remain platform-owned.
 
 Client telemetry follows the privacy contract in [Clients](architecture/clients.md#client-observability-boundary). Operators must not add credentials or broaden capture at the collector to compensate for fields that Waltr intentionally excludes.
 
 ## Tauri Application
 
-`crates/waltr-app/` packages local `crates/waltr-web/` assets and runs the shared client and native access coordinator in Rust. Its Tauri configuration defines Linux and macOS desktop bundles plus Android packaging. It does not bundle a Waltr server or change server and protobuf contracts. Its fixed configuration is:
+`crates/waltr-app/` packages local `crates/waltr-web/` assets and an embedded `waltr-server`. It runs the shared client in Rust against an ephemeral IPv4 loopback endpoint.
 
-| Setting | Value |
+Each server generation receives a random 256-bit local bearer. Rust keeps the endpoint and bearer out of IPC, WebView state, logs, and telemetry.
+
+After prebinding that endpoint, startup atomically writes its `/mcp` URL to app config `server/.waltr/resources/mcp-servers/waltr.yaml`, then loads the ordinary bundled-plus-persisted catalog. The endpoint is therefore durable on disk and refreshed each generation; only the bearer remains memory-only.
+
+Rust removes the exact endpoint and bearer from every Tauri snapshot before publication. Shared client state retains its original values inside Rust.
+
+If an outbound authorization URL contains the local endpoint, Rust also removes that URL from the snapshot. WebView opens it through the current opaque attempt ID.
+
+The embedded server derives `http://127.0.0.1:<port>/outbound-oauth/callback` from its prebound origin. It passes this callback through all outbound MCP OAuth stages.
+
+Registration, completion-mode selection, and callback completion use the same exact URL. The app requires no `WALTR_PUBLIC_URL` or per-target OAuth redirect variable.
+
+Embedded mode publishes no CIMD client metadata URI. Its local metadata endpoint returns `404 Not Found` because remote authorization servers cannot fetch device loopback.
+
+If upstream advertises CIMD and DCR, embedded mode skips CIMD. It can use preregistration or DCR. Reauthorization in the same server generation reuses a valid DCR registration; a replacement generation performs fresh DCR because the previous generation's registration marker is stale.
+
+Embedded composition ignores `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS`. Only its explicit trusted-origin list can admit private HTTPS OAuth destinations.
+
+Embedded attempts and MCP credentials persist only an opaque per-generation callback marker. They never persist the loopback callback endpoint.
+
+Every embedded server restart rejects stale markers and credentials. Status and cancel return not found for stale attempts, and self-MCP credential logout returns failed precondition because that credential is host-owned. Affected outbound MCP targets require reauthorization and cannot reuse generation-specific DCR registration.
+
+The app has no Waltr endpoint selector or native Waltr access OAuth. Its web adapter supplies no generic Waltr access operations, so an unexpected login-required snapshot offers no sign-in action and the authenticated shell offers no sign-out action. Routes still follow authoritative shared access and readiness snapshots. Provider and upstream-MCP OAuth remain server-owned.
+
+The main WebView loads only packaged local assets. Remote navigation and new windows remain denied. Rust validates credential-free HTTPS URLs before the operating system opens them.
+
+The embedded server uses explicit Tauri app-private roots:
+
+| State | Location under Tauri roots |
 | --- | --- |
-| Application identifier | `dev.waltr.app` |
-| Waltr endpoint | `https://preview-waltr.holdenitdown.net` |
-| Native client ID | `waltr-preview-native` |
-| Audience | `waltr-preview-api` |
-| Desktop callback | Ephemeral `http://127.0.0.1:<port>/callback` |
-| Android callback | Exact `dev.waltr.app:/oauth2redirect` |
+| Waltr database | App data `server/waltr.sqlite3` |
+| MCP database | App data `server/mcp.sqlite3` |
+| Sessions | App data `server/sessions/` |
+| Workspace | App data `workspace/` |
+| models.dev cache | App data `server/models/api.json` |
+| Resource overrides | App config `server/.waltr/resources` |
 
-The app has no Waltr endpoint selector, telemetry endpoint selector, updater, persistent credential store, or broad shell, filesystem, or HTTP capability. Its main WebView loads only packaged local assets. Remote navigation and new windows are denied; credential-free HTTPS URLs are validated in Rust and opened by the operating system. Native OAuth and bearer/refresh credentials remain in Rust and never cross IPC.
+Startup fetches `https://models.dev/api.json` before it reads the app cache fallback. HTTP connect time has a five-second bound.
+
+The complete request and response body have a 15-second bound. Failure or timeout falls back to a valid app cache.
+
+First launch requires network access unless a valid cache already exists.
+
+Later startup can use a valid cache when the network source fails. Startup fails when neither source supplies a valid catalog.
+
+Desktop and Android use the same ordinary bundled and persisted resource catalog. Desktop retains server-side Bash shell execution; the shell has no operating-system sandbox.
+
+Android is compiled without shell support. Shell-bearing definitions remain valid and inspectable, but runtime construction omits the shell tool and feature-derived shell tool permissions. Stdio MCP resources materialize and use the ordinary runtime path.
+
+These server-side capabilities differ from WebView capabilities. The WebView keeps its minimal local IPC grants on every platform.
 
 Run these commands from the repository root. They map to current workspace scripts and manifests:
 
@@ -268,9 +316,39 @@ Run these commands from the repository root. They map to current workspace scrip
 | Android package | `pnpm --filter @rfhold/waltr-app android:build` | Build through the generated Android project under `crates/waltr-app/gen/android/`. |
 | Android app | `pnpm --filter @rfhold/waltr-app exec cargo tauri android dev` | Build, install, and start on a configured emulator or device. |
 
-Focused deterministic checks are listed in [Testing](testing.md). Linux desktop and Android build/start checks require the corresponding host display, emulator, or device. An Android package build and the native TLS tests prove compilation and deterministic trust configuration, not Android runtime connectivity, operating-system intent delivery, or successful provider authorization. Android runtime success for this trust fix remains unverified until RC8 is exercised on a device against the live public-root Waltr, OIDC, and OTLP endpoints. Preview login, protected requests, refresh, suspension, process-death, and logout smoke tests require an installed app, explicit authority to access the preview deployment, and a live provider registration; they are not part of normal local validation.
+Focused deterministic checks are listed in [Testing](testing.md). Package creation does not prove installed-device lifecycle behavior.
 
-Android login uses an external system browser and an explicit private-scheme `Intent` filter on `MainActivity`. Kotlin passes cold and warm `Intent` objects opaquely to JNI after the superclass callback. Rust reads and validates the URI. No callback enters a Tauri event, WebView API, capability, or IPC command. Callback URL, code, state, verifier, and tokens remain Rust-only. Private schemes are not cryptographically bound to one Android application: another installed app can claim or intercept the callback. PKCE prevents code redemption without the verifier, and state prevents forged completion. An interceptor can still deny service by withholding the callback. Verified HTTPS App Links remain a possible future mitigation. No live provider action, Android installation, or device test occurred. macOS and iOS require macOS and remain unverified.
+### Android Foreground Service
+
+Android requires notification permission before it starts the embedded server on Android 13 and later. Denial leaves startup at `notificationPermissionRequired`.
+
+`WaltrForegroundService` is non-exported and runs in the app process. It uses foreground-service type `specialUse`, a persistent notification, `START_STICKY`, and `android:stopWithTask="false"`.
+
+The service enters foreground state before it loads the native library. Native server work starts only after both steps complete.
+
+The current `specialUse` declaration targets sideload distribution. Play distribution requires separate policy review, declarations, and product work.
+
+Activity pause stops only the client runtime. The service and embedded server survive background and task removal on a best-effort basis.
+
+Android lifecycle callbacks never wait for Rust client or server thread joins. Reaper threads complete those joins outside callbacks.
+
+A nonblocking server stop transitions the exact current generation to `Stopping` and detaches its thread under the controller lock. Its reaper joins only that generation and publishes `Stopped` or `Failed` after the join.
+
+New start reservation waits while the controller is `Stopping`, so a replacement starts only after the old reaper completes. Embedded generations never overlap their shared app-private roots, and Android callbacks remain nonblocking because they do not perform the join.
+
+Notification permission changes publish an adapter-private startup control event to an active client generation. A later client generation reads the current permission state at startup.
+
+A fresh generation applies permission state before it can use an existing server connection. Permission-required generations remain disconnected until permission changes.
+
+Each client-start ticket owns the exact bridge generation that it creates. Suspend invalidates in-progress ownership, and resume creates a replacement ticket.
+
+A stale or suspended completion stops only its own generation. It never stops a newer replacement or leaves an unowned background client.
+
+Foreground-service APIs do not guarantee survival through force-stop, process kill, reboot, or user termination. Android can terminate the process at any time.
+
+After process death, a later service or app start creates a new endpoint and bearer. Durable stores reopen, and Routine restart reconciliation handles unfinished invocations.
+
+Android excludes all app-private files, databases, shared preferences, and root data from cloud backup and device transfer.
 
 ## Authentik And Pulumi Deployment
 
@@ -279,10 +357,8 @@ The repository's supported infrastructure/workload definition is Pulumi under `i
 | Provider | Type | Use |
 | --- | --- | --- |
 | Browser | Confidential | Server-side browser Authorization Code flow and `/oidc/callback`. |
-| Native API | Public | TUI and Tauri desktop/Android Authorization Code with PKCE; issues the API audience/scope. |
+| Native API | Public | Remote native clients such as the TUI; issues the API audience and scope. |
 Authentik has no MCP provider, application, audience, scope mapping, callback, or token-issuance role. Waltr hosts MCP authorization, supports DCR and CIMD according to explicit stack policy, and retains `WALTR_MCP_REQUIRED_SCOPES` as local policy.
-
-Both `Pulumi.preview.yaml` and `Pulumi.prod.yaml` set `waltr:androidNativeRedirectUri` to exactly `dev.waltr.app:/oauth2redirect`. Pulumi validates that exact value and adds it in strict matching mode to each stack's existing public native client alongside the desktop regex `^http://127\.0\.0\.1:[0-9]+/callback$`. These committed stack sources define the registration that a future `pulumi up` would reconcile. They do not prove that either provider currently has the redirect registered. No live provider registration, `pulumi up`, deployment, Android installation, or authorized login smoke test was performed for this implementation.
 
 This is a clean cutover. Do not add `WALTR_MCP_OIDC_*`, `WALTR_MCP_SELF_OAUTH_*`, an Authentik MCP audience, a second advertised issuer, or a fallback validator. Existing native API tokens remain Authentik-issued but are not accepted at `/mcp`.
 
@@ -310,7 +386,23 @@ The prerelease PipelineRun references the shared homelab Tasks from the homelab 
 
 The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and routine engine, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
 
-The bundled `mcp-servers/waltr.yaml` resource expands required `${env:WALTR_PUBLIC_URL}` and joins `/mcp`. The resource uses the normal target-scoped outbound OAuth lifecycle. When hosted MCP OAuth starts, Waltr admits its private HTTPS origin only for that exact self resource. Other private origins require explicit configuration.
+Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS` once as a boolean.
+
+Later environment changes do not alter active behavior. Embedded composition ignores the ambient private-test switch.
+
+The snapshot excludes arbitrary process environment. Its redacted `Debug` representation reports configuration presence and count without values.
+
+Embedded configuration and lifecycle `Debug` output omits endpoints, bearers, app-private paths, and task or thread handles.
+
+Environment-owned servers expand required `${env:WALTR_PUBLIC_URL}` in bundled `mcp-servers/waltr.yaml` and join `/mcp`. Their self resource remains mutable through persisted overlays and administration.
+
+Embedded Tauri composition prebinds loopback, atomically overwrites the ordinary persisted `mcp-servers/waltr.yaml` slot with that generation's exact URL, and then loads the same bundled-plus-persisted catalog. The filesystem resource remains ordinarily inspectable, replaceable, watchable, and resettable. Reset can fail normal candidate validation because the bundled fallback needs `WALTR_PUBLIC_URL`.
+
+The host-owned generation credential remains memory-only and is available only when the effective resource URL exactly matches the initialized loopback endpoint, so an edited endpoint cannot receive it. Hosted servers retain their private-origin policy.
+
+Embedded outbound OAuth uses the exact callback derived from that same prebound origin. It does not consult ambient public or target redirect variables.
+
+Embedded configuration contains no client metadata URI. Therefore its local `/.well-known/oauth-client/waltr` route returns `404 Not Found`.
 
 `/health` reports process liveness. `/ready` checks persistence, routine engine health, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy.
 
@@ -318,9 +410,15 @@ Startup interrupts unfinished Routine invocations before the engine reports read
 
 Deploy one active Routine engine for each Waltr database. Clustered Routine leases and cross-engine execution coordination are not implemented.
 
-`ServerApplication` owns the definition watcher, routine engine, and hosted OAuth maintenance. Graceful shutdown cancels and joins each owned task. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+`ServerApplication` owns the definition watcher, routine engine, session host, and hosted OAuth maintenance. Graceful shutdown stops Routine work, invokes `SessionCoordinator::shutdown`, and joins the other owned tasks. Coordinator shutdown rejects new work, cancels active and queued work, waits for run ownership to drain, atomically drains MCP caches under the lifecycle gate, and awaits each cached runtime's explicit shutdown. Stdio runtimes therefore use the generic MCP client's shutdown/reap path; no stronger bounded-termination guarantee is made. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
 
-Startup loads models.dev to materialize provider resource selectors. The loader uses `WALTR_MODELS_DEV_PATH` or `WALTR_MODELS_DEV_URL`, then its configured default. The disk cache can satisfy an unavailable source. Startup fails when no source or cache can materialize the complete catalog.
+Environment-owned startup loads models.dev from `WALTR_MODELS_DEV_PATH`, `WALTR_MODELS_DEV_URL`, or the default URL. The disk cache can satisfy an unavailable source.
+
+Tauri always requests `https://models.dev/api.json` first. The connection has a five-second bound, and the complete request has a 15-second bound.
+
+Failure or timeout uses the app-private cache when that cache contains a valid catalog. First launch requires network without a valid cache.
+
+Every mode fails startup when neither source nor cache can materialize the complete catalog.
 
 Local revocation wakes same-process streams after the database commit. Every hosted stream also performs an authoritative durable check at most every five seconds; another replica's revocation therefore closes it within five seconds plus scheduling and query latency. PostgreSQL `LISTEN/NOTIFY` is not implemented. Do not increase the current one-replica Pulumi workload until the documented container-backed concurrency and cross-replica operational checks have been exercised.
 

@@ -52,7 +52,7 @@ Agent, feature, and permission syntax is documented in [Agent Architecture](agen
 
 A provider catalog selector names a models.dev provider and an `include` list. Optional `keyPrefix` and `aliases` alter materialized model keys. Waltr uses the materialized key as the session and upstream model identifier, so prefixes are functional routing identifiers rather than presentation-only namespaces.
 
-`McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command.
+`McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command. Both forms belong to the ordinary catalog schema in every host build.
 
 `Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
 
@@ -80,13 +80,27 @@ The server bundles [`title`](../../crates/waltr-server/resources/routines/title.
 
 The catalog materializes providers, MCP servers, and defaults into `waltr.config.v1.Configuration`. Runtime, auth, catalog search, and clients use this projection. The server retains routines separately, so routine resources never enter agent-definition bundles.
 
+## Build Capabilities
+
+Environment-owned servers and embedded desktop and Android servers load one ordinary bundled catalog plus persisted overrides. There is no host-specific catalog variant or alternate Android resource tree.
+
+Shell-bearing agent, feature, and permission resources remain valid, inspectable, and loadable when the server is compiled without the `shell` feature. Runtime construction then omits the unavailable shell tool and any permissions derived by selecting the shell feature. Shell-enabled builds install the configured shell tool and its applicable permissions normally.
+
+The Tauri host passes app config `server` as the catalog root. Persisted overrides therefore live exactly at app config `server/.waltr/resources`.
+
+Stdio MCP resources materialize in every build and use ordinary runtime process behavior when selected. Build capability handling controls server-side agent tools; it does not describe Tauri WebView capabilities. The WebView keeps its separate minimal IPC capability set.
+
+Embedded startup prebinds its loopback listener, then atomically overwrites app config `server/.waltr/resources/mcp-servers/waltr.yaml` with that generation's exact `/mcp` URL before loading the catalog. The file is an ordinary persisted resource with filesystem origin and is refreshed on every server generation.
+
+Embedded self-MCP therefore uses the same bundled-plus-persisted load, inspection, replacement, watcher, reset, and ETag behavior as every other resource. It needs no `WALTR_PUBLIC_URL` while the provisioned file replaces the bundled resource. Reset still validates the ordinary candidate catalog before deletion and can fail when the bundled fallback cannot expand `${env:WALTR_PUBLIC_URL}`; there is no embedded reset rule.
+
 ## Environment Templates
 
 Resource string templates use `${env:NAME}`. Provider header values support whole-value or embedded templates.
 
 URL templates require uppercase ASCII environment names with digits or underscores. A missing required URL value fails catalog validation.
 
-The bundled [`mcp-servers/waltr.yaml`](../../crates/waltr-server/resources/mcp-servers/waltr.yaml) requires `${env:WALTR_PUBLIC_URL}`. Waltr joins its `/mcp` path through URL parsing.
+The environment-owned bundled [`mcp-servers/waltr.yaml`](../../crates/waltr-server/resources/mcp-servers/waltr.yaml) requires `${env:WALTR_PUBLIC_URL}`. Waltr joins its `/mcp` path through URL parsing.
 
 The join preserves a deployment path prefix and avoids duplicate separators. The public URL must meet the security rules in [Deployment](../deployment.md#oidc-access-domains).
 
@@ -143,7 +157,7 @@ Provider, MCP server, and defaults edits follow one flow:
 
 Reset uses the captured persisted-slot ETag and then waits for the authoritative catalog snapshot. Clients preserve the current catalog while a write fails or a reload error remains active.
 
-Provider and MCP credentials remain durable SQL state outside the resource catalog. Resource reset never resets credentials.
+Provider and upstream-MCP credentials remain durable SQL state outside the resource catalog. The embedded self-MCP generation credential is host-owned and memory-only. Resource reset never resets credentials.
 
 Each session stores a self-contained inference snapshot. Catalog changes do not alter that durable session snapshot.
 

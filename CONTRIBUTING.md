@@ -26,7 +26,7 @@ Run the Linux Tauri app with its packaged local web assets:
 
 `pnpm --filter @rfhold/waltr-app dev`
 
-The Tauri app is fixed to the preview endpoint and supports desktop and Android native login. See [docs/deployment.md](docs/deployment.md#tauri-application) for platform/build boundaries and [docs/testing.md](docs/testing.md) for deterministic versus installed-device and live-provider validation.
+The Tauri app starts its own loopback Waltr server. It has no native Waltr access login. See [docs/deployment.md](docs/deployment.md#tauri-application).
 
 Install and run the bundled TUI with an embedded server and web assets:
 
@@ -64,6 +64,10 @@ Build the Linux Tauri packages:
 
 `pnpm --filter @rfhold/waltr-app build`
 
+Build the Android package:
+
+`pnpm --filter @rfhold/waltr-app android:build`
+
 Application prereleases are produced only from signed annotated tags exactly matching `vX.Y.Z-rc.N` whose commit is reachable from `origin/main`. Stable `vX.Y.Z` tags remain reserved for the production server pipeline. See [docs/deployment.md](docs/deployment.md#release-pipelines) for release artifacts, versionCode bounds, signing, secret, and rerun behavior.
 
 # Protocol Buffers
@@ -75,6 +79,8 @@ Run `buf lint` and `buf generate` after changing proto files.
 # Testing
 
 See [docs/testing.md](docs/testing.md) for test structure, commands, layering expectations, live-test setup, and container-backed test notes.
+
+The canonical guide also covers Tauri host checks, Android feature checks, Gradle checks, and installed-device requirements.
 
 Run MCP spec tests:
 

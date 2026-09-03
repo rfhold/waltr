@@ -7,6 +7,7 @@ Waltr access authentication decides whether a caller may use a Waltr server. It 
 | Boundary | Meaning | Owner |
 | --- | --- | --- |
 | Waltr access authentication | Admit a browser, native client, or MCP client to this Waltr server. | `waltr-server` access-auth module, shared client access state, and platform login runtimes. |
+| Tauri local admission | Admit only the app's Rust client and embedded self-MCP client to one server generation. | `waltr-server` local admission and `waltr-app` server controller. |
 | Provider/upstream-MCP credential OAuth | Acquire credentials Waltr uses for outbound provider or MCP calls. | Server `AuthService`, generic `AuthTarget` operations, agent credential refresh, and config client surfaces. |
 | Hosted MCP authorization | Authenticate the resource owner through the Waltr browser session, collect Waltr consent, and issue credentials accepted by Waltr `/mcp`. | Generic `mcp` authorization server and Waltr browser/consent adapters. |
 
@@ -16,13 +17,13 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 
 `WALTR_AUTH_MODE` is exactly `disabled` or `oidc` and defaults to `disabled`.
 
-- `disabled` admits a synthetic local principal. `WALTR_PUBLIC_URL` remains required independently so the bundled self-MCP resource can materialize. Any actual browser, API, or hosted-MCP OAuth setting still fails startup instead of being silently ignored as partial OIDC configuration.
+- For environment-owned servers, `disabled` admits a synthetic local principal. `WALTR_PUBLIC_URL` remains required so the bundled self-MCP resource can materialize. Any partial OIDC configuration still fails startup.
 - `oidc` requires valid configuration, successful provider discovery, an initial JWKS load, and initialized SQL persistence before the application is constructed. It never falls back to disabled mode.
 
 | Variable | Required | Contract |
 | --- | --- | --- |
 | `WALTR_AUTH_MODE` | Yes | Exactly `disabled` or `oidc`; omitted means `disabled`. |
-| `WALTR_PUBLIC_URL` | Every mode | Absolute public Waltr API resource URL, consumed independently of access authentication by the bundled self-MCP resource. HTTPS is required except for loopback development; query, fragment, and userinfo are forbidden. |
+| `WALTR_PUBLIC_URL` | Every environment-owned mode | Absolute public Waltr API resource URL, consumed independently of access authentication by the bundled self-MCP resource. HTTPS is required except for loopback development; query, fragment, and userinfo are forbidden. |
 | `WALTR_OIDC_ISSUER` | Yes | Absolute HTTP(S) issuer URL without query, fragment, or userinfo. Discovery must return this issuer exactly. |
 | `WALTR_OIDC_CLIENT_ID` | Yes | Browser authorization-code client identifier. |
 | `WALTR_OIDC_CLIENT_SECRET` | No | Confidential-client secret. When absent, provider metadata must support token endpoint auth method `none`. |
@@ -49,7 +50,7 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 
 HTTP callback URLs and insecure cookies are accepted only when both insecure flags are `true` and the callback host is loopback. Otherwise the callback and discovered OIDC endpoints must use HTTPS and cookies use the `Secure` attribute.
 
-## Public And Protected Surfaces
+## Hosted Public And Protected Surfaces
 
 | Public | Protected in OIDC mode |
 | --- | --- |
@@ -61,6 +62,44 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 | API-root RFC 9728 metadata, path-specific MCP metadata, local RFC 8414 metadata/JWKS, OAuth authorization/token/revocation/registration routes, and outbound callback/CIMD routes | |
 
 API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before each stateless MCP request dispatch.
+
+## Embedded Local Admission
+
+Tauri starts an access-disabled embedded server on a prebound ephemeral `127.0.0.1` port. It does not configure browser or native Waltr access OAuth.
+
+`waltr-app` creates a random 256-bit bearer for each embedded server generation. Rust retains both the endpoint and bearer.
+
+The local admission middleware requires an exact bearer match on `/waltr.*` gRPC paths and `/mcp`.
+
+`GET /health`, `GET /ready`, and `/outbound-oauth/callback` do not require the local bearer. The callback completes only an explicit server-owned outbound attempt.
+
+Embedded composition derives the exact callback URL from the prebound loopback origin. It passes that URL explicitly to outbound MCP authorization.
+
+The explicit URL controls registration redirects, attempt completion mode, and callback completion checks. The embedded app reads no ambient public or target-specific OAuth redirect variables.
+
+Embedded mode deliberately configures no public CIMD URI. `GET /.well-known/oauth-client/waltr` returns `404 Not Found` because remote authorization servers cannot fetch device loopback.
+
+When an upstream server offers CIMD and DCR, embedded mode skips CIMD. It can use preregistration or DCR. A valid dynamic registration is reused for reauthorization within the same embedded generation; a replacement generation performs fresh DCR because it cannot rehydrate the old generation's redirect marker.
+
+Embedded outbound destination policy ignores `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS`. Only explicit `EmbeddedOutboundPolicy::trusted_private_origins` entries admit private HTTPS origins.
+
+Embedded configuration and lifecycle `Debug` output omits endpoints, bearers, app-private paths, and task or thread handles.
+
+Embedded startup prebinds loopback and atomically provisions the exact `/mcp` URL at app config `server/.waltr/resources/mcp-servers/waltr.yaml` before ordinary catalog load. The resource has filesystem origin and ordinary inspect, replace, watch, reset, and ETag behavior.
+
+A host-owned memory credential supplies the generation bearer only when the effective self-MCP resource URL exactly matches the initialized loopback endpoint. Editing the resource to another endpoint therefore cannot send that bearer to the edited destination.
+
+The self-MCP credential cannot change, refresh, or persist through the normal credential store. Logout returns failed precondition and preserves it because the credential is host-owned. Resource reset is unrelated and follows ordinary candidate validation, which can fail if the bundled fallback needs an unavailable `WALTR_PUBLIC_URL`. Other provider and upstream-MCP credentials remain server-owned Waltr SQL state.
+
+Loopback reachability alone grants no protocol access. The WebView, Kotlin layer, IPC payloads, logs, and telemetry never receive the endpoint or bearer.
+
+Tauri removes the exact private endpoint from every client snapshot. It also removes an outbound authorization URL when that URL contains the endpoint.
+
+For such attempts, Rust retains the full URL and binds it to the current generation and attempt ID. WebView requests an opaque open by attempt ID.
+
+Rust resolves the current attempt and applies the external HTTPS policy before launch. Hosted browser and TUI authorization presentation remain unchanged.
+
+Access tokens, refresh tokens, PKCE material, and callback state remain outside every client snapshot.
 
 ## Browser Flow
 
@@ -77,7 +116,7 @@ ID tokens and access tokens have independent asymmetric signing-algorithm allowl
 
 Logout is `POST /oidc/logout`. In OIDC mode it requires exactly one valid `Origin` header whose scheme, host, and effective port exactly match `WALTR_PUBLIC_URL`; if `Sec-Fetch-Site` is present it must occur once and equal `same-origin`. The server revokes the persisted session before clearing the cookie. The web client calls logout with same-origin credentials and clears shared protected state only after a successful response.
 
-## Native Protocol And Host Adapters
+## Remote Native Protocol And Host Adapters
 
 Native gRPC uses `Authorization: Bearer`, never the browser cookie. Under the `native-access` feature, `crates/waltr-client/src/native_access.rs` owns the public-client Authorization Code with PKCE protocol: protected-resource and authorization-server discovery, callback binding and validation, code exchange, refresh/expiry, cancellation, logout, redaction, generation-safe in-memory bearers, and the shell-neutral refresh-token store boundary. It emits shared reducer commands and secret-free progress. Native hosts supply configuration, secure-store adapters, and effects; they do not reimplement the protocol.
 
@@ -92,25 +131,23 @@ The TUI host reads these variables:
 
 The shared native protocol fetches only `/.well-known/oauth-protected-resource` from the configured server origin. It requires that document's resource to exactly match the normalized endpoint scheme, host, effective port, and path before trusting its single advertised API authorization server. It sends the advertised API resource in the authorization request; it neither derives `/mcp` nor consumes MCP metadata. Server and provider metadata must use HTTPS, except HTTP on loopback for local development. Provider metadata must support code flow and PKCE S256, and the configured native client must be public.
 
-The callback policy separates desktop loopback delivery from platform-delivered callbacks without changing protocol ownership. For loopback, the shared protocol binds the listener before generating state, nonce, and PKCE values and validates the callback method, authority, path, state, and duplicate parameters. For Android, the redirect URI is exactly `dev.waltr.app:/oauth2redirect`: a hostless private-use URI with no fragment. The Android host rejects every other URI shape before delivery; the shared protocol then validates the exact redirect URI, one state value matching the active attempt, and exactly one nonempty code or one provider error. Invalid callbacks, including a wrong-state callback, do not terminate the attempt, so a later valid callback may complete it.
+The loopback callback policy binds the listener before it creates state, nonce, and PKCE values. It validates method, authority, path, state, and duplicate parameters.
 
-The TUI adapter opens a browser when available and always displays a copyable URL. The Tauri adapter keeps the complete authorization URL, callback URL, authorization code, state, nonce, PKCE verifier, and access/refresh tokens in Rust. Rust validates and opens the external HTTPS authorization URL and sends only redacted presentation progress over IPC. Android sends each cold or warm callback `Intent` from `MainActivity` to JNI. Kotlin passes the object opaquely; Rust reads and wraps its URI. No callback enters a Tauri event, WebView API, capability, or IPC command. The host uses a nonblocking one-entry latest-value slot for the active generation. The coordinator delivers queued callback actions serially to shared validation. Runtime-generation and credential-lease checks reject stale work.
+The TUI adapter opens a browser when available and always displays a copyable URL.
 
-A refresh token is used shortly before access-token expiry; without one, the client expires access at the declared lifetime. Tauri persists only refresh-token bytes. Startup loads those bytes, repeats protected-resource and authorization-server discovery from current configuration, refreshes, durably writes any rotation, and only then installs the bearer. Login and near-expiry refresh use the same durable-before-bearer order; a refresh response that omits a replacement retains the current refresh token. Secure-store unavailability permits process-memory login and emits only a bounded secret-free warning.
+A refresh token is used shortly before access-token expiry. Without one, the client expires access at the declared lifetime. The TUI keeps native tokens in process memory.
 
-Explicit logout clears memory and attempts durable deletion even when no bearer is installed. Malformed or undecryptable stored data, exact OAuth `invalid_grant`, and an exact terminal `WALTR_ACCESS` rejection delete durable state. Ordinary stop, disposal, suspension, process exit, token expiry without terminal invalidity, and transient network or server failures clear process memory as applicable but retain the durable refresh token. A failed deletion is reported as a bounded safe error and is never represented as confirmed deletion. Android has one narrow suspension exception. Rust marks an unauthenticated browser handoff before it opens the browser. Only the first browser-away pause preserves the generation. A callback received before resume remains in the Rust slot. The first resume consumes preservation and releases the callback. Return without a callback also consumes preservation. Every later pause, authenticated pause, or terminal result during preserved suspension invalidates the generation and clears process-memory credentials.
+Explicit TUI logout clears process-memory native credentials. Restart also requires a new login.
 
 Native provider metadata must advertise Authorization Code and PKCE `S256`. Native hosts always act as public PKCE clients and send no client secret; discovery may advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. HTTPS is required except for the single explicitly enabled loopback-HTTP mode described above.
-
-The Tauri host has fixed configuration: application identifier `dev.waltr.app`, endpoint `https://preview-waltr.holdenitdown.net`, client ID `waltr-preview-native`, and audience `waltr-preview-api`. Desktop uses an ephemeral loopback callback; Android uses the exact private-use callback above with the same public native client and no client secret. Linux stores the refresh token in Secret Service through the Rust-crypto zbus adapter. Android stores it through Android Keystore-backed encrypted SharedPreferences; backup and device transfer exclude that named ciphertext file because its key is device-local. Access tokens, endpoints, client configuration, expiry, account identity, callback state, nonce, PKCE material, and JSON token bundles are never persisted. A callback delivered after process death has no active handoff, attempt, state, verifier, or credential lease and is rejected; startup restoration is a separate refresh flow.
-
-Android private schemes are claimable and interceptable by another installed application. PKCE prevents an interceptor from redeeming the captured code without the verifier, and state prevents a forged callback from completing Waltr's attempt, but interception can still deny service by withholding the callback. Verified HTTPS App Links could provide stronger application binding in a future design; they are not implemented.
 
 The external API bearer verifier accepts the exact RFC 9068 `at+jwt` JOSE type with its existing claim validation. It accepts Authentik's exact provider-generic `JWT` spelling only when `WALTR_API_OIDC_CLIENT_ID` is configured and the token's `azp` exactly matches it. Case variants, absent types, and unrelated types are rejected. Both accepted forms require an allowed asymmetric signature and key, exact issuer and API audience, lifetime, nonempty subject, and every configured API scope. Audience and scope overlap alone do not distinguish an ID token from a provider-generic access token; the additional authorized-party binding prevents that confusion.
 
 `NativeCredentialLease` generations prevent a stale login or refresh task from replacing credentials installed by a newer flow. The transport reads the current credential for every newly sent unary request or opened stream, so reconnecting a watch receives the replacement token without rebuilding shared client state.
 
-This native boundary does not change hosted browser access. Hosted browser navigation and gRPC-web remain same-origin and cookie-based; the browser build does not inject native bearer credentials or use the Tauri bridge.
+This remote native boundary does not change hosted browser access. Hosted browser navigation and gRPC-web remain same-origin and cookie-based.
+
+Tauri does not use this remote native protocol. Its embedded local admission uses the separate process-generation bearer contract.
 
 ## MCP Flow
 
@@ -154,6 +191,10 @@ The cutover is intentionally clean: there is no direct-Authentik MCP validator, 
 - `LoginRequired`, `LoginInProgress`, and `LoginFailed` drive platform login UI.
 - A successful protected status event for the current watch epoch establishes `Authenticated`.
 
+Web routes treat that shared access snapshot, together with the shared readiness snapshot, as authoritative. They do not use host embedding or native control events to bypass authentication. `ClientAdapter.access` is an optional generic capability containing `openLogin` and `logout`: the hosted browser supplies server-owned login navigation and same-origin logout, while the embedded Tauri adapter supplies neither. A login-required Tauri snapshot therefore presents no sign-in action, and its authenticated shell presents no sign-out action.
+
+The optional `openAuthorizationAttempt(attemptId)` capability is separate from Waltr access. It lets a host open a Rust-redacted outbound provider or MCP authorization URL from the current opaque attempt ID without exposing that URL. Tauri `platform` startup events remain private adapter IPC sequencing inputs and do not enter app context or route presentation.
+
 Authentication failures use the versioned protobuf `AuthenticationFailure` status detail. Its domain is `WALTR_ACCESS`, `OUTBOUND_PROVIDER`, or `OUTBOUND_MCP`; its reason distinguishes required/rejected credentials, token exchange, network, invalid response, and missing configuration. Outbound failures include a typed `AuthTarget`; outbound MCP failures may additionally preserve the sanitized endpoint, HTTP status, resource-metadata URL, scope, bearer error fields, and realm from the structured challenge.
 
 Provider and upstream-MCP credential management uses one target-scoped `AuthService` contract. A caller can list or read sanitized status, begin and complete authorization, inspect or cancel an attempt, force refresh a refreshable credential, and reset local credential state. Provider-only RPC variants are not part of the contract. Status may report whether refresh is available, but never includes access tokens, refresh tokens, PKCE material, callback state, or registration responses.
@@ -172,4 +213,18 @@ OIDC back-channel requests do not follow redirects. Deployments behind a reverse
 
 Environment-owned `build_app()` is intentionally async and fallible because database migrations, OIDC discovery, and initial key loading precede listener binding. Explicit app builders are synchronous composition APIs and require initialized `Persistence`; builders that enable access authentication also require an initialized `AccessAuthenticator`.
 
+Standalone startup snapshots only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It separately snapshots the private-test switch as a boolean.
+
+Later environment changes do not alter active behavior. Embedded composition always disables that switch regardless of process environment.
+
+The snapshot excludes all unrelated environment entries. Its `Debug` output reports only bounded configuration facts and never prints retained values.
+
+Embedded attempts and MCP credentials persist an opaque per-generation callback marker instead of the callback endpoint. Only the matching active generation rehydrates its exact callback in memory.
+
+Every embedded server restart creates another marker. It rejects stale attempts and hides stale marked credentials. Status and cancel return not found for stale attempts without mutating them. Outbound MCP targets therefore require reauthorization after restart.
+
+Same-generation embedded reauthorization can reuse its valid DCR registration. That registration cannot transfer to a replacement generation, which performs fresh DCR when selected. Standalone durable attempts, credentials, and registration reuse retain their current behavior.
+
 See [Server Persistence](persistence.md), [Clients](clients.md), and [Deployment](../deployment.md).
+
+Implementation references include [`waltr-server` embedded composition](../../crates/waltr-server/src/embedded.rs), [`waltr-server` local admission](../../crates/waltr-server/src/local_admission.rs), and the [`waltr-app` server controller](../../crates/waltr-app/src/server_controller.rs).
