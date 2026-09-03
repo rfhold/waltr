@@ -38,7 +38,7 @@ Use explicit app data and config roots for all embedded state. Resource override
 
 After the server prebinds loopback, atomically overwrite `server/.waltr/resources/mcp-servers/waltr.yaml` with the generation URL before ordinary catalog load. The endpoint is durable on disk and refreshed each generation; only the bearer remains memory-only.
 
-Use the fixed bounded models.dev connect and request timeouts. On failure or timeout, accept only a valid app cache; do not expose host-configurable catalog timeout policy.
+Use the fixed bounded models.dev connect and request timeouts. On failure or timeout, prefer a valid app cache. If the cache is absent, explicitly select the curated built-in seed and mark it stale; malformed or unreadable cache state must still fail startup. Do not expose host-configurable catalog timeout policy.
 
 Desktop and Android load the same ordinary bundled and persisted resource catalog. Desktop compiles the server-side shell tool; Android does not. Android still accepts and exposes shell-bearing definitions, but runtime construction omits the unavailable shell tool and feature-derived shell tool permissions. Stdio MCP resources materialize and run through the ordinary MCP runtime on both targets.
 
@@ -91,3 +91,5 @@ Use standard OpenTelemetry SDK providers: batched span and log exporters plus a 
 Allow trace targets only from this app or `waltr_client::transport::native_trace`. Allow log targets only from this app. Use the shared blocking Rustls client for all exporters. Configure it explicitly with the ring provider, TLS 1.2/1.3, and bundled `webpki_roots`; retain normal chain and hostname verification. Do not add platform roots, private or user CAs, or `SSL_CERT_FILE` to that telemetry client; the process-level Android verifier initialization is only for ordinary reqwest users. Disable redirects and strip every inherited or environment-derived header except the canonical protobuf content type.
 
 Telemetry must exclude credentials, local endpoints, query strings, commands, snapshots, content, arbitrary error or panic text, bodies, and stable user or device IDs. Keep provider setup and export fail-open. Bound trace and log shutdown requests to two seconds. Preserve the OpenTelemetry SDK 0.32 fixed five-second metric shutdown bound. Keep automated Rust tests isolated through disabled native initialization and deterministic in-memory exporters. Do not synchronously flush native telemetry from Android suspend callbacks.
+
+On Android embedded-server startup failure, retain the server's sanitized build category through the controller and emit only the fixed startup-failure event, outcome, and bounded category. A caught JNI panic marks the startup operation span but relies on the global panic hook for its sole panic error event. Never attach inner error text or configuration values.

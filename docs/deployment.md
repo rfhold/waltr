@@ -85,6 +85,8 @@ The server always registers bundled `routines/title.yaml` and `routines/fork.yam
 
 Waltr validates the complete catalog before startup. Invalid YAML, identity mismatches, unresolved references, invalid models.dev selectors, and invalid environment templates fail startup.
 
+Models.dev loading is network-first with fixed request bounds. A valid configured disk cache is the first fallback and is reported stale. Embedded hosts may explicitly supply the curated seed in `resources/models-dev-defaults.json` as a final stale fallback only when no cache file exists. Malformed or unreadable cache files fail closed, and standalone startup does not enable the built-in fallback.
+
 The environment-owned bundled self-MCP resource requires `WALTR_PUBLIC_URL` in every access-auth mode. It consumes the variable independently of OIDC, joins `/mcp` through URL parsing, and preserves a deployment path prefix. With access auth disabled, actual partial browser, API, or hosted-MCP OIDC settings still fail startup.
 
 The server watches `.waltr/resources` after startup. An invalid reload preserves the last-known-good snapshot and exposes the reload error.

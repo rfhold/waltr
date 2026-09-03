@@ -15,6 +15,8 @@ use crate::{
 };
 use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf};
 
+const BUILT_IN_CATALOG: &str = include_str!("../resources/models-dev-defaults.json");
+
 /// Explicit models.dev source used by an embedded generation.
 #[derive(Clone)]
 pub enum EmbeddedCatalogSource {
@@ -22,6 +24,13 @@ pub enum EmbeddedCatalogSource {
     Url(String),
     /// Load a local catalog fixture or bundled extraction.
     Path(PathBuf),
+}
+
+/// Optional final catalog fallback selected by an embedding host.
+#[derive(Clone, Copy, Debug)]
+pub enum EmbeddedCatalogFallback {
+    /// Use Waltr's curated catalog after a network failure when no cache file exists.
+    BuiltIn,
 }
 
 impl fmt::Debug for EmbeddedCatalogSource {
@@ -69,6 +78,8 @@ pub struct EmbeddedServerConfig {
     pub catalog_source: EmbeddedCatalogSource,
     /// Models catalog cache file.
     pub catalog_cache_path: PathBuf,
+    /// Optional host-selected fallback used only when the cache file does not exist.
+    pub catalog_fallback: Option<EmbeddedCatalogFallback>,
     /// Exact default agent name.
     pub default_agent: String,
     /// Process-generation bearer supplied by the embedding host.
@@ -171,7 +182,7 @@ pub async fn build_embedded_server(
     let persistence = Persistence::initialize(database)
         .await
         .map_err(|_| EmbeddedBuildError::Persistence)?;
-    let catalog_loader = match config.catalog_source {
+    let mut catalog_loader = match config.catalog_source {
         EmbeddedCatalogSource::Url(url) => {
             CatalogLoader::from_url_with_cache(url, config.catalog_cache_path)
         }
@@ -179,6 +190,9 @@ pub async fn build_embedded_server(
             CatalogLoader::from_path_with_cache(path, config.catalog_cache_path)
         }
     };
+    if let Some(EmbeddedCatalogFallback::BuiltIn) = config.catalog_fallback {
+        catalog_loader = catalog_loader.with_fallback_catalog(BUILT_IN_CATALOG);
+    }
     let materializer = CatalogMaterializer::load(&catalog_loader)
         .await
         .map_err(|_| EmbeddedBuildError::Catalog)?;

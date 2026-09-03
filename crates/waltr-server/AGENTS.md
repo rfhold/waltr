@@ -42,7 +42,9 @@ Keep the embedded self-MCP credential host-owned and memory-only. Other provider
 
 After prebinding loopback, atomically overwrite the ordinary persisted `mcp-servers/waltr.yaml` slot with the generation URL before catalog load. Keep its filesystem origin and ordinary inspect, replace, watcher, reset, and ETag behavior. Reset may fail normal candidate validation when the bundled fallback needs `WALTR_PUBLIC_URL`; do not add an embedded reset rule.
 
-Use fixed bounds for models.dev HTTP connection and total request time. Fall back only to a valid configured cache after failure or timeout; malformed cache content must still fail startup. Do not add public catalog-timeout policy.
+Use fixed bounds for models.dev HTTP connection and total request time. After failure or timeout, prefer a valid configured cache. Only when that cache is absent may an embedding host's explicit built-in seed satisfy startup, marked stale. A malformed or unreadable configured cache must still fail startup. Standalone mode has no built-in fallback. Do not add public catalog-timeout policy.
+
+Keep the production fallback at `resources/models-dev-defaults.json` limited to verified current model IDs needed by bundled providers. Keep synthetic selector edge cases in `tests/fixtures/models-dev-defaults.json`; do not promote them into shipped fallback data.
 
 Derive the embedded outbound callback from the prebound loopback origin. Pass it explicitly through registration, attempt mode, and completion.
 

@@ -432,8 +432,18 @@ pub fn nativeStartServer(
         })
         .into_outcome();
     let succeeded = matches!(result, jni::Outcome::Ok(Ok(_)));
-    let outcome = if succeeded { "ok" } else { "error" };
-    observability::record_outcome(&span, outcome);
+    match &result {
+        jni::Outcome::Ok(Err(error)) => observability::record_android_startup_failure(
+            &span,
+            observability::AndroidStartupFailure::Server(*error),
+        ),
+        jni::Outcome::Err(_) => observability::record_android_startup_failure(
+            &span,
+            observability::AndroidStartupFailure::Jni,
+        ),
+        jni::Outcome::Panic(_) => observability::record_android_startup_panic(&span),
+        jni::Outcome::Ok(Ok(_)) => observability::record_outcome(&span, "ok"),
+    }
     i32::from(succeeded)
 }
 
@@ -726,6 +736,8 @@ mod configuration_tests {
             .find("android_server().start(roots)")
             .expect("Android embedded server start");
         assert!(verifier_init < server_start);
+        assert!(rust.contains("record_android_startup_failure("));
+        assert!(rust.contains("record_android_startup_panic(&span)"));
         for forbidden in ["endpoint", "bearer", "token", "127.0.0.1"] {
             assert!(
                 !format!("{activity}\n{service}")

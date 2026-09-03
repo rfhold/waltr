@@ -16,6 +16,9 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
 };
 use tracing::Span;
+
+#[cfg(any(target_os = "android", test))]
+use crate::server_controller::ServerStartError;
 use tracing_subscriber::{
     Layer as _, filter::filter_fn, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
@@ -309,7 +312,45 @@ pub(crate) fn operation_span(name: &'static str, class: &'static str) -> Span {
         operation.name = name,
         operation.class = class,
         operation.outcome = tracing::field::Empty,
+        failure.category = tracing::field::Empty,
     )
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg(any(target_os = "android", test))]
+pub(crate) enum AndroidStartupFailure {
+    Jni,
+    Server(ServerStartError),
+}
+
+#[cfg(any(target_os = "android", test))]
+impl AndroidStartupFailure {
+    const fn category(self) -> &'static str {
+        match self {
+            Self::Jni => "jni",
+            Self::Server(error) => error.telemetry_category(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn record_android_startup_panic(span: &Span) {
+    span.record("operation.outcome", "error");
+    span.record("failure.category", "panic");
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn record_android_startup_failure(span: &Span, failure: AndroidStartupFailure) {
+    let category = failure.category();
+    span.record("operation.outcome", "error");
+    span.record("failure.category", category);
+    span.in_scope(|| {
+        tracing::error!(
+            event.name = "android.server.start_failed",
+            outcome = "error",
+            failure.category = category,
+        );
+    });
 }
 
 pub(crate) fn record_result<T, E>(span: &Span, result: &Result<T, E>) {
@@ -501,6 +542,132 @@ mod tests {
         assert_eq!(result_outcome(&success), "ok");
         assert_eq!(result_outcome(&failure), "error");
         assert!(!result_outcome(&failure).contains("SECRET_ERROR_MARKER"));
+    }
+
+    #[test]
+    fn android_startup_failure_classification_is_closed_and_categorical() {
+        use waltr_server::embedded::EmbeddedBuildError;
+
+        let categories = [
+            AndroidStartupFailure::Jni,
+            AndroidStartupFailure::Server(ServerStartError::Paths),
+            AndroidStartupFailure::Server(ServerStartError::Entropy),
+            AndroidStartupFailure::Server(ServerStartError::Thread),
+            AndroidStartupFailure::Server(ServerStartError::Readiness),
+            AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Paths)),
+            AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Listener)),
+            AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Persistence)),
+            AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Catalog)),
+            AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Resources)),
+            AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Application)),
+        ]
+        .map(AndroidStartupFailure::category);
+
+        assert_eq!(
+            categories,
+            [
+                "jni",
+                "paths",
+                "entropy",
+                "thread",
+                "readiness",
+                "build_paths",
+                "build_listener",
+                "build_persistence",
+                "build_catalog",
+                "build_resources",
+                "build_application",
+            ]
+        );
+        assert!(categories.iter().all(|category| {
+            category.len() <= 17
+                && category
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }));
+
+        let production_source = include_str!("observability.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production_source.contains("android.server.start_failed"));
+        assert!(!production_source.contains("error.to_string()"));
+        assert!(!production_source.contains("format!(\"{error}"));
+
+        let spans = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = operation_span("android.server.start", "lifecycle");
+            record_android_startup_failure(
+                &span,
+                AndroidStartupFailure::Server(ServerStartError::Build(EmbeddedBuildError::Catalog)),
+            );
+        });
+        provider.force_flush().unwrap();
+        let exported = spans.get_finished_spans().unwrap();
+        let startup = exported
+            .iter()
+            .find(|span| span.name == "waltr.app.operation")
+            .unwrap();
+        for (key, value) in [
+            ("operation.name", "android.server.start"),
+            ("operation.class", "lifecycle"),
+            ("operation.outcome", "error"),
+            ("failure.category", "build_catalog"),
+        ] {
+            assert!(startup.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == key && attribute.value.to_string() == value
+            }));
+        }
+        let event = startup.events.events.first().unwrap();
+        assert_eq!(startup.events.events.len(), 1);
+        for (key, value) in [
+            ("event.name", "android.server.start_failed"),
+            ("outcome", "error"),
+            ("failure.category", "build_catalog"),
+        ] {
+            assert!(event.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == key && attribute.value.to_string() == value
+            }));
+        }
+        let diagnostic = format!("{startup:?}");
+        assert!(!diagnostic.contains("embedded models catalog could not be initialized"));
+        assert!(!diagnostic.contains("http://"));
+        drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+    }
+
+    #[test]
+    fn android_startup_panic_marks_operation_without_duplicate_failure_event() {
+        let spans = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = operation_span("android.server.start", "lifecycle");
+            record_android_startup_panic(&span);
+        });
+        provider.force_flush().unwrap();
+        let exported = spans.get_finished_spans().unwrap();
+        let startup = exported
+            .iter()
+            .find(|span| span.name == "waltr.app.operation")
+            .unwrap();
+        for (key, value) in [
+            ("operation.outcome", "error"),
+            ("failure.category", "panic"),
+        ] {
+            assert!(startup.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == key && attribute.value.to_string() == value
+            }));
+        }
+        assert!(startup.events.events.is_empty());
+        drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
     }
 
     #[test]
