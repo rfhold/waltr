@@ -349,13 +349,6 @@ impl AgentSessionRuntimeFactory {
         settings: &InferenceSettings,
         definition: &ResolvedAgent,
     ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError> {
-        #[cfg(not(feature = "shell"))]
-        if definition.features.shell.is_some() {
-            return Err(AgentSessionRuntimeError::FailedPrecondition(
-                "agent definition enables shell but waltr-agent was built without the shell feature"
-                    .to_owned(),
-            ));
-        }
         let builder = if let Some(build) = self.runtime_provider_override.as_ref() {
             build(settings)?.into_builder()
         } else {
@@ -509,6 +502,7 @@ impl AgentSessionRuntimeFactory {
             AgentFeature::Skills if definition.features.skills.is_some() => {
                 vec!["load_skill".to_owned()]
             }
+            #[cfg(feature = "shell")]
             AgentFeature::Shell if definition.features.shell.is_some() => {
                 vec!["shell".to_owned()]
             }
@@ -1829,8 +1823,8 @@ spec: { tools: [{ name: read, permission: allow }] }
         assert!(!debug.contains("systemPrompt: later"));
     }
 
-    #[test]
-    fn resolved_definition_drives_registered_feature_inventory() {
+    #[tokio::test]
+    async fn resolved_definition_drives_available_feature_inventory() {
         let directory = tempfile::tempdir().expect("temp directory");
         let root = directory.path().to_path_buf();
         let definition = resolved_test_agent(
@@ -1851,18 +1845,36 @@ metadata: { name: permissions }
 spec:
   tools: [{ name: question, permission: allow }]",
         );
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        let override_model = model.clone();
         let factory = AgentSessionRuntimeFactory::new(
             root.clone(),
             FileCredentialStore::new(root.join("auth.json")),
             definition.clone(),
-        );
-        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        )
+        .with_runtime_provider(move |_| {
+            Ok(AgentRuntimeProvider::new(
+                override_model.clone(),
+                Arc::new(EmptyProvider),
+            ))
+        });
+        let settings = InferenceSettings {
+            provider: InferenceProviderSettings {
+                key: "unused".to_owned(),
+                api: ModelApi::OpenAiResponses,
+                url: String::new(),
+                model_id: "gpt-5".to_owned(),
+                model_cost: None,
+                headers: BTreeMap::new(),
+                oauth: None,
+                reasoning_effort: None,
+            },
+        };
         let policy = factory.definition_permission_policy(&definition, &model, &[]);
         let runtime = factory
-            .apply_definition(
-                AgentRuntimeBuilder::new(model.clone(), Arc::new(EmptyProvider)),
-                &definition,
-            )
+            .base_runtime_builder(&settings, &definition)
+            .await
+            .expect("shell-bearing definitions remain loadable")
             .with_permission_policy(policy)
             .build();
         let names = runtime
@@ -1874,7 +1886,7 @@ spec:
         for kind in FilesystemConfig::new(&root).exposed_tools(&model).all() {
             assert!(names.contains(kind.name()), "missing {}", kind.name());
         }
-        assert!(names.contains("shell"));
+        assert_eq!(names.contains("shell"), cfg!(feature = "shell"));
         assert!(names.contains("question"));
         assert!(!names.contains("task"));
         assert!(!names.contains("disabled_tool"));
@@ -1950,15 +1962,17 @@ spec:
         for name in FilesystemConfig::new(&root).exposed_tools(&model).all() {
             assert_eq!(policy.evaluate_tool(name.name()), PermissionLevel::Allow);
         }
-        for name in [
-            "question",
-            "load_skill",
-            "shell",
-            "task",
-            "mcp_remote_lookup",
-        ] {
+        for name in ["question", "load_skill", "task", "mcp_remote_lookup"] {
             assert_eq!(policy.evaluate_tool(name), PermissionLevel::Allow, "{name}");
         }
+        assert_eq!(
+            policy.evaluate_tool("shell"),
+            if cfg!(feature = "shell") {
+                PermissionLevel::Allow
+            } else {
+                PermissionLevel::Deny
+            }
+        );
         assert_eq!(policy.evaluate_tool("disabled_tool"), PermissionLevel::Deny);
 
         let outside = crate::PermissionClaim::new(
@@ -1988,7 +2002,11 @@ spec:
         );
         assert_eq!(
             policy.evaluate_claim("shell", &ordinary),
-            PermissionLevel::Allow
+            if cfg!(feature = "shell") {
+                PermissionLevel::Allow
+            } else {
+                PermissionLevel::Deny
+            }
         );
     }
 
