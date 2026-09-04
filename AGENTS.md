@@ -17,6 +17,7 @@
 | [docs/architecture/routines.md](docs/architecture/routines.md) | Canonical Routine lifecycle, persistence, replay, restart, and client boundary. |
 | [docs/deployment.md](docs/deployment.md) | Database, Compose, OIDC, proxy, and native-client deployment. |
 | [docs/runbooks/mcp-oauth-key-rotation-recovery.md](docs/runbooks/mcp-oauth-key-rotation-recovery.md) | Hosted MCP OAuth wrapping/signing-key rotation and recovery. |
+| [docs/runbooks/telemetry-smoke.md](docs/runbooks/telemetry-smoke.md) | Grafana Explore smoke checks for Faro, OTLP signals, and Pyroscope. |
 | [docs/mcp/](docs/mcp/) | Generic MCP protocol documentation. |
 
 # Hints
