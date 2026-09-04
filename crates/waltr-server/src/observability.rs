@@ -10,8 +10,7 @@ use std::env;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const SERVICE_NAME: &str = "waltr-server";
-const DEFAULT_FILTER: &str =
-    "waltr_server=info,waltr=info,mcp=info,tower_http=info,otel::tracing=info";
+const DEFAULT_FILTER: &str = "info";
 
 /// Holds OpenTelemetry providers until process shutdown.
 #[derive(Debug)]
@@ -150,7 +149,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_filter_enables_generic_mcp_info_spans() {
+    fn default_filter_enables_info_spans_from_all_targets() {
         let targets = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry()
             .with(EnvFilter::new(DEFAULT_FILTER))
@@ -161,7 +160,7 @@ mod tests {
             let _dependency = tracing::info_span!(target: "reqwest", "dependency.request");
         });
 
-        assert_eq!(*targets.lock().unwrap(), ["mcp::client"]);
+        assert_eq!(*targets.lock().unwrap(), ["mcp::client", "reqwest"]);
     }
 
     struct TargetCapture(Arc<Mutex<Vec<&'static str>>>);

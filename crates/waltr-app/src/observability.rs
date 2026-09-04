@@ -1,6 +1,7 @@
 //! Native application observability with bounded, fail-open OTLP exporters.
 
 use std::{
+    io::Write as _,
     panic::PanicHookInfo,
     sync::{Arc, Once},
     time::Duration,
@@ -30,17 +31,10 @@ const TRACE_LOG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_METRIC: &str = "waltr.app.startups";
 const STARTUP_ATTRIBUTE_KEY: &str = "app.lifecycle";
 const STARTUP_ATTRIBUTE_VALUE: &str = "started";
-const SAFE_LOG_TARGETS: [&str; 3] = [
-    "waltr_app_lib",
-    "waltr_app_lib::bridge",
-    "waltr_app_lib::observability",
-];
-const SAFE_TRACE_TARGETS: [&str; 4] = [
-    "waltr_app_lib",
-    "waltr_app_lib::bridge",
-    "waltr_app_lib::observability",
-    "waltr_client::transport::native_trace",
-];
+const APP_TARGET: &str = "waltr_app_lib";
+const NATIVE_TRACE_TARGET: &str = "waltr_client::transport::native_trace";
+const INIT_FAILURE_MESSAGE: &str =
+    "waltr native telemetry initialization failed; continuing without telemetry";
 static PANIC_HOOK: Once = Once::new();
 
 /// Process-lifetime owner of all native telemetry providers.
@@ -90,10 +84,17 @@ fn init_for_mode(mode: ExportMode) -> ObservabilityGuard {
         return ObservabilityGuard::default();
     }
 
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(try_init))
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(try_init)) {
+        Ok(Ok(guard)) => guard,
+        Ok(Err(_)) | Err(_) => {
+            report_init_failure();
+            ObservabilityGuard::default()
+        }
+    }
+}
+
+fn report_init_failure() {
+    drop(writeln!(std::io::stderr().lock(), "{INIT_FAILURE_MESSAGE}"));
 }
 
 fn try_init() -> Result<ObservabilityGuard, Box<dyn std::error::Error + Send + Sync>> {
@@ -200,11 +201,24 @@ fn install_subscriber(
 }
 
 fn safe_trace_target(metadata: &tracing::Metadata<'_>) -> bool {
-    SAFE_TRACE_TARGETS.contains(&metadata.target())
+    useful_level(metadata)
+        && (target_in_module(metadata.target(), APP_TARGET)
+            || target_in_module(metadata.target(), NATIVE_TRACE_TARGET))
 }
 
 fn safe_log_target(metadata: &tracing::Metadata<'_>) -> bool {
-    SAFE_LOG_TARGETS.contains(&metadata.target())
+    useful_level(metadata) && target_in_module(metadata.target(), APP_TARGET)
+}
+
+fn useful_level(metadata: &tracing::Metadata<'_>) -> bool {
+    *metadata.level() <= tracing::Level::INFO
+}
+
+fn target_in_module(target: &str, module: &str) -> bool {
+    target == module
+        || target
+            .strip_prefix(module)
+            .is_some_and(|suffix| suffix.starts_with("::"))
 }
 
 fn emit_startup_metric(provider: &SdkMeterProvider) {
@@ -761,8 +775,8 @@ mod tests {
                 error = "SECRET_ERROR_MARKER",
             ));
             drop(tracing::info_span!(
-                target: "waltr_app_lib::observability",
-                "safe.app",
+                target: "waltr_app_lib::previously_unlisted::nested",
+                "safe.nested.app",
                 operation.outcome = "ok",
             ));
             drop(tracing::info_span!(
@@ -770,17 +784,79 @@ mod tests {
                 "safe.native.grpc",
                 rpc.system = "grpc",
             ));
+            drop(tracing::debug_span!(
+                target: "waltr_app_lib::bridge",
+                "noisy.app.debug",
+            ));
+            drop(tracing::info_span!(
+                target: "waltr_app_lib_extra::bridge",
+                "hostile.app.lookalike",
+            ));
+            drop(tracing::info_span!(
+                target: "waltr_client::transport::native_trace_extra",
+                "hostile.native.lookalike",
+            ));
         });
         provider.force_flush().unwrap();
 
         let exported = spans.get_finished_spans().unwrap();
         let mut names: Vec<_> = exported.iter().map(|span| span.name.as_ref()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["safe.app", "safe.native.grpc"]);
+        assert_eq!(names, ["safe.native.grpc", "safe.nested.app"]);
         let diagnostic = format!("{exported:?}");
         assert!(!diagnostic.contains("SECRET_IPC_MARKER"));
         assert!(!diagnostic.contains("SECRET_ERROR_MARKER"));
+        assert!(!diagnostic.contains("noisy.app.debug"));
+        assert!(!diagnostic.contains("hostile.app.lookalike"));
+        assert!(!diagnostic.contains("hostile.native.lookalike"));
         drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+    }
+
+    #[test]
+    fn log_filter_exports_all_app_modules_at_info_and_above() {
+        let logs = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            OpenTelemetryTracingBridge::new(&provider).with_filter(filter_fn(safe_log_target)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "waltr_app_lib::previously_unlisted", "safe.app");
+            tracing::error!(target: "waltr_app_lib", "safe.app.error");
+            tracing::debug!(target: "waltr_app_lib::bridge", "noisy.app.debug");
+            tracing::info!(
+                target: "waltr_client::transport::native_trace",
+                "excluded.native.log",
+            );
+            tracing::info!(target: "waltr_app_lib_extra", "excluded.lookalike");
+        });
+        provider.force_flush().unwrap();
+
+        let emitted = logs.get_emitted_logs().unwrap();
+        let diagnostic = format!("{emitted:?}");
+        assert_eq!(emitted.len(), 2);
+        assert!(diagnostic.contains("safe.app"));
+        assert!(diagnostic.contains("safe.app.error"));
+        assert!(!diagnostic.contains("noisy.app.debug"));
+        assert!(!diagnostic.contains("excluded.native.log"));
+        assert!(!diagnostic.contains("excluded.lookalike"));
+        drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+    }
+
+    #[test]
+    fn initialization_failure_diagnostic_is_fixed_and_local() {
+        assert_eq!(
+            INIT_FAILURE_MESSAGE,
+            "waltr native telemetry initialization failed; continuing without telemetry"
+        );
+        let production_source = include_str!("observability.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production_source.contains("std::io::stderr().lock()"));
+        assert!(!INIT_FAILURE_MESSAGE.contains("http"));
     }
 
     #[test]

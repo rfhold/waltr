@@ -22,11 +22,11 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-client/tests/` | UI-like tests for the shared client state machine over the server contract. |
 | `crates/waltr-client/tests/live.rs` and `crates/waltr-client/tests/live/session.rs` | Ignored client state-machine tests that run session commands through live providers. |
 | `crates/waltr-web/tests/` | Browser UI state, routing, forms, transitions, and component-level behavior. |
-| `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, privacy filtering, and platform-specific propagation. |
+| `crates/waltr-web/tests/telemetry.test.ts` | Faro enablement, stable identities, route normalization, standard instrumentation, repeated errors, and Tauri request exclusion. |
 | `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
 | `crates/waltr-app/src/server_controller.rs` tests | App-private paths, random local bearer generation, redaction, exact embedded-build error mapping, and process-owned server state. |
 | `crates/waltr-app/src/bridge.rs` tests | Tauri generation order, permission gates, snapshot redaction, opaque authorization opening, and nonblocking replacement. |
-| `crates/waltr-app/src/observability.rs` tests | Test-only initialization disablement, all-build enablement, target allowlists, fixed URLs, shared resources, bounded categorical Android startup failures and panic event cardinality, shutdown bounds, header privacy, redirect non-following, bundled-root loading, untrusted TLS rejection, and in-memory exporters. |
+| `crates/waltr-app/src/observability.rs` tests | Test-only disablement, all-build enablement, complete app-module target filters, fixed URLs and resources, startup failures, fixed panic exclusions, initialization diagnostics, hardened transport, shutdown bounds, and in-memory exporters. |
 | `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
@@ -174,7 +174,7 @@ Run hosted browser and Tauri web-adapter tests:
 
 `pnpm --filter @rfhold/waltr-web test`
 
-The web suite covers hosted access, provider-OAuth separation, same-origin logout, and capability-driven access controls. It verifies that authoritative login-required and authenticated snapshots remain authoritative when an adapter supplies no access operations. Platform tests cover browser-provided access operations, hosted WASM disposal, and Tauri adapter-private startup event sequencing, sequence recovery, disposal, and opaque authorization or external URL delegation. Telemetry tests cover build modes, identities, propagation ownership, and privacy filters. Server tests own cookie and OIDC validation.
+The web suite covers hosted access, provider-OAuth separation, same-origin logout, and capability-driven access controls. It verifies that authoritative login-required and authenticated snapshots remain authoritative when an adapter supplies no access operations. Platform tests cover browser-provided access operations, hosted WASM disposal, and Tauri adapter-private startup event sequencing, sequence recovery, disposal, and opaque authorization or external URL delegation. Telemetry tests cover build modes, identities, standard instrumentation, repeated error events, route normalization, and Tauri request exclusion. Server tests own cookie and OIDC validation.
 
 Build the hosted web client:
 
@@ -232,7 +232,9 @@ Run only native observability tests:
 
 `cargo test -p waltr-app observability`
 
-The observability tests use deterministic in-memory span, log, and metric exporters. They verify target allowlists, shared resource identity, fixed signal URLs, startup signals, shutdown bounds, header sanitization, redirect non-following, ring provider ownership, complete bundled-root loading with ISRG Root X1, rejection of an untrusted local TLS endpoint, and test isolation. They do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, mobile process-exit delivery, or Android runtime connectivity.
+The observability tests use deterministic in-memory span, log, and metric exporters. They verify the complete app-module filters, native transport trace target, shared resource identity, fixed signal URLs, startup signals, fixed panic payload exclusion, initialization diagnostics, shutdown bounds, header sanitization, redirect non-following, ring provider ownership, complete bundled-root loading with ISRG Root X1, rejection of an untrusted local TLS endpoint, and test isolation. They do not contact either collector. They do not prove collector TLS, CORS, reachability, ingestion, mobile process-exit delivery, or Android runtime connectivity.
+
+Use [Telemetry Smoke Checks](runbooks/telemetry-smoke.md) for live Faro, OTLP, and Pyroscope ingestion. Those checks require a built and active runtime. They complement deterministic tests and do not prove that uncommitted source changes reached a deployment.
 
 Build the no-WASM Tauri web target:
 
