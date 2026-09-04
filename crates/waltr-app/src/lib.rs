@@ -198,6 +198,8 @@ fn dispose_runtime(bridge: State<'_, Arc<RuntimeBridge>>) {
     if let Some(generation) = generation {
         bridge.stop_generation_nonblocking(generation);
     }
+    #[cfg(target_os = "android")]
+    bridge.clear_authorization_state();
     #[cfg(not(target_os = "android"))]
     stop_client_bridge(bridge.inner());
     observability::record_outcome(&span, "ok");
@@ -451,6 +453,13 @@ pub fn nativeStartServer(
 #[jni_fn::jni_fn("dev.waltr.app.WaltrForegroundService")]
 /// Stop the process-owned mobile embedded server and clear its local credential.
 pub fn nativeStopServer(_env: jni::EnvUnowned<'_>, _service: jni::objects::JObject<'_>) {
+    if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
+        lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bridge
+            .clear_authorization_state();
+    }
     android_server().stop_nonblocking();
 }
 
@@ -509,7 +518,7 @@ pub fn nativeClientSuspend(_env: jni::EnvUnowned<'_>, _activity: jni::objects::J
         bridge.invalidate_start(ticket);
     }
     if let Some(generation) = generation {
-        bridge.stop_generation_nonblocking(generation);
+        bridge.suspend_generation_nonblocking(generation);
     }
 }
 

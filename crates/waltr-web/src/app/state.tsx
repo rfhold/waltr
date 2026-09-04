@@ -27,6 +27,9 @@ export function AppStateProvider(props: AppStateProviderProps) {
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
   const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Extract<ClientCommand, { type: "beginAuth" }>["target"]>();
+  const [presentedAuthAttemptId, setPresentedAuthAttemptId] = createSignal<string>();
+  const [ignoredPresentedAttemptId, setIgnoredPresentedAttemptId] = createSignal<string>();
+  const [authorizationDraft, setAuthorizationDraft] = createSignal<{ attemptId: string; input: string }>();
   const [ignoredTerminalAttemptId, setIgnoredTerminalAttemptId] = createSignal<string>();
   const operationWaiters = new Set<OperationWaiter>();
   const [clientAdapter] = createResource(() => props.loadClientAdapter());
@@ -46,12 +49,43 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
   createEffect(() => {
     const explicitTarget = explicitAuthTarget();
+    const presentedAttemptId = presentedAuthAttemptId();
     const attempt = snapshot()?.auth.activeAttempt;
+    if (!explicitTarget
+      && attempt
+      && attempt.attemptId !== ignoredPresentedAttemptId()
+      && ["pending", "completing"].includes(attempt.lifecycle)) {
+      setExplicitAuthTarget(attempt.target);
+      setPresentedAuthAttemptId(attempt.attemptId);
+      setIgnoredPresentedAttemptId(undefined);
+      return;
+    }
+    if (!explicitTarget) return;
+    if (!presentedAttemptId) {
+      if (attempt
+        && attempt.attemptId !== ignoredTerminalAttemptId()
+        && sameAuthTarget(explicitTarget, attempt.target)) {
+        setPresentedAuthAttemptId(attempt.attemptId);
+      }
+      return;
+    }
+    if (!attempt
+      || attempt.attemptId !== presentedAttemptId
+      || !sameAuthTarget(explicitTarget, attempt.target)) {
+      setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
+      setIgnoredPresentedAttemptId(attempt?.attemptId ?? presentedAttemptId);
+      setIgnoredTerminalAttemptId(undefined);
+      setAuthorizationDraft(undefined);
+      return;
+    }
     if (attempt?.lifecycle === "succeeded"
       && attempt.attemptId !== ignoredTerminalAttemptId()
       && sameAuthTarget(explicitTarget, attempt.target)) {
       setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
       setIgnoredTerminalAttemptId(undefined);
+      setAuthorizationDraft(undefined);
     }
   });
 
@@ -163,11 +197,14 @@ export function AppStateProvider(props: AppStateProviderProps) {
         : undefined,
     );
     setExplicitAuthTarget(target);
+    setPresentedAuthAttemptId(undefined);
+    setIgnoredPresentedAttemptId(undefined);
     try {
       return await dispatchBeginAuth(target);
     } catch (error) {
       if (sameAuthTarget(explicitAuthTarget(), target)) {
         setExplicitAuthTarget(undefined);
+        setPresentedAuthAttemptId(undefined);
         setIgnoredTerminalAttemptId(undefined);
       }
       throw error;
@@ -185,7 +222,9 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
     if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) {
       setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
       setIgnoredTerminalAttemptId(undefined);
+      setAuthorizationDraft(undefined);
     }
     return result;
   };
@@ -201,7 +240,9 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
     if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) {
       setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
       setIgnoredTerminalAttemptId(undefined);
+      setAuthorizationDraft(undefined);
     }
     return result;
   };
@@ -366,6 +407,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         clientLoaded: () => Boolean(clientAdapter()),
         systemReady,
         explicitAuthTarget,
+        presentedAuthAttemptId,
+        authorizationDraft,
         accessOperations: () => clientAdapter()?.access,
         openAuthorizationAttempt: () => clientAdapter()?.openAuthorizationAttempt,
         openExternalUrl: () => clientAdapter()?.openExternalUrl,
@@ -375,7 +418,12 @@ export function AppStateProvider(props: AppStateProviderProps) {
         dispatchCancelAuth,
         dispatchRefreshAuth,
         dispatchLogoutAuth,
-        clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
+        clearExplicitAuthTarget: () => {
+          setExplicitAuthTarget(undefined);
+          setPresentedAuthAttemptId(undefined);
+        },
+        setAuthorizationDraft: (attemptId, input) => setAuthorizationDraft({ attemptId, input }),
+        clearAuthorizationDraft: () => setAuthorizationDraft(undefined),
         dispatchConfigPatch,
         dispatchResetConfig,
         dispatchCreateSession,

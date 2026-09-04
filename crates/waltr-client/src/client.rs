@@ -29,6 +29,10 @@ impl Client {
         &self.state
     }
 
+    pub(crate) fn restore_pending_auth_attempt(&mut self, attempt: crate::AuthAttemptState) {
+        self.state.auth.active_attempt = Some(attempt);
+    }
+
     /// Apply a shell-neutral event and return resulting side-effect intents.
     pub fn apply(&mut self, event: ClientEvent) -> ClientUpdate {
         self.apply_current(event)

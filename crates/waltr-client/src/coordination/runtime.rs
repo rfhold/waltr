@@ -1221,6 +1221,19 @@ impl ClientRuntime {
         Self::with_executor(GrpcEffectExecutor::with_transport(transport))
     }
 
+    /// Create a runtime and restore one process-local pending outbound auth attempt.
+    #[must_use]
+    pub fn with_transport_and_pending_auth_attempt(
+        transport: crate::DefaultGrpcTransport,
+        attempt: AuthAttemptSnapshot,
+    ) -> Self {
+        let mut runtime = Self::with_transport(transport);
+        if let Some(attempt) = pending_auth_attempt_state(attempt) {
+            runtime.reducer.restore_pending_auth_attempt(attempt);
+        }
+        runtime
+    }
+
     fn with_executor(executor: GrpcEffectExecutor) -> Self {
         Self {
             reducer: Client::new(),
@@ -1634,18 +1647,30 @@ impl fmt::Debug for ClientStateStream {
 }
 
 impl ClientStateStream {
-    fn new<Sleep, SleepFuture>(runtime: ClientRuntime, sleep: Sleep) -> Self
+    fn new<Sleep, SleepFuture>(mut runtime: ClientRuntime, sleep: Sleep) -> Self
     where
         Sleep: Fn(u64) -> SleepFuture + 'static,
         SleepFuture: Future<Output = ()> + 'static,
     {
-        Self {
+        let poll = runtime
+            .reducer
+            .state()
+            .auth
+            .active_attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_id.clone())
+            .map(|attempt_id| runtime.reducer.poll_auth_attempt(attempt_id));
+        let mut stream = Self {
             runtime,
             phase: ClientStateStreamPhase::WaitForSystemReady,
             effects: Vec::new(),
             in_flight: None,
             sleep: Rc::new(move |delay_ms| Box::pin(sleep(delay_ms))),
+        };
+        if let Some(update) = poll {
+            stream.extend_effects(&update);
         }
+        stream
     }
 
     /// Return the next state snapshot from shared startup/config orchestration.
@@ -3231,6 +3256,56 @@ impl ClientAuthTarget {
     }
 }
 
+fn pending_auth_attempt_state(attempt: AuthAttemptSnapshot) -> Option<AuthAttemptState> {
+    use waltr::grpc::waltr::auth::v1::{
+        AuthAttemptLifecycle, AuthCompletionMode, McpOAuthRegistrationMethod,
+    };
+
+    if attempt.lifecycle != "pending" || attempt.attempt_id.is_empty() {
+        return None;
+    }
+    let completion_mode = match attempt.completion_mode.as_str() {
+        "serverCallback" => AuthCompletionMode::ServerCallback,
+        "manual" => AuthCompletionMode::Manual,
+        _ => return None,
+    };
+    let registration_method = match attempt.registration_method.as_str() {
+        "preregistered" => McpOAuthRegistrationMethod::Preregistered,
+        "clientMetadata" => McpOAuthRegistrationMethod::ClientMetadata,
+        "dynamic" => McpOAuthRegistrationMethod::Dynamic,
+        "" | "unknown" => McpOAuthRegistrationMethod::Unspecified,
+        _ => return None,
+    };
+    if !matches!(attempt.target.kind.as_str(), "provider" | "mcpServer")
+        || attempt.target.key.is_empty()
+    {
+        return None;
+    }
+
+    Some(AuthAttemptState {
+        target: attempt.target.into_auth_target(),
+        attempt_id: attempt.attempt_id,
+        auth_url: crate::coordination::state::safe_http_url(&attempt.auth_url).unwrap_or_default(),
+        verification_url: crate::coordination::state::safe_http_url(&attempt.verification_url)
+            .unwrap_or_default(),
+        user_code: crate::coordination::state::safe_text(&attempt.user_code, 256),
+        expires_at_ms: attempt.expires_at_ms,
+        poll_interval_seconds: attempt.poll_interval_seconds,
+        messages: attempt
+            .messages
+            .into_iter()
+            .map(|message| crate::coordination::state::safe_text(&message, 1_024))
+            .collect(),
+        completion_mode: completion_mode as i32,
+        registration_method: registration_method as i32,
+        lifecycle: AuthAttemptLifecycle::Pending as i32,
+        failure_reason: String::new(),
+        poll_generation: 0,
+        poll_count: 0,
+        poll_failures: 0,
+    })
+}
+
 impl From<AuthTarget> for ClientAuthTarget {
     fn from(target: AuthTarget) -> Self {
         match target.target {
@@ -3657,6 +3732,72 @@ mod tests {
     use crate::transport::{
         ConfigWatchUpdate, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
     };
+
+    fn pending_attempt(completion_mode: &str) -> AuthAttemptSnapshot {
+        AuthAttemptSnapshot {
+            target: ClientAuthTarget {
+                kind: "provider".to_owned(),
+                key: "test".to_owned(),
+            },
+            attempt_id: "attempt-restored".to_owned(),
+            auth_url: "https://provider.example/authorize?state=opaque".to_owned(),
+            verification_url: String::new(),
+            user_code: String::new(),
+            expires_at_ms: i64::MAX,
+            poll_interval_seconds: 2,
+            messages: vec!["Continue in the browser.".to_owned()],
+            completion_mode: completion_mode.to_owned(),
+            registration_method: String::new(),
+            lifecycle: "pending".to_owned(),
+            failure_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn restored_pending_attempt_seeds_snapshot_and_only_callback_mode_resumes_polling() {
+        let manual = ClientRuntime::with_transport_and_pending_auth_attempt(
+            crate::NativeGrpcTransport::new("http://127.0.0.1:0"),
+            pending_attempt("manual"),
+        )
+        .into_state_stream(|_| std::future::ready(()));
+        assert_eq!(
+            manual
+                .snapshot()
+                .auth
+                .active_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.as_str()),
+            Some("attempt-restored")
+        );
+        assert!(manual.effects.is_empty());
+
+        let callback = ClientRuntime::with_transport_and_pending_auth_attempt(
+            crate::NativeGrpcTransport::new("http://127.0.0.1:0"),
+            pending_attempt("serverCallback"),
+        )
+        .into_state_stream(|_| std::future::ready(()));
+        assert!(matches!(
+            callback.effects.as_slice(),
+            [QueuedEffect {
+                effect: ClientEffect::Auth(crate::AuthEffect::Poll { attempt_id, .. }),
+                ..
+            }] if attempt_id == "attempt-restored"
+        ));
+    }
+
+    #[test]
+    fn restored_attempt_rejects_terminal_and_malformed_state() {
+        for mut attempt in [pending_attempt("manual"), pending_attempt("unknown")] {
+            if attempt.completion_mode == "manual" {
+                attempt.lifecycle = "succeeded".to_owned();
+            }
+            let runtime = ClientRuntime::with_transport_and_pending_auth_attempt(
+                crate::NativeGrpcTransport::new("http://127.0.0.1:0"),
+                attempt,
+            );
+            assert!(runtime.snapshot().auth.active_attempt.is_none());
+        }
+    }
 
     #[test]
     fn snapshot_exposes_latest_catalog_operations() {

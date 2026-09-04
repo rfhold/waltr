@@ -54,6 +54,10 @@ export function renderWithAppState(
       options.snapshot,
     );
     const [explicitAuthTarget, setExplicitAuthTarget] = createSignal(options.explicitAuthTarget);
+    const [presentedAuthAttemptId, setPresentedAuthAttemptId] = createSignal(
+      options.explicitAuthTarget ? options.snapshot?.auth.activeAttempt?.attemptId : undefined,
+    );
+    const [authorizationDraft, setAuthorizationDraft] = createSignal<{ attemptId: string; input: string }>();
     options.onSnapshotSetter?.(setSnapshot);
     const systemReady = createMemo(() => snapshot()?.status.ready ?? false);
     const phase = createMemo(() => systemReady() ? "ready" : "splash");
@@ -443,6 +447,8 @@ export function renderWithAppState(
           clientLoaded: () => options.clientLoaded ?? true,
           systemReady,
           explicitAuthTarget,
+          presentedAuthAttemptId,
+          authorizationDraft,
           accessOperations: () => options.accessOperations === null
             ? undefined
             : options.accessOperations ?? browserAccessOperations,
@@ -451,8 +457,11 @@ export function renderWithAppState(
           dispatch,
           dispatchBeginExplicitAuth: async (target) => {
             setExplicitAuthTarget(target);
+            setPresentedAuthAttemptId(undefined);
             try {
-              return await dispatch({ type: "beginAuth", target });
+              const result = await dispatch({ type: "beginAuth", target });
+              setPresentedAuthAttemptId(result.auth.activeAttempt?.attemptId);
+              return result;
             } catch (error) {
               setExplicitAuthTarget(undefined);
               throw error;
@@ -461,18 +470,29 @@ export function renderWithAppState(
           dispatchCompleteAuth: async (attemptId, input) => {
             const attemptTarget = snapshot()?.auth.activeAttempt?.target;
             const result = await dispatch({ type: "completeAuth", attemptId, input });
-            if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) setExplicitAuthTarget(undefined);
+            if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) {
+              setExplicitAuthTarget(undefined);
+              setPresentedAuthAttemptId(undefined);
+            }
             return result;
           },
           dispatchCancelAuth: async (attemptId) => {
             const attemptTarget = snapshot()?.auth.activeAttempt?.target;
             const result = await dispatch({ type: "cancelAuth", attemptId });
-            if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) setExplicitAuthTarget(undefined);
+            if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) {
+              setExplicitAuthTarget(undefined);
+              setPresentedAuthAttemptId(undefined);
+            }
             return result;
           },
           dispatchRefreshAuth: (target) => dispatch({ type: "refreshAuth", target }),
           dispatchLogoutAuth: (target) => dispatch({ type: "logoutAuth", target }),
-          clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
+          clearExplicitAuthTarget: () => {
+            setExplicitAuthTarget(undefined);
+            setPresentedAuthAttemptId(undefined);
+          },
+          setAuthorizationDraft: (attemptId, input) => setAuthorizationDraft({ attemptId, input }),
+          clearAuthorizationDraft: () => setAuthorizationDraft(undefined),
           dispatchConfigPatch,
           dispatchResetConfig: () => dispatch({ type: "resetConfig" }),
           dispatchCreateSession,

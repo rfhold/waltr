@@ -266,6 +266,12 @@ Compile the Android manifest and Kotlin host layer without the Rust cross-build:
 
 These Gradle checks validate Android source and manifest integration. They do not validate native linking or installed-device behavior.
 
+Verify that committed launcher resources are deterministically generated from the web favicon, include legacy and adaptive regular/round assets, and keep the duplicate Android resource trees synchronized:
+
+`crates/waltr-app/scripts/android-launcher-icons.sh --check`
+
+This check requires `rsvg-convert`, ImageMagick, and `perl`. It validates dimensions, adaptive foreground transparency, resource identity, and removal of the superseded green/lime palette. It does not validate launcher masking or icon caching on a device.
+
 Validate the Pulumi source registration and deployment shape without applying a stack:
 
 `bun run --cwd infra/pulumi build && bun run --cwd infra/pulumi test`
@@ -281,10 +287,12 @@ On an installed Android build, verify these outcomes:
 5. Remove the task. Confirm best-effort service continuity without treating survival as guaranteed.
 6. Kill the process, then reopen the app. Confirm durable state reopens and unfinished Routines receive restart reconciliation.
 7. Force-stop the app. Confirm that documentation and UI make no survival guarantee.
-8. Exercise provider and upstream-MCP OAuth. Confirm that opaque authorization-attempt opening still works without Waltr access operations.
-9. Load persisted shell-bearing resources. Confirm that they remain inspectable while no shell tool or feature-derived shell permission is installed.
-10. Load and select a stdio MCP resource. Confirm that it materializes and follows ordinary runtime behavior.
-11. Inspect app backup and transfer behavior. Confirm that private databases, files, preferences, and root data remain excluded.
+8. Begin provider and upstream-MCP OAuth, switch to the external browser, then return before completion. Confirm the fresh client generation restores the same pending attempt, dialog, manual draft when applicable, and opaque Rust-owned URL opener.
+9. Complete the restored authorization attempt. Confirm callback attempts resume polling, manual attempts submit normally, and terminal or canceled attempts do not reopen.
+10. Inspect the installed launcher icon after uninstalling the prior build to avoid launcher caching. Confirm the purple lowercase-k artwork under supported adaptive masks and confirm the foreground-service notification remains the separate monochrome server icon.
+11. Load persisted shell-bearing resources. Confirm that they remain inspectable while no shell tool or feature-derived shell permission is installed.
+12. Load and select a stdio MCP resource. Confirm that it materializes and follows ordinary runtime behavior.
+13. Inspect app backup and transfer behavior. Confirm that private databases, files, preferences, and root data remain excluded.
 
 Installed-device validation must cover a supported Android version before release. Current local Rust and Gradle checks do not satisfy this gate.
 

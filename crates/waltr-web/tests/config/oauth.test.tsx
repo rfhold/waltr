@@ -1,7 +1,11 @@
-import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
+import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
+import { createSignal, Show } from "solid-js";
 import { describe, expect, test } from "vitest";
 
 import type { AuthStatusSnapshot, ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
+import { AppStateProvider } from "../../src/app/state";
+import { OAuthDialog } from "../../src/routes/auth/OAuthDialog";
+import type { ClientAdapter } from "../../src/platform/client";
 import { renderWithAppState } from "../support/render";
 import { ConfigRouteWithChildren, ShellRouteWithChildren } from "../support/routes";
 import { claudeConfig, mcpServerView, snapshotWithConfig } from "../support/snapshots";
@@ -58,6 +62,118 @@ describe("config authentication status", () => {
 });
 
 describe("config authentication actions", () => {
+  test("restores a handed-off pending dialog and preserves its draft across dialog remount", async () => {
+    const snapshot = providerAuthSnapshot(authStatus("provider", "claude", "notConfigured"));
+    snapshot.auth.activeAttempt = {
+      target: { kind: "provider", key: "claude" },
+      attemptId: "handed-off-attempt",
+      authUrl: "",
+      verificationUrl: "",
+      userCode: "",
+      expiresAtMs: 1_800_000_000_000n,
+      pollIntervalSeconds: 1,
+      messages: [],
+      completionMode: "manual",
+      registrationMethod: "",
+      lifecycle: "pending",
+      failureReason: "",
+    };
+    let listener: ((snapshot: ClientSnapshot) => void) | undefined;
+    const adapter: ClientAdapter = {
+      snapshot: () => snapshot,
+      start: async () => undefined,
+      subscribe: (next) => {
+        listener = next;
+        return () => undefined;
+      },
+      dispatch: async () => snapshot,
+      dispose: () => undefined,
+      openAuthorizationAttempt: async () => undefined,
+    };
+    const Harness = () => {
+      const [mounted, setMounted] = createSignal(true);
+      return <>
+        <button type="button" onClick={() => setMounted(false)}>Unmount OAuth</button>
+        <button type="button" onClick={() => setMounted(true)}>Remount OAuth</button>
+        <Show when={mounted()}><OAuthDialog /></Show>
+      </>;
+    };
+    render(() => (
+      <AppStateProvider loadClientAdapter={async () => adapter}>
+        <Harness />
+      </AppStateProvider>
+    ));
+
+    const dialog = await screen.findByRole("dialog", { name: "OAuth authorization" });
+    expect(dialog.textContent).toContain("Authenticate provider claude.");
+    const input = screen.getByLabelText("Final redirect URL or code") as HTMLTextAreaElement;
+    fireEvent.input(input, { target: { value: "draft callback value" } });
+
+    listener?.({ ...snapshot, auth: { ...snapshot.auth, activeAttempt: { ...snapshot.auth.activeAttempt! } } });
+    fireEvent.click(screen.getByRole("button", { name: "Unmount OAuth" }));
+    expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Remount OAuth" }));
+    expect((await screen.findByLabelText("Final redirect URL or code") as HTMLTextAreaElement).value)
+      .toBe("draft callback value");
+
+    listener?.({ ...snapshot, auth: { ...snapshot.auth, activeAttempt: null } });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull());
+    listener?.({ ...snapshot, auth: { ...snapshot.auth, activeAttempt: { ...snapshot.auth.activeAttempt! } } });
+    await Promise.resolve();
+    expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull();
+  });
+
+  test("does not transfer presentation or draft to a same-target replacement attempt", async () => {
+    const snapshot = providerAuthSnapshot(authStatus("provider", "claude", "notConfigured"));
+    snapshot.auth.activeAttempt = {
+      target: { kind: "provider", key: "claude" },
+      attemptId: "attempt-old",
+      authUrl: "https://auth.example/old",
+      verificationUrl: "",
+      userCode: "",
+      expiresAtMs: 1_800_000_000_000n,
+      pollIntervalSeconds: 1,
+      messages: [],
+      completionMode: "manual",
+      registrationMethod: "",
+      lifecycle: "pending",
+      failureReason: "",
+    };
+    let listener: ((snapshot: ClientSnapshot) => void) | undefined;
+    const adapter: ClientAdapter = {
+      snapshot: () => snapshot,
+      start: async () => undefined,
+      subscribe: (next) => {
+        listener = next;
+        return () => undefined;
+      },
+      dispatch: async () => snapshot,
+      dispose: () => undefined,
+    };
+    render(() => (
+      <AppStateProvider loadClientAdapter={async () => adapter}>
+        <OAuthDialog />
+      </AppStateProvider>
+    ));
+
+    const input = await screen.findByLabelText("Final redirect URL or code") as HTMLTextAreaElement;
+    fireEvent.input(input, { target: { value: "old attempt draft" } });
+    listener?.({
+      ...snapshot,
+      auth: {
+        ...snapshot.auth,
+        activeAttempt: {
+          ...snapshot.auth.activeAttempt!,
+          attemptId: "attempt-new",
+          authUrl: "https://auth.example/new",
+        },
+      },
+    });
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull());
+    expect(screen.queryByText("https://auth.example/new")).toBeNull();
+  });
+
   test("marks config authorization explicit and presents its attempt without a requirement", async () => {
     const commands: ClientCommand[] = [];
     renderWithAppState(() => <ShellRouteWithChildren />, {

@@ -8,12 +8,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use waltr_client::{
-    ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot, ClientStateStream,
-    ClientStateStreamEvent, NativeCredentialProvider, NativeGrpcTransport,
+    AuthAttemptSnapshot, ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot,
+    ClientStateStream, ClientStateStreamEvent, NativeCredentialProvider, NativeGrpcTransport,
 };
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -259,8 +259,8 @@ enum HostRequest {
 #[derive(Clone, Eq, PartialEq)]
 struct RetainedAuthorizationAttempt {
     generation: u64,
-    attempt_id: String,
-    auth_url: String,
+    server_generation: u64,
+    attempt: AuthAttemptSnapshot,
 }
 
 impl fmt::Debug for RetainedAuthorizationAttempt {
@@ -268,8 +268,26 @@ impl fmt::Debug for RetainedAuthorizationAttempt {
         formatter
             .debug_struct("RetainedAuthorizationAttempt")
             .field("generation", &self.generation)
-            .field("attempt_id", &"<opaque>")
-            .field("auth_url", &"<redacted>")
+            .field("server_generation", &self.server_generation)
+            .field("attempt", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct PendingAuthorizationHandoff {
+    replacement_generation: u64,
+    server_generation: u64,
+    attempt: AuthAttemptSnapshot,
+}
+
+impl fmt::Debug for PendingAuthorizationHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingAuthorizationHandoff")
+            .field("replacement_generation", &self.replacement_generation)
+            .field("server_generation", &self.server_generation)
+            .field("attempt", &"<redacted>")
             .finish()
     }
 }
@@ -278,6 +296,7 @@ impl fmt::Debug for RetainedAuthorizationAttempt {
 struct PresentationState {
     endpoint: String,
     bearer: String,
+    server_generation: u64,
     generation: u64,
     active_generation: Arc<AtomicU64>,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
@@ -304,8 +323,8 @@ impl PresentationState {
             (!attempt.auth_url.is_empty() && attempt.lifecycle == "pending").then(|| {
                 RetainedAuthorizationAttempt {
                     generation: self.generation,
-                    attempt_id: attempt.attempt_id.clone(),
-                    auth_url: attempt.auth_url.clone(),
+                    server_generation: self.server_generation,
+                    attempt: attempt.clone(),
                 }
             })
         });
@@ -334,6 +353,43 @@ fn auth_url_contains_endpoint(auth_url: &str, endpoint: &str) -> bool {
         || url::Url::parse(auth_url)
             .ok()
             .is_some_and(|url| url.query_pairs().any(|(_, value)| value.contains(endpoint)))
+}
+
+fn pending_attempt_is_unexpired(attempt: &AuthAttemptSnapshot) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX);
+    attempt.lifecycle == "pending"
+        && !attempt.attempt_id.is_empty()
+        && attempt.expires_at_ms > now_ms
+}
+
+fn retained_authorization_url(
+    retained: Option<&RetainedAuthorizationAttempt>,
+    generation: u64,
+    server_generation: u64,
+    attempt_id: &str,
+) -> Option<String> {
+    retained
+        .filter(|attempt| {
+            attempt.generation == generation
+                && attempt.server_generation == server_generation
+                && attempt.attempt.attempt_id == attempt_id
+                && attempt.attempt.lifecycle == "pending"
+        })
+        .map(|attempt| attempt.attempt.auth_url.clone())
+        .filter(|url| !url.is_empty())
+}
+
+fn handoff_attempt_for_server(
+    handoff: Option<PendingAuthorizationHandoff>,
+    server_generation: u64,
+) -> Option<AuthAttemptSnapshot> {
+    handoff
+        .filter(|handoff| handoff.server_generation == server_generation)
+        .map(|handoff| handoff.attempt)
 }
 
 fn redact_snapshot_projection<const N: usize>(
@@ -395,6 +451,7 @@ pub struct RuntimeBridge {
     server: EmbeddedServerController,
     notification_permission_required: std::sync::atomic::AtomicBool,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
+    authorization_handoff: Mutex<Option<PendingAuthorizationHandoff>>,
     start_operation: Mutex<()>,
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     mobile_start_ticket: AtomicU64,
@@ -423,6 +480,7 @@ impl RuntimeBridge {
             server,
             notification_permission_required: std::sync::atomic::AtomicBool::new(false),
             authorization_attempt: Arc::new(RwLock::new(None)),
+            authorization_handoff: Mutex::new(None),
             start_operation: Mutex::new(()),
             mobile_start_ticket: AtomicU64::new(0),
         }
@@ -449,7 +507,14 @@ impl RuntimeBridge {
         if self.mobile_start_ticket.load(Ordering::Acquire) != ticket {
             return Err("native client start was cancelled".to_owned());
         }
-        self.stop_nonblocking();
+        if self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            self.stop_nonblocking();
+        }
         if self.mobile_start_ticket.load(Ordering::Acquire) != ticket {
             return Err("native client start was cancelled".to_owned());
         }
@@ -486,6 +551,7 @@ impl RuntimeBridge {
             .next_generation
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
+        let authorization_handoff = self.take_authorization_handoff(generation);
         self.active_generation.store(generation, Ordering::Release);
         let recovery = Arc::new(RwLock::new(RecoveryState::new(generation)));
         let (publisher, feed) = Publisher::new(
@@ -509,6 +575,7 @@ impl RuntimeBridge {
                     publisher,
                     server,
                     authorization_attempt,
+                    authorization_handoff,
                     initial,
                 );
             })
@@ -577,6 +644,7 @@ impl RuntimeBridge {
     pub fn stop(&self) {
         let span = observability::operation_span("bridge.generation.stop", "native_thread");
         let running = self.signal_stop();
+        self.clear_authorization_state();
         let Some(running) = running else {
             observability::record_outcome(&span, "unchanged");
             return;
@@ -593,8 +661,10 @@ impl RuntimeBridge {
     #[cfg(any(target_os = "android", test))]
     pub fn stop_nonblocking(&self) {
         let Some(running) = self.signal_stop() else {
+            self.clear_authorization_state();
             return;
         };
+        self.clear_authorization_state();
         drop(
             thread::Builder::new()
                 .name("waltr-client-reaper".to_owned())
@@ -605,6 +675,17 @@ impl RuntimeBridge {
     /// Stop only the exact active generation without joining the caller.
     #[cfg(any(target_os = "android", test))]
     pub fn stop_generation_nonblocking(&self, generation: u64) -> bool {
+        self.stop_exact_generation_nonblocking(generation, false)
+    }
+
+    /// Suspend one exact generation and retain only its pending auth attempt for its replacement.
+    #[cfg(any(target_os = "android", test))]
+    pub fn suspend_generation_nonblocking(&self, generation: u64) -> bool {
+        self.stop_exact_generation_nonblocking(generation, true)
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn stop_exact_generation_nonblocking(&self, generation: u64, preserve_auth: bool) -> bool {
         let running = {
             let mut running = self
                 .running
@@ -628,7 +709,12 @@ impl RuntimeBridge {
             Ordering::Acquire,
         );
         running.stop.send_replace(true);
-        self.clear_authorization_generation(generation);
+        if preserve_auth {
+            self.retain_authorization_handoff(generation);
+        } else {
+            self.clear_authorization_generation(generation);
+            self.clear_authorization_handoff();
+        }
         drop(
             thread::Builder::new()
                 .name("waltr-client-reaper".to_owned())
@@ -656,18 +742,33 @@ impl RuntimeBridge {
     /// Resolve the exact current outbound authorization attempt inside Rust memory.
     pub(crate) fn authorization_attempt_url(&self, attempt_id: &str) -> Result<String, String> {
         let generation = self.active_generation.load(Ordering::Acquire);
+        let server_generation = self
+            .server
+            .connection()
+            .map(|connection| connection.generation)
+            .ok_or_else(|| "authorization attempt is unavailable".to_owned())?;
         if generation == 0 {
             return Err("authorization attempt is unavailable".to_owned());
         }
-        let auth_url = self
+        let retained = self
             .authorization_attempt
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|attempt| attempt.generation == generation && attempt.attempt_id == attempt_id)
-            .map(|attempt| attempt.auth_url.clone())
-            .ok_or_else(|| "authorization attempt is unavailable".to_owned())?;
-        if self.active_generation.load(Ordering::Acquire) != generation {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let auth_url = retained_authorization_url(
+            retained.as_ref(),
+            generation,
+            server_generation,
+            attempt_id,
+        )
+        .ok_or_else(|| "authorization attempt is unavailable".to_owned())?;
+        drop(retained);
+        if self.active_generation.load(Ordering::Acquire) != generation
+            || self
+                .server
+                .connection()
+                .map(|connection| connection.generation)
+                != Some(server_generation)
+        {
             return Err("authorization attempt is unavailable".to_owned());
         }
         Ok(auth_url)
@@ -733,6 +834,56 @@ impl RuntimeBridge {
         }
     }
 
+    #[cfg(any(target_os = "android", test))]
+    fn retain_authorization_handoff(&self, generation: u64) {
+        let attempt = {
+            let mut retained = self
+                .authorization_attempt
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retained
+                .take()
+                .filter(|attempt| attempt.generation == generation)
+        };
+        let handoff = attempt.and_then(|attempt| {
+            pending_attempt_is_unexpired(&attempt.attempt).then_some(PendingAuthorizationHandoff {
+                replacement_generation: generation.saturating_add(1),
+                server_generation: attempt.server_generation,
+                attempt: attempt.attempt,
+            })
+        });
+        *self
+            .authorization_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handoff;
+    }
+
+    fn take_authorization_handoff(&self, generation: u64) -> Option<PendingAuthorizationHandoff> {
+        self.authorization_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .filter(|handoff| {
+                handoff.replacement_generation == generation
+                    && pending_attempt_is_unexpired(&handoff.attempt)
+            })
+    }
+
+    fn clear_authorization_handoff(&self) {
+        *self
+            .authorization_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn clear_authorization_state(&self) {
+        *self
+            .authorization_attempt
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.clear_authorization_handoff();
+    }
+
     /// Return the current generation for event delivery validation.
     #[must_use]
     pub fn is_current(&self, generation: u64) -> bool {
@@ -753,6 +904,7 @@ fn run_thread(
     publisher: Publisher<BridgePayload>,
     server: EmbeddedServerController,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
+    authorization_handoff: Option<PendingAuthorizationHandoff>,
     initial: PlatformStartup,
 ) {
     let runtime_span = observability::operation_span("native.runtime", "native_thread");
@@ -770,6 +922,7 @@ fn run_thread(
             publisher,
             server,
             authorization_attempt,
+            authorization_handoff,
             initial,
         )
         .instrument(runtime_span.clone()),
@@ -788,6 +941,7 @@ async fn run_generation(
     mut publisher: Publisher<BridgePayload>,
     server: EmbeddedServerController,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
+    mut authorization_handoff: Option<PendingAuthorizationHandoff>,
     initial: PlatformStartup,
 ) {
     let mut initial_sent = false;
@@ -800,6 +954,7 @@ async fn run_generation(
             &mut publisher,
             connection,
             Arc::clone(&authorization_attempt),
+            authorization_handoff.take(),
             true,
         )
         .await
@@ -842,6 +997,7 @@ async fn run_generation(
                 &mut publisher,
                 connection,
                 Arc::clone(&authorization_attempt),
+                authorization_handoff.take(),
                 false,
             )
             .await
@@ -918,11 +1074,13 @@ async fn run_connected_generation(
     publisher: &mut Publisher<BridgePayload>,
     connection: ServerConnection,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
+    authorization_handoff: Option<PendingAuthorizationHandoff>,
     initial: bool,
 ) -> ConnectedExit {
     let presentation = PresentationState {
         endpoint: connection.endpoint.clone(),
         bearer: connection.bearer.clone(),
+        server_generation: connection.generation,
         generation: publisher.generation,
         active_generation: Arc::clone(&publisher.active_generation),
         authorization_attempt,
@@ -939,7 +1097,10 @@ async fn run_connected_generation(
     }
     let transport =
         NativeGrpcTransport::with_credential_provider(connection.endpoint, credentials.clone());
-    let runtime = ClientRuntime::with_transport(transport);
+    let runtime = match handoff_attempt_for_server(authorization_handoff, connection.generation) {
+        Some(attempt) => ClientRuntime::with_transport_and_pending_auth_attempt(transport, attempt),
+        None => ClientRuntime::with_transport(transport),
+    };
     let mut stream =
         runtime.into_state_stream(|delay_ms| tokio::time::sleep(Duration::from_millis(delay_ms)));
     let initial_payload = BridgePayload::State {
@@ -1254,12 +1415,13 @@ mod tests {
         let presentation = PresentationState {
             endpoint: endpoint.to_owned(),
             bearer: "local-bearer".to_owned(),
+            server_generation: 4,
             generation: 9,
             active_generation,
             authorization_attempt: Arc::clone(&authorization_attempt),
         };
         let mut snapshot = ClientRuntime::for_endpoint("http://unused.invalid").snapshot();
-        snapshot.auth.active_attempt = Some(waltr_client::AuthAttemptSnapshot {
+        let attempt = waltr_client::AuthAttemptSnapshot {
             target: waltr_client::ClientAuthTarget {
                 kind: "provider".to_owned(),
                 key: "provider:test".to_owned(),
@@ -1275,7 +1437,8 @@ mod tests {
             registration_method: String::new(),
             lifecycle: "pending".to_owned(),
             failure_reason: String::new(),
-        });
+        };
+        snapshot.auth.active_attempt = Some(attempt.clone());
 
         let presented = presentation.snapshot(&snapshot);
         assert_eq!(
@@ -1286,8 +1449,8 @@ mod tests {
             authorization_attempt.read().unwrap().as_ref(),
             Some(&RetainedAuthorizationAttempt {
                 generation: 9,
-                attempt_id: "attempt-current".to_owned(),
-                auth_url: auth_url.to_owned(),
+                server_generation: 4,
+                attempt,
             })
         );
 
@@ -1298,6 +1461,110 @@ mod tests {
         snapshot.auth.active_attempt = None;
         drop(presentation.snapshot(&snapshot));
         assert!(authorization_attempt.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_auth_handoff_is_exact_single_use_and_rejects_terminal_or_expired_attempts() {
+        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+        assert!(!bridge.suspend_generation_nonblocking(99));
+        let private_auth_url = concat!(
+            "https://provider.example/authorize?redirect_uri=",
+            "http%3A%2F%2F127.0.0.1%3A43123%2Foauth%2Fcallback&state=opaque"
+        );
+        let pending = AuthAttemptSnapshot {
+            target: waltr_client::ClientAuthTarget {
+                kind: "provider".to_owned(),
+                key: "test".to_owned(),
+            },
+            attempt_id: "attempt-current".to_owned(),
+            auth_url: private_auth_url.to_owned(),
+            verification_url: String::new(),
+            user_code: String::new(),
+            expires_at_ms: i64::MAX,
+            poll_interval_seconds: 1,
+            messages: Vec::new(),
+            completion_mode: "serverCallback".to_owned(),
+            registration_method: String::new(),
+            lifecycle: "pending".to_owned(),
+            failure_reason: String::new(),
+        };
+        *bridge.authorization_attempt.write().unwrap() = Some(RetainedAuthorizationAttempt {
+            generation: 8,
+            server_generation: 3,
+            attempt: pending.clone(),
+        });
+
+        bridge.retain_authorization_handoff(8);
+        assert!(bridge.take_authorization_handoff(10).is_none());
+        assert!(bridge.authorization_handoff.lock().unwrap().is_none());
+
+        for (lifecycle, expires_at_ms) in [("succeeded", i64::MAX), ("pending", 1)] {
+            let mut attempt = pending.clone();
+            attempt.lifecycle = lifecycle.to_owned();
+            attempt.expires_at_ms = expires_at_ms;
+            *bridge.authorization_attempt.write().unwrap() = Some(RetainedAuthorizationAttempt {
+                generation: 8,
+                server_generation: 3,
+                attempt,
+            });
+            bridge.retain_authorization_handoff(8);
+            assert!(bridge.authorization_handoff.lock().unwrap().is_none());
+        }
+
+        *bridge.authorization_attempt.write().unwrap() = Some(RetainedAuthorizationAttempt {
+            generation: 8,
+            server_generation: 3,
+            attempt: pending,
+        });
+        bridge.retain_authorization_handoff(8);
+        let retained_handoff = bridge.authorization_handoff.lock().unwrap().clone();
+        assert!(handoff_attempt_for_server(retained_handoff.clone(), 4).is_none());
+        assert_eq!(
+            handoff_attempt_for_server(retained_handoff, 3)
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.as_str()),
+            Some("attempt-current")
+        );
+        let handoff = bridge
+            .take_authorization_handoff(9)
+            .expect("exact replacement consumes handoff");
+        assert_eq!(handoff.server_generation, 3);
+        assert_eq!(handoff.attempt.attempt_id, "attempt-current");
+        let runtime = ClientRuntime::with_transport_and_pending_auth_attempt(
+            NativeGrpcTransport::new("http://127.0.0.1:0"),
+            handoff.attempt,
+        );
+        let presentation = PresentationState {
+            endpoint: "http://127.0.0.1:43123".to_owned(),
+            bearer: "local-bearer".to_owned(),
+            server_generation: 3,
+            generation: 9,
+            active_generation: Arc::new(AtomicU64::new(9)),
+            authorization_attempt: Arc::new(RwLock::new(None)),
+        };
+        let payload = BridgePayload::State {
+            snapshot: Box::new(presentation.snapshot(&runtime.snapshot())),
+        };
+        assert!(
+            !serde_json::to_string(&payload)
+                .unwrap()
+                .contains(private_auth_url)
+        );
+        assert!(bridge.take_authorization_handoff(9).is_none());
+
+        *bridge.authorization_attempt.write().unwrap() = Some(RetainedAuthorizationAttempt {
+            generation: 9,
+            server_generation: 3,
+            attempt: runtime.snapshot().auth.active_attempt.unwrap(),
+        });
+        *bridge.authorization_handoff.lock().unwrap() = Some(PendingAuthorizationHandoff {
+            replacement_generation: 10,
+            server_generation: 3,
+            attempt: runtime.snapshot().auth.active_attempt.unwrap(),
+        });
+        bridge.clear_authorization_state();
+        assert!(bridge.authorization_attempt.read().unwrap().is_none());
+        assert!(bridge.authorization_handoff.lock().unwrap().is_none());
     }
 
     fn payload_snapshot(payload: &BridgePayload) -> &serde_json::Value {
@@ -1355,14 +1622,40 @@ mod tests {
         bridge.invalidate_start(10);
         assert_eq!(bridge.mobile_start_ticket.load(Ordering::Acquire), 0);
         let auth_url = "https://provider.example/authorize?state=opaque";
-        *bridge.authorization_attempt.write().unwrap() = Some(RetainedAuthorizationAttempt {
-            generation: 1,
+        let attempt = AuthAttemptSnapshot {
+            target: waltr_client::ClientAuthTarget {
+                kind: "provider".to_owned(),
+                key: "provider:test".to_owned(),
+            },
             attempt_id: "attempt-current".to_owned(),
             auth_url: auth_url.to_owned(),
+            verification_url: String::new(),
+            user_code: String::new(),
+            expires_at_ms: i64::MAX,
+            poll_interval_seconds: 1,
+            messages: Vec::new(),
+            completion_mode: "manual".to_owned(),
+            registration_method: String::new(),
+            lifecycle: "pending".to_owned(),
+            failure_reason: String::new(),
+        };
+        *bridge.authorization_attempt.write().unwrap() = Some(RetainedAuthorizationAttempt {
+            generation: 1,
+            server_generation: 4,
+            attempt,
         });
+        let retained = bridge.authorization_attempt.read().unwrap();
         assert_eq!(
-            bridge.authorization_attempt_url("attempt-current").unwrap(),
-            auth_url
+            retained_authorization_url(retained.as_ref(), 1, 4, "attempt-current").as_deref(),
+            Some(auth_url)
+        );
+        assert!(retained_authorization_url(retained.as_ref(), 1, 5, "attempt-current").is_none());
+        drop(retained);
+        assert_eq!(
+            bridge
+                .authorization_attempt_url("attempt-current")
+                .unwrap_err(),
+            "authorization attempt is unavailable"
         );
         assert_eq!(
             bridge
