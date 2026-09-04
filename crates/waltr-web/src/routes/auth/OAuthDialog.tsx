@@ -70,16 +70,20 @@ function lifecycleMessage(attempt: AuthAttemptSnapshot) {
 
 export function OAuthDialog() {
   const app = useAppState();
-  const [input, setInput] = createSignal("");
   const [localError, setLocalError] = createSignal<string | undefined>();
   const activeAttempt = createMemo(() => app.snapshot()?.auth?.activeAttempt);
   const attempt = createMemo(() => (
     sameTarget(app.explicitAuthTarget(), activeAttempt()?.target)
+      && app.presentedAuthAttemptId() === activeAttempt()?.attemptId
       ? activeAttempt() ?? undefined
       : undefined
   ));
   const target = createMemo(() => attempt()?.target);
   const attemptId = createMemo(() => attempt()?.attemptId);
+  const input = createMemo(() => {
+    const draft = app.authorizationDraft();
+    return draft && draft.attemptId === attemptId() ? draft.input : "";
+  });
   const terminal = createMemo(() => TERMINAL_LIFECYCLES.has(attempt()?.lifecycle ?? ""));
   const cancellable = createMemo(() => ["pending", "completing"].includes(attempt()?.lifecycle ?? ""));
   const manualInput = createMemo(() => attempt()?.completionMode === "manual" && attempt()?.lifecycle === "pending");
@@ -102,7 +106,6 @@ export function OAuthDialog() {
   const manualFieldError = createMemo(() => localError() === "Paste the final redirect URL or authorization code." ? localError() : undefined);
   createEffect(() => {
     attemptId();
-    setInput("");
     setLocalError(undefined);
   });
 
@@ -122,7 +125,7 @@ export function OAuthDialog() {
     setLocalError(undefined);
     try {
       await app.dispatchCompleteAuth(current.attemptId, value);
-      setInput("");
+      app.clearAuthorizationDraft();
       await app.dispatch({ type: "requestAuthStatuses" }).catch(() => undefined);
     } catch (error) {
       setLocalError(displayText(error instanceof Error ? error.message : "Authorization could not be completed."));
@@ -145,6 +148,7 @@ export function OAuthDialog() {
     }
 
     if (currentAttempt) {
+      app.clearAuthorizationDraft();
       app.clearExplicitAuthTarget();
     }
   };
@@ -218,7 +222,7 @@ export function OAuthDialog() {
                           aria-invalid={field.invalid}
                           rows={4}
                           value={input()}
-                          onInput={(event) => setInput(event.currentTarget.value)}
+                          onInput={(event) => app.setAuthorizationDraft(currentAttempt().attemptId, event.currentTarget.value)}
                           placeholder="Paste the final redirect URL or authorization code"
                         />
                       )}

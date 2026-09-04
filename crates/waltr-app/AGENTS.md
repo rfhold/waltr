@@ -46,6 +46,8 @@ Android notification permission gates foreground-service startup. The non-export
 
 Activity pause stops only the client runtime. Activity resume creates a fresh client generation against the current server generation.
 
+Suspend may preserve one unexpired pending outbound authorization attempt for only the immediate replacement client generation against the same server generation. Keep that handoff process-local, single-use, stale-safe, and secret-safe; ordinary stop, disposal, terminal state, skipped generations, and server replacement must clear it.
+
 Never join Rust client or server threads inside Android lifecycle callbacks. Signal stop there and complete joins on reaper threads.
 
 For a nonblocking server stop, transition the exact current generation to `Stopping` and detach its thread under the controller lock. Its reaper must join that exact thread before publishing `Stopped` or `Failed`.
@@ -73,6 +75,8 @@ Only packaged local content may invoke IPC. Deny remote main-WebView navigation 
 If an outbound authorization URL contains the local endpoint, remove it from the snapshot. Retain it only in Rust for the current pending attempt.
 
 Open that URL only from an opaque current attempt ID. Recheck generation, attempt identity, lifecycle, and external HTTPS policy.
+
+Generate Android legacy and adaptive launcher resources from the web favicon with `scripts/android-launcher-icons.sh`. Keep both committed Android resource trees synchronized, isolate the adaptive foreground glyph from its full-bleed background, and leave the monochrome notification icon independent.
 
 Use the callback derived from the prebound server origin. Do not read `WALTR_PUBLIC_URL` or target OAuth redirect variables for embedded composition.
 

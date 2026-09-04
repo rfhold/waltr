@@ -37,7 +37,7 @@ Tests inject independent in-memory databases or temporary file-backed SQLite dat
 
 The embedded builder requires absolute paths. It never derives these stores from the current directory, `HOME`, XDG variables, or server persistence variables.
 
-The app uses separate Waltr and MCP SQLite files plus filesystem sessions. Provider and upstream-MCP OAuth credentials remain in Waltr SQL.
+The app uses separate Waltr and MCP SQLite files plus filesystem sessions. Filesystem mutations use advisory shared/exclusive locks through an Android-capable Unix implementation, preserving the global wipe barrier and per-session mutation serialization on the app-private store. Provider and upstream-MCP OAuth credentials remain in Waltr SQL.
 
 The process-generation local bearer stays in private Rust memory. The loopback endpoint is also retained in private runtime configuration, but it is not memory-only: before catalog load, startup atomically writes it into app config `server/.waltr/resources/mcp-servers/waltr.yaml`. Each generation overwrites the durable file with its current endpoint.
 

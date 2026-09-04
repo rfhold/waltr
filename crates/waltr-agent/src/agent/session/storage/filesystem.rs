@@ -26,6 +26,77 @@ use serde_json::Value;
 const LOCK_DIRECTORY: &str = ".waltr-session-locks";
 const STORE_LOCK_FILE: &str = "store.lock";
 
+#[derive(Debug)]
+struct AdvisoryLock {
+    file: File,
+}
+
+impl AdvisoryLock {
+    fn shared(&self) -> std::io::Result<()> {
+        lock_shared(&self.file)
+    }
+
+    fn exclusive(&self) -> std::io::Result<()> {
+        lock_exclusive(&self.file)
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn lock_shared(file: &File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockShared).map_err(Into::into)
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+)))]
+fn lock_shared(file: &File) -> std::io::Result<()> {
+    File::lock_shared(file)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn lock_exclusive(file: &File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive).map_err(Into::into)
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+)))]
+fn lock_exclusive(file: &File) -> std::io::Result<()> {
+    File::lock(file)
+}
+
 /// Local JSON-file implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
 pub struct FilesystemSessionStore {
@@ -43,16 +114,17 @@ impl FilesystemSessionStore {
         self.root.join(format!("{}.json", id.as_str()))
     }
 
-    fn lock_file(&self, name: &str) -> SessionStoreResult<File> {
+    fn lock_file(&self, name: &str) -> SessionStoreResult<AdvisoryLock> {
         let directory = self.root.join(LOCK_DIRECTORY);
         fs::create_dir_all(&directory).map_err(backend_error)?;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(directory.join(name))
-            .map_err(backend_error)
+            .map_err(backend_error)?;
+        Ok(AdvisoryLock { file })
     }
 
     fn with_session_lock<T>(
@@ -61,9 +133,9 @@ impl FilesystemSessionStore {
         operation: impl FnOnce() -> SessionStoreResult<T>,
     ) -> SessionStoreResult<T> {
         let store_lock = self.lock_file(STORE_LOCK_FILE)?;
-        store_lock.lock_shared().map_err(backend_error)?;
+        store_lock.shared().map_err(backend_error)?;
         let session_lock = self.lock_file(&format!("{}.lock", id.as_str()))?;
-        session_lock.lock().map_err(backend_error)?;
+        session_lock.exclusive().map_err(backend_error)?;
         operation()
     }
 
@@ -184,7 +256,7 @@ impl FilesystemSessionStore {
     fn wipe_sync(&self) -> SessionStoreResult<()> {
         fs::create_dir_all(&self.root).map_err(backend_error)?;
         let store_lock = self.lock_file(STORE_LOCK_FILE)?;
-        store_lock.lock().map_err(backend_error)?;
+        store_lock.exclusive().map_err(backend_error)?;
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -544,7 +616,7 @@ mod tests {
             .unwrap();
 
         let held = first.lock_file(&format!("{}.lock", id.as_str())).unwrap();
-        held.lock().unwrap();
+        held.exclusive().unwrap();
         let blocked_store = second.clone();
         let blocked_id = id.clone();
         let blocked = tokio::spawn(async move {
@@ -594,7 +666,7 @@ mod tests {
         let second = FilesystemSessionStore::new(temp.path());
         let id = SessionId::new("create-store-lock");
         let held = first.lock_file(STORE_LOCK_FILE).unwrap();
-        held.lock().unwrap();
+        held.exclusive().unwrap();
 
         let blocked_id = id.clone();
         let blocked =
@@ -606,6 +678,20 @@ mod tests {
         drop(held);
         blocked.await.unwrap().unwrap();
         assert!(first.path(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn shared_store_lock_allows_session_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = FilesystemSessionStore::new(temp.path());
+        let second = FilesystemSessionStore::new(temp.path());
+        let held = first.lock_file(STORE_LOCK_FILE).unwrap();
+        held.shared().unwrap();
+
+        second
+            .create(SessionCreateRequest::new("shared-store-lock"))
+            .await
+            .unwrap();
     }
 
     #[test]

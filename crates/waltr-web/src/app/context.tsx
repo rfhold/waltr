@@ -19,6 +19,8 @@ export type AppState = {
   clientLoaded: Accessor<boolean>;
   systemReady: Accessor<boolean>;
   explicitAuthTarget: Accessor<ClientAuthTarget | undefined>;
+  presentedAuthAttemptId: Accessor<string | undefined>;
+  authorizationDraft: Accessor<{ attemptId: string; input: string } | undefined>;
   accessOperations: Accessor<AccessOperations | undefined>;
   openAuthorizationAttempt: Accessor<((attemptId: string) => Promise<void>) | undefined>;
   openExternalUrl: Accessor<((url: string) => Promise<void>) | undefined>;
@@ -29,6 +31,8 @@ export type AppState = {
   dispatchRefreshAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
   dispatchLogoutAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
   clearExplicitAuthTarget: () => void;
+  setAuthorizationDraft: (attemptId: string, input: string) => void;
+  clearAuthorizationDraft: () => void;
   dispatchConfigPatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispatchResetConfig: () => Promise<ClientSnapshot>;
   dispatchCreateSession: (agentName: string) => Promise<ClientSnapshot>;

@@ -19,6 +19,8 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
   const snapshot = () => props.snapshot;
   const phase = createMemo<AppPhase>(() => "ready");
   const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Parameters<AppState["dispatchBeginExplicitAuth"]>[0]>();
+  const [presentedAuthAttemptId, setPresentedAuthAttemptId] = createSignal<string>();
+  const [authorizationDraft, setAuthorizationDraft] = createSignal<{ attemptId: string; input: string }>();
   const state: AppState = {
     phase,
     minimumSplashElapsed: () => true,
@@ -28,25 +30,35 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     clientLoaded: () => true,
     systemReady: () => true,
     explicitAuthTarget,
+    presentedAuthAttemptId,
+    authorizationDraft,
     accessOperations: () => undefined,
     openAuthorizationAttempt: () => undefined,
     openExternalUrl: () => undefined,
     dispatch: async (_command: ClientCommand) => props.snapshot,
     dispatchBeginExplicitAuth: async (target) => {
       setExplicitAuthTarget(target);
+      setPresentedAuthAttemptId(props.snapshot.auth.activeAttempt?.attemptId);
       return props.snapshot;
     },
     dispatchCompleteAuth: async (_attemptId, _input) => {
       setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
       return props.snapshot;
     },
     dispatchCancelAuth: async (_attemptId) => {
       setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
       return props.snapshot;
     },
     dispatchRefreshAuth: async (_target) => props.snapshot,
     dispatchLogoutAuth: async (_target) => props.snapshot,
-    clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
+    clearExplicitAuthTarget: () => {
+      setExplicitAuthTarget(undefined);
+      setPresentedAuthAttemptId(undefined);
+    },
+    setAuthorizationDraft: (attemptId, input) => setAuthorizationDraft({ attemptId, input }),
+    clearAuthorizationDraft: () => setAuthorizationDraft(undefined),
     dispatchConfigPatch: async (_command: ClientCommand) => props.snapshot,
     dispatchResetConfig: async () => props.snapshot,
     dispatchCreateSession: async (_agentName) => props.snapshot,

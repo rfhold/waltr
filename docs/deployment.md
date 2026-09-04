@@ -318,6 +318,8 @@ Run these commands from the repository root. They map to current workspace scrip
 | Android package | `pnpm --filter @rfhold/waltr-app android:build` | Build through the generated Android project under `crates/waltr-app/gen/android/`. |
 | Android app | `pnpm --filter @rfhold/waltr-app exec cargo tauri android dev` | Build, install, and start on a configured emulator or device. |
 
+Android launcher assets derive from `crates/waltr-web/public/favicon.svg`. Run `crates/waltr-app/scripts/android-launcher-icons.sh` after changing that artwork, and run the same command with `--check` to verify the committed legacy and adaptive resources. The launcher assets are separate from the monochrome foreground-service notification icon.
+
 Focused deterministic checks are listed in [Testing](testing.md). Package creation does not prove installed-device lifecycle behavior.
 
 ### Android Foreground Service

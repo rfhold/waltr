@@ -163,6 +163,7 @@ The Tauri bridge preserves these lifecycle invariants:
 - Disposal invalidates publication, stops the client runtime, clears its local bearer provider, removes listeners, and rejects later native output.
 - Android activity pause stops only the client runtime. The same-process foreground service keeps the embedded server alive best effort.
 - Android activity resume creates a fresh client generation against the current embedded server generation.
+- A suspend may hand one unexpired pending outbound authorization attempt to only the immediately following client generation against that same server generation. The handoff is process-local and single-use; terminal, expired, stale, skipped-generation, disposal, and server-replacement paths clear it.
 - Android lifecycle callbacks signal client or server stop and delegate thread joins to reaper threads.
 - A fresh Android generation applies current notification permission before it considers an existing server connection.
 - A permission-required generation remains disconnected until a permission transition permits connection.
@@ -276,7 +277,9 @@ Hosted browser and TUI surfaces retain the generic authorization URL behavior. T
 
 For that case, the bridge blanks the snapshot URL and retains the full URL only in Rust. WebView sends the current opaque attempt ID to `open_authorization_attempt`.
 
-Rust accepts only the active generation's current pending attempt. It validates the retained URL with the external HTTPS policy before launch.
+Rust accepts only the active generation's current pending attempt. On Android suspend, it may rebind that pending attempt and its Rust-only URL to the exact immediate replacement client generation when the embedded server generation is unchanged. The fresh shared-client reducer restores the attempt without replaying `BeginAuth`; callback attempts resume polling and manual attempts remain idle. Web presentation reopens the restored pending attempt and retains its keyed manual-input draft across the temporary route remount.
+
+Rust validates the retained URL with the external HTTPS policy before launch. The handoff does not survive process death and never exposes the private URL, endpoint, or bearer to the WebView.
 
 Browser, Tauri, and TUI surfaces never receive provider or MCP tokens, PKCE verifiers, registration responses, or callback state.
 
