@@ -700,6 +700,8 @@ mod configuration_tests {
         let service = include_str!(
             "../gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt"
         );
+        let strings = include_str!("../gen/android/app/src/main/res/values/strings.xml");
+        let stop_icon = include_str!("../gen/android/app/src/main/res/drawable/ic_stop_server.xml");
         let gradle = include_str!("../gen/android/app/build.gradle.kts");
         let proguard = include_str!("../gen/android/app/proguard-rules.pro");
         let rust = include_str!("lib.rs");
@@ -720,6 +722,38 @@ mod configuration_tests {
         assert!(activity.contains("nativeNotificationPermissionRequired"));
         assert!(service.contains("startForeground("));
         assert!(service.contains("START_STICKY"));
+        assert!(
+            service
+                .contains("private const val STOP_ACTION = \"dev.waltr.app.action.STOP_SERVER\"")
+        );
+        assert!(
+            service
+                .contains("Intent(this, WaltrForegroundService::class.java).setAction(STOP_ACTION)")
+        );
+        assert!(service.contains("PendingIntent.getService("));
+        assert!(service.contains("private const val STOP_REQUEST_CODE = 14334"));
+        assert!(
+            service.contains("PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT")
+        );
+        assert!(service.contains(
+            ".addAction(\n        R.drawable.ic_stop_server,\n        getString(R.string.server_notification_stop),\n        stopPendingIntent\n      )"
+        ));
+        assert!(service.contains(
+            "if (intent?.action == STOP_ACTION) {\n      nativeStopServer()\n      stopForeground(STOP_FOREGROUND_REMOVE)\n      stopSelf()\n      return START_NOT_STICKY\n    }"
+        ));
+        let stop_dispatch = service
+            .find("if (intent?.action == STOP_ACTION)")
+            .expect("stop action dispatch");
+        let ordinary_start = service[stop_dispatch..]
+            .find("promote()")
+            .map(|offset| stop_dispatch + offset)
+            .expect("ordinary server-start path");
+        assert!(stop_dispatch < ordinary_start);
+        assert!(strings.contains("<string name=\"server_notification_stop\">Stop server</string>"));
+        assert!(stop_icon.contains("android:width=\"24dp\""));
+        assert!(stop_icon.contains("android:height=\"24dp\""));
+        assert!(stop_icon.contains("android:fillColor=\"#FFFFFFFF\""));
+        assert!(stop_icon.contains("android:pathData=\"M6,6h12v12H6z\""));
         assert!(service.contains("System.loadLibrary(\"waltr_app_lib\")"));
         assert!(service.contains(
             "try {\n          nativeStartServer(filesDir.absolutePath, File(filesDir, \"config\").absolutePath)\n        } finally {\n          workerStarted.set(false)\n        }"
