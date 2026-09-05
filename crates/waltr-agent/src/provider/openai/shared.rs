@@ -34,7 +34,7 @@ pub(super) async fn stream_openai_http(
 ) -> Result<BoxCompletionStream> {
     // `body` is the projected payload journaled by the agent loop; crash
     // recovery retries the whole turn rather than resuming mid-stream.
-    let mut request_builder = reqwest::Client::new().post(url).json(&body);
+    let mut request_builder = crate::outbound_http::client().post(url).json(&body);
     for (name, value) in headers {
         request_builder = request_builder.header(name.as_str(), value);
     }

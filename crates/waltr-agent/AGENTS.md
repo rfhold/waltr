@@ -14,6 +14,8 @@ Session lifecycle and list projection are centralized in `src/agent/session/cont
 
 Source-backed Routine helpers persist rollback-aware provider-neutral inference history through the latest completed turn, followed by the task prompt. Provider requests derive only from durable helper state. Preserve replay prompts, assistant text, tool calls and results, and images. Exclude lifecycle, middleware, status, usage and cost, request audit, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work. Provider adapters retain normal encoding rules.
 
+Use `src/outbound_http.rs` as the shared reqwest construction boundary for OpenAI and Anthropic HTTP inference and provider or MCP OAuth refresh. On Android, it uses the ring provider, safe TLS 1.2/1.3, and bundled `webpki_roots`. Pass the same client through `McpTransportOptions` for Waltr-agent MCP Streamable HTTP. Retain normal certificate-chain and hostname verification. Do not add Android platform, user, or private roots or `SSL_CERT_FILE`. Preserve default reqwest behavior on non-Android targets. OpenAI websocket uses its separate explicit ring and bundled-root connector on every platform. Generic MCP defaults remain platform-independent.
+
 # Hints
 
 Use the agent-modification skill when modifying the isolated agent library.

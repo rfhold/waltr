@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use mcp::client::{McpClient, McpClientHandler, McpClientOptions, McpTransportLimits};
+use mcp::client::{
+    McpClient, McpClientHandler, McpClientOptions, McpTransportLimits, McpTransportOptions,
+};
 use mcp::{
     McpCompletionRequest, McpCompletionResult, McpLogLevel, McpProgressNotification,
     McpPromptDefinition, McpResourceDefinition, McpResourceTemplateDefinition, McpRoot,
@@ -116,28 +118,29 @@ impl McpServerRuntime {
         if let Some(level) = log_level {
             options = options.with_log_level(level);
         }
-        let client = if let Some(provider) = config.bearer_provider {
-            McpClient::connect_with_bearer_provider_and_transport_limits(
-                name.clone(),
-                config.transport,
-                provider,
-                handler.clone(),
-                options,
-                McpTransportLimits::new(WALTR_MCP_MESSAGE_BYTES, WALTR_MCP_MESSAGE_BYTES),
-                cancellation_token.clone(),
-            )
-            .await?
-        } else {
-            McpClient::connect_with_transport_limits(
-                name.clone(),
-                config.transport,
-                handler.clone(),
-                options,
-                McpTransportLimits::new(WALTR_MCP_MESSAGE_BYTES, WALTR_MCP_MESSAGE_BYTES),
-                cancellation_token.clone(),
-            )
-            .await?
-        };
+        let mut transport_options = McpTransportOptions::default().with_limits(
+            McpTransportLimits::new(WALTR_MCP_MESSAGE_BYTES, WALTR_MCP_MESSAGE_BYTES),
+        );
+        if let Some(provider) = config.bearer_provider {
+            transport_options = transport_options.with_bearer_provider(provider);
+        }
+        #[cfg(target_os = "android")]
+        if matches!(
+            &config.transport,
+            mcp::client::McpTransportConfig::StreamableHttp { .. }
+        ) {
+            transport_options =
+                transport_options.with_streamable_http_client(crate::outbound_http::client());
+        }
+        let client = McpClient::connect_with_transport_options(
+            name.clone(),
+            config.transport,
+            handler.clone(),
+            options,
+            transport_options,
+            cancellation_token.clone(),
+        )
+        .await?;
         let runtime = Arc::new(Self {
             name,
             client,

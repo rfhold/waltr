@@ -942,7 +942,15 @@ async fn oauth_client_for(
     {
         return Err(refresh_configuration_error(target));
     }
-    let mut builder = Client::builder()
+    let mut builder = crate::outbound_http::client_builder()
+        .map_err(|_| {
+            refresh_error(
+                target.clone(),
+                AuthenticationFailureReason::NetworkFailed,
+                "failed to build OAuth token client",
+                RefreshFailureDisposition::RetrySafe,
+            )
+        })?
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))

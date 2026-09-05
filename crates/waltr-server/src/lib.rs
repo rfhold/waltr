@@ -12,6 +12,7 @@ mod local_admission;
 pub mod mcp_oauth;
 pub mod mcp_service;
 pub mod observability;
+mod outbound_http;
 pub mod persistence;
 #[cfg(feature = "profiling")]
 pub mod profiling;

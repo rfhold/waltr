@@ -63,7 +63,7 @@ impl OutboundHttpPolicy {
                 "OAuth endpoint resolves to a disallowed destination",
             ));
         }
-        let mut builder = Client::builder()
+        let mut builder = crate::outbound_http::client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))

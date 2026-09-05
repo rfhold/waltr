@@ -40,7 +40,7 @@ impl AnthropicMessages {
             thinking: None,
             prompt_cache: true,
             oauth_billing_version: None,
-            client: reqwest::Client::new(),
+            client: crate::outbound_http::client(),
         }
     }
 

@@ -7,6 +7,7 @@ mod error;
 pub mod mcp;
 pub mod middleware;
 mod model;
+mod outbound_http;
 mod permission;
 pub mod prompt;
 pub mod provider;
