@@ -163,6 +163,9 @@ The Tauri bridge preserves these lifecycle invariants:
 - Disposal invalidates publication, stops the client runtime, clears its local bearer provider, removes listeners, and rejects later native output.
 - Android activity pause stops only the client runtime. The same-process foreground service keeps the embedded server alive best effort.
 - Android activity resume creates a fresh client generation against the current embedded server generation.
+- The Android foreground notification exposes a Stop server action. The action requests the current nonblocking native server stop, removes the notification, and stops the service.
+- The Stop command uses `START_NOT_STICKY`. Ordinary service startup remains `START_STICKY`; task-removal continuity remains best effort.
+- Stop does not persist a disabled setting. A later app open or resume starts a fresh embedded server generation.
 - A suspend may hand one unexpired pending outbound authorization attempt to only the immediately following client generation against that same server generation. The handoff is process-local and single-use; terminal, expired, stale, skipped-generation, disposal, and server-replacement paths clear it.
 - Android lifecycle callbacks signal client or server stop and delegate thread joins to reaper threads.
 - A fresh Android generation applies current notification permission before it considers an existing server connection.
@@ -181,7 +184,7 @@ Start reservation waits while the controller is `Stopping`; a replacement cannot
 
 Android starts the server through a non-exported, same-process `specialUse` foreground service. Notification permission gates service startup on Android 13 and later.
 
-`android:stopWithTask="false"` and `START_STICKY` provide best-effort continuity after task removal. They do not guarantee survival after force-stop, process kill, reboot, or user termination.
+`android:stopWithTask="false"` and ordinary `START_STICKY` startup provide best-effort continuity after task removal. They do not guarantee survival after force-stop, process kill, reboot, or user termination. The notification Stop command instead returns `START_NOT_STICKY` and prevents an automatic sticky restart for that command.
 
 Every server restart creates a new endpoint, bearer, and outbound callback marker. Startup atomically refreshes the durable self-MCP resource file with the new endpoint before catalog load. Durable databases and sessions reopen, and normal Routine restart reconciliation handles unfinished work.
 

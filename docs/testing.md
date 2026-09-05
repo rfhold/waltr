@@ -266,7 +266,7 @@ Compile the Android manifest and Kotlin host layer without the Rust cross-build:
 
 `./gradlew :app:processUniversalDebugMainManifest :app:compileUniversalDebugKotlin -x rustBuildUniversalDebug`
 
-These Gradle checks validate Android source and manifest integration. They do not validate native linking or installed-device behavior.
+These Gradle checks validate Android source and manifest integration. They do not validate native linking or installed-device behavior. Static Android checks cannot prove notification rendering or runtime Stop-intent delivery.
 
 Verify that committed launcher resources are deterministically generated from the web favicon, include legacy and adaptive regular/round assets, and keep the duplicate Android resource trees synchronized:
 
@@ -295,6 +295,11 @@ On an installed Android build, verify these outcomes:
 11. Load persisted shell-bearing resources. Confirm that they remain inspectable while no shell tool or feature-derived shell permission is installed.
 12. Load and select a stdio MCP resource. Confirm that it materializes and follows ordinary runtime behavior.
 13. Inspect app backup and transfer behavior. Confirm that private databases, files, preferences, and root data remain excluded.
+14. Confirm that the foreground notification displays the Stop server action while the server runs.
+15. Tap Stop after readiness. Confirm nonblocking server shutdown, notification removal, service stop, and no automatic sticky restart.
+16. Tap Stop during server startup. Confirm the same shutdown, notification removal, service stop, and no automatic sticky restart.
+17. Start Waltr normally, then remove its task without Stop. Confirm the documented best-effort service continuity remains unchanged.
+18. After Stop completes, reopen or resume Waltr. Confirm that it starts a fresh server generation and does not retain a disabled setting.
 
 Installed-device validation must cover a supported Android version before release. Current local Rust and Gradle checks do not satisfy this gate.
 

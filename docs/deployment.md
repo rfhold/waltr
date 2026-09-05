@@ -338,13 +338,17 @@ Focused deterministic checks are listed in [Testing](testing.md). Package creati
 
 Android requires notification permission before it starts the embedded server on Android 13 and later. Denial leaves startup at `notificationPermissionRequired`.
 
-`WaltrForegroundService` is non-exported and runs in the app process. It uses foreground-service type `specialUse`, a persistent notification, `START_STICKY`, and `android:stopWithTask="false"`.
+`WaltrForegroundService` is non-exported and runs in the app process. It uses foreground-service type `specialUse`, a persistent notification, and `android:stopWithTask="false"`.
+
+Ordinary service startup returns `START_STICKY`. The notification exposes a Stop server action. That action requests the current nonblocking native server stop, removes the foreground notification, stops the service, and returns `START_NOT_STICKY` for that command.
 
 The service enters foreground state before it loads the native library. Native server work starts only after both steps complete.
 
 The current `specialUse` declaration targets sideload distribution. Play distribution requires separate policy review, declarations, and product work.
 
 Activity pause stops only the client runtime. The service and embedded server survive background and task removal on a best-effort basis.
+
+The Stop action does not persist a disabled setting. A later app open or resume starts a fresh embedded server generation after the prior generation stops.
 
 Android lifecycle callbacks never wait for Rust client or server thread joins. Reaper threads complete those joins outside callbacks.
 

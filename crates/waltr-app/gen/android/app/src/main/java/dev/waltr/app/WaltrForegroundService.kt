@@ -25,6 +25,12 @@ class WaltrForegroundService : Service() {
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    if (intent?.action == STOP_ACTION) {
+      nativeStopServer()
+      stopForeground(STOP_FOREGROUND_REMOVE)
+      stopSelf()
+      return START_NOT_STICKY
+    }
     promote()
     if (nativeServerStatus() != RUNNING && workerStarted.compareAndSet(false, true)) {
       Thread({
@@ -63,11 +69,23 @@ class WaltrForegroundService : Service() {
       launchIntent,
       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
     )
+    val stopIntent = Intent(this, WaltrForegroundService::class.java).setAction(STOP_ACTION)
+    val stopPendingIntent = PendingIntent.getService(
+      this,
+      STOP_REQUEST_CODE,
+      stopIntent,
+      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
     val notification = NotificationCompat.Builder(this, CHANNEL_ID)
       .setSmallIcon(R.drawable.ic_server_notification)
       .setContentTitle(getString(R.string.server_notification_title))
       .setContentText(getString(R.string.server_notification_text))
       .setContentIntent(pendingIntent)
+      .addAction(
+        R.drawable.ic_stop_server,
+        getString(R.string.server_notification_stop),
+        stopPendingIntent
+      )
       .setOngoing(true)
       .setCategory(NotificationCompat.CATEGORY_SERVICE)
       .build()
@@ -77,6 +95,8 @@ class WaltrForegroundService : Service() {
   companion object {
     private const val CHANNEL_ID = "waltr_embedded_server"
     private const val NOTIFICATION_ID = 14333
+    private const val STOP_REQUEST_CODE = 14334
+    private const val STOP_ACTION = "dev.waltr.app.action.STOP_SERVER"
     private const val RUNNING = 2
 
     private var nativeLibraryLoaded = false
