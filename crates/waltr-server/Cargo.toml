@@ -59,6 +59,10 @@ tracing-subscriber.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+rustls.workspace = true
+webpki-roots.workspace = true
+
 [lints]
 workspace = true
 

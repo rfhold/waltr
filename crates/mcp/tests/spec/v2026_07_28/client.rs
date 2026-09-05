@@ -17,6 +17,7 @@ use mcp::{
     McpRoot, McpToolCall, McpToolDefinition, McpToolList, McpToolResult,
     client::{
         McpClient, McpClientHandler, McpClientOptions, McpTransportConfig, McpTransportLimits,
+        McpTransportOptions,
     },
     protocol::{MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION_META_KEY},
     server::{
@@ -38,6 +39,57 @@ impl McpClientHandler for RootsHandler {
             Some("Workspace".to_owned()),
         )]
     }
+}
+
+#[tokio::test]
+async fn streamable_http_uses_supplied_client_and_preserves_default_client() -> mcp::Result<()> {
+    let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+    let app = Router::new()
+        .route("/mcp", post(header_mock_server))
+        .with_state(Arc::clone(&captured));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    tokio::spawn(async move {
+        drop(axum::serve(listener, app).await);
+    });
+
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert("x-mcp-test-client", "supplied".parse().unwrap());
+    let http_client = reqwest::Client::builder()
+        .default_headers(default_headers)
+        .build()?;
+    let client = McpClient::connect_with_transport_options(
+        "custom-http-client-spec",
+        McpTransportConfig::StreamableHttp {
+            endpoint: endpoint.clone(),
+            bearer_token: None,
+        },
+        Arc::new(RootsHandler),
+        McpClientOptions::new("spec-client", "1.0.0", Duration::from_secs(2)),
+        McpTransportOptions::default().with_streamable_http_client(http_client),
+        CancellationToken::new(),
+    )
+    .await?;
+    client.shutdown().await?;
+
+    let client = McpClient::connect(
+        "default-http-client-spec",
+        McpTransportConfig::StreamableHttp {
+            endpoint,
+            bearer_token: None,
+        },
+        Arc::new(RootsHandler),
+        McpClientOptions::new("spec-client", "1.0.0", Duration::from_secs(2)),
+        CancellationToken::new(),
+    )
+    .await?;
+    client.shutdown().await?;
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0]["x-mcp-test-client"], "supplied");
+    assert!(!captured[1].contains_key("x-mcp-test-client"));
+    Ok(())
 }
 
 #[tokio::test]

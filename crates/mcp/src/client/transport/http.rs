@@ -54,6 +54,7 @@ impl StreamableHttpTransport {
         endpoint: String,
         bearer_token: Option<String>,
         bearer_provider: Option<Arc<dyn McpBearerProvider>>,
+        client: reqwest::Client,
         inbound: InboundSender,
         limits: McpTransportLimits,
     ) -> Self {
@@ -61,7 +62,7 @@ impl StreamableHttpTransport {
             endpoint,
             bearer_token,
             bearer_provider,
-            client: reqwest::Client::new(),
+            client,
             inbound,
             cancellation: CancellationToken::new(),
             readers: Mutex::new(JoinSet::new()),

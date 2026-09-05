@@ -108,6 +108,12 @@ stdio line. Applications expecting larger bounded content such as Base64 image b
 `McpClient::connect_with_bearer_provider_and_transport_limits`; the original connection and public
 transport entry points retain the conservative defaults.
 
+`McpClient::connect_with_transport_options` accepts `McpTransportOptions` for callers that need to
+combine explicit receive limits, a dynamic bearer provider, or a preconfigured `reqwest::Client`.
+Low-level transport callers can pass the same options to `McpTransport::start_with_options`.
+The supplied client is used only by Streamable HTTP. When no client is supplied, Streamable HTTP
+continues to use `reqwest::Client::new()` behavior; stdio ignores the HTTP client option.
+
 ## Authorization
 
 Authorization is optional and applies only to HTTP. Protected-resource and issuer URLs

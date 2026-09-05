@@ -541,9 +541,43 @@ async fn request_token(
         OauthTokenRequestStyle::FormUrlencoded => builder.form(&pairs).send().await,
         OauthTokenRequestStyle::Unspecified => unreachable!("validated request style"),
     }
-    .map_err(|error| Status::unavailable(format!("OAuth token request failed: {error}")))?;
+    .map_err(|error| oauth_token_request_send_status(&error))?;
     validate_response_peer(&policy, &response)?;
     token_response_to_credential(definition, response).await
+}
+
+fn oauth_token_request_send_status(error: &reqwest::Error) -> Status {
+    let mut details = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if !detail.is_empty() && details.last() != Some(&detail) {
+            details.push(detail);
+        }
+        source = cause.source();
+    }
+
+    Status::unavailable(format!(
+        "OAuth token request failed [{}]: {}",
+        oauth_transport_category(error),
+        details.join(": ")
+    ))
+}
+
+fn oauth_transport_category(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
 }
 
 #[allow(
@@ -1115,6 +1149,77 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn oauth_transport_category_classifies_connect_and_timeout_errors() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let connect_error = reqwest::Client::new()
+            .post(format!("http://{address}/token"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert_eq!(oauth_transport_category(&connect_error), "connect");
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let timeout_error = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(20))
+            .build()
+            .unwrap()
+            .post(format!("http://{address}/token"))
+            .send()
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert_eq!(oauth_transport_category(&timeout_error), "timeout");
+    }
+
+    #[tokio::test]
+    async fn oauth_send_status_includes_category_and_complete_source_chain() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .post(format!("http://{address}/token"))
+            .send()
+            .await
+            .unwrap_err();
+        let mut details = vec![error.to_string()];
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            let detail = cause.to_string();
+            if !detail.is_empty() && details.last() != Some(&detail) {
+                details.push(detail);
+            }
+            source = cause.source();
+        }
+
+        let status = oauth_token_request_send_status(&error);
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            format!(
+                "OAuth token request failed [connect]: {}",
+                details.join(": ")
+            )
+        );
+        assert!(details.len() > 1, "expected reqwest error sources");
     }
 
     #[test]

@@ -4332,6 +4332,7 @@ dependencies = [
  "pyroscope",
  "rand 0.9.4",
  "reqwest",
+ "rustls 0.23.40",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -4353,6 +4354,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

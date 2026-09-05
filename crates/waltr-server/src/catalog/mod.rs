@@ -359,7 +359,7 @@ impl CatalogLoader {
 }
 
 fn catalog_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+    crate::outbound_http::client_builder()
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
         .timeout(DEFAULT_REQUEST_TIMEOUT)
         .build()
@@ -369,7 +369,7 @@ fn catalog_client() -> Result<reqwest::Client, reqwest::Error> {
 fn catalog_client_with_timeouts(
     timeouts: CatalogRequestTimeouts,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+    crate::outbound_http::client_builder()
         .connect_timeout(timeouts.connect)
         .timeout(timeouts.request)
         .build()

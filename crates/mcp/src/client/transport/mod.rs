@@ -49,6 +49,61 @@ impl Default for McpTransportLimits {
     }
 }
 
+/// Runtime options applied when starting an MCP client transport.
+#[derive(Clone)]
+pub struct McpTransportOptions {
+    limits: McpTransportLimits,
+    bearer_provider: Option<Arc<dyn McpBearerProvider>>,
+    streamable_http_client: Option<reqwest::Client>,
+}
+
+impl fmt::Debug for McpTransportOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpTransportOptions")
+            .field("limits", &self.limits)
+            .field("has_bearer_provider", &self.bearer_provider.is_some())
+            .field(
+                "has_streamable_http_client",
+                &self.streamable_http_client.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl McpTransportOptions {
+    /// Use explicit receive limits.
+    #[must_use]
+    pub const fn with_limits(mut self, limits: McpTransportLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Resolve a bearer token for every Streamable HTTP request.
+    #[must_use]
+    pub fn with_bearer_provider(mut self, bearer_provider: Arc<dyn McpBearerProvider>) -> Self {
+        self.bearer_provider = Some(bearer_provider);
+        self
+    }
+
+    /// Use a preconfigured client for Streamable HTTP requests.
+    #[must_use]
+    pub fn with_streamable_http_client(mut self, client: reqwest::Client) -> Self {
+        self.streamable_http_client = Some(client);
+        self
+    }
+}
+
+impl Default for McpTransportOptions {
+    fn default() -> Self {
+        Self {
+            limits: McpTransportLimits::default(),
+            bearer_provider: None,
+            streamable_http_client: None,
+        }
+    }
+}
+
 /// Transport inbound channel sender.
 pub type InboundSender = mpsc::UnboundedSender<TransportInbound>;
 
@@ -212,7 +267,13 @@ impl McpTransport {
         inbound: InboundSender,
         limits: McpTransportLimits,
     ) -> Result<Self> {
-        Self::start_with_optional_bearer_provider(server_name, config, inbound, limits, None).await
+        Self::start_with_options(
+            server_name,
+            config,
+            inbound,
+            McpTransportOptions::default().with_limits(limits),
+        )
+        .await
     }
 
     /// Start a transport with a dynamic Streamable HTTP bearer provider.
@@ -250,22 +311,27 @@ impl McpTransport {
         bearer_provider: Arc<dyn McpBearerProvider>,
         limits: McpTransportLimits,
     ) -> Result<Self> {
-        Self::start_with_optional_bearer_provider(
+        Self::start_with_options(
             server_name,
             config,
             inbound,
-            limits,
-            Some(bearer_provider),
+            McpTransportOptions::default()
+                .with_limits(limits)
+                .with_bearer_provider(bearer_provider),
         )
         .await
     }
 
-    async fn start_with_optional_bearer_provider(
+    /// Start a transport with unified runtime options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured transport cannot start.
+    pub async fn start_with_options(
         server_name: String,
         config: McpTransportConfig,
         inbound: InboundSender,
-        limits: McpTransportLimits,
-        bearer_provider: Option<Arc<dyn McpBearerProvider>>,
+        options: McpTransportOptions,
     ) -> Result<Self> {
         match config {
             McpTransportConfig::Stdio { command, args } => Ok(Self::Stdio(Box::new(
@@ -274,7 +340,7 @@ impl McpTransport {
                     command,
                     args,
                     inbound,
-                    limits.max_message_bytes,
+                    options.limits.max_message_bytes,
                 )
                 .await?,
             ))),
@@ -284,9 +350,12 @@ impl McpTransport {
             } => Ok(Self::StreamableHttp(StreamableHttpTransport::new(
                 endpoint,
                 bearer_token,
-                bearer_provider,
+                options.bearer_provider,
+                options
+                    .streamable_http_client
+                    .unwrap_or_else(reqwest::Client::new),
                 inbound,
-                limits,
+                options.limits,
             ))),
         }
     }
