@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use jaq_interpret::{Ctx, FilterT as _, ParseCtx, RcIter, Val};
+use schemars::generate::SchemaSettings;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -243,7 +244,11 @@ pub fn json_schema_for<T>() -> Value
 where
     T: schemars::JsonSchema,
 {
-    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| json!({ "type": "object" }))
+    let settings = SchemaSettings::draft2020_12().with(|settings| {
+        settings.inline_subschemas = true;
+    });
+    serde_json::to_value(settings.into_generator().into_root_schema_for::<T>())
+        .unwrap_or_else(|_| json!({ "type": "object" }))
 }
 
 /// Build auto-generated server instructions.
