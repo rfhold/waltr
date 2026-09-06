@@ -45,6 +45,25 @@ struct GetReleaseInput {
     id: String,
 }
 
+#[derive(JsonSchema)]
+#[expect(
+    dead_code,
+    reason = "used only to generate a schema regression fixture"
+)]
+enum SchemaFixtureState {
+    Ready,
+    Paused,
+}
+
+#[derive(JsonSchema)]
+#[expect(
+    dead_code,
+    reason = "used only to generate a schema regression fixture"
+)]
+struct SchemaFixtureInput {
+    state: SchemaFixtureState,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PolicyCheckInput {
     /// Release id to check.
@@ -517,6 +536,19 @@ fn progressive_semantic_resource_conversion_requires_non_error_structure() {
         )
         .expect_err("invalid semantic resource output");
     }
+}
+
+#[test]
+fn progressive_input_schemas_inline_subschemas() {
+    let schema = mcp::progressive::json_schema_for::<SchemaFixtureInput>();
+    let serialized = schema.to_string();
+
+    assert!(schema.get("$defs").is_none());
+    assert!(!serialized.contains("\"$ref\""));
+    assert_eq!(
+        schema["properties"]["state"]["enum"],
+        json!(["Ready", "Paused"])
+    );
 }
 
 #[tokio::test]
