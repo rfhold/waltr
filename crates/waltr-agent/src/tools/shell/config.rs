@@ -3,8 +3,11 @@ use std::{path::PathBuf, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{ShellCommandParser, ShellScan, tool_input};
-use crate::{AgentTool, Result, ToolDefinition, middleware::tool_metadata::RootHintsMiddleware};
+use super::{ShellCommandParser, ShellScan};
+use crate::{
+    AgentTool, Result, ToolDefinition, middleware::tool_metadata::RootHintsMiddleware,
+    sandbox_gateway::SandboxHandle,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 20 * 1024;
@@ -58,10 +61,7 @@ impl ShellConfig {
 
     /// Build the per-request root-hint metadata middleware for the `shell` tool.
     pub(crate) fn root_hints_middleware(&self) -> RootHintsMiddleware {
-        let root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
+        let root = self.root.clone();
         RootHintsMiddleware::new(
             vec![SHELL_TOOL_NAME.to_owned()],
             format!(
@@ -73,10 +73,14 @@ impl ShellConfig {
 
     /// Convert this configuration into the `shell` agent tool.
     #[must_use]
-    pub fn into_agent_tool(self) -> AgentTool {
-        let definition = ToolDefinition::new(
+    pub fn into_agent_tool(self, sandbox: SandboxHandle) -> AgentTool {
+        crate::tools::sandbox::agent_tool(self.definition(), sandbox).with_shell_config(self)
+    }
+
+    pub(crate) fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
             SHELL_TOOL_NAME,
-            "Execute a Bash/POSIX shell command on the host after permission checks. Commands run with /bin/bash -lc. Provide a short description explaining why the command is needed.",
+            "Execute a Bash/POSIX shell command in the sandbox after permission checks. Commands run with /bin/bash -lc. Provide a short description explaining why the command is needed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -101,20 +105,7 @@ impl ShellConfig {
                 "required": ["command", "description"],
                 "additionalProperties": false
             }),
-        );
-        AgentTool::new_async(definition, move |context| {
-            let config = self.clone();
-            Box::pin(async move {
-                let content = config
-                    .execute_with_progress_and_cancellation(
-                        &tool_input(context.call())?,
-                        context.progress().clone(),
-                        context.cancellation_token().clone(),
-                    )
-                    .await?;
-                Ok(context.result(content))
-            })
-        })
+        )
     }
 
     /// Scan a shell command and return parsed commands, claims, and reusable patterns.

@@ -213,6 +213,7 @@ where
             retry_config,
             template_base_dir,
             max_provider_turns,
+            sandbox,
         } = runtime;
 
         let middleware_chain = if extra_tools.is_empty() {
@@ -240,6 +241,7 @@ where
             retry_config,
             template_base_dir,
             max_provider_turns,
+            sandbox,
             session_id,
             session_store,
             session_run_context,

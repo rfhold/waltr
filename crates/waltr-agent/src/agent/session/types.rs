@@ -462,6 +462,8 @@ impl SessionRecord {
                 SessionJournalEvent::Timeline(event) => Some(event),
                 SessionJournalEvent::PromptAppended { .. }
                 | SessionJournalEvent::ProviderRequestRecorded { .. }
+                | SessionJournalEvent::SandboxDispatchStarted { .. }
+                | SessionJournalEvent::SandboxCallRecorded { .. }
                 | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
                 | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
                 | SessionJournalEvent::MiddlewareStateUpdated { .. }
@@ -485,6 +487,8 @@ impl SessionRecord {
             SessionJournalEvent::Timeline(event) => Some(event),
             SessionJournalEvent::PromptAppended { .. }
             | SessionJournalEvent::ProviderRequestRecorded { .. }
+            | SessionJournalEvent::SandboxDispatchStarted { .. }
+            | SessionJournalEvent::SandboxCallRecorded { .. }
             | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
             | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
             | SessionJournalEvent::MiddlewareStateUpdated { .. }
@@ -550,6 +554,8 @@ impl SessionRecord {
                 SessionJournalEvent::ProviderRequestRecorded { request } => Some(request),
                 SessionJournalEvent::Timeline(_)
                 | SessionJournalEvent::PromptAppended { .. }
+                | SessionJournalEvent::SandboxDispatchStarted { .. }
+                | SessionJournalEvent::SandboxCallRecorded { .. }
                 | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
                 | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
                 | SessionJournalEvent::MiddlewareStateUpdated { .. }
@@ -629,6 +635,12 @@ pub struct SessionSnapshot {
     pub status: SessionStatus,
     /// Pending, canceled, finished, and failed work tracked for deterministic resume.
     pub pending_work: Vec<PendingWork>,
+    /// Sandbox calls recorded by this agent version before dispatch.
+    #[serde(default)]
+    pub sandbox_calls_recorded: Vec<SandboxDispatch>,
+    /// Sandbox calls whose Execute may have reached a worker.
+    #[serde(default)]
+    pub sandbox_dispatches: Vec<SandboxDispatch>,
     /// External requests created by suspensions.
     pub external_requests: Vec<ExternalRequest>,
     /// Namespaced durable middleware state blobs.
@@ -650,6 +662,8 @@ impl SessionSnapshot {
             turns: Vec::new(),
             status: SessionStatus::Idle,
             pending_work: Vec::new(),
+            sandbox_calls_recorded: Vec::new(),
+            sandbox_dispatches: Vec::new(),
             external_requests: Vec::new(),
             middleware_state: BTreeMap::new(),
         }
@@ -721,6 +735,19 @@ impl SessionSnapshot {
             }
             SessionJournalEvent::ProviderRequestRecorded { .. } => {
                 self.status = SessionStatus::StreamingProvider;
+            }
+            SessionJournalEvent::SandboxCallRecorded { turn, tool_call_id } => {
+                self.sandbox_calls_recorded.push(SandboxDispatch {
+                    turn: *turn,
+                    tool_call_id: tool_call_id.clone(),
+                });
+            }
+            SessionJournalEvent::SandboxDispatchStarted { turn, tool_call_id } => {
+                self.sandbox_dispatches.push(SandboxDispatch {
+                    turn: *turn,
+                    tool_call_id: tool_call_id.clone(),
+                });
+                self.status = SessionStatus::RunningTool;
             }
             SessionJournalEvent::ProviderThinkingBlockRecorded { turn, block } => {
                 CompletionTurn::entry(&mut self.turns, *turn)
@@ -1011,6 +1038,10 @@ pub enum SessionJournalEvent {
     PromptAppended { prompt: String },
     /// Provider request was recorded before dispatch.
     ProviderRequestRecorded { request: RequestRecord },
+    /// A new sandbox call was recorded by this version of the agent before execution.
+    SandboxCallRecorded { turn: u64, tool_call_id: String },
+    /// Sandbox execution may have reached the worker; persist before polling Execute.
+    SandboxDispatchStarted { turn: u64, tool_call_id: String },
     /// Provider emitted a replayable thinking block.
     ProviderThinkingBlockRecorded { turn: u64, block: ThinkingBlock },
     /// Provider surfaced response metadata for the turn.
@@ -1059,6 +1090,15 @@ pub enum SessionJournalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authentication_failure: Option<AuthenticationFailure>,
     },
+}
+
+/// Identity of a sandbox call in a provider turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxDispatch {
+    /// Provider turn containing the call.
+    pub turn: u64,
+    /// Provider tool call identity.
+    pub tool_call_id: String,
 }
 
 /// Input used to resume a session.
@@ -1313,6 +1353,46 @@ mod tests {
             text: "reasoning".to_owned(),
             payload: json!({ "id": "thinking-1" }),
         }
+    }
+
+    #[test]
+    fn sandbox_dispatch_fence_is_effective_only_until_rollback() {
+        let mut record = SessionRecord::new("sandbox-fence");
+        record.append_journal_event(SessionJournalEvent::SandboxCallRecorded {
+            turn: 0,
+            tool_call_id: "call".into(),
+        });
+        let before_dispatch = record.journal.len() as u64;
+        record.append_journal_event(SessionJournalEvent::SandboxDispatchStarted {
+            turn: 0,
+            tool_call_id: "call".into(),
+        });
+        let reloaded: SessionRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert!(reloaded.effective_journal_events().iter().any(|event| matches!(event,
+            SessionJournalEvent::SandboxDispatchStarted { tool_call_id, .. } if tool_call_id == "call")));
+        assert_eq!(reloaded.snapshot().sandbox_dispatches.len(), 1);
+        record.append_journal_event(SessionJournalEvent::Rollback {
+            target: SessionRollbackTarget {
+                journal_len: before_dispatch,
+                after_cursor: None,
+                next_turn: 0,
+                remove_prompt_index: None,
+            },
+        });
+        assert!(
+            !record
+                .effective_journal_events()
+                .iter()
+                .any(|event| matches!(event, SessionJournalEvent::SandboxDispatchStarted { .. }))
+        );
+        assert!(
+            record
+                .effective_journal_events()
+                .iter()
+                .any(|event| matches!(event, SessionJournalEvent::SandboxCallRecorded { .. }))
+        );
+        assert!(record.snapshot().sandbox_dispatches.is_empty());
     }
 
     fn sample_turn_metadata() -> crate::ProviderTurnMetadata {

@@ -783,16 +783,12 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                 persistence,
                 catalog_loader,
                 authenticator,
-                |routes, config, credential_store, agent_state, event_sink| {
-                    session::add_sessions_service_with_agent_state_and_event_sink(
+                |routes, input| {
+                    Ok(session::add_sessions_service(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
-                        config,
-                        credential_store,
-                        Vec::new(),
-                        agent_state,
-                        event_sink,
-                    )
+                        input,
+                    ))
                 },
             )
             .await
@@ -964,17 +960,7 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                 config_service,
                 persistence,
                 catalog_loader,
-                |routes, config, credential_store, agent_state, event_sink| {
-                    session::add_sessions_service_with_agent_state_and_event_sink(
-                        routes,
-                        sessions,
-                        config,
-                        credential_store,
-                        Vec::new(),
-                        agent_state,
-                        event_sink,
-                    )
-                },
+                |routes, input| Ok(session::add_sessions_service(routes, sessions, input)),
             )
             .await
             .expect("test server config should load")
@@ -1149,16 +1135,13 @@ END
                 catalog_loader,
                 authenticator,
                 mcp_oauth,
-                move |routes, config, credential_store, agent_state, event_sink| {
-                    session::add_sessions_service_with_agent_state_and_event_sink(
+                move |routes, mut input| {
+                    input.trusted_mcp_oauth_origins = trusted_mcp_oauth_origin.into_iter().collect();
+                    Ok(session::add_sessions_service(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
-                        config,
-                        credential_store,
-                        trusted_mcp_oauth_origin.into_iter().collect(),
-                        agent_state,
-                        event_sink,
-                    )
+                        input,
+                    ))
                 },
             )
             .await

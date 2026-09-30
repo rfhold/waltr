@@ -21,12 +21,14 @@ before(async () => {
     "waltr:displayName": "Waltr Test",
     "waltr:slug": "waltr-test",
     "waltr:image": "registry.example.test/waltr:test",
+    "waltr:workerImage": "registry.example.test/waltr-sandbox:test",
     "waltr:authentikBaseUrl": "https://auth.example.test",
     "waltr:androidNativeRedirectUri": "dev.waltr.app:/oauth2redirect",
     "waltr:protectData": "false",
     "waltr:storageClass": "test",
     "waltr:bucketStorageClass": "test-bucket",
     "waltr:dataStorageSize": "1Gi",
+    "waltr:workspaceStorageSize": "2Gi",
     "waltr:databaseStorageSize": "1Gi",
     "waltr:s3Endpoint": "https://s3.example.test",
     "waltr:s3Prefix": "test/sessions",
@@ -368,6 +370,95 @@ describe("hosted MCP OAuth deployment", () => {
     );
   });
 
+  test("runs a credential-free sandbox worker beside the server with isolated workspace storage", () => {
+    const claim = resource(
+      "kubernetes:core/v1:PersistentVolumeClaim",
+      "waltr-workspace",
+    );
+    assert.deepEqual(claim.inputs.spec, {
+      accessModes: ["ReadWriteOnce"],
+      storageClassName: "test",
+      resources: { requests: { storage: "2Gi" } },
+    });
+
+    const deployment = resource("kubernetes:apps/v1:Deployment", "waltr");
+    const spec = deployment.inputs.spec as any;
+    assert.equal(spec.replicas, 1);
+    assert.deepEqual(spec.strategy, { type: "Recreate" });
+    const pod = spec.template.spec;
+    assert.equal(pod.securityContext.runAsUser, 65532);
+    assert.equal(pod.securityContext.runAsGroup, 65532);
+    assert.deepEqual(
+      pod.containers.map((container: any) => container.name),
+      ["waltr", "waltr-sandbox"],
+    );
+    const [server, worker] = pod.containers;
+    assert.equal(server.image, "registry.example.test/waltr:test");
+    assert.equal(worker.image, "registry.example.test/waltr-sandbox:test");
+    assert.deepEqual(server.envFrom, [{ secretRef: { name: "waltr-app" } }]);
+    assert.equal(server.env, undefined);
+    assert.equal(
+      environment().WALTR_SANDBOX_SOCKET,
+      "/run/waltr-sandbox/gateway.sock",
+    );
+    assert.equal(environment().WALTR_WORKSPACE_ROOT, "/workspace");
+    assert.deepEqual(worker.env, [
+      { name: "WALTR_SANDBOX_SOCKET", value: "/run/waltr-sandbox/gateway.sock" },
+      { name: "WALTR_SANDBOX_WORKSPACE_ROOT", value: "/workspace" },
+    ]);
+    assert.equal(worker.envFrom, undefined);
+    assert.equal(worker.securityContext.runAsNonRoot, true);
+    assert.equal(worker.securityContext.allowPrivilegeEscalation, false);
+    assert.equal(worker.securityContext.readOnlyRootFilesystem, true);
+    assert.deepEqual(worker.securityContext.capabilities.drop, ["ALL"]);
+    assert.deepEqual(worker.resources, {
+      requests: { cpu: "100m", memory: "128Mi" },
+      limits: { cpu: "500m", memory: "512Mi" },
+    });
+    assert.equal(pod.automountServiceAccountToken, false);
+
+    assert.deepEqual(
+      pod.volumes.find((volume: any) => volume.name === "sandbox-socket"),
+      { name: "sandbox-socket", emptyDir: {} },
+    );
+    assert.deepEqual(
+      pod.volumes.find((volume: any) => volume.name === "workspace"),
+      {
+        name: "workspace",
+        persistentVolumeClaim: { claimName: "waltr-workspace" },
+      },
+    );
+    assert.deepEqual(
+      pod.volumes.find((volume: any) => volume.name === "worker-tmp"),
+      { name: "worker-tmp", emptyDir: { sizeLimit: "256Mi" } },
+    );
+    assert.deepEqual(
+      server.volumeMounts.find((mount: any) => mount.name === "sandbox-socket"),
+      { name: "sandbox-socket", mountPath: "/run/waltr-sandbox" },
+    );
+    assert.deepEqual(worker.volumeMounts, [
+      { name: "sandbox-socket", mountPath: "/run/waltr-sandbox" },
+      { name: "workspace", mountPath: "/workspace" },
+      { name: "worker-tmp", mountPath: "/tmp" },
+    ]);
+    assert.equal(
+      server.volumeMounts.some((mount: any) => mount.name === "workspace"),
+      false,
+    );
+    assert.equal(
+      worker.volumeMounts.some((mount: any) =>
+        ["data", "mcp-oauth-wrapping-keys", "postgres-ca", "tmp"].includes(
+          mount.name,
+        ),
+      ),
+      false,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(worker),
+      /waltr-app|password|secret|access.key/i,
+    );
+  });
+
   test("runs Ceph session storage in single-writer mode", () => {
     const deployment = resource("kubernetes:apps/v1:Deployment", "waltr");
     const spec = deployment.inputs.spec as any;
@@ -422,12 +513,21 @@ describe("hosted MCP OAuth deployment", () => {
     );
   });
 
-  test("keeps all WALTR configuration out of non-Secret resources and outputs", () => {
+  test("keeps all WALTR configuration except worker socket paths out of non-Secret resources and outputs", () => {
     for (const candidate of resources.filter(
       (resource) => resource.type !== "kubernetes:core/v1:Secret",
     )) {
+      const inputs = structuredClone(candidate.inputs);
+      if (candidate.type === "kubernetes:apps/v1:Deployment") {
+        const worker = (inputs.spec as any).template.spec.containers[1];
+        assert.deepEqual(worker.env.map((env: any) => env.name), [
+          "WALTR_SANDBOX_SOCKET",
+          "WALTR_SANDBOX_WORKSPACE_ROOT",
+        ]);
+        delete worker.env;
+      }
       assert.doesNotMatch(
-        JSON.stringify(candidate.inputs),
+        JSON.stringify(inputs),
         /"WALTR_[A-Z0-9_]+"/,
       );
     }
@@ -456,6 +556,8 @@ describe("hosted MCP OAuth deployment", () => {
     );
     for (const stack of [preview, production]) {
       assert.doesNotMatch(stack, /^\s*waltr:image:/m);
+      assert.doesNotMatch(stack, /^\s*waltr:workerImage:/m);
+      assert.match(stack, /^\s*waltr:workspaceStorageSize: 10Gi$/m);
       assert.doesNotMatch(
         stack,
         /(?:password|secret|privateKey|accessKeyId)\s*:/i,

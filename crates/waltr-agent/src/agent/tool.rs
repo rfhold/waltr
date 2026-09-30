@@ -9,12 +9,16 @@ use crate::{
 use tokio_util::sync::CancellationToken;
 
 use super::session::SessionId;
+use crate::sandbox_gateway::PreparedSandboxCall;
 
 /// Host tool available to an agent loop.
 #[derive(Clone)]
 pub struct AgentTool {
     definition: ToolDefinition,
     handler: Arc<ToolHandler>,
+    sandbox_backed: bool,
+    #[cfg(feature = "shell")]
+    shell_config: Option<crate::shell::ShellConfig>,
 }
 
 /// Future returned by an asynchronous tool handler.
@@ -22,13 +26,14 @@ pub type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>;
 type ToolHandler = dyn Fn(ToolExecutionContext) -> ToolFuture + Send + Sync;
 
 /// Context supplied to an agent tool invocation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ToolExecutionContext {
     call: ToolCall,
     progress: ToolProgressSink,
     cancellation_token: CancellationToken,
     session_id: Option<SessionId>,
     turn: Option<u64>,
+    prepared_sandbox_call: Option<PreparedSandboxCall>,
 }
 
 impl ToolExecutionContext {
@@ -57,6 +62,7 @@ impl ToolExecutionContext {
             cancellation_token,
             session_id: None,
             turn: None,
+            prepared_sandbox_call: None,
         }
     }
 
@@ -66,6 +72,15 @@ impl ToolExecutionContext {
         self.session_id = Some(session_id);
         self.turn = Some(turn);
         self
+    }
+
+    pub(crate) fn with_prepared_sandbox_call(mut self, prepared: PreparedSandboxCall) -> Self {
+        self.prepared_sandbox_call = Some(prepared);
+        self
+    }
+
+    pub(crate) fn prepared_sandbox_call(&mut self) -> Option<PreparedSandboxCall> {
+        self.prepared_sandbox_call.take()
     }
 
     /// Return the provider tool call.
@@ -269,6 +284,9 @@ impl AgentTool {
         Self {
             definition,
             handler: Arc::new(move |context| Box::pin(std::future::ready(handler(context)))),
+            sandbox_backed: false,
+            #[cfg(feature = "shell")]
+            shell_config: None,
         }
     }
 
@@ -280,6 +298,9 @@ impl AgentTool {
         Self {
             definition,
             handler: Arc::new(handler),
+            sandbox_backed: false,
+            #[cfg(feature = "shell")]
+            shell_config: None,
         }
     }
 
@@ -291,6 +312,36 @@ impl AgentTool {
 
     pub(crate) fn call(&self, context: ToolExecutionContext) -> ToolFuture {
         (self.handler)(context)
+    }
+
+    pub(crate) fn with_sandbox_backing(mut self) -> Self {
+        self.sandbox_backed = true;
+        self
+    }
+
+    pub(crate) fn is_sandbox_backed(&self) -> bool {
+        self.sandbox_backed
+    }
+
+    #[cfg(feature = "shell")]
+    pub(crate) fn with_shell_config(mut self, config: crate::shell::ShellConfig) -> Self {
+        self.shell_config = Some(config);
+        self
+    }
+
+    pub(crate) fn shell_defaults(
+        &self,
+    ) -> Option<waltr::grpc::waltr::sandbox::v1::ShellExecutionDefaults> {
+        #[cfg(feature = "shell")]
+        if let Some(config) = &self.shell_config {
+            return Some(waltr::grpc::waltr::sandbox::v1::ShellExecutionDefaults {
+                default_workdir: config.default_workdir.to_string_lossy().into_owned(),
+                default_timeout_seconds: config.default_timeout.as_secs(),
+                default_timeout_nanos: config.default_timeout.subsec_nanos(),
+                max_output_bytes: u64::try_from(config.max_output_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        None
     }
 }
 

@@ -42,12 +42,12 @@ use waltr_agent::{
     AgentSessionRunError, AgentSessionRunSubmission, AgentSessionRuntimeError,
     AgentSessionRuntimeFactory, CredentialStore, ExternalRequestId, McpConnectionKind,
     McpConnectionResolveRequest, McpResolvedConnection, MetadataSetCondition, MetadataSetOutcome,
-    ResolvedAgent, RunConflictPolicy, SessionCoordinator, SessionCreateRequest, SessionId,
-    SessionListEvent, SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind,
-    SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
-    SessionTimelineEvent, SessionTimelineMode, SessionTimelinePresentation,
-    SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
-    SessionTimelineProjectionUpdateEvent, TimelineCursor,
+    RunConflictPolicy, SessionCoordinator, SessionCreateRequest, SessionId, SessionListEvent,
+    SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind, SessionTemplateOption,
+    SessionTemplateSearchRequest, SessionTemplateSearchTarget, SessionTimelineEvent,
+    SessionTimelineMode, SessionTimelinePresentation, SessionTimelineProjectedEvent,
+    SessionTimelineProjectionEvent, SessionTimelineProjectionUpdateEvent, TimelineCursor,
+    sandbox_gateway::SandboxHandle,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -62,16 +62,19 @@ where
 {
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
-    agent_catalog: AgentCatalogSource,
+    agent_catalog: SessionCatalogSource,
 }
 
+/// Source of selectable agent definitions for a session host.
 #[derive(Debug, Clone)]
-enum AgentCatalogSource {
+pub enum SessionCatalogSource {
+    /// Fixed catalog for a host generation.
     Static(AgentDefinitionCatalog),
+    /// Live definitions with last-known-good reload semantics.
     Dynamic(AgentDefinitionState),
 }
 
-impl AgentCatalogSource {
+impl SessionCatalogSource {
     fn catalog(&self) -> AgentDefinitionCatalog {
         match self {
             Self::Static(catalog) => catalog.clone(),
@@ -80,217 +83,93 @@ impl AgentCatalogSource {
     }
 }
 
+/// Host-owned capabilities needed to construct session runtimes.
+pub struct SessionRegistrationInput {
+    /// Root exposed to the private workspace worker.
+    pub workspace_root: PathBuf,
+    /// Server configuration snapshot source.
+    pub config: ConfigHandle,
+    /// Host credential access.
+    pub credential_store: CredentialStore,
+    /// Origins permitted for outbound MCP OAuth.
+    pub trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    /// Static or live agent definitions.
+    pub catalog: SessionCatalogSource,
+    /// Semantic session events for server coordination.
+    pub event_sink: Arc<dyn waltr_agent::SessionEventSink>,
+    /// Live private worker handle (never a local fallback).
+    pub sandbox: SandboxHandle,
+}
+
+impl std::fmt::Debug for SessionRegistrationInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionRegistrationInput")
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S> SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    /// Create a session service from a store and config handle.
+    /// Construct a session service from a store and explicit host capabilities.
     #[must_use]
-    pub fn new_with_config(
-        store: S,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origin: Option<reqwest::Url>,
-        agent_catalog: AgentDefinitionCatalog,
-    ) -> Arc<Self> {
-        Self::new_with_oauth_policy(
-            store,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origin.into_iter().collect(),
-            agent_catalog,
-        )
+    pub fn new(store: S, input: SessionRegistrationInput) -> Arc<Self> {
+        Self::from_sessions(SessionCoordinator::new(store), input)
     }
 
-    pub(crate) fn new_with_oauth_policy(
-        store: S,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_catalog: AgentDefinitionCatalog,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source(
-            SessionCoordinator::new(store),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            AgentCatalogSource::Static(agent_catalog),
-        )
-    }
-
-    /// Create a session service backed by the current successful agent-definition state.
+    /// Construct a session service from an existing coordinator and host capabilities.
     #[must_use]
-    pub fn new_with_config_and_agent_state(
-        store: S,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origin: Option<reqwest::Url>,
-        agent_state: AgentDefinitionState,
+    pub fn from_sessions(
+        sessions: SessionCoordinator<S>,
+        input: SessionRegistrationInput,
     ) -> Arc<Self> {
-        Self::new_with_oauth_policy_and_agent_state(
-            store,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origin.into_iter().collect(),
-            agent_state,
-        )
-    }
-
-    pub(crate) fn new_with_oauth_policy_and_agent_state(
-        store: S,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_state: AgentDefinitionState,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source(
-            SessionCoordinator::new(store),
+        let SessionRegistrationInput {
+            workspace_root,
             config,
             credential_store,
             trusted_mcp_oauth_origins,
-            AgentCatalogSource::Dynamic(agent_state),
-        )
-    }
-
-    /// Create a session service from an existing session coordinator and config handle.
-    #[must_use]
-    pub fn from_sessions_with_config(
-        sessions: SessionCoordinator<S>,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origin: Option<reqwest::Url>,
-        agent_catalog: AgentDefinitionCatalog,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source(
-            sessions,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origin.into_iter().collect(),
-            AgentCatalogSource::Static(agent_catalog),
-        )
-    }
-
-    pub(crate) fn from_sessions_with_oauth_policy(
-        sessions: SessionCoordinator<S>,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_catalog: AgentDefinitionCatalog,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source(
-            sessions,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            AgentCatalogSource::Static(agent_catalog),
-        )
-    }
-
-    /// Create a session service from an existing coordinator and live agent-definition state.
-    #[must_use]
-    pub fn from_sessions_with_config_and_agent_state(
-        sessions: SessionCoordinator<S>,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origin: Option<reqwest::Url>,
-        agent_state: AgentDefinitionState,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_oauth_policy_and_agent_state(
-            sessions,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origin.into_iter().collect(),
-            agent_state,
-        )
-    }
-
-    pub(crate) fn from_sessions_with_oauth_policy_and_agent_state(
-        sessions: SessionCoordinator<S>,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_state: AgentDefinitionState,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source(
-            sessions,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            AgentCatalogSource::Dynamic(agent_state),
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "runtime construction receives independent session and host policy dependencies"
-    )]
-    fn from_sessions_with_catalog_source(
-        sessions: SessionCoordinator<S>,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_catalog: AgentCatalogSource,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source_and_root(
-            sessions,
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_catalog,
-            default_root(),
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "runtime construction receives independent session and host policy dependencies"
-    )]
-    fn from_sessions_with_catalog_source_and_root(
-        sessions: SessionCoordinator<S>,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_catalog: AgentCatalogSource,
-        workspace_root: PathBuf,
-    ) -> Arc<Self> {
+            catalog: agent_catalog,
+            event_sink,
+            sandbox,
+        } = input;
         let current_catalog = agent_catalog.catalog();
         let default_agent_definition = current_catalog
             .resolved(current_catalog.default_agent_name())
             .expect("catalog default agent must be present")
             .clone();
-        let runtime_factory = runtime_factory(
-            workspace_root.clone(),
+        let runtime_factory = AgentSessionRuntimeFactory::new(
+            sandbox,
+            workspace_root,
             credential_store,
-            trusted_mcp_oauth_origins,
             default_agent_definition,
-            &agent_catalog,
-            config.clone(),
         );
-        let sessions = sessions.with_runtime_factory(runtime_factory);
+        let runtime_factory = match &agent_catalog {
+            SessionCatalogSource::Static(catalog) => {
+                runtime_factory.with_agent_catalog(catalog.clone())
+            }
+            SessionCatalogSource::Dynamic(state) => {
+                let state = state.clone();
+                runtime_factory
+                    .with_agent_catalog_provider(move || state.snapshot().catalog().clone())
+            }
+        };
+        let resolver_config = config.clone();
+        let runtime_factory = runtime_factory
+            .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins)
+            .with_mcp_connection_resolver(move |request| {
+                let config = resolver_config.clone();
+                Box::pin(async move { resolve_mcp_connections(&config.load().await, request) })
+            });
+        let sessions = sessions
+            .with_session_event_sink(event_sink)
+            .with_runtime_factory(runtime_factory);
         Arc::new(Self {
             sessions,
             config,
             agent_catalog,
         })
-    }
-
-    pub(crate) fn new_with_explicit_root_and_agent_state(
-        store: S,
-        workspace_root: PathBuf,
-        config: ConfigHandle,
-        credential_store: CredentialStore,
-        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-        agent_state: AgentDefinitionState,
-        event_sink: Arc<dyn waltr_agent::SessionEventSink>,
-    ) -> Arc<Self> {
-        Self::from_sessions_with_catalog_source_and_root(
-            SessionCoordinator::new(store).with_session_event_sink(event_sink),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            AgentCatalogSource::Dynamic(agent_state),
-            workspace_root,
-        )
     }
 
     async fn load_config(&self) -> Configuration {
@@ -1374,40 +1253,6 @@ fn push_history(
     }
 }
 
-fn default_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "runtime factory policy is supplied by independent server-owned capabilities"
-)]
-fn runtime_factory(
-    workspace_root: PathBuf,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    default_agent_definition: ResolvedAgent,
-    agent_catalog: &AgentCatalogSource,
-    config: ConfigHandle,
-) -> AgentSessionRuntimeFactory {
-    let factory =
-        AgentSessionRuntimeFactory::new(workspace_root, credential_store, default_agent_definition);
-    let factory = match agent_catalog {
-        AgentCatalogSource::Static(catalog) => factory.with_agent_catalog(catalog.clone()),
-        AgentCatalogSource::Dynamic(state) => {
-            let state = state.clone();
-            factory.with_agent_catalog_provider(move || state.snapshot().catalog().clone())
-        }
-    };
-    factory
-        .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins)
-        // TODO: This feels like it should be a similar catalog like the agents catalog
-        .with_mcp_connection_resolver(move |request| {
-            let config = config.clone();
-            Box::pin(async move { resolve_mcp_connections(&config.load().await, request) })
-        })
-}
-
 fn resolve_mcp_connections(
     config: &Configuration,
     request: McpConnectionResolveRequest,
@@ -1468,7 +1313,7 @@ mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         fs,
-        time::Duration,
+        sync::Arc,
     };
 
     use waltr::grpc::waltr::config::v1::{Configuration, McpServer, McpServerType, Provider};
@@ -1487,7 +1332,31 @@ mod tests {
         config::ConfigHandle,
     };
 
-    use super::{GeneratedSessionService, SessionService, resolve_mcp_connections};
+    use super::{
+        GeneratedSessionService, SessionCatalogSource, SessionRegistrationInput, SessionService,
+        resolve_mcp_connections,
+    };
+
+    async fn test_input(
+        root: &std::path::Path,
+        catalog: SessionCatalogSource,
+    ) -> (SessionRegistrationInput, crate::sandbox::LocalSandbox) {
+        let sandbox = crate::sandbox::LocalSandbox::start(root.to_path_buf())
+            .await
+            .unwrap();
+        (
+            SessionRegistrationInput {
+                workspace_root: root.to_path_buf(),
+                config: config_handle(),
+                credential_store: credential_store(root),
+                trusted_mcp_oauth_origins: Vec::new(),
+                catalog,
+                event_sink: Arc::new(crate::routine::EventBus::default()),
+                sandbox: sandbox.handle(),
+            },
+            sandbox,
+        )
+    }
 
     fn agent_source(name: &str, description: &str) -> String {
         format!(
@@ -1663,13 +1532,9 @@ mod tests {
     async fn dynamic_list_agents_tracks_valid_state_and_keeps_last_known_good() {
         let directory = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&directory, &[], "coding").unwrap();
-        let service = SessionService::new_with_config_and_agent_state(
-            MemorySessionStore::new(),
-            config_handle(),
-            credential_store(&directory),
-            None,
-            state.clone(),
-        );
+        let (input, sandbox) =
+            test_input(&directory, SessionCatalogSource::Dynamic(state.clone())).await;
+        let service = SessionService::new(MemorySessionStore::new(), input);
         let initial = service
             .list_agents(Request::new(ListAgentsRequest {}))
             .await
@@ -1702,27 +1567,21 @@ mod tests {
         assert_eq!(current.default_agent_name, "coding");
         assert!(current.agents.iter().any(|agent| agent.name == "later"));
 
-        let watcher = state.spawn_watcher().unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         fs::write(
             directory.join(".waltr/resources/agents/later.yaml"),
             "kind: [",
         )
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.reload_error().is_none() {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("invalid edit is observed");
+        state.reload_from_disk().await;
+        assert!(state.reload_error().is_some());
         let last_known_good = service
             .list_agents(Request::new(ListAgentsRequest {}))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(last_known_good, current);
-        watcher.shutdown().await.unwrap();
+        super::super::SessionHost::shutdown(service.as_ref()).await;
+        sandbox.shutdown().await;
     }
 
     #[tokio::test]
@@ -1733,13 +1592,9 @@ mod tests {
         fs::write(&external_path, &external_source).unwrap();
         let state = AgentDefinitionState::load(&directory, &[external_path], "coding").unwrap();
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let service = SessionService::from_sessions_with_config_and_agent_state(
-            sessions.clone(),
-            config_handle(),
-            credential_store(&directory),
-            None,
-            state.clone(),
-        );
+        let (input, sandbox) =
+            test_input(&directory, SessionCatalogSource::Dynamic(state.clone())).await;
+        let service = SessionService::from_sessions(sessions.clone(), input);
         let before = super::super::SessionHost::create(service.as_ref(), None)
             .await
             .unwrap();
@@ -1772,6 +1627,8 @@ mod tests {
             before_bundle,
             "passive replacement must not rebase an existing record"
         );
+        super::super::SessionHost::shutdown(service.as_ref()).await;
+        sandbox.shutdown().await;
     }
 
     #[tokio::test]
@@ -1779,13 +1636,9 @@ mod tests {
         let directory = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&directory, &[], "coding").unwrap();
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let service = SessionService::from_sessions_with_config_and_agent_state(
-            sessions.clone(),
-            config_handle(),
-            credential_store(&directory),
-            None,
-            state.clone(),
-        );
+        let (input, sandbox) =
+            test_input(&directory, SessionCatalogSource::Dynamic(state.clone())).await;
+        let service = SessionService::from_sessions(sessions.clone(), input);
         let created = service
             .create_session(Request::new(CreateSessionRequest::default()))
             .await
@@ -1824,19 +1677,16 @@ mod tests {
         assert!(bundle.sources.contains(&source));
         assert_eq!(audit.old_name, "coding");
         assert_eq!(audit.new_name, "later");
+        super::super::SessionHost::shutdown(service.as_ref()).await;
+        sandbox.shutdown().await;
     }
 
     #[tokio::test]
     async fn static_service_constructor_preserves_default_agent_labeling() {
         let directory = crate::test_support::temp_root();
         let catalog = crate::test_support::default_agent_catalog();
-        let service = SessionService::new_with_config(
-            MemorySessionStore::new(),
-            config_handle(),
-            credential_store(&directory),
-            None,
-            catalog,
-        );
+        let (input, sandbox) = test_input(&directory, SessionCatalogSource::Static(catalog)).await;
+        let service = SessionService::new(MemorySessionStore::new(), input);
 
         let response = service
             .list_agents(Request::new(ListAgentsRequest {}))
@@ -1846,5 +1696,7 @@ mod tests {
 
         assert_eq!(response.default_agent_name, "coding");
         assert!(response.agents.iter().any(|agent| agent.name == "coding"));
+        super::super::SessionHost::shutdown(service.as_ref()).await;
+        sandbox.shutdown().await;
     }
 }

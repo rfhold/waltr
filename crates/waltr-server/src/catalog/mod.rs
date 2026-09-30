@@ -153,6 +153,10 @@ impl Default for CatalogRequestTimeouts {
 }
 
 impl CatalogLoader {
+    pub(crate) fn cache_path(&self) -> &std::path::Path {
+        &self.cache_path
+    }
+
     /// Create a loader from `WALTR_MODELS_DEV_PATH`, `WALTR_MODELS_DEV_URL`, or defaults.
     #[must_use]
     pub fn from_env() -> Self {

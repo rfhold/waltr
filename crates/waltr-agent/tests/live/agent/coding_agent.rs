@@ -7,18 +7,18 @@ use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT,
     ExternalRequest, ExternalRequestKind, ExternalResponse, LlmError, LlmStream,
     MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy, ResumeInput,
-    SessionCoordinator, SessionId, SessionRecord, SessionStore, TimelineContent, TimelineEventKind,
-    TimelineStatus,
+    SessionCoordinator, SessionId, SessionRecord, SessionStore, SkillsConfig, TimelineContent,
+    TimelineEventKind, TimelineStatus,
     tools::{
         filesystem::{FilesystemConfig, FilesystemToolProfile},
-        filesystem_skills::SkillsConfig,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
     },
 };
 use serde_json::json;
 
 use crate::{
-    live_provider, scripted_provider::CapturingProvider, session::TEST_HARNESS_SYSTEM_PROMPT,
+    live_provider, sandbox::TestSandbox, scripted_provider::CapturingProvider,
+    session::TEST_HARNESS_SYSTEM_PROMPT,
 };
 
 #[tokio::test]
@@ -41,11 +41,13 @@ async fn run_live_coding_agent(
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
     let fixture = CodingAgentFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(CapturingProvider::new(provider));
     let store = MemorySessionStore::new();
     let policy =
         PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask());
     let agent = AgentRuntime::builder(model, Arc::clone(&provider))
+        .with_sandbox(sandbox.handle())
         .with_system_prompt("You are a coding agent validating durable middleware execution.")
         .with_permission_policy(policy)
         .with_filesystem_tools(
@@ -152,6 +154,7 @@ async fn run_live_coding_agent(
         );
     }
 
+    sandbox.disconnect();
     Ok(())
 }
 

@@ -39,7 +39,7 @@ pub use session::{
     OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
     OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, ReplacementUserContent,
     RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput,
-    S3SessionStore, S3SessionWriteMode, ScyllaSessionStore, SessionCapabilities,
+    S3SessionStore, S3SessionWriteMode, SandboxDispatch, ScyllaSessionStore, SessionCapabilities,
     SessionCaptureError, SessionCaptureLimits, SessionCompletionCoordinationFuture,
     SessionCompletionCoordinationHandler, SessionCompletionCoordinationPreparation,
     SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
@@ -74,6 +74,7 @@ pub struct AgentRuntime {
     pub(super) retry_config: ProviderRetryConfig,
     pub(super) template_base_dir: Option<std::path::PathBuf>,
     pub(super) max_provider_turns: Option<u64>,
+    pub(super) sandbox: Option<crate::sandbox_gateway::SandboxHandle>,
 }
 
 impl AgentRuntime {
@@ -384,7 +385,7 @@ mod tests {
 
         let agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider)).build();
 
-        assert_eq!(agent.middleware_chain.len(), 3);
+        assert_eq!(agent.middleware_chain.len(), 2);
     }
 
     #[test]
@@ -400,8 +401,8 @@ mod tests {
             .with_middleware_chain(chain)
             .build();
 
-        assert_eq!(agent.middleware_chain.len(), 4);
-        assert_eq!(chain_agent.middleware_chain.len(), 4);
+        assert_eq!(agent.middleware_chain.len(), 3);
+        assert_eq!(chain_agent.middleware_chain.len(), 3);
     }
 
     #[test]
@@ -416,6 +417,7 @@ mod tests {
         );
         assert!(
             AgentRuntime::builder(model, Arc::new(TextOnlyProvider))
+                .with_sandbox(crate::sandbox_gateway::SandboxGateway::new("test".into()).handle())
                 .with_filesystem_tools(FilesystemConfig::new("."))
                 .build()
                 .tools()

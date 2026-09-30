@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, timeout};
 
+use crate::sandbox::TestSandbox;
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -52,7 +53,7 @@ async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Resu
             }
         },
     )));
-    let runs = task_sessions(provider.clone(), 1);
+    let (runs, _sandbox, _root) = task_sessions(provider.clone(), 1).await;
     let parent_id = SessionId::new("ephemeral");
     let agent_definition = task_agent_definition();
     let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
@@ -160,7 +161,7 @@ async fn task_tool_default_depth_blocks_subagents_from_spawning_tasks() -> waltr
             }
         },
     )));
-    let runs = task_sessions(provider.clone(), 1);
+    let (runs, _sandbox, _root) = task_sessions(provider.clone(), 1).await;
     let parent_id = SessionId::new("ephemeral");
     let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
     request.inference_settings = Some(test_inference_settings());
@@ -239,7 +240,7 @@ async fn task_tool_max_depth_allows_configured_nested_subagent() -> waltr_agent:
             }
         },
     )));
-    let runs = task_sessions(provider.clone(), 2);
+    let (runs, _sandbox, _root) = task_sessions(provider.clone(), 2).await;
     let parent_id = SessionId::new("ephemeral");
     let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
     request.inference_settings = Some(test_inference_settings());
@@ -273,7 +274,7 @@ async fn task_tool_max_depth_allows_configured_nested_subagent() -> waltr_agent:
 #[allow(clippy::too_many_lines)]
 async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Result<()> {
     let provider = Arc::new(AsyncTaskProvider::new());
-    let runs = task_sessions(provider.clone(), 1);
+    let (runs, _sandbox, _root) = task_sessions(provider.clone(), 1).await;
 
     let parent_id = SessionId::new("parent");
     let parent_definition = task_agent_definition();
@@ -408,7 +409,7 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
 #[allow(clippy::too_many_lines)]
 async fn async_task_callbacks_coalesce_while_parent_is_active() -> waltr_agent::Result<()> {
     let provider = Arc::new(AsyncTaskProvider::new());
-    let runs = task_sessions(provider.clone(), 1);
+    let (runs, _sandbox, _root) = task_sessions(provider.clone(), 1).await;
 
     let parent_id = SessionId::new("parent");
     let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
@@ -527,21 +528,32 @@ async fn task_progress_events(
         .collect())
 }
 
-fn task_sessions<P>(
+async fn task_sessions<P>(
     provider: Arc<P>,
     max_subagent_depth: usize,
-) -> SessionCoordinator<MemorySessionStore>
+) -> (
+    SessionCoordinator<MemorySessionStore>,
+    TestSandbox,
+    tempfile::TempDir,
+)
 where
     P: LlmStream + 'static,
 {
+    let root = tempfile::tempdir().expect("task workspace");
+    let sandbox = TestSandbox::new(root.path()).await;
     let environment = AgentSessionRuntimeFactory::new(
-        std::env::temp_dir(),
-        FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-task-test-auth.json")),
+        sandbox.handle(),
+        root.path().to_path_buf(),
+        FileCredentialStore::new(root.path().join("auth.json")),
         crate::agent_definitions::task_agent(max_subagent_depth),
     )
     .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(test_model(), provider.clone())));
 
-    SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
+    (
+        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment),
+        sandbox,
+        root,
+    )
 }
 
 fn test_inference_settings() -> InferenceSettings {

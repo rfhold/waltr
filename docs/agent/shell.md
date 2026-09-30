@@ -1,8 +1,8 @@
 # Shell Tool
 
-The shell tool gives an agent controlled access to local shell command execution. It is an optional `waltr-agent` feature and is not available unless the crate is built with the `shell` feature and the host enables the tool through `AgentBuilder`.
+The shell tool gives an agent policy-controlled access to local shell command execution. The agent owns the schema and permissions; `waltr-agent-sandbox` executes commands through the private worker. Both crates require the `shell` feature and the host must enable the tool through `AgentBuilder`. See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
 
-The standalone server and embedded desktop app retain this feature. Their shell has no operating-system sandbox. Android is compiled without it.
+The standalone server and embedded desktop app retain this feature. Their worker runs in the server process without operating-system isolation. Android is compiled without it.
 
 Every host loads the same ordinary catalog. A no-shell build accepts, exposes, and resolves shell-bearing definitions, but runtime construction does not install the shell tool or feature-derived shell tool permissions.
 
@@ -10,19 +10,19 @@ Every host loads the same ordinary catalog. A no-shell build accepts, exposes, a
 
 | API | Purpose |
 | --- | --- |
-| Cargo feature `shell` | Enables shell modules and tree-sitter bash parsing dependencies. |
+| Cargo feature `shell` | Enables agent shell schemas and worker-side tree-sitter bash scanning/execution. |
 | `AgentBuilder::with_shell_tool` | Adds the provider-facing `shell` tool. |
 | `AgentBuilder::with_shell_system_prompt` | Adds shell usage guidance to the system prompt. |
-| `ShellConfig` | Configures root, timeout, and output limits. |
+| `ShellConfig` | Configures root, default workdir, timeout, and output limits; overrides are sent to the worker. |
 | `ShellInput` | Provider-facing command input. |
-| `ShellScan` and `ParsedShellCommand` | Parser output used for permission claims and command hints. |
+| `ShellScan` and `ParsedShellCommand` | Agent-side parser types for command hints; worker supplies claims for runtime decisions. |
 
 ## Execution Behavior
 
-The provider sees a single tool named `shell`. Tool calls execute through:
+The provider sees a single tool named `shell`. Approved calls execute in the workspace worker after worker preparation, host permission evaluation, and a durable dispatch fence. Standalone containers run it in the separate worker image; embedded hosts run it in-process. The worker wraps the command with signal cleanup and invokes Bash with `-lc`:
 
 ```text
-/bin/bash -lc <command>
+/bin/bash -lc <wrapped command>
 ```
 
 Current behavior:
@@ -36,11 +36,11 @@ Current behavior:
 - Timed-out processes are killed and reported with timeout metadata.
 - Nonzero exit status is returned as normal tool output, not as a Rust error.
 
-Relative working directories resolve from the configured root. Absolute working directories are normalized by the shell path helper.
+Without an explicit `workdir`, commands use the configured default workdir (the root unless overridden; a relative default is rooted there). An explicit relative `workdir` resolves from the root, **not** from that default; an explicit absolute `workdir` is normalized by the worker. The worker uses configured timeout and output-limit overrides for execution.
 
 ## Parsing And Permission Claims
 
-The shell feature uses tree-sitter bash to inspect commands before execution. The parser finds simple and nested commands, then permission helpers derive claims for:
+The worker's shell feature uses tree-sitter bash to inspect commands before execution. The parser finds simple and nested commands, then permission helpers derive claims for:
 
 - Shell command execution.
 - Directory changes from commands such as `cd` and `pushd`.
@@ -51,27 +51,28 @@ Some shell constructs cannot be safely inferred. Dynamic paths containing shell 
 
 ## Safety Boundaries
 
-The shell tool is a local command runner, not a sandbox.
+The worker is a local command runner, not an OS sandbox. Private RPC separates tool ownership but does not reduce operating-system authority.
 
 - There is no chroot, container, seccomp, or PTY sandbox.
-- The embedded desktop server runs shell commands with the app process's operating-system authority.
+- The embedded desktop worker runs shell commands with the app process's operating-system authority.
 - Android exposes no shell tool. Shell-bearing resource source remains valid and inspectable, but shell feature selectors produce no runtime tool permission rules.
 - Interactive command handling is not implemented.
 - Shell output progress is display-only timeline data; provider replay still receives the final tool result.
 - Environment configuration is not exposed through `ShellConfig` today.
-- Durable allow-once or allow-always approvals are not implemented in the agent loop.
+- A dispatched call with unknown outcome suspends awaiting tool results; it is not automatically re-executed on restart.
 
 Hosts should configure explicit `PermissionPolicy` rules for shell use. The parser improves permission decisions, but it cannot prove all side effects of arbitrary shell code.
 
 ## Tests
 
-See [../testing.md](../testing.md) for canonical test commands. Shell tests require `--features shell`.
+See [../testing.md](../testing.md) for canonical test commands. Agent shell tests require `--features shell`; server shell builds enable both agent and worker features.
 
 Focused coverage:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/waltr-agent/src/tools/shell/mod.rs](../../crates/waltr-agent/src/tools/shell/mod.rs) | Unit coverage for shell parsing, permissions, and execution. |
+| [../../crates/waltr-agent/src/tools/shell/mod.rs](../../crates/waltr-agent/src/tools/shell/mod.rs) | Agent-side shell schema and parser unit coverage. |
+| [../../crates/waltr-agent-sandbox/src/shell.rs](../../crates/waltr-agent-sandbox/src/shell.rs) | Worker-side shell parsing, claims, and execution. |
 | [../../crates/waltr-agent/tests/agent/permissions.rs](../../crates/waltr-agent/tests/agent/permissions.rs) | Deterministic permission behavior with shell claims when the feature is enabled. |
 | [../../crates/waltr-agent/tests/live/agent/shell.rs](../../crates/waltr-agent/tests/live/agent/shell.rs) | Ignored live-provider shell coverage. |
 
@@ -81,8 +82,4 @@ Focused coverage:
 | --- | --- |
 | [../../crates/waltr-agent/Cargo.toml](../../crates/waltr-agent/Cargo.toml) | `shell` feature declaration. |
 | [../../crates/waltr-agent/src/tools/shell/config.rs](../../crates/waltr-agent/src/tools/shell/config.rs) | Shell configuration and input types. |
-| [../../crates/waltr-agent/src/tools/shell/execute.rs](../../crates/waltr-agent/src/tools/shell/execute.rs) | Process execution, timeout, and output capture. |
-| [../../crates/waltr-agent/src/tools/shell/formatting.rs](../../crates/waltr-agent/src/tools/shell/formatting.rs) | Tool result formatting. |
-| [../../crates/waltr-agent/src/tools/shell/parser.rs](../../crates/waltr-agent/src/tools/shell/parser.rs) | Tree-sitter bash parsing. |
-| [../../crates/waltr-agent/src/tools/shell/permissions.rs](../../crates/waltr-agent/src/tools/shell/permissions.rs) | Shell permission claim construction. |
-| [../../crates/waltr-agent/src/tools/shell/path.rs](../../crates/waltr-agent/src/tools/shell/path.rs) | Working-directory normalization. |
+| [../../crates/waltr-agent-sandbox/src/wire.rs](../../crates/waltr-agent-sandbox/src/wire.rs) | Worker RPC defaults including configured shell overrides. |

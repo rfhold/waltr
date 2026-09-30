@@ -1,6 +1,6 @@
 # Agent
 
-Waltr agent architecture keeps model interaction, prompt assembly, tool execution, permissions, middleware, and durable session replay in `crates/waltr-agent/`. The crate is an isolated library: it can be used by hosts, tests, or future runtimes without depending on the server, shared client, TUI, or web layers.
+Waltr agent architecture keeps model interaction, prompt assembly, permission policy, middleware, and durable session replay in `crates/waltr-agent/`. Workspace operations execute in `crates/waltr-agent-sandbox/`, not in the agent host. The agent remains a library independent of the server, shared client, TUI, and web layers.
 
 ## Responsibilities
 
@@ -12,10 +12,11 @@ Waltr agent architecture keeps model interaction, prompt assembly, tool executio
 | Provider adapters | OpenAI and Anthropic request encoding, streaming, parsing, and provider-specific continuation data. |
 | Agent loop | Turn progression, provider streaming, timeline events, tool execution, permission checks, and host-facing `AgentTimelineEvent` output. |
 | Host primitives | Structured session creation, per-run provider-turn limits, conditional metadata updates, and post-durable session events. |
-| Tools | Built-in filesystem, question, skills, task, MCP, and optional shell tool integration. |
+| Tools | Provider-facing filesystem and optional shell schemas, worker-backed execution, plus question, skills, task, and MCP integration. |
 | Permissions | Generic permission claims, resource matching, policy evaluation, and allow/ask/deny behavior before tool execution. |
-| Middleware | Request construction hooks, prompt assembly, tool visibility and metadata, claims, skills, `AGENTS.md`, and suspension hooks. |
+| Middleware | Request construction hooks, prompt assembly, tool visibility and metadata, worker-backed context, skills, `AGENTS.md`, and suspension hooks. |
 | Durable sessions | Event-sourced session records, snapshots, suspensions, resume inputs, and storage backends. |
+| Sandbox worker | Filesystem, patch, optional shell execution, workspace reads/searches/snapshots, and skill file I/O in `crates/waltr-agent-sandbox/`. |
 
 ## Boundaries
 
@@ -25,14 +26,28 @@ Adjacent layers should treat the agent as a hostable capability:
 
 | Layer | Relationship To Agent |
 | --- | --- |
-| Server | Hosts and coordinates agent sessions through `SessionCoordinator`, while server state, authorization, and RPC/MCP contracts stay outside the agent crate. |
+| Server | Hosts and coordinates agent sessions through `SessionCoordinator`; owns the private worker gateway and transport, while public authorization and RPC/MCP contracts stay outside the agent crate. |
 | Shared client | May render or control server-exposed agent state, but shared client reducers stay outside the agent crate. |
 | Web and TUI | May present agent output, prompts, approvals, and session state, but UI routing and rendering stay outside the agent crate. |
 | Tests | Exercise the agent directly through scripted providers, live providers, tools, and storage backends. |
 
 The agent crate owns provider-neutral domain types and host-tool contracts. Hosts own policy choices, UI presentation, server APIs, process lifecycle, and runtime wiring around the library.
 
-Hosts inject the workspace root when they construct the session runtime factory. Agent and MCP runtime code does not introspect a production workspace root from process state.
+Hosts inject the workspace root and a required `SandboxHandle` when constructing the session runtime factory. The worker reports its canonical root; runtime construction uses it for workspace-relative prompts and permissions. Agent and MCP runtime code does not introspect a production workspace root from process state.
+
+## Private Workspace Boundary
+
+`waltr-agent` owns providers, session journals, permission policy, prompt assembly, and the agent loop. `SandboxGateway` in `crates/waltr-agent/src/sandbox_gateway.rs` hosts a private bidirectional `waltr.sandbox.v1.SandboxService/Connect` stream. The worker in `crates/waltr-agent-sandbox/` owns workspace I/O and execution tickets. Embedded desktop and Android hosts run the gateway and worker as tasks in the same process, using Tonic over `tokio::io::duplex`; they do not consult standalone sandbox environment variables. Standalone hosts may run a separate worker process/container: the server listens on a local Unix domain socket shared only with that worker, and the worker connects to the gateway there. Neither mode exposes `SandboxService` on public HTTP/gRPC routes or on a TCP listener. The process-local mode is not OS isolation; a sidecar can separate filesystem mounts and process authority, but a shared Kubernetes pod network is not network isolation. See [deployment](../deployment.md#workspace-worker-deployment) for the socket, mounts, and environment contract.
+
+The worker must report its canonical root before agent runtime construction and readiness. Startup fails if the required worker cannot connect or its root is unusable; `/ready` fails when the worker disconnects and recovers after the same worker reconnects. `/health` remains process liveness, not proof of worker availability. A lost stream does not restart an accepted operation, and a replacement worker/process cannot recover the old worker's in-memory tickets, running work, or replies. There is no host-side workspace execution fallback.
+
+For a sandbox-backed tool the loop first records the provider tool call, then `SandboxCallRecorded`. Whole-tool permission runs before prepare; the worker's `Prepare` validates arguments and returns resource claims and an opaque ticket. After the complete pre-tool middleware chain and the final claim/input permission decision, deny or ask cancels the unused ticket. On allow, the loop durably appends `SandboxDispatchStarted` *before* polling `Execute`. The worker consumes the single-use ticket for exactly the prepared invocation and arguments, rechecks paths/claims, and sends correlated progress and completion. Disconnect, cancellation, and lost replies do not fall back to host-side execution. A transport error after dispatch is not turned into a provider-visible tool error because the side effect might already have occurred.
+
+The gateway holds a bounded in-memory queue across stream disconnects. The same living worker keeps running accepted work and automatically resends outstanding replies when it reconnects; the host matches IDs and ignores duplicate or late replies, without querying worker status or resending an uncertain Execute. Prepare and workspace requests have 30-second host delivery deadlines, and Execute has a 60-second deadline for non-shell tools or a deadline derived from the configured shell timeout. The worker has its own per-request execution bound. If no reply arrives by the host deadline, the request times out; a timeout does not prove a side effect did not happen. Gateway state is lost on server process death; tickets and unsent results are lost on worker process death. Known worker tool errors return normal provider-visible error results, while an unresolved provider-facing Execute timeout has an uncertain outcome and suspends instead. On resume, a pending sandbox call with a dispatch fence (or a legacy pending call with no recorded pre-dispatch marker) is unknown, not retryable: the session suspends awaiting tool results. A recorded call without a dispatch fence may retry after a pending permission response. Explicit external tool results can resolve pending work; a new prompt can supersede it through the ordinary interrupted-turn path. The two journal events are replayed from the rollback-effective journal; no migration or backfill is installed for old sessions. Provider dispatch remains retry-the-turn as described under durable sessions; the fence applies to provider-facing workspace tool execution, not provider requests or prompt templates.
+
+The worker also handles read-only workspace context requests (`info`, `resolve`, `read`, `list`/`glob`, `search`/`grep`, ranked and bounded `search_files`, `skills`, `skill`) and bounded `snapshot` walks. Filesystem prompt snapshots are opt-in, not part of every runtime. Workspace-derived prompt snapshots, `AGENTS.md`, `@file` templates, `/skill` templates, skills, and server workspace context use the worker rather than locally reading the workspace. Worker glob results are capped at 1,024 and explicitly mark truncation; ordinary search excludes ignored files but makes a narrow exception to discover hidden `.agents/skills` trees. Context requests do not grant a provider-facing mutating tool. Server startup checks only known configured host-owned paths against the workspace root; it does not recursively scan the workspace. Host-owned catalog, persistence, and server configuration still belong to the server. See [Filesystem Tools](../agent/filesystem.md), [Shell Tool](../agent/shell.md), and [Skills](../agent/skills.md).
+
+Prompt templates are a separate dispatch path. Sandbox-backed `@tool(...)` references, including nested and runtime instruction templates, use the same whole-tool and claim-based permissions and worker Prepare/Execute path as provider-facing calls. A successful result is included in the rendered prompt; a worker error or delivery timeout becomes a template tool error. Completed sandbox results are retained across permission suspensions within one submitted prompt batch and cleared once the entire rendered batch is durably accepted. There is no template dispatch fence: a fresh render invokes the tool again, even if a previous attempt timed out after performing a side effect. Other tool templates retain their existing permission Ask/suspension and replay behavior. For user templates the submitted source prompt is held in durable middleware state while rendering; the rendered prompt is appended only after the batch succeeds. See [MCP prompt discovery](../agent/mcp.md#prompt-discovery).
 
 All server hosts load the same ordinary agent definitions from the unified catalog. Build capabilities control which configured tools runtime construction can install: shell-enabled builds install a configured shell tool, while builds without the `shell` feature keep shell-bearing definitions inspectable and loadable but omit the shell tool and feature-derived shell tool permissions.
 
@@ -179,7 +194,9 @@ flowchart TD
     Middleware[Middleware chain]
     Provider[LlmStream provider]
     Policy[PermissionPolicy]
-    Tools[Agent tools]
+    Tools[Other agent and MCP tools]
+    WorkspaceTools[Filesystem and shell tools]
+    Worker[Private sandbox worker]
     Store[SessionStore]
 
     Host -->|prompt or resume input| Agent
@@ -189,6 +206,10 @@ flowchart TD
     Agent -->|tool call| Policy
     Policy -->|allow, ask, or deny| Agent
     Agent -->|allowed call| Tools
+    Agent -->|workspace tool call| WorkspaceTools
+    WorkspaceTools -->|private prepare and execute| Worker
+    Worker -->|claims, progress, result| WorkspaceTools
+    WorkspaceTools -->|ToolResult| Agent
     Tools -->|ToolResult| Agent
     Agent -->|timeline and journal records| Store
     Agent -->|AgentTimelineEvent stream| Host
@@ -220,11 +241,11 @@ Built-in tool areas:
 
 | Tool Area | Purpose |
 | --- | --- |
-| `tools::filesystem` | Controlled file operations rooted in configured workspace paths. |
+| `tools::filesystem` | Provider-facing schemas for worker-executed file operations. |
 | `tools::question` | Structured external questions that suspend the run until a host answer is provided. |
-| `tools::skills` | Agent skill discovery and loading. |
+| `tools::skills` | Agent skill metadata and rendering; worker-backed discovery and loading. |
 | `tools::task` | Task-oriented agent tool support. |
-| `tools::shell` | Optional shell execution tool behind the `shell` feature. |
+| `tools::shell` | Optional shell schema and hints behind the `shell` feature; worker executes commands. |
 | `mcp` | Waltr-side Model Context Protocol integration exposed as agent tools and templates. |
 
 Tool execution passes through generic permission claims. Tools and middleware describe requested operations as `PermissionClaim` values, and `PermissionPolicy` evaluates those claims by tool selector, operation class, filesystem path, shell command, or resource pattern.
@@ -315,7 +336,7 @@ Crash recovery is retry-the-turn. The request is journaled before provider dispa
 
 ## Dependencies
 
-The agent crate depends on provider, storage, protocol, and async infrastructure crates such as `reqwest`, `tokio`, `mcp`, `opendal`, `aws-sdk-s3`, `scylla`, `tokio-postgres`, and provider protocol helpers. The optional `shell` feature adds shell parsing dependencies through `tree-sitter` and `tree-sitter-bash`.
+The agent crate depends on provider, storage, protocol, and async infrastructure crates such as `reqwest`, `tokio`, `mcp`, `opendal`, `aws-sdk-s3`, `scylla`, `tokio-postgres`, and provider protocol helpers. The server composes the agent and worker crates; the optional `shell` feature enables agent-side shell configuration and worker-side shell execution and Bash parsing.
 
 These dependencies stay inside the agent layer. Higher layers should use the public agent API instead of depending on provider adapter internals, middleware internals, or storage implementation details.
 
@@ -335,6 +356,8 @@ Current and expected dependents include:
 - Provider adapters must cross the provider boundary through provider-neutral request and event types.
 - Built-in host tools are opt-in; a default agent has no filesystem, shell, MCP, skills, task, or question tools unless configured.
 - Permission claims must be evaluated before executing host tools that can read, write, delete, execute, or otherwise affect external resources.
+- Workspace-backed tools must not execute in the agent or server host; use the required private worker. Persist the dispatch fence before polling provider-facing Execute and never automatically replay an uncertain dispatch.
+- Sandbox-backed `@tool(...)` templates must evaluate worker claims and permissions before execution. A fresh render may invoke the tool again after an earlier timeout; keep `@file` and `/skill` worker-backed.
 - Middleware assembly order must remain deterministic.
 - Durable session replay must be based on persisted timeline/journal records and derived projections, not provider-specific transient parser state.
 - Provider-native metadata is an optimization for continuation and compatibility, not a requirement for replay correctness.
@@ -370,6 +393,10 @@ Focused paths:
 | [../../crates/waltr-agent/src/provider/mod.rs](../../crates/waltr-agent/src/provider/mod.rs) | Provider adapter exports. |
 | [../../crates/waltr-agent/src/middleware/mod.rs](../../crates/waltr-agent/src/middleware/mod.rs) | Middleware hook contract. |
 | [../../crates/waltr-agent/src/tools/mod.rs](../../crates/waltr-agent/src/tools/mod.rs) | Built-in tool modules. |
+| [../../crates/waltr-agent/src/sandbox_gateway.rs](../../crates/waltr-agent/src/sandbox_gateway.rs) | Agent-owned private worker gateway and request correlation. |
+| [../../crates/waltr-agent-sandbox/src/lib.rs](../../crates/waltr-agent-sandbox/src/lib.rs) | Worker-owned workspace operations and RPC entry point. |
+| [../../crates/waltr-server/src/sandbox.rs](../../crates/waltr-server/src/sandbox.rs) | Private gateway, embedded duplex worker, and standalone socket lifecycle. |
+| [../../proto/waltr/sandbox/v1/sandbox_service.proto](../../proto/waltr/sandbox/v1/sandbox_service.proto) | Private streaming RPC contract. |
 | [../../crates/waltr-agent/src/mcp/mod.rs](../../crates/waltr-agent/src/mcp/mod.rs) | Waltr-side MCP integration boundary. |
 | [../../crates/mcp/](../../crates/mcp/) | Generic MCP protocol crate. |
 | [../../crates/waltr-agent/src/permission/mod.rs](../../crates/waltr-agent/src/permission/mod.rs) | Permission policy, claims, matching, and effects. |

@@ -1,18 +1,17 @@
 //! Session service coordination.
 
-use crate::{agent_definition::AgentDefinitionState, config::ConfigHandle};
 use futures_util::Stream;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
 use waltr_agent::{
-    AgentDefinitionCatalog, AgentRunLimits, AgentSession, AgentSessionActiveRunState,
-    AgentSessionRunError, AgentSessionRunSubmission, CompletedSessionCapture, CredentialStore,
-    FilesystemSessionStore, MemorySessionStore, MetadataSetCondition, MetadataSetOutcome,
-    SessionCaptureError, SessionCompletionCoordinationHandler, SessionCoordinationReason,
-    SessionCoordinator, SessionCreateRequest, SessionEventSink, SessionId, SessionListUpdate,
-    SessionMaskMutation, SessionMaskMutationOutcome, SessionPauseError, SessionPauseLease,
-    SessionStore, SessionSummary, TimelineCursor,
+    AgentRunLimits, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
+    AgentSessionRunSubmission, CompletedSessionCapture, FilesystemSessionStore, MemorySessionStore,
+    MetadataSetCondition, MetadataSetOutcome, SessionCaptureError,
+    SessionCompletionCoordinationHandler, SessionCoordinationReason, SessionCoordinator,
+    SessionCreateRequest, SessionId, SessionListUpdate, SessionMaskMutation,
+    SessionMaskMutationOutcome, SessionPauseError, SessionPauseLease, SessionStore, SessionSummary,
+    TimelineCursor,
 };
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 use tonic::service::RoutesBuilder;
 
 pub mod service;
@@ -23,10 +22,10 @@ mod error;
 mod inference_settings;
 mod timeline_convert;
 
-pub use service::SessionService;
+pub use service::{SessionCatalogSource, SessionRegistrationInput, SessionService};
 pub use storage::SessionStorageConfigError;
 
-use storage::SessionStorageConfig;
+pub(crate) use storage::SessionStorageConfig;
 
 /// Object-safe access to the coordinator owned by the registered gRPC session service.
 #[tonic::async_trait]
@@ -110,437 +109,120 @@ pub trait SessionHost: Send + Sync {
     async fn shutdown(&self);
 }
 
-/// Add the configured session service to the gRPC routes builder.
+/// Load storage from the environment and register a session host with a live worker.
 ///
 /// # Errors
 ///
-/// Returns an error when session storage environment configuration is invalid.
+/// Returns an error for invalid storage configuration or a workspace overlap.
 pub fn add_service_from_env(
     routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origin: Option<reqwest::Url>,
-    agent_catalog: AgentDefinitionCatalog,
+    input: SessionRegistrationInput,
 ) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    add_service_from_env_with_oauth_policy(
-        routes,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origin.into_iter().collect(),
-        agent_catalog,
-    )
+    add_storage_service(routes, SessionStorageConfig::from_env()?, input)
 }
 
-pub(crate) fn add_service_from_env_with_oauth_policy(
-    routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_catalog: AgentDefinitionCatalog,
-) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    let host = match SessionStorageConfig::from_env()? {
-        SessionStorageConfig::Memory => add_store_service(
-            routes,
-            MemorySessionStore::new(),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_catalog,
-        ),
-        SessionStorageConfig::Filesystem { root } => add_store_service(
-            routes,
-            FilesystemSessionStore::new(root),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_catalog,
-        ),
-        SessionStorageConfig::S3(s3_config) => add_store_service(
-            routes,
-            s3_config.into_store(),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_catalog,
-        ),
-    };
-
-    Ok(host)
-}
-
-/// Add the configured session service backed by live agent-definition state.
-///
-/// # Errors
-///
-/// Returns an error when session storage environment configuration is invalid.
-pub fn add_service_from_env_with_agent_state(
-    routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origin: Option<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    add_service_from_env_with_oauth_policy_and_agent_state(
-        routes,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origin.into_iter().collect(),
-        agent_state,
-    )
-}
-
-pub(crate) fn add_service_from_env_with_oauth_policy_and_agent_state(
-    routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    let host = match SessionStorageConfig::from_env()? {
-        SessionStorageConfig::Memory => add_store_service_with_agent_state(
-            routes,
-            MemorySessionStore::new(),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_state,
-        ),
-        SessionStorageConfig::Filesystem { root } => add_store_service_with_agent_state(
-            routes,
-            FilesystemSessionStore::new(root),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_state,
-        ),
-        SessionStorageConfig::S3(s3_config) => add_store_service_with_agent_state(
-            routes,
-            s3_config.into_store(),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_state,
-        ),
-    };
-
-    Ok(host)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "session construction receives independent host dependencies"
-)]
-pub(crate) fn add_service_from_env_with_oauth_policy_agent_state_and_event_sink(
-    routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-    event_sink: Arc<dyn SessionEventSink>,
-) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    let host = match SessionStorageConfig::from_env()? {
-        SessionStorageConfig::Memory => add_store_service_with_agent_state_and_event_sink(
-            routes,
-            MemorySessionStore::new(),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_state,
-            event_sink,
-        ),
-        SessionStorageConfig::Filesystem { root } => {
-            add_store_service_with_agent_state_and_event_sink(
-                routes,
-                FilesystemSessionStore::new(root),
-                config,
-                credential_store,
-                trusted_mcp_oauth_origins,
-                agent_state,
-                event_sink,
-            )
+pub(crate) fn validate_storage_workspace(
+    storage: &SessionStorageConfig,
+    workspace: &std::path::Path,
+) -> Result<(), SessionStorageConfigError> {
+    if let SessionStorageConfig::Filesystem { root } = storage {
+        let root = if root.is_absolute() {
+            root.clone()
+        } else {
+            workspace.join(root)
+        };
+        if !crate::workspace_paths::overlaps(workspace, &root).is_ok_and(|overlap| !overlap) {
+            return Err(SessionStorageConfigError::Invalid {
+                variable: "WALTR_SESSION_FILESYSTEM_ROOT",
+                requirement: "must not overlap the worker workspace and must be resolvable",
+            });
         }
-        SessionStorageConfig::S3(s3_config) => add_store_service_with_agent_state_and_event_sink(
-            routes,
-            s3_config.into_store(),
-            config,
-            credential_store,
-            trusted_mcp_oauth_origins,
-            agent_state,
-            event_sink,
-        ),
-    };
-    Ok(host)
+    }
+    Ok(())
 }
 
-/// Add an in-memory session service using an explicit config store.
-pub fn add_memory_service(
+/// Register the selected storage only after its workspace policy has been validated.
+pub(crate) fn add_storage_service(
     routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    agent_catalog: AgentDefinitionCatalog,
-) -> Arc<dyn SessionHost> {
-    add_store_service(
-        routes,
-        MemorySessionStore::new(),
-        config,
-        credential_store,
-        Vec::new(),
-        agent_catalog,
-    )
+    storage: SessionStorageConfig,
+    input: SessionRegistrationInput,
+) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
+    validate_storage_workspace(&storage, &input.workspace_root)?;
+    Ok(match storage {
+        SessionStorageConfig::Memory => add_store_service(routes, MemorySessionStore::new(), input),
+        SessionStorageConfig::Filesystem { root } => {
+            add_store_service(routes, FilesystemSessionStore::new(root), input)
+        }
+        SessionStorageConfig::S3(config) => add_store_service(routes, config.into_store(), input),
+    })
 }
 
-/// Add an in-memory session service backed by live agent-definition state.
-pub fn add_memory_service_with_agent_state(
+/// Register a session service backed by an explicit store.
+pub fn add_store_service<S>(
     routes: &mut RoutesBuilder,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    agent_state: AgentDefinitionState,
-) -> Arc<dyn SessionHost> {
-    add_store_service_with_agent_state(
-        routes,
-        MemorySessionStore::new(),
-        config,
-        credential_store,
-        Vec::new(),
-        agent_state,
-    )
+    store: S,
+    input: SessionRegistrationInput,
+) -> Arc<dyn SessionHost>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    add_sessions_service(routes, SessionCoordinator::new(store), input)
 }
 
-/// Add an in-memory session service using an existing session coordinator.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
+/// Register a session service backed by an existing coordinator.
 pub fn add_sessions_service<S>(
     routes: &mut RoutesBuilder,
     sessions: SessionCoordinator<S>,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origin: Option<reqwest::Url>,
-    agent_catalog: AgentDefinitionCatalog,
+    input: SessionRegistrationInput,
 ) -> Arc<dyn SessionHost>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    add_sessions_service_with_oauth_policy(
-        routes,
-        sessions,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origin.into_iter().collect(),
-        agent_catalog,
-    )
-}
-
-/// Add a session service using an existing coordinator and live agent-definition state.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-pub fn add_sessions_service_with_agent_state<S>(
-    routes: &mut RoutesBuilder,
-    sessions: SessionCoordinator<S>,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origin: Option<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    add_sessions_service_with_oauth_policy_and_agent_state(
-        routes,
-        sessions,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origin.into_iter().collect(),
-        agent_state,
-    )
-}
-
-/// Add a session service using an existing coordinator, live definitions, and semantic event sink.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-pub(crate) fn add_sessions_service_with_agent_state_and_event_sink<S>(
-    routes: &mut RoutesBuilder,
-    sessions: SessionCoordinator<S>,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-    event_sink: Arc<dyn SessionEventSink>,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    add_sessions_service_with_oauth_policy_and_agent_state(
-        routes,
-        sessions.with_session_event_sink(event_sink),
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_state,
-    )
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-pub(crate) fn add_sessions_service_with_oauth_policy<S>(
-    routes: &mut RoutesBuilder,
-    sessions: SessionCoordinator<S>,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_catalog: AgentDefinitionCatalog,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    let service = SessionService::from_sessions_with_oauth_policy(
-        sessions,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_catalog,
-    );
+    let service = SessionService::from_sessions(sessions, input);
     routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
-    let host: Arc<dyn SessionHost> = service;
-    host
+    service
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-pub(crate) fn add_sessions_service_with_oauth_policy_and_agent_state<S>(
-    routes: &mut RoutesBuilder,
-    sessions: SessionCoordinator<S>,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    let service = SessionService::from_sessions_with_oauth_policy_and_agent_state(
-        sessions,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_state,
-    );
-    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
-    let host: Arc<dyn SessionHost> = service;
-    host
-}
+#[cfg(test)]
+mod sandbox_root_tests {
+    use super::*;
+    use std::path::PathBuf;
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-fn add_store_service<S>(
-    routes: &mut RoutesBuilder,
-    store: S,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_catalog: AgentDefinitionCatalog,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    let service = SessionService::new_with_oauth_policy(
-        store,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_catalog,
-    );
-    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
-    let host: Arc<dyn SessionHost> = service;
-    host
-}
+    #[test]
+    fn session_storage_cannot_alias_the_worker_root() {
+        let workspace = crate::test_support::temp_root();
+        let check = |root| {
+            validate_storage_workspace(&SessionStorageConfig::Filesystem { root }, &workspace)
+        };
+        assert!(check(workspace.clone()).is_err());
+        assert!(check(PathBuf::from(".")).is_err());
+        assert!(check(workspace.join("sessions")).is_err());
+        assert!(check(workspace.parent().unwrap().to_path_buf()).is_err());
+        assert!(check(workspace.parent().unwrap().join("other-sessions")).is_ok());
+    }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-fn add_store_service_with_agent_state<S>(
-    routes: &mut RoutesBuilder,
-    store: S,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    let service = SessionService::new_with_oauth_policy_and_agent_state(
-        store,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_state,
-    );
-    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
-    let host: Arc<dyn SessionHost> = service;
-    host
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "service registration receives independent coordinator dependencies"
-)]
-pub(crate) fn add_store_service_with_agent_state_and_event_sink<S>(
-    routes: &mut RoutesBuilder,
-    store: S,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-    event_sink: Arc<dyn SessionEventSink>,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    add_sessions_service_with_agent_state_and_event_sink(
-        routes,
-        SessionCoordinator::new(store),
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_state,
-        event_sink,
-    )
-}
-
-/// Add a filesystem-backed session service from an explicit host-owned root.
-pub(crate) fn add_filesystem_service_with_agent_state_and_event_sink(
-    routes: &mut RoutesBuilder,
-    session_root: PathBuf,
-    workspace_root: PathBuf,
-    config: ConfigHandle,
-    credential_store: CredentialStore,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    agent_state: AgentDefinitionState,
-    event_sink: Arc<dyn SessionEventSink>,
-) -> Arc<dyn SessionHost> {
-    let service = SessionService::new_with_explicit_root_and_agent_state(
-        FilesystemSessionStore::new(session_root),
-        workspace_root,
-        config,
-        credential_store,
-        trusted_mcp_oauth_origins,
-        agent_state,
-        event_sink,
-    );
-    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
-    let host: Arc<dyn SessionHost> = service;
-    host
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_and_missing_nested_store_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = crate::test_support::temp_root();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        symlink(&workspace, root.join("alias")).unwrap();
+        let check = |root| {
+            validate_storage_workspace(&SessionStorageConfig::Filesystem { root }, &workspace)
+        };
+        assert!(check(root.join("alias/sessions/missing")).is_err());
+        assert!(check(root.join("alias")).is_err());
+        let session = root.join("sessions");
+        std::fs::create_dir(&session).unwrap();
+        symlink(&root, root.join("root-alias")).unwrap();
+        assert!(
+            validate_storage_workspace(
+                &SessionStorageConfig::Filesystem { root: session },
+                &root.join("root-alias"),
+            )
+            .is_err()
+        );
+    }
 }

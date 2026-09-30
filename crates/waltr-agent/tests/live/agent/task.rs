@@ -213,6 +213,7 @@ where
     P: LlmStream + 'static,
 {
     let environment = AgentSessionRuntimeFactory::new(
+        waltr_agent::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
         std::env::temp_dir(),
         FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-live-task-auth.json")),
         crate::agent_definitions::live_task_visibility_agent(max_depth, tool_names_system_prompt()),

@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package waltr.sandbox.v1;
+
+// Private worker-to-agent connection. This service is not client-facing.
+service SandboxService {
+  rpc Connect(stream ConnectRequest) returns (stream ConnectResponse);
+}
+
+message ConnectRequest {
+  oneof body {
+    Hello hello = 1;
+    Prepared prepared = 2;
+    Progress progress = 3;
+    Completed completed = 4;
+    WorkspaceResponse workspace_response = 5;
+  }
+}
+
+message ConnectResponse {
+  oneof body {
+    Prepare prepare = 1;
+    Execute execute = 2;
+    Cancel cancel = 3;
+    WorkspaceRequest workspace_request = 4;
+  }
+}
+
+message Hello {
+  string worker_id = 1;
+  string workspace_id = 2;
+  uint64 generation = 3;
+  repeated string tools = 4;
+  // Canonical worker-local workspace root; never resolved on the host.
+  string canonical_root = 5;
+}
+
+message Prepare {
+  string invocation_id = 1;
+  string tool_name = 2;
+  string arguments_json = 3;
+  // Present only for shell; these defaults belong to this invocation, not the workspace.
+  ShellExecutionDefaults shell_defaults = 4;
+  // Worker execution budget in milliseconds; zero uses the worker default.
+  uint64 timeout_millis = 5;
+}
+
+message ShellExecutionDefaults {
+  string default_workdir = 1;
+  uint64 default_timeout_seconds = 2;
+  uint32 default_timeout_nanos = 3;
+  uint64 max_output_bytes = 4;
+}
+
+message Claim {
+  string operation = 1;
+  string resource_kind = 2;
+  string resource = 3;
+}
+
+message Prepared {
+  string invocation_id = 1;
+  repeated Claim claims = 2;
+  string ticket = 3;
+  string error = 4;
+}
+
+message Execute {
+  string invocation_id = 1;
+  string ticket = 2;
+  // Worker execution budget in milliseconds; zero uses the worker default.
+  uint64 timeout_millis = 3;
+}
+
+message Cancel {
+  string invocation_id = 1;
+}
+
+message Progress {
+  string invocation_id = 1;
+  uint64 sequence = 2;
+  string level = 3;
+  string text = 4;
+}
+
+message ToolOutput {
+  string content = 1;
+  bool is_error = 2;
+}
+
+message Completed {
+  string invocation_id = 1;
+  ToolOutput output = 2;
+  string error = 3;
+}
+
+message WorkspaceRequest {
+  string request_id = 1;
+  // Read-only operation, including info, resolve, and bounded snapshot.
+  string operation = 2;
+  string path = 3;
+  string pattern = 4;
+  string include = 5;
+  // Required for snapshot; zero is a valid bound (not an unlimited sentinel).
+  uint32 max_entries = 6;
+  uint32 max_depth = 7;
+  uint32 max_bytes = 8;
+  // Worker execution budget in milliseconds; zero uses the worker default.
+  uint64 timeout_millis = 9;
+}
+
+message WorkspaceResponse {
+  string request_id = 1;
+  string content = 2;
+  repeated string entries = 3;
+  string error = 4;
+  // Populated for info/resolve; resolve may describe a path outside the workspace.
+  string canonical_path = 5;
+  // file, directory, or other.
+  string path_kind = 6;
+  string canonical_root = 7;
+}

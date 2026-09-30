@@ -3,9 +3,7 @@
 use crate::{
     LocalBearer, ServerApplication,
     access_auth::AccessAuthenticator,
-    app::{
-        LocalAdmission, build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy,
-    },
+    app::{AppServices, LocalAdmission, assemble_app},
     auth::OutboundOAuthConfig,
     catalog::{CatalogLoader, CatalogMaterializer},
     config_service::ConfigService,
@@ -211,33 +209,33 @@ pub async fn build_embedded_server(
     let session_root = config.session_root;
     let workspace_root = config.workspace_root;
     let bearer = config.local_bearer;
-    let application = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
-        config_service,
-        persistence,
-        catalog_loader,
-        &AccessAuthenticator::disabled(),
-        None,
-        trusted_origins,
-        OutboundOAuthConfig::for_server_callback(outbound_callback_url),
-        Some(self_resource),
-        Some(state),
-        Some(LocalAdmission {
-            bearer,
-            self_mcp_url,
-        }),
-        move |routes, config, credentials, state, event_sink| {
-            session::add_filesystem_service_with_agent_state_and_event_sink(
+    let application = assemble_app(
+        AppServices {
+            config_service,
+            persistence,
+            catalog_loader,
+            access_authenticator: AccessAuthenticator::disabled(),
+            mcp_oauth: None,
+            outbound_private_origins: trusted_origins,
+            outbound_oauth: OutboundOAuthConfig::for_server_callback(outbound_callback_url),
+            automatic_self_mcp_resource: Some(self_resource),
+            agent_state: Some(state),
+            local_admission: Some(LocalAdmission {
+                bearer,
+                self_mcp_url,
+            }),
+            workspace_root,
+        },
+        move |routes, mut input| {
+            input.trusted_mcp_oauth_origins = session_origins;
+            session::add_storage_service(
                 routes,
-                session_root,
-                workspace_root,
-                config,
-                credentials,
-                session_origins,
-                state,
-                event_sink,
+                session::SessionStorageConfig::Filesystem { root: session_root },
+                input,
             )
         },
     )
+    .await
     .map_err(|_| EmbeddedBuildError::Application)?;
 
     Ok(EmbeddedServer {
@@ -267,7 +265,23 @@ fn validate_paths(config: &EmbeddedServerConfig) -> Result<(), EmbeddedBuildErro
         EmbeddedCatalogSource::Path(path) => path.is_absolute(),
         EmbeddedCatalogSource::Url(_) => true,
     };
-    if paths.iter().any(|path| !path.is_absolute()) || !catalog_path_absolute {
+    if paths.iter().any(|path| !path.is_absolute())
+        || !catalog_path_absolute
+        || !crate::workspace_paths::overlaps(&config.workspace_root, &config.session_root)
+            .is_ok_and(|overlap| !overlap)
+        || !crate::workspace_paths::inside_config(&config.workspace_root, &config.resources_root)
+            .is_ok_and(|inside| !inside)
+        || [
+            &config.waltr_database_path,
+            &config.mcp_database_path,
+            &config.catalog_cache_path,
+        ]
+        .into_iter()
+        .any(|path| {
+            !crate::workspace_paths::contains_file(&config.workspace_root, path)
+                .is_ok_and(|inside| !inside)
+        })
+    {
         return Err(EmbeddedBuildError::Paths);
     }
     Ok(())

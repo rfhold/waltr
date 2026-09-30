@@ -25,6 +25,7 @@ import { test } from "node:test";
 
 import {
   acquireScreenshotLock,
+  buildComposeResourcePublishArgs,
   buildRunPlan,
   cleanEnvironment,
   cleanupHarness,
@@ -218,6 +219,24 @@ test("browser scripts select complete resource-tree fixtures", () => {
     "sessions-runtime",
   );
   assert.equal(fixtureNameForBrowserScript("tests/web/k6/config/providers.browser.js"), null);
+});
+
+test("Compose resource fixtures publish as the server identity in both access modes", () => {
+  for (const phase of ["disabled", "oidc"]) {
+    const args = buildComposeResourcePublishArgs(
+      profileForPhase(phase),
+      "tests/web/k6/config/providers.browser.js",
+    );
+    assert.deepEqual(args.slice(0, 8), [
+      "--profile", profileForPhase(phase).profile, "exec", "-T", "--user", "65532:65532",
+      profileForPhase(phase).waltrService, "/bin/bash",
+    ]);
+    assert.equal(args.at(-1), "-");
+  }
+  assert.equal(
+    buildComposeResourcePublishArgs(profileForPhase("oidc"), "tests/web/k6/sessions/mcp-oauth.browser.js").at(-1),
+    "/fixtures/resource-trees/mcp-oauth-runtime/.waltr/resources",
+  );
 });
 
 test("resource fixture publication removes stale slots and atomically publishes files", (context) => {
@@ -444,6 +463,13 @@ test("screenshot lock uses process identity and safely recovers stale metadata",
   const afterReuse = acquireScreenshotLock(lockPath, afterReuseOwner, reusedRuntime);
   assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).runId, "after-reuse");
   assert.equal(releaseScreenshotLock(afterReuse, reusedRuntime), true);
+
+  const legacyOwner = { ...firstOwner, runId: "legacy-live", processStartIdentity: null };
+  writeFileSync(lockPath, `${JSON.stringify(legacyOwner)}\n`);
+  utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+  assert.throws(() => acquireScreenshotLock(lockPath, secondOwner, runtime), /legacy-live already holds/);
+  assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).token, legacyOwner.token);
+  rmSync(lockPath);
 
   const failedPath = join(root, "failed.lock");
   const failedRuntime = createHarnessRuntime({
@@ -1829,7 +1855,7 @@ test("runRoot quarantine never replaces an occupied destination", async (context
   assert.equal(readFileSync(join(root, "unrelated-sentinel"), "utf8"), "must survive");
 });
 
-test("runRoot cleanup removes nested directories through the Linux helper", async (context) => {
+test("runRoot cleanup removes nested directories through the platform helper", async (context) => {
   const root = mkdtempSync(join(tmpdir(), "waltr-run-root-helper-descriptor-"));
   const runRoot = join(root, "run");
   mkdirSync(join(runRoot, "nested", "deeper"), { recursive: true });
@@ -1863,6 +1889,15 @@ test("runRoot final removal preserves a quarantine identity mismatch", async (co
       error.code = "ESTALE";
       throw error;
     },
+    removeDirectoryIfIdentityAtSync(_descriptor, name) {
+      assert.equal(join(root, name), quarantinePath);
+      renameSync(quarantinePath, movedOwned);
+      mkdirSync(quarantinePath);
+      replacementIdentity = fileIdentity(lstatSync(quarantinePath));
+      const error = new Error("directory identity changed before removal");
+      error.code = "ESTALE";
+      throw error;
+    },
   });
   const state = testState({ runtime, runRoot });
 
@@ -1891,6 +1926,11 @@ test("descriptor cleanup refuses to cross a child mount identity", async (contex
     },
     getDescriptorMountId(descriptor) {
       return descriptorMounts.get(descriptor);
+    },
+    clearOwnedTreeSync() {
+      const error = new Error("refusing to cross mount boundary");
+      error.code = "EXDEV";
+      throw error;
     },
   });
   const state = testState({ runtime, runRoot });
@@ -2010,7 +2050,7 @@ test("leader close does not cancel the armed process-group force kill", async ()
   assert.equal(state.children.size, 0);
 });
 
-test("stopChildren kills a TERM-ignoring descendant after its group leader exits", { skip: process.platform !== "linux" }, async (context) => {
+test("stopChildren kills a TERM-ignoring descendant after its group leader exits", { skip: !["linux", "darwin"].includes(process.platform) }, async (context) => {
   const root = mkdtempSync(join(tmpdir(), "waltr-process-group-contract-"));
   const childPidPath = join(root, "child.pid");
   const readyPath = join(root, "ready");
@@ -2072,7 +2112,7 @@ test("stopChildren kills a TERM-ignoring descendant after its group leader exits
   assert.equal(state.children.size, 0);
 });
 
-test("runCommandResult waits for a timed-out leader's TERM-ignoring descendant", { skip: process.platform !== "linux" }, async (context) => {
+test("runCommandResult waits for a timed-out leader's TERM-ignoring descendant", { skip: !["linux", "darwin"].includes(process.platform) }, async (context) => {
   const root = mkdtempSync(join(tmpdir(), "waltr-command-timeout-descendant-"));
   const childPidPath = join(root, "child.pid");
   const readyPath = join(root, "ready");
@@ -2154,7 +2194,7 @@ test("process-group identity reuse is never signaled", async () => {
   assert.equal(state.children.size, 0);
 });
 
-test("missing launch identity is contained without signaling a later reused process group", { skip: process.platform !== "linux" }, async () => {
+test("missing launch identity is contained without signaling a later reused process group", { skip: !["linux", "darwin"].includes(process.platform) }, async () => {
   const root = mkdtempSync(join(tmpdir(), "waltr-process-group-missing-identity-"));
   const child = fakeChild(7373);
   const directSignals = [];
@@ -2187,13 +2227,13 @@ test("missing launch identity is contained without signaling a later reused proc
   identityReused = true;
   child.emit("close", 0, null);
   const result = await record.closed;
-  assert.match(result.error.message, /could not establish Linux process-group identity/);
+  assert.match(result.error.message, /could not establish process-group identity/);
   assert.equal(await cleanupHarness(state), false);
   assert.deepEqual(groupSignals, [], "a reused numeric PGID must never receive a negative signal");
   assert.equal(existsSync(root), false);
 });
 
-test("missing launch identity settles as cleanup failure when close never arrives", { skip: process.platform !== "linux" }, async () => {
+test("missing launch identity settles as cleanup failure when close never arrives", { skip: !["linux", "darwin"].includes(process.platform) }, async () => {
   const timers = [];
   const child = fakeChild(7474);
   const directSignals = [];
@@ -2244,7 +2284,7 @@ test("missing launch identity settles as cleanup failure when close never arrive
   assert.equal(record.hasProcessGroup, false);
   const result = await record.closed;
   assert.ok(timers.some((timer) => timer.milliseconds === 7_000));
-  assert.match(result.error.message, /could not establish Linux process-group identity/);
+  assert.match(result.error.message, /could not establish process-group identity/);
   assert.match(result.error.message, /did not exit after termination/);
   assert.equal(state.processGroupOwnershipFailed, true);
   assert.equal(state.children.size, 1, "settlement must retain cleanup ownership of a live child");
@@ -2255,7 +2295,7 @@ test("missing launch identity settles as cleanup failure when close never arrive
   assert.equal(state.children.size, 0, "late close must release retained ownership");
 });
 
-test("completion deadline clears timers and relinquishes handles while retaining live ownership", { skip: process.platform !== "linux" }, async () => {
+test("completion deadline clears timers and relinquishes handles while retaining live ownership", { skip: !["linux", "darwin"].includes(process.platform) }, async () => {
   const timers = [];
   const child = fakeChild(7575);
   const streams = ["stdin", "stdout", "stderr"].map(() => ({
@@ -2318,7 +2358,7 @@ test("completion deadline clears timers and relinquishes handles while retaining
   assert.equal(state.children.size, 0);
 });
 
-test("retained-record cleanup keeps one poll armed and settles once after late close", { skip: process.platform !== "linux" }, async () => {
+test("retained-record cleanup keeps one poll armed and settles once after late close", { skip: !["linux", "darwin"].includes(process.platform) }, async () => {
   const timers = [];
   const child = fakeChild(7676);
   let killCount = 0;

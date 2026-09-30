@@ -6,6 +6,9 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
+    depends_on:
+      waltr-worker:
+        condition: service_started
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: disabled
@@ -15,8 +18,10 @@ services:
       WALTR_SESSION_STORE: filesystem
       WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
       WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
+      WALTR_SANDBOX_SOCKET: /run/waltr-sandbox/gateway.sock
+      WALTR_WORKSPACE_ROOT: /workspace
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/health"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/ready"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -24,7 +29,22 @@ services:
       - "127.0.0.1:14333:14333"
     volumes:
       - waltr-dev-data:/data
+      - waltr-dev-sandbox-socket:/run/waltr-sandbox
       - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
+
+  waltr-worker:
+    profiles:
+      - dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker-runtime
+    environment:
+      WALTR_SANDBOX_SOCKET: /run/waltr-sandbox/gateway.sock
+      WALTR_SANDBOX_WORKSPACE_ROOT: /workspace
+    volumes:
+      - waltr-dev-sandbox-socket:/run/waltr-sandbox
+      - waltr-dev-workspace:/workspace
 
   waltr-test:
     profiles:
@@ -38,6 +58,8 @@ services:
         condition: service_healthy
       mcp:
         condition: service_healthy
+      waltr-test-worker:
+        condition: service_started
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: disabled
@@ -47,20 +69,40 @@ services:
       WALTR_SESSION_STORE: filesystem
       WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
       WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
+      WALTR_SANDBOX_SOCKET: /run/waltr-sandbox/gateway.sock
+      WALTR_WORKSPACE_ROOT: /workspace
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/health"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/ready"]
       interval: 2s
       timeout: 2s
       retries: 30
     tmpfs:
-      - /data
+      - /data:mode=0700,uid=65532,gid=65532
     networks:
       test:
         aliases:
           - waltr
     volumes:
+      - waltr-test-sandbox-socket:/run/waltr-sandbox
       - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
       - ./tests/web/k6/support/resource-trees:/fixtures/resource-trees:ro
+
+  waltr-test-worker:
+    profiles:
+      - test
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker-runtime
+    environment:
+      WALTR_SANDBOX_SOCKET: /run/waltr-sandbox/gateway.sock
+      WALTR_SANDBOX_WORKSPACE_ROOT: /workspace
+    tmpfs:
+      - /workspace:mode=0700,uid=65532,gid=65532
+    networks:
+      - test
+    volumes:
+      - waltr-test-sandbox-socket:/run/waltr-sandbox
 
   dex:
     profiles:
@@ -185,10 +227,11 @@ services:
       context: .
       dockerfile: Dockerfile
       target: test-runtime
+    user: "0:0"
     command:
       - /bin/sh
       - -c
-      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && KEY=$$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=') && printf '{"schema_version":1,"active":"compose-v1","keys":[{"id":"compose-v1","key":"%s"}]}' "$$KEY" > /run/waltr-mcp-oauth/keyring.json && chmod 0440 /run/waltr-mcp-oauth/keyring.json && chown 65532:65532 /run/waltr-mcp-oauth/keyring.json && exec waltr-server
+      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && KEY=$$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=') && printf '{"schema_version":1,"active":"compose-v1","keys":[{"id":"compose-v1","key":"%s"}]}' "$$KEY" > /run/waltr-mcp-oauth/keyring.json && chmod 0440 /run/waltr-mcp-oauth/keyring.json && chown 65532:65532 /run/waltr-mcp-oauth/keyring.json && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-server
     depends_on:
       auth-proxy:
         condition: service_healthy
@@ -196,6 +239,8 @@ services:
         condition: service_healthy
       test-ca:
         condition: service_completed_successfully
+      waltr-auth-worker:
+        condition: service_started
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: oidc
@@ -204,6 +249,8 @@ services:
       WALTR_SESSION_STORE: filesystem
       WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
       WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
+      WALTR_SANDBOX_SOCKET: /run/waltr-sandbox/gateway.sock
+      WALTR_WORKSPACE_ROOT: /workspace
       WALTR_MCP_REQUIRED_SCOPES: mcp:use
       WALTR_MCP_OAUTH_ISSUER: https://waltr.test/oauth
       WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE: /run/waltr-mcp-oauth/keyring.json
@@ -223,19 +270,37 @@ services:
       WALTR_OIDC_AUDIENCE: waltr-access-test
       WALTR_OIDC_SCOPES: openid email profile
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/health"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/ready"]
       interval: 2s
       timeout: 2s
       retries: 30
     tmpfs:
-      - /data
+      - /data:mode=0700,uid=65532,gid=65532
       - /run/waltr-mcp-oauth:mode=0750,uid=65532,gid=65532
     networks:
       - test-auth
     volumes:
+      - waltr-auth-sandbox-socket:/run/waltr-sandbox
       - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
       - ./tests/web/k6/support/resource-trees:/fixtures/resource-trees:ro
       - test-ca-public:/test-ca-public:ro
+
+  waltr-auth-worker:
+    profiles:
+      - test-auth
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker-runtime
+    environment:
+      WALTR_SANDBOX_SOCKET: /run/waltr-sandbox/gateway.sock
+      WALTR_SANDBOX_WORKSPACE_ROOT: /workspace
+    tmpfs:
+      - /workspace:mode=0700,uid=65532,gid=65532
+    networks:
+      - test-auth
+    volumes:
+      - waltr-auth-sandbox-socket:/run/waltr-sandbox
 
   mcp-auth:
     profiles:
@@ -244,10 +309,11 @@ services:
       context: .
       dockerfile: Dockerfile
       target: test-runtime
+    user: "0:0"
     command:
       - /bin/sh
       - -c
-      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && exec waltr-agent-test-mcp-server --http 0.0.0.0:14666
+      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-agent-test-mcp-server --http 0.0.0.0:14666
     depends_on:
       auth-proxy:
         condition: service_healthy
@@ -312,6 +378,10 @@ services:
 
 volumes:
   waltr-dev-data:
+  waltr-dev-workspace:
+  waltr-dev-sandbox-socket:
+  waltr-test-sandbox-socket:
+  waltr-auth-sandbox-socket:
   test-ca-public:
   test-ca-caddy:
 

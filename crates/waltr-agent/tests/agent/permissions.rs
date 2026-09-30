@@ -9,10 +9,11 @@ use waltr_agent::{
     CancelReason, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
     PendingWorkStatus, PermissionEffect, PermissionInputCondition, PermissionInputRule,
-    PermissionInputScalar, PermissionInputValueMatcher, PermissionJsonPointer, PermissionOperation,
-    PermissionPattern, PermissionPolicy, PermissionResourcePattern, PermissionResponse,
-    PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput, SessionCoordinator,
-    SessionId, SessionStatus, SessionStore, TimelineContent, ToolCall, ToolDefinition,
+    PermissionInputScalar, PermissionInputValueMatcher, PermissionJsonPointer, PermissionLevel,
+    PermissionOperation, PermissionPattern, PermissionPolicy, PermissionResourcePattern,
+    PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput,
+    SessionCoordinator, SessionId, SessionStatus, SessionStore, TimelineContent, ToolCall,
+    ToolDefinition,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -20,6 +21,7 @@ use waltr_agent::{PermissionCommandPattern, tools::shell::ShellConfig};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::sandbox::TestSandbox;
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
@@ -189,6 +191,7 @@ async fn nested_input_deny_prevents_ordinary_tool_invocation() -> waltr_agent::R
 async fn approved_whole_tool_ask_does_not_bypass_post_middleware_resource_deny()
 -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "whole_ask_resource_deny",
         |request| {
@@ -207,6 +210,7 @@ async fn approved_whole_tool_ask_does_not_bypass_post_middleware_resource_deny()
         PermissionEffect::ask(),
     );
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(policy)
         .with_filesystem_tools(FilesystemConfig::new(fixture.root.path()))
         .build();
@@ -266,6 +270,7 @@ async fn approved_whole_tool_ask_does_not_bypass_post_middleware_resource_deny()
 #[allow(clippy::too_many_lines)]
 async fn whole_tool_and_contextual_ask_require_exactly_two_approvals() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new("two_stage_ask", |request| {
         if request.tool_results().next().is_some() {
             vec![Ok(CompletionEvent::Finished)]
@@ -283,6 +288,7 @@ async fn whole_tool_and_contextual_ask_require_exactly_two_approvals() -> waltr_
                 PermissionEffect::ask(),
             );
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(policy)
         .with_filesystem_tools(FilesystemConfig::new(fixture.root.path()))
         .build();
@@ -458,6 +464,7 @@ async fn contextual_approval_does_not_cross_policy_switch_for_same_call() -> wal
 async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
 -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let policy =
         PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask());
     #[cfg(feature = "shell")]
@@ -479,6 +486,7 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
         );
     let provider = Arc::new(ScriptedPermissionProvider);
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(policy)
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())
@@ -568,6 +576,7 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
 #[allow(clippy::too_many_lines)]
 async fn permission_external_request_resumes_from_durable_session() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_resume_provider",
         |request| {
@@ -589,6 +598,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -694,6 +704,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
 #[allow(clippy::too_many_lines)]
 async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_multi_tool_resume_provider",
         |request| {
@@ -721,6 +732,7 @@ async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_ag
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -800,6 +812,7 @@ async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_ag
 #[tokio::test]
 async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_cancel_resume_provider",
         |request| {
@@ -820,6 +833,7 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -892,6 +906,7 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
 async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> waltr_agent::Result<()>
 {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_allow_always_provider",
         |request| {
@@ -920,6 +935,7 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -1015,6 +1031,7 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
 #[allow(clippy::too_many_lines)]
 async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_allow_once_provider",
         |request| {
@@ -1034,6 +1051,7 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -1116,6 +1134,7 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
 #[tokio::test]
 async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_deny_result_provider",
         |request| {
@@ -1135,6 +1154,7 @@ async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -1201,6 +1221,7 @@ async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
 #[tokio::test]
 async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "permission_deny_cancel_provider",
         |_| {
@@ -1211,6 +1232,7 @@ async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -1272,6 +1294,7 @@ async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
 #[tokio::test]
 async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let policy = PermissionPolicy::filesystem_default(fixture.root.path())
         .with_tool_rule(
             PermissionToolSelector::exact("edit"),
@@ -1299,6 +1322,7 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
         |_| vec![Ok(CompletionEvent::Finished)],
     )));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider.clone())
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(policy)
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())
@@ -1328,9 +1352,40 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
 }
 
 #[tokio::test]
+async fn denied_workspace_tool_does_not_prepare_on_disconnected_worker() -> waltr_agent::Result<()> {
+    let provider = Arc::new(ScriptedProvider::new("denied_workspace", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "denied", "note.txt",
+            )))]
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(waltr_agent::sandbox_gateway::SandboxGateway::new("test".into()).handle())
+        .with_filesystem_tools(FilesystemConfig::new("/workspace"))
+        .with_permission_policy(PermissionPolicy::new(PermissionLevel::Deny))
+        .build();
+    let events = agent
+        .prompt("read denied file")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    assert!(events.iter().any(|event| matches!(
+        &event.content,
+        TimelineContent::ToolResult { result } if result.content.contains("tool is not permitted: read")
+    )));
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let denied = fixture.outside.path().join("denied.txt");
     #[cfg(feature = "shell")]
     let shell_denied = fixture.outside.path().join("shell-denied.txt");
@@ -1341,6 +1396,7 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
         shell_denied: shell_denied.clone(),
     });
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -1378,7 +1434,16 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     assert_eq!(request.kind, ExternalRequestKind::Permission);
     assert_eq!(request.tool_call_id.as_deref(), Some("call_1"));
     assert!(
-        request.prompt.contains("Write filesystem path"),
+        request.prompt.contains(&format!(
+            "write {}",
+            fixture.outside.path().join("denied.txt").display()
+        )) && request.payload["claims"]
+            .as_array()
+            .is_some_and(|claims| claims.len() == 1
+                && claims[0]["operation"] == "Write"
+                && claims[0]["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("denied.txt"))),
         "{request:#?}"
     );
     let external_request_id = request.id.clone();
@@ -1433,6 +1498,7 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
 async fn whole_tool_ask_allow_once_executes_claim_producing_tool_without_reasking()
 -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(ScriptedProvider::new(
         "whole_tool_ask_provider",
         |request| {
@@ -1450,6 +1516,7 @@ async fn whole_tool_ask_allow_once_executes_claim_producing_tool_without_reaskin
         },
     ));
     let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::default().with_tool_rule(
             PermissionToolSelector::exact("read"),
             PermissionEffect::ask(),
@@ -1717,7 +1784,9 @@ impl TempRoot {
 
     fn at(path: PathBuf) -> waltr_agent::Result<Self> {
         fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path: path.canonicalize()?,
+        })
     }
 
     fn path(&self) -> PathBuf {

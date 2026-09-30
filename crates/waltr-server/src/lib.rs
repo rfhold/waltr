@@ -20,6 +20,7 @@ pub mod resource_catalog;
 pub mod resource_error;
 pub mod routine;
 pub mod routine_service;
+mod sandbox;
 pub mod session;
 pub mod status_service;
 #[cfg(any(debug_assertions, feature = "test"))]
@@ -27,6 +28,7 @@ pub mod status_service;
 pub mod test_support;
 #[cfg(feature = "web")]
 mod web_assets;
+mod workspace_paths;
 
 pub use agent_definition::{
     AgentDefinitionLoadError, AgentDefinitionSnapshot, AgentDefinitionState,

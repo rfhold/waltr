@@ -1,6 +1,6 @@
 # Permissions
 
-Agent permissions decide whether host-affecting tool operations are allowed, denied, hidden, or suspended for host approval. The permission system is provider-neutral and lives entirely in `crates/waltr-agent/`.
+Agent permissions decide whether host-affecting tool operations are allowed, denied, hidden, or suspended for host approval. The provider-neutral policy and decisions live in `crates/waltr-agent/`; `crates/waltr-agent-sandbox/` prepares workspace resource claims without deciding policy.
 
 ## Concepts
 
@@ -34,9 +34,9 @@ Permissions are applied in two places during an agent turn.
 | Phase | Behavior |
 | --- | --- |
 | Tool listing | Middleware can hide tools from provider requests when whole-tool access is denied. |
-| Tool execution | Middleware collects claims, the policy evaluates them, and the agent loop applies the outcome before running the tool. |
+| Tool execution | The agent loop collects claims after pre-tool middleware, evaluates policy, and applies the outcome before running the tool. For sandbox-backed tools it asks the worker to prepare claims and a ticket, then persists a dispatch fence before Execute. |
 
-Filesystem and shell tools generate detailed claims for the operations they infer. Generic tools, including MCP-backed tools, can still be controlled at the tool-selector level.
+The worker generates detailed filesystem and shell claims for the operations it infers. Generic tools, including MCP-backed tools, can still be controlled at the tool-selector level. An ask or deny cancels an unused worker ticket. Once dispatched, an unknown result suspends rather than retrying a side effect; see [agent architecture](../architecture/agent.md#private-workspace-boundary).
 
 ## Outcomes
 
@@ -86,7 +86,7 @@ Focused coverage:
 | Path | Covers |
 | --- | --- |
 | [../../crates/waltr-agent/src/permission/mod.rs](../../crates/waltr-agent/src/permission/mod.rs) | Permission rule and pattern unit coverage. |
-| [../../crates/waltr-agent/src/middleware/claims.rs](../../crates/waltr-agent/src/middleware/claims.rs) | Claim construction before tool execution. |
+| [../../crates/waltr-agent-sandbox/src/tools.rs](../../crates/waltr-agent-sandbox/src/tools.rs) | Worker filesystem claim preparation. |
 | [../../crates/waltr-agent/src/middleware/tools.rs](../../crates/waltr-agent/src/middleware/tools.rs) | Tool visibility filtering. |
 | [../../crates/waltr-agent/tests/agent/permissions.rs](../../crates/waltr-agent/tests/agent/permissions.rs) | Deterministic permission integration, suspension, resume, and cancellation behavior. |
 | [../../crates/waltr-agent/tests/live/agent/permissions.rs](../../crates/waltr-agent/tests/live/agent/permissions.rs) | Ignored live-provider permission coverage. |
@@ -98,7 +98,7 @@ Focused coverage:
 | [../../crates/waltr-agent/src/permission/mod.rs](../../crates/waltr-agent/src/permission/mod.rs) | Public permission module exports. |
 | [../../crates/waltr-agent/src/permission/policy.rs](../../crates/waltr-agent/src/permission/policy.rs) | Policy representation and evaluation. |
 | [../../crates/waltr-agent/src/permission/rule.rs](../../crates/waltr-agent/src/permission/rule.rs) | Rule matching and specificity. |
-| [../../crates/waltr-agent/src/middleware/claims.rs](../../crates/waltr-agent/src/middleware/claims.rs) | Middleware claim collection. |
+| [../../crates/waltr-agent/src/tools/sandbox.rs](../../crates/waltr-agent/src/tools/sandbox.rs) | Worker claim translation into agent policy inputs. |
 | [../../crates/waltr-agent/src/middleware/tools.rs](../../crates/waltr-agent/src/middleware/tools.rs) | Tool-list filtering. |
 | [../../crates/waltr-agent/src/agent/loop.rs](../../crates/waltr-agent/src/agent/loop.rs) | Runtime permission outcomes and suspension behavior. |
 | [../../crates/waltr-agent/src/agent/session/types.rs](../../crates/waltr-agent/src/agent/session/types.rs) | External request and response session types. |

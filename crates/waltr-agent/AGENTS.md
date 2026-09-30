@@ -2,6 +2,8 @@
 
 Waltr agent is an isolated agent library.
 
+`src/sandbox_gateway.rs` owns the private worker RPC gateway. `src/tools/sandbox.rs` adapts prepared worker claims/tickets to agent permissions and tools. Workspace filesystem and shell operations belong to `../waltr-agent-sandbox/`, not to agent-side handlers. See [agent architecture](../../docs/architecture/agent.md#private-workspace-boundary).
+
 `src/mcp/` owns Waltr-side MCP session integration: runtime adaptation, generated tool names, prompt/resource template wiring, progress routing, and conversion into agent tools/templates. Generic MCP protocol behavior belongs in `../mcp/`.
 
 # Contracts
@@ -9,6 +11,8 @@ Waltr agent is an isolated agent library.
 Agent code should not depend on client, server, TUI, or web layers.
 
 Agent code may depend on the generic `mcp` crate. The `mcp` crate must not depend back on `waltr-agent`.
+
+Keep provider, session, prompt, and policy in this crate. For provider-facing sandbox calls, persist `SandboxCallRecorded` on preview and `SandboxDispatchStarted` before polling Execute. Unknown dispatched work must suspend rather than retry; permission retries are allowed only before dispatch. Template `@tool(...)` calls use sandbox permissions and execution without that journal fence: a fresh render can invoke the tool again. Do not add a local workspace execution fallback.
 
 Session lifecycle and list projection are centralized in `src/agent/session/control.rs` and `src/agent/session/list.rs`. Acquire lifecycle before the per-session mutation gate, and enter the synchronous list projection only after both; never hold a synchronous mutex across an await. Pass coordinator-owned run services through `SessionRunContext` rather than adding independent gates or broadcasters to the run loop.
 

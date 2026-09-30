@@ -1,16 +1,15 @@
 //! File prompt-template search and rendering.
 
-use ignore::WalkBuilder;
 use serde_json::json;
+use std::path::Path;
 
 use crate::{
     Result,
     resource::{
         SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, file_score,
-        file_template, normalize_path,
+        file_template,
     },
     template::{TemplateReference, TemplateReferenceRender, template_error},
-    tools::filesystem::{FilesystemConfig, ReadInput},
 };
 
 use super::{
@@ -30,27 +29,22 @@ impl AgentMiddleware for FileTemplateMiddleware {
     ) -> Result<()> {
         if ctx.request.target != SessionTemplateSearchTarget::Resources
             || !ctx.request.includes(SessionTemplateKind::File)
-            || !ctx.root.is_dir()
+            || ctx.sandbox.is_none()
         {
             return Ok(());
         }
 
         let query_lower = ctx.request.query.trim().to_lowercase();
         let limit = ctx.request.effective_limit();
-        for entry in WalkBuilder::new(ctx.root)
-            .standard_filters(true)
-            .build()
-            .filter_map(std::result::Result::ok)
-        {
-            let file_type = entry.file_type();
-            if !file_type.is_some_and(|file_type| file_type.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(ctx.root) else {
-                continue;
-            };
-            let detail = normalize_path(relative);
+        let workspace = ctx
+            .sandbox
+            .expect("checked above")
+            .search_files(&query_lower, limit)
+            .await?;
+        for entry in workspace.entries {
+            let path = Path::new(&entry);
+            let relative = path.strip_prefix(ctx.root).unwrap_or(path);
+            let detail = relative.to_string_lossy().replace('\\', "/");
             let label = relative
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -84,12 +78,19 @@ impl AgentMiddleware for FileTemplateMiddleware {
             return Ok(TemplateReferenceRender::Continue);
         };
 
-        match FilesystemConfig::new(ctx.base_dir).read(&ReadInput::new(path.clone())) {
-            Ok(content) => Ok(TemplateReferenceRender::TemplateResult {
+        let Some(sandbox) = ctx.sandbox else {
+            return Ok(TemplateReferenceRender::Rendered(template_error(
+                "file",
+                "sandbox unavailable",
+            )));
+        };
+        let target = ctx.base_dir.join(path);
+        match sandbox.formatted_read(&target.to_string_lossy()).await {
+            Ok(data) => Ok(TemplateReferenceRender::TemplateResult {
                 kind: "file".to_owned(),
                 tool: Some("read".to_owned()),
                 source: Some(path.clone()),
-                content,
+                content: data.content,
                 render_nested: true,
             }),
             Err(error) => Ok(TemplateReferenceRender::Rendered(template_error(

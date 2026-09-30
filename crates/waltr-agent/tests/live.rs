@@ -4,6 +4,8 @@
 mod agent_definitions;
 #[path = "support/live_provider.rs"]
 mod live_provider;
+#[path = "support/sandbox.rs"]
+mod sandbox;
 #[path = "support/scripted_provider.rs"]
 mod scripted_provider;
 #[path = "agent/session.rs"]

@@ -195,6 +195,7 @@ fn resource_error_to_status(error: &AgentDefinitionLoadError) -> Status {
     } else if error.is_validation() {
         Status::invalid_argument(error.sanitized_validation_message())
     } else {
+        tracing::warn!(error = %error, "resource catalog operation failed");
         Status::internal("resource catalog service unavailable")
     }
 }

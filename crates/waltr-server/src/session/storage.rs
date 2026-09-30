@@ -21,7 +21,7 @@ const ENV_S3_FORCE_PATH_STYLE: &str = "WALTR_SESSION_S3_FORCE_PATH_STYLE";
 const ENV_S3_WRITE_MODE: &str = "WALTR_SESSION_S3_WRITE_MODE";
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) enum SessionStorageConfig {
+pub(crate) enum SessionStorageConfig {
     Memory,
     Filesystem { root: PathBuf },
     S3(Box<S3SessionStorageConfig>),
@@ -41,7 +41,7 @@ impl fmt::Debug for SessionStorageConfig {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct S3SessionStorageConfig {
+pub(crate) struct S3SessionStorageConfig {
     endpoint: Url,
     region: String,
     bucket: String,
@@ -94,7 +94,7 @@ impl S3SessionStorageConfig {
 }
 
 impl SessionStorageConfig {
-    pub(super) fn from_env() -> Result<Self, SessionStorageConfigError> {
+    pub(crate) fn from_env() -> Result<Self, SessionStorageConfigError> {
         Self::from_lookup(|name| env::var(name).ok(), default_filesystem_root())
     }
 

@@ -1,9 +1,6 @@
 //! System prompt construction helpers.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 /// Reusable base system prompt for Waltr agents.
 pub const BASE_SYSTEM_PROMPT: &str = "You are Waltr Agent, a careful coding and operations assistant. Follow the user's instructions, use available tools when they are helpful, and report results clearly. Treat tool errors as recoverable information and continue when possible.";
@@ -93,38 +90,6 @@ impl AgentsPromptConfig {
         self.filename = filename.into();
         self
     }
-
-    /// Load configured instruction files.
-    #[must_use]
-    pub fn instructions(&self) -> Vec<AgentsInstruction> {
-        let path = self.root.join(&self.filename);
-        let Ok(content) = fs::read_to_string(&path) else {
-            return Vec::new();
-        };
-        let path = canonicalize_existing(&path);
-        vec![AgentsInstruction {
-            content: render_agents_instruction(&path, &content),
-            path,
-        }]
-    }
-
-    /// Render this configuration as a system prompt fragment.
-    #[must_use]
-    pub fn system_prompt(&self) -> Option<String> {
-        // Compatibility renderer for callers that need a prompt fragment directly.
-        let instructions = self.instructions();
-        if instructions.is_empty() {
-            None
-        } else {
-            Some(
-                instructions
-                    .into_iter()
-                    .map(|instruction| instruction.content)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            )
-        }
-    }
 }
 
 /// Filesystem system prompt configuration.
@@ -187,20 +152,9 @@ impl FilesystemPromptConfig {
     pub fn system_prompt(&self) -> String {
         // Compatibility renderer for callers that need a prompt fragment directly.
         let root = display_path(&self.root);
-        let mut prompt = format!(
+        let prompt = format!(
             "Filesystem tools are available when exposed in the tool list. Paths are scoped to this filesystem root: {root}. Prefer relative paths under the root unless the user gives an absolute path inside the root."
         );
-
-        if self.include_snapshot {
-            prompt.push_str("\n\nCurrent filesystem snapshot:");
-            match filesystem_snapshot(self) {
-                Some(snapshot) => {
-                    prompt.push('\n');
-                    prompt.push_str(&snapshot);
-                }
-                None => prompt.push_str("\n- <empty>"),
-            }
-        }
 
         prompt
     }
@@ -280,116 +234,16 @@ impl ShellPromptConfig {
 }
 
 fn display_path(path: &Path) -> String {
-    canonicalize_existing(path).display().to_string()
-}
-
-pub(crate) fn canonicalize_existing(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    path.display().to_string()
 }
 
 pub(crate) fn render_agents_instruction(path: &Path, content: &str) -> String {
     format!("Instructions from: {}\n{}", path.display(), content.trim())
 }
 
-fn filesystem_snapshot(config: &FilesystemPromptConfig) -> Option<String> {
-    let root = config
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| config.root.clone());
-    let mut collector = SnapshotCollector::new(root, config);
-    collector.collect(collector.root.clone(), 0);
-    collector.entries.sort();
-
-    let mut output = String::new();
-    let mut bytes = 0usize;
-    for entry in collector.entries {
-        let line = format!("- {entry}\n");
-        if bytes + line.len() > config.max_snapshot_bytes {
-            collector.limited = true;
-            break;
-        }
-        bytes += line.len();
-        output.push_str(&line);
-    }
-
-    if collector.limited {
-        output.push_str("- <snapshot truncated>\n");
-    }
-
-    if output.is_empty() {
-        None
-    } else {
-        Some(output.trim_end().to_owned())
-    }
-}
-
-struct SnapshotCollector<'a> {
-    root: PathBuf,
-    config: &'a FilesystemPromptConfig,
-    entries: Vec<String>,
-    limited: bool,
-}
-
-impl<'a> SnapshotCollector<'a> {
-    const fn new(root: PathBuf, config: &'a FilesystemPromptConfig) -> Self {
-        Self {
-            root,
-            config,
-            entries: Vec::new(),
-            limited: false,
-        }
-    }
-
-    fn collect(&mut self, directory: PathBuf, depth: usize) {
-        if self.limited || depth >= self.config.max_snapshot_depth {
-            return;
-        }
-
-        let Ok(read_dir) = fs::read_dir(directory) else {
-            return;
-        };
-        let mut children = read_dir
-            .filter_map(std::result::Result::ok)
-            .collect::<Vec<_>>();
-        children.sort_by_key(std::fs::DirEntry::path);
-
-        for child in children {
-            if self.entries.len() >= self.config.max_snapshot_entries {
-                self.limited = true;
-                return;
-            }
-
-            let path = child.path();
-            let Ok(file_type) = child.file_type() else {
-                continue;
-            };
-            let Ok(relative) = path.strip_prefix(&self.root) else {
-                continue;
-            };
-            if relative.as_os_str().is_empty() {
-                continue;
-            }
-
-            let mut entry = relative.to_string_lossy().replace('\\', "/");
-            if file_type.is_dir() {
-                entry.push('/');
-            }
-            self.entries.push(entry);
-
-            if file_type.is_dir() {
-                self.collect(path, depth + 1);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use super::{
-        AgentsPromptConfig, BASE_SYSTEM_PROMPT, FilesystemPromptConfig, SystemPromptBuilder,
-    };
+    use super::{BASE_SYSTEM_PROMPT, FilesystemPromptConfig, SystemPromptBuilder};
 
     #[test]
     fn builder_joins_non_empty_fragments() {
@@ -413,61 +267,22 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_snapshot_is_deterministic_and_bounded() {
-        let root =
-            std::env::temp_dir().join(format!("waltr-agent-prompt-test-{}", std::process::id()));
-        drop(fs::remove_dir_all(&root));
-        fs::create_dir_all(root.join("src")).expect("create src dir");
-        fs::write(root.join("Cargo.toml"), "").expect("write Cargo.toml");
-        fs::write(root.join("src/lib.rs"), "").expect("write lib.rs");
-
-        let prompt = FilesystemPromptConfig::new(&root)
+    fn filesystem_prompt_does_not_read_workspace() {
+        let prompt = FilesystemPromptConfig::new("/workspace")
             .with_snapshot()
             .system_prompt();
-
-        assert!(prompt.contains("Current filesystem snapshot:"));
-        assert!(prompt.contains("- Cargo.toml"));
-        assert!(prompt.contains("- src/"));
-        assert!(prompt.contains("- src/lib.rs"));
-
-        fs::remove_dir_all(&root).expect("remove temp dir");
+        assert!(prompt.contains("/workspace"));
+        assert!(!prompt.contains("Current filesystem snapshot:"));
     }
 
     #[test]
     fn agents_prompt_renders_instruction_source_and_content() {
-        let root = std::env::temp_dir().join(format!(
-            "waltr-agent-agents-prompt-test-{}",
-            std::process::id()
-        ));
-        drop(fs::remove_dir_all(&root));
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("AGENTS.md"), "Follow local instructions.\n").expect("write AGENTS.md");
-
-        let prompt = AgentsPromptConfig::new(&root)
-            .system_prompt()
-            .expect("agents prompt");
-
-        assert!(prompt.contains(&format!(
-            "Instructions from: {}",
-            root.join("AGENTS.md").display()
-        )));
-        assert!(prompt.contains("Follow local instructions."));
-
-        fs::remove_dir_all(&root).expect("remove temp dir");
-    }
-
-    #[test]
-    fn agents_prompt_ignores_missing_file() {
-        let root = std::env::temp_dir().join(format!(
-            "waltr-agent-missing-agents-prompt-test-{}",
-            std::process::id()
-        ));
-        drop(fs::remove_dir_all(&root));
-        fs::create_dir_all(&root).expect("create root");
-
-        assert_eq!(AgentsPromptConfig::new(&root).system_prompt(), None);
-
-        fs::remove_dir_all(&root).expect("remove temp dir");
+        let path = std::path::Path::new("/workspace/AGENTS.md");
+        let prompt = super::render_agents_instruction(path, "Follow local instructions.\n");
+        assert_eq!(
+            prompt,
+            "Instructions from: /workspace/AGENTS.md\nFollow local instructions."
+        );
     }
 
     #[cfg(feature = "shell")]

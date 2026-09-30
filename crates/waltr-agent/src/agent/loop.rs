@@ -14,6 +14,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -36,7 +37,10 @@ use crate::{
             ToolCallContext, ToolDraft, ToolResultContext,
         },
     },
-    template::{TemplateRender, TemplateRuntime, TemplateSource},
+    template::{
+        TemplateOrigin, TemplateRender, TemplateRunContext, TemplateRuntime,
+        clear_sandbox_template_results,
+    },
     timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS, TimelineStatus},
 };
 use tokio::{sync::mpsc, time::Sleep};
@@ -91,6 +95,7 @@ where
     cancellation_token: CancellationToken,
     template_base_dir: Option<PathBuf>,
     max_provider_turns: Option<u64>,
+    sandbox: Option<crate::sandbox_gateway::SandboxHandle>,
     provider_turns_dispatched: u64,
     turn_span: Option<Span>,
     assistant_item_id: Option<(u64, TimelineItemId)>,
@@ -104,6 +109,17 @@ struct RetryCheckpoint {
     journal_len: u64,
     after_cursor: Option<crate::timeline::TimelineCursor>,
     turn: u64,
+}
+
+const PENDING_USER_TEMPLATE: &str = "pending_user_template";
+
+#[derive(Serialize, Deserialize)]
+struct PendingUserTemplate {
+    prompts: Vec<String>,
+    prompt_count: usize,
+    submission: u64,
+    #[serde(default)]
+    denied: bool,
 }
 
 enum AgentLoopPhase {
@@ -128,6 +144,7 @@ struct RunningTool {
     call: ToolCall,
     result: ToolFuture,
     progress_rx: Option<mpsc::UnboundedReceiver<PendingTimelineEvent>>,
+    sandbox_backed: bool,
 }
 
 type ResolvedToolCall = (usize, ToolDefinition);
@@ -189,6 +206,7 @@ where
             cancellation_token: run.cancellation_token,
             template_base_dir: run.template_base_dir,
             max_provider_turns: run.max_provider_turns,
+            sandbox: run.sandbox,
             provider_turns_dispatched: 0,
             turn_span: None,
             assistant_item_id: None,
@@ -398,6 +416,19 @@ where
                         };
                         self.tool_item_ids
                             .insert(call.id.clone(), event.item_id.clone());
+                        if self.tools.iter().any(|tool| {
+                            tool.is_sandbox_backed() && tool.definition().name == call.name
+                        }) {
+                            if let Err(error) = self
+                                .append_journal_event(SessionJournalEvent::SandboxCallRecorded {
+                                    turn: self.turn as u64,
+                                    tool_call_id: call.id.clone(),
+                                })
+                                .await
+                            {
+                                return Some((Err(error), self));
+                            }
+                        }
                         streaming.tool_calls.push(call);
                         self.phase = AgentLoopPhase::Streaming(streaming);
                         return Some((Ok(event), self));
@@ -490,6 +521,13 @@ where
                         tokio::select! {
                             biased;
 
+                            () = self.cancellation_token.cancelled() => {
+                                if let Err(error) = self.record_interrupted().await {
+                                    return Some((Err(error), self));
+                                }
+                                self.phase = AgentLoopPhase::Done;
+                                return None;
+                            }
                             progress = rx.recv() => {
                                 match progress {
                                     Some(progress) => {
@@ -514,19 +552,12 @@ where
                                         Err(error) => return Some((Err(error), self)),
                                     }
                                 }
-                                match self.finish_running_tool(running.call, result).await {
+                                match self.finish_running_tool(running.call, result, running.sandbox_backed).await {
                                     Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
                                     Ok(false) => {}
                                     Err(error) => return Some((Err(error), self)),
                                 }
                                 continue;
-                            }
-                            () = self.cancellation_token.cancelled() => {
-                                if let Err(error) = self.record_interrupted().await {
-                                    return Some((Err(error), self));
-                                }
-                                self.phase = AgentLoopPhase::Done;
-                                return None;
                             }
                         }
                     } else {
@@ -542,7 +573,10 @@ where
                             }
                             result = running.result => result,
                         };
-                        match self.finish_running_tool(running.call, result).await {
+                        match self
+                            .finish_running_tool(running.call, result, running.sandbox_backed)
+                            .await
+                        {
                             Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
                             Ok(false) => {}
                             Err(error) => return Some((Err(error), self)),
@@ -620,6 +654,15 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn start_tool(&mut self, mut call: ToolCall) -> Result<ToolExecution> {
+        if self.session_record.as_ref().is_some_and(|record| {
+            record.snapshot().sandbox_dispatches.iter().any(|dispatch| {
+                dispatch.turn == self.turn as u64 && dispatch.tool_call_id == call.id
+            })
+        }) {
+            self.suspend_pending_sandbox_work().await?;
+            return Ok(ToolExecution::Finished(None));
+        }
+        let requested_name = call.name.clone();
         let whole_tool_level = self.permission_policy.evaluate_tool(&call.name);
         let resolved = self.resolve_tool_call(&call);
         let whole_tool_request = PermissionRequestContext {
@@ -717,6 +760,16 @@ where
             }
         }
 
+        if call.name != requested_name {
+            return Ok(ToolExecution::Finished(Some(error_tool_result(
+                &call,
+                &LlmError::Protocol {
+                    provider: "permission",
+                    message: "middleware changed the approved tool name".into(),
+                },
+            ))));
+        }
+
         let Some((tool_index, _)) = resolved else {
             return Ok(ToolExecution::Finished(Some(error_tool_result(
                 &call,
@@ -725,6 +778,41 @@ where
                     message: format!("unknown tool: {}", call.name),
                 },
             ))));
+        };
+
+        let prepared = if self.tools[tool_index].is_sandbox_backed() {
+            let sandbox = self.sandbox.as_ref().ok_or_else(|| LlmError::Protocol {
+                provider: "sandbox",
+                message: "workspace tool requires sandbox".into(),
+            })?;
+            match sandbox
+                .prepare_with_shell_defaults(
+                    &call.name,
+                    &call.arguments,
+                    self.tools[tool_index].shell_defaults(),
+                )
+                .await
+            {
+                Ok(prepared) => {
+                    match crate::tools::sandbox::claims(&prepared) {
+                        Ok(extra) => claims.extend(extra),
+                        Err(error) => {
+                            prepared.cancel(sandbox);
+                            return Ok(ToolExecution::Finished(Some(error_tool_result(
+                                &call, &error,
+                            ))));
+                        }
+                    }
+                    Some(prepared)
+                }
+                Err(error) => {
+                    return Ok(ToolExecution::Finished(Some(error_tool_result(
+                        &call, &error,
+                    ))));
+                }
+            }
+        } else {
+            None
         };
 
         match self.permission_outcome(&call, &claims, whole_tool_approved) {
@@ -744,6 +832,9 @@ where
                 self.flush_middleware_state().await?;
             }
             Ok(PermissionOutcome::Deny(message)) => {
+                if let (Some(prepared), Some(sandbox)) = (prepared, &self.sandbox) {
+                    prepared.cancel(sandbox);
+                }
                 self.in_turn_span(|| tracing::warn!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission denied"));
                 return Ok(ToolExecution::Finished(Some(error_tool_result(
                     &call,
@@ -754,6 +845,9 @@ where
                 ))));
             }
             Ok(PermissionOutcome::Ask(claims)) => {
+                if let (Some(prepared), Some(sandbox)) = (prepared, &self.sandbox) {
+                    prepared.cancel(sandbox);
+                }
                 self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission requested"));
                 let request = PermissionRequestContext {
                     session_id: self.session_id.as_str(),
@@ -768,6 +862,9 @@ where
                     .map(ToolExecution::Finished);
             }
             Err(error) => {
+                if let (Some(prepared), Some(sandbox)) = (prepared, &self.sandbox) {
+                    prepared.cancel(sandbox);
+                }
                 return Ok(ToolExecution::Finished(Some(error_tool_result(
                     &call, &error,
                 ))));
@@ -785,19 +882,31 @@ where
                 Ok(())
             },
         );
-        let result = self.tools[tool_index].call(
-            ToolExecutionContext::with_progress_and_cancellation(
-                call.clone(),
-                progress,
-                self.cancellation_token.clone(),
-            )
-            .with_session_context(self.session_id.clone(), self.turn as u64),
-        );
+        let mut context = ToolExecutionContext::with_progress_and_cancellation(
+            call.clone(),
+            progress,
+            self.cancellation_token.clone(),
+        )
+        .with_session_context(self.session_id.clone(), self.turn as u64);
+        if let Some(prepared) = prepared {
+            context = context.with_prepared_sandbox_call(prepared);
+        }
+        let sandbox_backed = self.tools[tool_index].is_sandbox_backed();
+        if sandbox_backed {
+            // No Execute future may be polled before the dispatch fence is durable.
+            self.append_journal_event(SessionJournalEvent::SandboxDispatchStarted {
+                turn: self.turn as u64,
+                tool_call_id: call.id.clone(),
+            })
+            .await?;
+        }
+        let result = self.tools[tool_index].call(context);
         let result = self.instrument_tool_future(&call, result);
         Ok(ToolExecution::Running(RunningTool {
             call,
             result,
             progress_rx: Some(progress_rx),
+            sandbox_backed,
         }))
     }
 
@@ -805,7 +914,14 @@ where
         &mut self,
         call: ToolCall,
         result: Result<ToolResult>,
+        sandbox_backed: bool,
     ) -> Result<bool> {
+        if sandbox_backed && result.is_err() {
+            // The worker may have performed the operation even if its reply was lost.
+            // Never turn an uncertain dispatch into a provider-visible tool error.
+            self.suspend_pending_sandbox_work().await?;
+            return Ok(false);
+        }
         let mut result = match result {
             Ok(result) => {
                 self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call completed"));
@@ -1047,35 +1163,37 @@ where
             Err(error) => return Err(session_store_error(error)),
         }
 
-        let Some(input) = self.input.take() else {
-            return Err(session_store_error("missing session input"));
-        };
-        let prompts = match input {
-            ResumeInput::Prompt(prompt) => vec![prompt],
-            ResumeInput::Prompts(prompts) if !prompts.is_empty() => prompts,
-            ResumeInput::Prompts(_) => {
-                return Err(session_store_error("prompt batch must not be empty"));
+        if !matches!(
+            self.input,
+            Some(ResumeInput::Prompt(_) | ResumeInput::Prompts(_))
+        ) {
+            return Err(session_store_error(
+                "cannot resume missing session without a prompt input",
+            ));
+        }
+        let plain_prompts = match self.input.as_ref() {
+            Some(ResumeInput::Prompt(prompt)) if !may_contain_template(prompt) => {
+                Some(vec![prompt.clone()])
             }
-            ResumeInput::Continue
-            | ResumeInput::ToolResults(_)
-            | ResumeInput::ExternalResponse { .. } => {
-                return Err(session_store_error(
-                    "cannot resume missing session without a prompt input",
-                ));
+            Some(ResumeInput::Prompts(prompts))
+                if !prompts.is_empty()
+                    && prompts.iter().all(|prompt| !may_contain_template(prompt)) =>
+            {
+                Some(prompts.clone())
             }
+            _ => None,
         };
-        let Some(prompts) = self.render_prompt_templates(prompts).await? else {
-            return Ok(false);
-        };
-        self.prompt = prompts.last().cloned().unwrap_or_default();
-        let messages = prompts
-            .iter()
-            .cloned()
-            .map(SessionStartMessage::user)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| session_store_error(error.to_string()))?;
         let mut request = SessionCreateRequest::new(self.session_id.clone());
-        request.start = SessionStart::Fresh { messages };
+        if let Some(prompts) = &plain_prompts {
+            request.start = SessionStart::Fresh {
+                messages: prompts
+                    .iter()
+                    .cloned()
+                    .map(SessionStartMessage::user)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| session_store_error(error.to_string()))?,
+            };
+        }
         let record = self
             .session_store
             .create(request)
@@ -1085,26 +1203,21 @@ where
             operation.publish_created(record.summary());
         }
         self.session_incarnation = incarnation;
-        self.session_metadata_values = record.metadata.values.clone();
-        self.session_journal_len = record.journal.len() as u64;
-        self.last_timeline_cursor = record.timeline_events().last().map(|event| event.cursor);
-        let events = record.timeline_events().cloned().collect::<Vec<_>>();
-        if let Some(context) = &self.session_run_context {
-            context.timeline().publish_all(events.clone());
+        if let Some(prompts) = plain_prompts {
+            self.input = None;
+            self.hydrate_from_record(&record);
+            let events = record.timeline_events().cloned().collect::<Vec<_>>();
+            if let Some(context) = &self.session_run_context {
+                context.timeline().publish_all(events.clone());
+            }
+            self.publish_user_message_events(0, 0, &prompts);
+            self.pending.extend(events.into_iter().map(Ok));
+            self.session_initialized = true;
+            return Ok(true);
         }
-        self.session_record = Some(record.clone());
-        let turn = self.turn as u64;
-        self.prompt_turns = prompts
-            .iter()
-            .map(|prompt| PromptTurn {
-                turn,
-                prompt: prompt.clone(),
-            })
-            .collect();
-        self.publish_user_message_events(0, 0, &prompts);
-        self.pending.extend(events.into_iter().map(Ok));
+        let continue_start_turn = self.apply_resume_input(record).await?;
         self.session_initialized = true;
-        Ok(true)
+        Ok(continue_start_turn)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1114,18 +1227,63 @@ where
             return Ok(true);
         };
 
+        // A previous process may have died after sending Execute, or an older
+        // record may have no dispatch fence at all. Neither can be retried safely.
+        let snapshot = record.snapshot();
+        self.hydrate_from_record(&record);
+        let pending_sandbox = snapshot
+            .pending_work
+            .iter()
+            .filter(|work| {
+                matches!(work.status, PendingWorkStatus::Pending)
+                    && work.tool_call.as_ref().is_some_and(|call| {
+                        self.tools.iter().any(|tool| {
+                            tool.is_sandbox_backed() && tool.definition().name == call.name
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let permission_retry =
+            matches!(&input, ResumeInput::ExternalResponse { request_id, .. }
+            if snapshot.external_requests.iter().any(|request|
+                request.id == *request_id && request.kind == ExternalRequestKind::Permission
+                && matches!(request.status, ExternalRequestStatus::Pending)))
+                && pending_sandbox.iter().all(|work| {
+                    snapshot.sandbox_calls_recorded.iter().any(|dispatch| {
+                        dispatch.turn == work.turn && dispatch.tool_call_id == work.id
+                    }) && !snapshot.sandbox_dispatches.iter().any(|dispatch| {
+                        dispatch.turn == work.turn && dispatch.tool_call_id == work.id
+                    })
+                });
+        let externally_resolved = matches!(&input, ResumeInput::ToolResults(results)
+            if snapshot.pending_work.iter()
+                .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
+                .all(|work| results.iter().any(|result| result.call_id == work.id)));
+        if !matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_))
+            && !pending_sandbox.is_empty()
+            && !permission_retry
+            && !externally_resolved
+        {
+            self.hydrate_from_record(&record);
+            self.suspend_pending_sandbox_work().await?;
+            return Ok(false);
+        }
+
         let mut continue_start_turn = true;
+        let new_prompts = matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_));
         let record = match input {
             ResumeInput::Continue => record,
             ResumeInput::Prompt(prompt) => {
-                let prompt = match self.render_prompt_templates(vec![prompt]).await? {
-                    Some(mut prompts) => prompts.remove(0),
-                    None => return Ok(false),
-                };
-                let snapshot = record.snapshot();
-                if snapshot.current_prompt.as_deref() == Some(prompt.as_str())
+                if may_contain_template(&prompt) {
+                    self.submit_template_prompts(vec![prompt]).await?;
+                    self.session_record
+                        .as_ref()
+                        .expect("submitted template")
+                        .clone()
+                } else if snapshot.current_prompt.as_deref() == Some(prompt.as_str())
                     && snapshot.prompts.len() == 1
                     && snapshot.turns.is_empty()
+                    && self.pending_user_template()?.is_none()
                 {
                     record
                 } else {
@@ -1140,16 +1298,21 @@ where
                 }
             }
             ResumeInput::Prompts(prompts) => {
-                let Some(prompts) = self.render_prompt_templates(prompts).await? else {
-                    return Ok(false);
-                };
-                match self
-                    .session_runtime()
-                    .resume(&self.session_id, ResumeInput::Prompts(prompts))
-                    .await?
-                {
-                    RuntimeResumeOutput::Resumed { record }
-                    | RuntimeResumeOutput::Suspended { record, .. } => record,
+                if prompts.iter().any(|prompt| may_contain_template(prompt)) {
+                    self.submit_template_prompts(prompts).await?;
+                    self.session_record
+                        .as_ref()
+                        .expect("submitted template")
+                        .clone()
+                } else {
+                    match self
+                        .session_runtime()
+                        .resume(&self.session_id, ResumeInput::Prompts(prompts))
+                        .await?
+                    {
+                        RuntimeResumeOutput::Resumed { record }
+                        | RuntimeResumeOutput::Suspended { record, .. } => record,
+                    }
                 }
             }
             ResumeInput::ExternalResponse {
@@ -1162,6 +1325,13 @@ where
                     &response,
                 )?;
                 let cancel = permission_cancel_response(&record.snapshot(), &request_id, &response);
+                let template_denied = record.snapshot().external_requests.iter().any(|request| {
+                    request.id == request_id
+                        && request.payload.get("template") == Some(&json!(true))
+                }) && matches!(
+                    PermissionResponse::from_value(response.payload.clone())?,
+                    PermissionResponse::Deny { .. }
+                );
                 let record = match self
                     .session_runtime()
                     .resume(
@@ -1185,7 +1355,32 @@ where
                     self.phase = AgentLoopPhase::Done;
                     continue_start_turn = false;
                 }
-                record
+                if template_denied {
+                    self.hydrate_from_record(&record);
+                    if let Some(mut pending) = self.pending_user_template()? {
+                        pending.denied = true;
+                        self.middleware_state.set(
+                            PENDING_USER_TEMPLATE,
+                            serde_json::to_value(pending).map_err(session_store_error)?,
+                        );
+                    }
+                    self.flush_middleware_state().await?;
+                    self.append_journal_event(SessionJournalEvent::Failed {
+                        message: "template permission denied".to_owned(),
+                        authentication_failure: None,
+                    })
+                    .await?;
+                    self.phase = AgentLoopPhase::Done;
+                    continue_start_turn = false;
+                }
+                if template_denied {
+                    self.session_record
+                        .as_ref()
+                        .expect("loaded session")
+                        .clone()
+                } else {
+                    record
+                }
             }
             ResumeInput::ToolResults(results) => {
                 match self
@@ -1200,7 +1395,110 @@ where
         };
 
         self.hydrate_from_record(&record);
+        if continue_start_turn && !self.render_pending_template_prompts(new_prompts).await? {
+            return Ok(false);
+        }
         Ok(continue_start_turn)
+    }
+
+    async fn submit_template_prompts(&mut self, prompts: Vec<String>) -> Result<()> {
+        if prompts.is_empty() {
+            return Err(session_store_error("prompt batch must not be empty"));
+        }
+        let prompt_count = self
+            .session_record
+            .as_ref()
+            .expect("loaded session")
+            .snapshot()
+            .prompts
+            .len();
+        self.middleware_state.set(
+            PENDING_USER_TEMPLATE,
+            serde_json::to_value(PendingUserTemplate {
+                prompts,
+                prompt_count,
+                submission: self.session_journal_len,
+                denied: false,
+            })
+            .map_err(session_store_error)?,
+        );
+        self.flush_middleware_state().await
+    }
+
+    async fn render_pending_template_prompts(&mut self, superseding_prompt: bool) -> Result<bool> {
+        let pending = self.pending_user_template()?;
+        let Some(pending) = pending else {
+            return Ok(true);
+        };
+        if pending.denied && !superseding_prompt {
+            self.phase = AgentLoopPhase::Done;
+            return Ok(false);
+        }
+        let snapshot = self
+            .session_record
+            .as_ref()
+            .expect("loaded session")
+            .snapshot();
+        if snapshot.prompts.len() == pending.prompt_count {
+            if !superseding_prompt
+                && snapshot.external_requests.iter().any(|request| {
+                    matches!(request.status, ExternalRequestStatus::Pending)
+                        && request.payload.get("template") == Some(&json!(true))
+                })
+            {
+                self.phase = AgentLoopPhase::Done;
+                return Ok(false);
+            }
+            let Some((prompts, tool_ids)) = self.render_prompt_templates(pending.prompts).await?
+            else {
+                return Ok(false);
+            };
+            let output = self
+                .session_runtime()
+                .resume(&self.session_id, ResumeInput::Prompts(prompts))
+                .await?;
+            let record = match output {
+                RuntimeResumeOutput::Resumed { record }
+                | RuntimeResumeOutput::Suspended { record, .. } => record,
+            };
+            self.hydrate_from_record(&record);
+            // Earlier prompts in this batch may have completed before a later one suspended.
+            clear_sandbox_template_results(&mut self.middleware_state, &tool_ids)?;
+        }
+        self.middleware_state
+            .set(PENDING_USER_TEMPLATE, Value::Null);
+        self.flush_middleware_state().await?;
+        Ok(true)
+    }
+
+    fn pending_user_template(&self) -> Result<Option<PendingUserTemplate>> {
+        self.middleware_state
+            .get(PENDING_USER_TEMPLATE)
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()).map_err(session_store_error))
+            .transpose()
+    }
+
+    async fn suspend_pending_sandbox_work(&mut self) -> Result<()> {
+        let snapshot = self
+            .session_record
+            .as_ref()
+            .expect("initialized session")
+            .snapshot();
+        if !matches!(
+            snapshot.status,
+            super::session::SessionStatus::Suspended(SessionSuspension::AwaitingToolResults { .. })
+        ) {
+            self.append_journal_event(SessionJournalEvent::Suspended {
+                suspension: SessionSuspension::AwaitingToolResults {
+                    work: snapshot.pending_work,
+                },
+            })
+            .await?;
+        }
+        self.phase = AgentLoopPhase::Done;
+        self.close_turn_span("sandbox_dispatch_uncertain");
+        Ok(())
     }
 
     fn hydrate_from_record(&mut self, record: &SessionRecord) {
@@ -1262,7 +1560,7 @@ where
     async fn render_prompt_templates(
         &mut self,
         prompts: Vec<String>,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<Option<(Vec<String>, Vec<String>)>> {
         let current_dir;
         let base_dir = if let Some(base_dir) = self.template_base_dir.as_deref() {
             base_dir
@@ -1271,18 +1569,37 @@ where
             current_dir.as_path()
         };
         let mut rendered = Vec::with_capacity(prompts.len());
-        for prompt in prompts {
-            let mut runtime = TemplateRuntime {
+        let mut tool_ids = Vec::new();
+        let prompt_count = self
+            .session_record
+            .as_ref()
+            .map_or(0, |record| record.snapshot().prompts.len());
+        let submission = self
+            .middleware_state
+            .get(PENDING_USER_TEMPLATE)
+            .and_then(|value| value.get("submission"))
+            .and_then(Value::as_u64)
+            .unwrap_or(self.session_journal_len);
+        for (index, prompt) in prompts.into_iter().enumerate() {
+            let mut runtime = TemplateRuntime::new(
                 base_dir,
-                middleware_chain: &self.middleware_chain,
-                permission_policy: &self.permission_policy,
-                middleware_state: &mut self.middleware_state,
-                cancellation_token: self.cancellation_token.clone(),
-                session_id: self.session_id.as_str(),
-                turn: self.turn as u64,
-                source: TemplateSource::UserPrompt,
-            };
-            match runtime.render_template(&prompt).await? {
+                &mut self.middleware_state,
+                TemplateRunContext {
+                    middleware_chain: &self.middleware_chain,
+                    permission_policy: &self.permission_policy,
+                    cancellation_token: self.cancellation_token.clone(),
+                    session_id: self.session_id.as_str(),
+                    turn: self.turn as u64,
+                    sandbox: self.sandbox.as_ref(),
+                },
+                TemplateOrigin::UserPrompt {
+                    submission,
+                    prompt_index: prompt_count + index,
+                },
+            );
+            let outcome = runtime.render_template(&prompt).await?;
+            tool_ids.extend_from_slice(runtime.rendered_tool_ids());
+            match outcome {
                 TemplateRender::Rendered(prompt) => rendered.push(prompt),
                 TemplateRender::Suspend(suspension) => {
                     self.suspend_from_hook(suspension).await?;
@@ -1290,7 +1607,7 @@ where
                 }
             }
         }
-        Ok(Some(rendered))
+        Ok(Some((rendered, tool_ids)))
     }
 
     async fn append_journal_event(&mut self, event: SessionJournalEvent) -> Result<()> {
@@ -1750,6 +2067,10 @@ where
         };
         context.publish_run_summary(incarnation, record.summary());
     }
+}
+
+fn may_contain_template(prompt: &str) -> bool {
+    prompt.contains('@') || prompt.contains('/')
 }
 
 fn drain_progress_events(

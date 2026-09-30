@@ -85,7 +85,23 @@ export default async function () {
     const stagedCreateModel = await waitForText(page, modelsSelector, MODEL_NAME);
     const stagedCreateModelKind = await waitForText(page, modelsSelector, "llm");
     await page.locator('form[aria-label="Create provider"] button[type="submit"]').click();
-    const createdProvider = await waitForText(page, '[aria-label="Provider list"]', PROVIDER);
+    let createdProvider;
+    try {
+      createdProvider = await waitForText(page, '[aria-label="Provider list"]', PROVIDER);
+    } catch (error) {
+      const state = await page.evaluate(() => {
+        const form = document.querySelector('form[aria-label="Create provider"]');
+        return {
+          pathname: window.location.pathname,
+          formPresent: Boolean(form),
+          invalidFields: form instanceof HTMLFormElement
+            ? Array.from(form.querySelectorAll(":invalid"), (field) => field.getAttribute("name"))
+            : [],
+          alert: document.querySelector('[role="alert"]')?.textContent,
+        };
+      });
+      throw new Error(`${error}; provider submit state: ${JSON.stringify(state)}`);
+    }
     const createdUrl = await waitForText(page, '[aria-label="Provider list"]', "https://api.openai.com/v1");
     await waitForButton(page, `Edit ${PROVIDER}`);
     await screenshotMatrix(page, "config-provider-list-created");

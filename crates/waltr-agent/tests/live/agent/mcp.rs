@@ -145,6 +145,7 @@ fn mcp_sessions(
     let root = tempfile::tempdir().expect("tempdir").keep();
     let credentials = FileCredentialStore::new(root.join("credentials.json"));
     let factory = AgentSessionRuntimeFactory::new(
+        waltr_agent::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
         root,
         credentials,
         crate::agent_definitions::mcp_agent(true),

@@ -196,6 +196,7 @@ async function createSession(page) {
   const dialog = page.locator('[role="dialog"][aria-label="Create session dialog"]');
   await dialog.waitFor();
   await dialog.locator('button[type="submit"]').click();
+  await page.locator('[aria-label="Session message"]').waitFor();
 }
 
 async function waitForTextareaValueChange(page, selector, previousValue) {

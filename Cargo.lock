@@ -4194,11 +4194,12 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures-util",
- "globset",
  "http 1.4.1",
  "httpdate",
- "ignore",
+ "hyper-util",
  "jsonwebtoken",
+ "waltr",
+ "waltr-agent-sandbox",
  "mcp",
  "oauth2",
  "opendal",
@@ -4220,6 +4221,8 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "tonic",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -4227,6 +4230,27 @@ dependencies = [
  "tree-sitter-bash",
  "uuid",
  "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "waltr-agent-sandbox"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "hyper-util",
+ "ignore",
+ "waltr",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "uuid",
 ]
 
 [[package]]
@@ -4312,6 +4336,7 @@ dependencies = [
  "cookie",
  "futures-util",
  "http-body 1.0.1",
+ "hyper-util",
  "jaq-core",
  "jaq-interpret",
  "jaq-parse",
@@ -4319,6 +4344,7 @@ dependencies = [
  "jsonwebtoken",
  "waltr",
  "waltr-agent",
+ "waltr-agent-sandbox",
  "mcp",
  "notify",
  "oauth2",

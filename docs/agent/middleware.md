@@ -10,7 +10,7 @@ It is responsible for:
 
 - Building durable system prompt content.
 - Listing, hiding, and annotating tools before a provider request.
-- Adding permission claims before tool execution.
+- Adding opt-in bounded worker snapshots to durable prompt context; the agent loop, not middleware, obtains prepared workspace-tool claims for policy evaluation.
 - Suspending a run for external questions or approvals.
 - Recording middleware state needed for deterministic durable replay.
 
@@ -34,11 +34,11 @@ Middleware behavior is exposed through agent configuration APIs, not through a p
 | Middleware Area | Behavior |
 | --- | --- |
 | System prompt | Stores prompt fragments in durable middleware state and replays them on resume. |
-| `AGENTS.md` | Loads configured instruction files and dynamic read-context reminders. |
-| Skills | Adds a visible skill catalog, exposes `load_skill`, and reveals dynamic skill catalogs. |
+| `AGENTS.md` | Loads configured instruction files and dynamic read-context reminders through worker workspace reads. |
+| Skills | Adds a visible skill catalog, exposes `load_skill`, and reveals dynamic catalogs using worker workspace reads. |
 | Tool visibility | Filters tools from provider requests when policy denies whole-tool access. |
 | Tool metadata | Adds request-scoped filesystem root hints. |
-| Claims | Adds filesystem and shell permission claims before tool execution. |
+| Sandbox context | When opted in, adds a bounded worker filesystem snapshot to durable prompt state. |
 | Question suspension | Converts question tool calls into external requests for the host. |
 
 Cost, pricing, usage, secrets, and OpenTelemetry middleware are not implemented agent middleware today.
@@ -91,7 +91,7 @@ Focused coverage:
 | [../../crates/waltr-agent/src/middleware/prompt.rs](../../crates/waltr-agent/src/middleware/prompt.rs) | Durable prompt state. |
 | [../../crates/waltr-agent/src/middleware/tools.rs](../../crates/waltr-agent/src/middleware/tools.rs) | Permission-filtered tool visibility. |
 | [../../crates/waltr-agent/src/middleware/tool_metadata.rs](../../crates/waltr-agent/src/middleware/tool_metadata.rs) | Request-scoped root hints. |
-| [../../crates/waltr-agent/src/middleware/claims.rs](../../crates/waltr-agent/src/middleware/claims.rs) | Filesystem and shell claim construction. |
+| [../../crates/waltr-agent/src/middleware/sandbox_snapshot.rs](../../crates/waltr-agent/src/middleware/sandbox_snapshot.rs) | Worker-bounded prompt snapshot. |
 | [../../crates/waltr-agent/src/middleware/question_suspension.rs](../../crates/waltr-agent/src/middleware/question_suspension.rs) | Question external-request suspension. |
 | [../../crates/waltr-agent/tests/agent/loop.rs](../../crates/waltr-agent/tests/agent/loop.rs) | Deterministic loop behavior that exercises middleware. |
 | [../../crates/waltr-agent/tests/agent/session.rs](../../crates/waltr-agent/tests/agent/session.rs) | Durable middleware state and resume behavior. |
@@ -106,3 +106,4 @@ Focused coverage:
 | [../../crates/waltr-agent/src/agent/builder.rs](../../crates/waltr-agent/src/agent/builder.rs) | Builder wiring and middleware assembly order. |
 | [../../crates/waltr-agent/src/agent/run.rs](../../crates/waltr-agent/src/agent/run.rs) | Run-time chain construction and overrides. |
 | [../../crates/waltr-agent/src/agent/loop.rs](../../crates/waltr-agent/src/agent/loop.rs) | Middleware calls in provider request and tool execution flow. |
+| [../../crates/waltr-agent/src/tools/sandbox.rs](../../crates/waltr-agent/src/tools/sandbox.rs) | Loop-facing worker claim translation and ticket-backed execution (not middleware). |

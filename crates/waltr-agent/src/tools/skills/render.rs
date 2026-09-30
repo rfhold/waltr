@@ -1,10 +1,8 @@
 //! Agent Skills rendering.
 
-use std::{collections::HashMap, fmt::Write as _, fs, path::Path};
+use std::{collections::HashMap, fmt::Write as _, path::Path};
 
-use crate::Result;
-
-use super::{definition::SkillDefinition, resources::collect_resource_paths};
+use super::definition::SkillDefinition;
 
 /// Render a skills catalog, or `None` when no skills are visible.
 #[must_use]
@@ -49,26 +47,6 @@ pub fn render_skills_reminder(skills: &[SkillDefinition], root: &Path) -> Option
         skills,
         &format!("New skills are available from {}:", root.display()),
     )
-}
-
-pub(crate) fn render_loaded_skill(skill: &SkillDefinition) -> Result<String> {
-    let content = fs::read_to_string(&skill.skill_path)?;
-    let resources = collect_resource_paths(skill)?;
-    let mut output = String::new();
-    writeln!(output, "<skill_content name=\"{}\">", skill.name).expect("write skill content");
-    writeln!(output, "Skill directory: {}\n", skill.skill_dir.display())
-        .expect("write skill content");
-    output.push_str(content.trim());
-    output.push_str("\n\n<skill_resources>");
-    if resources.is_empty() {
-        output.push_str("\n</skill_resources>\n</skill_content>");
-        return Ok(output);
-    }
-    for resource in resources {
-        write!(output, "\n- {}", resource.display()).expect("write skill resources");
-    }
-    output.push_str("\n</skill_resources>\n</skill_content>");
-    Ok(output)
 }
 
 fn ambiguous_names(skills: &[SkillDefinition]) -> std::collections::HashSet<String> {

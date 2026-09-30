@@ -22,7 +22,8 @@ use waltr_agent::{
     SessionTemplateSearchRequest, SessionTemplateSearchTarget, SkillsConfig, ThinkingBlock,
     ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind, TimelineQuery,
     TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
-    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
+    tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
+    tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 #[cfg(feature = "shell")]
@@ -34,7 +35,252 @@ use waltr_agent::{
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::sandbox::TestSandbox;
 use crate::scripted_provider::ScriptedProvider;
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn sandbox_disconnect_after_dispatch_suspends_without_provider_continuation() {
+    use waltr_agent::{ExternalRequest, ExternalRequestStatus, SessionJournalEvent, Suspension};
+
+    let root = tempfile::tempdir().unwrap();
+    let sandbox = TestSandbox::new(root.path()).await;
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = count.clone();
+    let provider = Arc::new(ScriptedProvider::new("sandbox-fence", move |_| {
+        let index = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match index {
+            0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "slow-call",
+                "shell",
+                json!({ "command": "sleep 30", "description": "wait" }),
+            )))],
+            1 => vec![Ok(CompletionEvent::Finished)],
+            _ => panic!("unexpected provider continuation {index}"),
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_permission_policy(PermissionPolicy::default())
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let mut stream = sessions.prompt(&agent, id.clone(), "run").stream();
+    let event = stream.next().await.unwrap().unwrap();
+    assert!(crate::session::channel_is(&event, CHANNEL_TOOL_CALL));
+    let remaining = tokio::spawn(async move { stream.collect::<Vec<_>>().await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if store.load(&id).await.unwrap().journal.iter().any(|event| matches!(event,
+                SessionJournalEvent::SandboxDispatchStarted { tool_call_id, .. } if tool_call_id == "slow-call")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    sandbox.disconnect();
+    let events = tokio::time::timeout(Duration::from_secs(10), remaining)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(events.iter().all(|event| !matches!(
+        event.as_ref().unwrap().content,
+        TimelineContent::ToolResult { .. }
+    )));
+    let record = store.load(&id).await.unwrap();
+    assert!(matches!(
+        record.snapshot().status,
+        SessionStatus::Suspended(Suspension::AwaitingToolResults { .. })
+    ));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let resumed = sessions
+        .resume(&agent, id.clone(), ResumeInput::Continue)
+        .stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        resumed.is_empty(),
+        "no retry or provider continuation: {resumed:?}"
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let record = store.load(&id).await.unwrap();
+    let request_id = ExternalRequestId::new("stale-sandbox-approval");
+    store
+        .append_timeline(
+            &id,
+            record.revision,
+            vec![PendingTimelineEvent::new(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                TimelineEventKind::ExternalRequestOpened,
+                Some(waltr_agent::TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
+                TimelineContent::ExternalRequest {
+                    request: ExternalRequest {
+                        id: request_id.clone(),
+                        kind: ExternalRequestKind::Permission,
+                        tool_call_id: Some("slow-call".into()),
+                        prompt: "stale approval".into(),
+                        payload: json!({}),
+                        status: ExternalRequestStatus::Pending,
+                    },
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    let approval = sessions
+        .resume(
+            &agent,
+            id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: request_id.clone(),
+                response: ExternalResponse::new(json!("allow-once")),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        approval.is_empty(),
+        "stale approval must not reissue: {approval:?}"
+    );
+    let record = store.load(&id).await.unwrap();
+    assert!(record.snapshot().external_requests.iter().any(
+        |request| request.id == request_id && request.status == ExternalRequestStatus::Pending
+    ));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let superseded = sessions
+        .prompt(&agent, id.clone(), "ignore previous work")
+        .stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(superseded.iter().all(Result::is_ok), "{superseded:?}");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn legacy_pending_sandbox_call_without_dispatch_marker_fails_closed() {
+    use waltr_agent::{SessionJournalEvent, Suspension};
+    let root = tempfile::tempdir().unwrap();
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "legacy-sandbox",
+        vec![vec![CompletionEvent::Finished]],
+    ));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(root.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let record = store.load(&id).await.unwrap();
+    store
+        .append_timeline(
+            &id,
+            record.revision,
+            vec![PendingTimelineEvent::tool_call(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                ToolCall::new(
+                    "legacy-call",
+                    "write",
+                    json!({"filePath":"note", "content":"unsafe"}),
+                ),
+            )],
+        )
+        .await
+        .unwrap();
+    let events = sessions
+        .resume(&agent, id.clone(), ResumeInput::Continue)
+        .stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        events.is_empty(),
+        "legacy call must not be replayed: {events:?}"
+    );
+    let record = store.load(&id).await.unwrap();
+    assert!(matches!(
+        record.snapshot().status,
+        SessionStatus::Suspended(Suspension::AwaitingToolResults { .. })
+    ));
+    assert!(
+        record
+            .journal
+            .iter()
+            .any(|event| matches!(event, SessionJournalEvent::Suspended { .. }))
+    );
+    assert!(!root.path().join("note").exists());
+    let reconciled = sessions
+        .resume(
+            &agent,
+            id.clone(),
+            ResumeInput::ToolResults(vec![waltr_agent::ToolResult::new(
+                "legacy-call",
+                "write",
+                "externally reconciled",
+            )]),
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(reconciled.iter().all(Result::is_ok), "{reconciled:?}");
+    assert_eq!(
+        store.load(&id).await.unwrap().snapshot().status,
+        SessionStatus::Finished
+    );
+    assert!(!root.path().join("note").exists());
+}
+
+#[tokio::test]
+async fn snapshot_is_bounded_and_replayed_from_durable_middleware_state() {
+    let root = TempRoot::new("waltr-agent-snapshot");
+    root.write("Cargo.toml", "");
+    root.write("src/lib.rs", "");
+    let sandbox = TestSandbox::new(root.path()).await;
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let seen = prompts.clone();
+    let provider = Arc::new(ScriptedProvider::new("snapshot", move |request| {
+        seen.lock()
+            .unwrap()
+            .push(request.system_prompt.unwrap_or_default().to_owned());
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_system_prompt(
+            FilesystemPromptConfig::new(root.path())
+                .with_snapshot()
+                .with_max_snapshot_entries(2),
+        )
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    drain(sessions.prompt(&agent, id.clone(), "hello").stream()).await;
+    let saved = store.load(&id).await.unwrap().snapshot();
+    let snapshot = saved.middleware_state["filesystem_snapshot"]
+        .as_str()
+        .unwrap();
+    assert!(snapshot.starts_with("Current filesystem snapshot:\n"));
+    assert!(snapshot.ends_with("- <snapshot truncated>"));
+    assert!(snapshot.contains("- Cargo.toml") || snapshot.contains("- src/"));
+    assert!(prompts.lock().unwrap()[0].contains(snapshot));
+
+    root.write("new.txt", "changed after snapshot");
+    sandbox.disconnect();
+    drain(sessions.prompt(&agent, id.clone(), "again").stream()).await;
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[1].contains(snapshot));
+    assert!(!prompts[1].contains("new.txt"));
+}
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -44,10 +290,16 @@ async fn session_template_search_finds_files_and_tools() {
     fs::write(root.path().join("src/nested/resource.rs"), "resource").expect("wrote file");
     fs::write(root.path().join("src/two words.md"), "notes").expect("wrote file");
     fs::write(root.path().join(".hidden.rs"), "hidden").expect("wrote hidden file");
+    for index in 0..1030 {
+        fs::write(root.path().join(format!("early-{index:04}.txt")), "").expect("wrote file");
+    }
+    fs::write(root.path().join("z-target-beyond-cap.rs"), "").expect("wrote target");
+    let sandbox = TestSandbox::new(root.path()).await;
 
     let provider = Arc::new(ScriptedProvider::from_turns("resource-search", Vec::new()));
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
-        root.path().to_path_buf(),
+        sandbox.handle(),
+        root.path().join("host-placeholder-that-does-not-exist"),
         FileCredentialStore::new(root.path().join("auth.json")),
         crate::agent_definitions::filesystem_agent(),
     )
@@ -94,6 +346,22 @@ async fn session_template_search_finds_files_and_tools() {
     }));
     assert!(!options.iter().any(|option| option.detail == ".hidden.rs"));
 
+    let beyond_cap = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "target-beyond-cap".into(),
+                limit: 2,
+                kinds: vec![SessionTemplateKind::File],
+                target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("searched beyond first 1024 paths");
+    assert_eq!(beyond_cap.len(), 1);
+    assert_eq!(beyond_cap[0].detail, "z-target-beyond-cap.rs");
+
     let quoted = sessions
         .search_templates(
             &session_id,
@@ -113,6 +381,165 @@ async fn session_template_search_finds_files_and_tools() {
 }
 
 #[tokio::test]
+async fn session_template_search_finds_sandbox_skills() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let root_path = root.path().canonicalize().expect("canonical root");
+    let skill_dir = root_path.join(".agents/skills/documenting");
+    fs::create_dir_all(&skill_dir).expect("skill directory");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: documenting\ndescription: Write repository documentation\n---\n# Guide\n",
+    )
+    .expect("skill file");
+    let sandbox = TestSandbox::new(&root_path).await;
+    let mut registry = waltr_agent::AgentDefinitionRegistry::new();
+    registry
+        .load_yaml("apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec:\n  features: [{ skills: { root: $(session.workspace.root) } }]\n")
+        .expect("agent definition");
+    let factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        sandbox.handle(),
+        root_path.clone(),
+        FileCredentialStore::new(root_path.join("auth.json")),
+        registry.resolve_agent("test").expect("resolved agent"),
+    )
+    .with_runtime_provider(|_| {
+        Ok(waltr_agent::AgentRuntimeProvider::new(
+            test_model(),
+            Arc::new(ScriptedProvider::from_turns("skill-search", Vec::new())),
+        ))
+    });
+    let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
+    let session_id = sessions
+        .create(request)
+        .await
+        .expect("session")
+        .id()
+        .clone();
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "skill:doc".to_owned(),
+                limit: 10,
+                kinds: vec![SessionTemplateKind::Prompt],
+                target: SessionTemplateSearchTarget::Prompts,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("skill search");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].label, "skill:documenting");
+    assert_eq!(options[0].template, "/skill:documenting");
+    assert_eq!(options[0].metadata["promptType"], "skill");
+}
+
+#[tokio::test]
+async fn filesystem_tools_execute_through_sandbox_across_write_read_search_edit_and_delete() {
+    let root = tempfile::tempdir().expect("workspace");
+    let root_path = root.path().canonicalize().expect("canonical workspace");
+    let sandbox = TestSandbox::new(&root_path).await;
+    let calls = [
+        (
+            "write",
+            json!({"filePath":"nested/note.txt","content":"alpha\nbeta\n"}),
+        ),
+        ("read", json!({"filePath":"nested/note.txt"})),
+        ("glob", json!({"pattern":"**/*.txt"})),
+        ("grep", json!({"pattern":"alpha"})),
+        (
+            "edit",
+            json!({"filePath":"nested/note.txt","oldString":"beta","newString":"gamma"}),
+        ),
+        ("read", json!({"filePath":"nested/note.txt"})),
+        ("delete", json!({"filePath":"nested/note.txt"})),
+    ];
+    let provider = Arc::new(ScriptedProvider::new(
+        "sandbox-filesystem-operations",
+        move |request| {
+            let index = request.tool_results().count();
+            if let Some((name, arguments)) = calls.get(index) {
+                vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                    format!("fs-{index}"),
+                    *name,
+                    arguments.clone(),
+                )))]
+            } else {
+                vec![Ok(CompletionEvent::Finished)]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(
+            FilesystemConfig::new(&root_path).with_profile(FilesystemToolProfile::ExactEdit),
+        )
+        .build();
+    let events = collect_events(agent.prompt("exercise workspace tools").stream()).await;
+    let results = events
+        .iter()
+        .filter_map(|event| match &event.content {
+            TimelineContent::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 7, "{results:#?}");
+    assert!(
+        results.iter().all(|result| !result.is_error),
+        "{results:#?}"
+    );
+    assert!(results[1].content.contains("alpha"), "{results:#?}");
+    assert!(results[2].content.contains("note.txt"), "{results:#?}");
+    assert!(results[3].content.contains("alpha"), "{results:#?}");
+    assert!(results[5].content.contains("gamma"), "{results:#?}");
+    assert!(!root.path().join("nested/note.txt").exists());
+}
+
+#[tokio::test]
+async fn structured_patch_executes_through_sandbox() {
+    let root = tempfile::tempdir().expect("workspace");
+    let root_path = root.path().canonicalize().expect("canonical workspace");
+    fs::write(root_path.join("existing.txt"), "before\nold\nafter\n").expect("fixture");
+    let sandbox = TestSandbox::new(&root_path).await;
+    let provider = Arc::new(ScriptedProvider::new("sandbox-patch", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "patch-1",
+                "apply_patch",
+                json!({"patchText":"*** Begin Patch\n*** Update File: existing.txt\n@@\n before\n-old\n+new\n after\n*** Add File: added.txt\n+created\n*** End Patch"}),
+            )))]
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(
+            FilesystemConfig::new(&root_path).with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let events = collect_events(agent.prompt("apply patch").stream()).await;
+    let result = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .expect("patch result");
+    assert!(!result.is_error, "{result:#?}");
+    assert_eq!(
+        fs::read_to_string(root_path.join("existing.txt")).unwrap(),
+        "before\nnew\nafter\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root_path.join("added.txt")).unwrap(),
+        "created\n"
+    );
+}
+
+#[tokio::test]
 async fn session_template_search_clamps_oversized_limits() {
     let root = tempfile::tempdir().expect("temp dir");
     for index in 0..150 {
@@ -122,10 +549,12 @@ async fn session_template_search_clamps_oversized_limits() {
         )
         .expect("wrote file");
     }
+    let sandbox = TestSandbox::new(root.path()).await;
 
     let provider = Arc::new(ScriptedProvider::from_turns("resource-limit", Vec::new()));
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
-        root.path().to_path_buf(),
+        sandbox.handle(),
+        root.path().canonicalize().expect("canonical root"),
         FileCredentialStore::new(root.path().join("auth.json")),
         crate::agent_definitions::filesystem_agent(),
     )
@@ -166,8 +595,10 @@ async fn session_template_search_clamps_oversized_limits() {
 #[tokio::test]
 async fn session_template_search_ignores_mcp_startup_failures() {
     let root = tempfile::tempdir().expect("temp dir");
+    let sandbox = TestSandbox::new(root.path()).await;
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
-        root.path().to_path_buf(),
+        sandbox.handle(),
+        root.path().canonicalize().expect("canonical root"),
         FileCredentialStore::new(root.path().join("auth.json")),
         crate::agent_definitions::filesystem_mcp_agent(),
     )
@@ -217,9 +648,11 @@ async fn session_template_search_ignores_mcp_startup_failures() {
 async fn session_template_search_empty_query_returns_no_options() {
     let root = tempfile::tempdir().expect("temp dir");
     fs::write(root.path().join("visible.rs"), "visible").expect("wrote file");
+    let sandbox = TestSandbox::new(root.path()).await;
     let provider = Arc::new(ScriptedProvider::from_turns("resource-empty", Vec::new()));
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
-        root.path().to_path_buf(),
+        sandbox.handle(),
+        root.path().canonicalize().expect("canonical root"),
         FileCredentialStore::new(root.path().join("auth.json")),
         crate::agent_definitions::filesystem_agent(),
     )
@@ -1206,8 +1639,138 @@ async fn cancellation_token_stops_running_tool_without_finishing_result() {
 
 #[cfg(feature = "shell")]
 #[tokio::test]
+async fn shell_worker_root_replaces_implicit_config_workdir() {
+    let root = tempfile::tempdir().unwrap();
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("shell-root-precedence", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "shell-root",
+                "shell",
+                json!({"command":"pwd", "description":"check root"}),
+            )))]
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_permission_policy(PermissionPolicy::default())
+        .with_shell_tool(ShellConfig::new(root.path().join("incorrect-root")))
+        .build();
+    let events = collect_events(agent.prompt("check root").stream()).await;
+    let canonical = root.path().canonicalize().unwrap();
+    assert!(events.iter().any(|event| matches!(&event.content,
+        TimelineContent::ToolResult { result } if result.content.contains(&canonical.display().to_string()) && !result.is_error
+    )), "{events:#?}");
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn shell_default_workdir_claims_gate_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("shell-default-claims", |_| {
+        vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+            "shell-claim",
+            "shell",
+            json!({"command":"printf denied > ./note", "description":"check claim"}),
+        )))]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            root.path(),
+            waltr_agent::PermissionEffect::ask(),
+        ))
+        .with_shell_tool(ShellConfig::new(root.path()).with_default_workdir(outside.path()))
+        .build();
+    let events = collect_events(agent.prompt("check shell permissions").stream()).await;
+    let expected = outside.path().canonicalize().unwrap().join("note");
+    assert!(events.iter().any(|event| matches!(&event.content,
+        TimelineContent::ExternalRequest { request } if request.prompt.contains(&expected.display().to_string())
+    )), "{events:#?}");
+    assert!(!expected.exists());
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn shell_executes_in_sandbox_with_workdir_timeout_and_exit_status() {
+    let root = tempfile::tempdir().expect("workspace");
+    let root_path = root.path().canonicalize().expect("canonical workspace");
+    fs::create_dir(root_path.join("subdir")).expect("workdir");
+    let sandbox = TestSandbox::new(&root_path).await;
+    let calls = [
+        json!({"command":"pwd; printf waltr-shell-ok","description":"check default workdir"}),
+        json!({"command":"pwd; exit 7","description":"check root-relative override","workdir":"."}),
+        json!({"command":"sleep 3","description":"check default timeout"}),
+        json!({"command":"printf '%01000d' 1","description":"check output cap","workdir":".","timeout":2}),
+    ];
+    let provider = Arc::new(ScriptedProvider::new(
+        "sandbox-shell-operations",
+        move |request| {
+            let index = request.tool_results().count();
+            calls.get(index).map_or_else(
+                || vec![Ok(CompletionEvent::Finished)],
+                |arguments| {
+                    vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                        format!("shell-{index}"),
+                        "shell",
+                        arguments.clone(),
+                    )))]
+                },
+            )
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_permission_policy(PermissionPolicy::default())
+        .with_shell_tool(
+            ShellConfig::new(&root_path)
+                .with_default_workdir("subdir")
+                .with_default_timeout(Duration::from_millis(500))
+                .with_max_output_bytes(256),
+        )
+        .build();
+    let events = collect_events(agent.prompt("run sandbox shell tools").stream()).await;
+    let results = events
+        .iter()
+        .filter_map(|event| match &event.content {
+            TimelineContent::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 4, "{results:#?}");
+    assert!(
+        results[0]
+            .content
+            .contains(&root_path.join("subdir").display().to_string()),
+        "{results:#?}"
+    );
+    assert!(results[0].content.contains("waltr-shell-ok"), "{results:#?}");
+    assert!(results[1].content.contains("Exit code: 7"), "{results:#?}");
+    assert!(
+        results[1]
+            .content
+            .contains(&format!("{}\n", root_path.display())),
+        "{results:#?}"
+    );
+    assert!(
+        results[2].content.contains("Timed out: true"),
+        "{results:#?}"
+    );
+    assert!(
+        results[3].content.contains("[output truncated]"),
+        "{results:#?}"
+    );
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
 async fn shell_cancellation_kills_running_command() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let sandbox = TestSandbox::new(temp.path()).await;
     let marker = temp.path().join("shell-cancel-marker.txt");
     let command = format!("(sleep 5; printf foo > {}) & wait", marker.display());
     let provider = ScriptedProvider::from_turns(
@@ -1226,6 +1789,7 @@ async fn shell_cancellation_kills_running_command() {
         ],
     );
     let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::default())
         .with_shell_tool(ShellConfig::new(temp.path()))
         .build();
@@ -1274,25 +1838,31 @@ async fn shell_cancellation_kills_running_command() {
         "canceled shell command should not write marker"
     );
     let record = store.load(&session_id).await.expect("stored session");
-    assert!(record.snapshot().pending_work.iter().any(|work| {
-        work.id == "shell-cancel-call"
-            && matches!(
-                work.status,
-                waltr_agent::PendingWorkStatus::Canceled(
-                    waltr_agent::CancelReason::SessionInterrupted
+    assert!(
+        record.snapshot().pending_work.iter().any(|work| {
+            work.id == "shell-cancel-call"
+                && matches!(
+                    work.status,
+                    waltr_agent::PendingWorkStatus::Canceled(
+                        waltr_agent::CancelReason::SessionInterrupted
+                    )
                 )
-            )
-    }));
+        }),
+        "{:?}",
+        record.snapshot().pending_work
+    );
 }
 
 #[tokio::test]
 async fn agents_system_prompt_is_sent_to_provider() {
     let temp = TempRoot::new("waltr-agent-static-agents-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write(AGENTS_INSTRUCTION_FILE, "Prefer concise answers.\n");
     let provider = AgentsSystemPromptProvider {
         expected_path: temp.path().join(AGENTS_INSTRUCTION_FILE),
     };
     let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_sandbox(sandbox.handle())
         .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
         .build();
 
@@ -1313,6 +1883,7 @@ async fn agents_system_prompt_is_sent_to_provider() {
 #[tokio::test]
 async fn agents_system_prompt_expands_file_references() {
     let temp = TempRoot::new("waltr-agent-agents-template-file-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write(AGENTS_INSTRUCTION_FILE, "Follow @CONTRIBUTING.md\n");
     temp.write("CONTRIBUTING.md", "template included instructions\n");
     let provider = Arc::new(ScriptedProvider::new("agents-template-file", |request| {
@@ -1320,13 +1891,14 @@ async fn agents_system_prompt_expands_file_references() {
         assert!(
             system_prompt.contains(
                 "<template-result kind=\"file\" tool=\"read\" source=\"CONTRIBUTING.md\">"
-            ) && system_prompt.contains("<type>file</type>")
-                && system_prompt.contains("1: template included instructions"),
+            ) && system_prompt.contains("template included instructions"),
             "{system_prompt}"
         );
         vec![Ok(CompletionEvent::Finished)]
     }));
     let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(temp.path()))
         .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
         .build();
 
@@ -1336,6 +1908,7 @@ async fn agents_system_prompt_expands_file_references() {
 #[tokio::test]
 async fn user_prompt_expands_file_references_and_persists_rendered_prompt() {
     let temp = TempRoot::new("waltr-agent-user-template-file-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write("prompt-fragment.md", "rendered user file\n");
     let file_ref = "@prompt-fragment.md";
     let provider = Arc::new(ScriptedProvider::new("user-template-file", |request| {
@@ -1345,14 +1918,12 @@ async fn user_prompt_expands_file_references_and_persists_rendered_prompt() {
                 .contains("<template-result kind=\"file\" tool=\"read\""),
             "{request:?}"
         );
-        assert!(request.prompt.contains("<type>file</type>"), "{request:?}");
-        assert!(
-            request.prompt.contains("1: rendered user file"),
-            "{request:?}"
-        );
+        assert!(request.prompt.contains("rendered user file"), "{request:?}");
         vec![Ok(CompletionEvent::Finished)]
     }));
     let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(temp.path()))
         .with_template_base_dir(temp.path())
         .build();
     let store = MemorySessionStore::new();
@@ -1373,8 +1944,34 @@ async fn user_prompt_expands_file_references_and_persists_rendered_prompt() {
         prompt.contains("<template-result kind=\"file\" tool=\"read\""),
         "{prompt}"
     );
-    assert!(prompt.contains("<type>file</type>"), "{prompt}");
-    assert!(prompt.contains("1: rendered user file"), "{prompt}");
+    assert!(prompt.contains("rendered user file"), "{prompt}");
+}
+
+#[tokio::test]
+async fn user_file_reference_uses_formatted_worker_read_not_raw_instructions() {
+    let temp = TempRoot::new("waltr-agent-formatted-template-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
+    temp.write("long.md", &"line\n".repeat(2002));
+    let provider = Arc::new(ScriptedProvider::new(
+        "formatted-file-template",
+        |request| {
+            assert!(
+                request.prompt.contains("<type>file</type>"),
+                "{:?}",
+                request.prompt
+            );
+            assert!(request.prompt.contains("2000: line"));
+            assert!(!request.prompt.contains("2001: line"));
+            assert!(request.prompt.contains("Use offset=2001 to continue."));
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(temp.path()))
+        .with_template_base_dir(temp.path())
+        .build();
+    drain(agent.prompt("@long.md").stream()).await;
 }
 
 #[tokio::test]
@@ -1521,11 +2118,12 @@ async fn user_prompt_template_tool_applies_nested_input_deny_before_invocation()
 
 #[cfg(feature = "shell")]
 #[tokio::test]
-async fn user_prompt_template_tool_auto_approves_ask_permissions() {
+async fn user_prompt_template_shell_asks_before_dispatch_and_runs_after_approval() {
     let root = TempRoot::new("waltr-agent-user-template-shell-root");
+    let sandbox = TestSandbox::new(root.path()).await;
     let outside = TempRoot::new("waltr-agent-user-template-shell-outside");
-    outside.write("secret.txt", "template ask approved\n");
-    let command = format!("cat {}", outside.path().join("secret.txt").display());
+    let side_effect = outside.path().join("unapproved.txt");
+    let command = "touch ./unapproved.txt";
     let provider = Arc::new(ScriptedProvider::new(
         "user-template-permission-ask",
         |request| {
@@ -1534,43 +2132,726 @@ async fn user_prompt_template_tool_auto_approves_ask_permissions() {
                     .prompt
                     .contains("<template-result kind=\"tool\" tool=\"shell\">")
             );
-            assert!(
-                request.prompt.contains("template ask approved"),
-                "{request:?}"
-            );
             vec![Ok(CompletionEvent::Finished)]
         },
     ));
-    let policy = PermissionPolicy::default().with_command_rule(
-        PermissionToolSelector::exact("shell"),
-        PermissionCommandPattern::Name("cat".to_owned()),
-        PermissionEffect::ask(),
-    );
+    let policy = PermissionPolicy::filesystem_external(root.path(), PermissionEffect::ask())
+        .with_command_rule(
+            PermissionToolSelector::exact("shell"),
+            PermissionCommandPattern::Name("touch".to_owned()),
+            PermissionEffect::ask(),
+        );
     let agent = AgentRuntime::builder(test_model(), provider)
-        .with_shell_tool(ShellConfig::new(root.path()))
+        .with_sandbox(sandbox.handle())
+        .with_shell_tool(ShellConfig::new(root.path()).with_default_workdir(outside.path()))
         .with_permission_policy(policy)
         .build();
 
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
+    let session_id = create_session_id(&sessions).await;
     let events = collect_events(
-        agent
-            .prompt(format!(
+        sessions
+            .prompt(&agent, session_id.clone(), format!(
                 "@tool(shell, {{\"command\":{command:?},\"description\":\"Read the test fixture.\"}})"
             ))
             .stream(),
     )
     .await;
 
+    let request = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("contextual permission request");
+    assert_eq!(request.kind, ExternalRequestKind::Permission);
     assert!(
-        !events
+        request.payload["claims"]
+            .as_array()
+            .is_some_and(|claims| !claims.is_empty())
+    );
+    assert!(!side_effect.exists(), "unapproved shell command ran");
+    drain(
+        sessions
+            .resume(
+                &agent,
+                session_id,
+                ResumeInput::ExternalResponse {
+                    request_id: request.id.clone(),
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert!(side_effect.exists(), "approved shell command did not run");
+}
+
+#[tokio::test]
+async fn user_prompt_template_workspace_write_ask_can_be_denied() {
+    let root = TempRoot::new("waltr-agent-user-template-write-root");
+    let sandbox = TestSandbox::new(root.path()).await;
+    let target = root.path().join("unapproved.txt");
+    let provider = Arc::new(ScriptedProvider::new("template-write-ask", |_| {
+        panic!("provider must not see a denied template submission")
+    }));
+    let policy = PermissionPolicy::default().with_tool_rule(
+        PermissionToolSelector::exact("write"),
+        PermissionEffect::ask(),
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(root.path()))
+        .with_permission_policy(policy)
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+    let events = collect_events(
+        sessions
+            .prompt(
+                &agent,
+                session_id.clone(),
+                "@tool(write, {\"filePath\":\"unapproved.txt\",\"content\":\"unsafe\"})",
+            )
+            .stream(),
+    )
+    .await;
+    let request_id = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("whole-tool permission request");
+    assert!(!target.exists(), "unapproved write ran");
+    drain(
+        sessions
+            .resume(
+                &agent,
+                session_id,
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response: ExternalResponse::new(json!({"decision":"deny","message":"no"})),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert!(!target.exists(), "denied write ran");
+}
+
+#[tokio::test]
+async fn sandbox_template_worker_claim_deny_prevents_write() {
+    let root = TempRoot::new("waltr-agent-template-claim-deny");
+    let outside = TempRoot::new("waltr-agent-template-claim-deny-outside");
+    let target = outside.path().join("denied.txt");
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("template-claim-deny", |request| {
+        assert!(request.prompt.contains("status=\"error\""), "{request:?}");
+        assert!(request.prompt.contains("permission denied"), "{request:?}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(root.path()))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            root.path(),
+            PermissionEffect::deny(),
+        ))
+        .build();
+    let prompt = format!(
+        "@tool(write, {{\"filePath\":{:?},\"content\":\"denied\"}})",
+        target.display().to_string()
+    );
+    drain(agent.prompt(prompt).stream()).await;
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn completed_sandbox_template_write_is_not_replayed_on_partial_turn_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().unwrap();
+    let sandbox = TestSandbox::new(root.path()).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let provider = Arc::new(ScriptedProvider::new("template-drop", move |request| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            request
+                .prompt
+                .matches("<template-result kind=\"tool\" tool=\"write\">")
+                .count(),
+            2
+        );
+        vec![
+            Ok(CompletionEvent::Delta("started".to_owned())),
+            Ok(CompletionEvent::Finished),
+        ]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(root.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let prompt = "@tool(write, {\"filePath\":\"once\",\"content\":\"first\"}) @tool(write, {\"filePath\":\"once\",\"content\":\"second\"})";
+    let mut stream = sessions.prompt(&agent, id.clone(), prompt).stream();
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        if matches!(event.content, TimelineContent::TextDelta { .. }) {
+            break;
+        }
+    }
+    drop(stream);
+    let resumed = collect_events(
+        sessions
+            .resume(&agent, id.clone(), ResumeInput::Continue)
+            .stream(),
+    )
+    .await;
+    assert!(
+        resumed
             .iter()
-            .any(|event| matches!(event.content, TimelineContent::ExternalRequest { .. }))
+            .all(|event| !matches!(event.content, TimelineContent::ToolResult { .. }))
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(root.path().join("once")).unwrap(),
+        "second"
+    );
+    let record = store.load(&id).await.unwrap();
+    assert_eq!(record.snapshot().prompts.len(), 1);
+    assert!(!record.journal.iter().any(|event| matches!(
+        event,
+        waltr_agent::SessionJournalEvent::SandboxDispatchStarted { .. }
+    )));
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn disconnected_sandbox_template_renders_error_and_fresh_render_can_execute() {
+    let root = TempRoot::new("waltr-agent-template-disconnect");
+    let disconnected = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("template-disconnected", |request| {
+        assert!(request.prompt.contains("status=\"error\""), "{request:?}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(disconnected.handle())
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .build();
+    disconnected.disconnect();
+    let prompt = "@tool(shell, {\"command\":\"pwd\",\"description\":\"Print workdir.\"})";
+    drain(agent.prompt(prompt).stream()).await;
+
+    let connected = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("template-reconnected", |request| {
+        assert!(
+            request
+                .prompt
+                .contains("<template-result kind=\"tool\" tool=\"shell\">"),
+            "{request:?}"
+        );
+        assert!(!request.prompt.contains("status=\"error\""), "{request:?}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(connected.handle())
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .build();
+    drain(agent.prompt(prompt).stream()).await;
+}
+
+#[tokio::test]
+async fn nested_file_sandbox_template_executes_and_rerender_is_new_invocation() {
+    let root = TempRoot::new("waltr-agent-template-nested-rerender");
+    root.write(
+        "nested.md",
+        "@tool(write, {\"filePath\":\"marker\",\"content\":\"first\"})",
+    );
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("nested-template", |request| {
+        assert!(
+            request.prompt.contains("<template-result kind=\"file\""),
+            "{request:?}"
+        );
+        assert!(
+            request
+                .prompt
+                .contains("<template-result kind=\"tool\" tool=\"write\">"),
+            "{request:?}"
+        );
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(root.path()))
+        .build();
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
+    let id = create_session_id(&sessions).await;
+    let reference = format!("@\"{}\"", root.path().join("nested.md").display());
+    drain(sessions.prompt(&agent, id.clone(), &reference).stream()).await;
+    assert_eq!(
+        fs::read_to_string(root.path().join("marker")).unwrap(),
+        "first"
+    );
+    root.write(
+        "nested.md",
+        "@tool(write, {\"filePath\":\"marker\",\"content\":\"second\"})",
+    );
+    drain(sessions.prompt(&agent, id, &reference).stream()).await;
+    assert_eq!(
+        fs::read_to_string(root.path().join("marker")).unwrap(),
+        "second"
+    );
+}
+
+#[tokio::test]
+async fn agents_instruction_template_read_does_not_reload_its_own_instruction() {
+    let root = TempRoot::new("waltr-agent-instruction-template-reentrancy");
+    root.write("src/main.rs", "fixture content\n");
+    root.write(
+        AGENTS_INSTRUCTION_FILE,
+        "Inspect @tool(read, {\"filePath\":\"src/main.rs\"})\n",
+    );
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("instruction-reentrancy", |request| {
+        let system = request.system_prompt.expect("instruction prompt");
+        assert_eq!(system.matches("Inspect ").count(), 1, "{system}");
+        assert!(system.contains("fixture content"), "{system}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
+        .with_filesystem_tools(FilesystemConfig::new(root.path()).with_agents_read_context())
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        drain(sessions.prompt(&agent, id.clone(), "hello").stream()),
+    )
+    .await
+    .expect("instruction render should not recurse");
+    let state = &store.load(&id).await.unwrap().snapshot().middleware_state["agents"];
+    assert_eq!(state["loaded"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["loaded"][0]["prompt"], true);
+}
+
+#[tokio::test]
+async fn agents_instruction_template_releases_render_guard_on_permission_suspend() {
+    let root = TempRoot::new("waltr-agent-instruction-template-suspend");
+    root.write("src/main.rs", "approved fixture\n");
+    root.write(
+        AGENTS_INSTRUCTION_FILE,
+        "Read @tool(read, {\"filePath\":\"src/main.rs\"})\n",
+    );
+    let sandbox = TestSandbox::new(root.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("instruction-after-ask", |request| {
+        let system = request.system_prompt.expect("instruction prompt");
+        assert_eq!(system.matches("Read ").count(), 1, "{system}");
+        assert!(system.contains("approved fixture"), "{system}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
+        .with_filesystem_tools(FilesystemConfig::new(root.path()).with_agents_read_context())
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("read"),
+            PermissionEffect::ask(),
+        ))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let events = collect_events(sessions.prompt(&agent, id.clone(), "hello").stream()).await;
+    let request_id = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("read approval request");
+    drain(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    let state = &store.load(&id).await.unwrap().snapshot().middleware_state["agents"];
+    assert_eq!(state["loaded"].as_array().map(Vec::len), Some(1));
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn sandbox_template_shell_timeout_renders_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = TempRoot::new("waltr-agent-template-timeout");
+    let sandbox = TestSandbox::new(root.path()).await;
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    let provider = Arc::new(ScriptedProvider::new("template-timeout", move |request| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            request
+                .prompt
+                .contains("<template-result kind=\"tool\" tool=\"shell\" status=\"error\">"),
+            "{request:?}"
+        );
+        assert!(
+            request.prompt.to_lowercase().contains("timed out"),
+            "{request:?}"
+        );
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .build();
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
+    let id = create_session_id(&sessions).await;
+    let prompt = "@tool(shell, {\"command\":\"printf x >> marker; sleep 3\",\"description\":\"Wait.\",\"timeout\":1})";
+    drain(sessions.prompt(&agent, id.clone(), prompt).stream()).await;
+    drain(sessions.prompt(&agent, id, prompt).stream()).await;
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(root.path().join("marker")).unwrap(),
+        "xx"
     );
 }
 
 #[cfg(feature = "shell")]
 #[tokio::test]
-async fn runtime_prompt_template_tool_asks_for_permission() {
+async fn sandbox_template_result_survives_later_prompt_ask_in_same_batch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = TempRoot::new("waltr-agent-template-batch-ask");
+    let sandbox = TestSandbox::new(root.path()).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let provider = Arc::new(ScriptedProvider::new(
+        "template-batch-ask",
+        move |request| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(
+                    request
+                        .prompt
+                        .contains("<template-result kind=\"tool\" tool=\"ordinary\">")
+                );
+            }
+            assert!(
+                request.prompt_turns.iter().any(|turn| turn
+                    .prompt
+                    .contains("<template-result kind=\"tool\" tool=\"shell\">")),
+                "{request:?}"
+            );
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .with_tool(AgentTool::new(
+            ToolDefinition::new("ordinary", "Test tool", json!({"type":"object"})),
+            |call| Ok(call.result("approved")),
+        ))
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("ordinary"),
+            PermissionEffect::ask(),
+        ))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let shell = "@tool(shell, {\"command\":\"printf x >> marker\",\"description\":\"Mark call.\"})";
+    let first = collect_events(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::Prompts(vec![shell.to_owned(), "@tool(ordinary, {})".to_owned()]),
+            )
+            .stream(),
+    )
+    .await;
+    let request_id = first
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("second prompt asks permission");
+    assert_eq!(fs::read_to_string(root.path().join("marker")).unwrap(), "x");
+    assert!(store.load(&id).await.unwrap().snapshot().prompts.is_empty());
+    drain(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert_eq!(fs::read_to_string(root.path().join("marker")).unwrap(), "x");
+    assert_eq!(store.load(&id).await.unwrap().snapshot().prompts.len(), 2);
+    drain(sessions.prompt(&agent, id, shell).stream()).await;
+    assert_eq!(
+        fs::read_to_string(root.path().join("marker")).unwrap(),
+        "xx"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn user_prompt_template_ask_replays_submitted_prompt_once_after_approval() {
+    let invoked = Arc::new(Mutex::new(false));
+    let observed = invoked.clone();
+    let provider = Arc::new(ScriptedProvider::new("ordinary-template-ask", |request| {
+        assert!(request.prompt.starts_with("Please "), "{request:?}");
+        assert!(request.prompt.contains("ordinary tool ran"), "{request:?}");
+        assert!(request.prompt.ends_with(" today"), "{request:?}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let tool = AgentTool::new(
+        ToolDefinition::new("ordinary", "Test tool", json!({"type":"object"})),
+        move |call| {
+            *observed.lock().unwrap() = true;
+            Ok(call.result("ordinary tool ran"))
+        },
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(tool)
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("ordinary"),
+            PermissionEffect::ask(),
+        ))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let original = "Please @tool(ordinary, {}) today";
+    let events = collect_events(sessions.prompt(&agent, id.clone(), original).stream()).await;
+    assert!(!*invoked.lock().unwrap());
+    let request_id = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("permission request");
+    let pending = store.load(&id).await.unwrap().snapshot();
+    assert!(pending.prompts.is_empty());
+    assert_eq!(
+        pending.middleware_state["pending_user_template"]["prompts"][0],
+        original
+    );
+    assert!(
+        collect_events(
+            sessions
+                .resume(&agent, id.clone(), ResumeInput::Continue)
+                .stream()
+        )
+        .await
+        .is_empty()
+    );
+    assert!(!*invoked.lock().unwrap());
+    let approved = collect_events(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert!(
+        *invoked.lock().unwrap(),
+        "approved events: {approved:?}, snapshot: {:?}",
+        store.load(&id).await.unwrap().snapshot()
+    );
+    let snapshot = store.load(&id).await.unwrap().snapshot();
+    assert_eq!(snapshot.prompts.len(), 1);
+    assert_eq!(snapshot.prompt_turns.len(), 1);
+    assert!(snapshot.current_prompt.unwrap().starts_with("Please "));
+}
+
+#[tokio::test]
+async fn identical_template_tool_occurrences_require_distinct_approvals() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoked = calls.clone();
+    let tool = AgentTool::new(
+        ToolDefinition::new("repeat", "Repeat.", json!({"type":"object"})),
+        move |call| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Ok(call.result("done"))
+        },
+    );
+    let provider = Arc::new(ScriptedProvider::new("repeat-template", |request| {
+        assert_eq!(
+            request
+                .prompt
+                .matches("<template-result kind=\"tool\"")
+                .count(),
+            2
+        );
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(tool)
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("repeat"),
+            PermissionEffect::ask(),
+        ))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let prompt = "@tool(repeat, {}) and @tool(repeat, {})";
+    let first = collect_events(sessions.prompt(&agent, id.clone(), prompt).stream()).await;
+    let first_id = first
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let second = collect_events(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id: first_id.clone(),
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    let second_id = second
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("second occurrence needs approval");
+    assert_ne!(first_id, second_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drain(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id: second_id,
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.load(&id).await.unwrap().snapshot().prompts.len(), 1);
+}
+
+#[tokio::test]
+async fn denied_template_approval_does_not_send_empty_prompt_or_authorize_later_input() {
+    let count = Arc::new(Mutex::new(0));
+    let seen = count.clone();
+    let provider = Arc::new(ScriptedProvider::new("denied-template", move |request| {
+        assert_eq!(request.prompt, "replacement");
+        *seen.lock().unwrap() += 1;
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(AgentTool::new(
+            ToolDefinition::new("ask", "Ask.", json!({"type":"object"})),
+            |_call| panic!("denied tool must not run"),
+        ))
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("ask"),
+            PermissionEffect::ask(),
+        ))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let id = create_session_id(&sessions).await;
+    let first = collect_events(
+        sessions
+            .prompt(&agent, id.clone(), "@tool(ask, {})")
+            .stream(),
+    )
+    .await;
+    let request_id = first
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    collect_events(
+        sessions
+            .resume(
+                &agent,
+                id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response: ExternalResponse::new(json!({"decision":"deny","message":"no"})),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert!(
+        collect_events(
+            sessions
+                .resume(&agent, id.clone(), ResumeInput::Continue)
+                .stream()
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(*count.lock().unwrap(), 0);
+    assert!(store.load(&id).await.unwrap().snapshot().prompts.is_empty());
+    drain(sessions.prompt(&agent, id.clone(), "replacement").stream()).await;
+    assert_eq!(*count.lock().unwrap(), 1);
+    assert_eq!(
+        store.load(&id).await.unwrap().snapshot().prompts,
+        ["replacement"]
+    );
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn runtime_prompt_sandbox_template_asks_for_contextual_permission() {
     let root = TempRoot::new("waltr-agent-runtime-template-shell-root");
+    let sandbox = TestSandbox::new(root.path()).await;
     let outside = TempRoot::new("waltr-agent-runtime-template-shell-outside");
     outside.write("secret.txt", "runtime ask should pause\n");
     let command = format!("cat {}", outside.path().join("secret.txt").display());
@@ -1582,7 +2863,7 @@ async fn runtime_prompt_template_tool_asks_for_permission() {
     );
     let provider = Arc::new(ScriptedProvider::new(
         "runtime-template-permission-ask",
-        |_request| panic!("provider should not be called before permission is answered"),
+        |_| panic!("provider should wait for permission"),
     ));
     let policy = PermissionPolicy::default().with_command_rule(
         PermissionToolSelector::exact("shell"),
@@ -1590,6 +2871,7 @@ async fn runtime_prompt_template_tool_asks_for_permission() {
         PermissionEffect::ask(),
     );
     let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
         .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
         .with_shell_tool(ShellConfig::new(root.path()))
         .with_permission_policy(policy)
@@ -1603,16 +2885,16 @@ async fn runtime_prompt_template_tool_asks_for_permission() {
             TimelineContent::ExternalRequest { request } => Some(request),
             _ => None,
         })
-        .expect("permission request");
+        .expect("contextual permission request");
     assert_eq!(request.kind, ExternalRequestKind::Permission);
-    assert_eq!(request.tool_call_id.as_deref(), Some("template-shell"));
-    assert!(request.prompt.contains("cat"), "{request:#?}");
+    assert!(request.prompt.contains("cat"), "{request:?}");
 }
 
 #[cfg(feature = "shell")]
 #[tokio::test]
-async fn runtime_prompt_template_tool_runs_after_permission_approval() {
+async fn runtime_prompt_sandbox_template_runs_after_approval() {
     let root = TempRoot::new("waltr-agent-runtime-template-resume-root");
+    let sandbox = TestSandbox::new(root.path()).await;
     let outside = TempRoot::new("waltr-agent-runtime-template-resume-outside");
     outside.write("secret.txt", "runtime template approved\n");
     let command = format!("cat {}", outside.path().join("secret.txt").display());
@@ -1639,12 +2921,13 @@ async fn runtime_prompt_template_tool_runs_after_permission_approval() {
         PermissionEffect::ask(),
     );
     let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
         .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
         .with_shell_tool(ShellConfig::new(root.path()))
         .with_permission_policy(policy)
         .build();
     let store = MemorySessionStore::new();
-    let sessions = SessionCoordinator::new(store);
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     let events = collect_events(
@@ -1659,13 +2942,12 @@ async fn runtime_prompt_template_tool_runs_after_permission_approval() {
             TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
             _ => None,
         })
-        .expect("permission request");
-
+        .expect("contextual permission request");
     drain(
         sessions
             .resume(
                 &agent,
-                session_id,
+                session_id.clone(),
                 ResumeInput::ExternalResponse {
                     request_id,
                     response: ExternalResponse::new(json!("allow-once")),
@@ -1674,13 +2956,23 @@ async fn runtime_prompt_template_tool_runs_after_permission_approval() {
             .stream(),
     )
     .await;
+    assert_eq!(
+        store
+            .load(&session_id)
+            .await
+            .unwrap()
+            .snapshot()
+            .prompts
+            .len(),
+        1
+    );
 }
 
 #[cfg(feature = "shell")]
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn runtime_template_whole_tool_and_contextual_ask_need_exactly_two_approvals() {
+async fn runtime_sandbox_template_whole_tool_and_contextual_ask_need_two_approvals() {
     let root = TempRoot::new("waltr-agent-runtime-template-two-stage-root");
+    let sandbox = TestSandbox::new(root.path()).await;
     let marker = root.path().join("template-approved.txt");
     let command = format!("printf approved > {}", marker.display());
     root.write(
@@ -1691,7 +2983,10 @@ async fn runtime_template_whole_tool_and_contextual_ask_need_exactly_two_approva
     );
     let provider = Arc::new(ScriptedProvider::new(
         "runtime-template-two-stage-permission",
-        |_request| vec![Ok(CompletionEvent::Finished)],
+        |request| {
+            assert!(request.system_prompt.unwrap().contains("Run fixture:"));
+            vec![Ok(CompletionEvent::Finished)]
+        },
     ));
     let policy = PermissionPolicy::default()
         .with_tool_rule(
@@ -1704,6 +2999,7 @@ async fn runtime_template_whole_tool_and_contextual_ask_need_exactly_two_approva
             PermissionEffect::ask(),
         );
     let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
         .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
         .with_shell_tool(ShellConfig::new(root.path()))
         .with_permission_policy(policy)
@@ -1718,80 +3014,49 @@ async fn runtime_template_whole_tool_and_contextual_ask_need_exactly_two_approva
             .stream(),
     )
     .await;
-    let whole_tool_request = first
+    let whole = first
         .iter()
         .find_map(|event| match &event.content {
             TimelineContent::ExternalRequest { request } => Some(request),
             _ => None,
         })
         .expect("whole-tool permission request");
-    assert_eq!(
-        whole_tool_request.tool_call_id.as_deref(),
-        Some("template-shell")
-    );
-    assert_eq!(whole_tool_request.payload["claims"], json!([]));
-    assert_eq!(whole_tool_request.payload["claim_identities"], json!([]));
-    assert!(
-        !marker.exists(),
-        "template tool ran before whole-tool approval"
-    );
-
+    assert_eq!(whole.payload["claims"], json!([]));
+    assert!(!marker.exists());
     let second = collect_events(
         sessions
             .resume(
                 &agent,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
-                    request_id: whole_tool_request.id.clone(),
+                    request_id: whole.id.clone(),
                     response: ExternalResponse::new(json!("allow-once")),
                 },
             )
             .stream(),
     )
     .await;
-    let contextual_request = second
+    let contextual = second
         .iter()
         .find_map(|event| match &event.content {
             TimelineContent::ExternalRequest { request } => Some(request),
             _ => None,
         })
         .expect("contextual permission request");
-    assert_ne!(contextual_request.id, whole_tool_request.id);
-    assert_eq!(
-        contextual_request.tool_call_id.as_deref(),
-        Some("template-shell")
-    );
+    assert_ne!(contextual.id, whole.id);
     assert!(
-        contextual_request.payload["claims"]
+        contextual.payload["claims"]
             .as_array()
             .is_some_and(|claims| !claims.is_empty())
     );
-    assert!(
-        contextual_request.payload["claim_identities"]
-            .as_array()
-            .is_some_and(|claims| !claims.is_empty())
-    );
-    assert!(
-        !marker.exists(),
-        "template tool ran before contextual approval"
-    );
-    let suspended = store
-        .load(&session_id)
-        .await
-        .expect("stored session")
-        .snapshot();
-    let one_shot = &suspended.middleware_state["permissions"]["one_shot"];
-    assert_eq!(one_shot.as_array().map(Vec::len), Some(1));
-    assert_eq!(one_shot[0]["request_id"], whole_tool_request.id.as_str());
-    assert_eq!(one_shot[0]["stage"], "whole_tool");
-
-    let third = collect_events(
+    assert!(!marker.exists());
+    drain(
         sessions
             .resume(
                 &agent,
-                session_id,
+                session_id.clone(),
                 ResumeInput::ExternalResponse {
-                    request_id: contextual_request.id.clone(),
+                    request_id: contextual.id.clone(),
                     response: ExternalResponse::new(json!("allow-once")),
                 },
             )
@@ -1799,10 +3064,15 @@ async fn runtime_template_whole_tool_and_contextual_ask_need_exactly_two_approva
     )
     .await;
     assert_eq!(fs::read_to_string(&marker).unwrap(), "approved");
-    assert!(
-        third
-            .iter()
-            .all(|event| !matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    assert_eq!(
+        store
+            .load(&session_id)
+            .await
+            .unwrap()
+            .snapshot()
+            .prompts
+            .len(),
+        1
     );
 }
 
@@ -1863,8 +3133,22 @@ async fn filesystem_read_agents_context_is_opt_in_and_loaded_once() {
     temp.write("AGENTS.md", "Root instructions.\n");
     temp.write("src/AGENTS.md", "Nested instructions.\n");
     temp.write("src/main.rs", "fn main() {}\n");
+    #[cfg(unix)]
+    let workspace = {
+        let link = temp.path().join("alias");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+        link
+    };
+    #[cfg(not(unix))]
+    let workspace = temp.path().to_path_buf();
+    let sandbox = TestSandbox::new(&workspace).await;
+    assert_eq!(
+        sandbox.handle().canonical_root().unwrap(),
+        temp.path().canonicalize().unwrap()
+    );
     let agent = AgentRuntime::builder(test_model(), Arc::new(RepeatedReadProvider::default()))
-        .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_agents_read_context())
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(&workspace).with_agents_read_context())
         .build();
 
     let mut events = agent.prompt("read twice").stream();
@@ -1886,12 +3170,39 @@ async fn filesystem_read_agents_context_is_opt_in_and_loaded_once() {
 }
 
 #[tokio::test]
+async fn filesystem_read_agents_context_normalizes_wrapped_model_path() {
+    let temp = TempRoot::new("waltr-agent-read-agents-wrapped-path");
+    temp.write("src/AGENTS.md", "Wrapped path instructions.\n");
+    temp.write("src/main.rs", "fn main() {}\n");
+    let sandbox = TestSandbox::new(temp.path()).await;
+    let provider = Arc::new(ScriptedProvider::new("wrapped-read", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "wrapped-read",
+                "read",
+                json!({"filePath": "<path>src/main.rs</path>"}),
+            )))]
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_agents_read_context())
+        .build();
+    let result = single_tool_result(agent.prompt("read wrapped path").stream()).await;
+    assert!(result.contains("Wrapped path instructions."), "{result}");
+}
+
+#[tokio::test]
 async fn filesystem_read_agents_context_is_disabled_by_default() {
     let temp = TempRoot::new("waltr-agent-read-agents-disabled-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write("AGENTS.md", "Root instructions.\n");
     temp.write("src/AGENTS.md", "Nested instructions.\n");
     temp.write("src/main.rs", "fn main() {}\n");
     let agent = AgentRuntime::builder(test_model(), Arc::new(SingleReadProvider))
+        .with_sandbox(sandbox.handle())
         .with_filesystem_tools(FilesystemConfig::new(temp.path()))
         .build();
 
@@ -1905,10 +3216,12 @@ async fn filesystem_read_agents_context_is_disabled_by_default() {
 #[tokio::test]
 async fn filesystem_read_agents_context_skips_static_root_instruction() {
     let temp = TempRoot::new("waltr-agent-read-static-agents-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write("AGENTS.md", "Root instructions.\n");
     temp.write("src/AGENTS.md", "Nested instructions.\n");
     temp.write("src/main.rs", "fn main() {}\n");
     let agent = AgentRuntime::builder(test_model(), Arc::new(SingleReadProvider))
+        .with_sandbox(sandbox.handle())
         .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_agents_read_context())
         .build();
@@ -1922,6 +3235,7 @@ async fn filesystem_read_agents_context_skips_static_root_instruction() {
 #[tokio::test]
 async fn skills_system_prompt_lists_root_skills_and_exposes_loader() {
     let temp = TempRoot::new("waltr-agent-skills-system-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write_skill(
         "example",
         "Use for example tasks.",
@@ -1931,6 +3245,7 @@ async fn skills_system_prompt_lists_root_skills_and_exposes_loader() {
         expected_root: temp.path().canonicalize().expect("canonical temp root"),
     };
     let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_sandbox(sandbox.handle())
         .with_skills(SkillsConfig::new(temp.path()))
         .build();
 
@@ -1938,8 +3253,32 @@ async fn skills_system_prompt_lists_root_skills_and_exposes_loader() {
 }
 
 #[tokio::test]
+async fn configured_non_root_skills_are_initially_visible_only_under_configured_root() {
+    let temp = TempRoot::new("waltr-agent-configured-skills-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
+    temp.write_skill("outer", "Outer skill.", "# Outer\n");
+    temp.write(
+        "packages/app/.agents/skills/inner/SKILL.md",
+        "---\nname: inner\ndescription: Inner skill.\n---\n# Inner\n",
+    );
+    let app = temp.path().join("packages/app");
+    let provider = Arc::new(ScriptedProvider::new("configured-skills", |request| {
+        let prompt = request.system_prompt.expect("system prompt");
+        assert!(prompt.contains("inner: Inner skill."), "{prompt}");
+        assert!(!prompt.contains("outer: Outer skill."), "{prompt}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_sandbox(sandbox.handle())
+        .with_skills(SkillsConfig::new(app))
+        .build();
+    drain(agent.prompt("hello").stream()).await;
+}
+
+#[tokio::test]
 async fn load_skill_loads_content_and_lists_resources_once() {
     let temp = TempRoot::new("waltr-agent-load-skill-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write_skill(
         "example",
         "Use for example tasks.",
@@ -1950,6 +3289,7 @@ async fn load_skill_loads_content_and_lists_resources_once() {
         test_model(),
         Arc::new(LoadSkillProvider::new(json!({ "name": "example" }))),
     )
+    .with_sandbox(sandbox.handle())
     .with_skills(SkillsConfig::new(temp.path()))
     .build();
 
@@ -1959,6 +3299,15 @@ async fn load_skill_loads_content_and_lists_resources_once() {
     assert!(tool_results[0].contains("<skill_content name=\"example\">"));
     assert!(tool_results[0].contains("Follow example steps."));
     assert!(tool_results[0].contains("- references/guide.md"));
+    assert!(
+        !tool_results[0].contains(
+            &temp
+                .path()
+                .join(".agents/skills/example/references/guide.md")
+                .display()
+                .to_string()
+        )
+    );
     assert!(tool_results[1].contains("already loaded"));
 }
 
@@ -1966,6 +3315,7 @@ async fn load_skill_loads_content_and_lists_resources_once() {
 #[allow(clippy::too_many_lines)]
 async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
     let temp = TempRoot::new("waltr-agent-load-skill-permission-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write_skill(
         "example",
         "Use for example tasks.",
@@ -1986,6 +3336,7 @@ async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
         }
     });
     let ask_agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_sandbox(sandbox.handle())
         .with_permission_policy(PermissionPolicy::default().with_tool_rule(
             PermissionToolSelector::exact("load_skill"),
             PermissionEffect::ask(),
@@ -2063,6 +3414,7 @@ async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
         test_model(),
         Arc::new(LoadSkillProvider::new(json!({ "name": "example" }))),
     )
+    .with_sandbox(sandbox.handle())
     .with_permission_policy(PermissionPolicy::default().with_tool_rule(
         PermissionToolSelector::exact("load_skill"),
         PermissionEffect::allow(),
@@ -2077,6 +3429,8 @@ async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
 #[tokio::test]
 async fn duplicate_skill_names_require_root() {
     let temp = TempRoot::new("waltr-agent-duplicate-skills-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
+    temp.write("packages/app/.ignore", "!.agents/\n");
     temp.write_skill("example", "Use root example.", "# Root Example\n");
     temp.write(
         "packages/app/.agents/skills/example/SKILL.md",
@@ -2084,23 +3438,37 @@ async fn duplicate_skill_names_require_root() {
     );
     temp.write("src/main.rs", "fn main() {}\n");
     temp.write("packages/app/src/main.rs", "fn main() {}\n");
-    let agent = AgentRuntime::builder(test_model(), Arc::new(DuplicateSkillProvider))
-        .with_skills(SkillsConfig::new(temp.path()))
-        .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
-        .build();
+    let agent = AgentRuntime::builder(
+        test_model(),
+        Arc::new(DuplicateSkillProvider {
+            root: temp.path().to_path_buf(),
+        }),
+    )
+    .with_sandbox(sandbox.handle())
+    .with_skills(SkillsConfig::new(temp.path()))
+    .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
+    .build();
 
     let tool_results = tool_results(agent.prompt("read and load").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
-    assert!(tool_results[0].contains("New skills are available"));
+    assert!(
+        tool_results[0].contains("New skills are available"),
+        "{tool_results:#?}"
+    );
     assert!(tool_results[0].contains("Use app example."));
     assert!(tool_results[1].contains("Tool error:"));
-    assert!(tool_results[1].contains("ambiguous"));
+    assert!(
+        tool_results[1].contains("skill is not visible"),
+        "{tool_results:#?}"
+    );
 }
 
 #[tokio::test]
 async fn duplicate_skill_names_load_with_root() {
     let temp = TempRoot::new("waltr-agent-rooted-skill-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
+    temp.write("packages/app/.ignore", "!.agents/\n");
     temp.write_skill("example", "Use root example.", "# Root Example\n");
     temp.write(
         "packages/app/.agents/skills/example/SKILL.md",
@@ -2116,6 +3484,7 @@ async fn duplicate_skill_names_load_with_root() {
         test_model(),
         Arc::new(RootedSkillProvider { root: app_root }),
     )
+    .with_sandbox(sandbox.handle())
     .with_skills(SkillsConfig::new(temp.path()))
     .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
     .build();
@@ -2123,7 +3492,10 @@ async fn duplicate_skill_names_load_with_root() {
     let tool_results = tool_results(agent.prompt("read and load").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
-    assert!(tool_results[1].contains("<skill_content name=\"example\">"));
+    assert!(
+        tool_results[1].contains("<skill_content name=\"example\">"),
+        "{tool_results:#?}"
+    );
     assert!(tool_results[1].contains("# App Example"));
     assert!(!tool_results[1].contains("# Root Example"));
 }
@@ -2131,12 +3503,14 @@ async fn duplicate_skill_names_load_with_root() {
 #[tokio::test]
 async fn glob_directory_walk_reveals_skills_once() {
     let temp = TempRoot::new("waltr-agent-glob-skills-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write(
         "packages/app/.agents/skills/app-skill/SKILL.md",
         "---\nname: app-skill\ndescription: Use app skill.\n---\n# App Skill\n",
     );
     temp.write("packages/app/src/main.rs", "fn main() {}\n");
     let agent = AgentRuntime::builder(test_model(), Arc::new(RepeatedGlobProvider::default()))
+        .with_sandbox(sandbox.handle())
         .with_skills(SkillsConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
         .build();
@@ -2144,7 +3518,10 @@ async fn glob_directory_walk_reveals_skills_once() {
     let tool_results = tool_results(agent.prompt("glob twice").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
-    assert!(tool_results[0].contains("New skills are available"));
+    assert!(
+        tool_results[0].contains("New skills are available"),
+        "{tool_results:#?}"
+    );
     assert!(tool_results[0].contains("app-skill: Use app skill."));
     assert!(!tool_results[1].contains("New skills are available"));
 }
@@ -2152,6 +3529,7 @@ async fn glob_directory_walk_reveals_skills_once() {
 #[tokio::test]
 async fn dynamic_skills_discovery_is_opt_in() {
     let temp = TempRoot::new("waltr-agent-skills-disabled-test");
+    let sandbox = TestSandbox::new(temp.path()).await;
     temp.write(
         "packages/app/.agents/skills/example/SKILL.md",
         "---\nname: example\ndescription: Use app example.\n---\n# App Example\n",
@@ -2159,6 +3537,7 @@ async fn dynamic_skills_discovery_is_opt_in() {
     temp.write("src/main.rs", "fn main() {}\n");
     temp.write("packages/app/src/main.rs", "fn main() {}\n");
     let agent = AgentRuntime::builder(test_model(), Arc::new(SingleReadProvider))
+        .with_sandbox(sandbox.handle())
         .with_skills(SkillsConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()))
         .build();
@@ -2889,7 +4268,9 @@ impl LlmStream for LoadSkillProvider {
     }
 }
 
-struct DuplicateSkillProvider;
+struct DuplicateSkillProvider {
+    root: PathBuf,
+}
 
 impl LlmStream for DuplicateSkillProvider {
     fn name(&self) -> &'static str {
@@ -2898,6 +4279,14 @@ impl LlmStream for DuplicateSkillProvider {
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
         Box::pin(async move {
+            if request.tool_results().next().is_none() {
+                let prompt = request.system_prompt.expect("root skill catalog");
+                assert!(prompt.contains("example: Use root example."), "{prompt}");
+                assert!(
+                    prompt.contains(&format!("Root: {}", self.root.display())),
+                    "{prompt}"
+                );
+            }
             let events = match request.tool_results().count() {
                 0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                     "read_once",
@@ -3242,7 +4631,9 @@ impl TempRoot {
             .as_ref()
             .join(format!("{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).expect("create temp root");
-        Self { path }
+        Self {
+            path: path.canonicalize().expect("canonical temp root"),
+        }
     }
 
     fn path(&self) -> &Path {

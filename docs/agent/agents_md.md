@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`AGENTS.md` support lets a host add repository instructions to agent prompts without baking those instructions into provider or UI code. The behavior is implemented inside `crates/waltr-agent/` as prompt middleware and optional filesystem-read context.
+`AGENTS.md` support lets a host add repository instructions to agent prompts without baking those instructions into provider or UI code. Agent prompt middleware owns durable state and optional filesystem-read context; instruction file I/O goes through the private workspace worker. See [agent architecture](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
 
@@ -47,7 +47,7 @@ Read-context behavior is intentionally narrow:
 
 ## Boundaries
 
-- `AGENTS.md` behavior is library-builder configuration, not server, TUI, web, or config-file behavior.
+- `AGENTS.md` behavior is library-builder and server agent-definition configuration, not a separate TUI, web, or public worker API.
 - Static prompt content is captured for durable replay; there is no file watcher or automatic reload for already captured content.
 - Dynamic context depends on the filesystem tool being enabled and configured with read context.
 - The agent does not execute instructions from `AGENTS.md`; it contributes them as prompt context.
@@ -60,7 +60,7 @@ Focused coverage:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/waltr-agent/src/prompt.rs](../../crates/waltr-agent/src/prompt.rs) | Prompt rendering and missing-file behavior. |
+| [../../crates/waltr-agent/src/prompt.rs](../../crates/waltr-agent/src/prompt.rs) | Prompt and instruction configuration types. |
 | [../../crates/waltr-agent/tests/agent/loop.rs](../../crates/waltr-agent/tests/agent/loop.rs) | Deterministic prompt and read-context behavior. |
 | [../../crates/waltr-agent/tests/agent/session.rs](../../crates/waltr-agent/tests/agent/session.rs) | Durable middleware state and resume behavior. |
 | [../../crates/waltr-agent/tests/live/agent/context.rs](../../crates/waltr-agent/tests/live/agent/context.rs) | Ignored live-provider context coverage. |
@@ -69,7 +69,7 @@ Focused coverage:
 
 | Path | Purpose |
 | --- | --- |
-| [../../crates/waltr-agent/src/prompt.rs](../../crates/waltr-agent/src/prompt.rs) | `AgentsPromptConfig`, instruction loading, and prompt rendering. |
+| [../../crates/waltr-agent-sandbox/src/tools.rs](../../crates/waltr-agent-sandbox/src/tools.rs) | Worker workspace instruction reads and path resolution. |
 | [../../crates/waltr-agent/src/middleware/agents.rs](../../crates/waltr-agent/src/middleware/agents.rs) | Static instruction middleware and filesystem read-context reminders. |
 | [../../crates/waltr-agent/src/agent/builder.rs](../../crates/waltr-agent/src/agent/builder.rs) | Builder wiring and middleware ordering. |
 | [../../crates/waltr-agent/src/tools/filesystem/config.rs](../../crates/waltr-agent/src/tools/filesystem/config.rs) | Filesystem read-context configuration. |

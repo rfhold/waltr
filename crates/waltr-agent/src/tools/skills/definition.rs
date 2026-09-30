@@ -1,10 +1,8 @@
 //! Agent Skill definition and frontmatter parsing.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-
-use crate::LlmError;
 
 /// Directory under a filesystem root that contains Agent Skills.
 pub const SKILLS_DIRECTORY: &str = ".agents/skills";
@@ -30,12 +28,12 @@ pub struct SkillDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SkillMetadata {
-    pub(super) name: String,
-    pub(super) description: String,
+pub(crate) struct SkillMetadata {
+    pub(crate) name: String,
+    pub(crate) description: String,
 }
 
-pub(super) fn parse_skill_frontmatter(content: &str) -> Option<SkillMetadata> {
+pub(crate) fn parse_skill_frontmatter(content: &str) -> Option<SkillMetadata> {
     let mut lines = content.lines();
     if lines.next()? != "---" {
         return None;
@@ -84,15 +82,4 @@ fn valid_skill_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-pub(crate) fn canonicalize_or_clone(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-pub(crate) fn skills_error(message: impl Into<String>) -> LlmError {
-    LlmError::Protocol {
-        provider: "skills",
-        message: message.into(),
-    }
 }

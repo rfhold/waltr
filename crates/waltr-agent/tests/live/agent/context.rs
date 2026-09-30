@@ -3,11 +3,10 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
 use waltr_agent::{
-    AgentRuntime, LlmStream, ModelRef,
-    tools::{filesystem::FilesystemConfig, filesystem_skills::SkillsConfig},
+    AgentRuntime, LlmStream, ModelRef, SkillsConfig, tools::filesystem::FilesystemConfig,
 };
 
-use crate::{live_provider, session::AgentTestSession};
+use crate::{live_provider, sandbox::TestSandbox, session::AgentTestSession};
 
 const COMPLETION_MARKER: &str = "dynamic-context-flow-complete";
 
@@ -29,8 +28,10 @@ async fn run_live_context(
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
     let fixture = ContextFixture::new()?;
+    let sandbox = TestSandbox::new(fixture.root.path()).await;
     let provider = Arc::new(provider);
     let agent = AgentRuntime::builder(model, Arc::clone(&provider))
+        .with_sandbox(sandbox.handle())
         .with_system_prompt("You are a coding agent validating dynamic context loading.")
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())
@@ -54,6 +55,7 @@ async fn run_live_context(
     assert!(session.text.contains("style-reference-606"), "{context}");
     assert!(session.text.contains("project-reference-303"), "{context}");
 
+    sandbox.disconnect();
     Ok(())
 }
 

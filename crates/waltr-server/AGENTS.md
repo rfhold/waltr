@@ -13,6 +13,9 @@ Waltr server is a coordination layer so multiple clients can stay on the same pa
 | [src/mcp_oauth.rs](src/mcp_oauth.rs) | Hosted MCP OAuth configuration, Authentik-session bridge, consent adapter, keyring loading, and lifecycle composition. |
 | [src/persistence/outbound_oauth.rs](src/persistence/outbound_oauth.rs) | Durable outbound MCP callback, credential, and refresh-claim state. |
 | [src/routine/](src/routine/) | Server-owned event adapters, host boundary, Routine engine lifecycle, invocation execution, and expressions. |
+| [src/sandbox.rs](src/sandbox.rs) | Private gateway, standalone UDS worker connection, embedded duplex worker, readiness and shutdown; never mount it on public routes. |
+| [src/workspace_paths.rs](src/workspace_paths.rs) | Startup checks keeping host-owned storage and config paths out of the workspace worker root. |
+| [../../docs/architecture/agent.md](../../docs/architecture/agent.md) | Canonical agent/worker private RPC and dispatch-fence contract. |
 | [../../docs/architecture/routines.md](../../docs/architecture/routines.md) | Canonical Routine lifecycle, persistence, replay, restart, and client boundary. |
 | [../../docs/architecture/persistence.md](../../docs/architecture/persistence.md) | Canonical database ownership, migration, and startup contract. |
 | [../../docs/architecture/access-authentication.md](../../docs/architecture/access-authentication.md) | Canonical access-auth contract. |
@@ -63,6 +66,10 @@ Configure no embedded CIMD metadata URI. If upstream offers CIMD and DCR, skip C
 Retain only supported outbound OAuth environment names. Keep arbitrary environment and all retained values out of `Debug`.
 
 Keep one ordinary bundled and persisted resource catalog for standalone and embedded hosts. A build without the `shell` feature still accepts and exposes shell-bearing definitions, but runtime construction omits the shell tool and feature-derived shell tool permissions. Stdio MCP resources materialize and use ordinary runtime behavior in every build.
+
+Standalone mode uses `WALTR_SANDBOX_SOCKET=/run/waltr-sandbox/gateway.sock` for a local Unix domain socket and `WALTR_WORKSPACE_ROOT=/workspace` for the workspace identity. Connect a separate worker with the same socket path and `WALTR_SANDBOX_WORKSPACE_ROOT=/workspace`. Require a connected worker and its canonical root before startup completes; report disconnect through `/ready` without host-side execution fallback. Keep the socket private and off public routes/TCP.
+
+Embedded desktop and Android always start the process-local duplex worker using explicit app-private roots; ignore standalone environment overrides. Shut down the owned worker/gateway with the host. A sidecar's separate mounts do not imply network isolation in a shared pod.
 
 Bind the host-owned self-MCP credential to the exact initialized resource URL. If the persisted resource is edited to another endpoint, never send the generation bearer there.
 

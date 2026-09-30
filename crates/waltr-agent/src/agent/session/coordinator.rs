@@ -2188,20 +2188,13 @@ where
         session_id: &SessionId,
         request: SessionTemplateSearchRequest,
     ) -> std::result::Result<Vec<SessionTemplateOption>, AgentSessionRunError> {
-        let root = self
-            .runtime_factory
-            .as_ref()
-            .ok_or_else(|| {
-                super::AgentSessionRuntimeError::Internal(
-                    "session runtime factory is not configured".to_owned(),
-                )
-            })?
-            .root
-            .clone();
         let (runtime, middleware_state, incarnation) =
             self.resolve_runtime_for_template_search(session_id).await?;
+        let root = runtime.template_base_dir.as_deref().ok_or_else(|| {
+            super::AgentSessionRuntimeError::Internal("runtime template root is missing".to_owned())
+        })?;
         let templates = crate::resource::search_session_templates_with_state(
-            &root,
+            root,
             &runtime,
             &request,
             Some(&middleware_state),
@@ -2498,13 +2491,15 @@ where
             }
             return Ok(Some(cached.runtime));
         }
-        let started = McpClientRuntime::start(
-            prepared.config,
-            factory.mcp_root_uri(),
-            CancellationToken::new(),
-        )
-        .await
-        .map_err(|error| mcp_start_error(error.server_key, error.error, &prepared.connections));
+        let started = async {
+            let root_uri = factory.mcp_root_uri()?;
+            McpClientRuntime::start(prepared.config, root_uri, CancellationToken::new())
+                .await
+                .map_err(|error| {
+                    mcp_start_error(error.server_key, error.error, &prepared.connections)
+                })
+        }
+        .await;
         let operation = match self.validate_incarnation(session_id, incarnation).await {
             Ok(operation) => operation,
             Err(error) => {
@@ -2995,6 +2990,7 @@ fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::runtime_factory::test_sandbox::worker_handle;
     use std::{
         num::NonZeroU64,
         sync::{
@@ -3555,11 +3551,12 @@ spec: { mcp: {} }
         registry.resolve_agent("test").expect("resolve test agent")
     }
 
-    fn runtime_sessions<P>(provider: Arc<P>) -> SessionCoordinator<MemorySessionStore>
+    async fn runtime_sessions<P>(provider: Arc<P>) -> SessionCoordinator<MemorySessionStore>
     where
         P: LlmStream + 'static,
     {
         let environment = AgentSessionRuntimeFactory::new(
+            worker_handle(std::env::temp_dir()).await,
             std::env::temp_dir(),
             FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-queue-test-auth.json")),
             empty_test_agent(),
@@ -4079,6 +4076,7 @@ spec: {}
             )
             .expect("load definition");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             definitions
@@ -4108,6 +4106,7 @@ spec: {}
     async fn empty_resolution_evicts_cache_while_active_arc_survives() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             mcp_test_agent(),
@@ -4167,6 +4166,7 @@ spec: {}
         };
         let resolver_connection = connection.clone();
         let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(directory.path()).await,
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             mcp_test_agent(),
@@ -4220,6 +4220,73 @@ spec: {}
     }
 
     #[tokio::test]
+    async fn mcp_start_rejects_missing_worker_root_without_replacing_cached_runtime() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            mcp_test_agent(),
+        )
+        .with_mcp_connection_resolver(|_| {
+            Box::pin(async {
+                Ok(vec![super::super::runtime_factory::McpResolvedConnection {
+                    key: "broken".to_owned(),
+                    kind: super::super::runtime_factory::McpConnectionKind::Stdio,
+                    command: "/definitely/missing/waltr-mcp-server".to_owned(),
+                    url: String::new(),
+                }])
+            })
+        });
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let record = SessionRecord::new("missing-mcp-worker-root");
+        let incarnation = establish_incarnation(&sessions, &record).await;
+
+        let error = sessions
+            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
+            .await
+            .expect_err("configured root must not start MCP without the worker");
+        assert!(matches!(
+            error,
+            super::super::AgentSessionRuntimeError::FailedPrecondition(message)
+                if message == "sandbox worker root is unavailable"
+        ));
+        assert!(sessions.mcp_sessions.lock().unwrap().is_empty());
+
+        let old = McpClientRuntime::start(
+            crate::mcp::McpConfig::new(),
+            "file:///tmp".to_owned(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("empty MCP runtime should start");
+        sessions.mcp_sessions.lock().unwrap().insert(
+            record.id.clone(),
+            CachedMcpRuntime {
+                runtime: Arc::clone(&old),
+                fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
+                    trace_propagation: false,
+                    connections: Vec::new(),
+                },
+                credentialed_servers: BTreeSet::new(),
+            },
+        );
+        let error = sessions
+            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
+            .await
+            .expect_err("missing worker root must not return cached MCP runtime");
+        assert!(matches!(
+            error,
+            super::super::AgentSessionRuntimeError::FailedPrecondition(message)
+                if message == "sandbox worker root is unavailable"
+        ));
+        assert!(Arc::ptr_eq(
+            &sessions.mcp_sessions.lock().unwrap()[&record.id].runtime,
+            &old
+        ));
+    }
+
+    #[tokio::test]
     async fn provider_only_inference_update_preserves_and_reuses_cached_mcp_runtime() {
         let directory = tempfile::tempdir().expect("temp directory");
         let connection = super::super::runtime_factory::McpResolvedConnection {
@@ -4230,6 +4297,7 @@ spec: {}
         };
         let resolver_connection = connection.clone();
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             mcp_test_agent(),
@@ -4444,7 +4512,7 @@ spec: {}
         assert_eq!(created.record.agent_definition, Some(bundle));
     }
 
-    fn catalog_runtime_sessions() -> SessionCoordinator<MemorySessionStore> {
+    async fn catalog_runtime_sessions() -> SessionCoordinator<MemorySessionStore> {
         let source = r"
 apiVersion: waltr.dev/v1alpha1
 kind: Agent
@@ -4464,6 +4532,7 @@ spec: { systemPrompt: gamma prompt }
         let catalog =
             crate::AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "alpha").unwrap();
         let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(std::env::temp_dir()).await,
             std::env::temp_dir(),
             FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-switch-test-auth.json")),
             catalog.resolved("alpha").unwrap().clone(),
@@ -4480,7 +4549,7 @@ spec: { systemPrompt: gamma prompt }
 
     #[tokio::test]
     async fn switch_is_immediate_but_audit_waits_for_next_cycle_and_coalesces() {
-        let sessions = catalog_runtime_sessions();
+        let sessions = catalog_runtime_sessions().await;
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -4554,7 +4623,7 @@ spec: { systemPrompt: gamma prompt }
 
     #[tokio::test]
     async fn switch_after_capture_does_not_change_captured_cycle_bundle() {
-        let sessions = catalog_runtime_sessions();
+        let sessions = catalog_runtime_sessions().await;
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -4581,7 +4650,7 @@ spec: { systemPrompt: gamma prompt }
 
     #[tokio::test]
     async fn missing_catalog_agent_fails_without_mutating_selection() {
-        let sessions = catalog_runtime_sessions();
+        let sessions = catalog_runtime_sessions().await;
         let session = sessions
             .create(SessionCreateRequest::new(SessionId::generate()))
             .await
@@ -4654,6 +4723,7 @@ spec:
         let catalog =
             crate::AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "alpha").unwrap();
         let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(std::env::temp_dir()).await,
             std::env::temp_dir(),
             FileCredentialStore::new(
                 std::env::temp_dir().join("waltr-agent-switch-permission-auth.json"),
@@ -4789,6 +4859,7 @@ spec:
         let catalog =
             crate::AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "alpha").unwrap();
         let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(std::env::temp_dir()).await,
             std::env::temp_dir(),
             FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-switch-task-auth.json")),
             catalog.resolved("alpha").unwrap().clone(),
@@ -4872,7 +4943,7 @@ spec:
 
     #[tokio::test]
     async fn mutation_gate_linearizes_runtime_record_capture() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -4930,7 +5001,7 @@ spec:
 
     #[tokio::test]
     async fn runtime_startup_does_not_hold_mutation_gate() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -4990,7 +5061,7 @@ spec:
     #[tokio::test]
     async fn queued_prompt_runs_are_coalesced_into_adjacent_user_messages() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(provider.clone());
+        let sessions = runtime_sessions(provider.clone()).await;
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5052,7 +5123,7 @@ spec:
     #[tokio::test]
     async fn pause_acquisition_is_exclusive_rejects_active_and_requires_completed_boundary() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let id = completed_session(&sessions).await;
 
         let (left, right) = tokio::join!(
@@ -5117,7 +5188,7 @@ spec: {}"
     #[tokio::test]
     async fn paused_prompts_queue_coalesce_and_release_is_idempotent() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let id = completed_session(&sessions).await;
         let lease = sessions
             .acquire_pause_reject_busy(&id, pause_reason())
@@ -5161,7 +5232,7 @@ spec: {}"
     #[tokio::test]
     async fn paused_mask_mutation_accepts_metadata_but_rejects_timeline_change() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(provider);
+        let sessions = runtime_sessions(provider).await;
         let id = completed_session(&sessions).await;
         let lease = sessions
             .acquire_pause_reject_busy(&id, pause_reason())
@@ -5217,7 +5288,7 @@ spec: {}"
     #[tokio::test]
     async fn effective_watch_invalidates_for_mask_add_subtract_and_rollback() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(provider);
+        let sessions = runtime_sessions(provider).await;
         let id = completed_session(&sessions).await;
         let lease = sessions
             .acquire_pause_reject_busy(&id, pause_reason())
@@ -5339,7 +5410,7 @@ spec: {}"
     #[tokio::test]
     async fn armed_continuation_runs_before_queued_prompts_without_rollback() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let id = completed_session(&sessions).await;
         let lease = sessions
             .acquire_pause_reject_busy(&id, pause_reason())
@@ -5390,7 +5461,7 @@ spec: {}"
     #[tokio::test]
     async fn delete_wipe_and_shutdown_invalidate_pauses_and_cancel_queues() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(provider);
+        let sessions = runtime_sessions(provider).await;
 
         let deleted_id = completed_session(&sessions).await;
         let deleted_lease = sessions
@@ -5434,7 +5505,7 @@ spec: {}"
             Err(SessionPauseError::OwnershipLost { .. })
         ));
 
-        let shutdown_sessions = runtime_sessions(Arc::new(QueuedPromptProvider::new()));
+        let shutdown_sessions = runtime_sessions(Arc::new(QueuedPromptProvider::new())).await;
         let shutdown_id = completed_session(&shutdown_sessions).await;
         let shutdown_lease = shutdown_sessions
             .acquire_pause_reject_busy(&shutdown_id, pause_reason())
@@ -5468,7 +5539,7 @@ spec: {}"
     #[tokio::test]
     async fn shutdown_waits_for_active_run_cleanup() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let session_id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5501,7 +5572,7 @@ spec: {}"
     #[tokio::test]
     async fn submitted_prompt_limit_fails_before_second_logical_dispatch() {
         let provider = Arc::new(ToolThenTextProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let session_id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5536,7 +5607,7 @@ spec: {}"
     #[tokio::test]
     async fn existing_unlimited_prompt_submission_still_dispatches_until_finished() {
         let provider = Arc::new(ToolThenTextProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let session_id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5562,7 +5633,7 @@ spec: {}"
     #[tokio::test]
     async fn queued_prompts_with_different_limits_are_not_coalesced() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let session_id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5610,7 +5681,7 @@ spec: {}"
 
     #[tokio::test]
     async fn asynchronous_provider_authentication_failure_is_durable() {
-        let sessions = runtime_sessions(Arc::new(AuthenticationFailingProvider));
+        let sessions = runtime_sessions(Arc::new(AuthenticationFailingProvider)).await;
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5664,6 +5735,7 @@ spec: {}"
         let runtime_provider = Arc::clone(&provider);
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(directory.path()).await,
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -5739,6 +5811,7 @@ spec: {}"
     async fn continue_authentication_preflight_does_not_append_rollback() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(directory.path()).await,
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -5822,7 +5895,7 @@ spec: {}"
     #[tokio::test]
     async fn completion_barrier_queues_simultaneous_submission_and_timeout_fails_open() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5869,7 +5942,7 @@ spec: {}"
 
     #[tokio::test]
     async fn watch_and_list_project_running_barrier_claimed_pause_and_release() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         let id = completed_session(&sessions).await;
         let mut watch = sessions.watch_sessions();
         let (lease_tx, lease_rx) = tokio::sync::oneshot::channel();
@@ -5943,7 +6016,7 @@ spec: {}"
 
     #[tokio::test]
     async fn list_registration_seam_converges_with_pause_publication() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         let id = completed_session(&sessions).await;
         let mut watch = sessions.watch_sessions();
         let entered = Arc::new(Notify::new());
@@ -5993,7 +6066,7 @@ spec: {}"
 
     #[tokio::test]
     async fn pause_queue_continuation_and_restart_projection_are_process_local() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         let id = completed_session(&sessions).await;
         let mut watch = sessions.watch_sessions();
         let reason = pause_reason();
@@ -6080,7 +6153,7 @@ spec: {}"
 
     #[tokio::test]
     async fn interrupt_delete_wipe_and_shutdown_remove_stale_coordination() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
 
         let interrupted_id = completed_session(&sessions).await;
         let interrupted_pause = sessions
@@ -6130,7 +6203,7 @@ spec: {}"
             }
         }
 
-        let shutdown_sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let shutdown_sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         let shutdown_id = completed_session(&shutdown_sessions).await;
         let _shutdown_pause = shutdown_sessions
             .acquire_pause_reject_busy(&shutdown_id, pause_reason())
@@ -6174,7 +6247,7 @@ spec: {}"
 
     #[tokio::test]
     async fn completion_finalization_failure_releases_claimed_pause() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         sessions.set_completion_admission_handler(Arc::new(FinalizingCompletionHandler(
             StdMutex::new(Some(TestFinalization::Fail)),
         )));
@@ -6191,7 +6264,7 @@ spec: {}"
     #[tokio::test]
     async fn delayed_post_claim_finalization_keeps_queued_work_blocked_until_failure_resolves() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let id = completed_session(&sessions).await;
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -6237,7 +6310,7 @@ spec: {}"
 
     #[tokio::test]
     async fn worker_construction_panic_fails_open_and_releases_claimed_pause() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         sessions.set_completion_admission_handler(Arc::new(FinalizingCompletionHandler(
             StdMutex::new(Some(TestFinalization::Panic)),
         )));
@@ -6253,7 +6326,7 @@ spec: {}"
 
     #[tokio::test]
     async fn completion_snapshot_uses_latest_turn_usage_and_effective_inference_identity() {
-        let sessions = runtime_sessions(Arc::new(UsageProvider));
+        let sessions = runtime_sessions(Arc::new(UsageProvider)).await;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         sessions.set_completion_admission_handler(Arc::new(SnapshotCompletionHandler(
             StdMutex::new(Some(sender)),
@@ -6294,7 +6367,7 @@ spec: {}"
     #[tokio::test]
     async fn completion_snapshot_keeps_inference_identity_captured_by_the_active_run() {
         let provider = Arc::new(QueuedPromptProvider::new());
-        let sessions = runtime_sessions(Arc::clone(&provider));
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         sessions.set_completion_admission_handler(Arc::new(SnapshotCompletionHandler(
             StdMutex::new(Some(sender)),
@@ -6336,7 +6409,7 @@ spec: {}"
 
     #[tokio::test]
     async fn completion_handler_error_fails_open_without_stranding_the_session() {
-        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider)).await;
         sessions.set_completion_admission_handler(Arc::new(FailingCompletionHandler));
         let id = completed_session(&sessions).await;
 
