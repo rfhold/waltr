@@ -89,7 +89,7 @@ pub type McpConnectionResolveFuture = Pin<
 type McpConnectionResolver =
     Arc<dyn Fn(McpConnectionResolveRequest) -> McpConnectionResolveFuture + Send + Sync>;
 
-/// Structural identity of a prepared MCP runtime. Credentials are intentionally excluded.
+/// Identity of a prepared MCP runtime. Skills additionally bind credential incarnations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpRuntimeFingerprint {
     pub trace_propagation: bool,
@@ -521,7 +521,7 @@ impl AgentSessionRuntimeFactory {
                     .features
                     .mcp
                     .as_ref()
-                    .is_some_and(|mcp| mcp.expose_tools) =>
+                    .is_some_and(|mcp| mcp.expose_tools || mcp.skills || mcp.resources) =>
             {
                 mcp_tool_names.to_vec()
             }
@@ -580,6 +580,10 @@ impl AgentSessionRuntimeFactory {
         if let Some(mcp_runtime) = mcp_runtime
             && let Some(mcp) = definition.features.mcp.as_ref()
         {
+            if mcp.skills {
+                mcp_tool_names.extend(["load_skill".to_owned()]);
+                builder = builder.with_mcp_skills(Arc::clone(&mcp_runtime));
+            }
             if mcp.expose_tools {
                 for tool in mcp_runtime.agent_tools().await {
                     mcp_tool_names.push(tool.definition().name.clone());
@@ -593,12 +597,9 @@ impl AgentSessionRuntimeFactory {
                     ),
                 );
             }
-            if mcp.resources {
-                builder = builder.with_middleware(
-                    crate::middleware::mcp_resources::McpResourcesMiddleware::new(Arc::clone(
-                        &mcp_runtime,
-                    )),
-                );
+            if mcp.resources || mcp.skills {
+                mcp_tool_names.push("read_mcp_resource".to_owned());
+                builder = builder.with_mcp_resources(Arc::clone(&mcp_runtime), mcp.resources);
             }
             if mcp.prompts {
                 builder = builder.with_middleware(
@@ -672,16 +673,33 @@ impl AgentSessionRuntimeFactory {
         if connections.is_empty() {
             return Ok(None);
         }
+        let mut fingerprint_connections = Vec::new();
+        for connection in &connections {
+            let mut identity = McpRuntimeFingerprintConnection::from_resolved(connection);
+            if feature.skills {
+                use sha2::{Digest as _, Sha256};
+                let token = self.mcp_bearer_token(connection).await?;
+                let bytes = serde_json::to_vec(&token).expect("optional token serializes");
+                let digest = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                identity
+                    .target
+                    .push_str(&format!("#skills-credential:{digest}"));
+            }
+            fingerprint_connections.push(identity);
+        }
         let fingerprint = McpRuntimeFingerprint {
             trace_propagation: feature.trace_propagation,
-            connections: connections
-                .iter()
-                .map(McpRuntimeFingerprintConnection::from_resolved)
-                .collect(),
+            connections: fingerprint_connections,
         };
-        let (config, credentialed_servers) = self
+        let (mut config, credentialed_servers) = self
             .mcp_config_with_credentials(&connections, feature.trace_propagation)
             .await?;
+        if feature.skills {
+            config = config.with_skills();
+        }
         Ok(Some(PreparedMcpRuntime {
             fingerprint,
             connections,
@@ -1360,6 +1378,7 @@ mod tests {
 
     fn mcp_feature(selection: McpServerSelection, trace_propagation: bool) -> McpFeatureConfig {
         McpFeatureConfig {
+            skills: false,
             servers: selection,
             expose_tools: true,
             instructions: true,
@@ -1999,7 +2018,7 @@ spec:
             )
             .build();
 
-        assert_eq!(runtime.middleware_chain.len(), 2);
+        assert_eq!(runtime.middleware_chain.len(), 3);
     }
 
     #[test]
@@ -2097,6 +2116,64 @@ spec:
             } else {
                 PermissionLevel::Deny
             }
+        );
+    }
+
+    #[test]
+    fn synthetic_mcp_helpers_follow_enabled_features_and_explicit_permissions() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().to_path_buf();
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        for (flags, names, expected) in [
+            (
+                "resources: true, exposeTools: false, skills: false, defaultPermissions: true",
+                vec!["read_mcp_resource"],
+                PermissionLevel::Allow,
+            ),
+            (
+                "resources: false, exposeTools: false, skills: true, defaultPermissions: true",
+                vec!["load_skill", "read_mcp_resource"],
+                PermissionLevel::Allow,
+            ),
+            (
+                "resources: true, exposeTools: false, skills: true, defaultPermissions: false",
+                vec!["load_skill", "read_mcp_resource"],
+                PermissionLevel::Deny,
+            ),
+        ] {
+            let definition =
+                resolved_test_agent(&format!("spec:\n  features:\n    - mcp: {{ {flags} }}"));
+            let factory = AgentSessionRuntimeFactory::new(
+                crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
+                root.clone(),
+                FileCredentialStore::new(root.join("auth.json")),
+                definition.clone(),
+            );
+            let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+            let policy = factory.definition_permission_policy(&definition, &model, &names);
+            for name in &names {
+                assert_eq!(policy.evaluate_tool(name), expected);
+            }
+            assert_eq!(policy.evaluate_tool("not_enabled"), PermissionLevel::Deny);
+        }
+        let definition = resolved_test_agent(
+            "spec:\n  features:\n    - mcp: { resources: false, exposeTools: false, skills: true, defaultPermissions: false }\n  permissions:\n    - { name: load_skill, permission: allow }\n    - { name: read_mcp_resource, permission: ask }",
+        );
+        let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
+            root.clone(),
+            FileCredentialStore::new(root.join("auth.json")),
+            definition.clone(),
+        );
+        let policy = factory.definition_permission_policy(
+            &definition,
+            &model,
+            &["load_skill".into(), "read_mcp_resource".into()],
+        );
+        assert_eq!(policy.evaluate_tool("load_skill"), PermissionLevel::Allow);
+        assert_eq!(
+            policy.evaluate_tool("read_mcp_resource"),
+            PermissionLevel::Ask
         );
     }
 
@@ -2511,6 +2588,79 @@ spec:
         assert_eq!(
             authenticated.credentialed_servers,
             BTreeSet::from(["remote".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_skills_fingerprint_changes_on_credential_replacement_logout_and_opt_out() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = test_factory(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        )
+        .with_mcp_connection_resolver(|_| Box::pin(async { Ok(vec![mcp_server_settings()]) }));
+        let mut feature = mcp_feature(McpServerSelection::Exclude(BTreeSet::new()), true);
+        feature.skills = true;
+        let anonymous = factory
+            .prepare_mcp_runtime(&feature)
+            .await
+            .unwrap()
+            .unwrap()
+            .fingerprint;
+        let key = AuthTarget::mcp_server("remote").credential_key();
+        let mut credential = mcp_state("https://issuer.example/token".into());
+        credential.token.expires_at_ms = None;
+        factory
+            .credential_store
+            .modify(&key, |_| {
+                Some(StoredCredential::McpOAuth(credential.clone()))
+            })
+            .await
+            .unwrap();
+        let authenticated = factory
+            .prepare_mcp_runtime(&feature)
+            .await
+            .unwrap()
+            .unwrap()
+            .fingerprint;
+        assert_ne!(anonymous, authenticated);
+        credential.token.access_token = oauth2::AccessToken::new("replacement-access".into());
+        factory
+            .credential_store
+            .modify(&key, |_| Some(StoredCredential::McpOAuth(credential)))
+            .await
+            .unwrap();
+        let replaced = factory
+            .prepare_mcp_runtime(&feature)
+            .await
+            .unwrap()
+            .unwrap()
+            .fingerprint;
+        assert_ne!(authenticated, replaced);
+        assert!(!format!("{replaced:?}").contains("replacement-access"));
+        factory
+            .credential_store
+            .modify(&key, |_| None)
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous,
+            factory
+                .prepare_mcp_runtime(&feature)
+                .await
+                .unwrap()
+                .unwrap()
+                .fingerprint
+        );
+        feature.skills = false;
+        assert_ne!(
+            anonymous,
+            factory
+                .prepare_mcp_runtime(&feature)
+                .await
+                .unwrap()
+                .unwrap()
+                .fingerprint
         );
     }
 

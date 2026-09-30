@@ -363,6 +363,11 @@ where
         }
 
         let mut journal = Vec::new();
+        let mut permissions = permission_state(&snapshot)?;
+        if !permissions.one_shot.is_empty() {
+            permissions.one_shot.clear();
+            journal.push(permission_state_event(&permissions));
+        }
         let mut cancellation_timeline = Vec::new();
         let mut status_timeline = Vec::new();
         for request in pending_external_requests(&snapshot) {
@@ -456,6 +461,11 @@ where
         }
         let snapshot = record.snapshot();
         let mut journal = Vec::new();
+        let mut permissions = permission_state(&snapshot)?;
+        if !permissions.one_shot.is_empty() {
+            permissions.one_shot.clear();
+            journal.push(permission_state_event(&permissions));
+        }
         let mut cancellation_timeline = Vec::new();
         let mut prompt_timeline = Vec::new();
         for request in pending_external_requests(&snapshot) {
@@ -652,47 +662,60 @@ where
                 self.append_journal_and_reload(record, vec![permission_state_event(&state)])
                     .await
             }
-            PermissionResponse::Deny { message, mode } => match mode {
-                PermissionDenyMode::ReturnToolResult => {
-                    if request.payload.get("template") == Some(&Value::Bool(true)) {
-                        return Ok(record);
-                    }
-                    let result = ToolResult::new(
-                        tool_call_id.to_owned(),
-                        "permission",
-                        message.unwrap_or_else(|| "permission denied".to_owned()),
-                    )
-                    .with_error();
-                    let session_id = record.id.clone();
-                    let parent_id = tool_call_item_id(&record, &result.call_id)?;
-                    let record = self
-                        .append_timeline_and_reload(
-                            record,
-                            vec![tool_result_timeline_event(
-                                &session_id,
-                                turn,
-                                parent_id,
-                                result,
-                            )],
+            PermissionResponse::Deny { message, mode } => {
+                let mut state = permission_state(snapshot)?;
+                let previous_count = state.one_shot.len();
+                state
+                    .one_shot
+                    .retain(|approval| approval.tool_call_id != tool_call_id);
+                let record = if state.one_shot.len() == previous_count {
+                    record
+                } else {
+                    self.append_journal_and_reload(record, vec![permission_state_event(&state)])
+                        .await?
+                };
+                match mode {
+                    PermissionDenyMode::ReturnToolResult => {
+                        if request.payload.get("template") == Some(&Value::Bool(true)) {
+                            return Ok(record);
+                        }
+                        let result = ToolResult::new(
+                            tool_call_id.to_owned(),
+                            "permission",
+                            message.unwrap_or_else(|| "permission denied".to_owned()),
                         )
-                        .await?;
-                    self.append_journal_and_reload(
-                        record,
-                        vec![SessionJournalEvent::TurnFinished { turn }],
-                    )
-                    .await
+                        .with_error();
+                        let session_id = record.id.clone();
+                        let parent_id = tool_call_item_id(&record, &result.call_id)?;
+                        let record = self
+                            .append_timeline_and_reload(
+                                record,
+                                vec![tool_result_timeline_event(
+                                    &session_id,
+                                    turn,
+                                    parent_id,
+                                    result,
+                                )],
+                            )
+                            .await?;
+                        self.append_journal_and_reload(
+                            record,
+                            vec![SessionJournalEvent::TurnFinished { turn }],
+                        )
+                        .await
+                    }
+                    PermissionDenyMode::CancelWork => {
+                        self.append_journal_and_reload(
+                            record,
+                            vec![SessionJournalEvent::WorkCanceled {
+                                work_id: tool_call_id.to_owned(),
+                                reason: CancelReason::ToolUnavailable,
+                            }],
+                        )
+                        .await
+                    }
                 }
-                PermissionDenyMode::CancelWork => {
-                    self.append_journal_and_reload(
-                        record,
-                        vec![SessionJournalEvent::WorkCanceled {
-                            work_id: tool_call_id.to_owned(),
-                            reason: CancelReason::ToolUnavailable,
-                        }],
-                    )
-                    .await
-                }
-            },
+            }
         }
     }
 

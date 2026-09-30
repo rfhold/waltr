@@ -95,7 +95,16 @@ impl McpClientRuntime {
         root_uri: String,
         cancellation_token: CancellationToken,
     ) -> std::result::Result<Arc<Self>, McpRuntimeStartError> {
-        let (servers, timeout, log_level, trace_propagation) = config.into_parts();
+        let (servers, timeout, log_level, trace_propagation, skills) = config.into_parts();
+        let mut server_labels = std::collections::BTreeSet::new();
+        for server in &servers {
+            if !server_labels.insert(&server.name) {
+                return Err(McpRuntimeStartError {
+                    server_key: server.name.clone(),
+                    error: protocol_error("duplicate host-assigned MCP server label"),
+                });
+            }
+        }
         let (events, _) = broadcast::channel(128);
         let mut active: BTreeMap<String, Arc<McpServerRuntime>> = BTreeMap::new();
         for server in servers {
@@ -105,6 +114,7 @@ impl McpClientRuntime {
                 timeout,
                 log_level,
                 trace_propagation,
+                skills,
                 root_uri.clone(),
                 events.clone(),
                 cancellation_token.clone(),
@@ -246,6 +256,78 @@ impl McpClientRuntime {
         self.servers.contains_key(server_name)
     }
 
+    pub(crate) fn skill_origin(&self, name: &str) -> Result<String> {
+        self.servers
+            .get(name)
+            .filter(|server| server.skills_enabled())
+            .map(|server| server.skill_origin().to_owned())
+            .ok_or_else(|| protocol_error("MCP Skills are not enabled for this server"))
+    }
+
+    pub(crate) async fn skill_catalog(&self) -> Result<Vec<(String, mcp::skills::McpSkillList)>> {
+        self.skill_catalog_with_budget(super::skills::METADATA_BUDGET)
+            .await
+    }
+
+    pub(crate) async fn skill_catalog_with_budget(
+        &self,
+        mut remaining: usize,
+    ) -> Result<Vec<(String, mcp::skills::McpSkillList)>> {
+        let mut pages = Vec::new();
+        for server in self
+            .servers
+            .values()
+            .filter(|server| server.skills_enabled())
+        {
+            for page in server.skill_catalog(&mut remaining).await? {
+                pages.push((server.name().to_owned(), page));
+            }
+        }
+        Ok(pages)
+    }
+
+    pub(crate) async fn tool_origins(&self, name: &str) -> Vec<String> {
+        let mut origins = Vec::new();
+        for server in self.servers.values() {
+            if server
+                .tools()
+                .await
+                .iter()
+                .any(|tool| direct_tool_name(server.name(), &tool.name) == name)
+            {
+                origins.push(server.name().to_owned());
+            }
+        }
+        origins
+    }
+
+    pub(crate) async fn get_skill(
+        &self,
+        server: &str,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<mcp::skills::McpSkillResult> {
+        self.servers
+            .get(server)
+            .ok_or_else(|| protocol_error("unknown skill origin"))?
+            .get_skill(uri, cancellation_token)
+            .await
+    }
+
+    pub(crate) async fn read_skill(
+        &self,
+        server: &str,
+        skill: &mcp::skills::McpSkill,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<u8>> {
+        self.servers
+            .get(server)
+            .ok_or_else(|| protocol_error("unknown skill origin"))?
+            .read_skill(skill, uri, cancellation_token)
+            .await
+    }
+
     pub(crate) async fn has_prompt(&self, server_name: &str, prompt_name: &str) -> bool {
         let Some(server) = self.servers.get(server_name) else {
             return false;
@@ -319,6 +401,19 @@ impl McpClientRuntime {
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
             .read_resource(uri, cancellation_token)
+            .await
+    }
+
+    pub(crate) async fn read_resource_data(
+        &self,
+        server_name: &str,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<mcp::McpResourceResult> {
+        self.servers
+            .get(server_name)
+            .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
+            .read_resource_data(uri, cancellation_token)
             .await
     }
 

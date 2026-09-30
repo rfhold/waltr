@@ -518,6 +518,22 @@ fn resolve_mcp_feature(source: &str) -> super::McpFeatureConfig {
 }
 
 #[test]
+fn mcp_skills_feature_is_explicit_opt_in() {
+    for (configuration, expected) in [
+        ("{}", false),
+        ("{ skills: false }", false),
+        ("{ skills: true }", true),
+    ] {
+        let source = format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: FeatureSet\nmetadata: {{ name: selected }}\nspec:\n  mcp: {configuration}\n"
+        );
+        let feature = resolve_mcp_feature(&source);
+        assert_eq!(feature.skills, expected);
+        assert!(!feature.expose_tools);
+    }
+}
+
+#[test]
 fn parses_multiple_documents_and_replaces_across_sources() {
     let mut registry = AgentDefinitionRegistry::new();
     registry

@@ -68,7 +68,14 @@ Hosts that need safe-by-default user approvals should provide an explicit policy
 
 Permission asks are part of the session model. The agent stores pending external requests, associated tool calls, responses, timeline events, and internal journal records through the configured `SessionStore`.
 
-Allow-once approvals and allow-always patterns are persisted in the session middleware state under the `permissions` namespace. The agent loop consumes one-shot approvals when the original tool call is retried, and reusable patterns apply to later matching permission claims in the same session.
+The agent persists allow-once approvals and allow-always patterns under the `permissions` middleware namespace.
+One-shot approvals survive all pre-dispatch suspensions for the same request-bound call.
+The agent clears them at final execution or result, denial, cancellation, or prompt supersession.
+Reusable patterns apply to later matching permission claims in the same session.
+
+Ordinary permission request IDs include a SHA-256 digest of the approval stage, policy identity, tool name, full arguments, and claim identities.
+Changed arguments require fresh one-shot consent. Approvals with earlier request-ID formats cannot authorize a current request; the agent asks again.
+Remote [MCP Skills](mcp.md#mcp-skills) require additional manifest-bound and per-call consent that generic reusable patterns cannot satisfy.
 
 ## Boundaries
 

@@ -1640,7 +1640,7 @@ mod agents_skills_state {
             CompletionEvent::ToolCall(ToolCall::new(
                 id,
                 "load_skill",
-                json!({ "name": "example" }),
+                json!({ "source": "local", "name": "example" }),
             ))
         };
         let provider = scripted_provider(vec![

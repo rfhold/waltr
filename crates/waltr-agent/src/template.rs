@@ -495,6 +495,7 @@ pub(crate) async fn render_tool_template_reference(
     let before_outcome = {
         let middleware_chain = ctx.middleware_chain;
         let mut tool_ctx = ToolCallContext {
+            cancellation_token: ctx.cancellation_token.clone(),
             session_id: ctx.session_id,
             turn: ctx.turn,
             call: &mut call,

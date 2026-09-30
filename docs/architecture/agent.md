@@ -107,7 +107,13 @@ Per-slot ETags and checks serialize writes through Waltr. They do not isolate th
 
 `ListAgents`, new sessions, and later explicit agent selections read the current successful snapshot. Current session bundles do not passively rebase after a resource reload.
 
-The bundled `configuration` agent explicitly includes only the `waltr` MCP resource. Its policy permits resource actions and denies session actions.
+The bundled `configuration` agent explicitly includes only the `waltr` MCP resource and enables remote MCP Skills.
+Its policy permits resource actions and denies session actions.
+It explicitly grants `load_skill` and `read_mcp_resource` while retaining `resources: false` and `skills: true`; resource reads therefore remain limited to approved loaded held skill files.
+The bundled `coding` agent enables Skills through an inline MCP override and preserves all current MCP settings.
+One `SkillsMiddleware` publishes `load_skill` with required `source: "local"` or `source: "mcp"` selectors and routes to the workspace or MCP adapter. `McpResourcesMiddleware` publishes `read_mcp_resource({server, uri})` for raw data, with held-manifest verification hooks. Ordinary MCP reads and user-inserted resource templates do not activate skills or grant execution authority.
+Remote Skill activation requires manifest-bound approval; subsequent tool calls require additional per-call consent without permission expansion.
+See [MCP Skills](../agent/mcp.md#mcp-skills) for durable-history, replay, and origin boundaries.
 
 Each new top-level session stores an `AgentDefinitionBundle` with a selected catalog name and the exact ordered YAML source texts. Current clients require an explicit selection; omission in the older create RPC shape uses the configured default. Session summaries project the effective agent name. Legacy sessions without a bundle also project and use the configured default without being backfilled.
 
@@ -265,6 +271,10 @@ Permission outcomes are runtime behavior, not UI behavior:
 | `Deny` | Return a permission error instead of executing the tool. |
 
 Whole-tool `deny` and `ask` gate execution before tool middleware. After an allowed whole-tool gate, input and resource checks evaluate the final arguments and claims produced by the complete pre-tool middleware chain. A matching input `ask` records reusable approval claims only for the exact tool, pointer, and typed scalar observed after middleware; a wildcard policy never creates a wildcard durable approval. Permission state writes version 2, reads legacy version 1 or an absent version, and rejects unknown versions. Stored approvals do not override a newly applicable deny.
+
+One-shot approvals survive pre-dispatch suspensions and clear at final execution or result, denial, cancellation, or prompt supersession.
+Ordinary request IDs bind the approval stage, policy identity, tool name, full arguments, and claim identities through SHA-256.
+Earlier request IDs require fresh consent. See [Permissions](../agent/permissions.md#durable-behavior) and [MCP Skills](../agent/mcp.md#mcp-skills).
 
 ## Middleware
 

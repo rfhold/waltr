@@ -1,6 +1,6 @@
 # MCP Integration
 
-Waltr agent MCP integration lets a session expose tools, prompt templates, and resource templates from configured MCP servers. Generic protocol behavior lives in [../mcp/protocol.md](../mcp/protocol.md); this document covers how the agent layer adapts that protocol surface into Waltr session behavior.
+Waltr agent MCP integration lets a session expose tools, prompt templates, resource data reads, resource templates, and opt-in Skills from configured MCP servers. Generic protocol behavior lives in [../mcp/protocol.md](../mcp/protocol.md); this document covers how the agent layer adapts that protocol surface into Waltr session behavior.
 
 MCP servers are owned by the durable session coordinator so they can remain initialized alongside a session. MCP is not attached directly to `AgentRuntimeBuilder`; runtime construction receives tools and template middleware from the coordinator-owned MCP runtime for that session.
 
@@ -15,6 +15,9 @@ MCP servers are owned by the durable session coordinator so they can remain init
 | `McpInstructionsMiddleware` | Middleware that adds initialized MCP server instructions to the system prompt. |
 | `McpFeatureConfig::servers` | Definition-owned include or exclude selector for current configured servers. |
 | `McpFeatureConfig::trace_propagation` | Definition-owned Waltr switch for MCP request trace context propagation. |
+| `McpFeatureConfig::resources` | Enables ordinary provider resource reads and user-inserted resource templates. |
+| `McpFeatureConfig::skills` | Explicit opt-in for remote MCP Skills through `load_skill` and verified supporting-file reads; default false. |
+| `McpConfig::with_skills` | Enables the same remote Skills contract for library callers. |
 | `SessionCoordinator` | Resolves current MCP configuration and caches a session-scoped MCP runtime. |
 
 The agent integration depends on the generic `mcp` crate. The generic crate must not depend back on `waltr-agent`.
@@ -48,6 +51,10 @@ Selection uses these exact rules:
 Include names match current configuration keys exactly. If any include is absent, reconstruction fails and names every missing key in deterministic order. Missing exclude names have no effect. Blank or whitespace-only names, duplicate names, both selectors, an empty selector mapping, `null`, and unknown fields fail strict definition parsing.
 
 The bundled `coding` feature uses `servers: { exclude: [] }`. This selects every configured server, including `waltr` when it is present.
+The bundled `coding` agent preserves that MCP configuration and explicitly enables `skills: true` through an inline feature override.
+The bundled `configuration` agent enables Skills only for its selected `waltr` server. Both definitions preserve their MCP action permissions.
+With `defaultPermissions: false`, the configuration agent explicitly allows `load_skill` and `read_mcp_resource` so those tools remain visible.
+It preserves `resources: false` and `skills: true`: the reader can access only files in approved loaded held manifests, not ordinary resources. These grants do not widen MCP action permissions or bypass mandatory manifest-bound consent.
 
 MCP server selection is part of the selected agent definition stored with the session, not an independent MCP setting. Session RPCs and clients can create or switch the session's agent definition, but expose no separate MCP selector, endpoint snapshot, drift status, or trace switch.
 
@@ -61,7 +68,9 @@ Template search uses the same current resolution. It treats MCP preparation fail
 
 ## Cache Lifecycle
 
-The coordinator caches one MCP runtime per durable session. Its structural fingerprint contains selected keys, transport kinds, targets, and trace propagation. Provider settings, credentials, and unselected MCP entries do not belong to this fingerprint.
+The coordinator caches one MCP runtime per durable session. Its structural fingerprint contains selected keys, transport kinds, targets, and trace propagation.
+With Skills enabled, it also incorporates a digest of each selected server's current bearer token.
+This binds Skills runtime identity to credential changes and opt-in state. Provider settings and unselected MCP entries do not affect the fingerprint.
 
 An equal fingerprint reuses the cached runtime after credential preflight. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. After a successful swap, current `Arc` users finish with the old runtime. Waltr shuts it down after those users release it.
 
@@ -98,7 +107,11 @@ When a provider calls an MCP-backed tool, the agent uses the normal tool executi
 
 MCP result conversion preserves text order, represents unknown content with explicit unsupported-content markers, appends `structuredContent` as text, and preserves MCP `isError` as structured tool-result state. Image blocks must use canonical standard Base64, declare `image/png`, `image/jpeg`, or `image/webp`, and match that type's file signature. Waltr accepts at most four images and 4 MiB of decoded image data in one result. Invalid encoding, unsupported media, signature mismatches, and excess data become bounded MCP protocol errors; image data is never included in the error.
 
-Waltr opts into an 8 MiB MCP message and event-stream line limit. This limit fits one bounded 4 MiB decoded image plus Base64 and JSON framing. Generic MCP client defaults remain smaller. Tool results persist ordered blocks for session replay. Text-only consumers receive media type, decoded size, and SHA-256 digest instead of Base64.
+Without Skills, Waltr opts into an 8 MiB MCP message and event-stream line limit.
+This limit fits one bounded 4 MiB decoded image plus Base64 and JSON framing.
+With Skills enabled, Waltr selects a 100 MiB receive limit to accommodate JSON escape overhead for bounded 16 MiB raw resources.
+The decoded tool-image limits remain unchanged. Generic MCP client defaults remain smaller.
+Tool results persist ordered blocks for session replay. Text-only consumers receive media type, decoded size, and SHA-256 digest instead of Base64.
 
 Provider adapters deliver validated images as follows:
 
@@ -138,7 +151,7 @@ When a user prompt starts with an MCP prompt template, the template middleware s
 
 For each configured server, the session MCP runtime lists concrete resources and resource URI templates when the server advertises resource support. Concrete resource definitions are stored with their URI, name, title, description, MIME type, and size when provided. Resource URI templates are stored with their URI template, name, title, description, and MIME type when provided.
 
-MCP resources are supported only as prompt templates for now. They are surfaced through the normal session template search target for resources, and inserted templates use the server key plus a JSON string URI:
+When `FeatureSet.spec.mcp.resources` is enabled, ordinary MCP resources use the session template search target for resources. Inserted templates use the server key plus a JSON string URI:
 
 ```text
 @resource(foo, "test://status")
@@ -160,7 +173,81 @@ The user fills the URI path in-place before submitting, for example:
 
 The renderer permits `resources/read` when the requested URI either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Resource template search can call the MCP completion API for URI template arguments when the server advertises completion support.
 
-MCP resources are not exposed as provider tools.
+### Provider Resource Reads
+
+`McpResourcesMiddleware` publishes `read_mcp_resource` with exactly two required fields:
+
+```json
+{"server":"foo","uri":"test://items/42"}
+```
+
+The server key must be nonempty and the URI absolute; unknown fields are rejected. With `resources: true`, the provider can read direct URIs whether listed, template-derived, or unlisted. Unlike user-inserted resource templates, direct provider reads do not require a discovery match. They return raw data and never evaluate that data as templates or activate a skill.
+
+The tool result is a JSON object with `server`, `uri`, `data`, and `verified_skill_origins`. `data` contains the complete raw MCP `resources/read` result, preserving text and blob contents and other result fields. `verified_skill_origins` is an array of `{server, uri}` entries identifying held skill manifests verified for this read; it is empty for ordinary data outside held skill roots. The outer `uri` identifies the requested file, while each verified origin's `uri` identifies its skill's `SKILL.md`.
+
+Feature gating is strict:
+
+| MCP flags | Provider resource reads and templates |
+| --- | --- |
+| `resources: true` | Exposes `read_mcp_resource` for ordinary direct data reads and enables resource search and user-inserted templates. |
+| `resources: false`, `skills: true` | Exposes the same reader only for files in approved loaded held skill manifests; no ordinary resource reads, resource search, or resource templates. |
+| `resources: false`, `skills: false` | Does not expose the reader or resource templates. |
+
+With Skills enabled, reads of held skill files pass through the manifest and consent hooks described next. Enabling ordinary resources does not bypass those hooks or grant activation approval.
+
+## MCP Skills
+
+Remote MCP Skills share `load_skill` with workspace skills but require the separate `FeatureSet.spec.mcp.skills: true` opt-in.
+Omission defaults to false. Library callers use `McpConfig::with_skills`.
+The host advertises the official Skills extension only after opt-in.
+See [generic Skills](../mcp/skills.md) for wire types, byte limits, and embedded catalogs.
+
+```yaml
+mcp:
+  servers:
+    include: [waltr]
+  skills: true
+```
+
+Discovery fetches metadata, not skill file contents. The provider sees origin-qualified server keys, URIs, names, and descriptions as untrusted catalog entries.
+The host does not share or persist a catalog cache. It follows pagination and rejects repeated cursors.
+Each discovery pass shares a 16 MiB serialized metadata budget across all pages and selected Skills-capable servers.
+The budget counts server labels and complete typed pages, including manifests and metadata. Each direct `skills/get` result has a separate 16 MiB budget.
+A byte-counting writer avoids an extra serialized buffer. The host applies these budgets after transport receives and parses each response.
+The 100 MiB single-response transport limit still applies; the metadata budget does not cap initial response parsing memory.
+
+| Tool | Behavior |
+| --- | --- |
+| `load_skill({source: "mcp", server, uri})` | Fetches an exact manifest, requests explicit activation approval, then verifies and reveals `SKILL.md`. Direct URIs need not appear in discovery. |
+| `read_mcp_resource({server, uri})` | Lazily reads raw data, automatically verifying every matching approved held manifest for the exact file URI. |
+
+One `SkillsMiddleware` owns the loader schema and routes the explicit source selector. The local adapter retains visible-catalog and worker-backed loading; the remote adapter owns manifest-bound activation, consent, and provenance. The schema does not change with enabled sources. See [Skills](skills.md#load_skill) for both input shapes.
+
+The generic reader does not accept a skill URI selector. Before resource I/O, the host finds all matching held manifests, rejects unlisted paths beneath any held root, and fails closed on conflicting overlapping manifests. Returned bytes must satisfy every matching manifest. Successful reads retain the complete raw MCP result and record every verified skill origin; read or integrity failures revoke the affected approvals.
+
+Activation approval binds the server origin, runtime incarnation, exact complete manifest, and current request.
+Generic policy allows and remembered approvals cannot satisfy this consent request. The host rejects dynamic manifests before any file read.
+Request-bound approvals survive additional pre-dispatch permission or middleware suspensions for the same call.
+The agent clears them at final execution or result, denial, cancellation, or prompt supersession.
+Skill output retains origin labels; the host never evaluates its text as templates.
+Ordinary `resources/read` and resource templates do not activate a skill or establish approval.
+
+### Execution And Replay
+
+Activation permits the model to act on remote instructions, subject to current tool permissions and additional per-call consent.
+The host does not automatically execute scripts. Author fields, `allowed-tools`, and hooks grant no permissions.
+The additional gate covers every other tool, including shell execution, custom tools, MCP tools, and nested local skill activation.
+Nested remote activation requires its own manifest-bound approval. Cross-origin supporting-file reads require per-call consent that identifies all active origins.
+The host disables delegation and template expansion while remote instructions remain in durable history.
+
+The acting window lasts for that durable history, not one turn. Held manifests and consent provenance survive session replay. Replay distinguishes local loader calls and ordinary data results from remote activation calls and resource results carrying verified skill origins; ordinary data does not establish activation provenance.
+Missing provenance, disabled Skills, or a retired runtime fail closed.
+A replacement runtime requires explicit reapproval of the unchanged held manifest before further action.
+Manifest changes and integrity failures revoke approval; the host never substitutes a new manifest automatically.
+Changed content requires a fresh session and fresh activation approval because old instructions remain in history.
+
+Waltr's hosted server publishes `resource-administration` and `hosted-sessions` as explicit embedded catalogs.
+Their files live under `crates/waltr-server/resources/skills/`; resource administration still uses complete YAML replacements and persisted-slot ETags.
 
 ## Server Instructions
 
@@ -290,6 +377,10 @@ Current deterministic coverage exercises stdio behavior but does not provide a r
 | Path | Purpose |
 | --- | --- |
 | [../mcp/protocol.md](../mcp/protocol.md) | Generic MCP protocol crate behavior and boundaries. |
+| [../mcp/skills.md](../mcp/skills.md) | Official Skills extension, explicit embedded manifests, and byte verification. |
+| [../../crates/waltr-agent/src/middleware/mcp_skills.rs](../../crates/waltr-agent/src/middleware/mcp_skills.rs) | Manifest-bound activation, origin labels, per-call consent, and durable replay gates. |
+| [../../crates/waltr-agent/src/middleware/skills.rs](../../crates/waltr-agent/src/middleware/skills.rs) | Shared skill loader schema and local/MCP source routing. |
+| [../../crates/waltr-agent/src/middleware/mcp_resources.rs](../../crates/waltr-agent/src/middleware/mcp_resources.rs) | Generic raw resource reader, held-manifest verification, and user-inserted resource templates. |
 | [../mcp/tracing.md](../mcp/tracing.md) | Generic MCP spans and trace propagation. |
 | [../../crates/mcp/src/client/](../../crates/mcp/src/client/) | Typed generic MCP client, connection loop, and transports. |
 | [../../crates/mcp/src/server/mod.rs](../../crates/mcp/src/server/mod.rs) | Typed generic MCP server. |

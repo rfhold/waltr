@@ -41,6 +41,332 @@ use crate::session::AgentTestSession;
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
 
 #[tokio::test]
+async fn mcp_skills_durable_permission_workflow_binds_activation_and_cross_origin_call()
+-> waltr_agent::Result<()> {
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_skill_consent",
+        |request| {
+            let event = match request.tool_results().count() {
+                0 => CompletionEvent::ToolCall(ToolCall::new(
+                    "load_remote",
+                    "load_skill",
+                    json!({"source":"mcp","server":"origin","uri":"skill://ops/inspect/SKILL.md"}),
+                )),
+                1 => CompletionEvent::ToolCall(ToolCall::new(
+                    "remote_action",
+                    "mcp_origin_echo_marker",
+                    json!({"value":"approved-action"}),
+                )),
+                2 => CompletionEvent::ToolCall(ToolCall::new(
+                    "support",
+                    "read_mcp_resource",
+                    json!({"server":"origin","uri":"skill://ops/inspect/references/action.txt"}),
+                )),
+                _ => CompletionEvent::Finished,
+            };
+            vec![Ok(event)]
+        },
+    )));
+    let root = tempfile::tempdir()?.keep();
+    let sandbox = TestSandbox::new(&root).await;
+    let mut definition = crate::agent_definitions::mcp_agent(false);
+    definition.features.mcp.as_mut().unwrap().skills = true;
+    let captured = provider.clone();
+    let command = test_stdio_server_command();
+    let factory = AgentSessionRuntimeFactory::new(
+        sandbox.handle(),
+        root.clone(),
+        FileCredentialStore::new(root.join("credentials.json")),
+        definition,
+    )
+    .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(test_model(), captured.clone())))
+    .with_mcp_connection_resolver(move |_| {
+        let command = command.clone();
+        Box::pin(async move {
+            Ok(vec![McpResolvedConnection {
+                key: "origin".into(),
+                kind: McpConnectionKind::Stdio,
+                command,
+                url: String::new(),
+            }])
+        })
+    });
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone()).with_runtime_factory(factory);
+    let mut create = SessionCreateRequest::new(SessionId::generate());
+    create.inference_settings = Some(test_inference_settings());
+    let id = sessions.create(create).await?.id().clone();
+    sessions
+        .submit_prompt(
+            id.clone(),
+            "load remote skill",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?
+        .handle
+        .wait()
+        .await?;
+    let record = store.load(&id).await.expect("stored session");
+    let snapshot = record.snapshot();
+    let activation = snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.tool_call_id.as_deref() == Some("load_remote"))
+        .expect("activation consent");
+    assert!(activation.prompt.contains("arbitrary host code execution"));
+    assert_eq!(
+        activation.payload["mcp_skill_consent"]["activation"]["manifest"]["uri"],
+        "skill://ops/inspect/SKILL.md"
+    );
+    assert!(!record.timeline_events().any(|event| matches!(&event.content,TimelineContent::ToolResult {result} if result.name == "load_skill")));
+    sessions
+        .resume_external_response(
+            id.clone(),
+            activation.id.clone(),
+            json!(waltr_agent::PermissionResponse::AllowOnce),
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?
+        .handle
+        .wait()
+        .await?;
+    let record = store.load(&id).await.expect("stored session");
+    let snapshot = record.snapshot();
+    let action = snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.tool_call_id.as_deref() == Some("remote_action"))
+        .expect("origin-bound per-call consent");
+    assert!(action.prompt.contains("origin"));
+    assert!(record.timeline_events().any(|event| matches!(&event.content,TimelineContent::ToolResult {result} if result.name == "load_skill" && result.content.contains("@tool(shell) stays literal"))));
+    sessions
+        .resume_external_response(
+            id.clone(),
+            action.id.clone(),
+            json!(waltr_agent::PermissionResponse::AllowOnce),
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?
+        .handle
+        .wait()
+        .await?;
+    let record = store.load(&id).await.expect("stored session");
+    assert!(record.timeline_events().any(|event| matches!(&event.content,TimelineContent::ToolResult {result} if result.name == "read_mcp_resource" && result.content.contains("Supporting skill file."))));
+    assert_eq!(
+        record.snapshot().middleware_state["mcp-skills"]["held"][0]["approved"],
+        true
+    );
+    assert_tool_was_surfaced(&provider, "load_skill");
+    assert_tool_was_surfaced(&provider, "read_mcp_resource");
+    sessions.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_skills_input_and_sandbox_ask_preserve_exact_call_approvals() -> waltr_agent::Result<()>
+{
+    for final_decision in 0..4 {
+        let provider = Arc::new(ScriptedProvider::new(
+            "skill_permission_retries",
+            |request| {
+                vec![Ok(match request.tool_results().count() {
+                    0 => CompletionEvent::ToolCall(ToolCall::new(
+                        "activate",
+                        "load_skill",
+                        json!({"source":"mcp","server":"origin","uri":"skill://ops/inspect/SKILL.md"}),
+                    )),
+                    1 => CompletionEvent::ToolCall(ToolCall::new(
+                        "read-outside",
+                        "read",
+                        json!({"filePath":"../outside.txt"}),
+                    )),
+                    _ => CompletionEvent::Finished,
+                })]
+            },
+        ));
+        let parent = tempfile::tempdir()?;
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root)?;
+        fs::write(
+            parent.path().join("outside.txt"),
+            "sandbox-permission-protected",
+        )?;
+        let sandbox = TestSandbox::new(&root).await;
+        let mut registry = waltr_agent::AgentDefinitionRegistry::new();
+        registry
+            .load_yaml(
+                r"apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata: { name: test }
+spec:
+  features:
+    - filesystem: { root: $(session.workspace.root), profile: auto, defaultPermissions: true }
+    - mcp: { skills: true, defaultPermissions: true }
+  permissions:
+    - name: read
+      permission:
+        inputs:
+          - match: [{ pointer: /filePath, value: { wildcard: '../*' } }]
+            effect: ask
+    - name: read
+      permission:
+        resources:
+          paths: [{ match: { outsideRoot: $(session.workspace.root) }, effect: ask }]
+",
+            )
+            .expect("load permission fixture");
+        let definition = registry.resolve_agent("test").expect("resolve fixture");
+        let command = test_stdio_server_command();
+        let factory = AgentSessionRuntimeFactory::new(
+            sandbox.handle(),
+            root.clone(),
+            FileCredentialStore::new(root.join("credentials.json")),
+            definition,
+        )
+        .with_runtime_provider(move |_| {
+            Ok(AgentRuntimeProvider::new(test_model(), provider.clone()))
+        })
+        .with_mcp_connection_resolver(move |_| {
+            let command = command.clone();
+            Box::pin(async move {
+                Ok(vec![McpResolvedConnection {
+                    key: "origin".into(),
+                    kind: McpConnectionKind::Stdio,
+                    command,
+                    url: String::new(),
+                }])
+            })
+        });
+        let store = MemorySessionStore::new();
+        let sessions = SessionCoordinator::new(store.clone()).with_runtime_factory(factory);
+        let mut create = SessionCreateRequest::new(SessionId::generate());
+        create.inference_settings = Some(test_inference_settings());
+        let id = sessions.create(create).await?.id().clone();
+        sessions
+            .submit_prompt(
+                id.clone(),
+                "load and read",
+                waltr_agent::RunConflictPolicy::ReplaceActive,
+            )
+            .await?
+            .handle
+            .wait()
+            .await?;
+        let mut seen = BTreeSet::new();
+        // Activation, input Ask, skill-bound call consent, sandbox Ask. Each
+        // request is approved once, despite replay across later suspensions.
+        for stage in 0..4 {
+            let snapshot = store.load(&id).await.unwrap().snapshot();
+            let pending = snapshot
+                .external_requests
+                .iter()
+                .find(|request| request.status == waltr_agent::ExternalRequestStatus::Pending)
+                .expect("distinct pending approval");
+            assert!(
+                seen.insert(pending.id.as_str().to_owned()),
+                "approval repeated at stage {stage}"
+            );
+            match stage {
+                0 => assert!(pending.payload.get("mcp_skill_consent").is_some()),
+                1 => assert!(pending.prompt.contains("input approval")),
+                2 => assert!(
+                    pending.payload["mcp_skill_consent"]["call"]["arguments"]["filePath"]
+                        == "../outside.txt"
+                ),
+                3 => {
+                    assert!(pending.payload.get("mcp_skill_consent").is_none());
+                    assert!(!pending.prompt.contains("input approval"));
+                    assert_eq!(
+                        snapshot.middleware_state["permissions"]["one_shot"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                }
+                _ => unreachable!(),
+            }
+            if stage == 3 && final_decision == 3 {
+                sessions.interrupt(&id).await?;
+                continue;
+            }
+            let response = if stage == 3 && final_decision != 0 {
+                waltr_agent::PermissionResponse::Deny {
+                    message: None,
+                    mode: waltr_agent::PermissionDenyMode::ReturnToolResult,
+                }
+            } else {
+                waltr_agent::PermissionResponse::AllowOnce
+            };
+            if stage == 3 && final_decision == 2 {
+                waltr_agent::AgentSessionRuntime::new(&store)
+                    .resume(
+                        &id,
+                        waltr_agent::ResumeInput::ExternalResponse {
+                            request_id: pending.id.clone(),
+                            response: waltr_agent::ExternalResponse::new(json!(
+                                waltr_agent::PermissionResponse::Deny {
+                                    message: None,
+                                    mode: waltr_agent::PermissionDenyMode::CancelWork
+                                }
+                            )),
+                        },
+                    )
+                    .await?;
+                continue;
+            }
+            sessions
+                .resume_external_response(
+                    id.clone(),
+                    pending.id.clone(),
+                    json!(response),
+                    waltr_agent::RunConflictPolicy::ReplaceActive,
+                )
+                .await?
+                .handle
+                .wait()
+                .await?;
+        }
+        let record = store.load(&id).await.unwrap();
+        assert!(
+            !record
+                .snapshot()
+                .external_requests
+                .iter()
+                .any(|request| request.status == waltr_agent::ExternalRequestStatus::Pending)
+        );
+        assert!(
+            record.snapshot().middleware_state["permissions"]["one_shot"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(record.journal.iter().any(|event| matches!(event, waltr_agent::SessionJournalEvent::SandboxDispatchStarted { tool_call_id, .. } if tool_call_id == "read-outside")), final_decision == 0);
+        let results = record
+            .timeline_events()
+            .filter_map(|event| match &event.content {
+                TimelineContent::ToolResult { result } if result.call_id == "read-outside" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if final_decision < 2 {
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].is_error, final_decision == 1);
+        }
+        assert_eq!(
+            results
+                .iter()
+                .any(|result| result.content.contains("sandbox-permission-protected")),
+            final_decision == 0
+        );
+        sessions.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_definition_selection_is_forwarded_to_host_resolver() -> waltr_agent::Result<()> {
     for (servers, expected) in [
         (
@@ -1085,7 +1411,8 @@ async fn mcp_uri_resource_template_renders_filled_uri_before_provider_request()
 }
 
 #[tokio::test]
-async fn mcp_resources_are_not_surfaced_as_provider_tools() -> waltr_agent::Result<()> {
+async fn mcp_resources_surface_one_generic_reader_not_per_resource_tools() -> waltr_agent::Result<()>
+{
     let stdio_command = test_stdio_server_command();
     let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
         "mcp_resource_tool_provider",
@@ -1095,14 +1422,66 @@ async fn mcp_resources_are_not_surfaced_as_provider_tools() -> waltr_agent::Resu
 
     run_session_prompt(
         &sessions,
-        "resources are templates only",
+        "resources use one generic reader",
         vec![stdio_runtime_server(&stdio_command)],
     )
     .await?;
 
     assert_tool_was_not_surfaced(&provider, "mcp_stdio_test_status_resource");
-    assert_tool_was_not_surfaced(&provider, "read_mcp_resource");
+    assert_tool_was_surfaced(&provider, "read_mcp_resource");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_generic_reader_reads_listed_and_filled_template_resources_as_data()
+-> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_generic_resource_reader",
+        |request| {
+            if request.tool_results().next().is_none() {
+                ["test://status", "test://items/42"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, uri)| {
+                        Ok(CompletionEvent::ToolCall(ToolCall::new(
+                            format!("resource-{index}"),
+                            "read_mcp_resource",
+                            json!({"server":"stdio_test","uri":uri}),
+                        )))
+                    })
+                    .collect()
+            } else {
+                let results: Vec<_> = request.tool_results().collect();
+                assert_eq!(results.len(), 2);
+                for (result, marker) in results.iter().zip([
+                    "stdio-mcp-resource-status-616",
+                    "stdio-mcp-resource-template-item-42-717",
+                ]) {
+                    assert!(!result.is_error, "{result:?}");
+                    let data: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                    assert!(
+                        data["data"]["contents"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains(marker)
+                    );
+                    assert_eq!(data["verified_skill_origins"], json!([]));
+                }
+                vec![Ok(CompletionEvent::Finished)]
+            }
+        },
+    )));
+    let sessions = mcp_sessions(provider.clone()).await;
+    let session = run_session_prompt(
+        &sessions,
+        "read resource data",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+    assert_eq!(session.tool_calls.len(), 2);
+    assert_tool_was_surfaced(&provider, "read_mcp_resource");
     Ok(())
 }
 

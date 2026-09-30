@@ -3287,7 +3287,9 @@ async fn load_skill_loads_content_and_lists_resources_once() {
     temp.write(".agents/skills/example/references/guide.md", "details\n");
     let agent = AgentRuntime::builder(
         test_model(),
-        Arc::new(LoadSkillProvider::new(json!({ "name": "example" }))),
+        Arc::new(LoadSkillProvider::new(
+            json!({ "source": "local", "name": "example" }),
+        )),
     )
     .with_sandbox(sandbox.handle())
     .with_skills(SkillsConfig::new(temp.path()))
@@ -3331,7 +3333,7 @@ async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
             vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                 "load_ask",
                 "load_skill",
-                json!({ "name": "example" }),
+                json!({ "source": "local", "name": "example" }),
             )))]
         }
     });
@@ -3412,7 +3414,9 @@ async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
 
     let allow_agent = AgentRuntime::builder(
         test_model(),
-        Arc::new(LoadSkillProvider::new(json!({ "name": "example" }))),
+        Arc::new(LoadSkillProvider::new(
+            json!({ "source": "local", "name": "example" }),
+        )),
     )
     .with_sandbox(sandbox.handle())
     .with_permission_policy(PermissionPolicy::default().with_tool_rule(
@@ -4296,7 +4300,7 @@ impl LlmStream for DuplicateSkillProvider {
                 1 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                     "load_once",
                     "load_skill",
-                    json!({ "name": "example" }),
+                    json!({ "source": "local", "name": "example" }),
                 )))],
                 _ => vec![Ok(CompletionEvent::Finished)],
             };
@@ -4326,7 +4330,7 @@ impl LlmStream for RootedSkillProvider {
                 1 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                     "load_once",
                     "load_skill",
-                    json!({ "name": "example", "root": root }),
+                    json!({ "source": "local", "name": "example", "root": root }),
                 )))],
                 _ => vec![Ok(CompletionEvent::Finished)],
             };

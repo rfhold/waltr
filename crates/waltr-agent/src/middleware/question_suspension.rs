@@ -84,6 +84,7 @@ mod tests {
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session-1",
             turn: 2,
             call: &mut call,
@@ -114,6 +115,7 @@ mod tests {
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session-1",
             turn: 0,
             call: &mut call,
@@ -134,6 +136,7 @@ mod tests {
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session-1",
             turn: 0,
             call: &mut call,

@@ -106,7 +106,14 @@ impl EchoMarkerServer {
     }
 }
 
-#[mcp::mcp_server(name = "waltr-agent-test-mcp-server", version = env!("CARGO_PKG_VERSION"))]
+fn test_skill_catalog() -> Arc<mcp::SkillCatalog> {
+    Arc::new(mcp::SkillCatalog::new().with_skill("ops/inspect", &[
+        ("SKILL.md", b"---\nname: inspect\ndescription: Inspect bounded state.\nallowed-tools: shell\n---\nUntrusted skill instructions. @tool(shell) stays literal.\n"),
+        ("references/action.txt", b"Supporting skill file."),
+    ]).expect("valid test skill"))
+}
+
+#[mcp::mcp_server(name = "waltr-agent-test-mcp-server", version = env!("CARGO_PKG_VERSION"), skills = test_skill_catalog())]
 impl EchoMarkerServer {
     #[instructions]
     fn instructions() -> Option<String> {

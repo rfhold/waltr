@@ -500,7 +500,15 @@ where
                         }
                         continue;
                     };
-                    match self.start_tool(call).await {
+                    let execution = self.start_tool(call).await;
+                    if self.cancellation_token.is_cancelled() {
+                        if let Err(error) = self.record_interrupted().await {
+                            return Some((Err(error), self));
+                        }
+                        self.phase = AgentLoopPhase::Done;
+                        return None;
+                    }
+                    match execution {
                         Ok(ToolExecution::Running(running)) => {
                             self.phase = AgentLoopPhase::RunningTool(running, batch);
                             continue;
@@ -709,8 +717,10 @@ where
         // Claims-producing middleware fills this during before_tool_call; permission
         // evaluation below runs after the full chain so it observes complete claims.
         let mut claims = Vec::new();
+        let requested_arguments = call.arguments.clone();
         let before_outcome = {
             let mut ctx = ToolCallContext {
+                cancellation_token: self.cancellation_token.clone(),
                 session_id: self.session_id.as_str(),
                 turn: self.turn as u64,
                 call: &mut call,
@@ -719,6 +729,20 @@ where
             };
             self.middleware_chain.before_tool_call(&mut ctx).await
         };
+        if self.cancellation_token.is_cancelled() {
+            return Ok(ToolExecution::Finished(None));
+        }
+        if call.arguments != requested_arguments
+            && self.middleware_state.get("mcp-skills").is_some()
+        {
+            return Ok(ToolExecution::Finished(Some(error_tool_result(
+                &call,
+                &LlmError::Protocol {
+                    provider: "permission",
+                    message: "middleware changed remote-skill-bound tool arguments".into(),
+                },
+            ))));
+        }
         match before_outcome {
             Ok(HookOutcome::Continue) => {}
             Ok(outcome) => {
@@ -817,17 +841,7 @@ where
 
         match self.permission_outcome(&call, &claims, whole_tool_approved) {
             Ok(PermissionOutcome::Allow) => {
-                if whole_tool_approved {
-                    let mut state = self.permission_runtime_state()?;
-                    if state.consume_one_shot(
-                        &whole_tool_request_id,
-                        &call.id,
-                        PermissionApprovalStage::WholeTool,
-                        &[],
-                    ) {
-                        self.set_permission_runtime_state(&state)?;
-                    }
-                }
+                self.clear_call_approvals(&call.id)?;
                 self.in_turn_span(|| tracing::debug!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission allowed"));
                 self.flush_middleware_state().await?;
             }
@@ -968,6 +982,7 @@ where
     }
 
     async fn finish_tool_result(&mut self, result: ToolResult) -> Result<()> {
+        self.clear_call_approvals(&result.call_id)?;
         let parent_id = self.tool_item_id(&result.call_id)?;
         CompletionTurn::entry(&mut self.turns, self.turn as u64)
             .items
@@ -1078,12 +1093,12 @@ where
             ));
         }
 
-        let mut state = self.permission_runtime_state()?;
+        let state = self.permission_runtime_state()?;
         let input_claims = input
             .as_ref()
             .filter(|input| input.effect.level == PermissionLevel::Ask)
             .map_or(&[][..], |input| input.claims.as_slice());
-        let unmatched = claims
+        let mut unmatched = claims
             .iter()
             .filter(|claim| {
                 self.permission_policy
@@ -1094,25 +1109,27 @@ where
             .chain(input_claims.iter().cloned())
             .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
             .collect::<Vec<_>>();
-        let identities = permission_claim_identities(&unmatched);
-        let request_id = permission_request_id(
-            &PermissionRequestContext {
-                session_id: self.session_id.as_str(),
-                turn: self.turn as u64,
-                stage: PermissionApprovalStage::Contextual,
-                policy: &self.permission_policy,
-            },
-            tool_call,
-            &identities,
-        );
-        if state.consume_one_shot(
-            &request_id,
-            &tool_call.id,
-            PermissionApprovalStage::Contextual,
-            &identities,
-        ) {
-            self.set_permission_runtime_state(&state)?;
-            return Ok(PermissionOutcome::Allow);
+        let request = PermissionRequestContext {
+            session_id: self.session_id.as_str(),
+            turn: self.turn as u64,
+            stage: PermissionApprovalStage::Contextual,
+            policy: &self.permission_policy,
+        };
+        // Preparation can add claims after middleware has already suspended. Keep
+        // exact-call approvals through those retries, and ask only for new claims.
+        for approval in &state.one_shot {
+            let Some(identities) = &approval.claims else {
+                continue;
+            };
+            if approval.tool_call_id == tool_call.id
+                && approval.stage == Some(PermissionApprovalStage::Contextual)
+                && approval.request_id == permission_request_id(&request, tool_call, identities)
+            {
+                unmatched.retain(|claim| {
+                    !identities
+                        .contains(&permission_claim_identities(std::slice::from_ref(claim))[0])
+                });
+            }
         }
         if unmatched.is_empty() {
             return Ok(PermissionOutcome::Allow);
@@ -1127,6 +1144,18 @@ where
             .transpose()
             .map_err(|error| session_store_error(error.to_string()))
             .map(Option::unwrap_or_default)
+    }
+
+    fn clear_call_approvals(&mut self, call_id: &str) -> Result<()> {
+        let mut state = self.permission_runtime_state()?;
+        let previous_count = state.one_shot.len();
+        state
+            .one_shot
+            .retain(|approval| approval.tool_call_id != call_id);
+        if state.one_shot.len() != previous_count {
+            self.set_permission_runtime_state(&state)?;
+        }
+        Ok(())
     }
 
     fn set_permission_runtime_state(&mut self, state: &PermissionRuntimeState) -> Result<()> {
@@ -2425,15 +2454,20 @@ fn permission_request_id(
     call: &ToolCall,
     claims: &[PermissionClaimIdentity],
 ) -> String {
-    let identity = serde_json::to_string(&(request.stage, request.policy.identity(), claims))
-        .expect("permission request identity serializes");
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in identity.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let identity = serde_json::to_string(&(
+        request.stage,
+        request.policy.identity(),
+        &call.name,
+        &call.arguments,
+        claims,
+    ))
+    .expect("permission request identity serializes");
+    let hash = Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     format!(
-        "permission:{}:{}:{}:{hash:016x}",
+        "permission:{}:{}:{}:{hash}",
         request.session_id, request.turn, call.id
     )
 }
@@ -2632,6 +2666,46 @@ mod tests {
     use crate::{ToolResult, ToolResultContent, ToolResultContentBlock, ToolResultImage};
 
     use super::{redact_provider_images, tool_result_json};
+
+    #[test]
+    fn permission_retry_identity_binds_complete_tool_name_and_arguments() {
+        let policy = crate::PermissionPolicy::default();
+        let request = super::PermissionRequestContext {
+            session_id: "session",
+            turn: 4,
+            stage: super::PermissionApprovalStage::Contextual,
+            policy: &policy,
+        };
+        let call = crate::ToolCall::new(
+            "call",
+            "read",
+            json!({"filePath":"outside", "extra":"original"}),
+        );
+        let id = super::permission_request_id(&request, &call, &[]);
+        let mut approvals = super::PermissionRuntimeState::default();
+        approvals.allow_once(
+            &crate::ExternalRequestId::new(&id),
+            "call",
+            request.stage,
+            vec![],
+        );
+        for changed in [
+            crate::ToolCall::new("call", "write", call.arguments.clone()),
+            crate::ToolCall::new(
+                "call",
+                "read",
+                json!({"filePath":"outside", "extra":"modified"}),
+            ),
+        ] {
+            assert!(!approvals.has_one_shot(
+                &super::permission_request_id(&request, &changed, &[]),
+                "call",
+                request.stage,
+                &[]
+            ));
+        }
+        assert!(approvals.has_one_shot(&id, "call", request.stage, &[]));
+    }
 
     #[test]
     fn provider_request_audit_redacts_native_and_data_url_images() {

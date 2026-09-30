@@ -24,6 +24,8 @@ use super::{AgentRuntime, AgentTool, ProviderRetryConfig, SessionStore};
 /// Builder for an agent runtime configuration.
 #[derive(Clone)]
 pub struct AgentRuntimeBuilder {
+    mcp_skills_runtime: Option<std::sync::Arc<crate::mcp::McpClientRuntime>>,
+    mcp_resources_runtime: Option<(Arc<crate::mcp::McpClientRuntime>, bool)>,
     provider: Arc<dyn LlmStream>,
     model: ModelRef,
     model_cost: Option<ModelCost>,
@@ -57,6 +59,8 @@ impl AgentRuntimeBuilder {
 
     pub(crate) fn new_dyn(model: ModelRef, provider: Arc<dyn LlmStream>) -> Self {
         Self {
+            mcp_skills_runtime: None,
+            mcp_resources_runtime: None,
             provider,
             model,
             model_cost: None,
@@ -323,12 +327,17 @@ impl AgentRuntimeBuilder {
     /// Build the agent runtime configuration.
     ///
     /// Middleware assembly order is deterministic and affects provider request
-    /// hashes: the stateful system prompt middleware runs first, then feature
+    /// hashes: the remote-skill provenance guard runs first, then the stateful
+    /// system prompt middleware, then feature
     /// and custom middleware in registration order, then `AGENTS.md`
     /// instructions, then skills.
     #[must_use]
     pub fn build(self) -> AgentRuntime {
         let mut middleware_chain = MiddlewareChain::new();
+        let remote = crate::middleware::mcp_skills::McpSkillsMiddleware::new(
+            self.mcp_skills_runtime.clone(),
+        );
+        middleware_chain.push(remote.clone());
         let mut prompt_middleware = SystemPromptMiddleware::new(self.system_prompt.build());
         if let Some(identity) = self.system_prompt_identity {
             prompt_middleware = prompt_middleware.with_identity(identity);
@@ -342,6 +351,17 @@ impl AgentRuntimeBuilder {
             self.permission_policy.clone(),
             true,
         ));
+        if let Some((runtime, ordinary)) = self.mcp_resources_runtime {
+            middleware_chain.push(if ordinary {
+                crate::middleware::mcp_resources::McpResourcesMiddleware::new(runtime)
+            } else {
+                crate::middleware::mcp_resources::McpResourcesMiddleware::skill_references(runtime)
+            });
+        } else if let Some(runtime) = self.mcp_skills_runtime.clone() {
+            middleware_chain.push(
+                crate::middleware::mcp_resources::McpResourcesMiddleware::skill_references(runtime),
+            );
+        }
         middleware_chain.extend(self.middleware_chain);
         if !self.agents_prompt_configs.is_empty() || !self.agents_read_roots.is_empty() {
             let sandbox = self
@@ -356,20 +376,28 @@ impl AgentRuntimeBuilder {
                 .with_sandbox(sandbox),
             );
         }
+        let mut local = None;
         if self.skills_enabled {
             if let Some(root) = self.skills_root {
                 let sandbox = self
                     .sandbox
                     .clone()
                     .expect("skills require a sandbox handle");
-                middleware_chain.push(
-                    crate::middleware::sandbox_skills::SandboxSkillsMiddleware::new(
-                        root,
-                        self.skills_reveal_roots.clone(),
-                        sandbox,
-                    ),
+                let adapter = crate::middleware::sandbox_skills::SandboxSkillsMiddleware::new(
+                    root,
+                    self.skills_reveal_roots.clone(),
+                    sandbox,
                 );
+                middleware_chain.push(adapter.clone());
+                local = Some(adapter);
             }
+        }
+        if local.is_some() || self.mcp_skills_runtime.is_some() {
+            middleware_chain.push(crate::middleware::skills::SkillsMiddleware::new(
+                local,
+                remote,
+                self.mcp_skills_runtime.is_some(),
+            ));
         }
         AgentRuntime {
             provider: self.provider,
@@ -383,6 +411,23 @@ impl AgentRuntimeBuilder {
             max_provider_turns: self.max_provider_turns,
             sandbox: self.sandbox,
         }
+    }
+
+    pub(crate) fn with_mcp_skills(
+        mut self,
+        runtime: std::sync::Arc<crate::mcp::McpClientRuntime>,
+    ) -> Self {
+        self.mcp_skills_runtime = Some(runtime);
+        self
+    }
+
+    pub(crate) fn with_mcp_resources(
+        mut self,
+        runtime: Arc<crate::mcp::McpClientRuntime>,
+        ordinary: bool,
+    ) -> Self {
+        self.mcp_resources_runtime = Some((runtime, ordinary));
+        self
     }
 }
 

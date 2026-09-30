@@ -505,6 +505,8 @@ pub struct McpFeatureConfig {
     pub resources: bool,
     /// Whether MCP prompts are available to the agent.
     pub prompts: bool,
+    /// Whether verified on-demand MCP Skills are available. Disabled by default.
+    pub skills: bool,
     /// Whether trace context is propagated to MCP servers.
     pub trace_propagation: bool,
     /// Whether to install the feature's runtime-owned default permissions.

@@ -1,4 +1,4 @@
-//! MCP resource template middleware.
+//! MCP resource data reader and user-inserted resource templates.
 
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Result,
+    LlmError, Result, ToolDefinition, ToolResult,
     mcp::McpClientRuntime,
     resource::{
         SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
@@ -15,28 +15,129 @@ use crate::{
     template::{TemplateReference, TemplateReferenceRender, template_error},
 };
 
-use super::{AgentMiddleware, context::TemplateRenderContext, context::TemplateSearchContext};
+use super::{
+    AgentMiddleware, HookOutcome,
+    context::{
+        RequestContext, TemplateRenderContext, TemplateSearchContext, ToolCallContext, ToolDraft,
+    },
+    mcp_skills::McpSkillsMiddleware,
+};
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceSelector {
+    pub server: String,
+    pub uri: String,
+}
+
+pub(crate) fn resource_selector(ctx: &ToolCallContext<'_>) -> Result<ResourceSelector> {
+    let selector: ResourceSelector =
+        serde_json::from_value(ctx.call.arguments.clone()).map_err(|error| LlmError::Protocol {
+            provider: "mcp-resources",
+            message: format!("invalid read_mcp_resource selector: {error}"),
+        })?;
+    if selector.server.is_empty() || reqwest::Url::parse(&selector.uri).is_err() {
+        return Err(LlmError::Protocol {
+            provider: "mcp-resources",
+            message: "invalid read_mcp_resource selector values".into(),
+        });
+    }
+    Ok(selector)
+}
 
 #[derive(Debug, Clone)]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpResourcesMiddleware {
     runtime: Arc<McpClientRuntime>,
+    ordinary: bool,
 }
 
 impl McpResourcesMiddleware {
     pub(crate) const fn new(runtime: Arc<McpClientRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            ordinary: true,
+        }
+    }
+
+    pub(crate) const fn skill_references(runtime: Arc<McpClientRuntime>) -> Self {
+        Self {
+            runtime,
+            ordinary: false,
+        }
     }
 }
 
 impl AgentMiddleware for McpResourcesMiddleware {
+    async fn list_tools(&self, _ctx: &mut RequestContext<'_>, tools: &mut ToolDraft) -> Result<()> {
+        let description = if self.ordinary {
+            "Read raw MCP resource DATA from the named server and direct URI, whether listed, template-derived, or unlisted. Does not activate skills or evaluate templates. Loaded skill files are automatically verified against every held manifest; unlisted paths beneath held roots are rejected."
+        } else {
+            "Read raw DATA for a file in a loaded, approved MCP skill's held manifest, using server and the exact file URI. Ordinary resource reads are disabled. Automatically verifies all matching held manifests. Does not activate skills or evaluate templates."
+        };
+        tools.push(ToolDefinition::new(
+            "read_mcp_resource", description,
+            json!({
+                "type": "object",
+                "properties": {"server": {"type": "string", "minLength": 1}, "uri": {"type": "string", "minLength": 1}},
+                "required": ["server", "uri"],
+                "additionalProperties": false
+            }),
+        ));
+        Ok(())
+    }
+
+    async fn before_tool_call(&self, ctx: &mut ToolCallContext<'_>) -> Result<HookOutcome> {
+        if ctx.call.name != "read_mcp_resource" {
+            return Ok(HookOutcome::Continue);
+        }
+        let ResourceSelector { server, uri } = resource_selector(ctx)?;
+        let manifests = McpSkillsMiddleware::resource_manifests(ctx, &server, &uri)?;
+        if !self.ordinary && manifests.is_empty() {
+            return Err(LlmError::Protocol { provider: "mcp-resources", message: "ordinary MCP resource reads are disabled; only loaded held skill files may be read".into() });
+        }
+        let response = match self
+            .runtime
+            .read_resource_data(&server, &uri, ctx.cancellation_token.clone())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if ctx.cancellation_token.is_cancelled() {
+                    return Err(error);
+                }
+                McpSkillsMiddleware::revoke_resource(ctx, &server, &manifests)?;
+                return Err(error);
+            }
+        };
+        for manifest in &manifests {
+            if let Err(error) =
+                crate::mcp::skills::verified_resource_bytes(manifest, &uri, response.clone())
+            {
+                McpSkillsMiddleware::revoke_resource(ctx, &server, &manifests)?;
+                return Err(error);
+            }
+        }
+        let origins: Vec<_> = manifests
+            .iter()
+            .map(|manifest| json!({"server":server,"uri":manifest.uri}))
+            .collect();
+        Ok(HookOutcome::ReplaceToolResult(ToolResult::new(
+            ctx.call.id.clone(),
+            ctx.call.name.clone(),
+            json!({"server":server,"uri":uri,"data":response.raw,"verified_skill_origins":origins})
+                .to_string(),
+        )))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn search_templates(
         &self,
         ctx: &TemplateSearchContext<'_>,
         results: &mut TemplateSearchResults,
     ) -> Result<()> {
-        if ctx.request.target != SessionTemplateSearchTarget::Resources
+        if !self.ordinary
+            || ctx.request.target != SessionTemplateSearchTarget::Resources
             || !ctx.request.includes(SessionTemplateKind::Resource)
         {
             return Ok(());
@@ -178,6 +279,9 @@ impl AgentMiddleware for McpResourcesMiddleware {
         ctx: &mut TemplateRenderContext<'_>,
         reference: &TemplateReference,
     ) -> Result<TemplateReferenceRender> {
+        if !self.ordinary {
+            return Ok(TemplateReferenceRender::Continue);
+        }
         let TemplateReference::Resource { server, uri, .. } = reference else {
             return Ok(TemplateReferenceRender::Continue);
         };
