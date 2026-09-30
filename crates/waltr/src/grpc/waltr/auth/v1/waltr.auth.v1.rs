@@ -5,93 +5,93 @@ pub struct ListAuthStatusesRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListAuthStatusesResponse {
-    #[prost(message, repeated, tag="1")]
+    #[prost(message, repeated, tag = "1")]
     pub statuses: ::prost::alloc::vec::Vec<AuthStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetAuthStatusRequest {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub target: ::core::option::Option<AuthTarget>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetAuthStatusResponse {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub status: ::core::option::Option<AuthStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BeginAuthRequest {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub target: ::core::option::Option<AuthTarget>,
-    #[prost(enumeration="AuthMethod", tag="2")]
+    #[prost(enumeration = "AuthMethod", tag = "2")]
     pub method: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BeginAuthResponse {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub attempt_id: ::prost::alloc::string::String,
-    #[prost(enumeration="AuthMethod", tag="2")]
+    #[prost(enumeration = "AuthMethod", tag = "2")]
     pub method: i32,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub auth_url: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
+    #[prost(string, tag = "4")]
     pub verification_url: ::prost::alloc::string::String,
-    #[prost(string, tag="5")]
+    #[prost(string, tag = "5")]
     pub user_code: ::prost::alloc::string::String,
-    #[prost(int64, tag="6")]
+    #[prost(int64, tag = "6")]
     pub expires_at_ms: i64,
-    #[prost(int32, tag="7")]
+    #[prost(int32, tag = "7")]
     pub poll_interval_seconds: i32,
-    #[prost(string, repeated, tag="8")]
+    #[prost(string, repeated, tag = "8")]
     pub messages: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(enumeration="AuthCompletionMode", tag="9")]
+    #[prost(enumeration = "AuthCompletionMode", tag = "9")]
     pub completion_mode: i32,
-    #[prost(enumeration="McpOAuthRegistrationMethod", tag="10")]
+    #[prost(enumeration = "McpOAuthRegistrationMethod", tag = "10")]
     pub registration_method: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompleteAuthRequest {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub attempt_id: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub input: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompleteAuthResponse {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub status: ::core::option::Option<AuthStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetAuthAttemptStatusRequest {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub attempt_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetAuthAttemptStatusResponse {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub attempt: ::core::option::Option<AuthAttemptStatus>,
-    #[prost(message, optional, tag="2")]
+    #[prost(message, optional, tag = "2")]
     pub status: ::core::option::Option<AuthStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthAttemptStatus {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub attempt_id: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="2")]
+    #[prost(message, optional, tag = "2")]
     pub target: ::core::option::Option<AuthTarget>,
-    #[prost(enumeration="AuthAttemptLifecycle", tag="3")]
+    #[prost(enumeration = "AuthAttemptLifecycle", tag = "3")]
     pub lifecycle: i32,
-    #[prost(enumeration="AuthCompletionMode", tag="4")]
+    #[prost(enumeration = "AuthCompletionMode", tag = "4")]
     pub completion_mode: i32,
-    #[prost(enumeration="McpOAuthRegistrationMethod", tag="5")]
+    #[prost(enumeration = "McpOAuthRegistrationMethod", tag = "5")]
     pub registration_method: i32,
-    #[prost(int64, tag="6")]
+    #[prost(int64, tag = "6")]
     pub expires_at_ms: i64,
-    #[prost(string, tag="7")]
+    #[prost(string, tag = "7")]
     pub failure_reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelAuthRequest {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub attempt_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -99,90 +99,90 @@ pub struct CancelAuthResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RefreshAuthRequest {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub target: ::core::option::Option<AuthTarget>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RefreshAuthResponse {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub status: ::core::option::Option<AuthStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogoutRequest {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub target: ::core::option::Option<AuthTarget>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LogoutResponse {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub status: ::core::option::Option<AuthStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthTarget {
-    #[prost(oneof="auth_target::Target", tags="1, 2")]
+    #[prost(oneof = "auth_target::Target", tags = "1, 2")]
     pub target: ::core::option::Option<auth_target::Target>,
 }
 /// Nested message and enum types in `AuthTarget`.
 pub mod auth_target {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Target {
-        #[prost(string, tag="1")]
+        #[prost(string, tag = "1")]
         ProviderKey(::prost::alloc::string::String),
-        #[prost(string, tag="2")]
+        #[prost(string, tag = "2")]
         McpServerKey(::prost::alloc::string::String),
     }
 }
 /// Versioned machine-readable authentication failure carried in gRPC status details.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthenticationFailure {
-    #[prost(uint32, tag="1")]
+    #[prost(uint32, tag = "1")]
     pub version: u32,
-    #[prost(enumeration="AuthenticationDomain", tag="2")]
+    #[prost(enumeration = "AuthenticationDomain", tag = "2")]
     pub domain: i32,
-    #[prost(enumeration="AuthenticationFailureReason", tag="3")]
+    #[prost(enumeration = "AuthenticationFailureReason", tag = "3")]
     pub reason: i32,
-    #[prost(message, optional, tag="4")]
+    #[prost(message, optional, tag = "4")]
     pub target: ::core::option::Option<AuthTarget>,
-    #[prost(message, optional, tag="5")]
+    #[prost(message, optional, tag = "5")]
     pub mcp_authorization: ::core::option::Option<McpAuthorizationContext>,
 }
 /// Sanitized MCP bearer challenge and protected endpoint context.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct McpAuthorizationContext {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub endpoint: ::prost::alloc::string::String,
-    #[prost(uint32, tag="2")]
+    #[prost(uint32, tag = "2")]
     pub http_status: u32,
-    #[prost(string, optional, tag="3")]
+    #[prost(string, optional, tag = "3")]
     pub resource_metadata_url: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="4")]
+    #[prost(string, optional, tag = "4")]
     pub scope: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="5")]
+    #[prost(string, optional, tag = "5")]
     pub error: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="6")]
+    #[prost(string, optional, tag = "6")]
     pub error_description: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="7")]
+    #[prost(string, optional, tag = "7")]
     pub error_uri: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="8")]
+    #[prost(string, optional, tag = "8")]
     pub realm: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AuthStatus {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub target: ::core::option::Option<AuthTarget>,
-    #[prost(enumeration="AuthStatusKind", tag="2")]
+    #[prost(enumeration = "AuthStatusKind", tag = "2")]
     pub kind: i32,
-    #[prost(enumeration="AuthMethod", repeated, tag="3")]
+    #[prost(enumeration = "AuthMethod", repeated, tag = "3")]
     pub supported_methods: ::prost::alloc::vec::Vec<i32>,
-    #[prost(int64, tag="4")]
+    #[prost(int64, tag = "4")]
     pub expires_at_ms: i64,
-    #[prost(map="string, string", tag="5")]
+    #[prost(map = "string, string", tag = "5")]
     pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    #[prost(string, tag="6")]
+    #[prost(string, tag = "6")]
     pub message: ::prost::alloc::string::String,
-    #[prost(enumeration="McpOAuthRegistrationMethod", tag="7")]
+    #[prost(enumeration = "McpOAuthRegistrationMethod", tag = "7")]
     pub registration_method: i32,
-    #[prost(bool, tag="8")]
+    #[prost(bool, tag = "8")]
     pub can_refresh: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

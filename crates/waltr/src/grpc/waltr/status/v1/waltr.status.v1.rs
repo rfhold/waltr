@@ -3,7 +3,7 @@
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SystemStatus {
-    #[prost(bool, tag="1")]
+    #[prost(bool, tag = "1")]
     pub ready: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -13,7 +13,7 @@ pub struct WatchStatusRequest {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchStatusResponse {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub status: ::core::option::Option<SystemStatus>,
 }
 include!("waltr.status.v1.tonic.rs");

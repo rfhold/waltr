@@ -3,334 +3,334 @@
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchManualRoutinesRequest {
     /// Correlation only. This ID does not provide idempotency or deduplication.
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchManualRoutinesResponse {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
     /// Definitions preserve the server catalog's canonical Routine and trigger declaration order.
-    #[prost(message, repeated, tag="2")]
+    #[prost(message, repeated, tag = "2")]
     pub routines: ::prost::alloc::vec::Vec<ManualRoutineDefinition>,
     /// Stable digest of this projected definition snapshot.
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub digest: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ManualRoutineDefinition {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub routine_name: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub trigger_name: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub display_name: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
+    #[prost(string, tag = "4")]
     pub description: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineScope", tag="5")]
+    #[prost(enumeration = "RoutineScope", tag = "5")]
     pub scope: i32,
     /// Inputs preserve trigger declaration order.
-    #[prost(message, repeated, tag="6")]
+    #[prost(message, repeated, tag = "6")]
     pub inputs: ::prost::alloc::vec::Vec<RoutineInputDefinition>,
     /// Results preserve Routine declaration order.
-    #[prost(message, repeated, tag="7")]
+    #[prost(message, repeated, tag = "7")]
     pub results: ::prost::alloc::vec::Vec<RoutineResultDefinition>,
-    #[prost(string, tag="8")]
+    #[prost(string, tag = "8")]
     pub routine_revision: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineInputDefinition {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineValueType", tag="2")]
+    #[prost(enumeration = "RoutineValueType", tag = "2")]
     pub r#type: i32,
-    #[prost(bool, tag="3")]
+    #[prost(bool, tag = "3")]
     pub required: bool,
-    #[prost(uint64, optional, tag="4")]
+    #[prost(uint64, optional, tag = "4")]
     pub minimum_string_length: ::core::option::Option<u64>,
-    #[prost(string, optional, tag="5")]
+    #[prost(string, optional, tag = "5")]
     pub string_pattern: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(message, optional, tag="6")]
+    #[prost(message, optional, tag = "6")]
     pub default_value: ::core::option::Option<RoutineValue>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineResultDefinition {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineValueType", tag="2")]
+    #[prost(enumeration = "RoutineValueType", tag = "2")]
     pub r#type: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StartManualRoutineRequest {
     /// Correlation only. This ID does not provide idempotency or deduplication.
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub routine_name: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub trigger_name: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
+    #[prost(string, tag = "4")]
     pub source_session_id: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag="5")]
+    #[prost(message, repeated, tag = "5")]
     pub inputs: ::prost::alloc::vec::Vec<RoutineInputValue>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StartManualRoutineResponse {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(oneof="start_manual_routine_response::Outcome", tags="2, 3")]
+    #[prost(oneof = "start_manual_routine_response::Outcome", tags = "2, 3")]
     pub outcome: ::core::option::Option<start_manual_routine_response::Outcome>,
 }
 /// Nested message and enum types in `StartManualRoutineResponse`.
 pub mod start_manual_routine_response {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Outcome {
-        #[prost(message, tag="2")]
+        #[prost(message, tag = "2")]
         Accepted(super::ManualRoutineAccepted),
-        #[prost(message, tag="3")]
+        #[prost(message, tag = "3")]
         ValidationFailure(super::RoutineValidationFailure),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ManualRoutineAccepted {
     /// Server-generated durable public identity, separate from execution identity.
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub invocation_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineInputValue {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="2")]
+    #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<RoutineValue>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineValue {
-    #[prost(oneof="routine_value::Value", tags="1, 2")]
+    #[prost(oneof = "routine_value::Value", tags = "1, 2")]
     pub value: ::core::option::Option<routine_value::Value>,
 }
 /// Nested message and enum types in `RoutineValue`.
 pub mod routine_value {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Value {
-        #[prost(string, tag="1")]
+        #[prost(string, tag = "1")]
         StringValue(::prost::alloc::string::String),
-        #[prost(bool, tag="2")]
+        #[prost(bool, tag = "2")]
         BooleanValue(bool),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListRoutineInvocationsRequest {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(uint32, tag="2")]
+    #[prost(uint32, tag = "2")]
     pub page_size: u32,
-    #[prost(uint64, optional, tag="3")]
+    #[prost(uint64, optional, tag = "3")]
     pub before_admission_sequence: ::core::option::Option<u64>,
-    #[prost(map="string, string", tag="4")]
+    #[prost(map = "string, string", tag = "4")]
     pub metadata_filters: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListRoutineInvocationsResponse {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag="2")]
+    #[prost(message, repeated, tag = "2")]
     pub invocations: ::prost::alloc::vec::Vec<RoutineInvocation>,
-    #[prost(uint64, optional, tag="3")]
+    #[prost(uint64, optional, tag = "3")]
     pub older_page_token: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetRoutineInvocationRequest {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub invocation_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetRoutineInvocationResponse {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="2")]
+    #[prost(message, optional, tag = "2")]
     pub invocation: ::core::option::Option<RoutineInvocationDetail>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchRoutineInvocationsRequest {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
     /// Omit for a bounded newest-first snapshot. Set to replay exact events after this cursor.
-    #[prost(uint64, optional, tag="2")]
+    #[prost(uint64, optional, tag = "2")]
     pub after_sequence: ::core::option::Option<u64>,
-    #[prost(uint32, tag="3")]
+    #[prost(uint32, tag = "3")]
     pub snapshot_size: u32,
-    #[prost(map="string, string", tag="4")]
+    #[prost(map = "string, string", tag = "4")]
     pub metadata_filters: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchRoutineInvocationsResponse {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub request_id: ::prost::alloc::string::String,
-    #[prost(oneof="watch_routine_invocations_response::Update", tags="2, 3")]
+    #[prost(oneof = "watch_routine_invocations_response::Update", tags = "2, 3")]
     pub update: ::core::option::Option<watch_routine_invocations_response::Update>,
 }
 /// Nested message and enum types in `WatchRoutineInvocationsResponse`.
 pub mod watch_routine_invocations_response {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Update {
-        #[prost(message, tag="2")]
+        #[prost(message, tag = "2")]
         Snapshot(super::RoutineInvocationSnapshot),
-        #[prost(message, tag="3")]
+        #[prost(message, tag = "3")]
         Event(super::RoutineInvocationEvent),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineInvocationSnapshot {
-    #[prost(message, repeated, tag="1")]
+    #[prost(message, repeated, tag = "1")]
     pub invocations: ::prost::alloc::vec::Vec<RoutineInvocation>,
-    #[prost(uint64, tag="2")]
+    #[prost(uint64, tag = "2")]
     pub through_sequence: u64,
-    #[prost(uint64, optional, tag="3")]
+    #[prost(uint64, optional, tag = "3")]
     pub older_page_token: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineInvocation {
-    #[prost(uint64, tag="1")]
+    #[prost(uint64, tag = "1")]
     pub admission_sequence: u64,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub invocation_id: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub routine_name: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
+    #[prost(string, tag = "4")]
     pub routine_revision: ::prost::alloc::string::String,
-    #[prost(string, tag="5")]
+    #[prost(string, tag = "5")]
     pub trigger_name: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineTriggerKind", tag="6")]
+    #[prost(enumeration = "RoutineTriggerKind", tag = "6")]
     pub trigger_kind: i32,
-    #[prost(string, tag="7")]
+    #[prost(string, tag = "7")]
     pub correlation_id: ::prost::alloc::string::String,
-    #[prost(string, optional, tag="9")]
+    #[prost(string, optional, tag = "9")]
     pub source_cursor: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(enumeration="RoutineInvocationStatus", tag="10")]
+    #[prost(enumeration = "RoutineInvocationStatus", tag = "10")]
     pub status: i32,
-    #[prost(int64, tag="11")]
+    #[prost(int64, tag = "11")]
     pub admitted_at_ms: i64,
-    #[prost(int64, optional, tag="12")]
+    #[prost(int64, optional, tag = "12")]
     pub started_at_ms: ::core::option::Option<i64>,
-    #[prost(int64, optional, tag="13")]
+    #[prost(int64, optional, tag = "13")]
     pub completed_at_ms: ::core::option::Option<i64>,
-    #[prost(int64, tag="14")]
+    #[prost(int64, tag = "14")]
     pub updated_at_ms: i64,
-    #[prost(message, optional, tag="15")]
+    #[prost(message, optional, tag = "15")]
     pub terminal_error: ::core::option::Option<RoutineFailure>,
-    #[prost(uint64, tag="16")]
+    #[prost(uint64, tag = "16")]
     pub latest_sequence: u64,
-    #[prost(map="string, string", tag="17")]
+    #[prost(map = "string, string", tag = "17")]
     pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineInvocationDetail {
-    #[prost(message, optional, tag="1")]
+    #[prost(message, optional, tag = "1")]
     pub summary: ::core::option::Option<RoutineInvocation>,
-    #[prost(message, repeated, tag="2")]
+    #[prost(message, repeated, tag = "2")]
     pub tasks: ::prost::alloc::vec::Vec<RoutineTask>,
-    #[prost(message, repeated, tag="3")]
+    #[prost(message, repeated, tag = "3")]
     pub results: ::prost::alloc::vec::Vec<RoutineResultValue>,
-    #[prost(message, repeated, tag="4")]
+    #[prost(message, repeated, tag = "4")]
     pub events: ::prost::alloc::vec::Vec<RoutineInvocationEvent>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineTask {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub r#type: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineTaskStatus", tag="3")]
+    #[prost(enumeration = "RoutineTaskStatus", tag = "3")]
     pub status: i32,
-    #[prost(message, repeated, tag="4")]
+    #[prost(message, repeated, tag = "4")]
     pub results: ::prost::alloc::vec::Vec<RoutineResultValue>,
-    #[prost(map="string, string", tag="5")]
+    #[prost(map = "string, string", tag = "5")]
     pub session_references: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    #[prost(message, optional, tag="6")]
+    #[prost(message, optional, tag = "6")]
     pub error: ::core::option::Option<RoutineFailure>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineInvocationEvent {
-    #[prost(uint64, tag="1")]
+    #[prost(uint64, tag = "1")]
     pub sequence: u64,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub invocation_id: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineEventKind", tag="3")]
+    #[prost(enumeration = "RoutineEventKind", tag = "3")]
     pub kind: i32,
-    #[prost(string, optional, tag="4")]
+    #[prost(string, optional, tag = "4")]
     pub task_name: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(int64, tag="5")]
+    #[prost(int64, tag = "5")]
     pub occurred_at_ms: i64,
-    #[prost(message, optional, tag="6")]
+    #[prost(message, optional, tag = "6")]
     pub error: ::core::option::Option<RoutineFailure>,
-    #[prost(message, repeated, tag="7")]
+    #[prost(message, repeated, tag = "7")]
     pub values: ::prost::alloc::vec::Vec<RoutineResultValue>,
-    #[prost(map="string, string", tag="8")]
+    #[prost(map = "string, string", tag = "8")]
     pub session_references: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// Present only for INVOCATION_ADMITTED and sufficient to create a client item from replay.
-    #[prost(message, optional, tag="9")]
+    #[prost(message, optional, tag = "9")]
     pub admission: ::core::option::Option<RoutineAdmission>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineAdmission {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub routine_name: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub routine_revision: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub trigger_name: ::prost::alloc::string::String,
-    #[prost(enumeration="RoutineTriggerKind", tag="4")]
+    #[prost(enumeration = "RoutineTriggerKind", tag = "4")]
     pub trigger_kind: i32,
-    #[prost(string, tag="5")]
+    #[prost(string, tag = "5")]
     pub correlation_id: ::prost::alloc::string::String,
-    #[prost(string, optional, tag="7")]
+    #[prost(string, optional, tag = "7")]
     pub source_cursor: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(int64, tag="8")]
+    #[prost(int64, tag = "8")]
     pub admitted_at_ms: i64,
-    #[prost(message, repeated, tag="9")]
+    #[prost(message, repeated, tag = "9")]
     pub declared_tasks: ::prost::alloc::vec::Vec<RoutineTaskDescriptor>,
     /// Immutable aggregate admission and pagination order, independent of journal event sequence.
-    #[prost(uint64, tag="10")]
+    #[prost(uint64, tag = "10")]
     pub admission_sequence: u64,
-    #[prost(map="string, string", tag="11")]
+    #[prost(map = "string, string", tag = "11")]
     pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineTaskDescriptor {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub r#type: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineResultValue {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="2")]
+    #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<RoutineValue>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineFailure {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub code: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoutineValidationFailure {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag="2")]
+    #[prost(message, repeated, tag = "2")]
     pub violations: ::prost::alloc::vec::Vec<RoutineFieldViolation>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineFieldViolation {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub field_path: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
