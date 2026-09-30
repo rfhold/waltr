@@ -27,6 +27,7 @@ Do not use this skill to implement fixes unless the user asks for changes after 
 | Item | What to look for | Reference file path |
 | --- | --- | --- |
 | Layer ownership | Behavior moved into a crate that should only consume the owning layer. | `references/layer-ownership.md` |
+| Construction inputs | Growing `*_with_*` variants, positional forwarding, or placeholder defaults hide required construction capabilities. | `references/construction-inputs.md` |
 | Shared state lifecycle | Server data duplicated in UI state or mutated outside the client reducer/effect model. | `references/shared-state-lifecycle.md` |
 | Request identity | Operations missing stable IDs, stale result guards, or keyed completion state. | `references/request-identity.md` |
 | Watch lifecycle | Watches opening too early, leaking after interest ends, or reconnecting outside readiness rules. | `references/watch-lifecycle.md` |
