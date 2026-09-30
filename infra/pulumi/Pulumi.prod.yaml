@@ -8,6 +8,7 @@ config:
   waltr:androidNativeRedirectUri: dev.waltr.app:/oauth2redirect
   waltr:protectData: true
   waltr:dataStorageSize: 10Gi
+  waltr:workspaceStorageSize: 10Gi
   waltr:databaseStorageSize: 20Gi
   waltr:storageClass: shared-fs
   waltr:bucketStorageClass: default-bucket

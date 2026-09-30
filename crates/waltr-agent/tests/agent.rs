@@ -2,6 +2,8 @@
 
 #[path = "support/agent_definitions.rs"]
 mod agent_definitions;
+#[path = "support/sandbox.rs"]
+mod sandbox;
 #[path = "support/scripted_provider.rs"]
 mod scripted_provider;
 

@@ -407,6 +407,8 @@ fn isolated_server_command(
     root: &std::path::Path,
     database_url: &str,
 ) -> Command {
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("create isolated process workspace");
     let catalog_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/models-dev-defaults.json");
     let mut command = Command::new(env!("CARGO_BIN_EXE_waltr-server"));
@@ -419,7 +421,7 @@ fn isolated_server_command(
         .env_remove("WALTR_OTEL_EXPORT")
         .env_remove("WALTR_PYROSCOPE_URL")
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .current_dir(root)
+        .current_dir(workspace)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for name in OIDC_ENVIRONMENT {

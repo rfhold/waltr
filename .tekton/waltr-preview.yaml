@@ -98,6 +98,8 @@ spec:
           params:
             - name: image
               type: string
+            - name: worker-image
+              type: string
             - name: revision
               type: string
             - name: buildkit-addr
@@ -120,9 +122,20 @@ spec:
                   --opt platform=linux/amd64 \
                   --opt "build-arg:REVISION=$(params.revision)" \
                   --output "type=image,name=$(params.image),push=true"
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 \
+                  --local context=. \
+                  --local dockerfile=. \
+                  --opt filename=Dockerfile \
+                  --opt target=worker-runtime \
+                  --opt platform=linux/amd64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --output "type=image,name=$(params.worker-image),push=true"
         params:
           - name: image
             value: $(params.base-image):preview-$(params.revision)-amd64
+          - name: worker-image
+            value: $(params.base-image)-worker:preview-$(params.revision)-amd64
           - name: revision
             value: $(params.revision)
           - name: buildkit-addr
@@ -137,6 +150,8 @@ spec:
         taskSpec:
           params:
             - name: image
+              type: string
+            - name: worker-image
               type: string
             - name: revision
               type: string
@@ -160,9 +175,20 @@ spec:
                   --opt platform=linux/arm64 \
                   --opt "build-arg:REVISION=$(params.revision)" \
                   --output "type=image,name=$(params.image),push=true"
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 \
+                  --local context=. \
+                  --local dockerfile=. \
+                  --opt filename=Dockerfile \
+                  --opt target=worker-runtime \
+                  --opt platform=linux/arm64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --output "type=image,name=$(params.worker-image),push=true"
         params:
           - name: image
             value: $(params.base-image):preview-$(params.revision)-arm64
+          - name: worker-image
+            value: $(params.base-image)-worker:preview-$(params.revision)-arm64
           - name: revision
             value: $(params.revision)
           - name: buildkit-addr
@@ -177,6 +203,8 @@ spec:
           params:
             - name: base-image
               type: string
+            - name: worker-base-image
+              type: string
             - name: tag
               type: string
           steps:
@@ -189,9 +217,15 @@ spec:
                   --platforms linux/amd64,linux/arm64 \
                   --template "$(params.base-image):$(params.tag)-ARCH" \
                   --target "$(params.base-image):$(params.tag)"
+                manifest-tool push from-args \
+                  --platforms linux/amd64,linux/arm64 \
+                  --template "$(params.worker-base-image):$(params.tag)-ARCH" \
+                  --target "$(params.worker-base-image):$(params.tag)"
         params:
           - name: base-image
             value: $(params.base-image)
+          - name: worker-base-image
+            value: $(params.base-image)-worker
           - name: tag
             value: preview-$(params.revision)
 
@@ -202,6 +236,8 @@ spec:
           params:
             - name: base-image
               type: string
+            - name: worker-base-image
+              type: string
             - name: tag
               type: string
             - name: revision
@@ -209,23 +245,33 @@ spec:
           results:
             - name: image
               type: string
+            - name: worker-image
+              type: string
           steps:
             - name: verify
               image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
               script: |
                 #!/busybox/sh
                 set -eu
-                tagged="$(params.base-image):$(params.tag)"
-                digest="`crane digest "$tagged"`"
-                case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
-                image="$(params.base-image)@$digest"
-                config="`crane config "$image"`"
-                printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
-                printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
-                printf '%s' "$image" > "$(results.image.path)"
+                verify_image() {
+                  base="$1"
+                  digest="`crane digest "$base:$(params.tag)"`"
+                  printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+                  immutable="$base@$digest"
+                  for platform in linux/amd64 linux/arm64; do
+                    config="`crane config --platform "$platform" "$immutable"`"
+                    printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
+                    printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
+                  done
+                  printf '%s' "$immutable"
+                }
+                verify_image "$(params.base-image)" > "$(results.image.path)"
+                verify_image "$(params.worker-base-image)" > "$(results.worker-image.path)"
         params:
           - name: base-image
             value: $(params.base-image)
+          - name: worker-base-image
+            value: $(params.base-image)-worker
           - name: tag
             value: preview-$(params.revision)
           - name: revision
@@ -237,6 +283,8 @@ spec:
         taskSpec:
           params:
             - name: image
+              type: string
+            - name: worker-image
               type: string
           workspaces:
             - name: source
@@ -269,11 +317,13 @@ spec:
                 test "`bun --version`" = "1.3.5"
                 test "`pulumi version`" = "v3.253.0"
                 bun install --frozen-lockfile
-                pulumi preview --stack preview --diff --config "image=$(params.image)"
-                pulumi up --stack preview --yes --skip-preview --config "image=$(params.image)"
+                pulumi preview --stack preview --diff --config "image=$(params.image)" --config "workerImage=$(params.worker-image)"
+                pulumi up --stack preview --yes --skip-preview --config "image=$(params.image)" --config "workerImage=$(params.worker-image)"
         params:
           - name: image
             value: $(tasks.resolve-and-verify-image.results.image)
+          - name: worker-image
+            value: $(tasks.resolve-and-verify-image.results.worker-image)
         workspaces:
           - name: source
             workspace: source

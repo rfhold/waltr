@@ -4,9 +4,7 @@ use super::ShellConfig;
 
 impl ShellConfig {
     pub(super) fn root_path(&self) -> PathBuf {
-        self.root
-            .canonicalize()
-            .unwrap_or_else(|_| normalize_path(&self.root))
+        normalize_path(&self.root)
     }
 
     pub(super) fn resolved_workdir(&self, requested: Option<&str>) -> PathBuf {

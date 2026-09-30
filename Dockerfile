@@ -35,6 +35,25 @@ RUN --mount=type=cache,id=waltr-${TARGETARCH}-pnpm-store,target=/pnpm/store \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
 
+FROM rust:${RUST_VERSION}-slim-bookworm AS worker-build
+
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential ca-certificates pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
+
+RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target \
+    cargo build -p waltr-agent-sandbox --features shell --bin waltr-agent-sandbox --locked --release && \
+    cp /workspace/target/release/waltr-agent-sandbox /usr/local/bin/waltr-agent-sandbox
+
 FROM build-base AS server-build
 
 ARG REVISION
@@ -58,9 +77,9 @@ RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/c
 FROM debian:bookworm-slim AS runtime-base
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
-    install -d -o 65532 -g 65532 /data
+    install -d -o 65532 -g 65532 /data /run/waltr-sandbox
 
 ENV WALTR_SERVER_ADDR=0.0.0.0:14333
 ENV WALTR_SESSION_FILESYSTEM_ROOT=/data/sessions
@@ -82,15 +101,39 @@ EXPOSE 14333
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/waltr-server"]
 
+FROM debian:bookworm-slim AS worker-runtime
+
+ARG REVISION
+
+LABEL org.opencontainers.image.source="https://git.holdenitdown.net/rfhold/waltr" \
+      org.opencontainers.image.revision="${REVISION}"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates bash coreutils findutils && \
+    rm -rf /var/lib/apt/lists/* && \
+    install -d -o 65532 -g 65532 /workspace /run/waltr-sandbox
+
+COPY --from=worker-build /usr/local/bin/waltr-agent-sandbox /usr/local/bin/waltr-agent-sandbox
+
+ENV WALTR_SANDBOX_SOCKET=/run/waltr-sandbox/gateway.sock
+ENV WALTR_SANDBOX_WORKSPACE_ROOT=/workspace
+ENV HOME=/workspace
+
+WORKDIR /workspace
+VOLUME ["/workspace"]
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/waltr-agent-sandbox"]
+
 FROM runtime-base AS test-runtime
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends bash coreutils curl findutils procps && \
+    apt-get install -y --no-install-recommends bash coreutils findutils procps util-linux && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=server-build /usr/local/bin/waltr-server /usr/local/bin/waltr-server
 COPY --from=test-build /usr/local/bin/waltr-agent-test-mcp-server /usr/local/bin/waltr-agent-test-mcp-server
 
+USER 65532:65532
 CMD ["/usr/local/bin/waltr-server"]
 
 FROM grafana/k6:1.3.0-with-browser AS k6-browser

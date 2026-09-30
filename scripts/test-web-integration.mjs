@@ -32,6 +32,8 @@ import { inflateSync } from "node:zlib";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const linuxDirectoryHelper = fileURLToPath(new URL("./linux-directory-helper.py", import.meta.url));
+const darwinDirectoryHelper = fileURLToPath(new URL("./darwin-directory-helper.py", import.meta.url));
+const darwinProcessHelper = fileURLToPath(new URL("./darwin-process-identity.py", import.meta.url));
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const logRoot = fileURLToPath(new URL("../.dev/logs", import.meta.url));
 const screenshotRoot = fileURLToPath(new URL("../.dev/web-screenshots", import.meta.url));
@@ -204,9 +206,25 @@ export function createHarnessRuntime(overrides = {}) {
   if (overrides.screenshotRoot && overrides.screenshotTrustRoot === undefined) {
     runtime.screenshotTrustRoot = dirname(resolve(runtime.screenshotRoot));
   }
-  runtime.getProcessIdentity ??= (pid) => readLinuxProcessIdentity(pid);
-  runtime.inspectProcessGroup ??= (identity) => inspectLinuxProcessGroup(identity, runtime);
-  runtime.getDescriptorMountId ??= (descriptor) => readLinuxDescriptorMountId(descriptor, runtime);
+  runtime.getProcessIdentity ??= (pid) => platform === "darwin"
+    ? readDarwinProcessIdentity(pid, runtime)
+    : readLinuxProcessIdentity(pid);
+  runtime.inspectProcessGroup ??= (identity) => inspectUnixProcessGroup(identity, runtime);
+  runtime.getDescriptorMountId ??= (descriptor) => platform === "darwin"
+    ? JSON.stringify(JSON.parse(runDirectoryHelper(runtime, ["mount-id"], descriptor)))
+    : readLinuxDescriptorMountId(descriptor, runtime);
+  runtime.clearOwnedTreeSync ??= (descriptor) => runDirectoryHelper(runtime, ["clear-tree-at"], descriptor);
+  runtime.clearOwnedFlatSync ??= (descriptor, expectedFiles) => runDirectoryHelper(
+    runtime,
+    ["clear-flat-at", JSON.stringify(expectedFiles === null ? null : Object.fromEntries(expectedFiles))],
+    descriptor,
+  );
+  runtime.renameNoReplaceAtSync ??= (descriptor, source, destination) => runDirectoryHelper(
+    runtime, ["rename-noreplace-at", source, destination], descriptor,
+  );
+  runtime.removeDirectoryIfIdentityAtSync ??= (descriptor, name, identity) => runDirectoryHelper(
+    runtime, ["remove-if-identity-at", name, String(identity.device), String(identity.inode)], descriptor,
+  );
   runtime.renameNoReplaceSync ??= (source, destination) => {
     const sourceAt = descriptorChildPath(source);
     const destinationAt = descriptorChildPath(destination);
@@ -214,24 +232,24 @@ export function createHarnessRuntime(overrides = {}) {
       if (!sourceAt || !destinationAt || sourceAt.descriptor !== destinationAt.descriptor) {
         throw new Error("atomic directory rename requires one verified parent descriptor");
       }
-      return runLinuxDirectoryHelper(
+      return runDirectoryHelper(
         runtime,
         ["rename-noreplace-at", sourceAt.name, destinationAt.name],
         sourceAt.descriptor,
       );
     }
-    return runLinuxDirectoryHelper(runtime, ["rename-noreplace", source, destination]);
+    return runDirectoryHelper(runtime, ["rename-noreplace", source, destination]);
   };
   runtime.removeDirectoryIfIdentitySync ??= (path, identity) => {
     const pathAt = descriptorChildPath(path);
     if (pathAt) {
-      return runLinuxDirectoryHelper(
+      return runDirectoryHelper(
         runtime,
         ["remove-if-identity-at", pathAt.name, String(identity.device), String(identity.inode)],
         pathAt.descriptor,
       );
     }
-    return runLinuxDirectoryHelper(
+    return runDirectoryHelper(
       runtime,
       ["remove-if-identity", path, String(identity.device), String(identity.inode)],
     );
@@ -244,18 +262,19 @@ function descriptorChildPath(path) {
   return match ? { descriptor: Number(match[1]), name: match[2] } : null;
 }
 
-function runLinuxDirectoryHelper(runtime, args, inheritedDescriptor = null) {
-  if (runtime.platform !== "linux") {
-    throw new Error("identity-bound directory cleanup requires Linux");
+function runDirectoryHelper(runtime, args, inheritedDescriptor = null) {
+  if (runtime.platform !== "linux" && runtime.platform !== "darwin") {
+    throw new Error("identity-bound directory cleanup requires Linux or macOS");
   }
-  const result = runtime.spawnSync("python3", [linuxDirectoryHelper, ...args], {
+  const helper = runtime.platform === "darwin" ? darwinDirectoryHelper : linuxDirectoryHelper;
+  const result = runtime.spawnSync("python3", [helper, ...args], {
     encoding: "utf8",
     stdio: inheritedDescriptor === null
-      ? ["ignore", "ignore", "pipe"]
-      : ["ignore", "ignore", "pipe", inheritedDescriptor],
+      ? ["ignore", "pipe", "pipe"]
+      : ["ignore", "pipe", "pipe", inheritedDescriptor],
   });
   if (!result.error && result.status === 0 && result.signal === null) {
-    return;
+    return result.stdout?.trim() ?? "";
   }
   let details;
   try {
@@ -270,6 +289,23 @@ function runLinuxDirectoryHelper(runtime, args, inheritedDescriptor = null) {
     error.code = details.code;
   }
   throw error;
+}
+
+function readDarwinProcessIdentity(pid, runtime) {
+  const result = runtime.spawnSync("python3", [darwinProcessHelper, String(pid)], {
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0 || result.signal !== null) {
+    throw new Error(`could not inspect macOS process ${pid}: ${result.error?.message ?? result.stderr?.trim() ?? result.status}`);
+  }
+  const identity = JSON.parse(result.stdout);
+  if (identity !== null && (
+    identity.pid !== pid || !Number.isInteger(identity.processGroupId) ||
+    !Number.isInteger(identity.sessionId) || !identity.startIdentity
+  )) {
+    throw new Error(`invalid macOS process identity for ${pid}`);
+  }
+  return identity;
 }
 
 function defaultSleepSync(milliseconds) {
@@ -314,11 +350,11 @@ function readLinuxProcessIdentity(pid) {
   }
 }
 
-function inspectLinuxProcessGroup(identity, runtime) {
+function inspectUnixProcessGroup(identity, runtime) {
   if (!identity) {
     return { alive: false, reused: false };
   }
-  if (runtime.platform !== "linux") {
+  if (runtime.platform !== "linux" && runtime.platform !== "darwin") {
     return { alive: !identity.leaderClosed, reused: false };
   }
 
@@ -673,7 +709,7 @@ export function screenshotPathsForRun(runId, runtime = createHarnessRuntime()) {
 
 export function createScreenshotLockOwner(runId, runtime = createHarnessRuntime()) {
   const identity = runtime.getProcessIdentity(runtime.pid);
-  if (runtime.platform === "linux" && !identity) {
+  if ((runtime.platform === "linux" || runtime.platform === "darwin") && !identity) {
     throw new Error(`could not read process start identity for screenshot owner ${runtime.pid}`);
   }
   return {
@@ -812,7 +848,8 @@ function recoverStalePendingLocks(path, parentIdentity, runtime) {
     const ageMs = Math.max(0, runtime.now() - snapshot.mtimeMs);
     const ownerIdentity = snapshot.owner ? runtime.getProcessIdentity(snapshot.owner.pid) : null;
     const ownerGone = snapshot.owner && (
-      !ownerIdentity || ownerIdentity.startIdentity !== snapshot.owner.processStartIdentity
+      !ownerIdentity || (snapshot.owner.processStartIdentity !== null &&
+        ownerIdentity.startIdentity !== snapshot.owner.processStartIdentity)
     );
     if (!ownerGone && ageMs < runtime.screenshotLockStaleMs) {
       continue;
@@ -1285,7 +1322,7 @@ function screenshotLockStaleReason(snapshot, runtime) {
   if (!identity) {
     return "owner exited";
   }
-  if (identity.startIdentity !== snapshot.owner.processStartIdentity) {
+  if (snapshot.owner.processStartIdentity !== null && identity.startIdentity !== snapshot.owner.processStartIdentity) {
     return "pid reused";
   }
   return null;
@@ -1463,9 +1500,9 @@ function openOwnedDirectory(ownership, runtime) {
     runtime.closeSync(descriptor);
     throw new Error(`${ownership.label} changed while opening ${ownership.path}`);
   }
-  if (runtime.platform !== "linux") {
+  if (runtime.platform !== "linux" && runtime.platform !== "darwin") {
     runtime.closeSync(descriptor);
-    throw new Error(`descriptor-bound ${ownership.label} cleanup requires Linux`);
+    throw new Error(`descriptor-bound ${ownership.label} cleanup requires Linux or macOS`);
   }
   let mountId;
   try {
@@ -1474,11 +1511,19 @@ function openOwnedDirectory(ownership, runtime) {
     runtime.closeSync(descriptor);
     throw error;
   }
-  if (!Number.isInteger(mountId)) {
+  if (!validMountIdentity(mountId)) {
     runtime.closeSync(descriptor);
     throw new Error(`could not read mount identity for ${ownership.label} ${ownership.path}`);
   }
-  return { descriptor, descriptorPath: `/proc/self/fd/${descriptor}`, mountId };
+  return {
+    descriptor,
+    descriptorPath: runtime.platform === "darwin" ? ownership.path : `/proc/self/fd/${descriptor}`,
+    mountId,
+  };
+}
+
+function validMountIdentity(identity) {
+  return Number.isInteger(identity) || (typeof identity === "string" && identity.length > 0);
 }
 
 function removeOwnedDirectoryTree(ownership, runtime) {
@@ -1503,6 +1548,10 @@ function removeOwnedDirectoryTree(ownership, runtime) {
 }
 
 function removeDescriptorDirectoryContents(openedDirectory, runtime, label) {
+  if (runtime.platform === "darwin") {
+    runtime.clearOwnedTreeSync(openedDirectory.descriptor);
+    return;
+  }
   for (const entry of runtime.readdirSync(openedDirectory.descriptorPath, { withFileTypes: true })) {
     const entryPath = join(openedDirectory.descriptorPath, entry.name);
     const before = runtime.lstatSync(entryPath);
@@ -1524,7 +1573,7 @@ function removeDescriptorDirectoryContents(openedDirectory, runtime, label) {
         throw new Error(`${label} child changed while opening ${entryPath}`);
       }
       const childMountId = runtime.getDescriptorMountId(childDescriptor);
-      if (!Number.isInteger(childMountId)) {
+      if (!validMountIdentity(childMountId)) {
         throw new Error(`could not read mount identity for ${label} child ${entryPath}`);
       }
       if (childMountId !== openedDirectory.mountId) {
@@ -1557,6 +1606,11 @@ function removeOwnedFlatDirectory(ownership, expectedFiles, runtime) {
   let opened;
   try {
     opened = openOwnedDirectory(ownership, runtime);
+    if (runtime.platform === "darwin") {
+      runtime.clearOwnedFlatSync(opened.descriptor, expectedFiles);
+      removeOpenedOwnedDirectory(ownership, opened, runtime);
+      return true;
+    }
     const entries = runtime.readdirSync(opened.descriptorPath).sort();
     if (expectedFiles && (
       entries.length !== expectedFiles.size || entries.some((entry) => !expectedFiles.has(entry))
@@ -1595,21 +1649,42 @@ function removeOwnedFlatDirectory(ownership, expectedFiles, runtime) {
 }
 
 function removeOpenedOwnedDirectory(ownership, opened, runtime) {
+  let parentDescriptor = null;
+  if (runtime.platform === "darwin") {
+    parentDescriptor = runtime.openSync(
+      ownership.parent,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    const parent = runtime.fstatSync(parentDescriptor);
+    if (!parent.isDirectory() || !sameFileIdentity(fileIdentityFromStat(parent), ownership.parentIdentity)) {
+      runtime.closeSync(parentDescriptor);
+      throw new Error(`${ownership.label} parent changed while opening: ${ownership.parent}`);
+    }
+  }
   const verifyParent = () => {
     const parent = verifyPlainDirectory(ownership.parent, runtime, `${ownership.label} parent`);
     if (!sameFileIdentity(parent.fileIdentity, ownership.parentIdentity)) {
       throw new Error(`${ownership.label} parent changed: ${ownership.parent}`);
     }
+    if (parentDescriptor !== null && !sameFileIdentity(
+      fileIdentityFromStat(runtime.fstatSync(parentDescriptor)), ownership.parentIdentity
+    )) {
+      throw new Error(`${ownership.label} parent descriptor changed: ${ownership.parent}`);
+    }
   };
-  removeOpenedDirectoryEntry(
-    ownership.path,
-    ownership.fileIdentity,
-    { descriptorPath: ownership.parent, mountId: opened.mountId },
-    opened,
-    runtime,
-    ownership.label,
-    verifyParent,
-  );
+  try {
+    removeOpenedDirectoryEntry(
+      ownership.path,
+      ownership.fileIdentity,
+      { descriptor: parentDescriptor, descriptorPath: ownership.parent, mountId: opened.mountId },
+      opened,
+      runtime,
+      ownership.label,
+      verifyParent,
+    );
+  } finally {
+    if (parentDescriptor !== null) runtime.closeSync(parentDescriptor);
+  }
 }
 
 function removeOpenedDirectoryEntry(
@@ -1648,7 +1723,11 @@ function removeOpenedDirectoryEntry(
   }
   verifyOpenParent();
   try {
-    runtime.renameNoReplaceSync(path, quarantinePath);
+    if (parentOpened.descriptor !== null && runtime.platform === "darwin") {
+      runtime.renameNoReplaceAtSync(parentOpened.descriptor, basename(path), basename(quarantinePath));
+    } else {
+      runtime.renameNoReplaceSync(path, quarantinePath);
+    }
   } catch (error) {
     throw new Error(`${label} could not be quarantined without replacement: ${errorMessage(error)}`, {
       cause: error,
@@ -1659,7 +1738,11 @@ function removeOpenedDirectoryEntry(
   if (!moved?.isDirectory() || !sameFileIdentity(fileIdentityFromStat(moved), identity) || source) {
     if (moved && !source) {
       try {
-        runtime.renameNoReplaceSync(quarantinePath, path);
+        if (parentOpened.descriptor !== null && runtime.platform === "darwin") {
+          runtime.renameNoReplaceAtSync(parentOpened.descriptor, basename(quarantinePath), basename(path));
+        } else {
+          runtime.renameNoReplaceSync(quarantinePath, path);
+        }
       } catch (restoreError) {
         throw new AggregateError(
           [restoreError],
@@ -1674,7 +1757,11 @@ function removeOpenedDirectoryEntry(
     runtime.getDescriptorMountId(opened.descriptor) !== opened.mountId) {
     throw new Error(`${label} descriptor changed after quarantine: ${quarantinePath}`);
   }
-  runtime.removeDirectoryIfIdentitySync(quarantinePath, identity);
+  if (parentOpened.descriptor !== null && runtime.platform === "darwin") {
+    runtime.removeDirectoryIfIdentityAtSync(parentOpened.descriptor, basename(quarantinePath), identity);
+  } else {
+    runtime.removeDirectoryIfIdentitySync(quarantinePath, identity);
+  }
 }
 
 function lstatIfExists(path, runtime) {
@@ -1949,19 +2036,25 @@ function seedDevConfig(state, browserScript) {
 }
 
 async function seedComposeConfig(state, phase, browserScript) {
+  await runComposeChecked(state, buildComposeResourcePublishArgs(phase, browserScript), DOCKER_TIMEOUT_MS);
+}
+
+export function buildComposeResourcePublishArgs(phase, browserScript) {
   const fixtureName = fixtureNameForBrowserScript(browserScript);
-  await runComposeChecked(state, [
+  return [
     "--profile",
     phase.profile,
     "exec",
     "-T",
+    "--user",
+    "65532:65532",
     phase.waltrService,
     "/bin/bash",
     "-ceu",
     COMPOSE_RESOURCE_PUBLISH_SCRIPT,
     "--",
     fixtureName === null ? "-" : `/fixtures/resource-trees/${fixtureName}/.waltr/resources`,
-  ], DOCKER_TIMEOUT_MS);
+  ];
 }
 
 function fixtureForBrowserScript(browserScript) {
@@ -2541,9 +2634,10 @@ export function spawnRecord(state, command, args, options) {
     } catch (error) {
       ownershipError = error;
     }
-    if (runtime.platform === "linux" && !validLaunchedProcessGroupIdentity(leaderIdentity, child.pid)) {
+    if ((runtime.platform === "linux" || runtime.platform === "darwin") &&
+      !validLaunchedProcessGroupIdentity(leaderIdentity, child.pid)) {
       ownershipError ??= new Error(
-        `could not establish Linux process-group identity for ${command} leader ${child.pid}`,
+        `could not establish process-group identity for ${command} leader ${child.pid}`,
       );
     }
   }
@@ -2789,7 +2883,8 @@ function relinquishRecordChild(record) {
 function sendRecordSignal(record, signal) {
   try {
     if (record.hasProcessGroup) {
-      if (record.runtime.platform === "linux" && !validTrackedProcessGroupIdentity(record.groupIdentity)) {
+      if ((record.runtime.platform === "linux" || record.runtime.platform === "darwin") &&
+        !validTrackedProcessGroupIdentity(record.groupIdentity)) {
         record.state.processGroupOwnershipFailed = true;
         record.runtime.logger.error(`refusing to signal unverified process group for ${record.command}`);
         return false;

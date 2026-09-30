@@ -12,6 +12,9 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/mcp/tests/oauth_authorization_server.rs` and `crates/mcp/tests/oauth_store.rs` | Hosted OAuth HTTP flow, DCR/CIMD security, token/revocation/key lifecycle, leases, and memory-store behavior. |
 | `crates/mcp/tests/oauth_*_store.rs` | Feature-gated SQLite and container-backed PostgreSQL OAuth store parity, migrations, reopen, and concurrency. |
 | `crates/waltr-agent/tests/agent.rs` and `crates/waltr-agent/tests/agent/` | Deterministic agent library tests using scripted/shared providers. |
+| `crates/waltr-agent-sandbox/src/` tests | Worker file/patch/shell operations, tickets, workspace context, and snapshots. |
+| `crates/waltr-agent/src/sandbox_gateway.rs` tests | Private RPC request correlation, cancellation, disconnect, and capacity. |
+| `crates/waltr-server/src/sandbox.rs` tests | Private gateway startup, embedded duplex and standalone UDS worker readiness, reconnect, and shutdown. |
 | `crates/waltr-agent/tests/live.rs` and `crates/waltr-agent/tests/live/` | Ignored live-provider and external-service agent tests. |
 | `crates/waltr-server/tests/` | Server contract, coordination, watch, validation, health, persistence, access-auth, and system flows. |
 | `crates/waltr-server/tests/embedded.rs` | Embedded composition, local admission, explicit callback metadata, public routes, and workspace isolation. |
@@ -216,7 +219,7 @@ Inspect the Android feature graph without compiling Android Rust code:
 
 `cargo tree -p waltr-app --target aarch64-linux-android -e features`
 
-The tree must omit `waltr-server/shell`, `waltr-agent/shell`, and `waltr-server/profiling`. It must contain no Pyroscope dependency.
+The tree must omit `waltr-server/shell`, `waltr-agent/shell`, `waltr-agent-sandbox/shell`, and `waltr-server/profiling`. It must contain no Pyroscope dependency.
 
 Check the standalone binary without profiling:
 
@@ -224,7 +227,7 @@ Check the standalone binary without profiling:
 
 This check proves profiling is optional for the executable; default builds still enable it.
 
-No-shell runtime-factory coverage must keep shell-bearing definitions loadable while omitting the shell tool and feature-derived shell permissions. Unified catalog coverage must materialize ordinary shell-bearing and stdio resources for embedded composition; stdio uses the normal session runtime rather than a host-specific rejection path.
+No-shell runtime-factory coverage must keep shell-bearing definitions loadable while omitting the shell tool and feature-derived shell permissions. Unified catalog coverage must materialize ordinary shell-bearing and stdio resources for embedded composition; stdio uses the normal session runtime rather than a host-specific rejection path. Server coverage must keep the worker off public routes and fail readiness if it stops; agent/session coverage must keep unknown dispatched workspace calls suspended rather than executing them twice. Standalone tests must check UDS startup failure, canonical-root agreement, loss and reconnection of the same worker, worker process replacement, and failure without host-side tool execution. Embedded tests must verify that ambient socket and workspace overrides cannot switch it out of duplex mode.
 
 Coordinator tests must prove shutdown rejects new work, cancels active and queued work, waits for active run ownership to drain, atomically empties MCP preparation/cache state, and awaits each cached runtime's explicit shutdown. Existing deterministic stdio coverage does not constitute a real child-process shutdown/reap integration test; do not claim that test exists.
 
@@ -307,7 +310,7 @@ Run web server-backed k6 tests:
 
 `pnpm test:web:integration`
 
-This builds the repository server+web image through the static local Compose test infrastructure and runs every browser scenario in both access modes. The `test` profile exercises access-disabled Waltr. The `test-auth` profile uses an HTTPS proxy with Waltr access OIDC enabled and an ephemeral hosted-MCP wrapping ring, then adds a real browser login, protected-route return, session-cookie checks, a real Sign out button click, and signed-out stream/state verification against Dex. Dex is the authentication-only fixture. The hosted MCP scenario exercises Waltr-to-Waltr CIMD registration, Waltr consent, durable callback completion, persisted credential reuse in a fresh session, dynamic bearer delivery, and protected resource discovery. Deterministic refresh, replay, revocation, and key-rotation behavior remains covered at the Rust protocol, store, agent, and server layers.
+This builds the repository server+web image through the static local Compose test infrastructure and runs every browser scenario in both access modes. The host runner supports Linux and macOS with Python 3 and Docker Compose; it uses platform-specific process identity and descriptor-bound cleanup rather than assuming Linux `/proc` is available on macOS. Windows is not supported. The `test` profile exercises access-disabled Waltr. The `test-auth` profile uses an HTTPS proxy with Waltr access OIDC enabled and an ephemeral hosted-MCP wrapping ring, then adds a real browser login, protected-route return, session-cookie checks, a real Sign out button click, and signed-out stream/state verification against Dex. Dex is the authentication-only fixture. The hosted MCP scenario exercises Waltr-to-Waltr CIMD registration, Waltr consent, durable callback completion, persisted credential reuse in a fresh session, dynamic bearer delivery, and protected resource discovery. Deterministic refresh, replay, revocation, and key-rotation behavior remains covered at the Rust protocol, store, agent, and server layers.
 
 Run only the unauthenticated Compose phase:
 
@@ -340,6 +343,30 @@ Update the local screenshot snapshots after an intentional visual change:
 Run agent unit tests:
 
 `cargo test -p waltr-agent --features shell --lib`
+
+Run worker unit tests, including shell execution:
+
+`cargo test -p waltr-agent-sandbox --features shell --lib`
+
+Run the worker without shell (the Android-style capability split, on the host target):
+
+`cargo test -p waltr-agent-sandbox --no-default-features --features rpc --lib`
+
+Run the server's focused sandbox transport tests (including UDS behavior on Unix hosts):
+
+`cargo test -p waltr-server --lib sandbox`
+
+For end-to-end standalone image/sidecar coverage, use Docker Compose on Linux or macOS with Python 3 on the host. Docker Desktop runs Linux worker and server containers on macOS, so the Compose smoke and browser phases exercise the Linux UDS and container mount contract there. A Kubernetes PVC still requires a deployed-pod write check; a macOS Docker run does not prove production CSI ownership. Run from the repository root after the worker image and static Compose services are present:
+
+```sh
+docker build --target worker-runtime -t waltr-worker:local .
+node --test scripts/compose-config.test.mjs
+node scripts/test-worker-compose.mjs
+pnpm test:web:integration
+pnpm test:web:trust
+```
+
+The static contract checks profile and mount topology. The worker Compose smoke starts an isolated project, checks worker-only workspace write access and a live socket, stops and restarts the worker, and verifies `/ready` fails and recovers while `/health` stays live. Compose browser integration runs both access modes through the server/worker fixture. The Rust socket tests exercise actual worker tool execution and in-flight reply delivery without re-executing it. Worker-process death leaves uncertain dispatched work unresolved rather than replaying it. `/health` is liveness, not proof of the worker connection. A Kubernetes PVC requires a separate deployed-pod write/read smoke check (see [Workspace Worker Deployment](deployment.md#workspace-worker-deployment)).
 
 Run deterministic agent integration tests:
 
@@ -418,7 +445,7 @@ MCP and server PostgreSQL store tests require Docker because they start `postgre
 
 The commands above define reproducible gates and expected outcomes. They do not record one local run or establish production readiness.
 
-Web server-backed integration tests require Docker Compose. Every test Waltr service uses tmpfs `/data`; test services communicate on an internal-only network and publish no host port. Long-running dependencies have health checks and startup uses `docker compose up --wait`. The runner preserves the first failure exit code, captures diagnostics, and treats failed teardown as a test failure while retrying cleanup. Caddy terminates HTTPS for the browser and OIDC issuer, and its ephemeral CA is trusted only inside the test stack.
+Web server-backed integration tests require Docker Compose. Every test Waltr service uses tmpfs `/data`; the standalone worker uses an ephemeral `/workspace` and a private shared socket directory rather than the server's `/data` or secrets. Test services communicate on an internal-only network and publish no host port. Long-running dependencies have health checks and startup uses `docker compose up --wait`. The runner preserves the first failure exit code, captures diagnostics, and treats failed teardown as a test failure while retrying cleanup. Caddy terminates HTTPS for the browser and OIDC issuer, and its ephemeral CA is trusted only inside the test stack.
 
 Run the static Compose deployment contract without starting services:
 

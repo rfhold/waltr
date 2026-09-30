@@ -18,7 +18,7 @@ Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migration
 
 ## Container Runtime And Local Compose
 
-The repository `Dockerfile` produces the supported production `runtime` image as well as test-only stages. The runtime contains the release server with embedded web assets, runs as nonroot UID/GID `65532`, listens on `0.0.0.0:14333`, and uses `/data` as its home, working directory, and default writable persistence root. Mount writable storage at `/data` for filesystem-backed settings, or configure external PostgreSQL and S3 services.
+The repository `Dockerfile` produces the production server `runtime` image, a separate `worker-runtime` image for standalone workspace operations, and test-only stages. The server runtime contains the release server with embedded web assets, runs as nonroot UID/GID `65532`, listens on `0.0.0.0:14333`, and uses `/data` as its home, working directory, and default writable persistence root. Mount writable storage at `/data` for filesystem-backed settings, or configure external PostgreSQL and S3 services. The worker image runs the sandbox executable; it is not a second public server and does not need the server's database, OAuth secrets, or `/data` mount.
 
 The server's default Cargo feature set includes `shell` and `profiling`. The optional `profiling` feature adds Pyroscope initialization, but the standalone server binary remains available and functional when that feature is disabled.
 
@@ -28,7 +28,7 @@ The build installs pnpm dependencies from workspace manifests before copying Rus
 
 `compose.yml` remains fixed local development and integration-test infrastructure. It intentionally exposes only static `dev`, `test`, and `test-auth` profiles; bare `docker compose up` starts nothing.
 
-`docker compose --profile dev up` builds the embedded server and web assets for local use. The `waltr` service uses:
+`docker compose --profile dev up` builds the server and web assets for local use, with the separate worker image alongside it. The `waltr` service uses:
 
 - `WALTR_DATABASE_URL=sqlite:///data/waltr.sqlite3`
 - Empty `WALTR_MCP_DATABASE_URL`, which derives the MCP target
@@ -38,11 +38,28 @@ The build installs pnpm dependencies from workspace manifests before copying Rus
 - `WALTR_PUBLIC_URL=http://127.0.0.1:14333`
 - Named volume `waltr-dev-data` mounted at `/data`
 
+The server and worker share the private socket directory; the worker mounts the writable workspace at `/workspace`, not the server's `/data` or secret mounts. Set the standalone socket and workspace environment as described in [Workspace Worker Deployment](#workspace-worker-deployment). The `test` and `test-auth` profiles use the same private-worker topology with ephemeral workspace and socket mounts. Do not add a public worker port or an ambient Compose profile switch.
+
 The static profile does not consume ambient `WALTR_*` deployment settings. Change server environment configuration in the actual process/container runtime used by a deployment, not through this Compose fixture.
 
 The `dev` volume contains both SQLite files, including unified outbound credentials in `waltr.sqlite3`, and filesystem agent sessions. It is disposable local state, not a production backup contract.
 
 The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. Their `WALTR_OAUTH_*` and `WALTR_TEST_MCP_*` values are test-fixture settings, not server deployment variables. The authenticated Waltr fixture enables the hosted MCP issuer, generates an ephemeral keyring in tmpfs, and sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` only so HTTPS Waltr-to-Waltr CIMD and token requests can reach private Compose aliases. Production deployments must leave this deterministic test exception unset. The fixture does not configure a direct MCP issuer or a preregistered self client.
+
+## Workspace Worker Deployment
+
+Standalone Waltr uses one local worker for workspace filesystem, context, skills, patch, and optional shell operations. The server hosts the private sandbox gateway; the separate worker connects over a Unix domain socket (UDS). Configure both processes with absolute paths:
+
+| Process | Setting | Standalone value | Purpose |
+| --- | --- | --- | --- |
+| Server | `WALTR_SANDBOX_SOCKET` | `/run/waltr-sandbox/gateway.sock` | Select the private UDS listener instead of the process-local worker. |
+| Server | `WALTR_WORKSPACE_ROOT` | `/workspace` | Workspace identity passed to agent runtime construction and checked against the worker's reported canonical root. |
+| Worker | `WALTR_SANDBOX_SOCKET` | `/run/waltr-sandbox/gateway.sock` | Connect to the server's gateway on the shared socket directory. |
+| Worker | `WALTR_SANDBOX_WORKSPACE_ROOT` | `/workspace` | Workspace tree visible to workspace tools in the worker. |
+
+Mount a writable socket directory at `/run/waltr-sandbox` in both processes with permissions allowing their runtime identities to connect; share the socket directory, not a TCP port. Mount the workspace at `/workspace` in the worker. Keep server persistence (`/data`), resource overrides, credentials, and projected secrets outside the worker mount. Server startup preflight checks known configured host-owned paths for overlap with the workspace, including canonicalized existing parents; it does not recursively audit arbitrary workspace content. The worker's canonical root must agree with the server's selected workspace root. Standalone deployments must set the socket to use the separate process; embedded Tauri hosts always use in-process duplex transport and explicit app-private workspace paths, ignoring these environment overrides.
+
+Compose defines static `dev`, `test`, and `test-auth` profiles, not a dynamic worker-mode profile. The worker is an internal service in each profile; server/test health gates must wait for a working connection. The test fixtures keep `/data` and workspace state ephemeral. A lost UDS stream makes `/ready` fail until the same worker reconnects, while `/health` continues to report server liveness; a worker that cannot connect during startup fails startup rather than silently moving workspace operations into the server. See [Private Workspace Boundary](architecture/agent.md#private-workspace-boundary) for request deadlines, reconnect, and unknown-outcome handling.
 
 ## Agent Session Storage
 
@@ -313,7 +330,9 @@ First launch requires network access unless a valid cache already exists.
 
 Later startup can use a valid cache when the network source fails. Startup fails when neither source supplies a valid catalog.
 
-Desktop and Android use the same ordinary bundled and persisted resource catalog. Desktop retains server-side Bash shell execution; the shell has no operating-system sandbox.
+Desktop and Android use the same ordinary bundled and persisted resource catalog. Both require the process-local workspace worker at startup. The embedded server runs the private Tonic service and worker in-process over `tokio::io::duplex`; it does not bind a worker socket or expose a public worker route. Workspace tools and context I/O have no host-side fallback. This separation does not provide operating-system isolation; desktop Bash commands have the app process's OS authority. See [agent architecture](architecture/agent.md#private-workspace-boundary).
+
+Workspace path preflight checks known configured host-owned paths against the worker root (including canonicalized existing parents of missing files). It does not recursively scan the workspace; ordinary repository files can remain in the workspace.
 
 Android is compiled without shell support. Shell-bearing definitions remain valid and inspectable, but runtime construction omits the shell tool and feature-derived shell tool permissions. Stdio MCP resources materialize and use the ordinary runtime path.
 
@@ -380,6 +399,17 @@ The repository's supported infrastructure/workload definition is Pulumi under `i
 | Native API | Public | Remote native clients such as the TUI; issues the API audience and scope. |
 Authentik has no MCP provider, application, audience, scope mapping, callback, or token-issuance role. Waltr hosts MCP authorization, supports DCR and CIMD according to explicit stack policy, and retains `WALTR_MCP_REQUIRED_SCOPES` as local policy.
 
+Pulumi keeps one Waltr replica with one workspace worker sidecar in the same pod. A protected workspace PVC is mounted at `/workspace` in the worker, separately from the server's `/data` PVC and secret projections; the server does not mount the workspace PVC, and the worker does not mount `/data`, the PostgreSQL CA, or the OAuth keyring. An ephemeral volume shared only by these containers holds `/run/waltr-sandbox/gateway.sock`. Give both containers the socket path and their respective workspace-root variables from [Workspace Worker Deployment](#workspace-worker-deployment). Keep only the server's public `14333` port on the Service/route; never create a sandbox Service, ingress, or published socket. The containers share one pod network namespace, so this layout separates mounts and processes, **not** network access. Restrict worker egress and runtime authority separately if stronger isolation is required; the pod NetworkPolicy by itself cannot isolate a sidecar from the server's network.
+
+After first rollout, confirm the storage driver grants UID/GID `65532` write access to the protected PVC and the worker has connected. Replace `YOUR_NAMESPACE` in these checks; the temporary probe file is removed after the read:
+
+```bash
+kubectl -n YOUR_NAMESPACE exec deployment/waltr -c waltr-sandbox -- /bin/sh -c 'printf ok > /workspace/.waltr-worker-smoke && test "$(cat /workspace/.waltr-worker-smoke)" = ok && rm /workspace/.waltr-worker-smoke'
+kubectl -n YOUR_NAMESPACE exec deployment/waltr -c waltr -- curl --fail --silent http://127.0.0.1:14333/ready
+```
+
+If the PVC cannot be written by the worker, fix storage provisioning or group ownership rather than mounting server-private storage or running the worker as root.
+
 This is a clean cutover. Do not add `WALTR_MCP_OIDC_*`, `WALTR_MCP_SELF_OAUTH_*`, an Authentik MCP audience, a second advertised issuer, or a fallback validator. Existing native API tokens remain Authentik-issued but are not accepted at `/mcp`.
 
 Pulumi creates one random 256-bit key per configured wrapping-key version and persists it as a secret output in stack state. The generated versioned ring is stored only in the `waltr-mcp-oauth-wrapping-keys` Secret, mounted read-only at `/var/run/secrets/waltr/mcp-oauth/keyring.json` with mode `0440`, and made readable to runtime UID/GID `65532` through pod `fsGroup`. A secret-derived SHA-256 rollout annotation changes when the ring changes; no key or keyring is exported. Stack outputs expose only issuer, resource, metadata, and JWKS URLs.
@@ -388,13 +418,13 @@ The keyring JSON requires top-level `schema_version: 1`, names one active versio
 
 The Pulumi workload exports logs, traces, and metrics over OTLP/HTTP protobuf to `https://telemetry.holdenitdown.net:4318` and profiles to `https://telemetry.holdenitdown.net:4040`. Its `OTEL_RESOURCE_ATTRIBUTES` sets `deployment.environment.name` to the Pulumi stack name, distinguishing `preview` from `prod`; profiles retain the `waltr-server` application name.
 
-The egress NetworkPolicy permits DNS, HTTPS discovery, OTLP on TCP `4318`, profiling on TCP `4040`, and PostgreSQL. Application destination policy rejects private, loopback, link-local, metadata-service, DNS-rebinding, and redirect destinations by default. The exact initialized hosted MCP HTTPS origin is trusted automatically for self-CIMD, exact-self authorization orchestration, and agent session refresh; additional private origins require the direction-specific allowlists above. Trust never admits another scheme, host, or port. Fetches pin approved DNS addresses, verify the connected peer, use bounded headers/body/timeouts, require JSON, and send no ambient credentials. Loopback, link-local, metadata, reserved, and other prohibited addresses remain blocked even for a trusted origin. NetworkPolicy port filtering does not replace those checks.
+The egress NetworkPolicy permits DNS, HTTPS discovery, OTLP on TCP `4318`, profiling on TCP `4040`, and PostgreSQL. The sidecar shares the pod's egress policy; its shell commands are not subject to the server's application HTTP destination policy. Application destination policy rejects private, loopback, link-local, metadata-service, DNS-rebinding, and redirect destinations by default. The exact initialized hosted MCP HTTPS origin is trusted automatically for self-CIMD, exact-self authorization orchestration, and agent session refresh; additional private origins require the direction-specific allowlists above. Trust never admits another scheme, host, or port. Fetches pin approved DNS addresses, verify the connected peer, use bounded headers/body/timeouts, require JSON, and send no ambient credentials. Loopback, link-local, metadata, reserved, and other prohibited addresses remain blocked even for a trusted origin. NetworkPolicy port filtering does not replace those checks.
 
 CloudNativePG writes compressed WAL and data backups under the generated S3 bucket's `database/` prefix, retains backups for 30 days, and runs a daily scheduled backup. Treat the MCP database and the matching wrapping-key Secret version as one recovery unit. A restored database without every wrapping key referenced by encrypted signing rows cannot issue or rotate credentials. See [MCP OAuth Key Rotation And Recovery](runbooks/mcp-oauth-key-rotation-recovery.md).
 
 ### Release Pipelines
 
-Pipelines as Code definitions under `.tekton/` separate server deployment from application prereleases. A push to `main` targets only the `preview` server stack with an image tagged by the full commit SHA; it publishes no Tauri application release. The production server definition is triggered only by an exact stable `vX.Y.Z` tag, retains signed annotated-tag validation, builds and deploys that tag, and publishes the multi-architecture container tag as `latest`. RC tags cannot trigger this stable pipeline.
+Pipelines as Code definitions under `.tekton/` separate server deployment from application prereleases. A push to `main` targets only the `preview` stack: it builds multi-architecture server and worker images from the full commit SHA and passes their verified immutable digests to Pulumi. It publishes no Tauri application release. The production pipeline is triggered only by an exact stable `vX.Y.Z` tag and retains signed annotated-tag validation. It builds both images, verifies that neither version tag conflicts with an existing digest, promotes both tags, and deploys their immutable digests. Registry writes to the two image repositories are not atomic; a failed partial promotion can be retried when the published digest matches. RC tags cannot trigger this stable pipeline.
 
 The Tauri prerelease definition is triggered only by an exact `vX.Y.Z-rc.N` tag. Before any build it requires the tag to be annotated, signed by a key in `waltr-release-trusted-signers`, resolved to the full webhook commit SHA, and reachable from `origin/main`. It strips the tag signature from the annotated message and uses the remaining message as the Forgejo release body. Version components have no leading zeros. The build additionally requires `X <= 20`, `Y <= 99`, `Z <= 999`, and `1 <= N <= 999`, and computes Android versionCode as `X*100000000 + Y*1000000 + Z*1000 + N` with an explicit signed 32-bit check.
 
@@ -424,7 +454,7 @@ Embedded outbound OAuth uses the exact callback derived from that same prebound 
 
 Embedded configuration contains no client metadata URI. Therefore its local `/.well-known/oauth-client/waltr` route returns `404 Not Found`.
 
-`/health` reports process liveness. `/ready` checks persistence, routine engine health, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy.
+`/health` reports process liveness. `/ready` checks worker connection in addition to persistence, routine engine health, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy. Startup requires a connected worker with a usable canonical root; after disconnect readiness fails until reconnection, without retrying an uncertain tool execution.
 
 Startup interrupts unfinished Routine invocations before the engine reports ready. Waltr does not resume them.
 

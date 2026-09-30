@@ -357,6 +357,8 @@ fn project_journal(
             }
             SessionJournalEvent::Timeline(_)
             | SessionJournalEvent::ProviderRequestRecorded { .. }
+            | SessionJournalEvent::SandboxDispatchStarted { .. }
+            | SessionJournalEvent::SandboxCallRecorded { .. }
             | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
             | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
             | SessionJournalEvent::MiddlewareStateUpdated { .. }

@@ -592,7 +592,11 @@ async fn automatic_failed_durable_admission_fails_open_without_history_or_pause(
     let mut registry = waltr_agent::AgentDefinitionRegistry::new();
     let source = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n";
     registry.load_yaml(source).unwrap();
+    let sandbox = crate::sandbox::LocalSandbox::start(std::env::temp_dir())
+        .await
+        .unwrap();
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        sandbox.handle(),
         std::env::temp_dir(),
         waltr_agent::FileCredentialStore::new(
             std::env::temp_dir().join("waltr-automatic-admission-auth.json"),
@@ -661,6 +665,8 @@ async fn automatic_failed_durable_admission_fails_open_without_history_or_pause(
     sessions.release_pause(&pause).await.unwrap();
     assert_eq!(host.pause_captures.load(Ordering::SeqCst), 1);
     engine.shutdown().await;
+    sessions.shutdown().await;
+    sandbox.shutdown().await;
 }
 
 fn event(id: &str, ephemeral: bool) -> EventEnvelope {

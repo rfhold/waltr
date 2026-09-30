@@ -26,6 +26,7 @@ where
     pub retry_config: ProviderRetryConfig,
     pub template_base_dir: Option<PathBuf>,
     pub max_provider_turns: Option<u64>,
+    pub sandbox: Option<crate::sandbox_gateway::SandboxHandle>,
     pub session_id: SessionId,
     pub session_store: S,
     pub session_run_context: Option<SessionRunContext>,

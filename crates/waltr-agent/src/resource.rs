@@ -143,6 +143,7 @@ pub(crate) async fn search_session_templates_with_state(
         root,
         request,
         middleware_state,
+        sandbox: runtime.sandbox.as_ref(),
     };
     runtime
         .middleware_chain()
@@ -270,14 +271,6 @@ fn compare_options(left: &ScoredTemplateOption, right: &ScoredTemplateOption) ->
 }
 
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) fn normalize_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn file_template(path: &str) -> String {
     if is_bare_file_ref(path) {
         format!("@{path}")
@@ -297,18 +290,7 @@ pub(crate) fn is_bare_file_ref(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
-
-    use futures_util::stream;
-
-    use super::{
-        SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
-        file_template, is_bare_file_ref, search_session_templates_with_state,
-    };
-    use crate::{
-        AgentRuntime, BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
-        ModelApi, ModelRef, ProviderId, SkillDefinition,
-    };
+    use super::{file_template, is_bare_file_ref, prompt_score};
 
     #[test]
     fn file_templates_quote_when_needed() {
@@ -327,57 +309,12 @@ mod tests {
         assert!(!is_bare_file_ref(""));
     }
 
-    #[tokio::test]
-    async fn prompt_search_returns_skill_templates() {
-        let root = PathBuf::from("/workspace");
-        let runtime = AgentRuntime::builder(
-            ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
-            Arc::new(TestProvider),
-        )
-        .with_skill_definitions(vec![SkillDefinition {
-            name: "documenting".to_owned(),
-            description: "Write repository documentation".to_owned(),
-            root: root.clone(),
-            skills_dir: root.join(".agents/skills"),
-            skill_dir: root.join(".agents/skills/documenting"),
-            skill_path: root.join(".agents/skills/documenting/SKILL.md"),
-        }])
-        .build();
-
-        let options = search_session_templates_with_state(
-            &root,
-            &runtime,
-            &SessionTemplateSearchRequest {
-                query: "skill:doc".to_owned(),
-                limit: 10,
-                kinds: vec![SessionTemplateKind::Prompt],
-                target: SessionTemplateSearchTarget::Prompts,
-                cursor: None,
-            },
-            None,
-        )
-        .await
-        .expect("template search should succeed");
-
-        assert_eq!(options.len(), 1);
-        assert_eq!(options[0].kind, SessionTemplateKind::Prompt);
-        assert_eq!(options[0].label, "skill:documenting");
-        assert_eq!(options[0].template, "/skill:documenting");
-        assert_eq!(options[0].metadata["promptType"], "skill");
-    }
-
-    struct TestProvider;
-
-    impl crate::LlmStream for TestProvider {
-        fn name(&self) -> &'static str {
-            "test"
-        }
-
-        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            Box::pin(async move {
-                Ok(Box::pin(stream::iter(vec![Ok(CompletionEvent::Finished)]))
-                    as BoxCompletionStream)
-            })
-        }
+    #[test]
+    fn skill_prompt_score_matches_prefixed_queries() {
+        assert!(prompt_score("documenting", "Write repository documentation", "skill:").is_some());
+        assert!(prompt_score("documenting", "Write repository documentation", "doc").is_some());
+        assert!(
+            prompt_score("documenting", "Write repository documentation", "unrelated").is_none()
+        );
     }
 }

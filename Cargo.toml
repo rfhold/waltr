@@ -2,6 +2,7 @@
 members = [
     "crates/waltr",
     "crates/waltr-agent",
+    "crates/waltr-agent-sandbox",
     "crates/waltr-app",
     "crates/waltr-client",
     "crates/waltr-server",

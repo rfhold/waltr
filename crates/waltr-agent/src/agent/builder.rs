@@ -6,8 +6,7 @@ use crate::{
     LlmStream, ModelCost, ModelRef, PermissionPolicy, SystemPromptBuilder,
     middleware::{
         AgentMiddleware, agents::AgentsInstructionsMiddleware, chain::MiddlewareChain,
-        claims::FilesystemClaimsMiddleware, file_templates::FileTemplateMiddleware,
-        prompt::SystemPromptMiddleware, skills::SkillsMiddleware,
+        file_templates::FileTemplateMiddleware, prompt::SystemPromptMiddleware,
         tools::PermissionFilteredToolRegistryMiddleware,
     },
     prompt::{AgentsPromptConfig, FilesystemPromptConfig},
@@ -18,9 +17,7 @@ use crate::{
 };
 
 #[cfg(feature = "shell")]
-use crate::{
-    middleware::claims::ShellClaimsMiddleware, prompt::ShellPromptConfig, tools::shell::ShellConfig,
-};
+use crate::{prompt::ShellPromptConfig, tools::shell::ShellConfig};
 
 use super::{AgentRuntime, AgentTool, ProviderRetryConfig, SessionStore};
 
@@ -37,7 +34,7 @@ pub struct AgentRuntimeBuilder {
     agents_prompt_configs: Vec<AgentsPromptConfig>,
     agents_read_roots: Vec<PathBuf>,
     skills_enabled: bool,
-    skills: Vec<crate::SkillDefinition>,
+    skills_root: Option<PathBuf>,
     skills_reveal_roots: Vec<PathBuf>,
     permission_policy: PermissionPolicy,
     explicit_permission_policy: bool,
@@ -45,6 +42,7 @@ pub struct AgentRuntimeBuilder {
     template_base_dir: Option<PathBuf>,
     file_templates: bool,
     max_provider_turns: Option<u64>,
+    sandbox: Option<crate::sandbox_gateway::SandboxHandle>,
 }
 
 impl AgentRuntimeBuilder {
@@ -69,19 +67,27 @@ impl AgentRuntimeBuilder {
             agents_prompt_configs: Vec::new(),
             agents_read_roots: Vec::new(),
             skills_enabled: false,
-            skills: Vec::new(),
+            skills_root: None,
             skills_reveal_roots: Vec::new(),
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
             retry_config: ProviderRetryConfig::default(),
             template_base_dir: None,
-            file_templates: true,
+            file_templates: false,
             max_provider_turns: None,
+            sandbox: None,
         }
     }
 
     pub(crate) const fn model(&self) -> &ModelRef {
         &self.model
+    }
+
+    /// Bind workspace-dependent tools and context to a connected sandbox.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: crate::sandbox_gateway::SandboxHandle) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 
     /// Set model pricing used to journal per-turn cost.
@@ -93,7 +99,15 @@ impl AgentRuntimeBuilder {
 
     /// Opt into filesystem tools as generic host tools.
     #[must_use]
-    pub fn with_filesystem_tools(mut self, config: FilesystemConfig) -> Self {
+    pub fn with_filesystem_tools(mut self, mut config: FilesystemConfig) -> Self {
+        if let Some(root) = self
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.canonical_root())
+        {
+            config.root = root;
+        }
+        self.file_templates = true;
         if !self.explicit_permission_policy {
             self.permission_policy = self
                 .permission_policy
@@ -107,9 +121,12 @@ impl AgentRuntimeBuilder {
         }
         self.middleware_chain
             .push(config.root_hints_middleware(&self.model));
-        self.middleware_chain
-            .push(FilesystemClaimsMiddleware::new(config.clone(), &self.model));
-        self.tools.extend(config.into_agent_tools(&self.model));
+        let sandbox = self
+            .sandbox
+            .clone()
+            .expect("filesystem tools require a sandbox handle");
+        self.tools
+            .extend(config.into_agent_tools(&self.model, sandbox));
         self
     }
 
@@ -146,6 +163,17 @@ impl AgentRuntimeBuilder {
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_filesystem_system_prompt(mut self, config: FilesystemPromptConfig) -> Self {
         self.system_prompt = self.system_prompt.with_fragment(config.system_prompt());
+        if config.include_snapshot {
+            let sandbox = self
+                .sandbox
+                .clone()
+                .expect("filesystem snapshot requires a sandbox handle");
+            self.middleware_chain.push(
+                crate::middleware::sandbox_snapshot::SandboxSnapshotMiddleware::new(
+                    config, sandbox,
+                ),
+            );
+        }
         self
     }
 
@@ -160,16 +188,11 @@ impl AgentRuntimeBuilder {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_skills(mut self, config: SkillsConfig) -> Self {
-        let skills = config.discover();
+        self.sandbox
+            .as_ref()
+            .expect("skills require a sandbox handle");
         self.skills_enabled = true;
-        self.skills.extend(skills);
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_skill_definitions(mut self, skills: Vec<crate::SkillDefinition>) -> Self {
-        self.skills_enabled = true;
-        self.skills.extend(skills);
+        self.skills_root = Some(config.root);
         self
     }
 
@@ -198,16 +221,28 @@ impl AgentRuntimeBuilder {
     /// Opt into the shell tool as a generic host tool.
     #[cfg(feature = "shell")]
     #[must_use]
-    pub fn with_shell_tool(mut self, config: ShellConfig) -> Self {
+    pub fn with_shell_tool(mut self, mut config: ShellConfig) -> Self {
+        if let Some(root) = self
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.canonical_root())
+        {
+            if config.default_workdir == config.root {
+                config.default_workdir = root.clone();
+            }
+            config.root = root;
+        }
         if !self.explicit_permission_policy {
             self.permission_policy = self
                 .permission_policy
                 .merged(PermissionPolicy::filesystem_default(config.root.clone()));
         }
         self.middleware_chain.push(config.root_hints_middleware());
-        self.middleware_chain
-            .push(ShellClaimsMiddleware::new(config.clone()));
-        self.tools.push(config.into_agent_tool());
+        let sandbox = self
+            .sandbox
+            .clone()
+            .expect("shell tool requires a sandbox handle");
+        self.tools.push(config.into_agent_tool(sandbox));
         self
     }
 
@@ -309,13 +344,32 @@ impl AgentRuntimeBuilder {
         ));
         middleware_chain.extend(self.middleware_chain);
         if !self.agents_prompt_configs.is_empty() || !self.agents_read_roots.is_empty() {
-            middleware_chain.push(AgentsInstructionsMiddleware::new(
-                self.agents_prompt_configs,
-                self.agents_read_roots,
-            ));
+            let sandbox = self
+                .sandbox
+                .clone()
+                .expect("AGENTS.md requires a sandbox handle");
+            middleware_chain.push(
+                AgentsInstructionsMiddleware::new(
+                    self.agents_prompt_configs,
+                    self.agents_read_roots,
+                )
+                .with_sandbox(sandbox),
+            );
         }
         if self.skills_enabled {
-            middleware_chain.push(SkillsMiddleware::new(self.skills, self.skills_reveal_roots));
+            if let Some(root) = self.skills_root {
+                let sandbox = self
+                    .sandbox
+                    .clone()
+                    .expect("skills require a sandbox handle");
+                middleware_chain.push(
+                    crate::middleware::sandbox_skills::SandboxSkillsMiddleware::new(
+                        root,
+                        self.skills_reveal_roots.clone(),
+                        sandbox,
+                    ),
+                );
+            }
         }
         AgentRuntime {
             provider: self.provider,
@@ -327,6 +381,7 @@ impl AgentRuntimeBuilder {
             retry_config: self.retry_config,
             template_base_dir: self.template_base_dir,
             max_provider_turns: self.max_provider_turns,
+            sandbox: self.sandbox,
         }
     }
 }
@@ -345,7 +400,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
             .field("agents_prompt_configs", &self.agents_prompt_configs)
             .field("agents_read_roots", &self.agents_read_roots)
             .field("skills_enabled", &self.skills_enabled)
-            .field("skills", &self.skills)
+            .field("skills_root", &self.skills_root)
             .field("skills_reveal_roots", &self.skills_reveal_roots)
             .field("permission_policy", &self.permission_policy)
             .field(

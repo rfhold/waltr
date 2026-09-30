@@ -11,7 +11,6 @@ use crate::{
     agent::session::{SessionJournalEvent, SessionSnapshot},
     middleware::chain::MiddlewareChain,
     resource::SessionTemplateSearchRequest,
-    template::TemplateSource,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -187,6 +186,7 @@ pub(crate) struct ToolCallContext<'a> {
     /// Tool call currently being evaluated.
     pub(crate) call: &'a mut ToolCall,
     /// Permission claims appended by claims-producing middleware earlier in the chain.
+    #[allow(dead_code)]
     pub(crate) permission_claims: &'a mut Vec<PermissionClaim>,
     /// Durable middleware state for this run.
     pub(crate) middleware_state: &'a mut MiddlewareStateLog,
@@ -242,6 +242,7 @@ pub(crate) struct TemplateSearchContext<'a> {
     pub(crate) request: &'a SessionTemplateSearchRequest,
     /// Durable middleware state from the session snapshot, when available.
     pub(crate) middleware_state: Option<&'a MiddlewareStateLog>,
+    pub(crate) sandbox: Option<&'a crate::sandbox_gateway::SandboxHandle>,
 }
 
 impl TemplateSearchContext<'_> {
@@ -263,8 +264,6 @@ impl TemplateSearchContext<'_> {
 pub(crate) struct TemplateRenderContext<'a> {
     /// Base directory used for relative file references.
     pub(crate) base_dir: &'a Path,
-    /// Source currently being rendered.
-    pub(crate) source: TemplateSource,
     /// Durable middleware state for this run.
     pub(crate) middleware_state: &'a mut MiddlewareStateLog,
     /// Middleware chain used by template-owned tool calls.
@@ -277,6 +276,8 @@ pub(crate) struct TemplateRenderContext<'a> {
     pub(crate) session_id: &'a str,
     /// Current provider turn for template-owned tool calls.
     pub(crate) turn: u64,
+    pub(crate) sandbox: Option<&'a crate::sandbox_gateway::SandboxHandle>,
+    pub(crate) tool_call_id: Option<&'a str>,
 }
 
 impl MiddlewareStateAccess for TemplateRenderContext<'_> {

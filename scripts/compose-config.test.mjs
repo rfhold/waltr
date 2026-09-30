@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -24,9 +24,9 @@ const hostedOauthDefaultsFixture = readFileSync(`${repoRoot}/tests/web/k6/suppor
 const config = composeConfig("*");
 
 const expectedServicesByProfile = {
-  dev: ["waltr"],
-  test: ["dex", "k6", "waltr-test", "mcp"],
-  "test-auth": ["auth-proxy", "dex-auth", "k6-auth", "waltr-auth", "mcp-auth", "test-ca"],
+  dev: ["waltr", "waltr-worker"],
+  test: ["dex", "k6", "waltr-test", "waltr-test-worker", "mcp"],
+  "test-auth": ["auth-proxy", "dex-auth", "k6-auth", "waltr-auth", "waltr-auth-worker", "mcp-auth", "test-ca"],
 };
 
 test("compose has the exact static profile topology", () => {
@@ -78,8 +78,10 @@ test("all Waltr services have exact static environments", () => {
     WALTR_DATABASE_URL: "sqlite:///data/waltr.sqlite3",
     WALTR_MCP_DATABASE_URL: "sqlite:///data/mcp.sqlite3",
     WALTR_MODELS_DEV_PATH: "/fixtures/models-dev-api.fixture.json",
+    WALTR_SANDBOX_SOCKET: "/run/waltr-sandbox/gateway.sock",
     WALTR_SESSION_FILESYSTEM_ROOT: "/data/sessions",
     WALTR_SESSION_STORE: "filesystem",
+    WALTR_WORKSPACE_ROOT: "/workspace",
   };
   const expected = {
     waltr: {
@@ -123,17 +125,66 @@ test("all Waltr services have exact static environments", () => {
     assert.equal(fixture?.read_only, true);
   }
   assert.equal(config.services.waltr.tmpfs, undefined);
-  assert.deepEqual(config.services["waltr-test"].tmpfs, ["/data"]);
+  assert.deepEqual(config.services["waltr-test"].tmpfs, ["/data:mode=0700,uid=65532,gid=65532"]);
   assert.deepEqual(config.services["waltr-auth"].tmpfs, [
-    "/data",
+    "/data:mode=0700,uid=65532,gid=65532",
     "/run/waltr-mcp-oauth:mode=0750,uid=65532,gid=65532",
   ]);
-  assert.match(config.services["waltr-auth"].command.join(" "), /head -c 32 \/dev\/urandom/);
-  assert.match(config.services["waltr-auth"].command.join(" "), /chmod 0440 \/run\/waltr-mcp-oauth\/keyring\.json/);
+  const authCommand = config.services["waltr-auth"].command.join(" ");
+  assert.equal(config.services["waltr-auth"].user, "0:0");
+  assert.equal(config.services["waltr-test"].user, undefined);
+  assert.match(authCommand, /head -c 32 \/dev\/urandom/);
+  assert.match(authCommand, /chmod 0440 \/run\/waltr-mcp-oauth\/keyring\.json/);
+  assert.match(authCommand, /chown 65532:65532 \/run\/waltr-mcp-oauth\/keyring\.json && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-server$/);
+  assert.equal(config.services["mcp-auth"].user, "0:0");
+  assert.equal(config.services.mcp.user, undefined);
+  assert.match(config.services["mcp-auth"].command.join(" "), /update-ca-certificates >\/dev\/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-agent-test-mcp-server --http 0\.0\.0\.0:14666$/);
   assert.doesNotMatch(rawCompose, /WALTR_MCP_(?:OIDC|SELF|PROTECTED_OAUTH)/);
   for (const serviceName of ["waltr", "waltr-test", "mcp", "k6", "mcp-auth", "k6-auth"]) {
     assert.equal(config.services[serviceName].environment?.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
   }
+});
+
+test("each profile gives only its worker a workspace and shares only its private socket", () => {
+  const pairs = [
+    ["waltr", "waltr-worker", "waltr-dev-sandbox-socket"],
+    ["waltr-test", "waltr-test-worker", "waltr-test-sandbox-socket"],
+    ["waltr-auth", "waltr-auth-worker", "waltr-auth-sandbox-socket"],
+  ];
+  for (const [serverName, workerName, socketVolume] of pairs) {
+    const server = config.services[serverName];
+    const worker = config.services[workerName];
+    assert.deepEqual(worker.environment, {
+      WALTR_SANDBOX_SOCKET: "/run/waltr-sandbox/gateway.sock",
+      WALTR_SANDBOX_WORKSPACE_ROOT: "/workspace",
+    });
+    assert.equal(worker.build.target, "worker-runtime");
+    assert.equal(worker.user, undefined);
+    assert.ok(worker.command == null);
+    assert.ok(worker.entrypoint == null);
+    assert.equal(worker.depends_on, undefined);
+    assert.deepEqual(servicesMounting(socketVolume), [serverName, workerName].sort());
+    for (const service of [server, worker]) {
+      const socketMount = service.volumes.find((volume) => volume.target === "/run/waltr-sandbox");
+      assert.equal(socketMount?.type, "volume");
+      assert.equal(socketMount.source, socketVolume);
+      assert.notEqual(socketMount.read_only, true);
+    }
+    assert.equal(server.volumes.some((volume) => volume.target === "/workspace"), false);
+    assert.equal(server.tmpfs?.some((mount) => mount.startsWith("/workspace")) ?? false, false);
+    assert.equal(worker.volumes.some((volume) => volume.target === "/data"), false);
+    assert.equal(worker.tmpfs?.some((mount) => mount.startsWith("/data")) ?? false, false);
+  }
+  assert.deepEqual(config.services["waltr-worker"].tmpfs, undefined);
+  assert.equal(config.services["waltr-worker"].volumes.find((volume) => volume.target === "/workspace")?.source, "waltr-dev-workspace");
+  assert.deepEqual(servicesMounting("waltr-dev-workspace"), ["waltr-worker"]);
+  for (const workerName of ["waltr-test-worker", "waltr-auth-worker"]) {
+    const worker = config.services[workerName];
+    assert.equal(worker.volumes.some((volume) => volume.target === "/workspace"), false);
+    assert.deepEqual(worker.tmpfs, ["/workspace:mode=0700,uid=65532,gid=65532"]);
+  }
+  assert.equal(config.services.waltr.volumes.find((volume) => volume.target === "/data")?.source, "waltr-dev-data");
+  assert.deepEqual(servicesMounting("waltr-dev-data"), ["waltr"]);
 });
 
 test("hosted MCP OAuth resource tree uses the OIDC/TLS Waltr contract", () => {
@@ -194,13 +245,16 @@ test("every required health dependency edge is explicit", () => {
   for (const serviceName of longRunning) {
     assert.ok(config.services[serviceName].healthcheck?.test, `${serviceName} needs a health check`);
   }
-  assert.match(config.services.waltr.healthcheck.test.join(" "), /curl .*--fail .*\/health/);
+  for (const serviceName of ["waltr", "waltr-test", "waltr-auth"]) {
+    assert.match(config.services[serviceName].healthcheck.test.join(" "), /curl .*--fail .*\/ready$/);
+  }
   assert.match(config.services.dex.healthcheck.test.join(" "), /well-known\/openid-configuration/);
   assert.match(config.services.mcp.healthcheck.test.join(" "), /--max-time 2 .*\/mcp/);
   assert.match(config.services["auth-proxy"].healthcheck.test.join(" "), /127\.0\.0\.1:2015\/health/);
 
   const expectedEdges = {
-    "waltr-test": { dex: "service_healthy", mcp: "service_healthy" },
+    waltr: { "waltr-worker": "service_started" },
+    "waltr-test": { dex: "service_healthy", mcp: "service_healthy", "waltr-test-worker": "service_started" },
     mcp: { dex: "service_healthy" },
     k6: { dex: "service_healthy", "waltr-test": "service_healthy", mcp: "service_healthy" },
     "auth-proxy": { "test-ca": "service_completed_successfully" },
@@ -208,6 +262,7 @@ test("every required health dependency edge is explicit", () => {
       "auth-proxy": "service_healthy",
       "dex-auth": "service_healthy",
       "test-ca": "service_completed_successfully",
+      "waltr-auth-worker": "service_started",
     },
     "mcp-auth": {
       "auth-proxy": "service_healthy",
@@ -225,7 +280,7 @@ test("every required health dependency edge is explicit", () => {
   for (const [serviceName, dependencies] of Object.entries(expectedEdges)) {
     assert.deepEqual(dependencyConditions(config.services[serviceName]), dependencies, serviceName);
   }
-  for (const serviceName of ["waltr", "dex", "test-ca", "dex-auth"]) {
+  for (const serviceName of ["waltr-worker", "waltr-test-worker", "waltr-auth-worker", "dex", "test-ca", "dex-auth"]) {
     assert.equal(config.services[serviceName].depends_on, undefined, serviceName);
   }
 });
@@ -266,7 +321,7 @@ test("TLS generator produces a verifiable two-SAN fixture with exact permissions
   assert.notEqual(statSync(caScriptPath).mode & 0o111, 0, "CA generator must be executable");
   assert.notEqual(statSync(`${repoRoot}/tests/web/k6/support/k6-entrypoint.sh`).mode & 0o111, 0, "k6 entrypoint must be executable");
 
-  const root = mkdtempSync(join(tmpdir(), "waltr-test-ca-contract-"));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "waltr-test-ca-contract-"));
   const publicDir = join(root, "public");
   const caddyDir = join(root, "caddy");
   const workDir = join(root, "work");
@@ -318,7 +373,7 @@ test("TLS generator produces a verifiable two-SAN fixture with exact permissions
 });
 
 test("TLS generator rejects symlinked output roots without external writes", (context) => {
-  const root = mkdtempSync(join(tmpdir(), "waltr-test-ca-symlink-contract-"));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "waltr-test-ca-symlink-contract-"));
   context.after(() => rmSync(root, { force: true, recursive: true }));
 
   for (const attackedRoot of ["public", "caddy"]) {
@@ -361,7 +416,7 @@ test("TLS generator rejects symlinked output roots without external writes", (co
 });
 
 test("project-built services do not use shared image tags", () => {
-  for (const serviceName of ["waltr", "waltr-test", "mcp", "k6", "test-ca", "waltr-auth", "mcp-auth", "k6-auth"]) {
+  for (const serviceName of ["waltr", "waltr-worker", "waltr-test", "waltr-test-worker", "mcp", "k6", "test-ca", "waltr-auth", "waltr-auth-worker", "mcp-auth", "k6-auth"]) {
     assert.ok(config.services[serviceName].build, `${serviceName} must be project-built`);
     assert.equal(config.services[serviceName].image, undefined, `${serviceName} must use its project-scoped image`);
   }
@@ -375,12 +430,18 @@ test("production and test services use isolated runtime targets", () => {
 
   const runtime = dockerStage("runtime");
   const testRuntime = dockerStage("test-runtime");
+  const workerRuntime = dockerStage("worker-runtime");
   assert.match(runtime, /COPY --from=server-build \/usr\/local\/bin\/waltr-server \/usr\/local\/bin\/waltr-server/);
   assert.doesNotMatch(runtime, /waltr-agent-test-mcp-server/);
   assert.match(runtime, /USER 65532:65532/);
   assert.match(runtime, /ENTRYPOINT \["\/usr\/local\/bin\/waltr-server"\]/);
   assert.doesNotMatch(runtime, /^CMD /m);
   assert.match(testRuntime, /waltr-agent-test-mcp-server/);
+  assert.match(testRuntime, /apt-get install -y --no-install-recommends [^\n]*util-linux/);
+  assert.match(testRuntime, /^USER 65532:65532$/m);
+  assert.match(workerRuntime, /^USER 65532:65532$/m);
+  assert.match(dockerStage("runtime-base"), /install -d -o 65532 -g 65532 \/data \/run\/waltr-sandbox/);
+  assert.match(workerRuntime, /install -d -o 65532 -g 65532 \/workspace \/run\/waltr-sandbox/);
   assert.match(dockerfile, /ENV HOME=\/data/);
   assert.match(dockerfile, /WORKDIR \/data/);
 });
@@ -389,8 +450,8 @@ test("runtime and build context contain required hardening", () => {
   const buildBase = dockerStage("build-base");
   const serverBuild = dockerStage("server-build");
   const testBuild = dockerStage("test-build");
-  assert.match(dockerStage("runtime-base"), /apt-get install -y --no-install-recommends ca-certificates/);
-  assert.match(dockerStage("test-runtime"), /apt-get install -y --no-install-recommends bash coreutils curl findutils procps/);
+  assert.match(dockerStage("runtime-base"), /apt-get install -y --no-install-recommends ca-certificates curl/);
+  assert.match(dockerStage("test-runtime"), /apt-get install -y --no-install-recommends bash coreutils findutils procps/);
   assert.match(dockerfile, /ENV PNPM_HOME=\/pnpm/);
   assert.equal((dockerfile.match(/pnpm install --frozen-lockfile/g) ?? []).length, 1);
   assert.equal((dockerfile.match(/pnpm --filter @rfhold\/waltr-web build/g) ?? []).length, 0);

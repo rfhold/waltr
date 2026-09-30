@@ -1,8 +1,9 @@
 //! Prompt template expansion.
 
-use std::{fmt::Write as _, path::Path};
+use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -22,12 +23,36 @@ use crate::{
 };
 
 const MAX_TEMPLATE_DEPTH: usize = 8;
+const TEMPLATE_TOOL_RESULTS: &str = "template_tool_results";
+const TEMPLATE_SANDBOX_RESULTS: &str = "template_sandbox_results";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) enum TemplateSource {
-    UserPrompt,
-    RuntimePrompt,
+pub(crate) enum TemplateOrigin<'a> {
+    UserPrompt {
+        submission: u64,
+        prompt_index: usize,
+    },
+    Instruction {
+        path: &'a Path,
+    },
+}
+
+impl TemplateOrigin<'_> {
+    fn scope(&self, turn: u64, input: &str) -> String {
+        let mut scope = match self {
+            Self::UserPrompt {
+                submission,
+                prompt_index,
+            } => {
+                format!("user-{submission}-{prompt_index}")
+            }
+            Self::Instruction { path } => format!("instruction-{turn}-{}", path.display()),
+        };
+        for byte in Sha256::digest(input.as_bytes()) {
+            write!(scope, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        scope
+    }
 }
 
 #[allow(clippy::redundant_pub_crate)]
@@ -93,27 +118,57 @@ enum TemplatePermissionOutcome {
     Ask(Vec<PermissionClaim>),
 }
 
-/// Runtime values available while expanding prompt templates.
+/// Values shared across templates rendered during one run.
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) struct TemplateRuntime<'a> {
-    /// Base directory used for relative file references.
-    pub(crate) base_dir: &'a Path,
+pub(crate) struct TemplateRunContext<'a> {
     pub(crate) middleware_chain: &'a MiddlewareChain,
     pub(crate) permission_policy: &'a PermissionPolicy,
-    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
-    /// Cancellation token shared with the agent run.
     pub(crate) cancellation_token: CancellationToken,
-    /// Durable session id to attach to templated tool calls.
     pub(crate) session_id: &'a str,
-    /// Current provider turn to attach to templated tool calls.
     pub(crate) turn: u64,
-    pub(crate) source: TemplateSource,
+    pub(crate) sandbox: Option<&'a crate::sandbox_gateway::SandboxHandle>,
+}
+
+/// Runtime values available while expanding one prompt template.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct TemplateRuntime<'a> {
+    pub(crate) base_dir: &'a Path,
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+    pub(crate) run: TemplateRunContext<'a>,
+    pub(crate) origin: TemplateOrigin<'a>,
+    occurrence_scope: String,
+    occurrence: u64,
+    rendered_tool_ids: Vec<String>,
 }
 
 impl TemplateRuntime<'_> {
+    pub(crate) fn new<'a>(
+        base_dir: &'a Path,
+        middleware_state: &'a mut MiddlewareStateLog,
+        run: TemplateRunContext<'a>,
+        origin: TemplateOrigin<'a>,
+    ) -> TemplateRuntime<'a> {
+        TemplateRuntime {
+            base_dir,
+            middleware_state,
+            run,
+            origin,
+            occurrence_scope: String::new(),
+            occurrence: 0,
+            rendered_tool_ids: Vec::new(),
+        }
+    }
+
     /// Expand file and tool references in one prompt template.
     pub(crate) async fn render_template(&mut self, input: &str) -> Result<TemplateRender> {
+        self.occurrence_scope = self.origin.scope(self.run.turn, input);
+        self.occurrence = 0;
+        self.rendered_tool_ids.clear();
         self.render_template_depth(input, 0).await
+    }
+
+    pub(crate) fn rendered_tool_ids(&self) -> &[String] {
+        &self.rendered_tool_ids
     }
 
     #[allow(clippy::too_many_lines)]
@@ -180,7 +235,7 @@ impl TemplateRuntime<'_> {
                 continue;
             }
 
-            if self.source == TemplateSource::UserPrompt
+            if matches!(self.origin, TemplateOrigin::UserPrompt { .. })
                 && is_first_line(input, index)
                 && remaining.starts_with('/')
                 && is_reference_boundary(input, index)
@@ -261,18 +316,29 @@ impl TemplateRuntime<'_> {
         reference: TemplateReference,
         depth: usize,
     ) -> Result<TemplateRender> {
-        let middleware_chain = self.middleware_chain;
-        let permission_policy = self.permission_policy;
-        let cancellation_token = self.cancellation_token.clone();
+        let call_id = match &reference {
+            TemplateReference::Tool { name, .. } => {
+                let ordinal = self.occurrence;
+                self.occurrence += 1;
+                let id = format!("template-{name}-{}-{ordinal}", self.occurrence_scope);
+                self.rendered_tool_ids.push(id.clone());
+                Some(id)
+            }
+            _ => None,
+        };
+        let middleware_chain = self.run.middleware_chain;
+        let permission_policy = self.run.permission_policy;
+        let cancellation_token = self.run.cancellation_token.clone();
         let mut ctx = TemplateRenderContext {
             base_dir: self.base_dir,
-            source: self.source,
             middleware_state: self.middleware_state,
             middleware_chain,
             permission_policy,
             cancellation_token,
-            session_id: self.session_id,
-            turn: self.turn,
+            session_id: self.run.session_id,
+            turn: self.run.turn,
+            sandbox: self.run.sandbox,
+            tool_call_id: call_id.as_deref(),
         };
         match middleware_chain
             .render_template_reference(&mut ctx, &reference)
@@ -322,6 +388,29 @@ impl TemplateRuntime<'_> {
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn clear_sandbox_template_results(
+    state: &mut MiddlewareStateLog,
+    tool_ids: &[String],
+) -> Result<()> {
+    let Some(value) = state.get(TEMPLATE_SANDBOX_RESULTS) else {
+        return Ok(());
+    };
+    let mut completed: BTreeMap<String, String> =
+        serde_json::from_value(value.clone()).map_err(template_runtime_error)?;
+    let mut removed = false;
+    for id in tool_ids {
+        removed |= completed.remove(id).is_some();
+    }
+    if removed {
+        state.set(
+            TEMPLATE_SANDBOX_RESULTS,
+            serde_json::to_value(completed).map_err(template_runtime_error)?,
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::redundant_pub_crate, clippy::too_many_lines)]
 pub(crate) async fn render_tool_template_reference(
     ctx: &mut TemplateRenderContext<'_>,
@@ -335,12 +424,32 @@ pub(crate) async fn render_tool_template_reference(
         ));
     };
     let tool_definition = tools[tool_index].definition().clone();
-    let mut call = ToolCall::new(format!("template-{name}"), name, arguments.clone());
+    let mut call = ToolCall::new(
+        ctx.tool_call_id.unwrap_or("template-tool"),
+        name,
+        arguments.clone(),
+    );
 
     if !tool_is_visible(ctx.permission_policy, &tool_definition, true) {
         return Ok(TemplateReferenceRender::Rendered(
             template_tool_error_result(name, &arguments, format!("tool is not permitted: {name}")),
         ));
+    }
+
+    // A later reference may Ask and restart rendering from the beginning.
+    let cache_namespace = if tools[tool_index].is_sandbox_backed() {
+        TEMPLATE_SANDBOX_RESULTS
+    } else {
+        TEMPLATE_TOOL_RESULTS
+    };
+    let completed: BTreeMap<String, String> = ctx
+        .middleware_state
+        .get(cache_namespace)
+        .map(|value| serde_json::from_value(value.clone()).map_err(template_runtime_error))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(rendered) = completed.get(&call.id) {
+        return Ok(TemplateReferenceRender::Rendered(rendered.clone()));
     }
 
     let whole_tool_level = ctx.permission_policy.evaluate_tool(&call.name);
@@ -372,7 +481,7 @@ pub(crate) async fn render_tool_template_reference(
                 &[],
             ) {
                 whole_tool_approved = true;
-            } else if ctx.source == TemplateSource::RuntimePrompt {
+            } else {
                 return Ok(TemplateReferenceRender::Suspend(permission_suspension(
                     &whole_tool_request,
                     &call,
@@ -410,6 +519,51 @@ pub(crate) async fn render_tool_template_reference(
             ));
         }
     }
+    if call.name != name {
+        return Ok(TemplateReferenceRender::Rendered(
+            template_tool_error_result(
+                name,
+                &arguments,
+                "middleware changed the approved tool name",
+            ),
+        ));
+    }
+
+    let prepared = if tools[tool_index].is_sandbox_backed() {
+        let Some(sandbox) = ctx.sandbox else {
+            return Ok(TemplateReferenceRender::Rendered(
+                template_tool_error_result(name, &arguments, "workspace tool requires sandbox"),
+            ));
+        };
+        match sandbox
+            .prepare_with_shell_defaults(
+                &call.name,
+                &call.arguments,
+                tools[tool_index].shell_defaults(),
+            )
+            .await
+        {
+            Ok(prepared) => {
+                match crate::tools::sandbox::claims(&prepared) {
+                    Ok(extra) => claims.extend(extra),
+                    Err(error) => {
+                        prepared.cancel(sandbox);
+                        return Ok(TemplateReferenceRender::Rendered(
+                            template_tool_error_result(name, &arguments, error),
+                        ));
+                    }
+                }
+                Some(prepared)
+            }
+            Err(error) => {
+                return Ok(TemplateReferenceRender::Rendered(
+                    template_tool_error_result(name, &arguments, error),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     match permission_outcome(ctx, &call, &claims)? {
         TemplatePermissionOutcome::Allow => {}
@@ -419,18 +573,16 @@ pub(crate) async fn render_tool_template_reference(
             ));
         }
         TemplatePermissionOutcome::Ask(claims) => {
-            if ctx.source == TemplateSource::RuntimePrompt {
-                return Ok(TemplateReferenceRender::Suspend(permission_suspension(
-                    &PermissionRequestContext {
-                        session_id: ctx.session_id,
-                        turn: ctx.turn,
-                        stage: PermissionApprovalStage::Contextual,
-                        policy: ctx.permission_policy,
-                    },
-                    &call,
-                    &claims,
-                )));
-            }
+            return Ok(TemplateReferenceRender::Suspend(permission_suspension(
+                &PermissionRequestContext {
+                    session_id: ctx.session_id,
+                    turn: ctx.turn,
+                    stage: PermissionApprovalStage::Contextual,
+                    policy: ctx.permission_policy,
+                },
+                &call,
+                &claims,
+            )));
         }
     }
 
@@ -446,20 +598,28 @@ pub(crate) async fn render_tool_template_reference(
         }
     }
 
-    let result = tools[tool_index]
-        .call(
-            ToolExecutionContext::with_progress_and_cancellation(
-                call.clone(),
-                ToolProgressSink::noop(),
-                ctx.cancellation_token.clone(),
-            )
-            .with_session_context(ctx.session_id.into(), ctx.turn),
-        )
-        .await;
+    let mut tool_context = ToolExecutionContext::with_progress_and_cancellation(
+        call.clone(),
+        ToolProgressSink::noop(),
+        ctx.cancellation_token.clone(),
+    )
+    .with_session_context(ctx.session_id.into(), ctx.turn);
+    if let Some(prepared) = prepared {
+        tool_context = tool_context.with_prepared_sandbox_call(prepared);
+    }
+    let result = tools[tool_index].call(tool_context).await;
     let mut result = match result {
         Ok(result) => result,
         Err(error) => error_tool_result(&call, &error),
     };
+    // Shell timeouts are reported in the worker output rather than as tool errors.
+    if tools[tool_index].is_sandbox_backed()
+        && call.name == "shell"
+        && result.content.starts_with("Timed out: true\n")
+    {
+        result.is_error = true;
+    }
+    let succeeded = !result.is_error;
     let after_outcome = {
         let middleware_chain = ctx.middleware_chain;
         let mut result_ctx = ToolResultContext {
@@ -474,18 +634,35 @@ pub(crate) async fn render_tool_template_reference(
         };
         middleware_chain.after_tool_call(&mut result_ctx).await
     };
-    match after_outcome {
-        Ok(HookOutcome::Continue) => Ok(TemplateReferenceRender::Rendered(
-            render_template_tool_result(&result, &arguments),
-        )),
-        Ok(HookOutcome::ReplaceToolResult(result)) => Ok(TemplateReferenceRender::Rendered(
-            render_template_tool_result(&result, &arguments),
-        )),
-        Ok(HookOutcome::Suspend(suspension)) => Ok(TemplateReferenceRender::Suspend(suspension)),
-        Err(error) => Ok(TemplateReferenceRender::Rendered(
-            template_tool_error_result(name, &arguments, error),
-        )),
+    let (rendered, cacheable) = match after_outcome {
+        Ok(HookOutcome::Continue) => (render_template_tool_result(&result, &arguments), succeeded),
+        Ok(HookOutcome::ReplaceToolResult(result)) => {
+            let cacheable = succeeded && !result.is_error;
+            (render_template_tool_result(&result, &arguments), cacheable)
+        }
+        Ok(HookOutcome::Suspend(suspension)) => {
+            // Execute completed; retrying this render must not dispatch the ticket again.
+            if tools[tool_index].is_sandbox_backed() && succeeded {
+                let mut completed = completed;
+                completed.insert(call.id, render_template_tool_result(&result, &arguments));
+                ctx.middleware_state.set(
+                    cache_namespace,
+                    serde_json::to_value(completed).map_err(template_runtime_error)?,
+                );
+            }
+            return Ok(TemplateReferenceRender::Suspend(suspension));
+        }
+        Err(error) => (template_tool_error_result(name, &arguments, error), false),
+    };
+    if !tools[tool_index].is_sandbox_backed() || cacheable {
+        let mut completed = completed;
+        completed.insert(call.id, rendered.clone());
+        ctx.middleware_state.set(
+            cache_namespace,
+            serde_json::to_value(completed).map_err(template_runtime_error)?,
+        );
     }
+    Ok(TemplateReferenceRender::Rendered(rendered))
 }
 
 fn render_template_tool_result(result: &ToolResult, arguments: &Value) -> String {
@@ -963,11 +1140,368 @@ fn escape_xml_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use futures_util::{StreamExt, stream};
     use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tokio_util::sync::CancellationToken;
 
-    use crate::ToolResult;
+    use crate::{
+        ToolResult,
+        middleware::{
+            AgentMiddleware, HookOutcome,
+            chain::MiddlewareChain,
+            context::{
+                MiddlewareStateLog, TemplateRenderContext, ToolCallContext, ToolResultContext,
+            },
+        },
+        sandbox_gateway::SandboxGateway,
+        tools::{filesystem::FilesystemToolKind, sandbox},
+    };
 
-    use super::render_template_tool_result;
+    use super::{
+        TemplateOrigin, TemplateReferenceRender, render_template_tool_result,
+        render_tool_template_reference,
+    };
+
+    struct RedirectWrite;
+
+    impl AgentMiddleware for RedirectWrite {
+        fn before_tool_call(
+            &self,
+            ctx: &mut ToolCallContext<'_>,
+        ) -> impl Future<Output = crate::Result<HookOutcome>> + Send {
+            ctx.call.arguments["filePath"] = json!("redirected");
+            async { Ok(HookOutcome::Continue) }
+        }
+    }
+
+    struct SuspendAfterWrite(Arc<AtomicUsize>);
+
+    struct TemplateProvider(Arc<AtomicUsize>);
+
+    impl crate::LlmStream for TemplateProvider {
+        fn name(&self) -> &'static str {
+            "template-post-hook"
+        }
+
+        fn stream_request<'a>(
+            &'a self,
+            request: crate::CompletionRequest<'a>,
+        ) -> crate::BoxStreamFuture<'a> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            assert!(request.prompt.contains("after hook"), "{request:?}");
+            Box::pin(async {
+                Ok(
+                    Box::pin(stream::iter(vec![Ok(crate::CompletionEvent::Finished)]))
+                        as crate::BoxCompletionStream,
+                )
+            })
+        }
+    }
+
+    impl AgentMiddleware for SuspendAfterWrite {
+        fn after_tool_call(
+            &self,
+            ctx: &mut ToolResultContext<'_>,
+        ) -> impl Future<Output = crate::Result<HookOutcome>> + Send {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ctx.result.content.push_str(" after hook");
+            async {
+                Ok(HookOutcome::Suspend(
+                    crate::middleware::Suspension::external(
+                        "approval",
+                        crate::middleware::ExternalRequestDraft {
+                            id: "post-hook-approval".into(),
+                            kind: crate::middleware::ExternalRequestKind::Custom(
+                                "post-hook".into(),
+                            ),
+                            tool_call_id: None,
+                            prompt: "Approve result".into(),
+                            payload: json!({}),
+                            status: crate::middleware::ExternalRequestStatus::Pending,
+                        },
+                    ),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_template_prepares_middleware_transformed_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = SandboxGateway::new("test".into());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = gateway.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service.service())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let path = root.path().to_path_buf();
+        let worker = tokio::spawn(async move {
+            waltr_agent_sandbox::run_worker(channel, path, "test")
+                .await
+                .unwrap();
+        });
+        gateway.wait_ready().await.unwrap();
+
+        let handle = gateway.handle();
+        let tools = [sandbox::agent_tool(
+            FilesystemToolKind::Write.definition(),
+            handle.clone(),
+        )];
+        let mut chain = MiddlewareChain::new();
+        chain.push(RedirectWrite);
+        let policy = crate::PermissionPolicy::default();
+        let mut state = MiddlewareStateLog::default();
+        let mut ctx = TemplateRenderContext {
+            base_dir: root.path(),
+            middleware_state: &mut state,
+            middleware_chain: &chain,
+            permission_policy: &policy,
+            cancellation_token: CancellationToken::new(),
+            session_id: "test",
+            turn: 0,
+            sandbox: Some(&handle),
+            tool_call_id: Some("template-write"),
+        };
+        let output = render_tool_template_reference(
+            &mut ctx,
+            &tools,
+            "write",
+            json!({"filePath":"original","content":"transformed"}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(output, TemplateReferenceRender::Rendered(result) if !result.contains("status=\"error\""))
+        );
+        assert!(!root.path().join("original").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("redirected")).unwrap(),
+            "transformed"
+        );
+        gateway.shutdown();
+        worker.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sandbox_template_after_tool_suspension_reuses_completed_result() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = SandboxGateway::new("test".into());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = gateway.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service.service())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let path = root.path().to_path_buf();
+        let worker = tokio::spawn(async move {
+            waltr_agent_sandbox::run_worker(channel, path, "test")
+                .await
+                .unwrap();
+        });
+        gateway.wait_ready().await.unwrap();
+
+        let handle = gateway.handle();
+        let tools = [sandbox::agent_tool(
+            FilesystemToolKind::Write.definition(),
+            handle.clone(),
+        )];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut chain = MiddlewareChain::new();
+        chain.push(SuspendAfterWrite(calls.clone()));
+        let policy = crate::PermissionPolicy::default();
+        let mut state = MiddlewareStateLog::default();
+        let mut ctx = TemplateRenderContext {
+            base_dir: root.path(),
+            middleware_state: &mut state,
+            middleware_chain: &chain,
+            permission_policy: &policy,
+            cancellation_token: CancellationToken::new(),
+            session_id: "test",
+            turn: 0,
+            sandbox: Some(&handle),
+            tool_call_id: Some("template-suspended-write"),
+        };
+        let arguments = json!({"filePath":"marker", "content":"executed once"});
+        let first = render_tool_template_reference(&mut ctx, &tools, "write", arguments.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, TemplateReferenceRender::Suspend(suspension) if suspension.external_request.is_some())
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("marker")).unwrap(),
+            "executed once"
+        );
+        std::fs::write(root.path().join("marker"), "outside change").unwrap();
+
+        let resumed = render_tool_template_reference(&mut ctx, &tools, "write", arguments)
+            .await
+            .unwrap();
+        assert!(
+            matches!(resumed, TemplateReferenceRender::Rendered(result) if result.contains("after hook"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("marker")).unwrap(),
+            "outside change"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        gateway.shutdown();
+        worker.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sandbox_template_after_tool_suspension_resumes_without_reexecution() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = SandboxGateway::new("test".into());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = gateway.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service.service())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let path = root.path().to_path_buf();
+        let worker = tokio::spawn(async move {
+            waltr_agent_sandbox::run_worker(channel, path, "test")
+                .await
+                .unwrap();
+        });
+        gateway.wait_ready().await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let agent = crate::AgentRuntime::builder(
+            crate::ModelRef::new(
+                crate::ProviderId::OpenAi,
+                "test-model",
+                crate::ModelApi::OpenAiResponses,
+            ),
+            Arc::new(TemplateProvider(provider_calls.clone())),
+        )
+        .with_sandbox(gateway.handle())
+        .with_filesystem_tools(crate::tools::filesystem::FilesystemConfig::new(root.path()))
+        .with_middleware(SuspendAfterWrite(calls.clone()))
+        .build();
+        let store = crate::MemorySessionStore::new();
+        let sessions = crate::SessionCoordinator::new(store.clone());
+        let id = sessions
+            .create(crate::SessionCreateRequest::new(
+                crate::SessionId::generate(),
+            ))
+            .await
+            .unwrap()
+            .id()
+            .clone();
+        let events = sessions
+            .prompt(
+                &agent,
+                id.clone(),
+                "@tool(write, {\"filePath\":\"marker\",\"content\":\"executed once\"})",
+            )
+            .stream()
+            .collect::<Vec<_>>()
+            .await;
+        let request_id = events
+            .iter()
+            .map(|event| event.as_ref().unwrap())
+            .find_map(|event| match &event.content {
+                crate::TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+                _ => None,
+            })
+            .expect("post-tool suspension request");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("marker")).unwrap(),
+            "executed once"
+        );
+        std::fs::write(root.path().join("marker"), "outside change").unwrap();
+        let resumed = sessions
+            .resume(
+                &agent,
+                id,
+                crate::ResumeInput::ExternalResponse {
+                    request_id,
+                    response: crate::ExternalResponse::new(json!("approved")),
+                },
+            )
+            .stream()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(resumed.iter().all(Result::is_ok), "{resumed:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("marker")).unwrap(),
+            "outside change"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        gateway.shutdown();
+        worker.abort();
+        server.abort();
+    }
+
+    #[test]
+    fn template_occurrence_scope_is_stable_and_separates_sources() {
+        let input = "@tool(camera, {})";
+        let user = TemplateOrigin::UserPrompt {
+            submission: 10,
+            prompt_index: 2,
+        };
+        let instruction = TemplateOrigin::Instruction {
+            path: Path::new("/workspace/AGENTS.md"),
+        };
+        assert_eq!(user.scope(4, input), user.scope(4, input));
+        assert_ne!(
+            user.scope(4, input),
+            user.scope(4, "@tool(camera, {\"x\":1})")
+        );
+        assert_ne!(user.scope(4, input), instruction.scope(4, input));
+        assert_ne!(
+            instruction.scope(4, input),
+            TemplateOrigin::Instruction {
+                path: Path::new("/workspace/nested/AGENTS.md")
+            }
+            .scope(4, input)
+        );
+    }
 
     #[test]
     fn structured_tool_error_uses_the_error_template() {

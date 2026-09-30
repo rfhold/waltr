@@ -12,10 +12,12 @@ const hostname = config.require("hostname");
 const displayName = config.require("displayName");
 const slug = config.require("slug");
 const image = config.require("image");
+const workerImage = config.require("workerImage");
 const authentikBaseUrl = config.require("authentikBaseUrl").replace(/\/$/, "");
 const storageClass = config.require("storageClass");
 const bucketStorageClass = config.require("bucketStorageClass");
 const dataStorageSize = config.require("dataStorageSize");
+const workspaceStorageSize = config.require("workspaceStorageSize");
 const databaseStorageSize = config.require("databaseStorageSize");
 const s3Endpoint = config.require("s3Endpoint");
 const s3Prefix = config.require("s3Prefix");
@@ -86,6 +88,8 @@ const wrappingKeyMountPath = "/var/run/secrets/waltr/mcp-oauth";
 const wrappingKeyFile = `${wrappingKeyMountPath}/keyring.json`;
 const postgresTrustMountPath = "/var/run/secrets/waltr/postgres";
 const postgresCaFile = `${postgresTrustMountPath}/ca.crt`;
+const sandboxSocket = "/run/waltr-sandbox/gateway.sock";
+const workspaceRoot = "/workspace";
 const browserCallback = `https://${hostname}/oidc/callback`;
 const nativeRedirectPattern = "^http://127\\.0\\.0\\.1:[0-9]+/callback$";
 const nativeRedirectUris: Array<{
@@ -215,6 +219,23 @@ const data = new k8s.core.v1.PersistentVolumeClaim(
       accessModes: ["ReadWriteOnce"],
       storageClassName: storageClass,
       resources: { requests: { storage: dataStorageSize } },
+    },
+  },
+  { dependsOn: [namespace], protect: protectData },
+);
+
+const workspace = new k8s.core.v1.PersistentVolumeClaim(
+  "waltr-workspace",
+  {
+    metadata: {
+      name: "waltr-workspace",
+      namespace: namespace.metadata.name,
+      labels,
+    },
+    spec: {
+      accessModes: ["ReadWriteOnce"],
+      storageClassName: storageClass,
+      resources: { requests: { storage: workspaceStorageSize } },
     },
   },
   { dependsOn: [namespace], protect: protectData },
@@ -358,6 +379,8 @@ const appSecret = new k8s.core.v1.Secret(
     stringData: {
       WALTR_DATABASE_URL: databaseUrl,
       WALTR_MCP_DATABASE_URL: databaseUrl,
+      WALTR_SANDBOX_SOCKET: sandboxSocket,
+      WALTR_WORKSPACE_ROOT: workspaceRoot,
       WALTR_AUTH_MODE: "oidc",
       WALTR_PUBLIC_URL: publicUrl,
       WALTR_OIDC_ISSUER: browserApp.issuer,
@@ -487,6 +510,7 @@ const deployment = new k8s.apps.v1.Deployment(
               volumeMounts: [
                 { name: "data", mountPath: "/data" },
                 { name: "tmp", mountPath: "/tmp" },
+                { name: "sandbox-socket", mountPath: "/run/waltr-sandbox" },
                 {
                   name: "mcp-oauth-wrapping-keys",
                   mountPath: wrappingKeyMountPath,
@@ -499,6 +523,30 @@ const deployment = new k8s.apps.v1.Deployment(
                 },
               ],
             },
+            {
+              name: "waltr-sandbox",
+              image: workerImage,
+              imagePullPolicy: "IfNotPresent",
+              env: [
+                { name: "WALTR_SANDBOX_SOCKET", value: sandboxSocket },
+                { name: "WALTR_SANDBOX_WORKSPACE_ROOT", value: workspaceRoot },
+              ],
+              securityContext: {
+                runAsNonRoot: true,
+                allowPrivilegeEscalation: false,
+                readOnlyRootFilesystem: true,
+                capabilities: { drop: ["ALL"] },
+              },
+              resources: {
+                requests: { cpu: "100m", memory: "128Mi" },
+                limits: { cpu: "500m", memory: "512Mi" },
+              },
+              volumeMounts: [
+                { name: "sandbox-socket", mountPath: "/run/waltr-sandbox" },
+                { name: "workspace", mountPath: workspaceRoot },
+                { name: "worker-tmp", mountPath: "/tmp" },
+              ],
+            },
           ],
           volumes: [
             {
@@ -506,6 +554,12 @@ const deployment = new k8s.apps.v1.Deployment(
               persistentVolumeClaim: { claimName: data.metadata.name },
             },
             { name: "tmp", emptyDir: { sizeLimit: "256Mi" } },
+            { name: "sandbox-socket", emptyDir: {} },
+            {
+              name: "workspace",
+              persistentVolumeClaim: { claimName: workspace.metadata.name },
+            },
+            { name: "worker-tmp", emptyDir: { sizeLimit: "256Mi" } },
             {
               name: "mcp-oauth-wrapping-keys",
               secret: {

@@ -1,12 +1,11 @@
 //! Filesystem tool schemas.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use globset::GlobSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{PermissionOperation, ToolDefinition};
+use crate::ToolDefinition;
 
 /// Input for the `filesystem.read` tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,12 +210,6 @@ pub struct GrepMatch {
     pub line: String,
 }
 
-pub(super) struct GrepSearch<'a> {
-    pub(super) base: &'a Path,
-    pub(super) pattern: &'a str,
-    pub(super) include: Option<&'a GlobSet>,
-}
-
 /// Filesystem tool kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesystemToolKind {
@@ -251,16 +244,8 @@ impl FilesystemToolKind {
         }
     }
 
-    pub(super) fn definition(self) -> ToolDefinition {
+    pub(crate) fn definition(self) -> ToolDefinition {
         ToolDefinition::new(self.name(), self.description(), self.input_schema())
-    }
-
-    pub(super) const fn permission_operation(self) -> PermissionOperation {
-        match self {
-            Self::Read | Self::Glob | Self::Grep => PermissionOperation::Read,
-            Self::Edit | Self::Write | Self::ApplyPatch => PermissionOperation::Write,
-            Self::Delete => PermissionOperation::Delete,
-        }
     }
 
     const fn description(self) -> &'static str {

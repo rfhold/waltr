@@ -82,7 +82,7 @@ pub use storage::{
 pub use types::{
     AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, MetadataSetCondition, MetadataSetOutcome, PendingWork,
-    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, SessionId,
+    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, SandboxDispatch, SessionId,
     SessionJournalEvent, SessionMetrics, SessionRecord, SessionRollbackTarget, SessionSnapshot,
     SessionStatus, SessionSummary, Suspension,
 };

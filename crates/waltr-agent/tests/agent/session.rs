@@ -857,6 +857,7 @@ mod tool_projection {
     };
     use serde_json::json;
 
+    use crate::sandbox::TestSandbox;
     use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
     fn scripted_provider(
@@ -875,8 +876,10 @@ mod tool_projection {
     fn filesystem_agent(
         root: &Path,
         provider: Arc<CapturingProvider<ScriptedProvider>>,
+        sandbox: waltr_agent::sandbox_gateway::SandboxHandle,
     ) -> AgentRuntime {
         AgentRuntime::builder(test_model(), provider)
+            .with_sandbox(sandbox)
             .with_filesystem_tools(FilesystemConfig::new(root))
             .with_question_tool(QuestionConfig::new())
             .build()
@@ -887,6 +890,8 @@ mod tool_projection {
     async fn root_hint_is_request_scoped_and_absent_from_stored_definitions() {
         let first_root = TempRoot::new("waltr-session-root-hint-a");
         let second_root = TempRoot::new("waltr-session-root-hint-b");
+        let first_sandbox = TestSandbox::new(first_root.path()).await;
+        let second_sandbox = TestSandbox::new(second_root.path()).await;
         let first_hint = format!(
             "Filesystem root: {}.",
             first_root.canonical_path().display()
@@ -896,7 +901,8 @@ mod tool_projection {
             second_root.canonical_path().display()
         );
 
-        let stored_tools = FilesystemConfig::new(first_root.path()).into_agent_tools(&test_model());
+        let stored_tools = FilesystemConfig::new(first_root.path())
+            .into_agent_tools(&test_model(), first_sandbox.handle());
         for tool in &stored_tools {
             assert!(
                 !tool.definition().description.contains("Filesystem root:"),
@@ -925,7 +931,7 @@ mod tool_projection {
             ],
         ]);
 
-        let agent = filesystem_agent(&first_root.path(), provider.clone());
+        let agent = filesystem_agent(&first_root.path(), provider.clone(), first_sandbox.handle());
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
             .create(SessionCreateRequest::new(SessionId::generate()))
@@ -949,7 +955,11 @@ mod tool_projection {
         let projected = provider.tool_description(0, "read");
         assert!(projected.contains(&first_hint), "{projected}");
 
-        let resume_agent = filesystem_agent(&second_root.path(), provider.clone());
+        let resume_agent = filesystem_agent(
+            &second_root.path(),
+            provider.clone(),
+            second_sandbox.handle(),
+        );
         let resume_sessions = SessionCoordinator::new(store);
         let mut stream = resume_sessions
             .resume(
@@ -987,7 +997,9 @@ mod tool_projection {
             let path =
                 std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
             fs::create_dir_all(&path).expect("create temp root");
-            Self { path }
+            Self {
+                path: path.canonicalize().expect("canonical temp root"),
+            }
         }
 
         fn path(&self) -> PathBuf {
@@ -1416,6 +1428,7 @@ mod agents_skills_state {
     };
     use serde_json::json;
 
+    use crate::sandbox::TestSandbox;
     use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
     fn test_model() -> ModelRef {
@@ -1487,8 +1500,10 @@ mod agents_skills_state {
     #[tokio::test]
     async fn agents_prompt_replays_stored_content_after_resume_despite_disk_changes() {
         let temp = TempRoot::new("waltr-session-agents-static");
+        let sandbox = TestSandbox::new(temp.path()).await;
         temp.write("AGENTS.md", "Original instructions marker-original.\n");
         let other = TempRoot::new("waltr-session-agents-other");
+        let other_sandbox = TestSandbox::new(other.path()).await;
         other.write("AGENTS.md", "Other instructions marker-other.\n");
         let store = MemorySessionStore::new();
         let provider = scripted_provider(vec![
@@ -1500,6 +1515,7 @@ mod agents_skills_state {
         ]);
 
         let agent = AgentRuntime::builder(test_model(), provider.clone())
+            .with_sandbox(sandbox.handle())
             .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
             .with_question_tool(QuestionConfig::new())
             .build();
@@ -1521,6 +1537,7 @@ mod agents_skills_state {
         temp.write("AGENTS.md", "Modified instructions marker-modified.\n");
 
         let resume_agent = AgentRuntime::builder(test_model(), provider.clone())
+            .with_sandbox(other_sandbox.handle())
             .with_agents_system_prompt(AgentsPromptConfig::new(other.path()))
             .with_question_tool(QuestionConfig::new())
             .build();
@@ -1544,6 +1561,7 @@ mod agents_skills_state {
     #[tokio::test]
     async fn agents_read_injection_is_not_repeated_after_resume() {
         let temp = TempRoot::new("waltr-session-agents-read");
+        let sandbox = TestSandbox::new(temp.path()).await;
         temp.write("src/AGENTS.md", "Nested instructions marker-nested.\n");
         temp.write("src/main.rs", "fn main() {}\n");
         let store = MemorySessionStore::new();
@@ -1565,6 +1583,7 @@ mod agents_skills_state {
         ]);
         let build_agent = || {
             AgentRuntime::builder(test_model(), provider.clone())
+                .with_sandbox(sandbox.handle())
                 .with_filesystem_tools(
                     FilesystemConfig::new(temp.path()).with_agents_read_context(),
                 )
@@ -1611,6 +1630,7 @@ mod agents_skills_state {
     #[tokio::test]
     async fn loaded_skill_state_replays_after_resume_despite_disk_changes() {
         let temp = TempRoot::new("waltr-session-skills-static");
+        let sandbox = TestSandbox::new(temp.path()).await;
         temp.write(
             ".agents/skills/example/SKILL.md",
             "---\nname: example\ndescription: Use example.\n---\nOriginal steps marker-skill-original.\n",
@@ -1635,6 +1655,7 @@ mod agents_skills_state {
         ]);
         let build_agent = || {
             AgentRuntime::builder(test_model(), provider.clone())
+                .with_sandbox(sandbox.handle())
                 .with_skills(SkillsConfig::new(temp.path()))
                 .with_question_tool(QuestionConfig::new())
                 .build()
@@ -1658,6 +1679,26 @@ mod agents_skills_state {
         assert!(run.tool_results[0].contains("marker-skill-original"));
         assert!(run.tool_results[1].contains("already loaded"));
         let request_id = run.external_request_id.expect("question request");
+        let saved = SessionStore::load(&store, &session_id)
+            .await
+            .expect("saved session");
+        let state = &saved.snapshot().middleware_state["skills"];
+        assert_eq!(state["catalog"][0]["name"], "example");
+        assert_eq!(state["loaded"][0]["name"], "example");
+        assert!(
+            state["loaded"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("marker-skill-original")
+        );
+        assert!(state["revealed_roots"].is_array());
+        assert!(
+            saved
+                .snapshot()
+                .middleware_state
+                .get("sandbox_skills")
+                .is_none()
+        );
 
         temp.write(
             ".agents/skills/example/SKILL.md",
@@ -1738,6 +1779,7 @@ mod agents_skills_state {
     #[tokio::test]
     async fn ephemeral_run_uses_supplied_memory_store_for_middleware_state() {
         let temp = TempRoot::new("waltr-session-agents-ephemeral");
+        let sandbox = TestSandbox::new(temp.path()).await;
         temp.write("AGENTS.md", "Ephemeral instructions marker-ephemeral.\n");
         let store = MemorySessionStore::new();
         let provider = scripted_provider(vec![vec![
@@ -1745,6 +1787,7 @@ mod agents_skills_state {
             CompletionEvent::Finished,
         ]]);
         let agent = AgentRuntime::builder(test_model(), provider.clone())
+            .with_sandbox(sandbox.handle())
             .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
             .build();
 
@@ -1782,7 +1825,9 @@ mod agents_skills_state {
             let path =
                 std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
             fs::create_dir_all(&path).expect("create temp root");
-            Self { path }
+            Self {
+                path: path.canonicalize().expect("canonical temp root"),
+            }
         }
 
         fn path(&self) -> &Path {

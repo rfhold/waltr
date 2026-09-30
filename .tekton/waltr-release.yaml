@@ -151,6 +151,8 @@ spec:
           params:
             - name: image
               type: string
+            - name: worker-image
+              type: string
             - name: revision
               type: string
             - name: buildkit-addr
@@ -169,9 +171,16 @@ spec:
                   --opt filename=Dockerfile --opt target=runtime --opt platform=linux/amd64 \
                   --opt "build-arg:REVISION=$(params.revision)" \
                   --output "type=image,name=$(params.image),push=true"
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=worker-runtime --opt platform=linux/amd64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --output "type=image,name=$(params.worker-image),push=true"
         params:
           - name: image
             value: $(params.base-image):sha-$(params.revision)-amd64
+          - name: worker-image
+            value: $(params.base-image)-worker:sha-$(params.revision)-amd64
           - name: revision
             value: $(params.revision)
           - name: buildkit-addr
@@ -186,6 +195,8 @@ spec:
         taskSpec:
           params:
             - name: image
+              type: string
+            - name: worker-image
               type: string
             - name: revision
               type: string
@@ -205,9 +216,16 @@ spec:
                   --opt filename=Dockerfile --opt target=runtime --opt platform=linux/arm64 \
                   --opt "build-arg:REVISION=$(params.revision)" \
                   --output "type=image,name=$(params.image),push=true"
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=worker-runtime --opt platform=linux/arm64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --output "type=image,name=$(params.worker-image),push=true"
         params:
           - name: image
             value: $(params.base-image):sha-$(params.revision)-arm64
+          - name: worker-image
+            value: $(params.base-image)-worker:sha-$(params.revision)-arm64
           - name: revision
             value: $(params.revision)
           - name: buildkit-addr
@@ -222,6 +240,8 @@ spec:
           params:
             - name: base-image
               type: string
+            - name: worker-base-image
+              type: string
             - name: tag
               type: string
           steps:
@@ -234,9 +254,15 @@ spec:
                   --platforms linux/amd64,linux/arm64 \
                   --template "$(params.base-image):$(params.tag)-ARCH" \
                   --target "$(params.base-image):$(params.tag)"
+                manifest-tool push from-args \
+                  --platforms linux/amd64,linux/arm64 \
+                  --template "$(params.worker-base-image):$(params.tag)-ARCH" \
+                  --target "$(params.worker-base-image):$(params.tag)"
         params:
           - name: base-image
             value: $(params.base-image)
+          - name: worker-base-image
+            value: $(params.base-image)-worker
           - name: tag
             value: sha-$(params.revision)
 
@@ -247,6 +273,8 @@ spec:
           params:
             - name: base-image
               type: string
+            - name: worker-base-image
+              type: string
             - name: source-tag
               type: string
             - name: release-tag
@@ -256,30 +284,66 @@ spec:
           results:
             - name: image
               type: string
+            - name: worker-image
+              type: string
           steps:
             - name: promote-and-verify
               image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
               script: |
                 #!/busybox/sh
                 set -eu
-                source="$(params.base-image):$(params.source-tag)"
-                digest="`crane digest "$source"`"
-                case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
-                immutable="$(params.base-image)@$digest"
-                config="`crane config "$immutable"`"
-                printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
-                printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
-                release="$(params.base-image):$(params.release-tag)"
-                if existing="`crane digest "$release" 2>/dev/null`"; then
-                  test "$existing" = "$digest"
-                else
-                  crane copy "$immutable" "$release"
-                fi
-                test "`crane digest "$release"`" = "$digest"
-                printf '%s' "$immutable" > "$(results.image.path)"
+                verify_source() {
+                  base="$1"
+                  digest="`crane digest "$base:$(params.source-tag)"`"
+                  printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+                  immutable="$base@$digest"
+                  for platform in linux/amd64 linux/arm64; do
+                    config="`crane config --platform "$platform" "$immutable"`"
+                    printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
+                    printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
+                  done
+                }
+                verify_source "$(params.base-image)"
+                server_digest="$digest"
+                server_immutable="$immutable"
+                verify_source "$(params.worker-base-image)"
+                worker_digest="$digest"
+                worker_immutable="$immutable"
+
+                check_release() {
+                  if response="`crane digest "$1" 2>&1`"; then
+                    test "$response" = "$2"
+                    release_missing=false
+                  else
+                    case "$response" in
+                      *MANIFEST_UNKNOWN*|*NAME_UNKNOWN*|*'404 Not Found'*) release_missing=true ;;
+                      *) printf '%s\n' "$response" >&2; return 1 ;;
+                    esac
+                  fi
+                }
+                server_release="$(params.base-image):$(params.release-tag)"
+                worker_release="$(params.worker-base-image):$(params.release-tag)"
+                check_release "$server_release" "$server_digest"
+                check_release "$worker_release" "$worker_digest"
+
+                promote() {
+                  check_release "$2" "$3"
+                  if [ "$release_missing" = true ]; then
+                    crane copy "$1" "$2"
+                  fi
+                  test "`crane digest "$2"`" = "$3"
+                }
+                promote "$server_immutable" "$server_release" "$server_digest"
+                promote "$worker_immutable" "$worker_release" "$worker_digest"
+                test "`crane digest "$server_release"`" = "$server_digest"
+                test "`crane digest "$worker_release"`" = "$worker_digest"
+                printf '%s' "$server_immutable" > "$(results.image.path)"
+                printf '%s' "$worker_immutable" > "$(results.worker-image.path)"
         params:
           - name: base-image
             value: $(params.base-image)
+          - name: worker-base-image
+            value: $(params.base-image)-worker
           - name: source-tag
             value: sha-$(params.revision)
           - name: release-tag
@@ -293,6 +357,8 @@ spec:
         taskSpec:
           params:
             - name: image
+              type: string
+            - name: worker-image
               type: string
           workspaces:
             - name: source
@@ -325,11 +391,13 @@ spec:
                 test "`bun --version`" = "1.3.5"
                 test "`pulumi version`" = "v3.253.0"
                 bun install --frozen-lockfile
-                pulumi preview --stack prod --diff --config "image=$(params.image)"
-                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)"
+                pulumi preview --stack prod --diff --config "image=$(params.image)" --config "workerImage=$(params.worker-image)"
+                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)" --config "workerImage=$(params.worker-image)"
         params:
           - name: image
             value: $(tasks.promote-release.results.image)
+          - name: worker-image
+            value: $(tasks.promote-release.results.worker-image)
         workspaces:
           - name: source
             workspace: source

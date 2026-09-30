@@ -12,6 +12,7 @@ mod permission;
 pub mod prompt;
 pub mod provider;
 mod resource;
+pub mod sandbox_gateway;
 mod stream;
 mod template;
 pub mod timeline;
@@ -36,7 +37,7 @@ pub use agent::{
     OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
     OpenDalSessionStore, PendingWork, PendingWorkStatus, ProviderRetryConfig, RefreshMode,
     ReplacementUserContent, RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy,
-    RuntimeResumeOutput, S3SessionStore, S3SessionWriteMode, ScyllaSessionStore,
+    RuntimeResumeOutput, S3SessionStore, S3SessionWriteMode, SandboxDispatch, ScyllaSessionStore,
     SessionCapabilities, SessionCaptureError, SessionCaptureLimits,
     SessionCompletionAdmissionFinalizer, SessionCompletionAdmissionHandler,
     SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,

@@ -43,6 +43,117 @@ async fn embedded_server_rejects_relative_workspace_root() {
 }
 
 #[tokio::test]
+async fn embedded_server_requires_a_workspace_distinct_from_session_storage() {
+    let root = waltr_server::test_support::temp_root();
+    let mut config = config(&root, "one-generation-secret");
+    config.workspace_root = config.session_root.clone();
+    assert!(matches!(
+        build_embedded_server(config).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+}
+
+#[tokio::test]
+async fn embedded_rejects_nested_storage_and_host_files_before_creating_resources() {
+    let root = waltr_server::test_support::temp_root();
+    let original = config(&root, "one-generation-secret");
+    let cases = [
+        (root.join("sessions/worker"), original.session_root.clone()),
+        (root.join("worker"), root.join("worker/sessions")),
+        (root.join("data"), original.session_root.clone()),
+        (root.join("cache"), original.session_root.clone()),
+        (
+            root.join("resources/.waltr/resources"),
+            original.session_root.clone(),
+        ),
+    ];
+    for (workspace, sessions) in cases {
+        let mut candidate = original.clone();
+        candidate.workspace_root = workspace;
+        candidate.session_root = sessions;
+        assert!(matches!(
+            build_embedded_server(candidate).await,
+            Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+        ));
+        assert!(!original.resources_root.exists());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn embedded_rejects_configured_path_aliases_of_workspace_and_host_files() {
+    use std::os::unix::fs::symlink;
+    let root = waltr_server::test_support::temp_root();
+    let original = config(&root, "one-generation-secret");
+    std::fs::create_dir(root.join("workspace")).unwrap();
+    symlink(root.join("workspace"), root.join("alias")).unwrap();
+    let mut candidate = original.clone();
+    candidate.session_root = root.join("alias/future/sessions");
+    assert!(matches!(
+        build_embedded_server(candidate).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+
+    let mut candidate = original.clone();
+    candidate.waltr_database_path = root.join("alias/future/waltr.sqlite3");
+    assert!(matches!(
+        build_embedded_server(candidate).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+
+    let mut candidate = original.clone();
+    candidate.mcp_database_path = root.join("alias/future/mcp.sqlite3");
+    assert!(matches!(
+        build_embedded_server(candidate).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+
+    let mut candidate = original.clone();
+    candidate.catalog_cache_path = root.join("alias/future/models.json");
+    assert!(matches!(
+        build_embedded_server(candidate).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+
+    let mut candidate = original.clone();
+    candidate.workspace_root = root.join("alias");
+    candidate.session_root = root.join("workspace/sessions");
+    assert!(matches!(
+        build_embedded_server(candidate).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+
+    let mut candidate = original.clone();
+    std::fs::create_dir_all(root.join("resources/.waltr")).unwrap();
+    symlink(root.join("resources/.waltr"), root.join("config-alias")).unwrap();
+    candidate.workspace_root = root.join("config-alias/workspace");
+    assert!(matches!(
+        build_embedded_server(candidate).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn embedded_startup_does_not_crawl_workspace_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = waltr_server::test_support::temp_root();
+    let config = config(&root, "one-generation-secret");
+    std::fs::create_dir(&config.workspace_root).unwrap();
+    std::fs::create_dir(&config.session_root).unwrap();
+    symlink(
+        &config.session_root,
+        config.workspace_root.join("journal-alias"),
+    )
+    .unwrap();
+    symlink(root.join("missing"), config.workspace_root.join("dangling")).unwrap();
+
+    let server = build_embedded_server(config).await.unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn embedded_server_materializes_bundled_resources_from_explicit_builtin_catalog() {
     let seed: serde_json::Value =
         serde_json::from_str(include_str!("../resources/models-dev-defaults.json"))

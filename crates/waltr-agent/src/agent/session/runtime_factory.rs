@@ -29,6 +29,9 @@ use mcp::{McpTracePropagation, client::McpBearerProviderError};
 
 mod headers;
 mod oauth;
+#[cfg(test)]
+#[path = "runtime_factory/test_sandbox.rs"]
+pub(super) mod test_sandbox;
 
 use headers::{configured_credential, is_credential_header, resolve_provider_headers};
 use oauth::now_ms;
@@ -174,6 +177,8 @@ impl std::fmt::Debug for AgentRuntimeProvider {
 pub struct AgentSessionRuntimeFactory {
     /// Workspace root for tools and prompts.
     pub root: PathBuf,
+    /// Required worker connection for workspace-dependent runtime behavior.
+    pub sandbox: crate::sandbox_gateway::SandboxHandle,
     /// Credential store used for provider auth.
     pub credential_store: CredentialStore,
     outbound_oauth_loopback_test_mode: bool,
@@ -190,6 +195,7 @@ impl std::fmt::Debug for AgentSessionRuntimeFactory {
         formatter
             .debug_struct("AgentSessionRuntimeFactory")
             .field("root", &self.root)
+            .field("sandbox", &self.sandbox)
             .field("credential_store", &self.credential_store)
             .field(
                 "outbound_oauth_loopback_test_mode",
@@ -221,12 +227,14 @@ impl AgentSessionRuntimeFactory {
     /// Create a runtime factory.
     #[must_use]
     pub fn new(
+        sandbox: crate::sandbox_gateway::SandboxHandle,
         root: PathBuf,
         credential_store: impl Into<CredentialStore>,
         definition: ResolvedAgent,
     ) -> Self {
         Self {
             root,
+            sandbox,
             credential_store: credential_store.into(),
             outbound_oauth_loopback_test_mode: false,
             trusted_mcp_oauth_origins: Vec::new(),
@@ -363,6 +371,7 @@ impl AgentSessionRuntimeFactory {
         definition: &ResolvedAgent,
     ) -> AgentRuntimeBuilder {
         builder = builder
+            .with_sandbox(self.sandbox.clone())
             .with_template_base_dir(self.root.clone())
             .without_file_templates();
         if let Some(prompt) = definition.system_prompt.as_ref() {
@@ -535,26 +544,29 @@ impl AgentSessionRuntimeFactory {
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
+        let mut factory = self.clone();
+        factory.root = self.sandbox_root()?;
         let settings = record.inference_settings.as_ref().ok_or_else(|| {
             AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required before prompting".to_owned(),
             )
         })?;
-        let definition = self.definition_for_session(record)?;
+        let definition = factory.definition_for_session(record)?;
         let identity = record.agent_definition.as_ref().map_or_else(
             || {
-                self.catalog.as_ref().map_or_else(
-                    || self.default_agent_name().to_owned(),
+                factory.catalog.as_ref().map_or_else(
+                    || factory.default_agent_name().to_owned(),
                     |catalog| catalog.default_bundle().identity(),
                 )
             },
             AgentDefinitionBundle::identity,
         );
-        let mut builder = self.base_runtime_builder(settings, &definition).await?;
+        let mut builder = factory.base_runtime_builder(settings, &definition).await?;
         builder = builder.with_system_prompt_identity(identity);
         if let Some(task) = definition.features.task.as_ref() {
             let captured_bundle = record.agent_definition.clone().or_else(|| {
-                self.catalog
+                factory
+                    .catalog
                     .as_ref()
                     .map(AgentDefinitionCatalog::default_bundle)
             });
@@ -595,7 +607,7 @@ impl AgentSessionRuntimeFactory {
             }
         }
         let policy =
-            self.definition_permission_policy(&definition, builder.model(), &mcp_tool_names);
+            factory.definition_permission_policy(&definition, builder.model(), &mcp_tool_names);
         Ok(builder.with_permission_policy(policy).build())
     }
 
@@ -699,8 +711,22 @@ impl AgentSessionRuntimeFactory {
         Ok(())
     }
 
-    pub(crate) fn mcp_root_uri(&self) -> String {
-        format!("file://{}", self.root.display())
+    fn sandbox_root(&self) -> Result<PathBuf, AgentSessionRuntimeError> {
+        let root = self.sandbox.canonical_root().ok_or_else(|| {
+            AgentSessionRuntimeError::FailedPrecondition(
+                "sandbox worker root is unavailable".into(),
+            )
+        })?;
+        if root.as_os_str().is_empty() {
+            return Err(AgentSessionRuntimeError::FailedPrecondition(
+                "sandbox worker root is missing".into(),
+            ));
+        }
+        Ok(root)
+    }
+
+    pub(crate) fn mcp_root_uri(&self) -> Result<String, AgentSessionRuntimeError> {
+        Ok(format!("file://{}", self.sandbox_root()?.display()))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1523,7 +1549,63 @@ mod tests {
         root: PathBuf,
         credential_store: impl Into<CredentialStore>,
     ) -> AgentSessionRuntimeFactory {
-        AgentSessionRuntimeFactory::new(root, credential_store, empty_test_agent())
+        AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
+            root,
+            credential_store,
+            empty_test_agent(),
+        )
+    }
+
+    #[tokio::test]
+    async fn runtime_for_session_rejects_unavailable_worker_root() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = test_factory(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        );
+        let record = SessionCreateRequest::new("worker-unavailable").materialize();
+        let error = factory
+            .runtime_for_session(
+                &record,
+                SessionCoordinator::new(crate::MemorySessionStore::new()),
+                None,
+            )
+            .await
+            .expect_err("configured root must not replace an unavailable worker root");
+        assert!(
+            matches!(error, AgentSessionRuntimeError::FailedPrecondition(message)
+            if message == "sandbox worker root is unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_root_uri_requires_worker_and_ignores_configured_root() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = test_factory(
+            PathBuf::from("/not-the-worker-root"),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        );
+        assert!(matches!(
+            factory.mcp_root_uri(),
+            Err(AgentSessionRuntimeError::FailedPrecondition(message))
+                if message == "sandbox worker root is unavailable"
+        ));
+
+        let worker_root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temp root");
+        let factory = AgentSessionRuntimeFactory::new(
+            test_sandbox::worker_handle(directory.path()).await,
+            PathBuf::from("/not-the-worker-root"),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
+        );
+        assert_eq!(
+            factory.mcp_root_uri().expect("worker root URI"),
+            format!("file://{}", worker_root.display())
+        );
     }
 
     struct EmptyProvider;
@@ -1556,6 +1638,7 @@ mod tests {
         let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
         let override_model = model.clone();
         let factory = AgentSessionRuntimeFactory::new(
+            test_sandbox::worker_handle(&root).await,
             root.clone(),
             FileCredentialStore::new(root.join("auth.json")),
             definition,
@@ -1647,6 +1730,7 @@ metadata: { name: current-permissions }
 spec: { tools: [{ name: load_skill, permission: allow }] }",
         );
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("waltr-agent-definition-merge-auth.json")),
             current.clone(),
@@ -1728,6 +1812,7 @@ spec: { tools: [{ name: read, permission: allow }] }
         let catalog = AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "default")
             .expect("catalog resolves");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("waltr-agent-catalog-auth.json")),
             catalog.resolved("default").unwrap().clone(),
@@ -1764,6 +1849,7 @@ spec: { tools: [{ name: read, permission: allow }] }
         let provider_catalog = catalog.clone();
         let root = std::env::temp_dir();
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("waltr-agent-static-catalog-auth.json")),
             catalog.resolved("default").unwrap().clone(),
@@ -1793,6 +1879,7 @@ spec: { tools: [{ name: read, permission: allow }] }
         let current = Arc::new(RwLock::new(initial.clone()));
         let root = std::env::temp_dir();
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("waltr-agent-dynamic-catalog-auth.json")),
             initial.resolved("initial").unwrap().clone(),
@@ -1848,6 +1935,7 @@ spec:
         let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
         let override_model = model.clone();
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("auth.json")),
             definition.clone(),
@@ -1897,6 +1985,7 @@ spec:
         let root = tempfile::tempdir().expect("temp directory");
         let definition = empty_test_agent();
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.path().to_path_buf(),
             FileCredentialStore::new(root.path().join("auth.json")),
             definition.clone(),
@@ -1948,6 +2037,7 @@ spec:
           commands: [{ match: { names: [git, kubectl, ssh] }, effect: ask }]",
         );
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("auth.json")),
             definition.clone(),
@@ -2028,6 +2118,7 @@ spec:
             effect: deny",
         );
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             root.clone(),
             FileCredentialStore::new(root.join("auth.json")),
             definition.clone(),
@@ -2358,6 +2449,7 @@ spec:
     async fn mcp_config_reports_exact_servers_configured_with_bearer_providers() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -2386,6 +2478,7 @@ spec:
     async fn mcp_preparation_detects_bearer_capability_upgrade_without_fingerprint_change() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -2505,6 +2598,7 @@ spec:
     #[allow(clippy::literal_string_with_formatting_args)]
     async fn runtime_builder_resolves_headers_at_agent_boundary() {
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             std::env::temp_dir(),
             FileCredentialStore::new(
                 std::env::temp_dir().join("waltr-agent-runtime-test-auth.json"),
@@ -2586,6 +2680,7 @@ spec:
         let directory = tempfile::tempdir().expect("temp directory");
         let (url, server) = messages_server().await;
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -2662,6 +2757,7 @@ spec:
         let directory = tempfile::tempdir().expect("temp directory");
         let (url, server) = messages_server().await;
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -2717,6 +2813,7 @@ spec:
     async fn anthropic_oauth_without_claude_code_user_agent_omits_billing_marker() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -2836,6 +2933,7 @@ spec:
     async fn configured_provider_oauth_without_credential_fails_before_provider_construction() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3216,6 +3314,7 @@ spec:
         let expected = mcp_state(token_url);
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3275,6 +3374,7 @@ spec:
         .await;
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3341,6 +3441,7 @@ spec:
         .await;
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3631,6 +3732,7 @@ spec:
         .await;
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3690,6 +3792,7 @@ spec:
         .await;
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3733,6 +3836,7 @@ spec:
     async fn typed_mcp_credential_requires_exact_resource_and_issuer_binding() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3776,6 +3880,7 @@ spec:
     async fn expired_mcp_credential_without_refresh_token_requires_authorization() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),
@@ -3844,6 +3949,7 @@ spec:
     async fn refresh_ahead_does_not_make_mcp_token_expired() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
+            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
             empty_test_agent(),

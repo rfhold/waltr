@@ -47,16 +47,17 @@ impl PermissionPolicy {
         }
     }
 
-    /// Create the default filesystem policy for one root.
+    /// Create the default filesystem policy for a worker-reported canonical root.
     #[must_use]
     pub fn filesystem_default(root: impl Into<PathBuf>) -> Self {
         Self::filesystem_external(root, PermissionEffect::deny())
     }
 
     /// Create a filesystem policy with configurable external path handling.
+    /// The root must be the worker's canonical root; this does no host filesystem I/O.
     #[must_use]
     pub fn filesystem_external(root: impl Into<PathBuf>, external: PermissionEffect) -> Self {
-        let root = normalize_policy_path(root.into());
+        let root = root.into();
         Self::default()
             .with_directory_rule(
                 PermissionToolSelector::Any,
@@ -257,6 +258,32 @@ impl PermissionPolicy {
     }
 }
 
-fn normalize_policy_path(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PermissionResource;
+
+    #[test]
+    fn policy_uses_worker_canonical_root_without_local_filesystem() {
+        let actual = PathBuf::from("/worker/workspace");
+        let policy = PermissionPolicy::filesystem_external(&actual, PermissionEffect::ask());
+        let inside = PermissionClaim::new(
+            PermissionOperation::Write,
+            PermissionResource::FilesystemPath(actual.join("note")),
+            "inside",
+        );
+        let outside = PermissionClaim::new(
+            PermissionOperation::Write,
+            PermissionResource::FilesystemPath(PathBuf::from("/host/workspace/other")),
+            "outside",
+        );
+        assert_eq!(
+            policy.evaluate_claim("write", &inside),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            policy.evaluate_claim("write", &outside),
+            PermissionLevel::Ask
+        );
+    }
 }
