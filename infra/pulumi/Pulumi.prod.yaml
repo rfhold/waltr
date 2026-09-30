@@ -17,6 +17,12 @@ config:
   waltr:apiAudience: waltr-api
   waltr:apiScope: waltr:use
   waltr:mcpScope: mcp:use
+  waltr:mcpOutboundOAuthTrustedPrivateOrigins:
+    - https://homelab-mcp.holdenitdown.net
+    - https://smarthome-mcp.holdenitdown.net
+    - https://re-search.holdenitdown.net
+    - https://faktory.holdenitdown.net
+    - https://axol.holdenitdown.net
   waltr:mcpOAuthAccessTokenTtl: "259200"
   waltr:mcpOAuthRefreshTokenTtl: "86400"
   waltr:mcpOAuthRefreshFamilyTtl: "2592000"
