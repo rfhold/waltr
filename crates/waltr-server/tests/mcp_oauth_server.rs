@@ -279,6 +279,18 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
             .status(),
         StatusCode::OK
     );
+    let skills = mcp_skills_list(&client, &server.url("/mcp"), access).await?;
+    assert_eq!(skills.status(), StatusCode::OK);
+    let text = skills.text().await?;
+    let payload = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap_or(&text);
+    let skills: Value = serde_json::from_str(payload)?;
+    assert_eq!(skills["result"]["resultType"], "complete");
+    assert_eq!(skills["result"]["cacheScope"], "private");
+    assert_eq!(skills["result"]["ttlMs"], 0);
+    assert_eq!(skills["result"]["skills"].as_array().map(Vec::len), Some(2));
     fixture.rotate_mcp_signing_key().await;
     let rotated_jwks: Value = client
         .get(replica.url("/oauth/jwks.json"))
@@ -295,6 +307,12 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         "a one-hour token must remain valid across signing-key rotation"
     );
     let upstream = fixture.access_token(Duration::from_hours(1));
+    assert_eq!(
+        mcp_skills_list(&client, &server.url("/mcp"), &upstream)
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         mcp_discover(&client, &server.url("/mcp"), &upstream)
             .await?
@@ -332,6 +350,12 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
     assert_eq!(revoked.status(), StatusCode::OK);
     assert_eq!(
         mcp_discover(&client, &server.url("/mcp"), refreshed_access)
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        mcp_skills_list(&client, &server.url("/mcp"), refreshed_access)
             .await?
             .status(),
         StatusCode::UNAUTHORIZED
@@ -500,6 +524,27 @@ async fn mcp_discover(
         .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
         .header("mcp-method", "server/discover")
         .json(&discover_body())
+        .send()
+        .await
+}
+
+async fn mcp_skills_list(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut body = discover_body();
+    body["method"] = json!("skills/list");
+    body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+        json!({"extensions": {"io.modelcontextprotocol/skills": {}}});
+    client
+        .post(endpoint)
+        .bearer_auth(token)
+        .header("accept", "application/json, text/event-stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "skills/list")
+        .json(&body)
         .send()
         .await
 }

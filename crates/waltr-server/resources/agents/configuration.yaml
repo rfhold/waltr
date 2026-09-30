@@ -21,12 +21,17 @@ spec:
         servers:
           include: [waltr]
         exposeTools: true
+        skills: true
         instructions: false
         resources: false
         prompts: false
         tracePropagation: false
         defaultPermissions: false
   permissions:
+    - name: load_skill
+      permission: allow
+    - name: read_mcp_resource
+      permission: allow
     - name: mcp_waltr_exec
       permission: allow
     - name: mcp_waltr_exec
@@ -34,23 +39,7 @@ spec:
         inputs:
           - match:
               - pointer: /action
-                value: { exact: "help" }
-            effect: allow
-          - match:
-              - pointer: /action
-                value: { wildcard: "help.*" }
-            effect: allow
-          - match:
-              - pointer: /action
-                value: { exact: "runbooks.load" }
-            effect: allow
-          - match:
-              - pointer: /action
-                value: { wildcard: "configuration.*" }
-            effect: allow
-          - match:
-              - pointer: /action
-                value: { wildcard: "agent-definitions.*" }
+                value: { wildcard: "resources.*" }
             effect: allow
           - match:
               - pointer: /action

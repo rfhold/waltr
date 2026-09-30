@@ -1103,10 +1103,16 @@ where
             return Err(AppAssemblyError::SessionStorage(error));
         }
     };
-    let waltr_mcp = Arc::new(WaltrMcpServer::new(
-        session_host.clone(),
-        agent_state.clone(),
-    ));
+    let waltr_mcp = match WaltrMcpServer::new(session_host.clone(), agent_state.clone()) {
+        Ok(server) => Arc::new(server),
+        Err(_) => {
+            session_host.shutdown().await;
+            sandbox.shutdown().await;
+            return Err(
+                ResourceError::unavailable("MCP skill catalog could not initialize").into(),
+            );
+        }
+    };
     let definition_watcher = match agent_state.spawn_watcher() {
         Ok(watcher) => watcher,
         Err(_) => {
