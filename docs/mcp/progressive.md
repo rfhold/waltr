@@ -2,45 +2,43 @@
 
 The `mcp` crate exposes an opinionated progressive-tool server pattern behind the `progressive` feature. It is implemented by `#[mcp::progressive_server]` and runtime helpers in `mcp::progressive`.
 
-A progressive server declares one or more named MCP tools. Each tool accepts an `action`, optional action-specific `input`, and optional jq-compatible `filter`. Tools own separate actions, namespaces, help, schemas, runbooks, and runbook resource templates.
+A progressive server declares named MCP tools with grouped actions. Each tool accepts an `action`, optional action-specific `input`, and optional jq-compatible `filter`.
+
+Caller-authored [MCP Skills](skills.md) supply workflow guidance. The macro exposes action schemas, not generated guidance documents.
 
 ## Server Surface
 
 | Surface | Generated Behavior |
 | --- | --- |
 | Tools | Every nested `tool(...)` declaration produces an independently described MCP tool and can set MCP tool annotations. |
-| Help actions | Each tool provides `help`, `help.<namespace>`, and, when applicable, `help.runbooks`. |
 | Actions | `#[action(tool = "...", name = "...")]` methods dispatch only through their declared tool. |
-| Runbooks | `#[runbook(tool = "...", name = "...")]` methods are available through that tool's `runbooks.load`, prompts, and resource template. |
+| Skills | `skills = self.catalog` registers an embedded `SkillCatalog` for `skills/list`, `skills/get`, and exact-byte `resources/read`. |
 | Resources | Actions can opt into fixed resources with `resource = "..."` or templates with `resource_template = "..."`. |
-| Instructions | Initialize instructions list the progressive tools and direct clients to call the relevant tool with action `help` first. |
 | HTTP auth | A `#[token_validator]` method generates the same Streamable HTTP protected-resource helpers as `#[mcp::mcp_server]`. Authentication is server-wide; stdio remains unauthenticated. |
 
-Tool declarations are explicit. There is no implicit `exec` tool. Each declaration requires a unique, non-empty name and a description. Namespaces, `runbook_uri_template`, and optional `annotations = <Rust expression>` belong to the tool declaration rather than the server. The annotation expression may produce either `serde_json::Value` or `Option<serde_json::Value>` and is preserved as the listed tool's `annotations` field. Duplicate `annotations` arguments are rejected during macro expansion.
-
-A tool that owns runbooks must declare a `runbook_uri_template` containing the `{runbook}` binding. Effective runbook templates must be unique across tools. `runbooks.load` returns Markdown as text content and object-shaped structured content containing `runbook` and `markdown`.
+Tool declarations are explicit. There is no implicit `exec` tool. Each declaration requires a unique, non-empty name and a description.
+Namespaces and optional `annotations = <Rust expression>` belong to the tool declaration; `skills` belongs to the server.
+The annotation expression accepts `serde_json::Value` or `Option<serde_json::Value>`. The macro preserves it in the tool's `annotations` field and rejects duplicate annotation arguments.
 
 ## Tool Isolation
 
 Each listed tool has an independent action enum and action-specific `input.oneOf` schema. A call first selects the MCP tool and can then dispatch only an action owned by that tool. The same flat action name may exist in different tools.
 
-Actions may use flat names such as `list` or dot-namespaced names such as `releases.get` and `alert-rule.list`. Namespaced actions must use a namespace declared by their tool. Root `help` lists flat actions and declared namespaces; `help.<namespace>` lists that namespace's actions with descriptions, guidance, schemas, and resource bindings.
+Actions accept flat names such as `list` or dot-namespaced names such as `releases.get` and `alert-rule.list`.
+Namespaced actions must use a namespace that their tool declares.
 
-Namespace declarations support two forms. `namespace(releases, description = "...")` preserves the original Rust-identifier form. `namespace(name = "alert-rule", description = "...")` declares a string-valued public name for namespaces that are not Rust identifiers. Explicit public names must match `[a-z0-9]+(?:-[a-z0-9]+)*`: non-empty ASCII lowercase letters or digits separated by single hyphens. This rejects dots, whitespace, uppercase letters, underscores, leading or trailing hyphens, and repeated hyphens. `help` and `runbooks` remain reserved in either form, namespace names must be unique within a tool, and action namespace matching uses the complete declared name exactly.
+Namespace declarations accept `namespace(releases, description = "...")` or `namespace(name = "alert-rule", description = "...")`.
+Explicit public names must match `[a-z0-9]+(?:-[a-z0-9]+)*` and remain unique within the tool.
+Action namespace validation uses the complete declared name exactly.
 
-Runbooks are tool-owned for loading and help, while MCP prompts are server-global. Runbook names must therefore be unique across the complete server and remain unprefixed in prompt listings.
-
-Prompts and resources exposed by the server are the union of declarations owned by its tools.
-
-## Help Content
-
-Every `#[action]` and `#[runbook]` method must have a doc comment. The first non-empty line becomes the short description. The remaining body explains why and when an LLM should use it.
-
-`help.runbooks` lists only the runbooks belonging to the called tool, with prompt and resource links. `runbooks.load` cannot load another tool's runbook.
+Every `#[action]` method requires a doc comment. Its first non-empty line supplies the short action description.
+Skill authors supply workflow prose and supporting files explicitly. The macro does not generate mechanical reference files from action declarations.
 
 ## Input Schemas And Filters
 
-Action input types should derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build the owning tool's `input.oneOf` schema. Progressive request and generated runbook input parsing reject unknown fields to match their `additionalProperties: false` schemas. The optional filter may be omitted or explicitly set to `null`.
+Action input types derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build each tool's `input.oneOf` schema.
+Progressive request parsing rejects unknown envelope fields. Action types control their own input deserialization.
+The optional filter accepts omission or explicit `null`.
 
 The optional `filter` field uses a pure-Rust jaq evaluator. Tests cover common jq-style filters such as `.[].id`; invalid filters and filters producing more than 256 values return MCP invalid-params errors. This is a result-count bound only; progressive servers do not impose a byte, message, or individual-result size limit.
 
@@ -63,8 +61,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[derive(Clone, Default)]
-struct ReleaseServer;
+#[derive(Clone)]
+struct ReleaseServer {
+    catalog: std::sync::Arc<mcp::SkillCatalog>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct GetReleaseInput {
@@ -76,6 +76,7 @@ struct GetReleaseInput {
     name = "release-desk",
     version = "1.0.0",
     description = "Release management for the example org.",
+    skills = self.catalog,
     tool(
         name = "releases",
         description = "Inspect product releases.",
@@ -84,8 +85,7 @@ struct GetReleaseInput {
             "destructiveHint": false
         }),
         namespace(releases, description = "Query and inspect product releases."),
-        namespace(name = "alert-rule", description = "Inspect release alert rules."),
-        runbook_uri_template = "playbooks://{runbook}"
+        namespace(name = "alert-rule", description = "Inspect release alert rules.")
     ),
     tool(
         name = "sessions",
@@ -116,14 +116,6 @@ impl ReleaseServer {
     #[action(tool = "releases", name = "alert-rule.list")]
     fn list_alert_rules(&self) -> ServerResult<Value> {
         Ok(json!([]))
-    }
-
-    /// Promote a release candidate to production with required pre-checks.
-    ///
-    /// Load this runbook for an end-to-end production procedure.
-    #[runbook(tool = "releases", name = "promote-to-production")]
-    fn promote_runbook(&self) -> ServerResult<String> {
-        Ok("## Promote to production\n1. Load release details.\n2. Check policy.\n".to_owned())
     }
 
     /// List recent release automation sessions.

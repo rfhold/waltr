@@ -88,7 +88,6 @@ struct PolicyCheckInput {
             name = "alert-rule",
             description = "Query alert rules associated with releases."
         ),
-        runbook_uri_template = "playbooks://{runbook}"
     ),
     tool(
         name = "policy",
@@ -97,7 +96,6 @@ struct PolicyCheckInput {
             policy,
             description = "Org release policies and compliance checks. Consult before recommending or performing any promotion."
         ),
-        runbook_uri_template = "playbooks://policy/{runbook}"
     ),
     auth(
         scopes = ["releases:read"],
@@ -235,24 +233,6 @@ impl ReleaseServer {
     #[action(tool = "releases", name = "fan-out")]
     fn fan_out(&self) -> ServerResult<Value> {
         Ok(json!((0..257).collect::<Vec<_>>()))
-    }
-
-    /// Promote a release candidate to production with required pre-checks.
-    ///
-    /// Load this runbook when the user wants an end-to-end production
-    /// promotion procedure rather than a single release fact.
-    #[runbook(tool = "policy", name = "promote-to-production")]
-    fn promote_runbook(&self) -> ServerResult<String> {
-        Ok("## Promote to production\n1. Load release details.\n2. Check policy.\n3. Confirm rollback plan.\n".to_owned())
-    }
-
-    /// Roll back production to the previous known-good release.
-    ///
-    /// Load this runbook when the user reports production impact or asks for a
-    /// rollback playbook.
-    #[runbook(tool = "releases", name = "rollback-release")]
-    fn rollback_runbook(&self) -> ServerResult<String> {
-        Ok("## Rollback release\n1. Identify the bad release.\n2. Select previous release.\n3. Announce rollback.\n".to_owned())
     }
 
     #[token_validator]
@@ -552,7 +532,7 @@ fn progressive_input_schemas_inline_subschemas() {
 }
 
 #[tokio::test]
-async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp::Result<()> {
+async fn progressive_server_isolates_actions_and_resources_without_help() -> mcp::Result<()> {
     let server = RunningServer::start_plain(ReleaseServer::default()).await?;
 
     let discover = post_json(&server.endpoint, discover_body("discover")).await?;
@@ -565,15 +545,13 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
         discover.body["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
-    assert!(discover.body["result"]["capabilities"]["prompts"].is_object());
-    assert!(discover.body["result"]["capabilities"]["resources"].is_object());
     assert!(
-        discover.body["result"]["instructions"]
-            .as_str()
-            .is_some_and(
-                |instructions| instructions.contains("`releases`: Release inventory actions.")
-            )
+        discover.body["result"]["capabilities"]
+            .get("prompts")
+            .is_none()
     );
+    assert!(discover.body["result"]["capabilities"]["resources"].is_object());
+    assert!(discover.body["result"].get("instructions").is_none());
 
     let tools = post_json(
         &server.endpoint,
@@ -594,11 +572,11 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     assert_eq!(releases_tool["annotations"]["readOnlyHint"], true);
     assert_eq!(releases_tool["annotations"]["destructiveHint"], false);
     assert!(policy_tool.get("annotations").is_none());
-    assert_array_contains(
+    assert_array_excludes(
         &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "help.releases",
     );
-    assert_array_contains(
+    assert_array_excludes(
         &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "help.alert-rule",
     );
@@ -606,7 +584,7 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
         &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "alert-rule.list",
     );
-    assert_array_contains(
+    assert_array_excludes(
         &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "runbooks.load",
     );
@@ -631,37 +609,6 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
             .any(|schema| schema.to_string().contains("Release id."))
     );
 
-    let root_help = call_tool(&server.endpoint, "releases", json!({ "action": "help" })).await?;
-    assert_eq!(root_help["structuredContent"]["topic"], "help");
-    assert_eq!(
-        root_help["structuredContent"]["actions"][0]["action"],
-        "list"
-    );
-    assert_eq!(
-        root_help["structuredContent"]["namespaces"][0]["help_action"],
-        "help.releases"
-    );
-    assert_eq!(root_help["structuredContent"]["runbooks"]["count"], 1);
-    assert_eq!(
-        root_help["structuredContent"]["description"],
-        "Release inventory actions."
-    );
-
-    let alert_rule_help = call_tool(
-        &server.endpoint,
-        "releases",
-        json!({ "action": "help.alert-rule" }),
-    )
-    .await?;
-    assert_eq!(
-        alert_rule_help["structuredContent"]["topic"],
-        "help.alert-rule"
-    );
-    assert_eq!(
-        alert_rule_help["structuredContent"]["actions"][0]["action"],
-        "alert-rule.list"
-    );
-
     let alert_rules = call_tool(
         &server.endpoint,
         "releases",
@@ -671,46 +618,6 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     assert_eq!(
         alert_rules["structuredContent"],
         json!({ "result": [{ "name": "release-health" }] })
-    );
-
-    let policy_help = call_tool(
-        &server.endpoint,
-        "policy",
-        json!({ "action": "help.policy" }),
-    )
-    .await?;
-    assert_eq!(policy_help["structuredContent"]["topic"], "help.policy");
-    assert_eq!(
-        policy_help["structuredContent"]["actions"][0]["action"],
-        "policy.check"
-    );
-    assert_eq!(
-        policy_help["structuredContent"]["actions"][0]["description"],
-        "Check release policy against one release and target environment."
-    );
-    assert!(
-        policy_help["structuredContent"]["actions"][0]["guidance"]
-            .as_str()
-            .is_some_and(|guidance| guidance.contains("deploy decision"))
-    );
-
-    let runbooks_help = call_tool(
-        &server.endpoint,
-        "policy",
-        json!({ "action": "help.runbooks" }),
-    )
-    .await?;
-    assert_eq!(
-        runbooks_help["structuredContent"]["resource_template"],
-        "playbooks://policy/{runbook}"
-    );
-    assert_eq!(
-        runbooks_help["structuredContent"]["runbooks"][0]["description"],
-        "Promote a release candidate to production with required pre-checks."
-    );
-    assert_eq!(
-        runbooks_help["structuredContent"]["runbooks"][0]["resource"],
-        "playbooks://policy/promote-to-production"
     );
 
     let filtered = call_tool(
@@ -784,45 +691,6 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     .await?;
     assert_eq!(fan_out.body["error"]["code"], -32602);
 
-    let runbook = call_tool(
-        &server.endpoint,
-        "policy",
-        json!({
-            "action": "runbooks.load",
-            "input": { "runbook": "promote-to-production" }
-        }),
-    )
-    .await?;
-    assert!(
-        runbook["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("## Promote to production"))
-    );
-    assert!(
-        runbook["structuredContent"]["markdown"]
-            .as_str()
-            .is_some_and(|text| text.contains("Check policy"))
-    );
-    assert_eq!(
-        runbook["structuredContent"]["runbook"],
-        "promote-to-production"
-    );
-
-    let isolated_runbook = call_tool_response(
-        &server.endpoint,
-        "releases",
-        json!({
-            "action": "runbooks.load",
-            "input": { "runbook": "promote-to-production" }
-        }),
-    )
-    .await?;
-    assert!(
-        isolated_runbook.body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("unknown runbook"))
-    );
-
     let isolated_action = call_tool_response(
         &server.endpoint,
         "policy",
@@ -833,36 +701,6 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
         isolated_action.body["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("unknown progressive action"))
-    );
-
-    let prompts = post_json(
-        &server.endpoint,
-        json!({ "jsonrpc": "2.0", "id": "prompts-list", "method": "prompts/list" }),
-    )
-    .await?;
-    assert_eq!(
-        prompts.body["result"]["prompts"][0]["name"],
-        "promote-to-production"
-    );
-    assert_eq!(
-        prompts.body["result"]["prompts"][1]["name"],
-        "rollback-release"
-    );
-
-    let prompt = post_json(
-        &server.endpoint,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "prompt-get",
-            "method": "prompts/get",
-            "params": { "name": "promote-to-production" }
-        }),
-    )
-    .await?;
-    assert!(
-        prompt.body["result"]["messages"][0]["content"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("## Promote to production"))
     );
 
     let resources = post_json(
@@ -889,14 +727,12 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
         "releases://{id}"
     );
     assert_eq!(
-        templates.body["result"]["resourceTemplates"][1]["uriTemplate"],
-        "playbooks://{runbook}"
+        templates.body["result"]["resourceTemplates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
-    assert_eq!(
-        templates.body["result"]["resourceTemplates"][2]["uriTemplate"],
-        "playbooks://policy/{runbook}"
-    );
-
     let policy_resource = post_json(
         &server.endpoint,
         json!({
@@ -947,38 +783,6 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     )?;
     assert_eq!(semantic_resource["items"][0]["id"], "v1.4.2");
 
-    let runbook_resource = post_json(
-        &server.endpoint,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "runbook-resource",
-            "method": "resources/read",
-            "params": { "uri": "playbooks://rollback-release" }
-        }),
-    )
-    .await?;
-    assert!(
-        runbook_resource.body["result"]["contents"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("## Rollback release"))
-    );
-
-    let overlapping_runbook_resource = post_json(
-        &server.endpoint,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "overlapping-runbook-resource",
-            "method": "resources/read",
-            "params": { "uri": "playbooks://policy/promote-to-production" }
-        }),
-    )
-    .await?;
-    assert!(
-        overlapping_runbook_resource.body["result"]["contents"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("## Promote to production"))
-    );
-
     let missing_input = post_json(
         &server.endpoint,
         json!({
@@ -992,7 +796,7 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     assert!(
         missing_input.body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("help.releases"))
+            .is_some_and(|message| message.contains("missing input"))
     );
     assert_eq!(missing_input.body["error"]["code"], -32602);
 
@@ -1009,7 +813,7 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     assert!(
         unknown_action.body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("call `help`"))
+            .is_some_and(|message| message.contains("unknown progressive action"))
     );
     assert_eq!(unknown_action.body["error"]["code"], -32602);
 
@@ -1021,29 +825,32 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     .await?;
     assert_eq!(unknown_field.body["error"]["code"], -32602);
 
-    let unknown_runbook_field = call_tool_response(
-        &server.endpoint,
-        "releases",
-        json!({
-            "action": "runbooks.load",
-            "input": { "runbook": "rollback-release", "unexpected": true }
-        }),
-    )
-    .await?;
-    assert_eq!(unknown_runbook_field.body["error"]["code"], -32602);
-
+    for action in ["help", "help.releases", "help.runbooks", "runbooks.load"] {
+        let response =
+            call_tool_response(&server.endpoint, "releases", json!({"action": action})).await?;
+        assert_eq!(response.body["error"]["code"], -32602);
+        assert!(
+            response.body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown progressive action")
+        );
+    }
     let null_filter = call_tool(
         &server.endpoint,
         "releases",
-        json!({ "action": "help", "filter": null }),
+        json!({ "action": "alert-rule.list", "filter": null }),
     )
     .await?;
-    assert_eq!(null_filter["structuredContent"]["topic"], "help");
+    assert_eq!(
+        null_filter["structuredContent"]["result"][0]["name"],
+        "release-health"
+    );
 
     let invalid_filter = call_tool_response(
         &server.endpoint,
         "releases",
-        json!({ "action": "help", "filter": ".]" }),
+        json!({ "action": "alert-rule.list", "filter": ".]" }),
     )
     .await?;
     assert_eq!(invalid_filter.body["error"]["code"], -32602);

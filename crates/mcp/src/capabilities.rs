@@ -43,6 +43,25 @@ pub struct McpResourcesCapability {
 }
 
 impl McpServerCapabilities {
+    /// Whether the server advertises Skills and its required Resources capability.
+    #[must_use]
+    pub fn supports_skills(&self) -> bool {
+        self.skills().is_some()
+    }
+
+    /// Parsed extension settings, only when the required Resources capability is present.
+    #[must_use]
+    pub fn skills(&self) -> Option<crate::skills::McpSkillsCapability> {
+        self.resources.as_ref()?;
+        let value = self
+            .extensions
+            .as_ref()?
+            .get(crate::skills::SKILLS_EXTENSION)?;
+        if !value.is_object() {
+            return None;
+        }
+        serde_json::from_value(value.clone()).ok()
+    }
     /// Parse capabilities from an optional JSON object.
     #[must_use]
     pub fn parse(value: Option<&Value>) -> Self {

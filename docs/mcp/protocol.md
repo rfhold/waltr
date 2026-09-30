@@ -50,6 +50,11 @@ The typed surface supports tools, prompts, resources, resource templates, comple
 pagination, progress, cancellation, annotations, icons, opaque metadata, and extension
 capability maps.
 
+The official `io.modelcontextprotocol/skills` extension adds typed `skills/list` and `skills/get` methods.
+Clients opt in with `McpClientOptions::with_skills`; the default remains off.
+Servers publish exact file manifests and serve their bytes through `resources/read`.
+See [Skills](skills.md) for catalog registration, validation, and host authority boundaries.
+
 Tool results retain their raw wire value and also expose ordered borrowed text, image, and
 unknown extension blocks. Parsing rejects malformed known blocks while leaving image decoding,
 MIME policy, and payload validation to the consuming application.
@@ -180,6 +185,7 @@ The crate explicitly does not implement:
 - sampling input requests
 - elicitation input requests
 - task runtime or task extension methods
+- `resources/directory/read` and the Skills `directoryRead` capability
 - non-roots MRTR input requests
 - initialize-era lifecycle, ping, or session transport behavior
 

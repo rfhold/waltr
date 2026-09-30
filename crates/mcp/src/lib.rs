@@ -18,9 +18,15 @@ mod resource;
 /// MCP server handler traits and stdio/HTTP serving helpers.
 pub mod server;
 mod server_telemetry;
+/// MCP Skills extension wire types, immutable catalogs, and integrity verification.
+pub mod skills;
 mod tool;
 mod trace;
 mod types;
+pub use skills::{
+    McpSkill, McpSkillList, McpSkillResource, McpSkillResources, McpSkillResult,
+    McpSkillsCapability, SkillCatalog,
+};
 
 pub use capabilities::{
     McpPromptsCapability, McpResourcesCapability, McpServerCapabilities, McpToolsCapability,

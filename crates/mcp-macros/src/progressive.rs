@@ -17,7 +17,6 @@ pub(crate) fn expand_progressive_server(
     let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
 
     let mut actions = Vec::new();
-    let mut runbooks = Vec::new();
     let mut token_validator = None;
 
     for item in &mut input.items {
@@ -29,7 +28,6 @@ pub(crate) fn expand_progressive_server(
         for attr in &method.attrs {
             match helper_attr_name(attr).as_deref() {
                 Some("action") => actions.push(ProgressiveAction::from_method(method, attr)?),
-                Some("runbook") => runbooks.push(ProgressiveRunbook::from_method(method, attr)?),
                 Some("token_validator") => token_validator = Some(method.clone()),
                 _ => retained_attrs.push(attr.clone()),
             }
@@ -37,17 +35,14 @@ pub(crate) fn expand_progressive_server(
         method.attrs = retained_attrs;
     }
 
-    validate_progressive_parts(args, &actions, &runbooks)?;
+    validate_progressive_parts(args, &actions)?;
 
     let handler_impl = handler_impl(
         args,
         &self_ty,
         &impl_generics,
         where_clause,
-        ProgressiveParts {
-            actions: &actions,
-            runbooks: &runbooks,
-        },
+        ProgressiveParts { actions: &actions },
     );
     let helpers_impl = helpers_impl(
         args,
@@ -73,17 +68,15 @@ fn handler_impl(
     where_clause: Option<&syn::WhereClause>,
     parts: ProgressiveParts<'_>,
 ) -> TokenStream2 {
-    let ProgressiveParts { actions, runbooks } = parts;
+    let ProgressiveParts { actions } = parts;
     let server_info = server_info_impl(args);
-    let capabilities = capabilities_impl(actions, runbooks);
-    let instructions = instructions_impl(args);
-    let list_tools = list_tools_impl(args, actions, runbooks);
-    let call_tool = call_tool_impl(args, actions, runbooks);
-    let list_prompts = list_prompts_impl(runbooks);
-    let get_prompt = get_prompt_impl(runbooks);
+    let capabilities = capabilities_impl(args, actions);
+    let catalog = super::skill_catalog_impl(args.skills.as_ref());
+    let list_tools = list_tools_impl(args, actions);
+    let call_tool = call_tool_impl(args, actions);
     let list_resources = list_resources_impl(actions);
-    let list_resource_templates = list_resource_templates_impl(args, actions, runbooks);
-    let read_resource = read_resource_impl(args, actions, runbooks);
+    let list_resource_templates = list_resource_templates_impl(actions);
+    let read_resource = read_resource_impl(actions);
 
     quote! {
         impl #impl_generics ::mcp::server::ServerHandler for #self_ty #where_clause {
@@ -91,15 +84,11 @@ fn handler_impl(
 
             #capabilities
 
-            #instructions
+            #catalog
 
             #list_tools
 
             #call_tool
-
-            #list_prompts
-
-            #get_prompt
 
             #list_resources
 
@@ -127,50 +116,28 @@ fn server_info_impl(args: &ProgressiveArgs) -> TokenStream2 {
     }
 }
 
-fn capabilities_impl(
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
-    let prompts =
-        (!runbooks.is_empty()).then(|| quote! { let capabilities = capabilities.prompts(); });
-    let resources = (actions.iter().any(ProgressiveAction::exposes_resource)
-        || !runbooks.is_empty())
-    .then(|| quote! { let capabilities = capabilities.resources(); });
+fn capabilities_impl(args: &ProgressiveArgs, actions: &[ProgressiveAction]) -> TokenStream2 {
+    let resources = actions
+        .iter()
+        .any(ProgressiveAction::exposes_resource)
+        .then(|| quote! { let capabilities = capabilities.resources(); });
+    let skills = args.skills.as_ref().map(|_| quote! { let capabilities = if self.skill_catalog().is_some_and(|catalog| !catalog.is_empty()) { capabilities.skills() } else { capabilities }; });
     quote! {
         fn capabilities(&self) -> ::mcp::server::ServerCapabilities {
             let capabilities = ::mcp::server::ServerCapabilities::new().tools();
-            #prompts
             #resources
+            #skills
             capabilities
         }
     }
 }
 
-fn instructions_impl(args: &ProgressiveArgs) -> TokenStream2 {
-    let description = optional_string_expr(args.description.as_ref());
-    let tools = args.tools.iter().map(|tool| {
-        let name = &tool.name;
-        let description = &tool.description;
-        quote! { (#name, #description) }
-    });
-    quote! {
-        fn instructions(&self) -> Option<String> {
-            let description = #description;
-            Some(::mcp::progressive::instructions(description.as_deref(), &[#(#tools),*]))
-        }
-    }
-}
-
-fn list_tools_impl(
-    args: &ProgressiveArgs,
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
+fn list_tools_impl(args: &ProgressiveArgs, actions: &[ProgressiveAction]) -> TokenStream2 {
     let definitions =
         args.tools.iter().map(|tool| {
             let name = &tool.name;
             let description = &tool.description;
-            let input_schema = input_schema_expr(tool, actions, runbooks);
+            let input_schema = input_schema_expr(tool, actions);
             tool.annotations.as_ref().map_or_else(
             || quote! { ::mcp::progressive::tool_definition(#name, #description, #input_schema) },
             |annotations| quote! {
@@ -200,33 +167,13 @@ fn list_tools_impl(
 }
 
 #[allow(clippy::too_many_lines)]
-fn call_tool_impl(
-    args: &ProgressiveArgs,
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
+fn call_tool_impl(args: &ProgressiveArgs, actions: &[ProgressiveAction]) -> TokenStream2 {
     let tool_branches = args.tools.iter().map(|tool| {
         let tool_name = &tool.name;
-        let root_help = root_help_expr(tool, actions, runbooks);
         let tool_actions = actions
             .iter()
             .filter(|action| action.tool == tool.name.value())
             .collect::<Vec<_>>();
-        let tool_runbooks = runbooks
-            .iter()
-            .filter(|runbook| runbook.tool == tool.name.value())
-            .collect::<Vec<_>>();
-        let namespace_branches = tool.namespaces.iter().map(|namespace| {
-            let help_action = format!("help.{}", namespace.name.value());
-            let help = namespace_help_expr(tool, namespace, actions);
-            quote! {
-                #help_action => {
-                    return Box::pin(async move {
-                        ::mcp::progressive::tool_result(#help, request.filter.as_deref())
-                    });
-                }
-            }
-        });
         let action_branches = tool_actions.iter().map(|action| {
             let name = action.name.value();
             let call = action_tool_call(action);
@@ -236,22 +183,6 @@ fn call_tool_impl(
                 }
             }
         });
-        let runbook_branches = if tool_runbooks.is_empty() {
-            TokenStream2::new()
-        } else {
-            let runbooks_help = runbooks_help_expr(tool, runbooks);
-            let runbook_load = runbook_load_call(&tool_runbooks);
-            quote! {
-                "help.runbooks" => {
-                    return Box::pin(async move {
-                        ::mcp::progressive::tool_result(#runbooks_help, request.filter.as_deref())
-                    });
-                }
-                "runbooks.load" => {
-                    return #runbook_load;
-                }
-            }
-        };
         quote! {
             if call.name == #tool_name {
                 let request = match ::mcp::progressive::parse_arguments(#tool_name, call.arguments) {
@@ -259,13 +190,6 @@ fn call_tool_impl(
                     Err(error) => return Box::pin(async move { Err(error) }),
                 };
                 match request.action.as_str() {
-                    "help" => {
-                        return Box::pin(async move {
-                            ::mcp::progressive::tool_result(#root_help, request.filter.as_deref())
-                        });
-                    }
-                    #runbook_branches
-                    #(#namespace_branches)*
                     #(#action_branches)*
                     _ => {}
                 }
@@ -287,61 +211,6 @@ fn call_tool_impl(
                 Err(::mcp::server::ServerError::invalid_params(format!(
                     "unknown progressive tool `{}`",
                     call.name
-                )))
-            })
-        }
-    }
-}
-
-fn list_prompts_impl(runbooks: &[ProgressiveRunbook]) -> TokenStream2 {
-    if runbooks.is_empty() {
-        return TokenStream2::new();
-    }
-    let definitions = runbooks.iter().map(|runbook| {
-        let name = &runbook.name;
-        let description = &runbook.docs.description;
-        quote! { ::mcp::progressive::runbook_prompt_definition(#name, #description) }
-    });
-    quote! {
-        fn list_prompts(
-            &self,
-            _cursor: Option<String>,
-            _context: ::mcp::server::ServerContext,
-        ) -> ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpPromptList>> {
-            Box::pin(async {
-                Ok(::mcp::McpPromptList {
-                    prompts: vec![#(#definitions),*],
-                    next_cursor: None,
-                })
-            })
-        }
-    }
-}
-
-fn get_prompt_impl(runbooks: &[ProgressiveRunbook]) -> TokenStream2 {
-    if runbooks.is_empty() {
-        return TokenStream2::new();
-    }
-    let branches = runbooks.iter().map(|runbook| {
-        let name = &runbook.name;
-        let call = runbook_prompt_call(runbook);
-        quote! {
-            if name == #name {
-                return #call;
-            }
-        }
-    });
-    quote! {
-        fn get_prompt(
-            &self,
-            name: String,
-            _arguments: Option<::mcp::server::JsonValue>,
-            context: ::mcp::server::ServerContext,
-        ) -> ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpPromptResult>> {
-            #(#branches)*
-            Box::pin(async move {
-                Err(::mcp::server::ServerError::invalid_params(format!(
-                    "unknown runbook prompt `{name}`; call `help.runbooks`"
                 )))
             })
         }
@@ -371,23 +240,12 @@ fn list_resources_impl(actions: &[ProgressiveAction]) -> TokenStream2 {
     }
 }
 
-fn list_resource_templates_impl(
-    args: &ProgressiveArgs,
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
+fn list_resource_templates_impl(actions: &[ProgressiveAction]) -> TokenStream2 {
     let action_templates = actions.iter().filter_map(|action| {
         let uri_template = action.attr.resource_template.as_ref()?;
         let name = &action.name;
         let description = &action.docs.description;
         Some(quote! { ::mcp::progressive::action_resource_template_definition(#uri_template, #name, #description) })
-    });
-    let runbook_templates = args.tools.iter().filter_map(|tool| {
-        if !runbooks.iter().any(|runbook| runbook.tool == tool.name.value()) {
-            return None;
-        }
-        let uri_template = tool.runbook_uri_template.as_ref()?;
-        Some(quote! { templates.push(::mcp::progressive::runbook_resource_template_definition(#uri_template)); })
     });
     quote! {
         fn list_resource_templates(
@@ -396,8 +254,7 @@ fn list_resource_templates_impl(
             _context: ::mcp::server::ServerContext,
         ) -> ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpResourceTemplateList>> {
             Box::pin(async {
-                let mut templates = vec![#(#action_templates),*];
-                #(#runbook_templates)*
+                let templates = vec![#(#action_templates),*];
                 Ok(::mcp::McpResourceTemplateList {
                     resource_templates: templates,
                     next_cursor: None,
@@ -407,11 +264,7 @@ fn list_resource_templates_impl(
     }
 }
 
-fn read_resource_impl(
-    args: &ProgressiveArgs,
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
+fn read_resource_impl(actions: &[ProgressiveAction]) -> TokenStream2 {
     let resource_branches = actions.iter().filter_map(|action| {
         let uri = action.attr.resource.as_ref()?;
         let call = action_resource_call(action, &quote! { uri.clone() });
@@ -430,29 +283,17 @@ fn read_resource_impl(
             }
         })
     });
-    let runbook_branches = args.tools.iter().filter_map(|tool| {
-        let tool_runbooks = runbooks
-            .iter()
-            .filter(|runbook| runbook.tool == tool.name.value())
-            .collect::<Vec<_>>();
-        if tool_runbooks.is_empty() {
-            return None;
-        }
-        let template = tool
-            .runbook_uri_template
-            .as_ref()
-            .expect("validated runbook URI template");
-        Some(runbook_resource_call(&tool_runbooks, template))
-    });
     quote! {
         fn read_resource(
             &self,
             uri: String,
             context: ::mcp::server::ServerContext,
         ) -> ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpResourceResult>> {
+            if let Some(result) = self.skill_catalog().and_then(|catalog| catalog.read(&uri)) {
+                return Box::pin(async move { Ok(result) });
+            }
             #(#resource_branches)*
             #(#template_branches)*
-            #(#runbook_branches)*
             Box::pin(async move { Err(::mcp::server::ServerError::resource_not_found(uri)) })
         }
     }
@@ -554,19 +395,16 @@ fn auth_helpers_impl(args: &ProgressiveArgs, method: &ImplItemFn) -> TokenStream
     }
 }
 
-fn input_schema_expr(
-    tool: &ProgressiveToolArg,
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
+fn input_schema_expr(tool: &ProgressiveToolArg, actions: &[ProgressiveAction]) -> TokenStream2 {
+    let namespaces = tool.namespaces.iter().map(|namespace| {
+        let name = &namespace.name;
+        let description = &namespace.description;
+        quote! { ::mcp::server::JsonValue::String(format!("{}: {}", #name, #description)) }
+    });
     let action_names = actions
         .iter()
         .filter(|action| action.tool == tool.name.value())
         .map(|action| &action.name);
-    let runbook_names = runbooks
-        .iter()
-        .filter(|runbook| runbook.tool == tool.name.value())
-        .map(|runbook| &runbook.name);
     let inputs = actions
         .iter()
         .filter(|action| action.tool == tool.name.value())
@@ -592,133 +430,15 @@ fn input_schema_expr(
             )
         });
     quote! {
-        ::mcp::progressive::input_schema(
+        {
+        let mut schema = ::mcp::progressive::input_schema(
             &[#(#action_names),*],
             vec![#(#inputs),*],
-            &[#(#runbook_names),*],
-        )
-    }
-}
-
-fn root_help_expr(
-    tool: &ProgressiveToolArg,
-    actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
-) -> TokenStream2 {
-    let description = &tool.description;
-    let namespaces = namespaces_expr(tool);
-    let action_help = actions
-        .iter()
-        .filter(|action| action.tool == tool.name.value())
-        .map(action_help_expr);
-    let runbook_help = runbooks_help_vec_expr(
-        runbooks
-            .iter()
-            .filter(|runbook| runbook.tool == tool.name.value()),
-    );
-    quote! {
-        {
-            let actions = vec![#(#action_help),*];
-            ::mcp::progressive::root_help(Some(#description), &#namespaces, &actions, &#runbook_help)
+        );
+        schema["x-namespaces"] = ::mcp::server::JsonValue::Array(vec![#(#namespaces),*]);
+        schema
         }
     }
-}
-
-fn namespace_help_expr(
-    tool: &ProgressiveToolArg,
-    namespace: &ProgressiveNamespaceArg,
-    actions: &[ProgressiveAction],
-) -> TokenStream2 {
-    let namespace_value = namespace_expr(namespace);
-    let action_values = actions
-        .iter()
-        .filter(|action| {
-            action.tool == tool.name.value() && namespace.name.value() == action.namespace
-        })
-        .map(action_help_expr);
-    quote! {
-        {
-            let namespace = #namespace_value;
-            let actions = vec![#(#action_values),*];
-            ::mcp::progressive::namespace_help(&namespace, &actions)
-        }
-    }
-}
-
-fn runbooks_help_expr(tool: &ProgressiveToolArg, runbooks: &[ProgressiveRunbook]) -> TokenStream2 {
-    let runbook_uri_template = tool
-        .runbook_uri_template
-        .as_ref()
-        .expect("validated runbook URI template");
-    let runbook_help = runbooks_help_vec_expr(
-        runbooks
-            .iter()
-            .filter(|runbook| runbook.tool == tool.name.value()),
-    );
-    quote! {
-        {
-            let runbooks = #runbook_help;
-            ::mcp::progressive::runbooks_help(#runbook_uri_template, &runbooks)
-        }
-    }
-}
-
-fn namespaces_expr(tool: &ProgressiveToolArg) -> TokenStream2 {
-    let namespaces = tool.namespaces.iter().map(namespace_expr);
-    quote! { vec![#(#namespaces),*] }
-}
-
-fn namespace_expr(namespace: &ProgressiveNamespaceArg) -> TokenStream2 {
-    let name = &namespace.name;
-    let description = &namespace.description;
-    quote! {
-        ::mcp::progressive::ProgressiveNamespace {
-            name: #name,
-            description: ::std::string::String::from(#description),
-        }
-    }
-}
-
-fn action_help_expr(action: &ProgressiveAction) -> TokenStream2 {
-    let name = &action.name;
-    let namespace = &action.namespace;
-    let description = &action.docs.description;
-    let guidance = &action.docs.guidance;
-    let resource = optional_litstr_expr(action.attr.resource.as_ref());
-    let resource_template = optional_litstr_expr(action.attr.resource_template.as_ref());
-    let input_schema = action.call.input_ty.as_ref().map_or_else(
-        || quote! { None },
-        |input_ty| quote! { Some(::mcp::progressive::json_schema_for::<#input_ty>()) },
-    );
-    quote! {
-        ::mcp::progressive::ProgressiveActionHelp {
-            name: #name,
-            namespace: #namespace,
-            description: ::std::string::String::from(#description),
-            guidance: ::std::string::String::from(#guidance),
-            input_schema: #input_schema,
-            resource: #resource,
-            resource_template: #resource_template,
-        }
-    }
-}
-
-fn runbooks_help_vec_expr<'a>(
-    runbooks: impl Iterator<Item = &'a ProgressiveRunbook>,
-) -> TokenStream2 {
-    let runbooks = runbooks.map(|runbook| {
-        let name = &runbook.name;
-        let description = &runbook.docs.description;
-        let guidance = &runbook.docs.guidance;
-        quote! {
-            ::mcp::progressive::ProgressiveRunbookHelp {
-                name: #name,
-                description: ::std::string::String::from(#description),
-                guidance: ::std::string::String::from(#guidance),
-            }
-        }
-    });
-    quote! { vec![#(#runbooks),*] }
 }
 
 fn action_tool_call(action: &ProgressiveAction) -> TokenStream2 {
@@ -757,7 +477,6 @@ fn action_template_resource_call(
     uri: &TokenStream2,
 ) -> TokenStream2 {
     let action_name = action.name.value();
-    let namespace = &action.namespace;
     let invocation = action_invocation(action, &quote! { input }, &quote! { context });
     let input_prepare = action.call.input_ty.as_ref().map_or_else(
         || quote! { let input = (); },
@@ -767,7 +486,6 @@ fn action_template_resource_call(
             };
             let input = match ::mcp::progressive::deserialize_action_input::<#input_ty>(
                 #action_name,
-                #namespace,
                 Some(::mcp::server::JsonValue::Object(bindings)),
             ) {
                 Ok(input) => input,
@@ -787,78 +505,8 @@ fn action_template_resource_call(
     }
 }
 
-fn runbook_load_call(runbooks: &[&ProgressiveRunbook]) -> TokenStream2 {
-    let branches = runbooks.iter().map(|runbook| {
-        let name = &runbook.name;
-        let call = runbook_string_future(runbook, &quote! { context });
-        quote! {
-            #name => {
-                let future = #call;
-                return Box::pin(async move {
-                    let markdown = future.await?;
-                    ::mcp::progressive::runbook_tool_result(#name, markdown, request.filter.as_deref())
-                }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpToolResult>>;
-            }
-        }
-    });
-    quote! {
-        {
-            let runbook = match ::mcp::progressive::runbook_load_input(request.input) {
-                Ok(runbook) => runbook,
-                Err(error) => return Box::pin(async move { Err(error) }),
-            };
-            match runbook.as_str() {
-                #(#branches)*
-                _ => {}
-            }
-            Box::pin(async move { Err(::mcp::progressive::unknown_runbook(&runbook)) })
-        }
-    }
-}
-
-fn runbook_prompt_call(runbook: &ProgressiveRunbook) -> TokenStream2 {
-    let call = runbook_string_future(runbook, &quote! { context });
-    quote! {
-        {
-            let future = #call;
-            Box::pin(async move {
-                let markdown = future.await?;
-                Ok(::mcp::progressive::runbook_prompt_result(markdown))
-            }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpPromptResult>>
-        }
-    }
-}
-
-fn runbook_resource_call(
-    runbooks: &[&ProgressiveRunbook],
-    runbook_uri_template: &LitStr,
-) -> TokenStream2 {
-    let branches = runbooks.iter().map(|runbook| {
-        let name = &runbook.name;
-        let call = runbook_string_future(runbook, &quote! { context });
-        quote! {
-            #name => {
-                let future = #call;
-                return Box::pin(async move {
-                    let markdown = future.await?;
-                    Ok(::mcp::progressive::runbook_resource_result(uri, markdown))
-                }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpResourceResult>>;
-            }
-        }
-    });
-    quote! {
-        if let Some(runbook) = ::mcp::progressive::runbook_from_uri(#runbook_uri_template, &uri) {
-            match runbook.as_str() {
-                #(#branches)*
-                _ => {}
-            }
-        }
-    }
-}
-
 fn action_input_prepare(action: &ProgressiveAction, input: &TokenStream2) -> TokenStream2 {
     let action_name = action.name.value();
-    let namespace = &action.namespace;
     action.call.input_ty.as_ref().map_or_else(
         || quote! {
             if let Err(error) = ::mcp::progressive::ensure_no_action_input(#action_name, #input) {
@@ -869,7 +517,6 @@ fn action_input_prepare(action: &ProgressiveAction, input: &TokenStream2) -> Tok
         |input_ty| quote! {
             let input = match ::mcp::progressive::deserialize_action_input::<#input_ty>(
                 #action_name,
-                #namespace,
                 #input,
             ) {
                 Ok(input) => input,
@@ -888,24 +535,6 @@ fn action_invocation(
     let await_token = action.method.sig.asyncness.map(|_| quote! { .await });
     let args = method_call_args(&action.call, input, context);
     if action.call.has_receiver {
-        quote! {
-            {
-                let server = self.clone();
-                async move { server.#ident(#args)#await_token }
-            }
-        }
-    } else {
-        quote! {
-            async move { Self::#ident(#args)#await_token }
-        }
-    }
-}
-
-fn runbook_string_future(runbook: &ProgressiveRunbook, context: &TokenStream2) -> TokenStream2 {
-    let ident = &runbook.method.sig.ident;
-    let await_token = runbook.method.sig.asyncness.map(|_| quote! { .await });
-    let args = method_call_args(&runbook.call, &quote! { () }, context);
-    if runbook.call.has_receiver {
         quote! {
             {
                 let server = self.clone();
@@ -958,34 +587,19 @@ fn token_validator_closure(method: &ImplItemFn) -> TokenStream2 {
     }
 }
 
-fn optional_string_expr(expr: Option<&Expr>) -> TokenStream2 {
-    expr.map_or_else(
-        || quote! { None::<String> },
-        |expr| quote! { Some(::std::string::String::from(#expr)) },
-    )
-}
-
-fn optional_litstr_expr(value: Option<&LitStr>) -> TokenStream2 {
-    value.map_or_else(|| quote! { None }, |value| quote! { Some(#value) })
-}
-
 fn helper_attr_name(attr: &Attribute) -> Option<String> {
     attr.path()
         .segments
         .last()
         .map(|segment| segment.ident.to_string())
-        .filter(|name| matches!(name.as_str(), "action" | "runbook" | "token_validator"))
+        .filter(|name| matches!(name.as_str(), "action" | "token_validator"))
 }
 
 #[allow(clippy::too_many_lines)]
 fn validate_progressive_parts(
     args: &ProgressiveArgs,
     actions: &[ProgressiveAction],
-    runbooks: &[ProgressiveRunbook],
 ) -> syn::Result<()> {
-    #[allow(clippy::literal_string_with_formatting_args)]
-    const RUNBOOK_BINDING: &str = "{runbook}";
-
     if args.tools.is_empty() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -1095,54 +709,6 @@ fn validate_progressive_parts(
             ));
         }
     }
-    let mut runbook_names = BTreeSet::new();
-    let mut checked_runbook_tools = BTreeSet::new();
-    let mut runbook_templates = BTreeSet::new();
-    for runbook in runbooks {
-        let tool = args
-            .tools
-            .iter()
-            .find(|tool| tool.name.value() == runbook.tool)
-            .ok_or_else(|| {
-                syn::Error::new_spanned(
-                    &runbook.tool_attr,
-                    format!(
-                        "progressive runbook references undeclared tool `{}`",
-                        runbook.tool
-                    ),
-                )
-            })?;
-        if checked_runbook_tools.insert(runbook.tool.clone()) {
-            let template = tool.runbook_uri_template.as_ref().ok_or_else(|| {
-                syn::Error::new_spanned(
-                    &runbook.name,
-                    format!(
-                        "tool `{}` must declare `runbook_uri_template` because it owns runbooks",
-                        runbook.tool
-                    ),
-                )
-            })?;
-            let template_value = template.value();
-            if !template_value.contains(RUNBOOK_BINDING) {
-                return Err(syn::Error::new_spanned(
-                    template,
-                    format!("runbook URI templates must contain a `{RUNBOOK_BINDING}` binding"),
-                ));
-            }
-            if !runbook_templates.insert(template_value) {
-                return Err(syn::Error::new_spanned(
-                    template,
-                    "runbook URI templates must be unique across progressive tools",
-                ));
-            }
-        }
-        if !runbook_names.insert(runbook.name.value()) {
-            return Err(syn::Error::new_spanned(
-                &runbook.name,
-                "duplicate progressive runbook name; runbook prompts are server-global",
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -1151,7 +717,6 @@ struct ProgressiveAction {
     attr: ActionAttr,
     docs: DocComment,
     tool: String,
-    namespace: String,
     name: LitStr,
     call: MethodCall,
 }
@@ -1159,18 +724,12 @@ struct ProgressiveAction {
 #[derive(Clone, Copy)]
 struct ProgressiveParts<'a> {
     actions: &'a [ProgressiveAction],
-    runbooks: &'a [ProgressiveRunbook],
 }
 
 impl ProgressiveAction {
     fn from_method(method: &ImplItemFn, attr: &Attribute) -> syn::Result<Self> {
         let attr = ActionAttr::from_attr(attr)?;
         let name = attr.name.clone();
-        let namespace = name
-            .value()
-            .split_once('.')
-            .map(|(namespace, _)| namespace.to_owned())
-            .unwrap_or_default();
         let docs = DocComment::from_attrs(&method.attrs).ok_or_else(|| {
             syn::Error::new_spanned(
                 method,
@@ -1181,50 +740,17 @@ impl ProgressiveAction {
             )
         })?;
         Ok(Self {
-            call: MethodCall::from_method(method, true)?,
+            call: MethodCall::from_method(method)?,
             method: method.clone(),
             tool: attr.tool.value(),
             attr,
             docs,
-            namespace,
             name,
         })
     }
 
     const fn exposes_resource(&self) -> bool {
         self.attr.resource.is_some() || self.attr.resource_template.is_some()
-    }
-}
-
-struct ProgressiveRunbook {
-    method: ImplItemFn,
-    tool_attr: LitStr,
-    tool: String,
-    name: LitStr,
-    docs: DocComment,
-    call: MethodCall,
-}
-
-impl ProgressiveRunbook {
-    fn from_method(method: &ImplItemFn, attr: &Attribute) -> syn::Result<Self> {
-        let attr = RunbookAttr::from_attr(attr)?;
-        let docs = DocComment::from_attrs(&method.attrs).ok_or_else(|| {
-            syn::Error::new_spanned(
-                method,
-                format!(
-                    "progressive runbook `{}` must have a doc comment",
-                    attr.name.value()
-                ),
-            )
-        })?;
-        Ok(Self {
-            call: MethodCall::from_method(method, false)?,
-            method: method.clone(),
-            tool: attr.tool.value(),
-            tool_attr: attr.tool,
-            name: attr.name,
-            docs,
-        })
     }
 }
 
@@ -1235,7 +761,7 @@ struct MethodCall {
 }
 
 impl MethodCall {
-    fn from_method(method: &ImplItemFn, allow_input: bool) -> syn::Result<Self> {
+    fn from_method(method: &ImplItemFn) -> syn::Result<Self> {
         let has_receiver = method.sig.receiver().is_some();
         let args = method
             .sig
@@ -1263,7 +789,7 @@ impl MethodCall {
                     ));
                 }
                 takes_context = true;
-            } else if allow_input {
+            } else {
                 if input_ty.is_some() {
                     return Err(syn::Error::new_spanned(
                         arg,
@@ -1271,11 +797,6 @@ impl MethodCall {
                     ));
                 }
                 input_ty = Some((*arg.ty).clone());
-            } else {
-                return Err(syn::Error::new_spanned(
-                    arg,
-                    "runbook methods do not accept action input; use only optional ServerContext",
-                ));
             }
         }
         Ok(Self {
@@ -1334,36 +855,8 @@ impl ActionAttr {
     }
 }
 
-struct RunbookAttr {
-    tool: LitStr,
-    name: LitStr,
-}
-
-impl RunbookAttr {
-    fn from_attr(attr: &Attribute) -> syn::Result<Self> {
-        let mut name = None;
-        let mut tool = None;
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("tool") {
-                tool = Some(meta.value()?.parse()?);
-                Ok(())
-            } else if meta.path.is_ident("name") {
-                name = Some(meta.value()?.parse()?);
-                Ok(())
-            } else {
-                Err(meta.error("unsupported progressive runbook argument"))
-            }
-        })?;
-        Ok(Self {
-            tool: tool.ok_or_else(|| syn::Error::new_spanned(attr, "missing `tool = ...`"))?,
-            name: name.ok_or_else(|| syn::Error::new_spanned(attr, "missing `name = ...`"))?,
-        })
-    }
-}
-
 struct DocComment {
     description: String,
-    guidance: String,
 }
 
 impl DocComment {
@@ -1384,24 +877,7 @@ impl DocComment {
             })
             .collect::<Vec<_>>();
         let description = lines.iter().find(|line| !line.is_empty())?.clone();
-        let mut seen_description = false;
-        let guidance = lines
-            .into_iter()
-            .filter_map(|line| {
-                if !seen_description && line == description {
-                    seen_description = true;
-                    return None;
-                }
-                seen_description.then_some(line)
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_owned();
-        Some(Self {
-            description,
-            guidance,
-        })
+        Some(Self { description })
     }
 }
 
@@ -1410,6 +886,7 @@ pub(crate) struct ProgressiveArgs {
     name: Expr,
     version: Expr,
     description: Option<Expr>,
+    skills: Option<Expr>,
     tools: Vec<ProgressiveToolArg>,
     auth: AuthArgs,
 }
@@ -1421,6 +898,7 @@ impl syn::parse::Parse for ProgressiveArgs {
             name: syn::parse_quote!("mcp-progressive-server"),
             version: syn::parse_quote!("0"),
             description: None,
+            skills: None,
             tools: Vec::new(),
             auth: AuthArgs::default(),
         };
@@ -1434,6 +912,9 @@ impl syn::parse::Parse for ProgressiveArgs {
                 }
                 Meta::NameValue(name_value) if path_is(&name_value.path, "description") => {
                     args.description = Some(name_value.value);
+                }
+                Meta::NameValue(value) if path_is(&value.path, "skills") => {
+                    args.skills = Some(value.value);
                 }
                 Meta::List(list) if path_is(&list.path, "tool") => {
                     args.tools
@@ -1459,7 +940,6 @@ struct ProgressiveToolArg {
     description: LitStr,
     annotations: Option<Expr>,
     namespaces: Vec<ProgressiveNamespaceArg>,
-    runbook_uri_template: Option<LitStr>,
 }
 
 impl ProgressiveToolArg {
@@ -1470,7 +950,6 @@ impl ProgressiveToolArg {
         let mut description = None;
         let mut annotations = None;
         let mut namespaces = Vec::new();
-        let mut runbook_uri_template = None;
         for meta in metas {
             match meta {
                 Meta::NameValue(value) if path_is(&value.path, "name") => {
@@ -1487,9 +966,6 @@ impl ProgressiveToolArg {
                         ));
                     }
                     annotations = Some(value.value);
-                }
-                Meta::NameValue(value) if path_is(&value.path, "runbook_uri_template") => {
-                    runbook_uri_template = Some(lit_str(value.value, "runbook_uri_template")?);
                 }
                 Meta::List(list) if path_is(&list.path, "namespace") => {
                     namespaces.push(ProgressiveNamespaceArg::from_tokens(list.tokens)?);
@@ -1517,7 +993,6 @@ impl ProgressiveToolArg {
             })?,
             annotations,
             namespaces,
-            runbook_uri_template,
         })
     }
 }
@@ -1692,17 +1167,6 @@ mod tests {
             "#,
             "action references undeclared tool `other`",
         );
-        assert_impl_error_contains(
-            one_tool_args(),
-            r#"
-                impl Server {
-                    /// Runbook.
-                    #[runbook(tool = "other", name = "setup")]
-                    fn setup() {}
-                }
-            "#,
-            "runbook references undeclared tool `other`",
-        );
     }
 
     #[test]
@@ -1868,64 +1332,17 @@ mod tests {
     }
 
     #[test]
-    fn runbook_names_are_globally_unique_and_require_a_template() {
-        let args = r#"
-            tool(name = "one", description = "One", runbook_uri_template = "one://{runbook}"),
-            tool(name = "two", description = "Two", runbook_uri_template = "two://{runbook}")
-        "#;
-        assert_impl_error_contains(
-            args,
-            r#"
-                impl Server {
-                    /// First.
-                    #[runbook(tool = "one", name = "setup")]
-                    fn first() {}
-                    /// Second.
-                    #[runbook(tool = "two", name = "setup")]
-                    fn second() {}
-                }
-            "#,
-            "runbook prompts are server-global",
-        );
-        assert_impl_error_contains(
-            one_tool_args(),
-            r#"
-                impl Server {
-                    /// Setup.
-                    #[runbook(tool = "exec", name = "setup")]
-                    fn setup() {}
-                }
-            "#,
-            "must declare `runbook_uri_template`",
-        );
-        assert_impl_error_contains(
-            r#"tool(name = "exec", description = "Exec", runbook_uri_template = "runbooks://static")"#,
-            r#"
-                impl Server {
-                    /// Setup.
-                    #[runbook(tool = "exec", name = "setup")]
-                    fn setup() {}
-                }
-            "#,
-            "must contain a `{runbook}` binding",
-        );
-        assert_impl_error_contains(
-            r#"
-                tool(name = "one", description = "One", runbook_uri_template = "runbooks://{runbook}"),
-                tool(name = "two", description = "Two", runbook_uri_template = "runbooks://{runbook}")
-            "#,
-            r#"
-                impl Server {
-                    /// First.
-                    #[runbook(tool = "one", name = "first")]
-                    fn first() {}
-                    /// Second.
-                    #[runbook(tool = "two", name = "second")]
-                    fn second() {}
-                }
-            "#,
-            "must be unique across progressive tools",
-        );
+    fn rejects_removed_runbook_options_and_registers_catalog() {
+        assert!(syn::parse_str::<ProgressiveArgs>(r#"tool(name = "exec", description = "Exec", runbook_uri_template = "x://{runbook}")"#).is_err());
+        let args = syn::parse_str::<ProgressiveArgs>(
+            r#"skills = self.catalog, tool(name = "exec", description = "Exec")"#,
+        )
+        .unwrap();
+        let expanded = expand_progressive_server(&args, syn::parse_str("impl Server {}").unwrap())
+            .unwrap()
+            .to_string();
+        assert!(expanded.contains("skill_catalog"));
+        assert!(!expanded.contains("root_help"));
     }
 
     fn one_tool_args() -> &'static str {

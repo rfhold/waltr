@@ -34,6 +34,8 @@ use super::{
 #[derive(Debug, Clone)]
 /// Options used when connecting an MCP client.
 pub struct McpClientOptions {
+    /// Opt in to the official Skills extension. Disabled by default.
+    pub skills: bool,
     /// Client implementation name sent in request metadata.
     pub client_name: String,
     /// Client implementation version sent in request metadata.
@@ -55,12 +57,20 @@ impl McpClientOptions {
         timeout: Duration,
     ) -> Self {
         Self {
+            skills: false,
             client_name: client_name.into(),
             client_version: client_version.into(),
             timeout,
             trace_propagation: McpTracePropagation::Disabled,
             log_level: None,
         }
+    }
+
+    /// Set request-level trace propagation.
+    #[must_use]
+    pub const fn with_skills(mut self) -> Self {
+        self.skills = true;
+        self
     }
 
     /// Set request-level trace propagation.
@@ -137,6 +147,67 @@ impl std::fmt::Debug for McpClient {
 }
 
 impl McpClient {
+    fn require_skills(&self) -> Result<()> {
+        let opted_in = self
+            .request_meta
+            .get(MCP_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(|v| v.get("extensions"))
+            .and_then(|v| v.get(crate::skills::SKILLS_EXTENSION))
+            .is_some();
+        if !opted_in || !self.capabilities.supports_skills() {
+            return Err(crate::Error::protocol(
+                "Skills extension requires explicit client opt-in and server advertisement",
+            ));
+        }
+        Ok(())
+    }
+
+    /// List one skill page while retaining cache metadata; no file content is prefetched.
+    pub async fn list_skills(
+        &self,
+        cursor: Option<&str>,
+        cancellation_token: CancellationToken,
+    ) -> Result<crate::McpSkillList> {
+        self.require_skills()?;
+        let mut params = json!({});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let raw = self
+            .request("skills/list", Some(params), cancellation_token)
+            .await?;
+        let page: crate::McpSkillList = serde_json::from_value(raw)
+            .map_err(|e| crate::Error::protocol(format!("invalid skills/list result: {e}")))?;
+        let mut seen = std::collections::HashSet::new();
+        for skill in &page.skills {
+            crate::skills::validate_skill(skill)?;
+            if !seen.insert(&skill.uri) {
+                return Err(crate::Error::protocol("duplicate skill URI on list page"));
+            }
+        }
+        Ok(page)
+    }
+
+    /// Fetch a held entry by URI without fetching or activating its files.
+    pub async fn get_skill(
+        &self,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<crate::McpSkillResult> {
+        self.require_skills()?;
+        let raw = self
+            .request("skills/get", Some(json!({"uri": uri})), cancellation_token)
+            .await?;
+        let result: crate::McpSkillResult = serde_json::from_value(raw)
+            .map_err(|e| crate::Error::protocol(format!("invalid skills/get result: {e}")))?;
+        crate::skills::validate_skill(&result.skill)?;
+        if result.skill.uri != uri {
+            return Err(crate::Error::protocol(
+                "skills/get returned a different URI",
+            ));
+        }
+        Ok(result)
+    }
     /// Connect to a server, discover its capabilities, and return a typed client.
     ///
     /// # Errors
@@ -838,6 +909,11 @@ fn client_request_meta(options: &McpClientOptions) -> serde_json::Map<String, Va
     ]);
     if let Some(level) = options.log_level {
         meta.insert(MCP_LOG_LEVEL_META_KEY.to_owned(), json!(level.to_string()));
+    }
+    if options.skills {
+        meta.get_mut(MCP_CLIENT_CAPABILITIES_META_KEY)
+            .expect("client capabilities")["extensions"] =
+            json!({crate::skills::SKILLS_EXTENSION: {}});
     }
     meta
 }
