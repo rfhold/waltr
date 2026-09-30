@@ -35,7 +35,8 @@ Middleware behavior is exposed through agent configuration APIs, not through a p
 | --- | --- |
 | System prompt | Stores prompt fragments in durable middleware state and replays them on resume. |
 | `AGENTS.md` | Loads configured instruction files and dynamic read-context reminders through worker workspace reads. |
-| Skills | Adds a visible skill catalog, exposes `load_skill`, and reveals dynamic catalogs using worker workspace reads. |
+| Skills | One loader publishes `load_skill` with an explicit local/MCP source selector; adapters own worker-backed local catalogs and reveal, or remote manifest-bound activation and consent. |
+| MCP resources | Publishes `read_mcp_resource` for raw data with held-manifest verification; ordinary reads and user-inserted resource templates require the resources feature. |
 | Tool visibility | Filters tools from provider requests when policy denies whole-tool access. |
 | Tool metadata | Adds request-scoped filesystem root hints. |
 | Sandbox context | When opted in, adds a bounded worker filesystem snapshot to durable prompt state. |

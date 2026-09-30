@@ -9,10 +9,12 @@ pub(crate) mod file_templates;
 pub(crate) mod mcp_instructions;
 pub(crate) mod mcp_prompts;
 pub(crate) mod mcp_resources;
+pub(crate) mod mcp_skills;
 pub(crate) mod prompt;
 pub(crate) mod question_suspension;
 pub(crate) mod sandbox_skills;
 pub(crate) mod sandbox_snapshot;
+pub(crate) mod skills;
 pub(crate) mod tool_metadata;
 pub(crate) mod tools;
 

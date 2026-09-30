@@ -575,6 +575,8 @@ struct RawMcpFeature {
     resources: bool,
     #[serde(default)]
     prompts: bool,
+    #[serde(default)]
+    skills: bool,
     #[serde(default = "default_true")]
     trace_propagation: bool,
     #[serde(default)]
@@ -597,6 +599,7 @@ impl RawMcpFeature {
             instructions: self.instructions,
             resources: self.resources,
             prompts: self.prompts,
+            skills: self.skills,
             trace_propagation: self.trace_propagation,
             default_permissions: self.default_permissions,
         })

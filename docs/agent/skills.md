@@ -1,5 +1,7 @@
 # Skills
 
+This document covers workspace skills and the shared `load_skill` interface. Remote MCP Skills use separate opt-in, origin labels, and manifest-bound consent; see [MCP Skills](mcp.md#mcp-skills).
+
 Agent skills are reusable prompt/resource packages discovered from `.agents/skills/` directories and exposed to the provider through a visible catalog plus a synthetic `load_skill` tool. Agent middleware owns catalog state and rendering; the private worker owns workspace discovery, reads, and resource listing. Skills are not enabled by default. See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
@@ -40,16 +42,31 @@ The catalog is request context. Loaded skill content is returned as a tool resul
 
 ## `load_skill`
 
-Skills middleware exposes a synthetic tool named `load_skill`.
+One `SkillsMiddleware` publishes the synthetic `load_skill` tool and routes calls to the local workspace or remote MCP adapter. Its schema is the same whether local skills, MCP Skills, or both are enabled. Every call requires an explicit `source`; a disabled source is rejected rather than inferred or substituted.
 
 Input shape:
 
 | Field | Purpose |
 | --- | --- |
-| `name` | Skill name to load. |
-| `root` | Optional root disambiguator when multiple visible catalogs contain the same name. |
+| `source` | Required selector: `local` or `mcp`. |
+| `name` | Required for `source: "local"`: visible skill name to load. |
+| `root` | Optional for `source: "local"`: root disambiguator when multiple visible catalogs contain the same name. |
+| `server` | Required for `source: "mcp"`: configured MCP server key. |
+| `uri` | Required for `source: "mcp"`: absolute skill URI ending in `/SKILL.md`. |
 
-The tool only resolves visible catalog entries. Worker reads return `SKILL.md` content and list resource paths under standard resource directories such as `scripts`, `references`, and `assets`; agent middleware formats and retains loaded content in durable middleware state.
+```json
+{"source":"local","name":"inspect","root":"/workspace"}
+```
+
+```json
+{"source":"mcp","server":"waltr","uri":"skill://resource-administration/SKILL.md"}
+```
+
+Local selectors cannot include `server` or `uri`; MCP selectors cannot include `name` or `root`. Unknown fields are rejected.
+
+For `source: "local"`, the tool only resolves visible catalog entries. Worker reads return `SKILL.md` content and list resource paths under standard resource directories such as `scripts`, `references`, and `assets`; agent middleware formats and retains loaded content in durable middleware state.
+
+For `source: "mcp"`, the tool fetches the exact remote manifest and requires explicit manifest-bound activation approval before revealing verified `SKILL.md`. Direct remote URIs need not appear in discovery. Supporting files use `read_mcp_resource` with `server` and the exact file `uri`, not another loader selector; this reads data and does not activate skills.
 
 Resource contents are not loaded automatically, and scripts are not executed by the skills system.
 
@@ -63,7 +80,7 @@ Dynamic reveal depends on filesystem tools and is separate from static skills co
 
 - Skills are opt-in through `AgentBuilder::with_skills`.
 - Dynamic reveal is separately opt-in through filesystem configuration.
-- `load_skill` cannot load arbitrary paths; it can only load visible discovered skills.
+- `load_skill` with `source: "local"` cannot load arbitrary paths; it can only load visible discovered skills.
 - Skill resource paths are listed, not read automatically.
 - Skill scripts are not executed by the skills implementation.
 - Server agent definitions can enable skills; there is no separate public worker route, TUI, web, or CLI skills API.
@@ -89,4 +106,5 @@ Focused coverage:
 | [../../crates/waltr-agent/src/tools/skills/config.rs](../../crates/waltr-agent/src/tools/skills/config.rs) | Skills configuration. |
 | [../../crates/waltr-agent/src/tools/skills/definition.rs](../../crates/waltr-agent/src/tools/skills/definition.rs) | Skill frontmatter and name validation. |
 | [../../crates/waltr-agent/src/tools/skills/render.rs](../../crates/waltr-agent/src/tools/skills/render.rs) | Visible skill catalog and reminder rendering. |
-| [../../crates/waltr-agent/src/middleware/sandbox_skills.rs](../../crates/waltr-agent/src/middleware/sandbox_skills.rs) | Worker-backed skills middleware, `load_skill`, and dynamic reveal. |
+| [../../crates/waltr-agent/src/middleware/skills.rs](../../crates/waltr-agent/src/middleware/skills.rs) | Shared `load_skill` schema and source routing. |
+| [../../crates/waltr-agent/src/middleware/sandbox_skills.rs](../../crates/waltr-agent/src/middleware/sandbox_skills.rs) | Worker-backed local skill catalog, loading, and dynamic reveal. |

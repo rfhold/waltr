@@ -179,6 +179,8 @@ impl MiddlewareStateAccess for RequestContext<'_> {
 /// Context shared by tool-call middleware phases.
 #[derive(Debug)]
 pub(crate) struct ToolCallContext<'a> {
+    /// Active run cancellation for predispatch middleware I/O.
+    pub(crate) cancellation_token: CancellationToken,
     /// Durable session id.
     pub(crate) session_id: &'a str,
     /// Current provider turn number.

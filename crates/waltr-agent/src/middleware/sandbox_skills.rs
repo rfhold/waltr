@@ -9,11 +9,11 @@ use super::{
     AgentMiddleware, HookOutcome,
     context::{
         MiddlewareStateAccess, RequestContext, SystemPromptParts, TemplateRenderContext,
-        TemplateSearchContext, ToolCallContext, ToolDraft, ToolResultContext,
+        TemplateSearchContext, ToolCallContext, ToolResultContext,
     },
 };
 use crate::{
-    Result, ToolDefinition, ToolResult,
+    Result, ToolResult,
     resource::{
         SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
         TemplateSearchResults, prompt_score,
@@ -158,8 +158,8 @@ fn select_skill<'a>(
     matches.next().is_none().then_some(first)
 }
 
-impl AgentMiddleware for SandboxSkillsMiddleware {
-    async fn build_system_prompt(
+impl SandboxSkillsMiddleware {
+    async fn build_catalog(
         &self,
         ctx: &mut RequestContext<'_>,
         prompt: &mut SystemPromptParts,
@@ -188,31 +188,16 @@ impl AgentMiddleware for SandboxSkillsMiddleware {
         }
         Ok(HookOutcome::Continue)
     }
+}
 
-    async fn list_tools(&self, _ctx: &mut RequestContext<'_>, tools: &mut ToolDraft) -> Result<()> {
-        tools.push(ToolDefinition::new("load_skill", "Load full instructions for a visible Agent Skill.", json!({"type":"object","properties":{"name":{"type":"string"},"root":{"type":"string"}},"required":["name"],"additionalProperties":false})));
-        Ok(())
-    }
-
-    async fn before_tool_call(&self, ctx: &mut ToolCallContext<'_>) -> Result<HookOutcome> {
-        if ctx.call.name != "load_skill" {
-            return Ok(HookOutcome::Continue);
-        }
-        let name = ctx
-            .call
-            .arguments
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| crate::LlmError::Protocol {
-                provider: "skills",
-                message: "missing skill name".into(),
-            })?;
+impl SandboxSkillsMiddleware {
+    pub(crate) async fn load(
+        &self,
+        ctx: &mut ToolCallContext<'_>,
+        name: &str,
+        root: Option<&str>,
+    ) -> Result<HookOutcome> {
         let mut state = ctx.state_as::<SkillState>(STATE)?.unwrap_or_default();
-        let root = ctx
-            .call
-            .arguments
-            .get("root")
-            .and_then(serde_json::Value::as_str);
         let skill =
             select_skill(&state.catalog, name, root).ok_or_else(|| crate::LlmError::Protocol {
                 provider: "skills",
@@ -244,7 +229,16 @@ impl AgentMiddleware for SandboxSkillsMiddleware {
             content,
         )))
     }
+}
 
+impl AgentMiddleware for SandboxSkillsMiddleware {
+    async fn build_system_prompt(
+        &self,
+        ctx: &mut RequestContext<'_>,
+        prompt: &mut SystemPromptParts,
+    ) -> Result<HookOutcome> {
+        self.build_catalog(ctx, prompt).await
+    }
     async fn after_tool_call(&self, ctx: &mut ToolResultContext<'_>) -> Result<HookOutcome> {
         if self.reveal_roots.is_empty() {
             return Ok(HookOutcome::Continue);

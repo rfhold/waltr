@@ -24,7 +24,7 @@ pub fn render_skills_catalog(skills: &[SkillDefinition], heading: &str) -> Optio
         )
         .expect("write skills catalog");
     }
-    output.push_str("\nUse the load_skill tool to load a skill before following its instructions.");
+    output.push_str("\nUse load_skill({source:\"local\",name,root?}) to load a visible skill before following its instructions; specify root when names collide.");
     if ambiguous.is_empty() {
         output.push_str(" If multiple skills share a name, pass the root shown in the catalog.");
     } else {

@@ -56,6 +56,10 @@ pub(in crate::mcp) struct McpResourceRegistry {
 
 pub(in crate::mcp) struct McpServerRuntime {
     name: String,
+    skills: bool,
+    skill_origin: String,
+    retired: std::sync::atomic::AtomicBool,
+    skill_cancellation: CancellationToken,
     client: McpClient,
     transport_kind: &'static str,
     #[allow(dead_code)]
@@ -95,6 +99,7 @@ impl McpServerRuntime {
         timeout: Duration,
         log_level: Option<McpLogLevel>,
         trace_propagation: McpTracePropagation,
+        skills: bool,
         root_uri: String,
         events: broadcast::Sender<McpRuntimeEvent>,
         cancellation_token: CancellationToken,
@@ -115,12 +120,20 @@ impl McpServerRuntime {
         });
         let mut options = McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
             .with_trace_propagation(trace_propagation);
+        if skills {
+            options = options.with_skills();
+        }
         if let Some(level) = log_level {
             options = options.with_log_level(level);
         }
-        let mut transport_options = McpTransportOptions::default().with_limits(
-            McpTransportLimits::new(WALTR_MCP_MESSAGE_BYTES, WALTR_MCP_MESSAGE_BYTES),
-        );
+        // JSON escaping can expand a 16 MiB UTF-8 resource to six times its raw size.
+        let message_bytes = if skills {
+            100 * 1024 * 1024
+        } else {
+            WALTR_MCP_MESSAGE_BYTES
+        };
+        let mut transport_options = McpTransportOptions::default()
+            .with_limits(McpTransportLimits::new(message_bytes, message_bytes));
         if let Some(provider) = config.bearer_provider {
             transport_options = transport_options.with_bearer_provider(provider);
         }
@@ -143,6 +156,10 @@ impl McpServerRuntime {
         .await?;
         let runtime = Arc::new(Self {
             name,
+            skills,
+            skill_origin: uuid::Uuid::now_v7().to_string(),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            skill_cancellation: cancellation_token.child_token(),
             client,
             transport_kind,
             root_uri,
@@ -194,6 +211,90 @@ impl McpServerRuntime {
 
     pub(in crate::mcp) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(in crate::mcp) fn skills_enabled(&self) -> bool {
+        self.skills
+            && !self.retired.load(Ordering::Acquire)
+            && self.client.capabilities().supports_skills()
+    }
+
+    pub(in crate::mcp) fn skill_origin(&self) -> &str {
+        &self.skill_origin
+    }
+
+    pub(in crate::mcp) async fn skill_catalog(
+        &self,
+        remaining: &mut usize,
+    ) -> Result<Vec<mcp::skills::McpSkillList>> {
+        let mut pages = Vec::new();
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut count = 0;
+        for _ in 0..128 {
+            let page = self
+                .client
+                .list_skills(cursor.as_deref(), self.skill_cancellation.child_token())
+                .await?;
+            super::skills::charge_metadata(&(self.name(), &page), remaining)?;
+            count += page.skills.len();
+            if count > 4096 {
+                return Err(protocol_error("MCP skill catalog exceeds 4096 entries"));
+            }
+            cursor = page.next_cursor.clone();
+            pages.push(page);
+            let Some(next) = &cursor else {
+                return Ok(pages);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(protocol_error("MCP skill catalog repeated a cursor"));
+            }
+        }
+        Err(protocol_error("MCP skill catalog exceeds 128 pages"))
+    }
+
+    pub(in crate::mcp) async fn get_skill(
+        &self,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<mcp::skills::McpSkillResult> {
+        if !self.skills_enabled() {
+            return Err(protocol_error("MCP Skills are not enabled"));
+        }
+        let cancellation = cancellation_token.child_token();
+        let operation = self.client.get_skill(uri, cancellation.clone());
+        tokio::pin!(operation);
+        let result = tokio::select! {
+            biased;
+            () = self.skill_cancellation.cancelled() => {
+                cancellation.cancel();
+                operation.await
+            }
+            result = &mut operation => result,
+        }?;
+        let mut remaining = super::skills::METADATA_BUDGET;
+        super::skills::charge_metadata(&result, &mut remaining)?;
+        Ok(result)
+    }
+
+    pub(in crate::mcp) async fn read_skill(
+        &self,
+        skill: &mcp::skills::McpSkill,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<u8>> {
+        if !self.skills_enabled() {
+            return Err(protocol_error("MCP Skills are not enabled"));
+        }
+        mcp::skills::validate_skill(skill)?;
+        let mcp::skills::McpSkillResources::Files(files) = &skill.resources else {
+            return Err(protocol_error("dynamic MCP skills are not supported"));
+        };
+        if !files.iter().any(|file| file.uri == uri) {
+            return Err(protocol_error("resource is not in the held skill manifest"));
+        }
+        let response = self.read_resource_data(uri, cancellation_token).await?;
+        super::skills::verified_resource_bytes(skill, uri, response)
     }
 
     pub(in crate::mcp) async fn tools(&self) -> Vec<McpToolDefinition> {
@@ -326,6 +427,44 @@ impl McpServerRuntime {
             self.ensure_initialized(cancellation_token.clone()).await?;
             let response = self.client.read_resource(uri, cancellation_token).await?;
             Ok(response.format_text())
+        }
+        .instrument(span)
+        .await
+    }
+
+    pub(in crate::mcp) async fn read_resource_data(
+        &self,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<mcp::McpResourceResult> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(protocol_error("MCP runtime is retired"));
+        }
+        let span = tracing::info_span!(
+            "mcp.agent.operation",
+            mcp.server = %self.name,
+            mcp.transport = self.transport_kind,
+            rpc.method = "resources/read",
+            mcp.resource.uri = %uri,
+        );
+        async move {
+            let cancellation = cancellation_token.child_token();
+            let operation = async {
+                self.ensure_initialized(cancellation.clone()).await?;
+                self.client
+                    .read_resource(uri, cancellation.clone())
+                    .await
+                    .map_err(Into::into)
+            };
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                () = self.skill_cancellation.cancelled() => {
+                    cancellation.cancel();
+                    operation.await
+                }
+                result = &mut operation => result,
+            }
         }
         .instrument(span)
         .await
@@ -501,6 +640,8 @@ impl McpServerRuntime {
     }
 
     pub(in crate::mcp) async fn shutdown(&self) -> Result<()> {
+        self.retired.store(true, Ordering::Release);
+        self.skill_cancellation.cancel();
         self.client.shutdown().await?;
         Ok(())
     }

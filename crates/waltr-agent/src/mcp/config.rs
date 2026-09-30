@@ -12,6 +12,7 @@ pub struct McpConfig {
     pub(in crate::mcp) timeout: Duration,
     pub(in crate::mcp) log_level: Option<McpLogLevel>,
     pub(in crate::mcp) trace_propagation: McpTracePropagation,
+    pub(in crate::mcp) skills: bool,
 }
 
 impl McpConfig {
@@ -23,6 +24,7 @@ impl McpConfig {
             timeout: DEFAULT_TIMEOUT,
             log_level: None,
             trace_propagation: McpTracePropagation::Disabled,
+            skills: false,
         }
     }
 
@@ -54,6 +56,13 @@ impl McpConfig {
         self
     }
 
+    /// Opt in to metadata discovery and verified on-demand MCP Skills.
+    #[must_use]
+    pub const fn with_skills(mut self) -> Self {
+        self.skills = true;
+        self
+    }
+
     pub(in crate::mcp) fn into_parts(
         self,
     ) -> (
@@ -61,12 +70,14 @@ impl McpConfig {
         Duration,
         Option<McpLogLevel>,
         McpTracePropagation,
+        bool,
     ) {
         (
             self.servers,
             self.timeout,
             self.log_level,
             self.trace_propagation,
+            self.skills,
         )
     }
 }
