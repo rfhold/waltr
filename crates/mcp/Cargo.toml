@@ -7,10 +7,10 @@ version.workspace = true
 [features]
 default = ["macros"]
 macros = ["dep:mcp-macros"]
-oauth-authorization-server = ["dep:aes-gcm", "dep:p256", "dep:sha2", "dep:zeroize"]
+oauth-authorization-server = ["dep:aes-gcm", "dep:p256", "dep:zeroize"]
 oauth-authorization-server-postgres = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/postgres", "sqlx/runtime-tokio-rustls"]
 oauth-authorization-server-sqlite = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite"]
-oauth-resource-owner-oidc = ["oauth-authorization-server", "dep:cookie", "dep:jsonwebtoken", "dep:sha2", "dep:zeroize"]
+oauth-resource-owner-oidc = ["oauth-authorization-server", "dep:cookie", "dep:jsonwebtoken", "dep:zeroize"]
 oauth-resource-owner-oidc-postgres = ["oauth-resource-owner-oidc", "oauth-authorization-server-postgres"]
 oauth-resource-owner-oidc-sqlite = ["oauth-resource-owner-oidc", "oauth-authorization-server-sqlite"]
 progressive = ["macros", "dep:jaq-core", "dep:jaq-interpret", "dep:jaq-parse", "dep:jaq-std", "dep:schemars"]
@@ -33,7 +33,8 @@ p256 = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
+serde_yaml_ng.workspace = true
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }

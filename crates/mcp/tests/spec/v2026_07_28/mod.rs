@@ -8,6 +8,7 @@ mod request_sse;
 mod schema;
 mod server;
 mod server_utilities;
+mod skills;
 mod stdio;
 mod subscriptions;
 mod transport;

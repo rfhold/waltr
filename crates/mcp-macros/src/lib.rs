@@ -15,6 +15,8 @@ use syn::{
 /// Supported method helper attributes are `tool`, `prompt`, `resource`,
 /// `resource_template`, `complete`, `notification`, `instructions`, and
 /// `token_validator`.
+/// Register embedded skills with `skills = self.catalog`, an expression yielding
+/// `Arc<mcp::SkillCatalog>`. An empty catalog does not advertise the extension.
 #[proc_macro_attribute]
 pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ServerArgs);
@@ -24,50 +26,10 @@ pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Generate an opinionated progressive MCP server.
-///
-/// Declare one or more `tool(...)` entries in the server attribute. Each tool
-/// owns its action schema, namespaces, help, and runbooks. Methods register with
-/// `#[action(tool = "...", name = "...")]` or
-/// `#[runbook(tool = "...", name = "...")]`. Runbook prompts and all resources
-/// are server-global, while tool calls dispatch only to declarations owned by
-/// the selected tool. The macro also generates the same Streamable HTTP helper
-/// methods as `#[mcp_server]`.
-///
-/// ```ignore
-/// #[mcp::progressive_server(
-///     name = "example",
-///     version = "1",
-///     description = "Example server.",
-///     tool(
-///         name = "exec",
-///         description = "Configuration actions.",
-///         namespace(configuration, description = "Inspect configuration."),
-///         namespace(name = "alert-rule", description = "Inspect alert rules."),
-///         runbook_uri_template = "example://runbooks/{runbook}"
-///     ),
-///     tool(name = "sessions", description = "Session actions.")
-/// )]
-/// impl ExampleServer {
-///     /// Inspect configuration.
-///     #[action(tool = "exec", name = "configuration.inspect")]
-///     fn inspect(&self) -> mcp::server::ServerResult<serde_json::Value> {
-///         todo!()
-///     }
-///
-///     /// List alert rules.
-///     #[action(tool = "exec", name = "alert-rule.list")]
-///     fn list_alert_rules(&self) -> mcp::server::ServerResult<serde_json::Value> {
-///         todo!()
-///     }
-///
-///     /// Configure the server.
-///     #[runbook(tool = "exec", name = "configuration")]
-///     fn configuration(&self) -> mcp::server::ServerResult<String> {
-///         todo!()
-///     }
-/// }
-/// ```
+/// Generate grouped action tools with typed input schemas and semantic results.
+/// Register caller-authored embedded skills using `skills = self.catalog`, where
+/// the expression returns an `Arc<mcp::SkillCatalog>`. No help actions or runbook
+/// prompts are generated. Action methods use `#[action(tool = "exec", name = "inspect")]`.
 #[proc_macro_attribute]
 pub fn progressive_server(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as progressive::ProgressiveArgs);
@@ -177,6 +139,7 @@ fn handler_impl(
     let read_resource = read_resource_impl(parts.resources, parts.resource_templates);
     let complete = completion_impl(parts.completion);
     let notifications = notifications_impl(parts.notifications);
+    let catalog = skill_catalog_impl(args.skills.as_ref());
 
     quote! {
         impl #impl_generics ::mcp::server::ServerHandler for #self_ty #where_clause {
@@ -203,6 +166,7 @@ fn handler_impl(
             #complete
 
             #notifications
+            #catalog
         }
     }
 }
@@ -240,6 +204,9 @@ fn capabilities_impl(args: &ServerArgs, parts: &HandlerParts<'_>) -> TokenStream
     let completions =
         completions.then(|| quote! { let capabilities = capabilities.completions(); });
     let logging = logging.then(|| quote! { let capabilities = capabilities.logging(); });
+    let skills = args.skills.as_ref().map(|_| quote! {
+        let capabilities = if self.skill_catalog().is_some_and(|catalog| !catalog.is_empty()) { capabilities.skills() } else { capabilities };
+    });
 
     quote! {
         fn capabilities(&self) -> ::mcp::server::ServerCapabilities {
@@ -249,6 +216,7 @@ fn capabilities_impl(args: &ServerArgs, parts: &HandlerParts<'_>) -> TokenStream
             #resources
             #completions
             #logging
+            #skills
             capabilities
         }
     }
@@ -269,6 +237,16 @@ fn instructions_impl(method: Option<&ImplItemFn>) -> TokenStream2 {
             #call
         }
     }
+}
+
+fn skill_catalog_impl(expression: Option<&Expr>) -> TokenStream2 {
+    expression.map_or_else(TokenStream2::new, |expression| {
+        quote! {
+            fn skill_catalog(&self) -> Option<::std::sync::Arc<::mcp::SkillCatalog>> {
+                Some((#expression).clone())
+            }
+        }
+    })
 }
 
 fn list_tools_impl(tools: &[RegisteredMethod], next_cursor: Option<&Expr>) -> TokenStream2 {
@@ -462,6 +440,9 @@ fn read_resource_impl(
             uri: String,
             context: ::mcp::server::ServerContext,
         ) -> ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpResourceResult>> {
+            if let Some(result) = self.skill_catalog().and_then(|catalog| catalog.read(&uri)) {
+                return Box::pin(async move { Ok(result) });
+            }
             #(#resource_branches)*
             #(#template_branches)*
             Box::pin(async move { Err(::mcp::server::ServerError::resource_not_found(uri)) })
@@ -813,6 +794,7 @@ impl NotificationAttr {
 }
 
 struct ServerArgs {
+    skills: Option<Expr>,
     name: Expr,
     version: Expr,
     description: Option<Expr>,
@@ -828,6 +810,7 @@ impl syn::parse::Parse for ServerArgs {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
         let mut args = Self {
+            skills: None,
             name: syn::parse_quote!("mcp-server"),
             version: syn::parse_quote!("0"),
             description: None,
@@ -841,6 +824,9 @@ impl syn::parse::Parse for ServerArgs {
 
         for meta in metas {
             match meta {
+                Meta::NameValue(value) if path_is(&value.path, "skills") => {
+                    args.skills = Some(value.value);
+                }
                 Meta::NameValue(name_value) if path_is(&name_value.path, "name") => {
                     args.name = name_value.value;
                 }

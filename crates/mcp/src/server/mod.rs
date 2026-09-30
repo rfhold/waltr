@@ -117,6 +117,16 @@ pub struct ServerCapabilities {
 }
 
 impl ServerCapabilities {
+    /// Advertise the Skills extension and its required Resources primitive.
+    #[must_use]
+    pub fn skills(mut self) -> Self {
+        let extensions = self.extensions.get_or_insert_with(|| json!({}));
+        extensions[crate::skills::SKILLS_EXTENSION] = json!({});
+        if self.resources.is_none() {
+            self = self.resources();
+        }
+        self
+    }
     /// Create empty server capabilities.
     #[must_use]
     pub fn new() -> Self {
@@ -438,6 +448,36 @@ impl NotificationSender {
 
 /// MCP server handler.
 pub trait ServerHandler: Send + Sync + 'static {
+    /// Optional immutable embedded catalog. Custom handlers can override list/get instead.
+    fn skill_catalog(&self) -> Option<std::sync::Arc<crate::SkillCatalog>> {
+        None
+    }
+    /// List an atomic page of Skills extension entries.
+    fn list_skills(
+        &self,
+        cursor: Option<String>,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<crate::McpSkillList>> {
+        let catalog = self.skill_catalog();
+        Box::pin(async move {
+            catalog
+                .ok_or_else(|| ServerError::method_not_found("skills/list"))?
+                .list(cursor)
+        })
+    }
+    /// Get a complete entry by its SKILL.md URI.
+    fn get_skill(
+        &self,
+        uri: String,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<crate::McpSkillResult>> {
+        let catalog = self.skill_catalog();
+        Box::pin(async move {
+            catalog
+                .ok_or_else(|| ServerError::method_not_found("skills/get"))?
+                .get(&uri)
+        })
+    }
     /// Server metadata.
     fn server_info(&self) -> ServerInfo;
     /// Server capabilities.
@@ -495,13 +535,22 @@ pub trait ServerHandler: Send + Sync + 'static {
     ) -> BoxFuture<ServerResult<McpResourceTemplateList>> {
         Box::pin(async { Err(ServerError::method_not_found("resources/templates/list")) })
     }
-    /// Read a resource.
+    /// Read a resource. The default serves the embedded catalog; overrides own
+    /// authorization and may compose catalog reads with other resources.
     fn read_resource(
         &self,
-        _uri: String,
+        uri: String,
         _context: ServerContext,
     ) -> BoxFuture<ServerResult<McpResourceResult>> {
-        Box::pin(async { Err(ServerError::method_not_found("resources/read")) })
+        let catalog = self.skill_catalog();
+        Box::pin(async move {
+            match catalog {
+                Some(catalog) => catalog
+                    .read(&uri)
+                    .ok_or_else(|| ServerError::resource_not_found(uri)),
+                None => Err(ServerError::method_not_found("resources/read")),
+            }
+        })
     }
     /// Complete a resource template argument.
     fn complete(
@@ -1477,6 +1526,14 @@ fn request_method_available(handler: &dyn ServerHandler, method: &str) -> bool {
         "server/discover" | "subscriptions/listen" => true,
         "tools/list" | "tools/call" => capabilities.tools.is_some(),
         "prompts/list" | "prompts/get" => capabilities.prompts.is_some(),
+        "skills/list" | "skills/get" => {
+            capabilities.resources.is_some()
+                && capabilities
+                    .extensions
+                    .as_ref()
+                    .and_then(|v| v.get(crate::skills::SKILLS_EXTENSION))
+                    .is_some_and(Value::is_object)
+        }
         "resources/list" | "resources/templates/list" | "resources/read" => {
             capabilities.resources.is_some()
         }
@@ -1942,6 +1999,49 @@ async fn handle_request(
                         .get_prompt(name, arguments, context)
                         .await
                         .map(|result| result.raw),
+                ),
+                Err(error) => server_error_response(request.id, error),
+            }
+        }
+        "skills/list" if request_method_available(handler.as_ref(), "skills/list") => {
+            let cursor = match request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("cursor"))
+            {
+                None => Ok(None),
+                Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
+                _ => Err(ServerError::invalid_params("skill cursor must be a string")),
+            };
+            let cursor = match cursor {
+                Ok(cursor) => cursor,
+                Err(error) => return server_error_response(request.id, error),
+            };
+            server_result(
+                request.id,
+                handler
+                    .list_skills(cursor, context)
+                    .await
+                    .and_then(|result| {
+                        serde_json::to_value(result)
+                            .map_err(|e| ServerError::internal(e.to_string()))
+                    }),
+            )
+        }
+        "skills/get" if request_method_available(handler.as_ref(), "skills/get") => {
+            let result = request
+                .params
+                .as_ref()
+                .ok_or_else(|| "missing skill params".to_owned())
+                .and_then(|params| require_string(params, "uri"))
+                .map_err(ServerError::invalid_params);
+            match result {
+                Ok(uri) => server_result(
+                    request.id,
+                    handler.get_skill(uri, context).await.and_then(|result| {
+                        serde_json::to_value(result)
+                            .map_err(|e| ServerError::internal(e.to_string()))
+                    }),
                 ),
                 Err(error) => server_error_response(request.id, error),
             }
