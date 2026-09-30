@@ -34,6 +34,7 @@ const WAIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 pub struct WaltrMcpServer {
     sessions: Arc<dyn SessionHost>,
     resources: AgentDefinitionState,
+    catalog: Arc<mcp::SkillCatalog>,
 }
 
 impl std::fmt::Debug for WaltrMcpServer {
@@ -116,12 +117,47 @@ struct ResetResourceInput {
 
 impl WaltrMcpServer {
     /// Create a Waltr MCP server backed by the same services registered with gRPC.
-    #[must_use]
-    pub fn new(sessions: Arc<dyn SessionHost>, resources: AgentDefinitionState) -> Self {
-        Self {
+    /// Returns an error if the embedded skill catalog fails validation.
+    pub fn new(
+        sessions: Arc<dyn SessionHost>,
+        resources: AgentDefinitionState,
+    ) -> mcp::Result<Self> {
+        let catalog = mcp::SkillCatalog::new()
+            .with_skill(
+                "resource-administration",
+                &[
+                    (
+                        "SKILL.md",
+                        include_bytes!("../resources/skills/resource-administration/SKILL.md"),
+                    ),
+                    (
+                        "references/resources.md",
+                        include_bytes!(
+                            "../resources/skills/resource-administration/references/resources.md"
+                        ),
+                    ),
+                ],
+            )?
+            .with_skill(
+                "hosted-sessions",
+                &[
+                    (
+                        "SKILL.md",
+                        include_bytes!("../resources/skills/hosted-sessions/SKILL.md"),
+                    ),
+                    (
+                        "references/sessions.md",
+                        include_bytes!(
+                            "../resources/skills/hosted-sessions/references/sessions.md"
+                        ),
+                    ),
+                ],
+            )?;
+        Ok(Self {
             sessions,
             resources,
-        }
+            catalog: Arc::new(catalog),
+        })
     }
 
     const fn resources(&self) -> &AgentDefinitionState {
@@ -148,14 +184,14 @@ impl WaltrMcpServer {
     name = "waltr",
     version = env!("CARGO_PKG_VERSION"),
     description = "Waltr resource administration and hosted session MCP surface.",
+    skills = self.catalog,
     tool(
         name = "exec",
         description = "Inspect and update complete Waltr resources.",
         namespace(
             resources,
             description = "Inspect, replace, and reset complete live YAML resources."
-        ),
-        runbook_uri_template = "waltr://runbooks/{runbook}"
+        )
     ),
     tool(
         name = "sessions",
@@ -200,19 +236,6 @@ impl WaltrMcpServer {
         self.inspect_resources(InspectResourcesInput {
             path: Some(input.path),
         })
-    }
-
-    /// Administer Waltr resources with stale-write protection.
-    #[runbook(tool = "exec", name = "resources")]
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    fn configuration_runbook(&self) -> ServerResult<String> {
-        Ok("## Waltr resource runbook\n\n\
-1. Call `resources.inspect` for the canonical resource path.\n\
-2. Edit one complete strict YAML resource.\n\
-3. Call `resources.replace` with its persisted-slot `expected_etag`.\n\
-4. Use `resources.reset` to remove a persisted override and reveal its bundled fallback.\n\
-5. On validation or stale-ETag errors, inspect again before retrying.\n"
-            .to_owned())
     }
 
     /// List durable hosted sessions, newest activity first.
@@ -1038,7 +1061,7 @@ mod tests {
     async fn agent_definition_action_handlers_dispatch_inspect_replace_and_reset() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state);
+        let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap();
 
         let inspected = server
             .inspect_resources(InspectResourcesInput {
@@ -1069,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_mcp_publishes_agent_definition_schema_help_and_calls() {
+    async fn public_mcp_publishes_only_service_actions_and_rejects_removed_actions() {
         let router = mcp::server::streamable_http_router(test_server());
 
         let tools = mcp_request(
@@ -1087,8 +1110,8 @@ mod tests {
         assert!(schema.contains("resources"));
         assert!(!schema.contains("configuration.inspect"));
 
-        let help = call_exec(&router, json!({ "action": "help" })).await;
-        assert!(help.to_string().contains("resources"));
+        assert!(!schema.contains("help"));
+        assert!(!schema.contains("runbooks"));
 
         let definitions = call_exec(
             &router,
@@ -1098,24 +1121,106 @@ mod tests {
         assert!(definitions.get("error").is_none(), "{definitions}");
         assert!(definitions.to_string().contains("agents/coding.yaml"));
 
-        let sessions = mcp_request(
+        for tool in ["exec", "sessions"] {
+            for action in ["help", "help.resources", "help.runbooks", "runbooks.load"] {
+                let rejected = mcp_request(
+                    &router,
+                    json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": tool, "arguments": { "action": action } }
+                    }),
+                )
+                .await;
+                assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+            }
+        }
+        let old_resource = mcp_request(
             &router,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": "sessions", "arguments": { "action": "help" } }
-            }),
+            json!({"jsonrpc":"2.0","id":1,"method":"resources/read",
+                "params":{"uri":"waltr://runbooks/resources"}}),
         )
         .await;
-        assert!(sessions["result"].is_object());
+        assert!(old_resource.get("error").is_some(), "{old_resource}");
+    }
+
+    #[tokio::test]
+    async fn public_mcp_skills_list_get_and_read_match_complete_embedded_manifest() {
+        use sha2::{Digest as _, Sha256};
+
+        let router = mcp::server::streamable_http_router(test_server());
+        let discovery = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover"}),
+        )
+        .await;
+        assert_eq!(
+            discovery["result"]["capabilities"]["extensions"][mcp::skills::SKILLS_EXTENSION],
+            json!({})
+        );
+        assert!(discovery["result"]["capabilities"]["resources"].is_object());
+
+        let listed = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"skills/list"}),
+        )
+        .await;
+        let result = &listed["result"];
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["cacheScope"], "private");
+        assert_eq!(result["ttlMs"], 0);
+        assert!(result.get("nextCursor").is_none());
+        let skills = result["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["uri"], "skill://hosted-sessions/SKILL.md");
+        assert_eq!(skills[1]["uri"], "skill://resource-administration/SKILL.md");
+        for skill in skills {
+            let uri = skill["uri"].as_str().unwrap();
+            let fetched = mcp_request(
+                &router,
+                json!({"jsonrpc":"2.0","id":1,"method":"skills/get","params":{"uri":uri}}),
+            )
+            .await;
+            assert_eq!(fetched["result"]["skill"], *skill);
+            assert_eq!(fetched["result"]["resultType"], "complete");
+            assert_eq!(fetched["result"]["cacheScope"], "private");
+            assert_eq!(fetched["result"]["ttlMs"], 0);
+            let manifest = skill["resources"].as_array().unwrap();
+            assert_eq!(manifest.len(), 2);
+            for file in manifest {
+                let read = mcp_request(
+                    &router,
+                    json!({"jsonrpc":"2.0","id":1,"method":"resources/read",
+                        "params":{"uri":file["uri"]}}),
+                )
+                .await;
+                assert_eq!(read["result"]["resultType"], "complete");
+                assert_eq!(read["result"]["cacheScope"], "private");
+                assert_eq!(read["result"]["ttlMs"], 0);
+                let content = &read["result"]["contents"][0];
+                assert_eq!(content["uri"], file["uri"]);
+                assert_eq!(content["mimeType"], "text/markdown");
+                let bytes = content["text"].as_str().unwrap().as_bytes();
+                assert_eq!(file["size"], bytes.len() as u64);
+                let hexadecimal = Sha256::digest(bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                assert_eq!(file["digest"], format!("sha256:{hexadecimal}"));
+                if file["uri"] == skill["uri"] {
+                    assert_eq!(
+                        mcp::skills::parse_skill_frontmatter(bytes).unwrap(),
+                        skill["frontmatter"].as_object().unwrap().clone()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
     async fn agent_definition_actions_classify_and_sanitize_failures() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let inner = Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state));
+        let inner = Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap());
 
         let validation = inner
             .inspect_resources(InspectResourcesInput {
@@ -1173,7 +1278,7 @@ mod tests {
     fn test_server() -> Arc<WaltrMcpServer> {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state))
+        Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap())
     }
 
     async fn call_exec(router: &Router, arguments: Value) -> Value {
@@ -1193,7 +1298,9 @@ mod tests {
         body["params"] = body.get("params").cloned().unwrap_or_else(|| json!({}));
         body["params"]["_meta"] = json!({
             "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
-            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/skills": {} }
+            },
             "io.modelcontextprotocol/clientInfo": { "name": "waltr-server-tests", "version": "1" }
         });
         let method = body["method"].as_str().unwrap();
@@ -1204,6 +1311,8 @@ mod tests {
             .header("mcp-method", method);
         if method == "tools/call" {
             request = request.header("mcp-name", body["params"]["name"].as_str().unwrap());
+        } else if method == "resources/read" {
+            request = request.header("mcp-name", body["params"]["uri"].as_str().unwrap());
         }
         let response = router
             .clone()

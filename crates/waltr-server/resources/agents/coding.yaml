@@ -9,6 +9,16 @@ spec:
   features:
     - featureSetRef:
         name: coding
+    - mcp:
+        servers:
+          exclude: []
+        exposeTools: true
+        skills: true
+        instructions: true
+        resources: true
+        prompts: true
+        tracePropagation: true
+        defaultPermissions: true
   permissions:
     - permissionSetRef:
         name: coding
