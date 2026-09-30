@@ -3,187 +3,187 @@
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Configuration {
-    #[prost(map="string, message", tag="1")]
+    #[prost(map = "string, message", tag = "1")]
     pub providers: ::std::collections::HashMap<::prost::alloc::string::String, Provider>,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub etag: ::prost::alloc::string::String,
-    #[prost(map="string, message", tag="3")]
+    #[prost(map = "string, message", tag = "3")]
     pub mcp_servers: ::std::collections::HashMap<::prost::alloc::string::String, McpServer>,
-    #[prost(message, optional, tag="4")]
+    #[prost(message, optional, tag = "4")]
     pub inference_defaults: ::core::option::Option<InferenceDefaults>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InferenceDefaults {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub provider_key: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub model_key: ::prost::alloc::string::String,
-    #[prost(string, optional, tag="5")]
+    #[prost(string, optional, tag = "5")]
     pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Provider {
-    #[prost(enumeration="ProviderType", tag="1")]
+    #[prost(enumeration = "ProviderType", tag = "1")]
     pub r#type: i32,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub url: ::prost::alloc::string::String,
-    #[prost(map="string, string", tag="4")]
+    #[prost(map = "string, string", tag = "4")]
     pub headers: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    #[prost(map="string, message", tag="5")]
+    #[prost(map = "string, message", tag = "5")]
     pub models: ::std::collections::HashMap<::prost::alloc::string::String, Model>,
-    #[prost(bool, tag="7")]
+    #[prost(bool, tag = "7")]
     pub oauth_compatible: bool,
-    #[prost(message, optional, tag="8")]
+    #[prost(message, optional, tag = "8")]
     pub oauth_settings: ::core::option::Option<OAuthProvider>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OAuthProvider {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub authorize_url: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub token_url: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
+    #[prost(string, tag = "4")]
     pub client_id: ::prost::alloc::string::String,
-    #[prost(string, tag="5")]
+    #[prost(string, tag = "5")]
     pub redirect_uri: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag="6")]
+    #[prost(string, repeated, tag = "6")]
     pub scopes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(enumeration="OauthTokenRequestStyle", tag="7")]
+    #[prost(enumeration = "OauthTokenRequestStyle", tag = "7")]
     pub token_request_style: i32,
-    #[prost(message, repeated, tag="8")]
+    #[prost(message, repeated, tag = "8")]
     pub auth_url_params: ::prost::alloc::vec::Vec<OauthUrlParam>,
-    #[prost(message, repeated, tag="9")]
+    #[prost(message, repeated, tag = "9")]
     pub jwt_metadata: ::prost::alloc::vec::Vec<OauthJwtMetadata>,
-    #[prost(bool, tag="10")]
+    #[prost(bool, tag = "10")]
     pub send_state_in_token_request: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OauthUrlParam {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub key: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub value: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OauthJwtMetadata {
-    #[prost(enumeration="OauthTokenField", tag="1")]
+    #[prost(enumeration = "OauthTokenField", tag = "1")]
     pub token: i32,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub metadata_key: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag="3")]
+    #[prost(string, repeated, tag = "3")]
     pub claim_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag="4")]
+    #[prost(bool, tag = "4")]
     pub required: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Model {
     /// Human-readable display name; map key is the stable id.
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(enumeration="ModelType", tag="2")]
+    #[prost(enumeration = "ModelType", tag = "2")]
     pub r#type: i32,
-    #[prost(message, optional, tag="3")]
+    #[prost(message, optional, tag = "3")]
     pub options: ::core::option::Option<ModelOptions>,
-    #[prost(message, optional, tag="4")]
+    #[prost(message, optional, tag = "4")]
     pub limits: ::core::option::Option<ModelLimits>,
-    #[prost(message, optional, tag="5")]
+    #[prost(message, optional, tag = "5")]
     pub capabilities: ::core::option::Option<ModelCapabilities>,
-    #[prost(message, optional, tag="6")]
+    #[prost(message, optional, tag = "6")]
     pub catalog_match: ::core::option::Option<ModelCatalogMatch>,
-    #[prost(message, optional, tag="7")]
+    #[prost(message, optional, tag = "7")]
     pub cost: ::core::option::Option<ModelCost>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ModelCost {
-    #[prost(double, optional, tag="1")]
+    #[prost(double, optional, tag = "1")]
     pub input_per_million_tokens: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="2")]
+    #[prost(double, optional, tag = "2")]
     pub output_per_million_tokens: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="3")]
+    #[prost(double, optional, tag = "3")]
     pub cache_read_per_million_tokens: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="4")]
+    #[prost(double, optional, tag = "4")]
     pub cache_write_per_million_tokens: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="5")]
+    #[prost(double, optional, tag = "5")]
     pub image_input_per_million_tokens: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="6")]
+    #[prost(double, optional, tag = "6")]
     pub image_input_per_image: ::core::option::Option<f64>,
-    #[prost(string, tag="7")]
+    #[prost(string, tag = "7")]
     pub currency: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelCatalogMatch {
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub provider_id: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
+    #[prost(string, tag = "2")]
     pub model_id: ::prost::alloc::string::String,
-    #[prost(string, optional, tag="3")]
+    #[prost(string, optional, tag = "3")]
     pub upstream_provider_id: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="4")]
+    #[prost(string, optional, tag = "4")]
     pub upstream_model_id: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(enumeration="CatalogMatchSource", tag="5")]
+    #[prost(enumeration = "CatalogMatchSource", tag = "5")]
     pub source: i32,
 }
 /// All option fields are optional; an absent field means "unset".
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ModelOptions {
-    #[prost(double, optional, tag="1")]
+    #[prost(double, optional, tag = "1")]
     pub temperature: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="2")]
+    #[prost(double, optional, tag = "2")]
     pub top_p: ::core::option::Option<f64>,
-    #[prost(uint32, optional, tag="3")]
+    #[prost(uint32, optional, tag = "3")]
     pub top_k: ::core::option::Option<u32>,
-    #[prost(double, optional, tag="4")]
+    #[prost(double, optional, tag = "4")]
     pub min_p: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="5")]
+    #[prost(double, optional, tag = "5")]
     pub presence_penalty: ::core::option::Option<f64>,
-    #[prost(double, optional, tag="6")]
+    #[prost(double, optional, tag = "6")]
     pub repetition_penalty: ::core::option::Option<f64>,
-    #[prost(string, repeated, tag="7")]
+    #[prost(string, repeated, tag = "7")]
     #[serde(default)]
     pub reasoning_efforts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelLimits {
-    #[prost(uint32, optional, tag="1")]
+    #[prost(uint32, optional, tag = "1")]
     pub context: ::core::option::Option<u32>,
-    #[prost(uint32, optional, tag="2")]
+    #[prost(uint32, optional, tag = "2")]
     pub output: ::core::option::Option<u32>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelCapabilities {
-    #[prost(bool, tag="1")]
+    #[prost(bool, tag = "1")]
     pub tools: bool,
-    #[prost(bool, tag="2")]
+    #[prost(bool, tag = "2")]
     pub image: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct McpServer {
     /// Human-readable display name; map key is the stable id.
-    #[prost(string, tag="1")]
+    #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(enumeration="McpServerType", tag="2")]
+    #[prost(enumeration = "McpServerType", tag = "2")]
     pub r#type: i32,
     /// Required when type == MCP_SERVER_TYPE_STDIO.
-    #[prost(string, tag="3")]
+    #[prost(string, tag = "3")]
     pub command: ::prost::alloc::string::String,
     /// Required when type == MCP_SERVER_TYPE_SSE.
-    #[prost(string, tag="4")]
+    #[prost(string, tag = "4")]
     pub url: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
