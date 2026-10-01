@@ -267,6 +267,10 @@ mod tests {
     ) -> Result<HookOutcome> {
         let mut call = ToolCall::new(id, tool, args);
         let mut ctx = ToolCallContext {
+            approved_tool_name: tool,
+            permission_policy: &crate::PermissionPolicy::default(),
+            contextual_input_is_approved: crate::template::contextual_input_is_approved,
+            contextual_suspension: crate::template::contextual_suspension,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session",
             turn: 0,
@@ -923,6 +927,10 @@ mod tests {
             ] {
                 let mut call = ToolCall::new("invalid", LOAD, args);
                 let mut ctx = ToolCallContext {
+                    approved_tool_name: LOAD,
+                    permission_policy: &crate::PermissionPolicy::default(),
+                    contextual_input_is_approved: crate::template::contextual_input_is_approved,
+                    contextual_suspension: crate::template::contextual_suspension,
                     cancellation_token: tokio_util::sync::CancellationToken::new(),
                     session_id: "session",
                     turn: 0,
@@ -947,6 +955,10 @@ mod tests {
         let mut call = ToolCall::new("data", READ, json!({"server":"alpha","uri":uri}));
         reader
             .before_tool_call(&mut ToolCallContext {
+                approved_tool_name: READ,
+                permission_policy: &crate::PermissionPolicy::default(),
+                contextual_input_is_approved: crate::template::contextual_input_is_approved,
+                contextual_suspension: crate::template::contextual_suspension,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 session_id: "session",
                 turn: 0,
@@ -1135,6 +1147,11 @@ mod tests {
                 let outcome = middleware
                     .load(
                         &mut ToolCallContext {
+                            approved_tool_name: LOAD,
+                            permission_policy: &crate::PermissionPolicy::default(),
+                            contextual_input_is_approved:
+                                crate::template::contextual_input_is_approved,
+                            contextual_suspension: crate::template::contextual_suspension,
                             cancellation_token: token,
                             session_id: "session",
                             turn: 0,
@@ -1210,6 +1227,10 @@ mod tests {
             assert!(
                 reader
                     .before_tool_call(&mut ToolCallContext {
+                        approved_tool_name: READ,
+                        permission_policy: &crate::PermissionPolicy::default(),
+                        contextual_input_is_approved: crate::template::contextual_input_is_approved,
+                        contextual_suspension: crate::template::contextual_suspension,
                         cancellation_token: tokio_util::sync::CancellationToken::new(),
                         session_id: "session",
                         turn: 0,

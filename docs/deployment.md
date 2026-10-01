@@ -110,15 +110,26 @@ The server watches `.waltr/resources` after startup. An invalid reload preserves
 
 Routine resources use strict YAML and stay outside durable agent-definition bundles. The Routine service exposes definitions and durable invocation history globally.
 
-Public `/mcp` actions provide resource administration:
+Public `/mcp` resources and uniform tools provide resource administration:
 
-| Action | Behavior |
+| Resource Or Tool/Action | Behavior |
 | --- | --- |
-| `resources.inspect` | Lists resource slots or inspects one canonical path. |
-| `resources.replace` | Validates and atomically replaces one complete YAML resource. |
-| `resources.reset` | Removes one persisted override and reveals any bundled fallback. |
+| `waltr://resources` | Lists resource slots with canonical item URIs. |
+| `waltr://resources/{path}` | Reads metadata and exact persisted, effective, and active sources. |
+| `waltr://resources/{path}/source` | Reads effective YAML as `application/yaml`. |
+| `create/resource.create` | Creates an absent persisted slot from complete strict YAML. |
+| `edit` (direct arguments) | Applies guarded, ordered text edits through one atomic replacement. |
+| `destroy/resource.destroy` | Removes one persisted override and reveals any bundled fallback. |
 
-Replace and reset require the latest persisted-slot ETag. They validate the complete candidate catalog before filesystem mutation.
+Mutations require the current `expected_revision` from item metadata.
+Persisted revisions equal persisted-slot ETags; absent revisions also guard the effective source hash.
+All mutations validate the complete candidate catalog before filesystem mutation.
+See the embedded [resource contract](../crates/waltr-server/resources/skills/resource-administration/references/resources.md) for URI encoding and text edit inputs.
+
+Hosted sessions use `waltr://sessions` and `waltr://sessions/{id}` for ordinary reads.
+Tool `create` exposes `session.create`; tool `execute` exposes `session.send` and `session.interrupt`.
+Tool `query` exposes bounded `session.wait`; tool `destroy` exposes `session.wipe` with `confirm: true` for ALL sessions.
+The old `exec` and `sessions` tools have no compatibility aliases.
 
 Embedded startup prebinds loopback and atomically overwrites app config `server/.waltr/resources/mcp-servers/waltr.yaml` with the generation URL before catalog load. This is an ordinary persisted resource with filesystem origin; the same inspection, replace, watcher, reset, and ETag behavior applies. Reset can fail candidate validation when the bundled fallback needs `WALTR_PUBLIC_URL`, without any embedded-specific reset rule.
 

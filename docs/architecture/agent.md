@@ -101,7 +101,8 @@ The server compiles each valid catalog snapshot into a name-sorted agent catalog
 
 Invalid persisted state fails startup. After startup, invalid direct edits remain on disk. The server retains the last-known-good active snapshot and exposes the reload error. A later valid edit activates without a restart.
 
-The public `/mcp` actions `resources.inspect`, `resources.replace`, and `resources.reset` manage every catalog kind. See [Resource Catalog](config.md#administration).
+The public `/mcp` resource collection `waltr://resources` and uniform create/edit/destroy tools manage every catalog kind.
+See [Resource Catalog](config.md#administration).
 
 Per-slot ETags and checks serialize writes through Waltr. They do not isolate the resource tree from another local process that can write `.waltr`.
 

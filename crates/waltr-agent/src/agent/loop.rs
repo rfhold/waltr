@@ -720,6 +720,10 @@ where
         let requested_arguments = call.arguments.clone();
         let before_outcome = {
             let mut ctx = ToolCallContext {
+                approved_tool_name: &requested_name,
+                permission_policy: &self.permission_policy,
+                contextual_input_is_approved,
+                contextual_suspension,
                 cancellation_token: self.cancellation_token.clone(),
                 session_id: self.session_id.as_str(),
                 turn: self.turn as u64,
@@ -1117,20 +1121,7 @@ where
         };
         // Preparation can add claims after middleware has already suspended. Keep
         // exact-call approvals through those retries, and ask only for new claims.
-        for approval in &state.one_shot {
-            let Some(identities) = &approval.claims else {
-                continue;
-            };
-            if approval.tool_call_id == tool_call.id
-                && approval.stage == Some(PermissionApprovalStage::Contextual)
-                && approval.request_id == permission_request_id(&request, tool_call, identities)
-            {
-                unmatched.retain(|claim| {
-                    !identities
-                        .contains(&permission_claim_identities(std::slice::from_ref(claim))[0])
-                });
-            }
-        }
+        apply_contextual_approvals(&request, tool_call, &state, &mut unmatched);
         if unmatched.is_empty() {
             return Ok(PermissionOutcome::Allow);
         }
@@ -2409,6 +2400,63 @@ struct PermissionRequestContext<'a> {
     turn: u64,
     stage: PermissionApprovalStage,
     policy: &'a PermissionPolicy,
+}
+
+fn contextual_input_is_approved(
+    ctx: &ToolCallContext<'_>,
+    claims: &[PermissionClaim],
+    state: &PermissionRuntimeState,
+) -> bool {
+    let mut unmatched = claims.to_vec();
+    apply_contextual_approvals(
+        &PermissionRequestContext {
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+            stage: PermissionApprovalStage::Contextual,
+            policy: ctx.permission_policy,
+        },
+        ctx.call,
+        state,
+        &mut unmatched,
+    );
+    unmatched.is_empty()
+}
+
+fn apply_contextual_approvals(
+    request: &PermissionRequestContext<'_>,
+    call: &ToolCall,
+    state: &PermissionRuntimeState,
+    unmatched: &mut Vec<PermissionClaim>,
+) {
+    for approval in &state.one_shot {
+        let Some(identities) = &approval.claims else {
+            continue;
+        };
+        if approval.tool_call_id == call.id
+            && approval.stage == Some(PermissionApprovalStage::Contextual)
+            && approval.request_id == permission_request_id(request, call, identities)
+        {
+            unmatched.retain(|claim| {
+                !identities.contains(&permission_claim_identities(std::slice::from_ref(claim))[0])
+            });
+        }
+    }
+}
+
+fn contextual_suspension(
+    ctx: &ToolCallContext<'_>,
+    claims: &[PermissionClaim],
+) -> middleware::Suspension {
+    permission_suspension(
+        &PermissionRequestContext {
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+            stage: PermissionApprovalStage::Contextual,
+            policy: ctx.permission_policy,
+        },
+        ctx.call,
+        claims,
+    )
 }
 
 fn permission_suspension(

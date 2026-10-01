@@ -10,12 +10,23 @@ spec:
     before editing it, make the smallest requested change, and preserve unrelated
     settings.
 
-    Agent-definition changes replace one complete YAML file. Inspect the file,
-    submit the complete replacement with the latest persisted-slot ETag, and
-    never submit a patch, merge, or diff. If an ETag is stale, inspect again and
-    rebuild the complete replacement instead of retrying blindly. Do not modify
-    credentials unless the user explicitly requests it. When finished, respond
-    with a concise explanation of what changed, or why no change was made.
+    Load the resource-administration skill from the waltr server. Read
+    waltr://resources, then the canonical item URI and its /source URI using
+    read_mcp_resource with server waltr. Encode the entire resource path as one
+    canonical URI component, for example agents%2Fcoding.yaml. Copy the complete
+    guarded revision from item metadata; never substitute a persisted-slot ETag.
+    Call mcp_waltr_edit directly with the item uri, expected_revision, and the
+    smallest ordered text edits, without an action/input envelope. On a conflict,
+    reread the source and revision and rebuild the edits instead of retrying blindly.
+
+    Use mcp_waltr_create with action resource.create only for an absent persisted
+    slot, including a requested bundled override, with complete strict YAML and
+    its guarded revision. Never overwrite an occupied slot through create. Use
+    mcp_waltr_destroy with action resource.destroy only for an explicitly requested
+    removal of a persisted override; this restores bundled fallback if present.
+    Reread the result. Do not read, create, wipe, or control hosted sessions.
+    Do not modify credentials unless the user explicitly requests it. When
+    finished, explain concisely what changed, or why no change was made.
   features:
     - mcp:
         servers:
@@ -23,7 +34,7 @@ spec:
         exposeTools: true
         skills: true
         instructions: false
-        resources: false
+        resources: true
         prompts: false
         tracePropagation: false
         defaultPermissions: false
@@ -32,20 +43,87 @@ spec:
       permission: allow
     - name: read_mcp_resource
       permission: allow
-    - name: mcp_waltr_exec
+    - name: read_mcp_resource
+      permission:
+        inputs:
+          - match:
+              - pointer: /server
+                value: { exact: waltr }
+              - pointer: /uri
+                value: { exact: "waltr://resources" }
+            effect: allow
+          - match:
+              - pointer: /server
+                value: { exact: waltr }
+              - pointer: /uri
+                value: { wildcard: "waltr://resources/*" }
+            effect: allow
+          - match:
+              - pointer: /server
+                value: { exact: waltr }
+              - pointer: /uri
+                value: { exact: "skill://resource-administration/SKILL.md" }
+            effect: allow
+          - match:
+              - pointer: /server
+                value: { exact: waltr }
+              - pointer: /uri
+                value: { exact: "skill://resource-administration/references/resources.md" }
+            effect: allow
+          - match:
+              - pointer: /uri
+                value: { wildcard: "*" }
+            effect: deny
+          - match:
+              - pointer: /server
+                value: { wildcard: "*" }
+            effect: deny
+    - name: mcp_waltr_create
       permission: allow
-    - name: mcp_waltr_exec
+    - name: mcp_waltr_create
       permission:
         inputs:
           - match:
               - pointer: /action
-                value: { wildcard: "resources.*" }
+                value: { exact: resource.create }
             effect: allow
           - match:
               - pointer: /action
-                value: { wildcard: "sessions.*" }
+                value: { wildcard: "*" }
+            effect: deny
+    - name: mcp_waltr_edit
+      permission: allow
+    - name: mcp_waltr_edit
+      permission:
+        inputs:
+          - match:
+              - pointer: /uri
+                value: { wildcard: "waltr://resources/*" }
+            effect: allow
+          - match:
+              - pointer: /uri
+                value: { wildcard: "*" }
             effect: deny
           - match:
               - pointer: /action
                 value: { wildcard: "*" }
             effect: deny
+    - name: mcp_waltr_destroy
+      permission: allow
+    - name: mcp_waltr_destroy
+      permission:
+        inputs:
+          - match:
+              - pointer: /action
+                value: { exact: resource.destroy }
+            effect: allow
+          - match:
+              - pointer: /action
+                value: { wildcard: "*" }
+            effect: deny
+    - name: mcp_waltr_execute
+      permission: deny
+    - name: mcp_waltr_query
+      permission: deny
+    - name: mcp_waltr_exec
+      permission: deny

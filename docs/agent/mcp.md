@@ -52,9 +52,8 @@ Include names match current configuration keys exactly. If any include is absent
 
 The bundled `coding` feature uses `servers: { exclude: [] }`. This selects every configured server, including `waltr` when it is present.
 The bundled `coding` agent preserves that MCP configuration and explicitly enables `skills: true` through an inline feature override.
-The bundled `configuration` agent enables Skills only for its selected `waltr` server. Both definitions preserve their MCP action permissions.
-With `defaultPermissions: false`, the configuration agent explicitly allows `load_skill` and `read_mcp_resource` so those tools remain visible.
-It preserves `resources: false` and `skills: true`: the reader can access only files in approved loaded held manifests, not ordinary resources. These grants do not widen MCP action permissions or bypass mandatory manifest-bound consent.
+The bundled `configuration` agent selects only `waltr`, with `resources: true`, `skills: true`, and `defaultPermissions: false`. Its reader input rules allow the `waltr://resources` catalog, `waltr://resources/*` source resources, and the two embedded administration Skill files, not session resources. `load_skill` remains available subject to manifest-bound consent.
+Its hosted action rules allow creation through `resource.create`, direct editing of `waltr://resources/*`, and deletion through `resource.destroy`. They deny session reads, `execute`, `query`, and the old `exec` surface; enabling ordinary resources does not grant those operations.
 
 MCP server selection is part of the selected agent definition stored with the session, not an independent MCP setting. Session RPCs and clients can create or switch the session's agent definition, but expose no separate MCP selector, endpoint snapshot, drift status, or trace switch.
 
@@ -171,7 +170,15 @@ The user fills the URI path in-place before submitting, for example:
 @resource(foo, "test://items/42")
 ```
 
-The renderer permits `resources/read` when the requested URI either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Resource template search can call the MCP completion API for URI template arguments when the server advertises completion support.
+The renderer requires an absolute URI that either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Before `resources/read`, it evaluates the same `read_mcp_resource` tool permission and input rules using `{server, uri}` as a direct reader call. Discovery does not grant read permission. Denied reads render a template error without resource I/O. Resource template search can call the MCP completion API for URI template arguments when the server advertises completion support.
+
+Resource references do not create tool-call identities or permission suspensions. An unresolved whole-tool or input `Ask` renders a template error without reading; invoke `read_mcp_resource` directly to request approval. Existing reusable input approval patterns apply to resource references, but one-shot tool-call approvals do not. Allowed reads retain the resource result wrapper and nested template expansion; every nested resource reference passes the same checks.
+
+The native reader also checks the final selector against those input rules before fetching data, including when middleware changes arguments. A direct call, or a registered `@tool(read_mcp_resource, ...)` reference, suspends on unresolved input `Ask` without resource I/O. The prefetch check recognizes reusable patterns and the caller's exact contextual one-shot approval without consuming it; normal permission continuation owns consumption or call-completion cleanup. Approving the whole tool does not override input denial or manifest-bound Skill consent.
+
+Template permission request identities bind the complete tool name and arguments as well as the policy, approval stage, and claims. A selector change requires a new approval even when an input Ask rule claims only the server. Prior request identities receive no compatibility grant.
+
+Reader completion caches bind the session, turn, call identity, complete selector, tool name, and policy identity. An exact authorized completion survives a render retry after its one-shot approval expires, without another fetch. Changed selectors or policies follow normal permission checks; input denial returns no cached private data. Reader calls never reuse legacy completion entries without this authorization binding. Other tool caches retain their current behavior.
 
 ### Provider Resource Reads
 

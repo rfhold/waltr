@@ -93,7 +93,8 @@ Session detail timeline commands explicitly request the Effective projection. Th
 
 `SessionTimelineView.events` contains `ProjectedTimelineEntryView` values. Durable entries wrap the existing action-capable `TimelineEventView`. Synthetic entries expose a distinct opaque identity, presentation enum, ordering position, content, and status but no durable item ID, parent ID, metadata, or action cursor. `MaskReplacement` is explicit and unknown presentation values remain `Unknown`; shells must not parse IDs or metadata to recover presentation.
 
-Hosted MCP `sessions.list`, `sessions.get`, and `sessions.wait` expose the same complete metadata map. This feature requires no generic MCP behavior; `crates/mcp` remains unchanged.
+Hosted MCP resources `waltr://sessions` and `waltr://sessions/{id}`, plus tool `query` action `session.wait`, expose the same complete metadata map.
+This feature requires no generic MCP behavior; `crates/mcp` remains unchanged.
 
 ## Reducer State Machine
 

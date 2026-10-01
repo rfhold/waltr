@@ -1,24 +1,25 @@
 ---
 name: resource-administration
-description: Inspect, replace, or reset complete Waltr YAML resources with persisted-slot ETag protection. Use for requested configuration and agent-definition changes.
+description: Read and edit Waltr YAML resources with guarded revisions. Use for requested configuration and agent-definition changes.
 ---
 
 # Resource Administration
 
-Use the `exec` tool for Waltr resource administration. Read
-[the resource contract](references/resources.md) before editing.
+Read [the resource contract](references/resources.md) before a mutation.
 
-1. Call `resources.inspect` with the canonical resource path. Omit the path to
-   discover available entries.
-2. Preserve unrelated settings and prepare one complete strict YAML resource.
-3. Call `resources.replace` with the path, complete source, and the inspected
-   persisted-slot `expected_etag`. Never send a patch, merge, or diff.
-4. Inspect the returned resource and report the change.
+1. Discover entries through the `waltr://resources` MCP resource.
+2. Read the entry URI for exact source and revision metadata.
+3. Preserve unrelated settings in ordered text edits.
+4. Call tool `edit` directly with the entry URI, `expected_revision`, and `edits`.
+5. Check the returned resource.
 
-Use `resources.reset` only when the user requests removal of the persisted
-override. Supply its current persisted-slot ETag. Reset reveals the bundled
-fallback if one exists; it does not write a replacement resource.
+Use tool `create`, action `resource.create`, for an absent persisted slot with complete YAML and its guarded revision.
+Creation can establish a bundled override, but cannot overwrite a persisted file.
+An edit to bundled effective source also establishes a persisted override.
 
-On validation or stale-ETag errors, inspect again and rebuild the requested
-replacement. Do not retry a stale write unchanged. Do not edit credentials or
-unrelated resources without explicit user direction.
+Use tool `destroy`, action `resource.destroy`, only for a requested removal of a persisted override.
+Destruction restores the bundled fallback if present; catalog validation can reject the removal.
+
+On validation or stale-revision errors, read the entry again.
+Do not retry a stale mutation unchanged.
+Do not edit credentials or unrelated resources without explicit user direction.

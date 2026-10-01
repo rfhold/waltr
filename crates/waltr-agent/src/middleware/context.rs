@@ -179,6 +179,19 @@ impl MiddlewareStateAccess for RequestContext<'_> {
 /// Context shared by tool-call middleware phases.
 #[derive(Debug)]
 pub(crate) struct ToolCallContext<'a> {
+    /// Tool name authorized before entering the middleware chain.
+    pub(crate) approved_tool_name: &'a str,
+    /// Current policy for middleware that performs predispatch I/O.
+    pub(crate) permission_policy: &'a PermissionPolicy,
+    /// Non-consuming check against the caller's contextual permission continuation.
+    pub(crate) contextual_input_is_approved: fn(
+        &ToolCallContext<'_>,
+        &[PermissionClaim],
+        &crate::permission::PermissionRuntimeState,
+    ) -> bool,
+    /// Suspension adapter for the caller's contextual permission continuation.
+    pub(crate) contextual_suspension:
+        fn(&ToolCallContext<'_>, &[PermissionClaim]) -> super::Suspension,
     /// Active run cancellation for predispatch middleware I/O.
     pub(crate) cancellation_token: CancellationToken,
     /// Durable session id.

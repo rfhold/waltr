@@ -1,10 +1,5 @@
 //! Waltr Model Context Protocol server surface.
 
-#![allow(
-    clippy::useless_vec,
-    reason = "the progressive_server macro generates this allocation"
-)]
-
 use crate::{
     agent_definition::{AgentDefinitionLoadError, AgentDefinitionState},
     session::SessionHost,
@@ -28,6 +23,254 @@ use tonic::{Code, Status};
 const DEFAULT_WAIT_SECONDS: u64 = 60;
 const MAX_WAIT_SECONDS: u64 = 300;
 const WAIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResourceCreateInput {
+    /// Canonical metadata URI, for example waltr://resources/agents%2Fcoding.yaml.
+    uri: String,
+    /// Complete strict YAML for an absent persisted slot; never overwrites a persisted file.
+    source: String,
+    /// Exact guarded revision from the metadata resource, including the effective hash for absent slots.
+    expected_revision: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResourceDestroyInput {
+    /// Canonical metadata URI of the persisted override to remove.
+    uri: String,
+    /// Exact revision from metadata. Removal restores bundled fallback if present.
+    expected_revision: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TextEditInput {
+    /// Canonical metadata URI of the effective YAML to edit (not the /source URI).
+    uri: String,
+    /// Exact guarded revision from metadata. A bundled edit creates a persisted override.
+    expected_revision: String,
+    /// Ordered edits, all validated before one atomic replacement against the original revision.
+    #[schemars(length(min = 1, max = 256))]
+    edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum TextEdit {
+    Replace {
+        /// Nonempty text matching exactly once, including overlapping matches.
+        old_text: String,
+        /// Replacement text, which must differ from old_text.
+        new_text: String,
+    },
+    Insert {
+        /// Nonempty inserted text.
+        text: String,
+        /// Insert at start/end or immediately before/after a unique anchor.
+        placement: Placement,
+        /// Required and nonempty for before/after; forbidden for start/end.
+        #[serde(default, deserialize_with = "deserialize_present_anchor")]
+        anchor: Option<String>,
+    },
+}
+
+fn deserialize_present_anchor<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+impl JsonSchema for TextEdit {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TextEdit".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json!({
+            "oneOf": [
+                {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["operation", "old_text", "new_text"],
+                    "properties": {
+                        "operation": {"const": "replace"},
+                        "old_text": {"type": "string", "minLength": 1},
+                        "new_text": {"type": "string"}
+                    }
+                },
+                {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["operation", "text", "placement"],
+                    "properties": {
+                        "operation": {"const": "insert"},
+                        "text": {"type": "string", "minLength": 1},
+                        "placement": {"enum": ["start", "end"]}
+                    }
+                },
+                {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["operation", "text", "placement", "anchor"],
+                    "properties": {
+                        "operation": {"const": "insert"},
+                        "text": {"type": "string", "minLength": 1},
+                        "placement": {"enum": ["before", "after"]},
+                        "anchor": {"type": "string", "minLength": 1}
+                    }
+                }
+            ]
+        })
+        .try_into()
+        .expect("text edit schema is an object")
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum Placement {
+    Start,
+    End,
+    Before,
+    After,
+}
+
+fn unique_anchor(source: &str, anchor: &str) -> ServerResult<usize> {
+    if anchor.is_empty() {
+        return Err(ServerError::invalid_params("anchor must not be empty"));
+    }
+    let mut positions = source
+        .char_indices()
+        .filter_map(|(position, _)| source[position..].starts_with(anchor).then_some(position));
+    let position = positions
+        .next()
+        .ok_or_else(|| ServerError::invalid_params("anchor not found"))?;
+    if positions.next().is_some() {
+        return Err(ServerError::invalid_params("anchor is ambiguous"));
+    }
+    Ok(position)
+}
+
+fn apply_text_edits(source: &str, edits: &[TextEdit]) -> ServerResult<String> {
+    if edits.is_empty() || edits.len() > 256 {
+        return Err(ServerError::invalid_params(
+            "edits must contain between 1 and 256 entries",
+        ));
+    }
+    let mut output = source.to_owned();
+    for edit in edits {
+        match edit {
+            TextEdit::Replace { old_text, new_text } => {
+                let position = unique_anchor(&output, old_text)?;
+                if old_text == new_text {
+                    return Err(ServerError::invalid_params("edit must change the source"));
+                }
+                output.replace_range(position..position + old_text.len(), new_text);
+            }
+            TextEdit::Insert {
+                text,
+                placement,
+                anchor,
+            } => {
+                if text.is_empty() {
+                    return Err(ServerError::invalid_params("insert text must not be empty"));
+                }
+                let position = match placement {
+                    Placement::Start | Placement::End => {
+                        if anchor.is_some() {
+                            return Err(ServerError::invalid_params(
+                                "start/end must not have an anchor",
+                            ));
+                        }
+                        if matches!(placement, Placement::Start) {
+                            0
+                        } else {
+                            output.len()
+                        }
+                    }
+                    Placement::Before | Placement::After => {
+                        let anchor = anchor.as_deref().ok_or_else(|| {
+                            ServerError::invalid_params("before/after require an anchor")
+                        })?;
+                        let position = unique_anchor(&output, anchor)?;
+                        position
+                            + if matches!(placement, Placement::After) {
+                                anchor.len()
+                            } else {
+                                0
+                            }
+                    }
+                };
+                output.insert_str(position, text);
+            }
+        }
+    }
+    if output == source {
+        return Err(ServerError::invalid_params("edits must change the source"));
+    }
+    Ok(output)
+}
+
+fn encode_component(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            output.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(output, "%{byte:02X}").expect("writing to string");
+        }
+    }
+    output
+}
+
+fn decode_component(value: &str) -> ServerResult<String> {
+    let invalid = || ServerError::invalid_params("invalid canonical Waltr URI");
+    let mut bytes = Vec::new();
+    let mut input = value.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = input
+                .next()
+                .and_then(|b| char::from(b).to_digit(16))
+                .ok_or_else(invalid)?;
+            let low = input
+                .next()
+                .and_then(|b| char::from(b).to_digit(16))
+                .ok_or_else(invalid)?;
+            bytes.push(u8::try_from(high * 16 + low).map_err(|_| invalid())?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    if decoded.is_empty()
+        || decoded.chars().any(char::is_control)
+        || encode_component(&decoded) != value
+    {
+        return Err(invalid());
+    }
+    Ok(decoded)
+}
+
+fn resource_path(uri: &str) -> ServerResult<String> {
+    let component = uri
+        .strip_prefix("waltr://resources/")
+        .ok_or_else(|| ServerError::invalid_params("expected waltr://resources/{path} URI"))?;
+    decode_component(component)
+}
+
+fn resource_revision(detail: &Value) -> String {
+    let persisted = detail["persisted_etag"].as_str().unwrap_or_default();
+    if detail["persisted"] == false {
+        format!(
+            "{persisted}@{}",
+            detail["effective_etag"].as_str().unwrap_or("absent")
+        )
+    } else {
+        persisted.to_owned()
+    }
+}
 
 /// MCP server backed by Waltr's registered configuration and session services.
 #[derive(Clone)]
@@ -83,7 +326,7 @@ struct SendInput {
 struct WaitInput {
     /// Hosted session id.
     id: String,
-    /// jq expression evaluated against the same projection returned by `get`.
+    /// jq expression evaluated against the same projection as waltr://sessions/{id}.
     jq: String,
     /// Maximum wait in seconds. Defaults to 60 and cannot exceed 300.
     #[serde(default)]
@@ -95,24 +338,6 @@ struct InspectResourcesInput {
     /// Canonical relative path such as `agents/coding.yaml`. Omit to list all entries.
     #[serde(default)]
     path: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ReplaceResourceInput {
-    /// Canonical relative path such as `agents/coding.yaml`.
-    path: String,
-    /// Complete strict YAML source for exactly one resource.
-    source: String,
-    /// Current persisted-slot `ETag` from `resources.inspect`.
-    expected_etag: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ResetResourceInput {
-    /// Canonical relative path such as `agents/coding.yaml`.
-    path: String,
-    /// Current persisted-slot `ETag` from `resources.inspect`.
-    expected_etag: String,
 }
 
 impl WaltrMcpServer {
@@ -180,27 +405,8 @@ impl WaltrMcpServer {
 }
 
 #[allow(missing_docs)]
-#[mcp::progressive_server(
-    name = "waltr",
-    version = env!("CARGO_PKG_VERSION"),
-    description = "Waltr resource administration and hosted session MCP surface.",
-    skills = self.catalog,
-    tool(
-        name = "exec",
-        description = "Inspect and update complete Waltr resources.",
-        namespace(
-            resources,
-            description = "Inspect, replace, and reset complete live YAML resources."
-        )
-    ),
-    tool(
-        name = "sessions",
-        description = "Inspect and control hosted Waltr sessions."
-    )
-)]
 impl WaltrMcpServer {
     /// Inspect all active resources or one canonical persisted slot.
-    #[action(tool = "exec", name = "resources.inspect")]
     fn inspect_resources(&self, input: InspectResourcesInput) -> ServerResult<Value> {
         let path = input.path;
         let resources = self
@@ -210,36 +416,7 @@ impl WaltrMcpServer {
         response_to_value(resources)
     }
 
-    /// Validate and atomically replace one complete resource file.
-    #[action(tool = "exec", name = "resources.replace")]
-    async fn replace_resource(&self, input: ReplaceResourceInput) -> ServerResult<Value> {
-        let result = self
-            .resources()
-            .replace(&input.path, input.source, &input.expected_etag)
-            .await
-            .map_err(|error| agent_definition_error(&error))?;
-        drop(result);
-        self.inspect_resources(InspectResourcesInput {
-            path: Some(input.path),
-        })
-    }
-
-    /// Remove one persisted resource, restoring its bundle fallback when present.
-    #[action(tool = "exec", name = "resources.reset")]
-    async fn reset_resource(&self, input: ResetResourceInput) -> ServerResult<Value> {
-        let result = self
-            .resources()
-            .reset(&input.path, &input.expected_etag)
-            .await
-            .map_err(|error| agent_definition_error(&error))?;
-        drop(result);
-        self.inspect_resources(InspectResourcesInput {
-            path: Some(input.path),
-        })
-    }
-
     /// List durable hosted sessions, newest activity first.
-    #[action(tool = "sessions", name = "list")]
     async fn list_sessions(&self) -> ServerResult<Value> {
         let summaries = self.sessions.list().await.map_err(session_error)?;
         let mut sessions = Vec::with_capacity(summaries.len());
@@ -251,7 +428,6 @@ impl WaltrMcpServer {
     }
 
     /// Create a hosted session and immediately start its required prompt.
-    #[action(tool = "sessions", name = "create")]
     async fn create_session(&self, input: CreateInput) -> ServerResult<Value> {
         if input.prompt.trim().is_empty() {
             return Err(ServerError::invalid_params("prompt must not be empty"));
@@ -280,6 +456,7 @@ impl WaltrMcpServer {
         };
         Ok(json!({
             "session_id": submission.session_id.as_str(),
+            "uri": format!("waltr://sessions/{}", encode_component(submission.session_id.as_str())),
             "agent_name": agent_name,
             "run_id": submission.run_id,
             "disposition": disposition,
@@ -288,14 +465,12 @@ impl WaltrMcpServer {
     }
 
     /// Get one durable session using the stable MCP session projection.
-    #[action(tool = "sessions", name = "get")]
     async fn get_session(&self, input: SessionIdInput) -> ServerResult<Value> {
         self.session_projection(&required_session_id(input.id)?)
             .await
     }
 
     /// Blindly delete every hosted agent session. Operators must ensure sessions are idle.
-    #[action(tool = "sessions", name = "wipe")]
     async fn wipe_sessions(&self, input: WipeInput) -> ServerResult<Value> {
         if !input.confirm {
             return Err(ServerError::invalid_params("confirm must be true"));
@@ -305,7 +480,6 @@ impl WaltrMcpServer {
     }
 
     /// Idempotently interrupt a hosted session and cancel its queued runs.
-    #[action(tool = "sessions", name = "interrupt")]
     async fn interrupt_session(&self, input: SessionIdInput) -> ServerResult<Value> {
         let id = required_session_id(input.id)?;
         self.sessions.interrupt(&id).await.map_err(session_error)?;
@@ -313,7 +487,6 @@ impl WaltrMcpServer {
     }
 
     /// Submit a prompt, queueing it when the session already has an active run.
-    #[action(tool = "sessions", name = "send")]
     async fn send_session(&self, input: SendInput) -> ServerResult<Value> {
         let id = required_session_id(input.id)?;
         if input.prompt.trim().is_empty() {
@@ -332,6 +505,7 @@ impl WaltrMcpServer {
         };
         Ok(json!({
             "session_id": submission.session_id.as_str(),
+            "uri": format!("waltr://sessions/{}", encode_component(submission.session_id.as_str())),
             "run_id": submission.run_id,
             "disposition": disposition,
             "queue_position": queue_position
@@ -339,7 +513,6 @@ impl WaltrMcpServer {
     }
 
     /// Wait until a jq condition matches, the session stops running, or time expires.
-    #[action(tool = "sessions", name = "wait")]
     #[allow(
         clippy::too_many_lines,
         reason = "the wait loop keeps jq evaluation and race-free session reconciliation together"
@@ -429,6 +602,256 @@ fn required_session_id(value: String) -> ServerResult<SessionId> {
     }
 }
 
+impl WaltrMcpServer {
+    fn resource_detail(&self, uri: &str) -> ServerResult<Value> {
+        let path = resource_path(uri)?;
+        let mut detail = self.inspect_resources(InspectResourcesInput { path: Some(path) })?;
+        detail["uri"] = json!(uri);
+        detail["source_uri"] = json!(format!("{uri}/source"));
+        detail["revision"] = json!(resource_revision(&detail));
+        Ok(detail)
+    }
+
+    async fn create_resource(&self, input: ResourceCreateInput) -> ServerResult<Value> {
+        let detail = self.resource_detail(&input.uri)?;
+        if detail["persisted"] != false || resource_revision(&detail) != input.expected_revision {
+            return Err(ServerError::invalid_params(
+                "failed precondition: slot occupied or revision changed; read and retry",
+            ));
+        }
+        self.resources
+            .replace_guarded(
+                &resource_path(&input.uri)?,
+                input.source,
+                detail["persisted_etag"].as_str().unwrap_or_default(),
+                detail["source"].as_str(),
+            )
+            .await
+            .map_err(|error| agent_definition_error(&error))?;
+        self.resource_detail(&input.uri)
+    }
+
+    async fn edit_resource(&self, input: TextEditInput) -> ServerResult<Value> {
+        let detail = self.resource_detail(&input.uri)?;
+        if resource_revision(&detail) != input.expected_revision {
+            return Err(ServerError::invalid_params(
+                "failed precondition: revision changed; read and retry",
+            ));
+        }
+        let source = detail["source"]
+            .as_str()
+            .ok_or_else(|| ServerError::invalid_params("resource has no source; use create"))?;
+        let output = apply_text_edits(source, &input.edits)?;
+        self.resources
+            .replace_guarded(
+                &resource_path(&input.uri)?,
+                output,
+                detail["persisted_etag"].as_str().unwrap_or_default(),
+                Some(source),
+            )
+            .await
+            .map_err(|error| agent_definition_error(&error))?;
+        self.resource_detail(&input.uri)
+    }
+
+    async fn destroy_resource(&self, input: ResourceDestroyInput) -> ServerResult<Value> {
+        let detail = self.resource_detail(&input.uri)?;
+        if detail["persisted"] != true || resource_revision(&detail) != input.expected_revision {
+            return Err(ServerError::invalid_params(
+                "failed precondition: no persisted override or revision changed; read and retry",
+            ));
+        }
+        self.resources
+            .reset(&resource_path(&input.uri)?, &input.expected_revision)
+            .await
+            .map_err(|error| agent_definition_error(&error))?;
+        self.resource_detail(&input.uri)
+    }
+}
+
+impl mcp::server::ServerHandler for WaltrMcpServer {
+    fn server_info(&self) -> mcp::server::ServerInfo {
+        mcp::server::ServerInfo::new("waltr", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn capabilities(&self) -> mcp::server::ServerCapabilities {
+        mcp::server::ServerCapabilities::new()
+            .tools()
+            .resources()
+            .skills()
+    }
+
+    fn skill_catalog(&self) -> Option<Arc<mcp::SkillCatalog>> {
+        Some(self.catalog.clone())
+    }
+
+    fn list_tools(
+        &self,
+        _cursor: Option<String>,
+        _context: mcp::server::ServerContext,
+    ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolList>> {
+        use mcp::progressive::{ActionInputSchema, input_schema, json_schema_for, tool_definition};
+        macro_rules! tool {
+            ($name:literal, $description:literal, $( $action:literal => $ty:ty ),+ ) => {
+                tool_definition($name, $description, input_schema(&[$($action),+], vec![$(ActionInputSchema { action: $action, schema: Some(json_schema_for::<$ty>()) }),+]))
+            };
+        }
+        Box::pin(async {
+            Ok(mcp::McpToolList {
+                tools: vec![
+                    tool!("create", "Create a session or an absent persisted resource slot (including a bundled override).", "session.create" => CreateInput, "resource.create" => ResourceCreateInput),
+                    tool_definition(
+                        "edit",
+                        "Apply ordered atomic text edits to effective YAML guarded by its revision.",
+                        json_schema_for::<TextEditInput>(),
+                    ),
+                    tool!("destroy", "Remove a persisted override, restoring bundled fallback if present, or explicitly wipe ALL sessions.", "resource.destroy" => ResourceDestroyInput, "session.wipe" => WipeInput),
+                    tool!("execute", "Control hosted sessions.", "session.send" => SendInput, "session.interrupt" => SessionIdInput),
+                    tool!("query", "Wait for a bounded jq condition on a hosted session.", "session.wait" => WaitInput),
+                ],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn call_tool(
+        &self,
+        call: mcp::McpToolCall,
+        _context: mcp::server::ServerContext,
+    ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolResult>> {
+        let server = self.clone();
+        Box::pin(async move {
+            if call.name == "edit" {
+                let input =
+                    serde_json::from_value::<TextEditInput>(call.arguments).map_err(|error| {
+                        ServerError::invalid_params(format!("invalid edit arguments: {error}"))
+                    })?;
+                let output = server.edit_resource(input).await?;
+                return mcp::progressive::tool_result(output, None);
+            }
+            let request = mcp::progressive::parse_arguments(&call.name, call.arguments)?;
+            macro_rules! input {
+                () => {
+                    mcp::progressive::deserialize_action_input(&request.action, request.input)?
+                };
+            }
+            let output = match (call.name.as_str(), request.action.as_str()) {
+                ("create", "session.create") => server.create_session(input!()).await?,
+                ("create", "resource.create") => server.create_resource(input!()).await?,
+                ("destroy", "resource.destroy") => server.destroy_resource(input!()).await?,
+                ("destroy", "session.wipe") => server.wipe_sessions(input!()).await?,
+                ("execute", "session.send") => server.send_session(input!()).await?,
+                ("execute", "session.interrupt") => server.interrupt_session(input!()).await?,
+                ("query", "session.wait") => server.wait_session(input!()).await?,
+                _ => return Err(mcp::progressive::unknown_action(&request.action)),
+            };
+            mcp::progressive::tool_result(output, request.filter.as_deref())
+        })
+    }
+
+    fn list_resources(
+        &self,
+        _cursor: Option<String>,
+        _context: mcp::server::ServerContext,
+    ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceList>> {
+        Box::pin(async {
+            Ok(mcp::McpResourceList {
+                resources: vec![
+                    mcp::progressive::action_resource_definition(
+                        "waltr://resources",
+                        "resources",
+                        "Resource catalog with canonical item and source URIs.",
+                    ),
+                    mcp::progressive::action_resource_definition(
+                        "waltr://sessions",
+                        "sessions",
+                        "Durable hosted sessions with canonical item URIs.",
+                    ),
+                ],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn list_resource_templates(
+        &self,
+        _cursor: Option<String>,
+        _context: mcp::server::ServerContext,
+    ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceTemplateList>> {
+        Box::pin(async {
+            let mut source = mcp::progressive::action_resource_template_definition(
+                "waltr://resources/{path}/source",
+                "resource.source",
+                "Exact effective YAML. Path is one canonically percent-encoded component.",
+            );
+            source.mime_type = Some("application/yaml".to_owned());
+            Ok(mcp::McpResourceTemplateList {
+                resource_templates: vec![
+                    mcp::progressive::action_resource_template_definition(
+                        "waltr://resources/{path}",
+                        "resource",
+                        "Slot metadata, persisted/effective/active sources and guarded revision.",
+                    ),
+                    source,
+                    mcp::progressive::action_resource_template_definition(
+                        "waltr://sessions/{id}",
+                        "session",
+                        "Stable hosted session projection. ID is one canonically percent-encoded component.",
+                    ),
+                ],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn read_resource(
+        &self,
+        uri: String,
+        _context: mcp::server::ServerContext,
+    ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceResult>> {
+        let server = self.clone();
+        Box::pin(async move {
+            if let Some(result) = server.catalog.read(&uri) {
+                return Ok(result);
+            }
+            let value = if uri == "waltr://resources" {
+                let mut catalog = server.inspect_resources(InspectResourcesInput { path: None })?;
+                if let Some(entries) = catalog["entries"].as_array_mut() {
+                    for entry in entries {
+                        let item = format!(
+                            "waltr://resources/{}",
+                            encode_component(entry["path"].as_str().unwrap_or_default())
+                        );
+                        entry["uri"] = json!(item);
+                        entry["source_uri"] = json!(format!("{item}/source"));
+                    }
+                }
+                catalog
+            } else if uri == "waltr://sessions" {
+                server.list_sessions().await?
+            } else if let Some(id) = uri.strip_prefix("waltr://sessions/") {
+                server
+                    .get_session(SessionIdInput {
+                        id: decode_component(id)?,
+                    })
+                    .await?
+            } else if uri.starts_with("waltr://resources/") {
+                if let Some(item) = uri.strip_suffix("/source") {
+                    let detail = server.resource_detail(item)?;
+                    let text = detail["source"]
+                        .as_str()
+                        .ok_or_else(|| ServerError::resource_not_found(uri.clone()))?;
+                    return Ok(mcp::McpResourceResult::text(uri, "application/yaml", text));
+                }
+                server.resource_detail(&uri)?
+            } else {
+                return Err(ServerError::resource_not_found(uri));
+            };
+            Ok(mcp::progressive::json_resource_result(uri, value))
+        })
+    }
+}
+
 fn projection_running(projection: &Value) -> bool {
     projection["running"].as_bool().unwrap_or(false)
 }
@@ -469,6 +892,7 @@ fn project_summary(
     let (status, suspension, failure, retry) = project_status(&summary.status);
     json!({
         "id": summary.id.as_str(),
+        "uri": format!("waltr://sessions/{}", encode_component(summary.id.as_str())),
         "revision": summary.revision.get(),
         "status": status,
         "running": summary.progress.running,
@@ -905,7 +1329,9 @@ mod tests {
         }
 
         async fn list(&self) -> Result<Vec<SessionSummary>, LlmError> {
-            unreachable!()
+            Ok(vec![
+                waltr_agent::SessionRecord::new("session /?#%").summary(),
+            ])
         }
 
         async fn load(&self, _: &SessionId) -> Result<AgentSession, LlmError> {
@@ -921,7 +1347,7 @@ mod tests {
         }
 
         async fn active_state(&self, _: &SessionId) -> Option<AgentSessionActiveRunState> {
-            unreachable!()
+            None
         }
 
         async fn submit_prompt(
@@ -947,6 +1373,331 @@ mod tests {
 
         fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>> {
             Box::pin(tokio_stream::empty())
+        }
+    }
+
+    #[test]
+    fn canonical_uri_components_round_trip_and_reject_aliases() {
+        for input in ["agents/coding.yaml", "session /?#%", "unicode-\u{00e9}"] {
+            assert_eq!(decode_component(&encode_component(input)).unwrap(), input);
+        }
+        for invalid in [
+            "",
+            "agents/coding.yaml",
+            "%2f",
+            "%61",
+            "%",
+            "%GG",
+            "%FF",
+            "a?b",
+            "a#b",
+            "%00",
+        ] {
+            assert!(decode_component(invalid).is_err(), "{invalid}");
+        }
+        assert!(resource_path("https://resources/agents%2Fcoding.yaml").is_err());
+    }
+
+    #[test]
+    fn text_edits_are_ordered_unique_and_nonempty() {
+        let edits: Vec<TextEdit> = serde_json::from_value(json!([
+            {"operation":"replace","old_text":"alpha","new_text":"beta"},
+            {"operation":"insert","text":"!","placement":"after","anchor":"beta"},
+            {"operation":"insert","text":"[","placement":"start"},
+            {"operation":"insert","text":"]","placement":"end"}
+        ]))
+        .unwrap();
+        assert_eq!(apply_text_edits("alpha", &edits).unwrap(), "[beta!]");
+        for edit in [
+            json!({"operation":"replace","old_text":"","new_text":"x"}),
+            json!({"operation":"replace","old_text":"a","new_text":"b"}),
+            json!({"operation":"replace","old_text":"aa","new_text":"b"}),
+            json!({"operation":"replace","old_text":"aaa","new_text":"aaa"}),
+            json!({"operation":"insert","text":"","placement":"start"}),
+            json!({"operation":"insert","text":"x","placement":"start","anchor":"aaa"}),
+            json!({"operation":"insert","text":"x","placement":"before"}),
+            json!({"operation":"insert","text":"x","placement":"after","anchor":"a"}),
+        ] {
+            let edit: TextEdit = serde_json::from_value(edit).unwrap();
+            assert!(apply_text_edits("aaa", &[edit]).is_err());
+        }
+        assert!(apply_text_edits("aaa", &[]).is_err());
+        let excessive: Vec<TextEdit> = (0..257)
+            .map(|_| TextEdit::Insert {
+                text: "x".to_owned(),
+                placement: Placement::End,
+                anchor: None,
+            })
+            .collect();
+        assert!(apply_text_edits("aaa", &excessive).is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_edit_http_contract_rejects_envelopes_and_null_anchors_without_writes() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let server = Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap());
+        let router = mcp::server::streamable_http_router(server.clone());
+        let uri = "waltr://resources/agents%2Fcoding.yaml";
+        let original = server.resource_detail(uri).unwrap();
+        let arguments = json!({
+            "uri": uri, "expected_revision": original["revision"],
+            "edits": [{"operation":"insert", "text":"\n# direct edit\n", "placement":"end"}]
+        });
+        let tools = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let edit = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "edit")
+            .unwrap();
+        let schema = &edit["inputSchema"];
+        assert_eq!(
+            schema["required"],
+            json!(["uri", "expected_revision", "edits"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"].get("action").is_none());
+        assert!(schema["properties"].get("input").is_none());
+        assert!(schema["properties"].get("filter").is_none());
+        let alternatives = schema["properties"]["edits"]["items"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(alternatives.len(), 3);
+        let unanchored = &alternatives[1];
+        assert_eq!(
+            unanchored["properties"]["placement"]["enum"],
+            json!(["start", "end"])
+        );
+        assert_eq!(unanchored["additionalProperties"], false);
+        assert!(unanchored["properties"].get("anchor").is_none());
+        let anchored = &alternatives[2];
+        assert_eq!(
+            anchored["properties"]["placement"]["enum"],
+            json!(["before", "after"])
+        );
+        assert!(
+            anchored["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("anchor"))
+        );
+        assert_eq!(anchored["properties"]["anchor"]["type"], "string");
+        assert_eq!(anchored["properties"]["anchor"]["minLength"], 1);
+
+        let mut rejected = vec![json!({"action":"resource.edit", "input":arguments})];
+        for placement in ["start", "end", "before", "after"] {
+            let mut null_anchor = arguments.clone();
+            null_anchor["edits"][0]["placement"] = json!(placement);
+            null_anchor["edits"][0]["anchor"] = Value::Null;
+            rejected.push(null_anchor);
+        }
+        for placement in ["before", "after"] {
+            let mut missing_anchor = arguments.clone();
+            missing_anchor["edits"][0]["placement"] = json!(placement);
+            rejected.push(missing_anchor);
+        }
+        for arguments in rejected {
+            let response = mcp_request(
+                &router,
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"edit", "arguments":arguments}
+                }),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+            assert_eq!(server.resource_detail(uri).unwrap(), original);
+            assert!(!root.join(".waltr/resources/agents/coding.yaml").exists());
+        }
+
+        let response = mcp_request(
+            &router,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"edit", "arguments":arguments}
+            }),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        let updated = server.resource_detail(uri).unwrap();
+        assert_eq!(updated["persisted"], true);
+        assert!(
+            updated["source"]
+                .as_str()
+                .unwrap()
+                .ends_with("\n# direct edit\n")
+        );
+        assert_eq!(response["result"]["structuredContent"], updated);
+        assert_eq!(
+            std::fs::read_to_string(root.join(".waltr/resources/agents/coding.yaml")).unwrap(),
+            updated["source"].as_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn edits_guard_bundled_source_revision_and_validate_atomically() {
+        let server = test_server();
+        let uri = "waltr://resources/agents%2Fcoding.yaml";
+        let original = server.resource_detail(uri).unwrap();
+        let source = original["source"].as_str().unwrap();
+        let revision = original["revision"].as_str().unwrap();
+        assert!(revision.contains('@'));
+        let invalid = server
+            .edit_resource(TextEditInput {
+                uri: uri.to_owned(),
+                expected_revision: revision.to_owned(),
+                edits: vec![TextEdit::Replace {
+                    old_text: source.to_owned(),
+                    new_text: "not a valid resource".to_owned(),
+                }],
+            })
+            .await;
+        assert!(invalid.is_err());
+        assert_eq!(server.resource_detail(uri).unwrap(), original);
+        let edited = server
+            .edit_resource(TextEditInput {
+                uri: uri.to_owned(),
+                expected_revision: revision.to_owned(),
+                edits: vec![TextEdit::Insert {
+                    text: "\n# override\n".to_owned(),
+                    placement: Placement::End,
+                    anchor: None,
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(edited["persisted"], true);
+        let stale = server
+            .edit_resource(TextEditInput {
+                uri: uri.to_owned(),
+                expected_revision: revision.to_owned(),
+                edits: vec![TextEdit::Insert {
+                    text: "\n# stale\n".to_owned(),
+                    placement: Placement::End,
+                    anchor: None,
+                }],
+            })
+            .await
+            .unwrap_err();
+        assert_server_error(&stale, -32602, "revision changed", &[]);
+        assert_eq!(server.resource_detail(uri).unwrap(), edited);
+        let guarded = server
+            .resources
+            .replace_guarded(
+                "agents/coding.yaml",
+                source.to_owned(),
+                edited["persisted_etag"].as_str().unwrap(),
+                Some("different source"),
+            )
+            .await
+            .unwrap_err();
+        assert!(guarded.is_failed_precondition());
+        assert_eq!(server.resource_detail(uri).unwrap(), edited);
+    }
+
+    #[tokio::test]
+    async fn collections_templates_sources_and_session_uris_are_discoverable() {
+        let router = mcp::server::streamable_http_router(test_server());
+        let resources = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"resources/list"}),
+        )
+        .await;
+        let entries = resources["result"]["resources"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["uri"], "waltr://resources");
+        assert_eq!(entries[1]["uri"], "waltr://sessions");
+        let templates = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"resources/templates/list"}),
+        )
+        .await;
+        assert_eq!(
+            templates["result"]["resourceTemplates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let catalog = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"waltr://resources"}})).await;
+        let catalog: Value =
+            serde_json::from_str(catalog["result"]["contents"][0]["text"].as_str().unwrap())
+                .unwrap();
+        for entry in catalog["entries"].as_array().unwrap() {
+            assert_eq!(
+                resource_path(entry["uri"].as_str().unwrap()).unwrap(),
+                entry["path"].as_str().unwrap()
+            );
+        }
+        let source = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"waltr://resources/agents%2Fcoding.yaml/source"}})).await;
+        assert_eq!(
+            source["result"]["contents"][0]["mimeType"],
+            "application/yaml"
+        );
+        assert!(
+            source["result"]["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("kind: Agent")
+        );
+        let sessions = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"waltr://sessions"}})).await;
+        let sessions: Value =
+            serde_json::from_str(sessions["result"]["contents"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            sessions["sessions"][0]["uri"],
+            "waltr://sessions/session%20%2F%3F%23%25"
+        );
+        let rejected = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"waltr://resources/agents/coding.yaml"}})).await;
+        assert_eq!(rejected["error"]["code"], -32602);
+        let wipe = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"destroy","arguments":{"action":"session.wipe","input":{"confirm":false}}}})).await;
+        assert_eq!(wipe["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn resource_reads_and_uniform_tools_remain_behind_local_admission() {
+        let router = mcp::server::streamable_http_router(test_server()).layer(
+            axum::middleware::from_fn_with_state(
+                crate::local_admission::LocalBearer::new("test-generation").unwrap(),
+                crate::local_admission::require_local_protocol_bearer,
+            ),
+        );
+        for (method, params) in [
+            ("resources/list", json!({})),
+            ("resources/templates/list", json!({})),
+            ("resources/read", json!({"uri":"waltr://resources"})),
+            (
+                "tools/call",
+                json!({"name":"destroy","arguments":{"action":"session.wipe","input":{"confirm":true}}}),
+            ),
+        ] {
+            for bearer in [None, Some("Bearer wrong-generation")] {
+                let mut request =
+                    HttpRequest::post("/mcp").header("content-type", "application/json");
+                if let Some(bearer) = bearer {
+                    request = request.header("authorization", bearer);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        request
+                            .body(Body::from(
+                                json!({
+                                    "jsonrpc":"2.0","id":1,"method":method,"params":params,
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+            }
         }
     }
 
@@ -1058,37 +1809,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_definition_action_handlers_dispatch_inspect_replace_and_reset() {
+    async fn resource_handlers_create_edit_and_destroy_without_overwrite() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
         let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap();
 
-        let inspected = server
-            .inspect_resources(InspectResourcesInput {
-                path: Some("agents/coding.yaml".to_owned()),
-            })
-            .unwrap();
-        let expected_etag = inspected["persisted_etag"].as_str().unwrap().to_owned();
+        let uri = "waltr://resources/agents%2Fcoding.yaml";
+        let inspected = server.resource_detail(uri).unwrap();
+        let revision = inspected["revision"].as_str().unwrap().to_owned();
         let source = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: coding\nspec:\n  description: managed\n";
         let replaced = server
-            .replace_resource(ReplaceResourceInput {
-                path: "agents/coding.yaml".to_owned(),
+            .create_resource(ResourceCreateInput {
+                uri: uri.to_owned(),
                 source: source.to_owned(),
-                expected_etag,
+                expected_revision: revision.clone(),
             })
             .await
             .unwrap();
         assert_eq!(replaced["persisted_source"], source);
+        let occupied = server
+            .create_resource(ResourceCreateInput {
+                uri: uri.to_owned(),
+                source: source.to_owned(),
+                expected_revision: replaced["revision"].as_str().unwrap().to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert_server_error(&occupied, -32602, "slot occupied", &[]);
+
+        let edited = server
+            .edit_resource(TextEditInput {
+                uri: uri.to_owned(),
+                expected_revision: replaced["revision"].as_str().unwrap().to_owned(),
+                edits: vec![TextEdit::Replace {
+                    old_text: "managed".to_owned(),
+                    new_text: "edited".to_owned(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(edited["source"].as_str().unwrap().contains("edited"));
 
         let reset = server
-            .reset_resource(ResetResourceInput {
-                path: "agents/coding.yaml".to_owned(),
-                expected_etag: replaced["persisted_etag"].as_str().unwrap().to_owned(),
+            .destroy_resource(ResourceDestroyInput {
+                uri: uri.to_owned(),
+                expected_revision: edited["revision"].as_str().unwrap().to_owned(),
             })
             .await
             .unwrap();
         assert_eq!(reset["origin"], "bundled");
         assert_eq!(reset["persisted"], false);
+        assert_eq!(reset["revision"], revision);
     }
 
     #[tokio::test]
@@ -1100,29 +1871,32 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
         )
         .await;
-        let exec = tools["result"]["tools"]
+        let names = tools["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "exec")
-            .unwrap();
-        let schema = exec["inputSchema"].to_string();
-        assert!(schema.contains("resources"));
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["create", "edit", "destroy", "execute", "query"]);
+        let schema = tools["result"]["tools"].to_string();
+        assert!(!schema.contains("resources.inspect"));
+        assert!(!schema.contains("session.get"));
+        assert!(!schema.contains("session.list"));
         assert!(!schema.contains("configuration.inspect"));
 
         assert!(!schema.contains("help"));
         assert!(!schema.contains("runbooks"));
 
-        let definitions = call_exec(
+        let definitions = mcp_request(
             &router,
-            json!({ "action": "resources.inspect", "input": {} }),
+            json!({"jsonrpc":"2.0","id":1,"method":"resources/read", "params":{"uri":"waltr://resources"}}),
         )
         .await;
         assert!(definitions.get("error").is_none(), "{definitions}");
         assert!(definitions.to_string().contains("agents/coding.yaml"));
 
-        for tool in ["exec", "sessions"] {
-            for action in ["help", "help.resources", "help.runbooks", "runbooks.load"] {
+        for tool in ["exec", "sessions", "query", "execute"] {
+            for action in ["resources.inspect", "session.get", "session.list", "help"] {
                 let rejected = mcp_request(
                     &router,
                     json!({
@@ -1131,7 +1905,12 @@ mod tests {
                     }),
                 )
                 .await;
-                assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+                let code = if matches!(tool, "exec" | "sessions") {
+                    -32020
+                } else {
+                    -32602
+                };
+                assert_eq!(rejected["error"]["code"], code, "{rejected}");
             }
         }
         let old_resource = mcp_request(
@@ -1229,20 +2008,15 @@ mod tests {
             .unwrap_err();
         assert_server_error(&validation, -32602, "invalid canonical", &["/private/tmp"]);
 
-        let inspected = inner
-            .inspect_resources(InspectResourcesInput {
-                path: Some("agents/coding.yaml".to_owned()),
-            })
-            .unwrap();
         let stale_error = inner
-            .replace_resource(ReplaceResourceInput {
-                path: "agents/coding.yaml".to_owned(),
+            .create_resource(ResourceCreateInput {
+                uri: "waltr://resources/agents%2Fcoding.yaml".to_owned(),
                 source: "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: coding\nspec: {}\n".to_owned(),
-                expected_etag: format!("{}-stale", inspected["persisted_etag"].as_str().unwrap()),
+                expected_revision: "stale".to_owned(),
             })
             .await
             .unwrap_err();
-        assert_server_error(&stale_error, -32602, "inspect and retry", &["sha256:"]);
+        assert_server_error(&stale_error, -32602, "read and retry", &["sha256:"]);
 
         let read = agent_definition_error(&AgentDefinitionLoadError::Read {
             path: PathBuf::from("/private/tmp/secret.yaml"),
@@ -1279,19 +2053,6 @@ mod tests {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
         Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap())
-    }
-
-    async fn call_exec(router: &Router, arguments: Value) -> Value {
-        mcp_request(
-            router,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": "exec", "arguments": arguments }
-            }),
-        )
-        .await
     }
 
     async fn mcp_request(router: &Router, mut body: Value) -> Value {
