@@ -45,6 +45,282 @@ async fn unified_state(directory: &TestDirectory) -> AgentDefinitionState {
     AgentDefinitionState::load_unified(&directory.0, materializer).unwrap()
 }
 
+#[tokio::test]
+async fn bundled_configuration_agent_enforces_resource_only_hosted_permissions() {
+    use futures_util::{StreamExt as _, stream};
+    use waltr_agent::{
+        AgentPermissionSelector, AgentRuntimeBuilder, AgentTool, BoxCompletionStream,
+        BoxStreamFuture, CompletionEvent, CompletionRequest, LlmStream, ModelApi, ModelRef,
+        PermissionLevel, PermissionPolicy, PermissionToolSelector, ProviderId, ResolvedPermission,
+        ToolCall, ToolDefinition,
+    };
+    use serde_json::json;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CallsProvider {
+        calls: Vec<ToolCall>,
+        requests: AtomicUsize,
+    }
+
+    impl LlmStream for CallsProvider {
+        fn name(&self) -> &'static str {
+            "configuration-permission-test"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async move {
+                let mut events = Vec::new();
+                if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    events.extend(self.calls.iter().cloned().map(CompletionEvent::ToolCall));
+                }
+                events.push(CompletionEvent::Finished);
+                Ok(Box::pin(stream::iter(events.into_iter().map(Ok))) as BoxCompletionStream)
+            })
+        }
+    }
+
+    let directory = TestDirectory::new("configuration-permissions");
+    let state = unified_state(&directory).await;
+    let snapshot = state.snapshot();
+    let definition = snapshot.catalog().resolved("configuration").unwrap();
+    let mcp = definition.features.mcp.as_ref().unwrap();
+    assert_eq!(
+        mcp.servers,
+        waltr_agent::definition::McpServerSelection::Include(["waltr".to_owned()].into())
+    );
+    assert!(mcp.resources && mcp.skills && mcp.expose_tools);
+    assert!(!mcp.default_permissions && !mcp.instructions && !mcp.prompts);
+    assert!(definition.features.filesystem.is_none());
+    assert!(definition.features.shell.is_none());
+    assert!(definition.features.task.is_none());
+
+    // The factory's compiler is private; these name-only declarations use its
+    // exact public policy construction, then exercise the real agent-loop matcher.
+    let mut policy = PermissionPolicy::new(PermissionLevel::Deny);
+    for entry in &definition.permissions {
+        let AgentPermissionSelector::Name(name) = &entry.selector else {
+            panic!("configuration must not grant feature-wide permissions");
+        };
+        let selector = PermissionToolSelector::exact(name);
+        match &entry.permission {
+            ResolvedPermission::Tool(effect) => {
+                policy = policy.with_tool_rule(selector, effect.clone());
+            }
+            ResolvedPermission::Inputs(rules) => {
+                for rule in rules {
+                    policy = policy.with_input_rule(selector.clone(), rule.clone());
+                }
+            }
+            ResolvedPermission::Resources(_) => panic!("no host resource permissions"),
+        }
+    }
+
+    let item = "waltr://resources/agents%2Fcoding.yaml";
+    let edit = json!({"uri":item,"expected_revision":"guarded-revision",
+        "edits":[{"operation":"replace","old_text":"old","new_text":"new"}]});
+    let cases = vec![
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"waltr://resources"}),
+            true,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":item}),
+            true,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":format!("{item}/source")}),
+            true,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"skill://resource-administration/SKILL.md"}),
+            true,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"skill://resource-administration/references/resources.md"}),
+            true,
+        ),
+        (
+            "mcp_waltr_create",
+            json!({"action":"resource.create","input":{"uri":item,"source":"strict YAML","expected_revision":"guarded-revision"}}),
+            true,
+        ),
+        ("mcp_waltr_edit", edit.clone(), true),
+        (
+            "mcp_waltr_destroy",
+            json!({"action":"resource.destroy","input":{"uri":item,"expected_revision":"guarded-revision"}}),
+            true,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"waltr://sessions"}),
+            false,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"waltr://sessions/session-id"}),
+            false,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"other","uri":item}),
+            false,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"other","uri":"skill://resource-administration/SKILL.md"}),
+            false,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"skill://hosted-sessions/SKILL.md"}),
+            false,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"file:///tmp/private"}),
+            false,
+        ),
+        (
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"skill://resource-administration/unknown.md"}),
+            false,
+        ),
+        (
+            "mcp_waltr_create",
+            json!({"action":"session.create","input":{"prompt":"run"}}),
+            false,
+        ),
+        (
+            "mcp_waltr_create",
+            json!({"action":"resource.unknown","input":{}}),
+            false,
+        ),
+        (
+            "mcp_waltr_destroy",
+            json!({"action":"session.wipe","input":{"confirm":true}}),
+            false,
+        ),
+        (
+            "mcp_waltr_destroy",
+            json!({"action":"resource.unknown","input":{}}),
+            false,
+        ),
+        (
+            "mcp_waltr_edit",
+            json!({"uri":"waltr://sessions/session-id","expected_revision":"rev","edits":[]}),
+            false,
+        ),
+        (
+            "mcp_waltr_edit",
+            json!({"uri":"file:///tmp/private","expected_revision":"rev","edits":[]}),
+            false,
+        ),
+        (
+            "mcp_waltr_edit",
+            json!({"action":"resource.edit","input":edit}),
+            false,
+        ),
+        (
+            "mcp_waltr_execute",
+            json!({"action":"session.send","input":{"id":"id","prompt":"run"}}),
+            false,
+        ),
+        (
+            "mcp_waltr_execute",
+            json!({"action":"session.interrupt","input":{"id":"id"}}),
+            false,
+        ),
+        (
+            "mcp_waltr_query",
+            json!({"action":"session.wait","input":{"id":"id","jq":"true"}}),
+            false,
+        ),
+        (
+            "mcp_waltr_exec",
+            json!({"action":"resources.replace","input":{}}),
+            false,
+        ),
+    ];
+    let calls = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments, _))| {
+            ToolCall::new(format!("case-{index}"), *name, arguments.clone())
+        })
+        .collect();
+    let provider = Arc::new(CallsProvider {
+        calls,
+        requests: AtomicUsize::new(0),
+    });
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = AgentRuntimeBuilder::new(
+        ModelRef::new(ProviderId::OpenAi, "test", ModelApi::OpenAiResponses),
+        provider.clone(),
+    )
+    .with_permission_policy(policy.clone());
+    for name in [
+        "read_mcp_resource",
+        "mcp_waltr_create",
+        "mcp_waltr_edit",
+        "mcp_waltr_destroy",
+        "mcp_waltr_execute",
+        "mcp_waltr_query",
+        "mcp_waltr_exec",
+    ] {
+        let executed = executed.clone();
+        builder = builder.with_tool(AgentTool::new(
+            ToolDefinition::new(
+                name,
+                "Record authorized dispatch only",
+                json!({"type":"object"}),
+            ),
+            move |context| {
+                executed.lock().unwrap().push(context.call().id.clone());
+                Ok(context.result("authorized"))
+            },
+        ));
+    }
+    let runtime = builder.build();
+    let events = runtime
+        .prompt("Check configuration permissions")
+        .stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert_eq!(
+        provider.requests.load(Ordering::SeqCst),
+        2,
+        "must finish, not ask for session authority"
+    );
+    let mut actual = executed.lock().unwrap().clone();
+    actual.sort();
+    let mut expected = cases
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, allowed))| *allowed)
+        .map(|(index, _)| format!("case-{index}"))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+    for name in [
+        "mcp_waltr_execute",
+        "mcp_waltr_query",
+        "mcp_waltr_exec",
+        "shell",
+        "read_file",
+    ] {
+        assert_eq!(policy.evaluate_tool(name), PermissionLevel::Deny, "{name}");
+    }
+}
+
 async fn explicit_embedded_state(
     directory: &TestDirectory,
 ) -> Result<AgentDefinitionState, AgentDefinitionLoadError> {

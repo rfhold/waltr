@@ -138,7 +138,13 @@ Replace and reset require the current persisted-slot ETag. A stale ETag returns 
 
 Replace validates the resource and complete candidate catalog before an atomic file replacement. Reset validates the complete fallback catalog before deletion.
 
-The public Waltr MCP server exposes equivalent `resources.inspect`, `resources.replace`, and `resources.reset` actions. These actions use canonical relative paths and persisted-slot ETags.
+The public Waltr MCP server exposes the `waltr://resources` collection and item/source templates through MCP resources.
+Items include canonical URIs, persisted/effective/active source metadata, and guarded revisions.
+Uniform tools expose `create/resource.create`, direct `edit` arguments, and `destroy/resource.destroy`; ordinary reads are not tools.
+Text edits preserve source, validate the complete candidate catalog, and publish one atomic replacement.
+Persisted revisions equal persisted-slot ETags; absent-slot revisions also guard the effective bundled source hash.
+Destroy removes only a persisted override and restores bundled fallback when present.
+See the embedded [resource contract](../../crates/waltr-server/resources/skills/resource-administration/references/resources.md) for URI encoding and edit inputs.
 
 `waltr.routine.v1.RoutineService` provides global definition snapshots, durable manual admission, history, detail, and lifecycle replay.
 

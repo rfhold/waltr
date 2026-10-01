@@ -84,6 +84,10 @@ mod tests {
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
+            approved_tool_name: "question",
+            permission_policy: &crate::PermissionPolicy::default(),
+            contextual_input_is_approved: crate::template::contextual_input_is_approved,
+            contextual_suspension: crate::template::contextual_suspension,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session-1",
             turn: 2,
@@ -115,6 +119,10 @@ mod tests {
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
+            approved_tool_name: "lookup",
+            permission_policy: &crate::PermissionPolicy::default(),
+            contextual_input_is_approved: crate::template::contextual_input_is_approved,
+            contextual_suspension: crate::template::contextual_suspension,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session-1",
             turn: 0,
@@ -136,6 +144,10 @@ mod tests {
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
+            approved_tool_name: "question",
+            permission_policy: &crate::PermissionPolicy::default(),
+            contextual_input_is_approved: crate::template::contextual_input_is_approved,
+            contextual_suspension: crate::template::contextual_suspension,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "session-1",
             turn: 0,

@@ -669,6 +669,22 @@ impl AgentDefinitionState {
         source: String,
         expected_etag: &str,
     ) -> Result<DefinitionResourceDetail, AgentDefinitionLoadError> {
+        self.replace_guarded(path, source, expected_etag, None)
+            .await
+    }
+
+    /// Replace a slot while also guarding the effective source used for a text edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary replace errors or a concurrent-change error when the source changed.
+    pub(crate) async fn replace_guarded(
+        &self,
+        path: &str,
+        source: String,
+        expected_etag: &str,
+        expected_source: Option<&str>,
+    ) -> Result<DefinitionResourceDetail, AgentDefinitionLoadError> {
         validate_resource_path(path)?;
         if expected_etag.trim().is_empty() {
             return Err(AgentDefinitionLoadError::MissingExpectedEtag);
@@ -677,6 +693,12 @@ impl AgentDefinitionState {
         let _maintenance = self.inner.maintenance.lock().await;
         let mut persisted = self.discover_persisted()?;
         check_expected_etag(path, persisted.get(path), expected_etag)?;
+        if let Some(expected) = expected_source {
+            let effective = persisted.get(path).or_else(|| self.inner.bundled.get(path));
+            if effective.map(String::as_str) != Some(expected) {
+                return Err(AgentDefinitionLoadError::ConcurrentFilesystemChange);
+            }
+        }
         let observed_fingerprint = tree_fingerprint(&persisted);
         persisted.insert(path.to_owned(), source.clone());
         drop(self.build_candidate(&persisted)?);

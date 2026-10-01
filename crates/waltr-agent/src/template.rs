@@ -24,6 +24,13 @@ use crate::{
 
 const MAX_TEMPLATE_DEPTH: usize = 8;
 const TEMPLATE_TOOL_RESULTS: &str = "template_tool_results";
+const TEMPLATE_RESOURCE_READER_RESULTS: &str = "template_resource_reader_results";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TemplateResourceReaderResult {
+    binding: Value,
+    rendered: String,
+}
 const TEMPLATE_SANDBOX_RESULTS: &str = "template_sandbox_results";
 
 #[allow(clippy::redundant_pub_crate)]
@@ -448,7 +455,23 @@ pub(crate) async fn render_tool_template_reference(
         .map(|value| serde_json::from_value(value.clone()).map_err(template_runtime_error))
         .transpose()?
         .unwrap_or_default();
-    if let Some(rendered) = completed.get(&call.id) {
+    if name == "read_mcp_resource" {
+        let readers: BTreeMap<String, TemplateResourceReaderResult> = ctx
+            .middleware_state
+            .get(TEMPLATE_RESOURCE_READER_RESULTS)
+            .map(|value| serde_json::from_value(value.clone()).map_err(template_runtime_error))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(cached) = readers.get(&call.id)
+            && cached.binding == template_reader_binding(ctx, &call)
+            && !ctx
+                .permission_policy
+                .evaluate_input(name, &arguments)
+                .is_some_and(|input| input.effect.level == PermissionLevel::Deny)
+        {
+            return Ok(TemplateReferenceRender::Rendered(cached.rendered.clone()));
+        }
+    } else if let Some(rendered) = completed.get(&call.id) {
         return Ok(TemplateReferenceRender::Rendered(rendered.clone()));
     }
 
@@ -495,6 +518,10 @@ pub(crate) async fn render_tool_template_reference(
     let before_outcome = {
         let middleware_chain = ctx.middleware_chain;
         let mut tool_ctx = ToolCallContext {
+            approved_tool_name: name,
+            permission_policy: ctx.permission_policy,
+            contextual_input_is_approved,
+            contextual_suspension,
             cancellation_token: ctx.cancellation_token.clone(),
             session_id: ctx.session_id,
             turn: ctx.turn,
@@ -507,6 +534,46 @@ pub(crate) async fn render_tool_template_reference(
     match before_outcome {
         Ok(HookOutcome::Continue) => {}
         Ok(HookOutcome::ReplaceToolResult(result)) => {
+            if name == "read_mcp_resource" {
+                match permission_outcome(ctx, &call, &claims)? {
+                    TemplatePermissionOutcome::Allow => {}
+                    TemplatePermissionOutcome::Deny(message) => {
+                        return Ok(TemplateReferenceRender::Rendered(
+                            template_tool_error_result(name, &arguments, message),
+                        ));
+                    }
+                    TemplatePermissionOutcome::Ask(claims) => {
+                        return Ok(TemplateReferenceRender::Suspend(permission_suspension(
+                            &PermissionRequestContext {
+                                session_id: ctx.session_id,
+                                turn: ctx.turn,
+                                stage: PermissionApprovalStage::Contextual,
+                                policy: ctx.permission_policy,
+                            },
+                            &call,
+                            &claims,
+                        )));
+                    }
+                }
+                if whole_tool_approved {
+                    let mut state = permission_runtime_state(ctx.middleware_state)?;
+                    if state.consume_one_shot(
+                        &whole_tool_request_id,
+                        &call.id,
+                        PermissionApprovalStage::WholeTool,
+                        &[],
+                    ) {
+                        set_permission_runtime_state(ctx.middleware_state, &state)?;
+                    }
+                }
+                if !result.is_error {
+                    cache_template_reader_result(
+                        ctx,
+                        &call,
+                        render_template_tool_result(&result, &arguments),
+                    )?;
+                }
+            }
             return Ok(TemplateReferenceRender::Rendered(
                 render_template_tool_result(&result, &arguments),
             ));
@@ -655,7 +722,9 @@ pub(crate) async fn render_tool_template_reference(
         }
         Err(error) => (template_tool_error_result(name, &arguments, error), false),
     };
-    if !tools[tool_index].is_sandbox_backed() || cacheable {
+    if name == "read_mcp_resource" && cacheable {
+        cache_template_reader_result(ctx, &call, rendered.clone())?;
+    } else if name != "read_mcp_resource" && (!tools[tool_index].is_sandbox_backed() || cacheable) {
         let mut completed = completed;
         completed.insert(call.id, rendered.clone());
         ctx.middleware_state.set(
@@ -671,6 +740,82 @@ fn render_template_tool_result(result: &ToolResult, arguments: &Value) -> String
         template_tool_error_result(&result.name, arguments, &result.content)
     } else {
         template_tool_result(&result.name, arguments, &result.content)
+    }
+}
+
+fn template_reader_binding(ctx: &TemplateRenderContext<'_>, call: &ToolCall) -> Value {
+    json!([
+        ctx.session_id,
+        ctx.turn,
+        call.id,
+        call.name,
+        call.arguments,
+        ctx.permission_policy.identity()
+    ])
+}
+
+fn cache_template_reader_result(
+    ctx: &mut TemplateRenderContext<'_>,
+    call: &ToolCall,
+    rendered: String,
+) -> Result<()> {
+    let mut readers: BTreeMap<String, TemplateResourceReaderResult> = ctx
+        .middleware_state
+        .get(TEMPLATE_RESOURCE_READER_RESULTS)
+        .map(|value| serde_json::from_value(value.clone()).map_err(template_runtime_error))
+        .transpose()?
+        .unwrap_or_default();
+    readers.insert(
+        call.id.clone(),
+        TemplateResourceReaderResult {
+            binding: template_reader_binding(ctx, call),
+            rendered,
+        },
+    );
+    ctx.middleware_state.set(
+        TEMPLATE_RESOURCE_READER_RESULTS,
+        serde_json::to_value(readers).map_err(template_runtime_error)?,
+    );
+    Ok(())
+}
+
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn template_read_permission_error(
+    ctx: &TemplateRenderContext<'_>,
+    name: &str,
+    arguments: &Value,
+) -> Result<Option<String>> {
+    match ctx.permission_policy.evaluate_tool(name) {
+        PermissionLevel::Allow => {}
+        PermissionLevel::Deny => return Ok(Some(format!("tool is not permitted: {name}"))),
+        PermissionLevel::Ask => {
+            return Ok(Some(format!(
+                "permission required: invoke {name} directly for approval"
+            )));
+        }
+    }
+    let Some(input) = ctx.permission_policy.evaluate_input(name, arguments) else {
+        return Ok(None);
+    };
+    match input.effect.level {
+        PermissionLevel::Allow => Ok(None),
+        PermissionLevel::Deny => Ok(Some(
+            "permission denied: tool input does not satisfy policy".to_owned(),
+        )),
+        PermissionLevel::Ask => {
+            let state = permission_runtime_state(ctx.middleware_state)?;
+            if input
+                .claims
+                .iter()
+                .all(|claim| state.patterns.iter().any(|pattern| pattern.matches(claim)))
+            {
+                return Ok(None);
+            }
+            // Resource references have no tool-call identity for one-shot approval.
+            Ok(Some(format!(
+                "permission required: invoke {name} directly for approval"
+            )))
+        }
     }
 }
 
@@ -984,6 +1129,48 @@ struct PermissionRequestContext<'a> {
     policy: &'a PermissionPolicy,
 }
 
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn contextual_input_is_approved(
+    ctx: &ToolCallContext<'_>,
+    claims: &[PermissionClaim],
+    state: &PermissionRuntimeState,
+) -> bool {
+    let identities = permission_claim_identities(claims);
+    let request_id = template_permission_request_id(
+        &PermissionRequestContext {
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+            stage: PermissionApprovalStage::Contextual,
+            policy: ctx.permission_policy,
+        },
+        ctx.call,
+        &identities,
+    );
+    state.has_one_shot(
+        &request_id,
+        &ctx.call.id,
+        PermissionApprovalStage::Contextual,
+        &identities,
+    )
+}
+
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn contextual_suspension(
+    ctx: &ToolCallContext<'_>,
+    claims: &[PermissionClaim],
+) -> middleware::Suspension {
+    permission_suspension(
+        &PermissionRequestContext {
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+            stage: PermissionApprovalStage::Contextual,
+            policy: ctx.permission_policy,
+        },
+        ctx.call,
+        claims,
+    )
+}
+
 fn permission_suspension(
     request: &PermissionRequestContext<'_>,
     call: &ToolCall,
@@ -1028,8 +1215,14 @@ fn template_permission_request_id(
     call: &ToolCall,
     claims: &[PermissionClaimIdentity],
 ) -> String {
-    let identity = serde_json::to_string(&(request.stage, request.policy.identity(), claims))
-        .expect("permission request identity serializes");
+    let identity = serde_json::to_string(&(
+        request.stage,
+        request.policy.identity(),
+        &call.name,
+        &call.arguments,
+        claims,
+    ))
+    .expect("permission request identity serializes");
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in identity.bytes() {
         hash ^= u64::from(byte);
@@ -1173,6 +1366,49 @@ mod tests {
         TemplateOrigin, TemplateReferenceRender, render_template_tool_result,
         render_tool_template_reference,
     };
+
+    #[test]
+    fn template_permission_identity_binds_tool_name_and_complete_arguments() {
+        let policy = crate::PermissionPolicy::default();
+        let request = super::PermissionRequestContext {
+            session_id: "session",
+            turn: 0,
+            stage: super::PermissionApprovalStage::Contextual,
+            policy: &policy,
+        };
+        let original = crate::ToolCall::new(
+            "same-occurrence",
+            "read_mcp_resource",
+            json!({"server":"waltr","uri":"waltr://resources"}),
+        );
+        let approved = super::template_permission_request_id(&request, &original, &[]);
+        assert_eq!(
+            approved,
+            super::template_permission_request_id(&request, &original, &[])
+        );
+        for changed in [
+            crate::ToolCall::new(
+                "same-occurrence",
+                "other_reader",
+                original.arguments.clone(),
+            ),
+            crate::ToolCall::new(
+                "same-occurrence",
+                "read_mcp_resource",
+                json!({"server":"waltr","uri":"waltr://sessions"}),
+            ),
+            crate::ToolCall::new(
+                "same-occurrence",
+                "read_mcp_resource",
+                json!({"server":"other","uri":"waltr://resources"}),
+            ),
+        ] {
+            assert_ne!(
+                approved,
+                super::template_permission_request_id(&request, &changed, &[])
+            );
+        }
+    }
 
     struct RedirectWrite;
 
