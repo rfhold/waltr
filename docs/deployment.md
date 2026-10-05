@@ -61,6 +61,190 @@ Mount a writable socket directory at `/run/waltr-sandbox` in both processes with
 
 Compose defines static `dev`, `test`, and `test-auth` profiles, not a dynamic worker-mode profile. The worker is an internal service in each profile; server/test health gates must wait for a working connection. The test fixtures keep `/data` and workspace state ephemeral. A lost UDS stream makes `/ready` fail until the same worker reconnects, while `/health` continues to report server liveness; a worker that cannot connect during startup fails startup rather than silently moving workspace operations into the server. See [Private Workspace Boundary](architecture/agent.md#private-workspace-boundary) for request deadlines, reconnect, and unknown-outcome handling.
 
+## MCP Apps Assets And App Container
+
+MCP Apps uses SDK assets and a separate-origin, asset-only listener.
+The bundled TUI with web assets owns that listener in the same process.
+Its normal loopback startup requires no separate command or Apps environment variables.
+This app container differs from the private workspace worker.
+It exposes no Waltr API, MCP endpoint, OAuth route, admission credentials, or filesystem access.
+Normal Apple Silicon macOS builds also own a dedicated loopback Apps listener; other native platforms remain unsupported.
+The host configuration below covers the hosted browser.
+See [Clients](architecture/clients.md#session-mcp-apps) for host policy and native limitations.
+
+### Build Prerequisites
+
+Run these commands from the repository root after `pnpm install`:
+
+```sh
+cargo build -p waltr-server
+```
+
+The default server features include `apps-assets`; `web` also enables it, even without default features.
+The umbrella feature selects both independent asset features:
+
+| Feature | Assets |
+| --- | --- |
+| `apps-host-assets` | Web-owned trusted container HTML and JavaScript from `crates/waltr-web/dist/app-container/`. |
+| `apps-served-assets` | Explicit server-owned app HTML from `crates/waltr-server/scripts/apps.entries`, currently `status`. |
+
+Web owns the trusted container source in `src/mcp-apps/container/`, the shared `src/mcp-apps/bridge-contract.ts`, and the `app-container/container.html` entry.
+These paths belong to `crates/waltr-web`.
+The normal Vite browser build emits the UI plus `dist/app-container/container.html` and `dist/app-container/container.js`.
+Vite assertions require a self-contained container script with no shared chunks, dynamic imports, or external asset references.
+The container HTML references only `./container.js`.
+The `app-container` Vite mode emits only those two files and requires no WASM build.
+Tauri frontend modes omit the container; Apple Silicon macOS Rust builds embed it through the server host-assets feature.
+
+Without a full web build or an override, the server runs `pnpm --filter @rfhold/waltr-web build:app-container` for host assets.
+It copies the two output files into Cargo's `OUT_DIR`.
+With the `web` feature, the server invokes one full web build and consumes its container output without a second host-assets build.
+For served assets, the server runs `pnpm --filter @rfhold/waltr-server build`.
+The `@rfhold/waltr-server` workspace package owns the served-app SDK and Vite toolchain.
+It pins `@modelcontextprotocol/ext-apps` to `1.2.2`, Vite to `7.2.4`, and `vite-plugin-singlefile` to `2.3.0`.
+`scripts/apps.entries` declares each app name and source root relative to the server package.
+`scripts/build-apps.mjs` runs independent standard Vite single-file builds through the shared configuration.
+Each `dist/<name>/` contains only a nonempty UTF-8 `index.html`, at most one MiB, with no external scripts or stylesheets.
+Cargo validates each document and copies it into `OUT_DIR/<name>.html`.
+Cargo generates `served_app_assets.rs` with optional `<NAME>_HTML` constants; builds without served assets generate `None`.
+The explicit Rust `AppResource` and `RESOURCES` list owns publication, capability checks, descriptors, content, and deny-all external CSP.
+Build entries do not create tools or a runtime app catalog.
+See [Waltr-served Apps authoring](mcp/apps-authoring.md) for the static addition workflow.
+Node and pnpm must exist on `PATH`; asset builds require installed workspace dependencies.
+Root dependencies supply only Playwright; each asset package owns its build dependencies.
+Cargo installs no Node packages; all asset builds use standard package commands.
+The Docker build copies all current workspace package manifests before its frozen pnpm install.
+Keep that manifest set complete when workspace packages change.
+Production asset builds do not import browser fixtures.
+The public MCP `status` declaration links the app only for requests advertising the HTML Apps MIME type; resource reads require the same capability.
+The app requests no external CSP origins or browser permissions and refreshes through `tools/call`, not HTTP fetch or inference.
+The main web asset collection excludes `/app-container/` and legacy `/apps/` files.
+A server build with `--no-default-features` and no asset feature omits Apps assets.
+Session Apps RPC support remains independent of both asset features.
+Asset inclusion alone does not start an Apps listener in the standalone server.
+
+`WALTR_APP_CONTAINER_DIST` optionally selects a prebuilt container artifact directory at compile time.
+Use an absolute path for a portable artifact override.
+The build script does not enforce absolute paths; it reads the supplied directory directly.
+With `apps-host-assets`, the override bypasses the host-assets Vite build and copies its files into `OUT_DIR`.
+It preserves the supplied directory; a `web` build still runs its full browser build.
+With `apps-served-assets`, all explicit served apps still build through the server workspace package.
+The override directory must contain exactly UTF-8 `container.html` and `container.js` files, each at most one MiB.
+The hosted web build also requires the WASM prerequisites in [Contributing](../CONTRIBUTING.md#building).
+
+### Bundled Startup
+
+`pnpm install:bundled` installs `waltr` through `cargo install --features bundled`; the Rust builder supplies the required asset builds.
+The `bundled` feature selects the embedded server, web assets, and default server startup.
+Web-enabled TUI startup uses `ServerApplication::bind_with_apps` to own both listeners.
+The Apps listener defaults to an ephemeral `127.0.0.1:0` address, separate from the API origin.
+The host derives exact parent origins from the actual loopback API address and its `localhost` alias.
+It injects the public app container URL into the HTML head through `waltr-mcp-apps-container-url` metadata.
+Root and deep-link shell responses use `Cache-Control: no-store` so they retain no stale listener URL.
+The API origin never serves Apps assets.
+
+The browser prefers this runtime metadata over a stale compiled Vite URL.
+Present but invalid or duplicate metadata fails closed; it does not fall back to the compiled URL.
+Without runtime metadata, external browser hosts still use `VITE_WALTR_MCP_APP_CONTAINER_URL`.
+
+The bundled host rolls back both listeners after startup failure.
+Normal and error TUI exits cancel and join the owned HTTP tasks and Apps expiry task.
+Unexpected Apps listener termination fails the server and enters the same cleanup path.
+HTTP shutdown permits at most five seconds for request drain before cleanup proceeds.
+Plain TUI mode displays no Apps UI and starts no Apps listener without the `web` feature.
+The standalone `waltr-server` API entry point uses this owned lifecycle only after explicit configuration of all three Apps environment variables.
+
+### Configuration
+
+| Setting | Contract |
+| --- | --- |
+| `WALTR_APP_CONTAINER_ADDR` | Dedicated listener address. Bundled web startup defaults to `127.0.0.1:0`; the optional `app-container` CLI defaults to `127.0.0.1:14334`. Standalone opt-in requires an explicit address. |
+| `WALTR_APP_CONTAINER_ORIGIN` | Optional exact HTTP(S) public origin. Loopback listeners derive an origin when absent; external binds require an explicit origin. |
+| `WALTR_APP_CONTAINER_HOST_ORIGINS` | Comma-separated exact parent origins, with 1 through 20 entries. Bundled loopback startup adds its exact API origins; external startup requires explicit parents. |
+| `VITE_WALTR_MCP_APP_CONTAINER_URL` | Optional web build/dev app container URL for an external host without runtime metadata, such as `http://127.0.0.1:5174/container.html`. |
+
+The app container origin must differ from every allowed host origin.
+For loopback public origins, the configured port must match the listener port.
+Use the browser's exact parent origin in `WALTR_APP_CONTAINER_HOST_ORIGINS`.
+`localhost` and `127.0.0.1` are different origins; manual hosts require exact parent configuration.
+The browser permits HTTP app container URLs only on loopback.
+Non-loopback bundled API binds require explicit public app container and parent origins; incomplete policy rejects startup.
+
+### Optional External Host
+
+The standalone asset CLI remains available for Vite or other external browser hosts.
+It is not a prerequisite for normal bundled startup.
+For a Vite host at `http://127.0.0.1:5173`, start a stable separate listener:
+
+```sh
+WALTR_APP_CONTAINER_ADDR=127.0.0.1:5174 \
+WALTR_APP_CONTAINER_HOST_ORIGINS=http://127.0.0.1:5173 \
+target/debug/waltr-server app-container
+```
+
+In another terminal, configure the browser bundle:
+
+```sh
+VITE_WALTR_MCP_APP_CONTAINER_URL=http://127.0.0.1:5174/container.html \
+pnpm --filter @rfhold/waltr-web dev
+```
+
+This asset listener does not start the Waltr API server.
+Start the ordinary API server separately with its usual persistence, workspace worker, and public URL configuration.
+If Vite selects another port, update the exact parent origin before use.
+For bundled web startup, configure runtime origins instead of a compiled Vite URL.
+
+### Hosted Origin And Limits
+
+Use a dedicated HTTPS, cookie-free asset origin for hosted deployments.
+Configure its exact public origin and allowed Waltr parent origins.
+Keep Waltr session cookies, API routes, authorization routes, and reverse-proxy credentials off that origin.
+Do not merge the Apps router into the main API router or serve app container files from the Waltr origin.
+Standalone startup leaves Apps disabled when all three `WALTR_APP_CONTAINER_*` runtime variables are absent.
+Explicit opt-in requires `WALTR_APP_CONTAINER_ADDR`, `WALTR_APP_CONTAINER_ORIGIN`, and `WALTR_APP_CONTAINER_HOST_ORIGINS` together, plus the server `web` feature.
+Partial configuration or an unsupported build fails startup; invalid, wildcard, or same-origin policy also fails closed.
+The server uses `bind_with_apps_config` for both listeners, runtime HTML bootstrap, startup rollback, child-failure cleanup, and joined shutdown.
+No compiled Vite URL or separate asset process is necessary for this topology.
+
+The Pulumi source configures this topology for both stacks:
+
+| Stack | Namespace | Main origin | Apps origin |
+| --- | --- | --- | --- |
+| `preview` | `waltr-preview` | `https://preview-waltr.holdenitdown.net` | `https://preview-waltr-apps.holdenitdown.net` |
+| `prod` | `waltr` | `https://waltr.holdenitdown.net` | `https://waltr-apps.holdenitdown.net` |
+
+Each stack sets the address to `0.0.0.0:14334`, the public origin to its Apps origin, and allowed parents to its main origin.
+The same server process exposes container port `apps-http` at `14334`; no Apps sidecar exists.
+A separate `waltr-apps` Service selects the server workload and declares `appProtocol: http`.
+Its own `waltr-apps` HTTPRoute targets that Service through the external `ingress/default-gateway` Gateway.
+The main Service and route retain port `14333`.
+Pulumi source configuration does not prove live deployment, DNS resolution, Gateway admission, or certificate coverage.
+Verify DNS and TLS for both Apps hostnames separately before rollout.
+These instructions authorize no commit, push, or deployment.
+
+The service accepts app-container-origin `POST /views` uploads of at most one MiB of UTF-8 HTML.
+It stores at most 64 views and 16 MiB total, with 60 uploads per minute per service instance.
+Each view receives a random 256-bit token and expires after ten minutes.
+`DELETE /views/{token}` requires the same exact Origin check and removes the view.
+Unknown or expired view tokens return 404.
+
+The service returns `no-store`, `no-referrer`, `nosniff`, a restrictive Permissions-Policy, and HTTP CSP headers.
+The view CSP denies network access, external scripts, nested frames, objects, base URLs, and forms.
+It permits bundled inline scripts/styles and data images/media under `sandbox allow-scripts`.
+The app container's `frame-src 'self'` also constrains view navigation; `navigate-to` alone is not portable enforcement.
+`frame-ancestors` restricts both app container and view ancestor chains to configured origins.
+The service grants no resource-declared external origins or browser permissions.
+
+Sources: [server asset build](../crates/waltr-server/build.rs), [web Vite build](../crates/waltr-web/vite.config.ts),
+[container entry](../crates/waltr-web/app-container/container.html), [server features](../crates/waltr-server/Cargo.toml),
+[bundled install](../package.json), [TUI lifecycle](../crates/waltr-tui/src/main.rs),
+[server lifecycle](../crates/waltr-server/src/app.rs), [HTML bootstrap](../crates/waltr-server/src/web_assets.rs),
+[server package](../crates/waltr-server/package.json), [status Vite build](../crates/waltr-server/vite.config.ts),
+[asset service](../crates/waltr-server/src/mcp_apps_host/container.rs), [CLI](../crates/waltr-server/src/main.rs),
+and [web policy](../crates/waltr-web/src/mcp-apps/policy.ts).
+Hosted opt-in sources: [standalone policy](../crates/waltr-server/src/standalone_apps.rs),
+[Pulumi topology](../infra/pulumi/index.ts), [preview stack](../infra/pulumi/Pulumi.preview.yaml), and [production stack](../infra/pulumi/Pulumi.prod.yaml).
+
 ## Agent Session Storage
 
 `WALTR_SESSION_STORE` selects agent session storage independently of the Waltr and MCP SQL databases:
@@ -322,6 +506,27 @@ The app has no Waltr endpoint selector or native Waltr access OAuth. Its web ada
 
 The main WebView loads only packaged local assets. Remote navigation and new windows remain denied. Rust validates credential-free HTTPS URLs before the operating system opens them.
 
+Normal Apple Silicon macOS builds enable Apps without `native-apps-test`, a disposable profile, or a prior diagnostic report.
+Target-specific Cargo dependencies select host assets, served assets, and the WKWebView adapter.
+Rust owns a dedicated ephemeral loopback container and joins its lifecycle with the embedded server.
+An unexpected listener exit fails the owner and triggers cleanup.
+The base `tauri.conf.json` retains `frame-src 'none'`; no automatic macOS configuration relaxes that policy.
+At startup, `app_container.rs` applies compile-target-aware CSP through `context.config_mut()` before the Tauri builder consumes the context.
+Only macOS/aarch64 permits `http://127.0.0.1:*/container.html`; other targets, including Intel macOS, retain `frame-src 'none'`.
+The function changes only `frame-src` in configured normal and development CSP; optional diagnostics also permit the probe frame URL.
+Rust further restricts subframe navigation to exact current-generation ports and asset paths.
+Empty `about:blank` and `about:srcdoc` frames require a packaged-page or trusted current-generation asset source.
+The `start_runtime` response exposes `nativeApps.containerUrl` only after the WKNavigationDelegate installation acknowledges success.
+That acknowledgement enforces runtime security; it is not a release-validation gate.
+The private API endpoint and generation bearer remain Rust-only; the six application IPC commands retain their packaged-top-frame boundary.
+Other native platforms remain unsupported; no Intel or universal package support follows from this target.
+
+The optional `native-apps-test` diagnostic feature requires `tauri.native-apps-test.conf.json` and identifier `dev.waltr.app.native-apps-test`.
+Its separate identifier selects disposable app-private roots and adds the attack-fixture listener and `nativeAppsTest` helper.
+Normal Apps require neither the helper nor its evidence pipeline.
+See [macOS Apps verification](testing.md#macos-native-apps-verification) for normal-app live acceptance and optional sanitized diagnostics.
+That procedure supplies no runtime success claim or commit, push, or deployment authority.
+
 The embedded server uses explicit Tauri app-private roots:
 
 | State | Location under Tauri roots |
@@ -337,9 +542,8 @@ Startup fetches `https://models.dev/api.json` before it reads the app cache fall
 
 The complete request and response body have a 15-second bound. Failure or timeout falls back to a valid app cache.
 
-First launch requires network access unless a valid cache already exists.
-
-Later startup can use a valid cache when the network source fails. Startup fails when neither source supplies a valid catalog.
+When the app cache is absent, embedded startup uses its explicit curated built-in seed as a final stale fallback.
+A malformed or unreadable cache still fails startup; it does not select the built-in seed.
 
 Desktop and Android use the same ordinary bundled and persisted resource catalog. Both require the process-local workspace worker at startup. The embedded server runs the private Tonic service and worker in-process over `tokio::io::duplex`; it does not bind a worker socket or expose a public worker route. Workspace tools and context I/O have no host-side fallback. This separation does not provide operating-system isolation; desktop Bash commands have the app process's OS authority. See [agent architecture](architecture/agent.md#private-workspace-boundary).
 
@@ -353,8 +557,8 @@ Run these commands from the repository root. They map to current workspace scrip
 
 | Target | Command | Purpose |
 | --- | --- | --- |
-| Tauri web | `pnpm build:tauri` | Type-check and build relative local assets with Vite `tauri` mode and no WASM build. |
-| Tauri development web | `pnpm --filter @rfhold/waltr-web build:tauri:dev` | Build relative no-WASM Tauri assets with real Faro export disabled. |
+| Tauri web | `pnpm build:tauri` | Generate shared WASM prerequisites, type-check, and build relative Tauri assets with no WASM output. |
+| Tauri development web | `pnpm --filter @rfhold/waltr-web build:tauri:dev` | Generate shared WASM prerequisites and build relative Tauri assets with no WASM output and real Faro export disabled. |
 | Linux desktop | `pnpm --filter @rfhold/waltr-app dev` | Build the Tauri web assets and start the desktop app. |
 | Linux packages | `pnpm --filter @rfhold/waltr-app build` | Build the configured Linux Tauri bundles. |
 | Android package | `pnpm --filter @rfhold/waltr-app android:build` | Build through the generated Android project under `crates/waltr-app/gen/android/`. |
@@ -410,7 +614,7 @@ The repository's supported infrastructure/workload definition is Pulumi under `i
 | Native API | Public | Remote native clients such as the TUI; issues the API audience and scope. |
 Authentik has no MCP provider, application, audience, scope mapping, callback, or token-issuance role. Waltr hosts MCP authorization, supports DCR and CIMD according to explicit stack policy, and retains `WALTR_MCP_REQUIRED_SCOPES` as local policy.
 
-Pulumi keeps one Waltr replica with one workspace worker sidecar in the same pod. A protected workspace PVC is mounted at `/workspace` in the worker, separately from the server's `/data` PVC and secret projections; the server does not mount the workspace PVC, and the worker does not mount `/data`, the PostgreSQL CA, or the OAuth keyring. An ephemeral volume shared only by these containers holds `/run/waltr-sandbox/gateway.sock`. Give both containers the socket path and their respective workspace-root variables from [Workspace Worker Deployment](#workspace-worker-deployment). Keep only the server's public `14333` port on the Service/route; never create a sandbox Service, ingress, or published socket. The containers share one pod network namespace, so this layout separates mounts and processes, **not** network access. Restrict worker egress and runtime authority separately if stronger isolation is required; the pod NetworkPolicy by itself cannot isolate a sidecar from the server's network.
+Pulumi keeps one Waltr replica with one workspace worker sidecar in the same pod. A protected workspace PVC is mounted at `/workspace` in the worker, separately from the server's `/data` PVC and secret projections; the server does not mount the workspace PVC, and the worker does not mount `/data`, the PostgreSQL CA, or the OAuth keyring. An ephemeral volume shared only by these containers holds `/run/waltr-sandbox/gateway.sock`. Give both containers the socket path and their respective workspace-root variables from [Workspace Worker Deployment](#workspace-worker-deployment). The main Service/route exposes server port `14333`; the separate Apps Service/route exposes the same server process's asset-only port `14334`. Never create a sandbox Service, ingress, or published socket. The containers share one pod network namespace, so this layout separates mounts and processes, **not** network access. Restrict worker egress and runtime authority separately if stronger isolation is required; the pod NetworkPolicy by itself cannot isolate a sidecar from the server's network.
 
 After first rollout, confirm the storage driver grants UID/GID `65532` write access to the protected PVC and the worker has connected. Replace `YOUR_NAMESPACE` in these checks; the temporary probe file is removed after the read:
 
@@ -477,9 +681,9 @@ Environment-owned startup loads models.dev from `WALTR_MODELS_DEV_PATH`, `WALTR_
 
 Tauri always requests `https://models.dev/api.json` first. The connection has a five-second bound, and the complete request has a 15-second bound.
 
-Failure or timeout uses the app-private cache when that cache contains a valid catalog. First launch requires network without a valid cache.
-
-Every mode fails startup when neither source nor cache can materialize the complete catalog.
+Failure or timeout uses a valid app-private cache, or the explicit built-in seed only when that cache is absent.
+Both fallback sources report stale catalog state; malformed or unreadable cache state fails closed.
+Standalone startup has no built-in fallback and fails when neither source nor cache supplies a valid catalog.
 
 Local revocation wakes same-process streams after the database commit. Every hosted stream also performs an authoritative durable check at most every five seconds; another replica's revocation therefore closes it within five seconds plus scheduling and query latency. PostgreSQL `LISTEN/NOTIFY` is not implemented. Do not increase the current one-replica Pulumi workload until the documented container-backed concurrency and cross-replica operational checks have been exercised.
 

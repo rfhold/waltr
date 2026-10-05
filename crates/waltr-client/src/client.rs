@@ -17,6 +17,19 @@ pub struct Client {
 }
 
 impl Client {
+    pub(crate) fn clear_mcp_apps(&mut self) {
+        self.state.apps = crate::McpAppsSnapshot::default();
+        self.state.apps_completed_requests.clear();
+    }
+    pub(crate) fn retain_completed_app_request(&mut self, request_id: String) {
+        crate::apps::retain_completed_request(&mut self.state, request_id);
+    }
+    pub(crate) fn apps_state_mut(&mut self) -> &mut crate::McpAppsSnapshot {
+        &mut self.state.apps
+    }
+    pub(crate) fn next_app_operation_key(&mut self) -> String {
+        self.state.next_operation_key()
+    }
     /// Create a client reducer.
     #[must_use]
     pub fn new() -> Self {
@@ -67,6 +80,7 @@ impl Client {
         }
 
         match event {
+            ClientEvent::McpApp(event) => crate::apps::reduce(&mut self.state, event),
             ClientEvent::Access(event) => access::reduce(&mut self.state, event),
             ClientEvent::Auth(event) => auth::reduce(&mut self.state, event),
             ClientEvent::Catalog(event) => catalog::reduce(&mut self.state, event),
@@ -1278,6 +1292,11 @@ impl Client {
 #[allow(clippy::too_many_lines)]
 fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
     match event {
+        ClientEvent::McpApp(crate::McpAppEvent::Failed { request_id, .. }) => state
+            .apps
+            .requests
+            .get(request_id)
+            .is_some_and(|op| op.status == "loading"),
         ClientEvent::Status(
             StatusEvent::WatchStartedForEpoch { epoch }
             | StatusEvent::WatchChangedForEpoch { epoch, .. }
@@ -1433,6 +1452,7 @@ fn operation_is_current(current: Option<&OperationKey>, completed: &OperationKey
 #[allow(clippy::manual_let_else)]
 fn waltr_login_error(event: &ClientEvent) -> Option<String> {
     let error = match event {
+        ClientEvent::McpApp(crate::McpAppEvent::Failed { error, .. }) => error,
         ClientEvent::Auth(
             AuthEvent::ListFailed(error)
             | AuthEvent::BeginFailed { error, .. }

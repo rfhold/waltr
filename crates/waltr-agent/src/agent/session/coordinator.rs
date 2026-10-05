@@ -42,6 +42,10 @@ use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
 
 type McpPreparationGuards = Arc<StdMutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>;
 
+#[path = "mcp_apps.rs"]
+mod mcp_apps;
+pub use mcp_apps::{McpAppError, McpAppHandle, SessionMcpApp};
+
 /// Durable session coordinator bound to a store.
 #[derive(Clone)]
 pub struct SessionCoordinator<S>
@@ -54,6 +58,8 @@ where
     runtime_factory: Option<AgentSessionRuntimeFactory>,
     mcp_sessions: Arc<StdMutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
     mcp_preparation_guards: McpPreparationGuards,
+    app_slots: Arc<tokio::sync::Semaphore>,
+    app_handles: Arc<StdMutex<Vec<std::sync::Weak<mcp_apps::AppHandleInner>>>>,
     mcp_lifecycle: Arc<RwLock<McpLifecycle>>,
     retired_mcp_runtimes: Arc<StdMutex<Vec<Arc<McpRuntimeRetirement>>>>,
     active_runs: Arc<Mutex<RunCoordination>>,
@@ -306,6 +312,7 @@ impl CachedMcpRuntime {
     fn can_reuse(&self, prepared: &super::runtime_factory::PreparedMcpRuntime) -> bool {
         self.fingerprint == prepared.fingerprint
             && self.credentialed_servers == prepared.credentialed_servers
+            && self.runtime.app_sources() == prepared.config.app_sources()
     }
 }
 
@@ -349,6 +356,8 @@ where
             runtime_factory: None,
             mcp_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
             mcp_preparation_guards: Arc::new(StdMutex::new(BTreeMap::new())),
+            app_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            app_handles: Arc::new(StdMutex::new(Vec::new())),
             mcp_lifecycle: Arc::new(RwLock::new(McpLifecycle::default())),
             retired_mcp_runtimes: Arc::new(StdMutex::new(Vec::new())),
             active_runs: Arc::new(Mutex::new(RunCoordination::default())),
@@ -446,6 +455,7 @@ where
         fields(operation = "delete", db_system = "session_store", session_id = %id.as_str())
     )]
     pub async fn delete(&self, id: &SessionId) -> Result<()> {
+        self.revoke_session_mcp_apps(Some(id));
         let operation = self.control.session(id.clone()).deletion().await;
         self.block_session(id, "session deleted").await;
         if let Err(error) = AgentSessionRuntime::new(&self.store)
@@ -495,6 +505,7 @@ where
         fields(operation = "wipe", db_system = "session_store")
     )]
     pub async fn wipe_sessions(&self) -> Result<()> {
+        self.revoke_session_mcp_apps(None);
         let lifecycle = self.control.exclusive().await;
         self.begin_wipe().await;
         let wipe = self.store.wipe().await.map_err(session_store_error);
@@ -1070,6 +1081,7 @@ where
         fields(operation = "interrupt", db_system = "session_store", session_id = %id.as_str())
     )]
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
+        self.revoke_session_mcp_apps(Some(id));
         let operation = self.control.session(id.clone()).operation().await;
         self.interrupt_active_run(id).await;
         let record = AgentSessionRuntime::new(&self.store)

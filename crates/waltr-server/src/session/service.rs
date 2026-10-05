@@ -1,5 +1,9 @@
 //! Implementation of the generated `SessionService`.
 
+#[cfg(test)]
+#[path = "apps_tests.rs"]
+mod apps_tests;
+
 use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::{agent_definition::AgentDefinitionState, config::ConfigHandle};
@@ -63,6 +67,7 @@ where
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
     agent_catalog: SessionCatalogSource,
+    apps: Arc<super::mcp_apps::Registry>,
 }
 
 /// Source of selectable agent definitions for a session host.
@@ -169,6 +174,7 @@ where
             sessions,
             config,
             agent_catalog,
+            apps: super::mcp_apps::Registry::new(),
         })
     }
 
@@ -229,6 +235,7 @@ where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     async fn shutdown(&self) {
+        self.apps.clear();
         self.sessions.shutdown().await;
     }
 
@@ -370,6 +377,95 @@ where
         Pin<Box<dyn Stream<Item = Result<WatchSessionsResponse, Status>> + Send>>;
     type WatchTimelineStream =
         Pin<Box<dyn Stream<Item = Result<WatchTimelineResponse, Status>> + Send>>;
+
+    async fn open_session_mcp_app(
+        &self,
+        request: Request<waltr::grpc::waltr::session::v1::OpenSessionMcpAppRequest>,
+    ) -> Result<Response<waltr::grpc::waltr::session::v1::OpenSessionMcpAppResponse>, Status> {
+        let owner = super::mcp_apps::owner(&request);
+        let request = request.into_inner();
+        if request.session_id.is_empty() || request.call_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "session and call IDs are required",
+            ));
+        }
+        let session = SessionId::new(request.session_id);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let _guard = cancellation.clone().drop_guard();
+        let app = tokio::time::timeout(
+            super::mcp_apps::TIMEOUT,
+            self.sessions
+                .open_session_mcp_app(&session, &request.call_id, cancellation),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("MCP app timeout"))?
+        .map_err(super::mcp_apps::status)?;
+        let response = waltr::grpc::waltr::session::v1::OpenSessionMcpAppResponse {
+            app_id: self
+                .apps
+                .insert(owner, session, request.call_id, app.handle)?,
+            html: app.resource.html,
+            tool_json: app.association.declaration.to_string(),
+            arguments_json: app.association.arguments.to_string(),
+            result_json: app.association.result.to_string(),
+            resource_meta_json: serde_json::to_string(&app.resource.meta)
+                .map_err(|_| Status::internal("MCP app metadata unavailable"))?,
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn call_session_mcp_app_tool(
+        &self,
+        request: Request<waltr::grpc::waltr::session::v1::CallSessionMcpAppToolRequest>,
+    ) -> Result<Response<waltr::grpc::waltr::session::v1::CallSessionMcpAppToolResponse>, Status>
+    {
+        let owner = super::mcp_apps::owner(&request);
+        let request = request.into_inner();
+        let entry = self.apps.get(&request.app_id, &owner)?;
+        let deadline = tokio::time::Instant::now() + super::mcp_apps::TIMEOUT;
+        tokio::time::timeout_at(deadline, self.sessions.load(&entry.session))
+            .await
+            .map_err(|_| Status::deadline_exceeded("MCP app timeout"))?
+            .map_err(|_| Status::failed_precondition("MCP app stale"))?;
+        if request.arguments_json.len() > 1024 * 1024 {
+            return Err(Status::invalid_argument("MCP app arguments too large"));
+        }
+        let arguments = serde_json::from_str(&request.arguments_json)
+            .map_err(|_| Status::invalid_argument("invalid MCP app arguments JSON"))?;
+        let cancellation = entry.cancellation.child_token();
+        let _guard = cancellation.clone().drop_guard();
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.sessions.call_session_mcp_app_tool(
+                &entry.handle,
+                &request.name,
+                arguments,
+                cancellation,
+            ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("MCP app timeout"))?
+        .map_err(super::mcp_apps::status)?;
+        Ok(Response::new(
+            waltr::grpc::waltr::session::v1::CallSessionMcpAppToolResponse {
+                result_json: result.raw.to_string(),
+            },
+        ))
+    }
+
+    async fn close_session_mcp_app(
+        &self,
+        request: Request<waltr::grpc::waltr::session::v1::CloseSessionMcpAppRequest>,
+    ) -> Result<Response<waltr::grpc::waltr::session::v1::CloseSessionMcpAppResponse>, Status> {
+        let owner = super::mcp_apps::owner(&request);
+        let request = request.into_inner();
+        let entry = self.apps.get(&request.app_id, &owner)?;
+        self.sessions.close_session_mcp_app(&entry.handle);
+        self.apps.remove(&request.app_id);
+        Ok(Response::new(
+            waltr::grpc::waltr::session::v1::CloseSessionMcpAppResponse {},
+        ))
+    }
 
     async fn list_agents(
         &self,

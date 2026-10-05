@@ -4,5 +4,13 @@
   "description": "Minimal IPC for the packaged Waltr main WebView.",
   "windows": ["main"],
   "local": true,
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "allow-start-runtime",
+    "allow-client-dispatch",
+    "allow-client-state",
+    "allow-dispose-runtime",
+    "allow-open-external-url",
+    "allow-open-authorization-attempt"
+  ]
 }

@@ -268,6 +268,40 @@ impl GrpcEffectExecutor {
     {
         Box::pin(async move {
             match effect {
+                ClientEffect::McpApp(effect) => {
+                    use crate::{McpAppEffect, McpAppEvent};
+                    let event = match effect {
+                        McpAppEffect::Open {
+                            request_id,
+                            request,
+                        } => match self.transport.open_session_mcp_app(request).await {
+                            Ok(app) => McpAppEvent::Opened { request_id, app },
+                            Err(error) => McpAppEvent::Failed { request_id, error },
+                        },
+                        McpAppEffect::Call {
+                            request_id,
+                            request,
+                        } => {
+                            let app_id = request.app_id.clone();
+                            match self.transport.call_session_mcp_app_tool(request).await {
+                                Ok(result_json) => McpAppEvent::Called {
+                                    request_id,
+                                    app_id,
+                                    result_json,
+                                },
+                                Err(error) => McpAppEvent::Failed { request_id, error },
+                            }
+                        }
+                        McpAppEffect::Close {
+                            request_id,
+                            request,
+                        } => match self.transport.close_session_mcp_app(request).await {
+                            Ok(()) => McpAppEvent::Closed { request_id },
+                            Err(error) => McpAppEvent::Failed { request_id, error },
+                        },
+                    };
+                    vec![ClientEvent::McpApp(event)]
+                }
                 ClientEffect::Auth(AuthEffect::ListStatuses) => {
                     match self.transport.list_auth_statuses().await {
                         Ok(statuses) => vec![ClientEvent::Auth(AuthEvent::Listed(statuses))],

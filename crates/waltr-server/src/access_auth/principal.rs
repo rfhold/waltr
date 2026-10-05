@@ -57,6 +57,15 @@ impl PartialEq for AuthenticatedPrincipal {
 impl Eq for AuthenticatedPrincipal {}
 
 impl AuthenticatedPrincipal {
+    #[cfg(test)]
+    pub(crate) fn apps_test_principal(subject: &str) -> Self {
+        Self::new(
+            "https://issuer.example",
+            subject,
+            [],
+            AuthenticationMethod::BearerAccessToken,
+        )
+    }
     /// Create authentication evidence for a validated identity.
     #[must_use]
     pub(super) fn new(

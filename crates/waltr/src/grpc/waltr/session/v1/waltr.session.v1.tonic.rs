@@ -79,6 +79,93 @@ pub mod session_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
+        pub async fn open_session_mcp_app(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenSessionMcpAppRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::OpenSessionMcpAppResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/OpenSessionMcpApp",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "OpenSessionMcpApp",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn call_session_mcp_app_tool(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CallSessionMcpAppToolRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CallSessionMcpAppToolResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/CallSessionMcpAppTool",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "CallSessionMcpAppTool",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn close_session_mcp_app(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CloseSessionMcpAppRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CloseSessionMcpAppResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/CloseSessionMcpApp",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "CloseSessionMcpApp",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn list_agents(
             &mut self,
             request: impl tonic::IntoRequest<super::ListAgentsRequest>,
@@ -525,6 +612,27 @@ pub mod session_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SessionServiceServer.
     #[async_trait]
     pub trait SessionService: std::marker::Send + std::marker::Sync + 'static {
+        async fn open_session_mcp_app(
+            &self,
+            request: tonic::Request<super::OpenSessionMcpAppRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::OpenSessionMcpAppResponse>,
+            tonic::Status,
+        >;
+        async fn call_session_mcp_app_tool(
+            &self,
+            request: tonic::Request<super::CallSessionMcpAppToolRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CallSessionMcpAppToolResponse>,
+            tonic::Status,
+        >;
+        async fn close_session_mcp_app(
+            &self,
+            request: tonic::Request<super::CloseSessionMcpAppRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CloseSessionMcpAppResponse>,
+            tonic::Status,
+        >;
         async fn list_agents(
             &self,
             request: tonic::Request<super::ListAgentsRequest>,
@@ -726,6 +834,150 @@ pub mod session_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/waltr.session.v1.SessionService/OpenSessionMcpApp" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenSessionMcpAppSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::OpenSessionMcpAppRequest>
+                    for OpenSessionMcpAppSvc<T> {
+                        type Response = super::OpenSessionMcpAppResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenSessionMcpAppRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::open_session_mcp_app(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenSessionMcpAppSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/CallSessionMcpAppTool" => {
+                    #[allow(non_camel_case_types)]
+                    struct CallSessionMcpAppToolSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::CallSessionMcpAppToolRequest>
+                    for CallSessionMcpAppToolSvc<T> {
+                        type Response = super::CallSessionMcpAppToolResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CallSessionMcpAppToolRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::call_session_mcp_app_tool(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CallSessionMcpAppToolSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/CloseSessionMcpApp" => {
+                    #[allow(non_camel_case_types)]
+                    struct CloseSessionMcpAppSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::CloseSessionMcpAppRequest>
+                    for CloseSessionMcpAppSvc<T> {
+                        type Response = super::CloseSessionMcpAppResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CloseSessionMcpAppRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::close_session_mcp_app(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CloseSessionMcpAppSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/waltr.session.v1.SessionService/ListAgents" => {
                     #[allow(non_camel_case_types)]
                     struct ListAgentsSvc<T: SessionService>(pub Arc<T>);

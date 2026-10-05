@@ -18,6 +18,45 @@ use tonic::codegen::{Body, Bytes, StdError};
 use super::{RemoteTransport, status_error};
 use crate::ClientError;
 
+macro_rules! app_rpc {
+    ($method:ident, $request:ident, $response:ident) => {
+        pub(super) async fn $method<T>(transport: &T, request: waltr::grpc::waltr::session::v1::$request) -> Result<waltr::grpc::waltr::session::v1::$response, ClientError>
+        where T: RemoteTransport,
+            T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+            <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+            <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody: Body<Data = Bytes> + Send + 'static,
+            <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error: Into<StdError> + Send,
+        {
+            let credentials = transport.request_credentials();
+            transport.session_client(&credentials).await?.$method(request).await
+                .map(tonic::Response::into_inner)
+                .map_err(|error| {
+                    let classified = status_error(&error, &credentials);
+                    if classified.is_waltr_login_required() {
+                        ClientError::waltr_login_required("Waltr login required")
+                    } else {
+                        ClientError::new("MCP app operation failed")
+                    }
+                })
+        }
+    };
+}
+app_rpc!(
+    open_session_mcp_app,
+    OpenSessionMcpAppRequest,
+    OpenSessionMcpAppResponse
+);
+app_rpc!(
+    call_session_mcp_app_tool,
+    CallSessionMcpAppToolRequest,
+    CallSessionMcpAppToolResponse
+);
+app_rpc!(
+    close_session_mcp_app,
+    CloseSessionMcpAppRequest,
+    CloseSessionMcpAppResponse
+);
+
 /// Stream returned by session watch transports.
 pub type SessionWatchStream = Pin<Box<dyn Stream<Item = Result<SessionWatchUpdate, ClientError>>>>;
 

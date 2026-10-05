@@ -19,6 +19,9 @@ import {
 } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { AppDialog } from "../../mcp-apps/AppDialog";
+import { appsAvailable } from "../../mcp-apps/policy";
+import { hasLinkedApp } from "../../mcp-apps/commands";
 import { clientRequestId } from "../../app/requestId";
 import { CodeBlock, HighlightedCode } from "../../components/markdown/CodeBlock";
 import { MarkdownMessage } from "../../components/markdown/MarkdownMessage";
@@ -465,6 +468,7 @@ function SessionDetail(props: { session: SessionView }) {
   const phone = useMediaQuery("(max-width: 700px)");
   const [editingInferenceSettings, setEditingInferenceSettings] = createSignal(false);
   const [editingAgent, setEditingAgent] = createSignal(false);
+  const [openedApp, setOpenedApp] = createSignal<{ sessionId: string; callId: string }>();
   const [draft, setDraft] = createSignal("");
   const [caret, setCaret] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
   const [resourceInputVersion, setResourceInputVersion] = createSignal(0);
@@ -1082,6 +1086,7 @@ function SessionDetail(props: { session: SessionView }) {
               <div class={`sessions__timeline-item sessions__timeline-item--${item.kind}${isMaskReplacement(item) ? " sessions__timeline-item--mask-replacement" : ""}`} data-timeline-item-key={timelineItemKey(item)}>
                 <TimelineItem
                   item={item}
+                  onOpenApp={(callId) => setOpenedApp({ sessionId: props.session.id, callId })}
                   expandedShellOutputs={expandedShellOutputs()}
                   onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
                   onRespond={respond}
@@ -1207,6 +1212,9 @@ function SessionDetail(props: { session: SessionView }) {
       <Show when={editingInferenceSettings()}>
         <SessionInferenceSettingsDialog session={props.session} onClose={() => setEditingInferenceSettings(false)} />
       </Show>
+      <Show when={openedApp()}>
+        {(selection) => <AppDialog sessionId={props.session.id} callId={selection().callId} onClose={() => setOpenedApp(undefined)} />}
+      </Show>
       <Show when={editingAgent()}>
         <SessionAgentDialog session={props.session} active={props.session.progress.running} onClose={() => setEditingAgent(false)} />
       </Show>
@@ -1260,6 +1268,7 @@ type ToolTimelineItem = {
   progressInfo: string;
   progressError: string;
   taskProgress?: TaskProgress;
+  appLinked?: boolean;
 };
 
 type TaskProgress = {
@@ -1616,6 +1625,7 @@ function TimelineVirtualizerItem(props: CustomItemComponentProps) {
 
 function TimelineItem(props: {
   item: TimelineItemModel;
+  onOpenApp: (callId: string) => void;
   expandedShellOutputs: Record<string, boolean>;
   onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
@@ -1641,6 +1651,7 @@ function TimelineItem(props: {
           {(toolItem) => (
             <ToolTimelineItemView
               item={toolItem()}
+              onOpenApp={props.onOpenApp}
               expandedShellOutputs={props.expandedShellOutputs}
               onSetShellOutputExpanded={props.onSetShellOutputExpanded}
             />
@@ -1744,11 +1755,12 @@ function TextTimelineItemView(props: { item: Extract<TimelineItemModel, { kind: 
 
 function ToolTimelineItemView(props: {
   item: ToolTimelineItem;
+  onOpenApp: (callId: string) => void;
   expandedShellOutputs: Record<string, boolean>;
   onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
 }) {
   return (
-    <Switch fallback={<GenericToolTimelineItem item={props.item} />}>
+    <Switch fallback={<GenericToolTimelineItem item={props.item} onOpenApp={props.onOpenApp} />}>
       <Match when={props.item.name === "shell"}>
         <ShellToolTimelineItem
           item={props.item}
@@ -1769,11 +1781,17 @@ function ToolTimelineItemView(props: {
   );
 }
 
-function GenericToolTimelineItem(props: { item: ToolTimelineItem }) {
+function GenericToolTimelineItem(props: { item: ToolTimelineItem; onOpenApp: (callId: string) => void }) {
   return (
-    <p class="sessions__timeline-tool">
-      {toolLabel(props.item.name, props.item.inputEntries)}
-      <ToolStateText state={props.item.state} />
+    <p class="sessions__timeline-tool sessions__timeline-tool--generic">
+      <span class="sessions__timeline-tool-label">
+        {toolLabel(props.item.name, props.item.inputEntries)}
+        <ToolStateText state={props.item.state} />
+      </span>
+      <Show when={props.item.appLinked && props.item.state === "complete"}>
+        <button class="sessions__timeline-app-button" type="button" disabled={!appsAvailable()} title={appsAvailable() ? undefined : "Apps are unavailable on this platform"} onClick={() => props.onOpenApp(props.item.id)}>Open app</button>
+        <Show when={!appsAvailable()}>{" "}<span>Apps unavailable on this platform.</span></Show>
+      </Show>
     </p>
   );
 }
@@ -2224,6 +2242,7 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
   const toolIdByItemId = new Map<string, string>();
   const externalById = new Map<string, ExternalPromptTimelineItem>();
   const metricItems: TurnMetricsTimelineItem[] = [];
+  const visibleCalls = new Set<string>();
 
   for (const entry of timeline?.events ?? []) {
     if (entry.entryKind === "synthetic") {
@@ -2268,6 +2287,7 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
       }
       case "toolCall": {
         const id = event.content.id || event.itemId;
+        if (entry.presentation === "durable") visibleCalls.add(id);
         toolIdByItemId.set(event.itemId, id);
         upsertToolItem(items, toolById, id, event.turn, event.cursor, event.content.name, "loading", parseJsonRecord(event.content.arguments_json), undefined);
         break;
@@ -2284,6 +2304,11 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
           undefined,
           event.content.content,
         );
+        {
+          const id = event.content.id || event.itemId;
+          const tool = toolById.get(id);
+          if (tool) tool.appLinked = entry.presentation === "durable" && visibleCalls.has(id) && hasLinkedApp(event.metadataJson);
+        }
         break;
       case "externalRequest": {
         const request = event.content.request;

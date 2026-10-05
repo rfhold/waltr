@@ -1,9 +1,24 @@
 //! Tauri shell and IPC surface for the Waltr native application.
+#![cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    forbid(unsafe_code)
+)]
 
+mod app_container;
 mod bridge;
 mod observability;
 mod policy;
 mod server_controller;
+
+#[cfg(all(
+    feature = "native-apps-test",
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
+compile_error!("native-apps-test is a disposable Apple Silicon macOS diagnostic build");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod native_apps;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod native_apps_navigation;
 
 use std::sync::{
     Arc,
@@ -31,6 +46,14 @@ const BRIDGE_EVENT: &str = "waltr://bridge";
 #[serde(rename_all = "camelCase")]
 struct RuntimeStarted {
     generation: u64,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    native_apps: native_apps::Bootstrap,
+    #[cfg(all(
+        feature = "native-apps-test",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    native_apps_test: native_apps::Bootstrap,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -114,6 +137,21 @@ async fn start_runtime(
     bridge: State<'_, Arc<RuntimeBridge>>,
 ) -> Result<RuntimeStarted, String> {
     let span = observability::operation_span("runtime.start", "ipc");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let native_apps = {
+        let bootstrap = app
+            .state::<EmbeddedServerController>()
+            .connection()
+            .and_then(|connection| connection.native_apps)
+            .map(|bootstrap| *bootstrap)
+            .ok_or_else(|| "native Apps listener is unavailable".to_owned())?;
+        if let Err(error) = native_apps_navigation::install(&app, &bootstrap).await {
+            app.state::<EmbeddedServerController>().stop();
+            app.exit(1);
+            return Err(error);
+        }
+        bootstrap
+    };
     let result = (|| {
         #[cfg(target_os = "android")]
         let (ticket, displaced_generation) = begin_mobile_client_request()?;
@@ -148,8 +186,24 @@ async fn start_runtime(
             }
         }
         #[cfg(not(target_os = "android"))]
-        deliver_events(app, Arc::clone(bridge.inner()), feed);
-        Ok(RuntimeStarted { generation })
+        deliver_events(app.clone(), Arc::clone(bridge.inner()), feed);
+        #[cfg(all(
+            feature = "native-apps-test",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        eprintln!("WALTR_NATIVE_PROBE positive-control");
+        Ok(RuntimeStarted {
+            generation,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_apps: native_apps.clone(),
+            #[cfg(all(
+                feature = "native-apps-test",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            native_apps_test: native_apps,
+        })
     })();
     observability::record_result(&span, &result);
     result
@@ -554,11 +608,23 @@ pub fn run() {
     let startup = observability::operation_span("app.run", "lifecycle");
     let startup_entered = startup.enter();
     tracing::info!(event.name = "app.startup", outcome = "started");
-    let app = tauri::Builder::default()
+    let mut context = tauri::generate_context!();
+    app_container::configure_apps_csp(context.config_mut());
+    let builder = tauri::Builder::default();
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    let builder = builder.invoke_system(app_container::confined_invoke_script());
+    let app = builder
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let setup = observability::operation_span("app.setup", "lifecycle");
             let _setup_entered = setup.enter();
+
+            #[cfg(all(
+                feature = "native-apps-test",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            native_apps::validate_profile(app.config())?;
 
             #[cfg(target_os = "android")]
             let server = android_server().clone();
@@ -580,8 +646,17 @@ pub fn run() {
 
             let first_page_load = Arc::new(AtomicBool::new(true));
             let page_load_bridge = Arc::clone(&bridge);
+            let page = if cfg!(all(
+                feature = "native-apps-test",
+                target_os = "macos",
+                target_arch = "aarch64"
+            )) {
+                "native-apps-test.html"
+            } else {
+                "index.html"
+            };
             let window =
-                tauri::WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                tauri::WebviewWindowBuilder::new(app, "main", WebviewUrl::App(page.into()))
                     .on_navigation(policy::allows_packaged_navigation)
                     .on_page_load(move |_, payload| {
                         if payload.event() == PageLoadEvent::Started
@@ -600,7 +675,11 @@ pub fn run() {
                 .title("Waltr")
                 .inner_size(1180.0, 780.0)
                 .min_inner_size(720.0, 540.0)
-                .on_new_window(|_, _| NewWindowResponse::Deny);
+                .on_new_window(|_, _| {
+                    #[cfg(feature = "native-apps-test")]
+                    eprintln!("WALTR_NATIVE_PROBE navigation-denied.popup");
+                    NewWindowResponse::Deny
+                });
             let result = window.build();
             observability::record_result(&setup, &result);
             result?;
@@ -614,13 +693,15 @@ pub fn run() {
             open_external_url,
             open_authorization_attempt,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build Waltr native application");
     observability::record_outcome(&startup, "ok");
     drop(startup_entered);
     drop(startup);
     app.run(|app, event| match event {
         tauri::RunEvent::Exit => {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_apps_navigation::detach("main");
             observability::lifecycle_event("app.shutdown", "lifecycle", "exit");
             stop_client_bridge(app.state::<Arc<RuntimeBridge>>().inner());
             #[cfg(not(target_os = "android"))]
@@ -631,6 +712,8 @@ pub fn run() {
             event: tauri::WindowEvent::Destroyed,
             ..
         } if label == "main" => {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_apps_navigation::detach("main");
             observability::lifecycle_event("webview.destroyed", "lifecycle", "client_stopped");
             stop_client_bridge(app.state::<Arc<RuntimeBridge>>().inner());
         }

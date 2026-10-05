@@ -7,6 +7,7 @@ const focusableSelector = [
   "textarea:not([disabled])",
   "input:not([disabled])",
   "select:not([disabled])",
+  "iframe",
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
@@ -15,6 +16,7 @@ type DialogProps = {
   label?: string;
   onClose: () => void;
   class?: string;
+  style?: JSX.CSSProperties;
   children: JSX.Element;
 };
 
@@ -78,6 +80,7 @@ export function Dialog(props: DialogProps) {
       <div
         ref={dialogRef}
         class={`ui-dialog ${props.class ?? ""}`.trim()}
+        style={props.style}
         role="dialog"
         aria-modal="true"
         aria-label={props.label ?? `${props.title} dialog`}

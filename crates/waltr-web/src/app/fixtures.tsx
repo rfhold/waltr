@@ -79,6 +79,7 @@ function promptFixtureSnapshot(): ClientSnapshot {
   return {
     access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
+    apps: { current: {}, requests: {} },
     auth: emptyAuthSnapshot(),
     catalog: {
       search: { requestId: "", query: "", status: "idle", error: null, stale: false, models: [] },

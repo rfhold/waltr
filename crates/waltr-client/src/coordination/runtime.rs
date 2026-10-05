@@ -323,6 +323,44 @@ pub enum ClientCommand {
         /// Cursor byte offset relative to query for context-aware completions.
         cursor: Option<u32>,
     },
+    /// Open an owner-bound app from a durable tool result.
+    OpenSessionMcpApp {
+        /// Session containing the completed tool call.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Durable tool call identity.
+        #[serde(rename = "callId")]
+        call_id: String,
+        /// Unique caller-local open correlation identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    /// Refresh an app through its allowed tool lane.
+    CallSessionMcpAppTool {
+        /// Opaque open lease identity.
+        #[serde(rename = "appId")]
+        app_id: String,
+        /// App-visible tool name.
+        name: String,
+        /// Complete arguments JSON.
+        #[serde(rename = "argumentsJson")]
+        arguments_json: String,
+        /// Unique caller-local refresh correlation identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    /// Forget local app payloads and close its server lease.
+    CloseSessionMcpApp {
+        /// Lease to forget and close.
+        #[serde(rename = "appId")]
+        app_id: String,
+    },
+    /// Cancel an open whose server identity is not yet known.
+    CancelSessionMcpAppOpen {
+        /// Open request to abandon, including a raced ready result.
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     /// Register interest in timeline updates for one session.
     RegisterSessionTimelineWatchInterest {
         /// Session id whose timeline should be watched.
@@ -465,6 +503,8 @@ pub enum ClientSessionTemplateSearchTarget {
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSnapshot {
+    /// Transient owner-bound Apps results and request tracking.
+    pub apps: crate::McpAppsSnapshot,
     /// Waltr access authentication snapshot.
     pub access: AccessSnapshot,
     /// Auth coordination snapshot.
@@ -1802,14 +1842,19 @@ impl ClientStateStream {
             pin_mut!(command);
 
             match select(command, next).await {
-                Either::Left((Some(request), _pending_next)) => request,
-                Either::Left((None, _)) => return ClientStateStreamEvent::CommandsClosed,
+                Either::Left((request, _pending_next)) => request,
                 Either::Right((snapshot, _)) => {
                     return ClientStateStreamEvent::Snapshot(Box::new(snapshot));
                 }
             }
         };
 
+        let Some(request) = request else {
+            self.effects.clear();
+            self.in_flight = None;
+            self.runtime.reducer.clear_mcp_apps();
+            return ClientStateStreamEvent::CommandsClosed;
+        };
         ClientStateStreamEvent::Snapshot(Box::new(self.dispatch_request(request)))
     }
 
@@ -1889,6 +1934,10 @@ impl ClientStateStream {
                 self.begin_routine_command(command)
             }
             ClientCommand::CreateSession { .. }
+            | ClientCommand::OpenSessionMcpApp { .. }
+            | ClientCommand::CallSessionMcpAppTool { .. }
+            | ClientCommand::CloseSessionMcpApp { .. }
+            | ClientCommand::CancelSessionMcpAppOpen { .. }
             | ClientCommand::RequestSessionAgents
             | ClientCommand::DeleteSession { .. }
             | ClientCommand::WipeSessions
@@ -2248,6 +2297,31 @@ impl ClientStateStream {
                 self.runtime.reducer.search_session_templates(
                     request_id, session_id, query, limit, kinds, target, cursor,
                 )
+            }
+            ClientCommand::OpenSessionMcpApp {
+                session_id,
+                call_id,
+                request_id,
+            } => self
+                .runtime
+                .reducer
+                .open_session_mcp_app(session_id, call_id, request_id),
+            ClientCommand::CallSessionMcpAppTool {
+                app_id,
+                name,
+                arguments_json,
+                request_id,
+            } => self.runtime.reducer.call_session_mcp_app_tool(
+                app_id,
+                name,
+                arguments_json,
+                request_id,
+            ),
+            ClientCommand::CloseSessionMcpApp { app_id } => {
+                self.runtime.reducer.close_session_mcp_app(app_id)
+            }
+            ClientCommand::CancelSessionMcpAppOpen { request_id } => {
+                self.runtime.reducer.cancel_session_mcp_app_open(request_id)
             }
             ClientCommand::RegisterSessionWatchInterest => {
                 self.runtime.reducer.register_session_watch_interest()
@@ -2672,6 +2746,15 @@ impl ClientStateStream {
 
     fn extend_effects(&mut self, update: &ClientUpdate) {
         for effect in update.effects() {
+            if let ClientEffect::McpApp(crate::McpAppEffect::Close { request, .. }) = effect {
+                self.cancel_effects(|effect| {
+                    matches!(
+                        effect,
+                        ClientEffect::McpApp(crate::McpAppEffect::Call { request: call, .. })
+                            if call.app_id == request.app_id
+                    )
+                });
+            }
             if let ClientEffect::Routine(RoutineEffect::WatchInvocations { session_id, .. }) =
                 effect
             {
@@ -2924,6 +3007,7 @@ impl ClientSnapshot {
         let state = client.state();
 
         Self {
+            apps: state.apps.clone(),
             access: AccessSnapshot {
                 status: state.access.status,
                 error: state.access.error.clone(),
@@ -3222,6 +3306,44 @@ impl ClientSnapshot {
                     .collect(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod apps_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn command_source_close_clears_apps_snapshot() {
+        let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
+        runtime
+            .reducer
+            .open_session_mcp_app("s".into(), "c".into(), "open".into());
+        runtime
+            .reducer
+            .apply(ClientEvent::McpApp(crate::McpAppEvent::Opened {
+                request_id: "open".into(),
+                app: crate::McpAppView {
+                    app_id: "lease".into(),
+                    html: "private-html".into(),
+                    ..crate::McpAppView::default()
+                },
+            }));
+        let mut stream = runtime.into_state_stream(|_| std::future::ready(()));
+        assert_eq!(stream.snapshot().apps.current.len(), 1);
+        assert_eq!(
+            stream.next_or_dispatch(std::future::ready(None)).await,
+            ClientStateStreamEvent::CommandsClosed
+        );
+        assert!(stream.snapshot().apps.current.is_empty());
+        assert!(stream.snapshot().apps.requests.is_empty());
+        assert!(
+            ClientRuntime::for_endpoint("http://127.0.0.1:1")
+                .snapshot()
+                .apps
+                .current
+                .is_empty()
+        );
     }
 }
 
@@ -5254,6 +5376,8 @@ mod tests {
             sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
         }
     }
+
+    mod apps_cancellation;
 
     fn controlled_in_flight(
         queued: QueuedEffect,

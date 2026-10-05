@@ -18,6 +18,7 @@ export function snapshotWithConfig(
   options: { ready?: boolean } = {},
 ): ClientSnapshot {
   return {
+    apps: { current: {}, requests: {} },
     access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
     auth: emptyAuthSnapshot(),

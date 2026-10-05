@@ -7,6 +7,8 @@
     "dev": "pnpm wasm:build && pnpm dev:vite",
     "dev:vite": "vite --host 0.0.0.0",
     "build": "pnpm wasm:build && tsc --noEmit && vite build",
+    "build:app-container": "vite build --mode app-container",
+    "test:app-container": "node node_modules/vitest/vitest.mjs run --config tests/mcp-apps/container.config.ts && node --test scripts/container-output.contract.mjs",
     "build:tauri": "pnpm wasm:build && tsc --noEmit -p tsconfig.tauri.json && vite build --mode tauri && node scripts/tauri-output.contract.mjs --telemetry=enabled",
     "build:tauri:dev": "pnpm wasm:build && tsc --noEmit -p tsconfig.tauri.json && vite build --mode tauri-dev && node scripts/tauri-output.contract.mjs --telemetry=disabled",
     "test": "node --test scripts/build-wasm.contract.mjs scripts/tauri-build.contract.mjs && vitest run --environment happy-dom",
@@ -16,6 +18,8 @@
   "dependencies": {
     "@grafana/faro-web-sdk": "2.11.0",
     "@grafana/faro-web-tracing": "2.11.0",
+    "@modelcontextprotocol/ext-apps": "1.2.2",
+    "@modelcontextprotocol/sdk": "1.27.1",
     "@shikijs/core": "^4.2.0",
     "@shikijs/engine-javascript": "^4.2.0",
     "@shikijs/langs": "^4.2.0",
@@ -31,11 +35,13 @@
     "unified": "^11.0.5",
     "virtua": "^0.49.1",
     "vite": "7.2.4",
-    "vite-plugin-solid": "2.11.8"
+    "vite-plugin-solid": "2.11.8",
+    "zod": "4.3.6"
   },
   "devDependencies": {
     "@solidjs/testing-library": "0.8.10",
     "@types/node": "24.10.1",
+    "esbuild": "0.25.12",
     "happy-dom": "20.9.0",
     "typescript": "5.9.3",
     "vitest": "4.0.14"

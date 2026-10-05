@@ -18,6 +18,7 @@ before(async () => {
   process.env.PULUMI_CONFIG = JSON.stringify({
     "waltr:namespace": "waltr-test",
     "waltr:hostname": "waltr.example.test",
+    "waltr:appsHostname": "waltr-apps.example.test",
     "waltr:displayName": "Waltr Test",
     "waltr:slug": "waltr-test",
     "waltr:image": "registry.example.test/waltr:test",
@@ -116,6 +117,52 @@ after(() => {
 });
 
 describe("hosted MCP OAuth deployment", () => {
+  test("owns a separate HTTP Apps listener in the same image without extra credentials", () => {
+    const values = environment();
+    assert.equal(values.WALTR_APP_CONTAINER_ADDR, "0.0.0.0:14334");
+    assert.equal(
+      values.WALTR_APP_CONTAINER_ORIGIN,
+      "https://waltr-apps.example.test",
+    );
+    assert.equal(
+      values.WALTR_APP_CONTAINER_HOST_ORIGINS,
+      "https://waltr.example.test",
+    );
+    const pod = (resource("kubernetes:apps/v1:Deployment", "waltr").inputs.spec as any)
+      .template.spec;
+    assert.deepEqual(pod.containers.map((container: any) => container.name), [
+      "waltr",
+      "waltr-sandbox",
+    ]);
+    assert.deepEqual(pod.containers[0].ports, [
+      { name: "grpc-web", containerPort: 14333, protocol: "TCP" },
+      { name: "apps-http", containerPort: 14334, protocol: "TCP" },
+    ]);
+    const api = resource("kubernetes:core/v1:Service", "waltr").inputs.spec as any;
+    const apps = resource("kubernetes:core/v1:Service", "waltr-apps").inputs.spec as any;
+    assert.deepEqual(apps.selector, api.selector);
+    assert.deepEqual(apps.ports, [
+      {
+        name: "apps-http",
+        port: 14334,
+        targetPort: "apps-http",
+        appProtocol: "http",
+      },
+    ]);
+    assert.equal(api.ports[0].port, 14333);
+    assert.equal(api.ports[0].appProtocol, "kubernetes.io/h2c");
+    const apiRoute = resourceByName("waltr-route").inputs.spec as any;
+    const appsRoute = resourceByName("waltr-apps-route").inputs.spec as any;
+    assert.deepEqual(appsRoute.parentRefs, apiRoute.parentRefs);
+    assert.deepEqual(appsRoute.hostnames, ["waltr-apps.example.test"]);
+    assert.deepEqual(apiRoute.hostnames, ["waltr.example.test"]);
+    assert.deepEqual(appsRoute.rules, [
+      {
+        matches: [{ path: { type: "PathPrefix", value: "/" } }],
+        backendRefs: [{ name: "waltr-apps", port: 14334 }],
+      },
+    ]);
+  });
   test("creates separate Authentik browser and native access clients", () => {
     const browser = resource(
       "authentik:index/providerOauth2:ProviderOauth2",
@@ -565,6 +612,14 @@ describe("hosted MCP OAuth deployment", () => {
       assert.doesNotMatch(stack, /WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS/);
     }
     assert.match(preview, /^\s*waltr:protectData: false$/m);
+    assert.match(
+      preview,
+      /^\s*waltr:appsHostname: preview-waltr-apps\.holdenitdown\.net$/m,
+    );
+    assert.match(
+      production,
+      /^\s*waltr:appsHostname: waltr-apps\.holdenitdown\.net$/m,
+    );
     assert.match(production, /^\s*waltr:protectData: true$/m);
     assert.match(
       preview,

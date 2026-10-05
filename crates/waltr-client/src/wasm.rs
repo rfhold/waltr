@@ -23,7 +23,7 @@ unsafe extern "C" {
 }
 
 /// Browser-facing shared reducer client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[wasm_bindgen]
 pub struct WaltrClient {
     endpoint: String,
@@ -31,6 +31,14 @@ pub struct WaltrClient {
     latest_snapshot: Rc<RefCell<String>>,
     snapshots: Rc<Mutex<mpsc::UnboundedReceiver<String>>>,
     stop: Rc<RefCell<Option<oneshot::Sender<()>>>>,
+}
+
+impl std::fmt::Debug for WaltrClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaltrClient")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 #[wasm_bindgen]
@@ -108,6 +116,16 @@ impl WaltrClient {
     /// Close the command source and stop the shared runtime.
     #[wasm_bindgen(js_name = dispose)]
     pub fn dispose(&self) {
+        let latest = self.latest_snapshot.borrow().clone();
+        if let Ok(mut snapshot) = serde_json::from_str::<serde_json::Value>(&latest) {
+            snapshot["apps"] = serde_json::json!({ "current": {}, "requests": {} });
+            if let Ok(json) = serde_json::to_string(&snapshot) {
+                *self.latest_snapshot.borrow_mut() = json;
+            }
+        }
+        if let Some(mut snapshots) = self.snapshots.try_lock() {
+            while snapshots.try_recv().is_ok() {}
+        }
         self.commands.close_channel();
         if let Some(stop) = self.stop.borrow_mut().take() {
             let _ = stop.send(());

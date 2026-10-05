@@ -32,6 +32,8 @@ pub(crate) struct ServerConnection {
     pub(crate) endpoint: String,
     pub(crate) bearer: String,
     pub(crate) first_catalog_download: bool,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) native_apps: Option<Box<crate::native_apps::Bootstrap>>,
 }
 
 impl fmt::Debug for ServerConnection {
@@ -248,6 +250,10 @@ impl EmbeddedServerController {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let reaper = self.inner.reaper.clone();
         let thread_cancellation = Arc::clone(&cancellation);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let native_bootstrap = Arc::new(Mutex::new(None));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let thread_bootstrap = Arc::clone(&native_bootstrap);
         let thread = thread::Builder::new()
             .name(format!("waltr-server-{generation}"))
             .spawn(move || {
@@ -259,6 +265,8 @@ impl EmbeddedServerController {
                     shutdown_rx,
                     ready_tx,
                     serve_rx,
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    thread_bootstrap,
                 );
             })
             .map_err(|_| {
@@ -282,6 +290,8 @@ impl EmbeddedServerController {
             endpoint,
             bearer: token,
             first_catalog_download,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_apps: native_bootstrap.lock().unwrap().take().map(Box::new),
         };
         let mut state = self
             .inner
@@ -640,6 +650,9 @@ fn run_server_thread(
     shutdown: oneshot::Receiver<()>,
     ready: std::sync::mpsc::SyncSender<Result<String, ServerStartError>>,
     serve: std::sync::mpsc::Receiver<()>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))] native_bootstrap: Arc<
+        Mutex<Option<crate::native_apps::Bootstrap>>,
+    >,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -678,17 +691,36 @@ fn run_server_thread(
             return true;
         }
         let endpoint = format!("http://{}", server.local_addr());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let assets = match crate::native_apps::NativeAssets::start().await {
+            Ok(assets) => {
+                *native_bootstrap.lock().unwrap() = Some(assets.bootstrap());
+                assets
+            }
+            Err(_) => {
+                server.shutdown().await;
+                drop(ready.send(Err(ServerStartError::Readiness)));
+                return false;
+            }
+        };
         if ready.send(Ok(endpoint)).is_err() {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            drop(assets.shutdown().await);
             server.shutdown().await;
             return true;
         }
         if serve.recv().is_err() {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            drop(assets.shutdown().await);
             server.shutdown().await;
             return true;
         }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let result = server
             .serve_with_shutdown(async move { drop(shutdown.await) })
             .await;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let result = assets.serve_with_parent(server, shutdown).await;
         result.is_ok()
     });
     drop(runtime);
@@ -838,6 +870,8 @@ mod tests {
             endpoint: "http://127.0.0.1:1234".to_owned(),
             bearer: bearer.clone(),
             first_catalog_download: true,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_apps: None,
         };
         let debug = format!("{connection:?}");
         assert!(!debug.contains(&bearer));
@@ -895,6 +929,8 @@ mod tests {
                 endpoint: format!("http://127.0.0.1:{generation}"),
                 bearer: format!("bearer-{generation}"),
                 first_catalog_download: false,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                native_apps: None,
             },
             shutdown: Some(shutdown),
             thread: Some(thread),
@@ -1046,6 +1082,8 @@ mod tests {
                 endpoint: "http://127.0.0.1:1".to_owned(),
                 bearer: "bearer-1".to_owned(),
                 first_catalog_download: false,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                native_apps: None,
             },
             shutdown: Some(shutdown),
             thread: Some(thread),

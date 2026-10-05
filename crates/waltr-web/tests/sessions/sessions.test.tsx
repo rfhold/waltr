@@ -1,5 +1,5 @@
 import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 
 import type { AuthenticationFailureSnapshot, ClientCommand, ClientRoutineInvocationSummary, ClientSnapshot, ProjectedTimelineEntryView, SessionCapabilitiesView, SessionProgressView, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
@@ -9,6 +9,42 @@ import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, sna
 const RESOURCE_TEST_DEBOUNCE_MS = 130;
 
 describe("sessions route", () => {
+  test.each(["close", "navigation"])("completed linked MCP rows open only on click and cancel on %s", async (exit) => {
+    vi.stubEnv("VITE_WALTR_MCP_APP_CONTAINER_URL", "https://sandbox.example/container.html");
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([sessionView({ id: "session-tools" })]);
+    snapshot.sessions.timelines["session-tools"] = { ...readySessionTimeline(), events: [
+      timelineEvent({ content: { kind: "toolCall", id: "linked", name: "mcp_status", arguments_json: "{}" } }),
+      timelineEvent({ cursor: 2n, itemId: "result", content: { kind: "toolResult", id: "linked", name: "mcp_status", content: "status", error: false }, metadataJson: '{"mcp_app":{"version":1,"resource_uri":"ui://status"}}' }),
+    ] };
+    renderWithAppState(() => <SessionsRouteWithRouter />, { commands, snapshot, routePath: "/sessions/session-tools" });
+    const action = screen.getByRole("button", { name: "Open app" });
+    expect(commands.some(command => command.type === "openSessionMcpApp")).toBe(false);
+    fireEvent.click(action);
+    await waitFor(() => expect(commands.some(command => command.type === "openSessionMcpApp")).toBe(true));
+    expect(screen.getByRole("dialog").textContent).toContain("Loading app");
+    if (exit === "navigation") testHistory().set({ value: "/sessions", replace: false, scroll: false });
+    else fireEvent.click(screen.getByRole("button", { name: "Close app" }));
+    await waitFor(() => expect(commands.some(command => command.type === "cancelSessionMcpAppOpen")).toBe(true));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("result-only, invalid, and masked calls never enable Apps", () => {
+    const snapshot = snapshotWithSessions([sessionView({ id: "session-tools" })]);
+    const linked = '{"mcp_app":{"version":1,"resource_uri":"ui://status"}}';
+    const maskedCall = timelineEvent({ content: { kind: "toolCall", id: "masked", name: "mcp_status", arguments_json: "{}" } });
+    maskedCall.presentation = "unknown";
+    snapshot.sessions.timelines["session-tools"] = { ...readySessionTimeline(), events: [
+      timelineEvent({ itemId: "orphan", content: { kind: "toolResult", id: "orphan", name: "mcp_status", content: "status", error: false }, metadataJson: linked }),
+      maskedCall,
+      timelineEvent({ itemId: "masked-result", content: { kind: "toolResult", id: "masked", name: "mcp_status", content: "status", error: false }, metadataJson: linked }),
+      timelineEvent({ itemId: "invalid", content: { kind: "toolCall", id: "invalid", name: "mcp_status", arguments_json: "{}" } }),
+      timelineEvent({ itemId: "invalid-result", content: { kind: "toolResult", id: "invalid", name: "mcp_status", content: "status", error: false }, metadataJson: '{"mcp_app":{"version":2,"resource_uri":"ui://status"}}' }),
+    ] };
+    renderWithAppState(() => <SessionsRouteWithRouter />, { snapshot, routePath: "/sessions/session-tools" });
+    expect(screen.queryByRole("button", { name: "Open app" })).toBeNull();
+  });
   test("lists sessions sorted by most recently updated", () => {
     renderWithAppState(() => <SessionsRouteWithRouter />, {
       routePath: "/sessions",

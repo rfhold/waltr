@@ -384,6 +384,217 @@ Run ignored live client session tests:
 
 `cargo test -p waltr-client --test live -- --ignored`
 
+## MCP Apps
+
+Apps tests separate generic protocol, session authority, shared client state, browser isolation, and native IPC prerequisites.
+Install the [asset build prerequisites](deployment.md#mcp-apps-assets-and-app-container) before server tests.
+Default server builds consume web-owned Vite container output and build each explicit served app independently.
+`WALTR_APP_CONTAINER_DIST` bypasses the host-assets Vite build, not a full `web` build or enabled served-app builds.
+See [Waltr-served Apps authoring](mcp/apps-authoring.md) for the static addition workflow and required per-app coverage.
+Run these focused commands from the repository root:
+
+```sh
+cargo test -p mcp --test spec apps
+cargo test -p waltr-agent --features shell --lib mcp_apps
+cargo test -p waltr-agent --features shell --test agent mcp
+cargo test -p waltr-client --test apps
+cargo test -p waltr-client --lib apps_cancellation
+cargo test -p waltr-server --lib apps
+cargo test -p waltr-server --lib mcp_apps_host
+cargo test -p waltr-server --no-default-features --features web --lib apps
+cargo test -p waltr-server --no-default-features --features web --lib bootstrap
+cargo test -p waltr-tui --features bundled --bin waltr
+pnpm --filter @rfhold/waltr-web exec vitest run tests/mcp-apps --environment happy-dom
+pnpm test:app-container:unit
+pnpm test:status-app
+cargo test -p waltr-app app_container
+node --test crates/waltr-app/scripts/confined-ipc.test.mjs
+```
+
+| Layer | Required Contract |
+| --- | --- |
+| Generic MCP | Default-off capability, typed declarations/read errors, exact metadata/visibility, raw fields, bounded resource decode, and independent lifecycle payloads. |
+| Asset builds | Actual self-contained status output, independent second-fixture Vite output/Rust embedding, and separate mocked Cargo feature/override orchestration. |
+| Agent | App-only exclusion, exact provenance, refresh-stable credential authority, account-replacement rejection, middleware mutation denial, and raw snapshots outside model context. |
+| Server session | Owner-bound handles, complete Effective pairs, stale/busy rejection, no inference, expiry/cancellation, audit results, and Close without session load. |
+| Shared client | Keyed state, original snapshot preservation, matching-call close preemption, unrelated-effect retention, stale completions, access invalidation, and late canceled-open cleanup. |
+| Web host | SDK handshake, original input/result exactly once, response-only refresh, message validation, unsupported methods, persisted pagehide retention, and final-unload cleanup. |
+| Asset service | Exact origins, HTTP CSP, no API/auth routes, byte-identical HTML, bounded uploads/storage, expiry, and deletion. |
+| Bundled host | Automatic distinct-origin listener, exact loopback parents, runtime URL precedence, no-store shells, startup rollback, child-failure cleanup, and joined shutdown. |
+| Native security | Explicit main-WebView permissions, confined invoke key, missing/guessed-key denial, and exact current-generation macOS frame policy. |
+
+Run the real-browser isolation contract:
+
+```sh
+pnpm test:app-container:browser
+```
+
+The web-owned Playwright configuration owns two temporary loopback servers: a fixture host and the actual Cargo asset service.
+The service command uses `--no-default-features --features apps-host-assets`, with no served status asset or full web/WASM build.
+Its host-assets build consumes the web container-only Vite output.
+The fixture host bundles its test-only SDK demo with esbuild and uses a fake tool callback.
+It does not exercise the session RPC path.
+The suite checks fixture HTML, unrelated tool names, network and navigation denial, parent DOM denial, protocol order, headers, and cleanup.
+`pnpm test:app-container:unit` runs web-owned container tests through the focused Vitest configuration and checks the Vite output contract.
+The output contract checks fixed self-contained assets, browser entry isolation, and container omission from Tauri builds.
+Its full browser output check requires current generated WASM artifacts; otherwise that check skips.
+The container implementation belongs in web `src/mcp-apps/container/`; container tests and browser fixtures belong in web `tests/mcp-apps/`.
+The web suite also covers `AppHost` and the modal.
+The default engine is Chromium; supply an installed Playwright browser or an explicit executable.
+For macOS Google Chrome, use:
+
+```sh
+WALTR_APPS_BROWSER_EXECUTABLE='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+pnpm test:app-container:browser
+```
+
+`WALTR_APPS_BROWSER` selects the Playwright engine, such as `chromium` or `webkit`; that engine must exist locally.
+`WALTR_APPS_TEST_BINARY` optionally selects a prebuilt asset-service binary and skips the Cargo service command.
+The browser contract independently bundles its test-only SDK fixture; it does not require any shipped app HTML.
+The production status app sources belong to `crates/waltr-server`; `build.rs` invokes its workspace package independently of the browser fixture.
+Server MCP tests verify conditional status linkage, current-request HTML capability checks, self-contained SDK resource content, deny-all external CSP, and readiness refresh with no session or inference use.
+Run `cargo test -p waltr-server --lib mcp_service::tests` and repeat with `--no-default-features` to check both linked-app and text-only builds.
+Run `pnpm test:status-app` to build the server package, check its actual output, and test Cargo asset orchestration.
+The package also runs `scripts/apps.contract.mjs` with the test-only `tests/fixtures/apps/second/` source.
+It builds independent real Vite documents and compiles generated Rust constants against those documents.
+The temporary pipeline stubs pnpm only after Vite creates the real output.
+The fixture has no production build entry or `RESOURCES` registration.
+The contract rejects shared output files, external script references, and oversized HTML.
+The status output contract checks the SDK handshake, original observation, refresh, malformed-result preservation, and teardown.
+It reads the actual Vite-built `dist/status/index.html` and requires one self-contained document within the one-MiB limit.
+This contract uses a local message/DOM stub; it does not prove browser isolation or full-session authorization.
+The separate `scripts/build-assets.contract.mjs` contract compiles `build.rs` and mocks pnpm commands and asset output.
+It checks feature selection, override behavior, full-web output reuse, and exclusion of Apps assets from the API asset collection.
+Run `node --test crates/waltr-server/scripts/build-assets.contract.mjs` for those orchestration checks alone.
+Mocked orchestration does not prove a real package or asset build.
+
+A Chrome result establishes only that engine's browser isolation behavior.
+It does not prove a full session-RPC browser flow, WebKit behavior, or native Tauri WebView isolation.
+MockRuntime and Node IPC tests also do not prove runtime native frame isolation.
+Normal Apple Silicon macOS builds enable Apps without a prior isolation report or diagnostic feature.
+These proof limits do not impose an enablement gate; runtime security enforcement remains mandatory.
+Other native platforms remain unsupported; browser results establish no additional native support.
+
+Sources: [Playwright configuration](../crates/waltr-web/playwright.config.mjs),
+[browser contract](../crates/waltr-web/tests/mcp-apps/browser/isolation.spec.mjs),
+[container unit configuration](../crates/waltr-web/tests/mcp-apps/container.config.ts),
+[container output contract](../crates/waltr-web/scripts/container-output.contract.mjs),
+[status output contract](../crates/waltr-server/scripts/status-app.contract.mjs),
+[independent served-app contract](../crates/waltr-server/scripts/apps.contract.mjs),
+[Cargo asset orchestration contract](../crates/waltr-server/scripts/build-assets.contract.mjs),
+[session RPC contract](../crates/waltr-server/src/session/apps_tests.rs),
+[shared client contracts](../crates/waltr-client/tests/apps.rs),
+[shared-lane cancellation](../crates/waltr-client/src/coordination/runtime/tests/apps_cancellation.rs),
+[bundled server contracts](../crates/waltr-server/src/app.rs), [HTML bootstrap contracts](../crates/waltr-server/src/web_assets.rs),
+[TUI lifecycle contracts](../crates/waltr-tui/src/main.rs),
+and [native prerequisites](../crates/waltr-app/src/app_container.rs).
+
+### macOS Native Apps Verification
+
+Normal Apple Silicon macOS builds enable Apps without `native-apps-test`, a disposable profile, or prior diagnostic proof.
+Actual macOS WKWebView observations remain distinct from Playwright WebKit and MockRuntime results.
+The normal local build targets unsigned `aarch64-apple-darwin`.
+This procedure covers no Intel/universal package, code signature, notarization, Android, Linux WebView, or Windows WebView.
+Future Git sources, navigation entries, and resource-first Apps launch remain outside this procedure.
+
+Install workspace dependencies and the [web/WASM prerequisites](../CONTRIBUTING.md#building) before the build.
+Use a compatible `cargo-tauri` CLI; the app pins Tauri `2.10.1`.
+See [the normal build and launch commands](../CONTRIBUTING.md#building) for the separate `target/macos-default` output.
+From the repository root, open the normal bundle:
+
+```sh
+open target/macos-default/aarch64-apple-darwin/debug/bundle/macos/Waltr.app
+```
+
+These commands describe a procedure, not a successful build or live test.
+For the current local acceptance, the user tests the normal app before any separately authorized commit, push, or deployment.
+This acceptance order does not disable Apps or require the optional diagnostic harness.
+This procedure grants none of those permissions.
+
+1. Record a fresh ordinary self-MCP `status` call/result pair in a session.
+2. Select **Open app** on that complete pair.
+3. Check the initial observation, Refresh, Close, and reopen through the ordinary session RPC path.
+4. Quit the app normally to check listener shutdown.
+
+Older text-only calls do not acquire an Open app action retroactively.
+The normal startup returns the container URL only after the WKNavigationDelegate installation acknowledges success.
+That acknowledgement enforces runtime security, not a release-validation gate.
+
+#### Optional Diagnostic Harness
+
+The `native-apps-test` feature adds a disposable attack fixture and the `nativeAppsTest` helper.
+It requires `tauri.native-apps-test.conf.json` and identifier `dev.waltr.app.native-apps-test` only for this optional diagnostic build.
+The separate configuration builds and stages packaged frontend assets plus the native attack page.
+It does not remove the current shared WASM prerequisite from the Tauri asset build.
+
+From the repository root, build the optional diagnostic candidate:
+
+```sh
+pnpm --filter @rfhold/waltr-app build:native-apps-test
+```
+
+The package script selects `--debug --no-bundle --target aarch64-apple-darwin --features native-apps-test --config tauri.native-apps-test.conf.json`.
+Build completion proves no runtime isolation.
+If the build fails, stop here; do not report the candidate as verified.
+
+For a diagnostic report, inspect both the attack page and the real App in actual WKWebView.
+The report does not replace normal-app live acceptance or authorize a commit, push, or deployment.
+
+From the repository root, launch with the diagnostic sanitizer directly attached:
+
+```sh
+target/aarch64-apple-darwin/debug/waltr-app 2>&1 | node crates/waltr-app/scripts/native-apps-evidence.mjs
+```
+
+If `CARGO_TARGET_DIR` changes the output location, use the corresponding candidate binary path.
+Never retain, print, copy, or `tee` raw stdout/stderr before the sanitizer.
+Tauri's invalid-key diagnostic includes the expected real invoke key; raw output is secret-bearing evidence.
+The sanitizer drops arbitrary output and emits only fixed probe IDs, bounded native gate markers, and a final report.
+Capture only sanitizer output when a retained report is necessary.
+
+1. Confirm that the trusted positive control succeeds on the initial WKWebView attack page.
+2. Inspect both the separate-origin outer fixture and opaque inner fixture for ancestor access or invoke-key leaks.
+3. Reject any `SUCCEEDED`, `LEAKED`, or `EXPOSED` outcome; absent APIs and timeouts do not prove native denial.
+4. Wait for the subframe navigation probe to execute.
+5. Select **Attempt Denied Main Navigation And Popup**.
+6. Confirm that the packaged page remains current and no popup opens.
+7. Select **Continue To Disposable Waltr UI**.
+8. Obtain a complete ordinary self-MCP `status` tool call/result pair in a session.
+9. Select **Open app** on that recorded pair.
+10. Check the real status App's initial observation, Refresh, Close, and reopen through the ordinary session RPC path.
+11. Quit the candidate normally so the sanitizer can emit its final report.
+
+The native key-fence report requires 28 explicit rejections: seven commands through raw IPC and `ipc:` from each attacker frame.
+The commands cover runtime start, dispatch, state, disposal, external URL, authorization-attempt opening, and channel fetch.
+The fixture also attempts `http://ipc.localhost`; macOS does not provide that protocol, so absence supplies no extra native proof.
+The report also requires the positive control and installed/main/subframe/popup native navigation markers.
+The sanitizer's `NATIVE KEY-FENCE CHECK PASS` covers only those checks, not the complete manual isolation procedure.
+Independently confirm ancestor/key isolation, native navigation denial, real status behavior, and listener shutdown.
+An incomplete report establishes no successful isolation check; a forbidden capability requires investigation.
+The report does not control normal Apps enablement or establish other native platform support.
+
+Focused source contracts, without a GUI launch:
+
+```sh
+node --test crates/waltr-app/scripts/native-apps-evidence.test.mjs
+cargo test -p waltr-app native_apps
+cargo test -p waltr-app --features native-apps-test native_apps
+```
+
+These tests check sanitizer behavior, normal container lifecycle, optional probe ownership, diagnostic profile policy, and native navigation decisions.
+The `app_container` source contract checks the same CSP function across six OS values, five architectures, and both diagnostic states.
+It checks normal and development CSP, exact frame sources, and unchanged other directives; unsupported targets retain `frame-src 'none'`.
+They do not replace the user boot or actual WKWebView observations.
+
+Sources: [candidate package script](../crates/waltr-app/package.json),
+[disposable configuration](../crates/waltr-app/tauri.native-apps-test.conf.json),
+[fixture staging](../crates/waltr-app/scripts/stage-native-apps-test.mjs),
+[Rust native container and optional probe](../crates/waltr-app/src/native_apps.rs),
+[WK navigation adapter](../crates/waltr-app/src/native_apps_navigation.rs),
+[attack page](../crates/waltr-app/tests/native-apps/native-apps-test.html),
+[frame probes](../crates/waltr-app/tests/native-apps/probe.js), and
+[diagnostic sanitizer](../crates/waltr-app/scripts/native-apps-evidence.mjs).
+
 # Live Agent Tests
 
 Live agent tests are ignored by default. Running them explicitly without provider credentials should complete successfully and print skip messages for missing API keys.

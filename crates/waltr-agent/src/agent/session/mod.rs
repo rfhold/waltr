@@ -24,7 +24,7 @@ pub use capture::{CompletedSessionCapture, SessionCaptureError, SessionCaptureLi
 pub use compat::EphemeralSessionRun;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) use control::{SessionControl, SessionOperation, SessionRunContext};
-pub use coordinator::SessionCoordinator;
+pub use coordinator::{McpAppError, McpAppHandle, SessionCoordinator, SessionMcpApp};
 pub use copy::{SessionCopy, SessionCopyError};
 pub use create::{
     SessionCreateRequest, SessionStart, SessionStartMessage, SessionStartMessageError,

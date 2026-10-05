@@ -9,6 +9,7 @@ import { OAuthApplication } from "./authentik";
 const config = new pulumi.Config();
 const namespaceName = config.require("namespace");
 const hostname = config.require("hostname");
+const appsHostname = config.require("appsHostname");
 const displayName = config.require("displayName");
 const slug = config.require("slug");
 const image = config.require("image");
@@ -82,6 +83,17 @@ const labels = {
 const workloadLabels = { ...labels, "app.kubernetes.io/component": "server" };
 const deploymentEnvironment = pulumi.getStack();
 const publicUrl = `https://${hostname}`;
+const appsPublicUrl = `https://${appsHostname}`;
+for (const host of [hostname, appsHostname]) {
+  if (
+    !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(host)
+  ) {
+    throw new Error("hostname and appsHostname must be exact DNS hostnames");
+  }
+}
+if (appsHostname === hostname) {
+  throw new Error("appsHostname must be separate from the API hostname");
+}
 const mcpIssuer = `${publicUrl}/oauth`;
 const mcpResource = `${publicUrl}/mcp`;
 const wrappingKeyMountPath = "/var/run/secrets/waltr/mcp-oauth";
@@ -383,6 +395,9 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_WORKSPACE_ROOT: workspaceRoot,
       WALTR_AUTH_MODE: "oidc",
       WALTR_PUBLIC_URL: publicUrl,
+      WALTR_APP_CONTAINER_ADDR: "0.0.0.0:14334",
+      WALTR_APP_CONTAINER_ORIGIN: appsPublicUrl,
+      WALTR_APP_CONTAINER_HOST_ORIGINS: publicUrl,
       WALTR_OIDC_ISSUER: browserApp.issuer,
       WALTR_OIDC_CLIENT_ID: browserApp.clientId,
       WALTR_OIDC_CLIENT_SECRET: browserApp.clientSecret!,
@@ -480,6 +495,7 @@ const deployment = new k8s.apps.v1.Deployment(
               imagePullPolicy: "IfNotPresent",
               ports: [
                 { name: "grpc-web", containerPort: 14333, protocol: "TCP" },
+                { name: "apps-http", containerPort: 14334, protocol: "TCP" },
               ],
               envFrom: [{ secretRef: { name: appSecret.metadata.name } }],
               securityContext: {
@@ -660,6 +676,44 @@ const route = new k8s.apiextensions.CustomResource("waltr-route", {
         matches: [{ path: { type: "PathPrefix", value: "/" } }],
         backendRefs: [{ name: service.metadata.name, port: 14333 }],
         timeouts: { request: "0s" },
+      },
+    ],
+  },
+});
+
+const appsService = new k8s.core.v1.Service("waltr-apps", {
+  metadata: { name: "waltr-apps", namespace: namespace.metadata.name, labels },
+  spec: {
+    selector: workloadLabels,
+    ports: [
+      {
+        name: "apps-http",
+        port: 14334,
+        targetPort: "apps-http",
+        appProtocol: "http",
+      },
+    ],
+  },
+});
+
+new k8s.apiextensions.CustomResource("waltr-apps-route", {
+  apiVersion: "gateway.networking.k8s.io/v1",
+  kind: "HTTPRoute",
+  metadata: { name: "waltr-apps", namespace: namespace.metadata.name, labels },
+  spec: {
+    parentRefs: [
+      {
+        group: "gateway.networking.k8s.io",
+        kind: "Gateway",
+        name: "default-gateway",
+        namespace: "ingress",
+      },
+    ],
+    hostnames: [appsHostname],
+    rules: [
+      {
+        matches: [{ path: { type: "PathPrefix", value: "/" } }],
+        backendRefs: [{ name: appsService.metadata.name, port: 14334 }],
       },
     ],
   },

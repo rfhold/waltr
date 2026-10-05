@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { acceptNativeAppsBootstrap } from "../mcp-apps/policy";
 
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 import type {
@@ -125,12 +126,13 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
         return;
       }
 
-      const runtime = await api.invoke<{ generation: number }>("start_runtime");
+      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown }>("start_runtime");
       if (disposed) {
         await api.invoke("dispose_runtime");
         return;
       }
       generation = runtime.generation;
+      acceptNativeAppsBootstrap(runtime.nativeApps);
       announcedGeneration = runtime.generation;
       for (const event of pendingEvents.splice(0)) await enqueue(event);
       await eventQueue;
@@ -139,6 +141,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
       }
       runtimeReady = true;
     } catch (error) {
+      acceptNativeAppsBootstrap(undefined);
       started = false;
       unlisten?.();
       unlisten = undefined;
@@ -150,6 +153,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
   const dispose = async () => {
     if (disposed) return;
     disposed = true;
+    acceptNativeAppsBootstrap(undefined);
     runtimeReady = false;
     announcedGeneration = undefined;
     unlisten?.();

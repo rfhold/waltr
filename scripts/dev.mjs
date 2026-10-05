@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, openSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { devAppContainerConfig } from "./dev-app-container.mjs";
 
+const apps = devAppContainerConfig();
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const logDir = fileURLToPath(new URL("../.dev/logs", import.meta.url));
 const launchLogDir = `${logDir}/${new Date().toISOString().replaceAll(/[:.]/g, "-")}`;
@@ -16,6 +18,7 @@ function run(command, args, options = {}) {
       stdio: "inherit",
     });
 
+    child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) {
         resolve();
@@ -39,6 +42,11 @@ function start(command, args, options = {}) {
 
   children.add(child);
 
+  child.once("error", (error) => {
+    console.error(`${command}: ${error.message}`);
+    children.delete(child);
+    stop(1);
+  });
   child.once("exit", (code, signal) => {
     children.delete(child);
 
@@ -70,6 +78,11 @@ function runForeground(command, args, options = {}) {
 
     children.add(child);
 
+    child.once("error", (error) => {
+      console.error(`${command}: ${error.message}`);
+      children.delete(child);
+      resolve(1);
+    });
     child.once("exit", (code, signal) => {
       children.delete(child);
       resolve(signal === "SIGINT" ? 130 : code ?? 1);
@@ -131,7 +144,7 @@ process.once("SIGTERM", () => stop(143));
 
 await run("pnpm", ["--filter", "@rfhold/waltr-web", "wasm:build"]);
 
-console.log(`web/server logs: ${launchLogDir}`);
+console.log(`web/server/app-container logs: ${launchLogDir}`);
 
 startLogged("server", "cargo", ["run", "-p", "waltr-server"], {
   env: {
@@ -139,8 +152,13 @@ startLogged("server", "cargo", ["run", "-p", "waltr-server"], {
     WALTR_SESSION_STORE: "filesystem",
   },
 });
-startLogged("web", "pnpm", ["--filter", "@rfhold/waltr-web", "dev:vite"], {
-  env: { WALTR_WEB_PROXY_TARGET: "http://127.0.0.1:14333" },
+if (apps.containerEnv) {
+  startLogged("app-container", "cargo", ["run", "-p", "waltr-server", "--", "app-container"], {
+    env: apps.containerEnv,
+  });
+}
+startLogged("web", "pnpm", ["--filter", "@rfhold/waltr-web", "dev:vite", ...apps.viteArgs], {
+  env: { WALTR_WEB_PROXY_TARGET: "http://127.0.0.1:14333", ...apps.webEnv },
 });
 
 const tuiExitCode = await runForeground("cargo", ["run", "-p", "waltr-tui"], {

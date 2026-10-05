@@ -12,6 +12,21 @@ Run web without starting the server:
 
 `pnpm --filter @rfhold/waltr-web dev`
 
+Run the server, Vite web client, and TUI together with `pnpm dev`.
+For the server and web client without the TUI, run `pnpm dev:web`.
+Both commands manage a separate loopback Apps container at `http://127.0.0.1:14334/container.html` and configure Vite automatically.
+Neither command requires a manual Apps service or environment setup.
+Vite binds `127.0.0.1:5173` with strict port selection so the container can trust exactly the `127.0.0.1` and `localhost` web origins.
+If a port has another listener, startup fails instead of silently changing origins.
+Set `WALTR_WEB_DEV_PORT` or `WALTR_APP_CONTAINER_ADDR` (an explicit `127.0.0.1:PORT` or `[::1]:PORT`) to choose unused ports.
+`pnpm dev` keeps its API at `127.0.0.1:14333` and writes background logs, including `app-container.log`, under `.dev/logs/`.
+`pnpm dev:web` keeps its API at `127.0.0.1:8080` and streams logs.
+All managed children stop when the runner stops or a background child fails.
+An explicit `VITE_WALTR_MCP_APP_CONTAINER_URL` instead uses a current separate-origin container; the runner starts no additional container.
+Its operator must configure the exact Vite parent origins and the [Apps asset security policy](docs/deployment.md#mcp-apps-assets-and-app-container).
+For a reverse proxy over the managed loopback container, `WALTR_APP_CONTAINER_ORIGIN` sets its exact public HTTPS origin.
+`WALTR_APP_CONTAINER_HOST_ORIGINS` adds exact parent origins (comma-separated, no wildcards).
+
 Run the static local Compose development profile:
 
 `docker compose --profile dev up`
@@ -32,9 +47,52 @@ Install and run the bundled TUI with an embedded server and web assets:
 
 `pnpm install:bundled`
 
+The bundled web host starts its separate-origin Apps listener automatically on loopback.
+Normal bundled startup requires no separate Apps command or URL environment variable.
+Plain TUI mode displays no Apps UI.
+
 The server uses separate durable `waltr.sqlite3` and `mcp.sqlite3` files under `XDG_DATA_HOME` or `$HOME/.local/share` when database URLs are unset. `WALTR_DATABASE_URL` selects Waltr persistence; optional `WALTR_MCP_DATABASE_URL` overrides the derived MCP target. Access auth defaults to disabled. OIDC mode uses Authentik for browser/native authentication and requires a local MCP OAuth wrapping-key ring; Waltr itself issues the only bearer accepted by `/mcp`. See [docs/deployment.md](docs/deployment.md).
 
 # Building
+
+Web builds require workspace dependencies, the `wasm32-unknown-unknown` Rust target, and a compatible `wasm-bindgen` CLI on `PATH`.
+Install the target with `rustup target add wasm32-unknown-unknown`.
+Install `wasm-bindgen-cli` at the exact `wasm-bindgen` version in `Cargo.lock`.
+The CLI and Rust dependency versions must match.
+Browser and Tauri build scripts both generate shared WASM artifacts as a prerequisite.
+Tauri bundles still contain no WASM output and use the Rust client runtime.
+Web owns the trusted Apps container and its shared bridge contract.
+Normal browser Vite builds emit the UI plus the self-contained `dist/app-container/container.html` and `container.js` pair.
+Tauri modes omit the container.
+Default server builds run `pnpm --filter @rfhold/waltr-web build:app-container`, without a WASM build.
+With `web`, the server consumes container output from one full web build instead.
+For served assets, Cargo runs `pnpm --filter @rfhold/waltr-server build` for the explicit `scripts/apps.entries` list.
+Each independent Vite build emits self-contained `dist/<name>/index.html`; Cargo generates optional Rust asset constants in `OUT_DIR`.
+The server workspace package owns the served-app SDK and Vite toolchain; root dependencies supply only Playwright.
+Asset builds require Node, pnpm, and installed workspace dependencies; Cargo installs no Node packages.
+`apps-assets` selects independent `apps-host-assets` and `apps-served-assets` features.
+`--no-default-features` with no asset feature omits the assets, not the session Apps RPCs.
+`WALTR_APP_CONTAINER_DIST` selects prebuilt container assets and bypasses the host-assets Vite build.
+The full `web` build and served-app builds remain independent of this override.
+See [Waltr-served Apps authoring](docs/mcp/apps-authoring.md) for the static source, resource, and ordinary tool addition path.
+See [MCP Apps deployment](docs/deployment.md#mcp-apps-assets-and-app-container) for prerequisites, bundled startup, and external host configuration.
+Normal Apple Silicon macOS builds enable Apps without a diagnostic feature, separate profile, or prior isolation report.
+Other native platforms remain unsupported; this support makes no Intel or universal-package promise.
+See [macOS Apps verification](docs/testing.md#macos-native-apps-verification) for live acceptance and the optional diagnostic harness.
+
+From `crates/waltr-app`, build the normal unsigned Apple Silicon debug app:
+
+```sh
+CARGO_TARGET_DIR=../../target/macos-default cargo tauri build --debug --target aarch64-apple-darwin --bundles app --no-sign
+```
+
+From the repository root, open that bundle:
+
+```sh
+open target/macos-default/aarch64-apple-darwin/debug/bundle/macos/Waltr.app
+```
+
+These commands describe a procedure, not a successful build or live test.
 
 Build a Rust crate:
 
@@ -47,6 +105,14 @@ Build the MCP crate:
 Build the server:
 
 `cargo build -p waltr-server`
+
+Build all explicit server-owned apps independently:
+
+`pnpm --filter @rfhold/waltr-server build`
+
+Build only the trusted Apps container, without WASM:
+
+`pnpm --filter @rfhold/waltr-web build:app-container`
 
 Build the TUI:
 
@@ -115,6 +181,19 @@ Compile the exact shared-client integration targets:
 Run the authenticated browser integration phase:
 
 `pnpm test:web:integration:auth`
+
+Run the web-owned app container unit/output and browser contracts:
+
+`pnpm test:app-container:unit`
+
+`pnpm test:app-container:browser`
+
+These browser contracts use the actual host-only Cargo service and a fake host callback, not the full session RPC path.
+See [MCP Apps tests](docs/testing.md#mcp-apps) for browser prerequisites and proof limits.
+
+Build and test served-app output, independent second-app embedding, and Cargo asset orchestration:
+
+`pnpm test:status-app`
 
 # Commits
 

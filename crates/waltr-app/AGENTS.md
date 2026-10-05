@@ -8,6 +8,11 @@
 | [src/policy.rs](src/policy.rs) | External URL and local navigation security policies. |
 | [capabilities/](capabilities/) | Minimal local main-WebView IPC grants. |
 | [tauri.conf.json](tauri.conf.json) | Desktop and Android shell configuration. |
+| [src/app_container.rs](src/app_container.rs) | Confined IPC and OS/architecture-specific runtime frame CSP policy. |
+| [src/native_apps.rs](src/native_apps.rs) | Normal Apple Silicon macOS container lifecycle and optional diagnostic probe listener. |
+| [tauri.native-apps-test.conf.json](tauri.native-apps-test.conf.json) | Optional diagnostic configuration and separate profile identifier. |
+| [src/native_apps_navigation.rs](src/native_apps_navigation.rs) | Frame-aware WKNavigationDelegate for Apple Silicon macOS. |
+| [../../docs/testing.md#macos-native-apps-verification](../../docs/testing.md#macos-native-apps-verification) | Normal-app live acceptance and optional sanitized native diagnostics. |
 | [gen/android/app/src/main/AndroidManifest.xml](gen/android/app/src/main/AndroidManifest.xml) | Notification permissions, private foreground service, and backup policy references. |
 | [gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt](gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt) | Notification gate and activity-owned client lifecycle. |
 | [gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt](gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt) | Same-process Android embedded-server service and persistent notification. |
@@ -71,6 +76,20 @@ Do not promise service survival after force-stop, process kill, reboot, or user 
 Exclude all Android private files, databases, preferences, and root data from cloud backup and device transfer.
 
 Only packaged local content may invoke IPC. Deny remote main-WebView navigation and all new windows; external opening must pass the Rust HTTPS URL policy.
+
+Normal Apple Silicon macOS builds enable Apps without a diagnostic feature, disposable profile, or prior isolation report.
+Keep other native platforms unsupported; make no Intel or universal-package promise.
+Preserve the Apple Silicon macOS container-only frame CSP and exact current-generation WKNavigationDelegate policy.
+Apply `configure_apps_csp` to `context.config_mut()` before the Tauri builder consumes the context.
+Keep the base configuration and unsupported targets, including Intel macOS, at `frame-src 'none'`.
+Change only `frame-src` in configured normal and development CSP; optional diagnostics add only the probe frame URL.
+Return `nativeApps.containerUrl` only after the WKNavigationDelegate installation acknowledges success.
+Treat that acknowledgement as runtime security enforcement, not a release-validation gate.
+Restrict optional `native-apps-test` diagnostics to Apple Silicon macOS and the disposable identifier/configuration.
+Keep asset URLs separate from the private API endpoint and bearer.
+Preserve exact current-generation subframe policy, packaged main navigation, popup denial, and owned listener shutdown.
+Pipe diagnostic-harness output directly through `scripts/native-apps-evidence.mjs`; never retain or `tee` raw invalid-key diagnostics.
+Unit tests and sanitizer reports do not prove live WKWebView behavior; neither is a prerequisite for normal Apps enablement.
 
 If an outbound authorization URL contains the local endpoint, remove it from the snapshot. Retain it only in Rust for the current pending attempt.
 

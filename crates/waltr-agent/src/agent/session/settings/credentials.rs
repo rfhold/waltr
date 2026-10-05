@@ -18,6 +18,10 @@ pub const OAUTH_CREDENTIAL_VERSION: u32 = 1;
 pub struct OAuthCredential {
     /// Stored representation version.
     pub version: u32,
+    /// Non-secret authorization incarnation, retained on refresh but replaced on authorization.
+    /// Legacy credentials without an identity cannot authorize MCP Apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
     /// Shared token material.
     pub token: OAuthTokenSet,
     /// Target-specific non-secret context.
@@ -41,9 +45,10 @@ impl std::fmt::Debug for OAuthCredential {
 impl OAuthCredential {
     /// Create a provider credential.
     #[must_use]
-    pub const fn provider(token: OAuthTokenSet, metadata: BTreeMap<String, String>) -> Self {
+    pub fn provider(token: OAuthTokenSet, metadata: BTreeMap<String, String>) -> Self {
         Self {
             version: OAUTH_CREDENTIAL_VERSION,
+            authority_id: Some(uuid::Uuid::now_v7().to_string()),
             token,
             context: OAuthCredentialContext::Provider { metadata },
         }
@@ -54,6 +59,7 @@ impl OAuthCredential {
     pub fn mcp(token: OAuthTokenSet, context: McpOAuthContext) -> Self {
         Self {
             version: OAUTH_CREDENTIAL_VERSION,
+            authority_id: Some(uuid::Uuid::now_v7().to_string()),
             token,
             context: OAuthCredentialContext::Mcp(Box::new(context)),
         }
@@ -143,7 +149,10 @@ impl Eq for OAuthTokenSet {}
 
 impl PartialEq for OAuthCredential {
     fn eq(&self, other: &Self) -> bool {
-        self.version == other.version && self.token == other.token && self.context == other.context
+        self.version == other.version
+            && self.authority_id == other.authority_id
+            && self.token == other.token
+            && self.context == other.context
     }
 }
 
@@ -795,6 +804,25 @@ fn unix_time_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn apps_authority_id_is_new_on_authorization_and_optional_on_legacy_replay() {
+        let first = super::OAuthCredential::provider(
+            super::OAuthTokenSet::bearer("a", None, None),
+            Default::default(),
+        );
+        let second = super::OAuthCredential::provider(
+            super::OAuthTokenSet::bearer("a", None, None),
+            Default::default(),
+        );
+        assert_ne!(first.authority_id, second.authority_id);
+        let mut encoded = serde_json::to_value(&first).unwrap();
+        encoded.as_object_mut().unwrap().remove("authority_id");
+        let legacy: super::OAuthCredential = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.authority_id, None);
+        let replay: super::OAuthCredential =
+            serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
+        assert_eq!(replay.authority_id, first.authority_id);
+    }
     use super::*;
 
     fn provider(access: &str) -> OAuthCredential {

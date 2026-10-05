@@ -1,3 +1,4 @@
+mod apps;
 mod authorization;
 mod basic;
 mod client;

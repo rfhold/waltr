@@ -459,6 +459,8 @@ test("runtime and build context contain required hardening", () => {
   const installIndex = dockerfile.indexOf("pnpm install --frozen-lockfile");
   for (const instruction of [
     "COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./",
+    "COPY crates/waltr-app/package.json crates/waltr-app/package.json",
+    "COPY crates/waltr-server/package.json crates/waltr-server/package.json",
     "COPY crates/waltr-web/package.json crates/waltr-web/package.json",
   ]) {
     const copyIndex = dockerfile.indexOf(instruction);
@@ -474,6 +476,7 @@ test("runtime and build context contain required hardening", () => {
     assert.ok(copyIndex > installIndex, `${instruction} must follow pnpm install`);
   }
   assert.match(dockerfile, /cargo build -p waltr-server --features web/);
+  assert.match(dockerfile, /^EXPOSE 14333 14334$/m);
   assert.doesNotMatch(buildBase, /^ARG REVISION$/m);
   assert.match(serverBuild, /^ARG REVISION$/m);
   assert.doesNotMatch(testBuild, /^ARG REVISION$/m);

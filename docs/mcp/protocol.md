@@ -55,6 +55,12 @@ Clients opt in with `McpClientOptions::with_skills`; the default remains off.
 Servers publish exact file manifests and serve their bytes through `resources/read`.
 See [Skills](skills.md) for catalog registration, validation, and host authority boundaries.
 
+The `io.modelcontextprotocol/ui` extension adds typed MCP Apps metadata, bounded resource decode, and iframe lifecycle payloads.
+Clients opt in with `McpClientOptions::with_apps`; the default remains off.
+Apps revision `2026-01-26` does not change core revision `2026-07-28` or its per-request discovery contract.
+The generic crate supplies no browser sandbox or host authorization policy.
+See [MCP Apps](apps.md) for the separate extension boundary.
+
 Tool results retain their raw wire value and also expose ordered borrowed text, image, and
 unknown extension blocks. Parsing rejects malformed known blocks while leaving image decoding,
 MIME policy, and payload validation to the consuming application.

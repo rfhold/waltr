@@ -1345,6 +1345,8 @@ mod tests {
             endpoint: "http://127.0.0.1:43123".to_owned(),
             bearer: "local-bearer".to_owned(),
             first_catalog_download: false,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_apps: None,
         };
         assert!(
             gated_connection(

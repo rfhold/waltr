@@ -107,6 +107,9 @@ const MAX_AUTH_POLL_FAILURES: u8 = 5;
 /// Full headless state for Waltr shells.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientState {
+    /// Transient protected MCP Apps data, never session history.
+    pub apps: crate::McpAppsSnapshot,
+    pub(crate) apps_completed_requests: VecDeque<String>,
     /// Monotonic generation of the current Waltr access context.
     pub access_generation: u64,
     /// Waltr access authentication state.
@@ -942,6 +945,8 @@ impl ClientState {
     }
 
     fn clear_protected_state(&mut self, policy: ClearPolicy) {
+        self.apps = crate::McpAppsSnapshot::default();
+        self.apps_completed_requests.clear();
         self.terminalize_loading_operations(policy);
         let config_interests = self.config.watch.interests;
         let session_interests = self.sessions.watch.interests;

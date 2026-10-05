@@ -148,7 +148,10 @@ The runtime loop:
 
 The stream form coordinates startup and long-lived watches. It waits for status readiness, maintains watch streams, applies watch events as they arrive, and dispatches shell commands into the same reducer-owned state.
 
-The hosted browser build compiles `waltr-client` to WASM and owns a deterministic adapter disposal path. Vite `tauri` mode selects `crates/waltr-web/src/platform/tauri.ts`, emits relative local assets, and does not build or import WASM. `crates/waltr-app` hosts one Rust `ClientStateStream` for its embedded server.
+The hosted browser build compiles `waltr-client` to WASM and owns a deterministic adapter disposal path.
+Vite `tauri` mode selects `crates/waltr-web/src/platform/tauri.ts` and emits relative local assets with no WASM import.
+Both browser and Tauri build scripts generate shared WASM artifacts as a prerequisite; Tauri bundles contain no WASM output.
+`crates/waltr-app` hosts one Rust `ClientStateStream` for its embedded server.
 
 Tauri starts `waltr-server` on an ephemeral IPv4 loopback port. Rust keeps the endpoint and random 256-bit bearer outside IPC and WebView state.
 
@@ -235,7 +238,130 @@ Manual start acceptance associates a keyed operation with a durable invocation I
 
 Request IDs provide transport correlation only. A deliberate retry uses a fresh request ID and operation key. The shared client emits no automatic start retry.
 
-The runtime keeps one cancellation-safe in-flight effect slot. Command preemption does not drop or restart that future; it resumes and completes exactly once. When access is denied and queued/in-flight work is drained, the stream parks until a command or credential generation change instead of publishing an unchanged busy loop.
+The runtime keeps one cancellation-safe in-flight effect slot. Ordinary command preemption retains that future until completion.
+Apps Close deliberately drops only a matching Apps Call; see [Session MCP Apps](#session-mcp-apps).
+When access is denied and queued/in-flight work is drained, the stream parks until a command or credential generation change instead of publishing an unchanged busy loop.
+
+## Session MCP Apps
+
+The hosted browser exposes an explicit Open app action on a tool call with linked Apps metadata.
+The action opens a modal inside the current session detail.
+It creates no app catalog, task graph, or separate session.
+Open, tool call, close, and cancellation use shared `waltr-client` commands and keyed Apps state.
+The web layer owns the modal, `AppHost` lifecycle, promise correlation, and trusted container implementation.
+Web `src/mcp-apps/container/` owns the container source; `src/mcp-apps/bridge-contract.ts` owns the shared bridge contract.
+Web `policy.ts` reexports the bridge constants and validator; it adds URL policy, not another container implementation.
+The web `app-container/container.html` entry joins the normal browser Vite build, which emits a self-contained `dist/app-container/` pair.
+Vite assertions forbid shared container chunks and external asset references.
+The container-only `app-container` mode requires no WASM; Tauri modes omit the container.
+
+`ClientStateStream` processes Apps Close through the same shared effect lane as other commands.
+Close drops an in-flight Apps Call only when its app ID matches, and removes queued calls for that app.
+The stream retains unrelated in-flight effects, including non-Apps work; server Close can wait behind those effects.
+It creates no parallel close lane or JavaScript RPC path.
+Direct `ClientRuntime` dispatch remains serialized and does not provide stream command preemption.
+Canceled Opens retain their pending effect so a late handle response can trigger cleanup through the same shared lane.
+Local payload removal and iframe disposal do not prove instantaneous server revocation.
+
+One generic app host renders any linked source-server HTML resource, regardless of tool name.
+App tool calls use the owner-bound session handle; responses update the view without overwriting the original snapshot or triggering inference.
+The public MCP `status` tool returns text plus `structuredContent.ready` and `structuredContent.observedAtUnixMs`.
+It uses the same dependency-readiness reader as `/ready`, not `/health` process liveness.
+With `apps-served-assets` enabled and an HTML Apps capability on the current request, its tool declaration links `ui://waltr/status`.
+The server owns this self-contained SDK app and serves it through ordinary MCP resources; Refresh calls the originating server's `status` tool without inference.
+Waltr renders it through the same generic AppHost and app container as any linked MCP app, with no status-specific host behavior.
+Without assets or the matching capability, the tool stays text-only and the UI resource is unavailable.
+Server defaults include the app container and server-owned status app assets; the generic MCP client's Apps capability remains default-off.
+`apps-host-assets` selects container assets; `apps-served-assets` selects MCP-served app assets; `apps-assets` selects both.
+The `web` feature selects that umbrella, and default features retain it.
+Neither asset feature gates the session Apps RPCs.
+
+Server `mcp_apps_host/` owns consumer isolation, asset routes, view storage, origin checks, and HTTP policy.
+The server consumes web-built container assets; the separate `@rfhold/waltr-server` workspace package builds explicit server-owned apps.
+Its `scripts/apps.entries` list selects independent single-file Vite builds, not a runtime catalog.
+The API web asset collection excludes `/app-container/` and legacy `/apps/` files.
+The public `app_container` module reexports its API for compatibility.
+Neutral `http_lifecycle` code owns HTTP connection tasks and bounded shutdown, independent of app content.
+`session/mcp_apps.rs` owns session RPC handle authority; `mcp_service/apps/mod.rs` owns static resource publication and common CSP.
+`mcp_service/apps/status.rs` owns ordinary status tool linkage.
+Neither module defines a special status renderer.
+See [Waltr-served Apps authoring](../mcp/apps-authoring.md) for source entries, resource declarations, and ordinary tool registration.
+
+The bundled web-enabled TUI owns a separate Apps listener through `ServerApplication::bind_with_apps`.
+Loopback startup derives exact API parent origins and starts an ephemeral asset listener in the same process.
+It supplies the public app container URL through HTML-head `waltr-mcp-apps-container-url` metadata.
+Root and deep-link shell responses use `no-store`.
+The browser treats runtime metadata as authoritative, ahead of the compiled Vite fallback.
+Invalid or duplicate metadata fails closed; absent metadata permits external hosts to use the compiled URL.
+The bundled host cancels and joins both HTTP lifecycles and the Apps expiry task on shutdown or startup rollback.
+An unexpected Apps listener exit fails the server and prevents a detached asset service.
+The standalone API entry point leaves Apps disabled unless all three runtime Apps environment variables explicitly opt in.
+That opt-in requires `web` and uses `bind_with_apps_config` for the same bootstrap, rollback, and shutdown ownership.
+The preview and production Pulumi sources configure separate HTTPS Apps origins; source configuration does not establish live DNS, TLS, or deployment.
+Plain TUI mode has no Apps renderer or non-web Apps listener.
+
+The SDK-backed `AppHost` loads an app container iframe from a separate trusted asset origin.
+The app container needs `allow-scripts allow-same-origin` only on that separate origin.
+It publishes bounded HTML to the asset service and loads an inner iframe with `allow-scripts` only.
+The inner view has an opaque origin and no parent DOM access.
+HTTP CSP policy applies before script execution; JavaScript or HTML meta policy does not replace that boundary.
+Both frames deny browser permissions and receive no Waltr credentials.
+
+Host/app-container messages validate source window, exact origin, generation, and size.
+The app container excludes reserved sandbox-control messages from the view channel.
+The host negotiates `ui/initialize`, accepts `ui/notifications/initialized`, then sends the original complete input and result exactly once.
+Refresh uses only the `tools/call` response, not a second original-result notification.
+The host reports protocol display mode `inline` despite the in-site modal presentation.
+Close bounds teardown, cancels calls, removes listeners and frames, and requests view deletion.
+Server Close checks the registry owner and revokes the handle without a session load.
+Session deletion or wipe therefore does not block handle cleanup.
+The modal and container ignore `pagehide` with `persisted: true`; final unload performs cleanup.
+Asset expiry also covers lost unload cleanup.
+
+The initial host supports same-server tool calls and bounded display/lifecycle messages.
+It rejects unsupported resource reads, model-context updates, messages to the model, sampling, and external links with method-not-supported errors.
+It grants no requested external CSP origins or browser permissions, and ignores resource domain hints.
+
+Normal Apple Silicon macOS builds enable Apps without a diagnostic feature, separate profile, or prior isolation report.
+Target-specific Cargo dependencies select container assets, served app assets, and the WKWebView adapter.
+Rust owns a dedicated ephemeral loopback container and joins its lifecycle with embedded-server shutdown.
+An unexpected container exit fails the owner and triggers cleanup.
+The `start_runtime` response supplies `nativeApps.containerUrl` only after the WKNavigationDelegate installation acknowledges success.
+The frontend uses that Rust capability for Open app; it does not require diagnostic evidence.
+The acknowledgement enforces runtime security rather than release validation.
+Bootstrap exposes only nonsecret asset URLs; the private API endpoint and bearer stay outside WebView state.
+The base `tauri.conf.json` retains `frame-src 'none'`; no automatic macOS configuration relaxes that policy.
+At startup, `app_container.rs` applies compile-target-aware CSP through `context.config_mut()` before the Tauri builder consumes the context.
+Only macOS/aarch64 permits `http://127.0.0.1:*/container.html`; other targets, including Intel macOS, retain `frame-src 'none'`.
+The function changes only `frame-src` in configured normal and development CSP; optional diagnostics also permit the probe frame URL.
+Rust restricts subframes further to exact current-generation ports and asset paths.
+It also permits empty `about:blank` and `about:srcdoc` frames only from the packaged page or trusted current-generation asset frames.
+The WKNavigationDelegate distinguishes main frames, subframes, responses, and popups before the original Wry delegate handles packaged navigation.
+Remote main navigation and new windows remain denied.
+The confined stock Tauri IPC transport restricts its lexical invoke key to the packaged top frame.
+The six application IPC commands and private API credential boundary remain unchanged.
+Other native platforms remain unsupported; this target makes no Intel or universal-package promise.
+MockRuntime, Node transport tests, and browser contracts do not prove native runtime isolation.
+Their proof limits do not impose a prerequisite for normal Apple Silicon macOS Apps enablement.
+Fresh recorded `status` calls can carry linked Apps metadata; older text-only calls do not acquire Open app retroactively.
+
+The optional `native-apps-test` diagnostic harness uses a separate identifier, configuration, and app-private profile.
+It adds the attack-fixture listener, probe markers, and the `nativeAppsTest` helper.
+Neither that helper nor its evidence pipeline is necessary for normal Apps.
+See [macOS Apps verification](../testing.md#macos-native-apps-verification) for normal-app live acceptance and optional diagnostic checks.
+
+Sources: [shared Apps state](../../crates/waltr-client/src/apps.rs), [dialog](../../crates/waltr-web/src/mcp-apps/AppDialog.tsx),
+[shared effect lane](../../crates/waltr-client/src/coordination/runtime.rs),
+[host](../../crates/waltr-web/src/mcp-apps/AppHost.ts), [app container](../../crates/waltr-web/src/mcp-apps/container/container.ts),
+[bridge contract](../../crates/waltr-web/src/mcp-apps/bridge-contract.ts), [Vite build](../../crates/waltr-web/vite.config.ts),
+[consumer isolation](../../crates/waltr-server/src/mcp_apps_host/mod.rs), [HTTP lifecycle](../../crates/waltr-server/src/http_lifecycle.rs),
+[session handle registry](../../crates/waltr-server/src/session/mcp_apps.rs), [status resource](../../crates/waltr-server/src/mcp_service/apps/status.rs),
+[URL policy](../../crates/waltr-web/src/mcp-apps/policy.ts), [bundled lifecycle](../../crates/waltr-server/src/app.rs),
+[HTML bootstrap](../../crates/waltr-server/src/web_assets.rs), [TUI startup](../../crates/waltr-tui/src/main.rs),
+[native IPC boundary](../../crates/waltr-app/src/app_container.rs), [native container lifecycle](../../crates/waltr-app/src/native_apps.rs),
+[WK navigation adapter](../../crates/waltr-app/src/native_apps_navigation.rs), and [readiness](../../crates/waltr-server/src/readiness.rs).
+See [Agent](agent.md#session-mcp-apps) for authority and audit behavior, [Deployment](../deployment.md#mcp-apps-assets-and-app-container) for configuration,
+and [Testing](../testing.md#mcp-apps) for proof limits.
 
 ## Session Context
 

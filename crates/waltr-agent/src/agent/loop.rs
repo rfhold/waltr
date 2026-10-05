@@ -141,6 +141,7 @@ struct ToolBatch {
 }
 
 struct RunningTool {
+    app_capture: crate::mcp::apps::AppCapture,
     call: ToolCall,
     result: ToolFuture,
     progress_rx: Option<mpsc::UnboundedReceiver<PendingTimelineEvent>>,
@@ -560,7 +561,7 @@ where
                                         Err(error) => return Some((Err(error), self)),
                                     }
                                 }
-                                match self.finish_running_tool(running.call, result, running.sandbox_backed).await {
+                                match self.finish_running_tool(running.call, result, running.sandbox_backed, running.app_capture).await {
                                     Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
                                     Ok(false) => {}
                                     Err(error) => return Some((Err(error), self)),
@@ -582,7 +583,12 @@ where
                             result = running.result => result,
                         };
                         match self
-                            .finish_running_tool(running.call, result, running.sandbox_backed)
+                            .finish_running_tool(
+                                running.call,
+                                result,
+                                running.sandbox_backed,
+                                running.app_capture,
+                            )
                             .await
                         {
                             Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
@@ -653,10 +659,9 @@ where
     }
 
     fn resolve_tool_call(&self, call: &ToolCall) -> Option<ResolvedToolCall> {
-        let tool_index = self
-            .tools
-            .iter()
-            .position(|tool| tool.definition().name == call.name)?;
+        let tool_index = self.tools.iter().position(|tool| {
+            crate::middleware::tools::model_visible(tool) && tool.definition().name == call.name
+        })?;
         Some((tool_index, self.tools[tool_index].definition().clone()))
     }
 
@@ -910,6 +915,8 @@ where
             context = context.with_prepared_sandbox_call(prepared);
         }
         let sandbox_backed = self.tools[tool_index].is_sandbox_backed();
+        let app_capture = Arc::new(std::sync::Mutex::new(None));
+        context.app_capture = Some(Arc::clone(&app_capture));
         if sandbox_backed {
             // No Execute future may be polled before the dispatch fence is durable.
             self.append_journal_event(SessionJournalEvent::SandboxDispatchStarted {
@@ -921,6 +928,7 @@ where
         let result = self.tools[tool_index].call(context);
         let result = self.instrument_tool_future(&call, result);
         Ok(ToolExecution::Running(RunningTool {
+            app_capture,
             call,
             result,
             progress_rx: Some(progress_rx),
@@ -933,6 +941,7 @@ where
         call: ToolCall,
         result: Result<ToolResult>,
         sandbox_backed: bool,
+        app_capture: crate::mcp::apps::AppCapture,
     ) -> Result<bool> {
         if sandbox_backed && result.is_err() {
             // The worker may have performed the operation even if its reply was lost.
@@ -951,6 +960,11 @@ where
             }
         };
 
+        let association = app_capture
+            .lock()
+            .expect("app capture lock poisoned")
+            .take();
+        let original_result = result.clone();
         let after_outcome = {
             let mut ctx = ToolResultContext {
                 call: Some(&call),
@@ -966,19 +980,25 @@ where
         };
         match after_outcome {
             Ok(HookOutcome::Continue) => {
-                self.finish_tool_result(result).await?;
+                let association = crate::mcp::apps::unmodified_association(
+                    association,
+                    &original_result,
+                    &result,
+                );
+                self.finish_tool_result_with_app(result, association)
+                    .await?;
                 Ok(true)
             }
             Ok(outcome) => {
                 if let Some(result) = self.tool_result_from_hook_outcome(&call, outcome).await? {
-                    self.finish_tool_result(result).await?;
+                    self.finish_tool_result_with_app(result, None).await?;
                     Ok(true)
                 } else {
                     Ok(false)
                 }
             }
             Err(error) => {
-                self.finish_tool_result(error_tool_result(&call, &error))
+                self.finish_tool_result_with_app(error_tool_result(&call, &error), None)
                     .await?;
                 Ok(true)
             }
@@ -986,6 +1006,14 @@ where
     }
 
     async fn finish_tool_result(&mut self, result: ToolResult) -> Result<()> {
+        self.finish_tool_result_with_app(result, None).await
+    }
+
+    async fn finish_tool_result_with_app(
+        &mut self,
+        result: ToolResult,
+        association: Option<crate::mcp::apps::McpAppAssociation>,
+    ) -> Result<()> {
         self.clear_call_approvals(&result.call_id)?;
         let parent_id = self.tool_item_id(&result.call_id)?;
         CompletionTurn::entry(&mut self.turns, self.turn as u64)
@@ -993,14 +1021,16 @@ where
             .push(TurnItem::ToolResult(result.clone()));
         let events = self.middleware_state.drain_pending();
         self.append_journal_events(events).await?;
-        let event = self
-            .append_timeline_event(tool_result_timeline_event(
-                &self.session_id,
-                self.turn as u64,
-                parent_id,
-                result,
-            ))
-            .await?;
+        let mut pending =
+            tool_result_timeline_event(&self.session_id, self.turn as u64, parent_id, result);
+        if let Some(association) = association {
+            pending.metadata[crate::mcp::apps::MCP_APP_ASSOCIATION] =
+                serde_json::to_value(association).map_err(|error| LlmError::Protocol {
+                    provider: "mcp",
+                    message: error.to_string(),
+                })?;
+        }
+        let event = self.append_timeline_event(pending).await?;
         self.pending.push_back(Ok(event));
         Ok(())
     }
@@ -2443,7 +2473,7 @@ fn apply_contextual_approvals(
     }
 }
 
-fn contextual_suspension(
+pub(crate) fn contextual_suspension(
     ctx: &ToolCallContext<'_>,
     claims: &[PermissionClaim],
 ) -> middleware::Suspension {

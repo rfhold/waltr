@@ -890,6 +890,7 @@ impl AgentSessionRuntimeFactory {
             mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
         }
         for server in connections {
+            let mut expected_authority = None;
             let config = match server.kind {
                 McpConnectionKind::Stdio => {
                     let mut parts = server.command.split_whitespace();
@@ -914,13 +915,28 @@ impl AgentSessionRuntimeFactory {
                         })?
                         .is_none()
                     {
-                        mcp = mcp.with_server(McpServerConfig::streamable_http(
-                            server.key.clone(),
-                            server.url.clone(),
+                        mcp = mcp.with_server(self.pin_app_source(
+                            McpServerConfig::streamable_http(
+                                server.key.clone(),
+                                server.url.clone(),
+                            ),
+                            server,
+                            None,
                         ));
                         continue;
                     }
-                    self.mcp_bearer_token(server).await?;
+                    let credential = self
+                        .refresh_coordinator()
+                        .refresh_mcp(server, RefreshMode::Normal)
+                        .await
+                        .map_err(|error| refresh_runtime_error(&error))?
+                        .ok_or_else(|| {
+                            AgentSessionRuntimeError::FailedPrecondition(
+                                "MCP credential disappeared".into(),
+                            )
+                        })?;
+                    let authority_id = credential.authority_id.clone();
+                    expected_authority.clone_from(&authority_id);
                     credentialed_servers.insert(server.key.clone());
                     let factory = self.clone();
                     let server_settings = server.clone();
@@ -928,10 +944,11 @@ impl AgentSessionRuntimeFactory {
                         let factory = factory.clone();
                         let server = server_settings.clone();
                         async move {
-                            factory
-                                .mcp_bearer_token(&server)
+                            let credential = factory
+                                .refresh_coordinator()
+                                .refresh_mcp(&server, RefreshMode::Normal)
                                 .await
-                                .map_err(|error| match error {
+                                .map_err(|error| match refresh_runtime_error(&error) {
                                     AgentSessionRuntimeError::Authentication {
                                         reason: crate::AuthenticationFailureReason::NetworkFailed,
                                         ..
@@ -941,19 +958,88 @@ impl AgentSessionRuntimeFactory {
                                     }
                                     _ => McpBearerProviderError::Unavailable,
                                 })?
-                                .ok_or(McpBearerProviderError::Authorization)
+                                .ok_or(McpBearerProviderError::Authorization)?;
+                            Ok((
+                                credential.authority_id.unwrap_or_default(),
+                                credential.token.access_token.secret().to_owned(),
+                            ))
                         }
                     });
-                    McpServerConfig::streamable_http_with_bearer_provider(
-                        server.key.clone(),
-                        server.url.clone(),
-                        provider,
-                    )
+                    match authority_id {
+                        Some(id) if !id.is_empty() => {
+                            McpServerConfig::streamable_http_with_app_credentials(
+                                server.key.clone(),
+                                server.url.clone(),
+                                id,
+                                provider,
+                            )
+                        }
+                        _ => {
+                            let bearer = Arc::new(move || {
+                                let provider = provider.clone();
+                                async move { provider().await.map(|(_, token)| token) }
+                            });
+                            McpServerConfig::streamable_http_with_bearer_provider(
+                                server.key.clone(),
+                                server.url.clone(),
+                                bearer,
+                            )
+                        }
+                    }
                 }
             };
-            mcp = mcp.with_server(config);
+            mcp = mcp.with_server(self.pin_app_source(config, server, expected_authority));
         }
         Ok((mcp, credentialed_servers))
+    }
+
+    fn pin_app_source(
+        &self,
+        config: McpServerConfig,
+        server: &McpResolvedConnection,
+        expected_authority: Option<String>,
+    ) -> McpServerConfig {
+        let factory = self.clone();
+        let server = server.clone();
+        config.with_app_authority_validator(Arc::new(move || {
+            let factory = factory.clone();
+            let server = server.clone();
+            let expected_authority = expected_authority.clone();
+            Box::pin(async move {
+                // Resolve identity without creating/reconfiguring the cached tool runtime.
+                if let Some(resolve) = &factory.mcp_connection_resolver {
+                    let Ok(current) = resolve(McpConnectionResolveRequest {
+                        servers: McpServerSelection::Include(BTreeSet::from([server.key.clone()])),
+                    })
+                    .await
+                    else {
+                        return false;
+                    };
+                    let matching = current
+                        .iter()
+                        .filter(|item| item.key == server.key)
+                        .collect::<Vec<_>>();
+                    if matching.len() != 1
+                        || McpRuntimeFingerprintConnection::from_resolved(matching[0])
+                            != McpRuntimeFingerprintConnection::from_resolved(&server)
+                    {
+                        return false;
+                    }
+                }
+                if server.kind == McpConnectionKind::Stdio {
+                    return true;
+                }
+                let key = AuthTarget::mcp_server(&server.key).credential_key();
+                match factory.credential_store.read(&key).await {
+                    Ok(None) => expected_authority.is_none(),
+                    Ok(Some(credential)) => {
+                        expected_authority.is_some()
+                            && credential.credential.authority_id == expected_authority
+                    }
+                    Err(_) => false,
+                }
+            })
+        }))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3490,6 +3576,7 @@ spec:
             .expect("read credential")
             .expect("expected typed MCP credential");
         let actual_credential = &actual.credential;
+        assert_eq!(actual_credential.authority_id, expected.authority_id);
         assert_eq!(actual_credential.mcp_context(), expected.mcp_context());
         assert_eq!(
             actual_credential

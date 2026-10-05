@@ -20,6 +20,10 @@ use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tonic::{Code, Status};
 
+#[path = "mcp_service/apps/mod.rs"]
+mod served_apps;
+use served_apps::status as status_app;
+
 const DEFAULT_WAIT_SECONDS: u64 = 60;
 const MAX_WAIT_SECONDS: u64 = 300;
 const WAIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
@@ -278,6 +282,7 @@ pub struct WaltrMcpServer {
     sessions: Arc<dyn SessionHost>,
     resources: AgentDefinitionState,
     catalog: Arc<mcp::SkillCatalog>,
+    readiness: Option<crate::readiness::Readiness>,
 }
 
 impl std::fmt::Debug for WaltrMcpServer {
@@ -382,7 +387,13 @@ impl WaltrMcpServer {
             sessions,
             resources,
             catalog: Arc::new(catalog),
+            readiness: None,
         })
+    }
+
+    pub(crate) fn with_readiness(mut self, readiness: crate::readiness::Readiness) -> Self {
+        self.readiness = Some(readiness);
+        self
     }
 
     const fn resources(&self) -> &AgentDefinitionState {
@@ -675,10 +686,12 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     }
 
     fn capabilities(&self) -> mcp::server::ServerCapabilities {
-        mcp::server::ServerCapabilities::new()
+        let mut capabilities = mcp::server::ServerCapabilities::new()
             .tools()
             .resources()
-            .skills()
+            .skills();
+        served_apps::advertise(&mut capabilities);
+        capabilities
     }
 
     fn skill_catalog(&self) -> Option<Arc<mcp::SkillCatalog>> {
@@ -688,7 +701,7 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     fn list_tools(
         &self,
         _cursor: Option<String>,
-        _context: mcp::server::ServerContext,
+        context: mcp::server::ServerContext,
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolList>> {
         use mcp::progressive::{ActionInputSchema, input_schema, json_schema_for, tool_definition};
         macro_rules! tool {
@@ -696,9 +709,10 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                 tool_definition($name, $description, input_schema(&[$($action),+], vec![$(ActionInputSchema { action: $action, schema: Some(json_schema_for::<$ty>()) }),+]))
             };
         }
-        Box::pin(async {
+        Box::pin(async move {
             Ok(mcp::McpToolList {
                 tools: vec![
+                    status_app::tool(&context),
                     tool!("create", "Create a session or an absent persisted resource slot (including a bundled override).", "session.create" => CreateInput, "resource.create" => ResourceCreateInput),
                     tool_definition(
                         "edit",
@@ -721,6 +735,28 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolResult>> {
         let server = self.clone();
         Box::pin(async move {
+            if call.name == "status" {
+                if !call.arguments.is_object()
+                    || call
+                        .arguments
+                        .as_object()
+                        .is_some_and(|args| !args.is_empty())
+                {
+                    return Err(ServerError::invalid_params("status takes an empty object"));
+                }
+                let ready = match &server.readiness {
+                    Some(readiness) => readiness.is_ready().await,
+                    None => false,
+                };
+                let observed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                return Ok(mcp::McpToolResult::new(json!({
+                    "content": [{"type":"text", "text": if ready { "Waltr is ready" } else { "Waltr is not ready" }}],
+                    "structuredContent": {"ready":ready,"observedAtUnixMs":observed}
+                })));
+            }
             if call.name == "edit" {
                 let input =
                     serde_json::from_value::<TextEditInput>(call.arguments).map_err(|error| {
@@ -752,10 +788,10 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     fn list_resources(
         &self,
         _cursor: Option<String>,
-        _context: mcp::server::ServerContext,
+        context: mcp::server::ServerContext,
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceList>> {
-        Box::pin(async {
-            Ok(mcp::McpResourceList {
+        Box::pin(async move {
+            let mut list = mcp::McpResourceList {
                 resources: vec![
                     mcp::progressive::action_resource_definition(
                         "waltr://resources",
@@ -769,7 +805,14 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                     ),
                 ],
                 next_cursor: None,
-            })
+            };
+            list.resources.extend(
+                served_apps::RESOURCES
+                    .iter()
+                    .filter(|app| app.supported(&context))
+                    .map(|app| app.descriptor()),
+            );
+            Ok(list)
         })
     }
 
@@ -807,10 +850,16 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     fn read_resource(
         &self,
         uri: String,
-        _context: mcp::server::ServerContext,
+        context: mcp::server::ServerContext,
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceResult>> {
         let server = self.clone();
         Box::pin(async move {
+            if let Some(app) = served_apps::RESOURCES
+                .iter()
+                .find(|app| app.uri == uri && app.supported(&context))
+            {
+                return Ok(app.resource());
+            }
             if let Some(result) = server.catalog.read(&uri) {
                 return Ok(result);
             }
@@ -1877,7 +1926,10 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["create", "edit", "destroy", "execute", "query"]);
+        assert_eq!(
+            names,
+            ["status", "create", "edit", "destroy", "execute", "query"]
+        );
         let schema = tools["result"]["tools"].to_string();
         assert!(!schema.contains("resources.inspect"));
         assert!(!schema.contains("session.get"));
@@ -2055,15 +2107,182 @@ mod tests {
         Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap())
     }
 
+    #[tokio::test]
+    async fn status_app_is_linked_only_with_assets_and_html_capability() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let persistence = crate::persistence::Persistence::initialize(
+            crate::persistence::DatabaseConfig::for_tests().unwrap(),
+        )
+        .await
+        .unwrap();
+        let (_definitions, definitions) =
+            tokio::sync::watch::channel(crate::DefinitionWatcherHealth::Running);
+        let (_routines, routines) =
+            tokio::sync::watch::channel(crate::routine::EngineHealth::Running);
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let readiness = crate::readiness::Readiness {
+            persistence,
+            oauth: None,
+            definitions,
+            routines,
+            sandbox_alive: alive.clone(),
+        };
+        assert!(readiness.is_ready().await);
+        let server = Arc::new(
+            WaltrMcpServer::new(Arc::new(UnusedSessionHost), state)
+                .unwrap()
+                .with_readiness(readiness),
+        );
+        let router = mcp::server::streamable_http_router(server);
+        let tools = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let status = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "status")
+            .unwrap();
+        assert!(status.get("_meta").is_none());
+        let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}});
+        let first = mcp_request(&router, call.clone()).await;
+        assert_eq!(first["result"]["structuredContent"]["ready"], true);
+        assert!(first["result"]["_meta"].get("ui").is_none());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        alive.store(false, std::sync::atomic::Ordering::Release);
+        let second = mcp_request(&router, call).await;
+        assert_eq!(second["result"]["structuredContent"]["ready"], false);
+        assert!(
+            second["result"]["structuredContent"]["observedAtUnixMs"]
+                .as_u64()
+                .unwrap()
+                > first["result"]["structuredContent"]["observedAtUnixMs"]
+                    .as_u64()
+                    .unwrap()
+        );
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":[mcp::apps::UI_MIME_TYPE]}}},
+            "io.modelcontextprotocol/clientInfo":{"name":"apps-test","version":"1"}
+        });
+        let tools = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":meta}}),
+        )
+        .await;
+        let status = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "status")
+            .unwrap();
+        let resource = mcp_request(&router, json!({"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"ui://waltr/status","_meta":meta}})).await;
+        let resources = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":6,"method":"resources/list","params":{"_meta":meta}}),
+        )
+        .await;
+        let discovered = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":7,"method":"server/discover","params":{"_meta":meta}}),
+        )
+        .await;
+        if cfg!(feature = "apps-served-assets") {
+            assert_eq!(status["_meta"]["ui"]["resourceUri"], status_app::URI);
+            assert_eq!(
+                discovered["result"]["capabilities"]["extensions"][mcp::apps::UI_EXTENSION],
+                json!({})
+            );
+            assert!(
+                resources["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["uri"] == status_app::URI
+                        && entry["mimeType"] == mcp::apps::UI_MIME_TYPE)
+            );
+            let decoded = mcp::apps::decode_resource(
+                &mcp::McpResourceResult::new(resource["result"].clone()),
+                status_app::URI,
+                mcp::apps::DEFAULT_MAX_HTML_BYTES,
+            )
+            .unwrap();
+            assert!(decoded.html.contains("Waltr Status"));
+            assert!(decoded.html.contains("ui/initialize"));
+            assert!(decoded.html.contains("ui/notifications/initialized"));
+            assert!(decoded.html.contains("tools/call"));
+            assert!(decoded.html.contains("observedAtUnixMs"));
+            assert!(!decoded.html.contains("<!-- STATUS_SCRIPT -->"));
+            assert!(!decoded.html.contains("<script src="));
+            assert!(!decoded.html.contains("https://cdn"));
+            let csp = decoded.ui.csp.unwrap();
+            assert_eq!(csp.connect_domains, Some(vec![]));
+            assert_eq!(csp.resource_domains, Some(vec![]));
+            assert_eq!(csp.frame_domains, Some(vec![]));
+            assert_eq!(csp.base_uri_domains, Some(vec![]));
+            assert_eq!(
+                decoded.ui.permissions,
+                Some(mcp::apps::UiPermissions::default())
+            );
+            let refresh = mcp_request(&router, json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"status","arguments":{},"_meta":meta}})).await;
+            assert_eq!(refresh["result"]["structuredContent"]["ready"], false);
+            assert_eq!(refresh["result"]["content"][0]["text"], "Waltr is not ready");
+        } else {
+            assert!(status.get("_meta").is_none());
+            assert!(resource.get("error").is_some());
+            assert!(
+                discovered["result"]["capabilities"]["extensions"]
+                    .get(mcp::apps::UI_EXTENSION)
+                    .is_none()
+            );
+            assert!(
+                !resources["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["uri"] == status_app::URI)
+            );
+        }
+        let denied = mcp_request(&router, json!({"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"ui://waltr/status"}})).await;
+        assert!(denied.get("error").is_some());
+        for capability in [
+            json!({"mimeTypes": []}),
+            json!({"mimeTypes": ["text/html"]}),
+            json!({"mimeTypes": null}),
+        ] {
+            let mut unsupported = meta.clone();
+            unsupported["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                [mcp::apps::UI_EXTENSION] = capability;
+            let tools = mcp_request(&router, json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":unsupported}})).await;
+            assert!(
+                tools["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == "status")
+                    .unwrap()
+                    .get("_meta")
+                    .is_none()
+            );
+            let denied = mcp_request(&router, json!({"jsonrpc":"2.0","id":10,"method":"resources/read","params":{"uri":status_app::URI,"_meta":unsupported}})).await;
+            assert!(denied.get("error").is_some());
+        }
+    }
+
     async fn mcp_request(router: &Router, mut body: Value) -> Value {
         body["params"] = body.get("params").cloned().unwrap_or_else(|| json!({}));
-        body["params"]["_meta"] = json!({
-            "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
-            "io.modelcontextprotocol/clientCapabilities": {
-                "extensions": { "io.modelcontextprotocol/skills": {} }
-            },
-            "io.modelcontextprotocol/clientInfo": { "name": "waltr-server-tests", "version": "1" }
-        });
+        if body["params"].get("_meta").is_none() {
+            body["params"]["_meta"] = json!({
+                "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/skills": {} }
+                },
+                "io.modelcontextprotocol/clientInfo": { "name": "waltr-server-tests", "version": "1" }
+            });
+        }
         let method = body["method"].as_str().unwrap();
         let mut request = HttpRequest::post("/mcp")
             .header("accept", "application/json, text/event-stream")

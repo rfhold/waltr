@@ -769,6 +769,7 @@ fn token_response_to_credential(
         crate::OAuthTokenSet::bearer(access, refresh, expires_at_ms),
         metadata,
     );
+    credential.authority_id.clone_from(&current.authority_id);
     for field in &definition.token_fields {
         let Some(field_value) = value.get(&field.source) else {
             continue;

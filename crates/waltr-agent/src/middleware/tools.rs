@@ -37,9 +37,13 @@ impl PermissionFilteredToolRegistryMiddleware {
 
 impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
     async fn list_tools(&self, _ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
-        draft
-            .tools
-            .extend(self.tools.iter().map(AgentTool::definition).cloned());
+        draft.tools.extend(
+            self.tools
+                .iter()
+                .filter(|tool| model_visible(tool))
+                .map(AgentTool::definition)
+                .cloned(),
+        );
         Ok(())
     }
 
@@ -57,6 +61,9 @@ impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
         let query_lower = ctx.request.query.trim().to_lowercase();
         let limit = ctx.request.effective_limit();
         for tool in &self.tools {
+            if !model_visible(tool) {
+                continue;
+            }
             let definition = tool.definition();
             if !tool_is_visible(&self.policy, definition, self.ask_available) {
                 continue;
@@ -99,13 +106,19 @@ impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
         if !self
             .tools
             .iter()
-            .any(|tool| tool.definition().name == *name)
+            .any(|tool| model_visible(tool) && tool.definition().name == *name)
         {
             return Ok(TemplateReferenceRender::Continue);
         }
 
         render_tool_template_reference(ctx, &self.tools, name, arguments.clone()).await
     }
+}
+
+pub(crate) fn model_visible(tool: &AgentTool) -> bool {
+    tool.mcp_app_source
+        .as_ref()
+        .is_none_or(|source| source.ui.visible_to(mcp::apps::UiVisibility::Model))
 }
 
 /// Return true when a tool should be visible to the model for the given permission setup.

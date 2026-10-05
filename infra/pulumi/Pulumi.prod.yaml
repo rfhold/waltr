@@ -2,6 +2,7 @@ config:
   kubernetes:context: pantheon
   waltr:namespace: waltr
   waltr:hostname: waltr.holdenitdown.net
+  waltr:appsHostname: waltr-apps.holdenitdown.net
   waltr:displayName: Waltr
   waltr:slug: waltr
   waltr:authentikBaseUrl: https://auth.holdenitdown.net
