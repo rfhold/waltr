@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Waltr Native Apps Test",
+  "identifier": "dev.waltr.app.native-apps-test",
+  "build": {
+    "beforeBuildCommand": "pnpm --filter @rfhold/waltr-web build:tauri && node scripts/stage-web.mjs && node scripts/stage-native-apps-test.mjs",
+    "beforeDevCommand": "pnpm --filter @rfhold/waltr-web build:tauri:dev && node scripts/stage-web.mjs && node scripts/stage-native-apps-test.mjs"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-src http://127.0.0.1:*/container.html http://127.0.0.1:*/probe/container.html; form-action 'none'",
+      "capabilities": ["main"]
+    }
+  },
+  "bundle": { "active": false }
+}

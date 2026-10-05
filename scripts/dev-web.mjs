@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { devAppContainerConfig } from "./dev-app-container.mjs";
 
+const apps = devAppContainerConfig(process.env, "http://127.0.0.1:8080");
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const children = new Set();
 let stopping = false;
@@ -13,6 +15,7 @@ function run(command, args, options = {}) {
       stdio: "inherit",
     });
 
+    child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) {
         resolve();
@@ -34,6 +37,11 @@ function start(command, args, options = {}) {
 
   children.add(child);
 
+  child.once("error", (error) => {
+    console.error(`${command}: ${error.message}`);
+    children.delete(child);
+    stop(1);
+  });
   child.once("exit", (code, signal) => {
     children.delete(child);
 
@@ -89,4 +97,11 @@ start("cargo", ["run", "-p", "waltr-server"], {
     WALTR_SESSION_STORE: "filesystem",
   },
 });
-start("pnpm", ["--filter", "@rfhold/waltr-web", "dev:vite"]);
+if (apps.containerEnv) {
+  start("cargo", ["run", "-p", "waltr-server", "--", "app-container"], {
+    env: apps.containerEnv,
+  });
+}
+start("pnpm", ["--filter", "@rfhold/waltr-web", "dev:vite", ...apps.viteArgs], {
+  env: { WALTR_WEB_PROXY_TARGET: "http://127.0.0.1:8080", ...apps.webEnv },
+});

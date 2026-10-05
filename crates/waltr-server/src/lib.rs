@@ -3,6 +3,9 @@
 pub mod access_auth;
 pub mod agent_definition;
 pub mod app;
+pub mod app_container;
+mod http_lifecycle;
+pub mod mcp_apps_host;
 pub mod auth;
 pub mod catalog;
 pub mod config;
@@ -16,6 +19,7 @@ mod outbound_http;
 pub mod persistence;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+mod readiness;
 pub mod resource_catalog;
 pub mod resource_error;
 pub mod routine;

@@ -14,7 +14,17 @@ fn main() {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory");
     std::fs::create_dir_all(std::path::PathBuf::from(manifest).join("frontend-dist"))
         .expect("create generated frontend staging directory");
-    tauri_build::build();
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "start_runtime",
+            "client_dispatch",
+            "client_state",
+            "dispose_runtime",
+            "open_external_url",
+            "open_authorization_attempt",
+        ]),
+    ))
+    .expect("generate Tauri app command permissions");
 }
 
 fn git_revision() -> Option<String> {

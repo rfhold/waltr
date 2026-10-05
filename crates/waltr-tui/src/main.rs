@@ -230,6 +230,9 @@ async fn start_embedded_server_with_app(
     app: waltr_server::ServerApplication,
     addr: SocketAddr,
 ) -> io::Result<EmbeddedServer> {
+    #[cfg(feature = "web")]
+    let (app, listener, addr) = app.bind_with_apps(addr).await?;
+    #[cfg(not(feature = "web"))]
     let (app, listener, addr) = app.bind(addr).await?;
     let (shutdown, shutdown_receiver) = oneshot::channel();
 

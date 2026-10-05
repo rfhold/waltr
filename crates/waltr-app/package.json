@@ -5,6 +5,8 @@
   "scripts": {
     "build": "cargo tauri build",
     "dev": "cargo tauri dev",
+    "build:native-apps-test": "cargo tauri build --debug --no-bundle --target aarch64-apple-darwin --features native-apps-test --config tauri.native-apps-test.conf.json",
+    "test:confined-ipc": "node --test scripts/confined-ipc.test.mjs",
     "android:init": "cargo tauri android init",
     "android:build": "cargo tauri android build"
   }

@@ -277,6 +277,85 @@ One-shot approvals survive pre-dispatch suspensions and clear at final execution
 Ordinary request IDs bind the approval stage, policy identity, tool name, full arguments, and claim identities through SHA-256.
 Earlier request IDs require fresh consent. See [Permissions](../agent/permissions.md#durable-behavior) and [MCP Skills](../agent/mcp.md#mcp-skills).
 
+## Session MCP Apps
+
+Waltr's MCP runtime opts into the generic Apps capability.
+Server defaults include Apps assets; generic MCP client options still leave capability advertisement off until the host opts in.
+The server-owned `status` app is an ordinary linked MCP resource, not a runtime app kind or special dispatch path.
+Its refresh uses the same originating-server authority and current tool permissions as other Apps calls.
+Asset availability does not grant tool authority or bypass the session checks in this section.
+Provider tool discovery and dispatch exclude app-only tools.
+The runtime keeps exact source-server and MCP tool identities; it does not derive authority from generated tool names.
+Apps validation reads cached declarations and source associations directly; it does not construct provider tool closures for lookup.
+The runtime uses generic typed declaration and resource-read helpers, but retains all Waltr authority and permission checks.
+Cached lookup does not change authority freshness: current source and declaration checks still apply before dispatch and publication.
+
+A linked tool result records a version-1 association in `event.metadata.mcp_app` only when after-tool middleware leaves its projection unchanged.
+The association captures an opaque source-authority stamp, declaration, resource URI, actual post-middleware arguments, and complete original MCP result.
+The raw result preserves `structuredContent` and `_meta` outside model context.
+Ordinary provider-facing tool results retain their separate projection.
+After-tool middleware mutation, replacement, suspension, or failure omits the Apps association.
+Waltr does not expose the original raw result as a substitute for a transformed result.
+
+Source-authority stamps bind the configured connection to anonymous authority or a non-secret authenticated authorization incarnation.
+`OAuthCredential.authority_id` is an optional, serde-defaulted string; new credential constructors assign a fresh UUID.
+Outbound OAuth refresh retains the identity, while reauthorization or account replacement creates a new identity.
+Legacy credentials without an identity remain usable for ordinary MCP tools, but cannot authorize Apps associations.
+Apps become eligible only after a new authorized credential supplies an identity.
+The optional field resides in the current credential JSON and requires no SQL migration.
+The embedded self-MCP store returns clones of one current credential, so its identity stays stable within that local store.
+
+The runtime validates current source authority before and after linked-resource reads and Apps tool calls.
+Credentialed Apps connections pin the authorization identity at construction.
+Their credential provider resolves identity and bearer atomically from one credential snapshot for every HTTP request.
+An identity mismatch rejects the request before dispatch; a separate token lookup cannot select a replacement account after the identity check.
+MCP runtime reuse compares Apps authority stamps separately from the structural configuration fingerprint and credentialed-server set.
+
+Custom Waltr-agent hosts use `McpAppCredentialProvider::credential()` to return `(nonsecret_authority_id, bearer)` from one snapshot.
+They configure the connection through `McpServerConfig::streamable_http_with_app_credentials` with that identity.
+Hosts retain the identity on refresh and replace it on reauthorization or account replacement.
+Static bearer tokens and ordinary custom bearer providers supply no stable identity, so their connections remain Apps-ineligible.
+Ordinary MCP tools remain available through those configurations.
+
+`SessionCoordinator` exposes `open_session_mcp_app`, `call_session_mcp_app_tool`, and `close_session_mcp_app` for current sessions.
+Open accepts only one complete recorded call/result pair that remains visible in the Effective timeline.
+It validates current source authority and reads the linked resource through the session's exact MCP server.
+Resource decode enforces the generic Apps URI, MIME, HTML-envelope, and one-MiB limit.
+
+App handles bind the coordinator, session incarnation, recorded call, and source association.
+The coordinator admits at most 32 handles, each with a 15-minute lifetime.
+Close revokes the handle and cancels its active calls.
+Interrupt, delete, wipe, and coordinator shutdown invalidate affected authority.
+Restart does not restore process-local handles.
+
+App tool calls require a current installed app-visible tool on the same source server.
+The path evaluates current whole-tool permission, the complete before-tool middleware chain, final input and resource claims, and after-tool middleware.
+Middleware cannot redirect the approved tool name.
+Permission `Ask` or middleware suspension returns an explicit approval-required error; this path creates no approval continuation or approval UI.
+Busy, suspended, paused, stale, or canceled sessions fail closed.
+Current policy and source checks apply again before dispatch and result publication.
+If after-tool middleware returns `Continue` but changes content or error state, the Apps call returns `Denied`.
+Replacement also denies the call; middleware suspension or failure follows its explicit error path.
+These paths publish neither the unfiltered raw result nor an Apps audit result.
+Result rejection does not undo a tool that already executed.
+Only an unchanged projection permits the complete original raw Apps result, including unknown fields, to reach the view.
+
+These operations create no provider request, inference turn, or new session.
+A successful app call appends a separate `mcp_app_audit` event with its arguments and raw result.
+The audit preserves the original tool result and stays outside provider tool turns.
+
+The server's `SessionService` supplies `OpenSessionMcpApp`, `CallSessionMcpAppTool`, and `CloseSessionMcpApp`.
+Its opaque registry binds each handle to the request's authenticated issuer/subject, or the access-disabled owner context.
+Owner mismatch fails closed; the registry does not grant general session ownership.
+RPC operations have a 30-second bound, and registry entries expire after 15 minutes.
+See [Clients](clients.md#session-mcp-apps) for the browser boundary and [Deployment](../deployment.md#mcp-apps-assets-and-app-container) for asset policy.
+
+Sources: [agent operations](../../crates/waltr-agent/src/agent/session/mcp_apps.rs), [association](../../crates/waltr-agent/src/mcp/apps.rs),
+[credential identity](../../crates/waltr-agent/src/agent/session/settings/credentials.rs), [custom host configuration](../../crates/waltr-agent/src/mcp/config.rs),
+[runtime preparation](../../crates/waltr-agent/src/agent/session/runtime_factory.rs), [runtime cache](../../crates/waltr-agent/src/agent/session/coordinator.rs),
+[provider result policy](../../crates/waltr-agent/src/agent/loop.rs), [embedded credentials](../../crates/waltr-server/src/local_admission.rs),
+[server registry](../../crates/waltr-server/src/session/mcp_apps.rs), and [session service](../../crates/waltr-server/src/session/service.rs).
+
 ## Middleware
 
 Middleware is the internal extension point for request construction, tool handling, and suspensions. Configured middleware behavior is exposed through builder options and public agent features.

@@ -18,6 +18,8 @@ pub type StreamId = u64;
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
+    /// Transient MCP Apps operation completion.
+    McpApp(crate::McpAppEvent),
     /// Waltr access authentication event.
     Access(AccessEvent),
     /// Auth coordination event.
@@ -898,6 +900,8 @@ pub enum SessionEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEffect {
+    /// Owner-bound MCP Apps RPC.
+    McpApp(crate::McpAppEffect),
     /// Auth side-effect intent.
     Auth(AuthEffect),
     /// Model catalog side-effect intent.

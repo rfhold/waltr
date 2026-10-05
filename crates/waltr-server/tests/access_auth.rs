@@ -32,6 +32,99 @@ fn fixture() -> &'static AccessAuthTestServer {
 }
 
 #[tokio::test]
+async fn session_apps_rpcs_revalidate_access_before_handle_lookup()
+-> Result<(), Box<dyn std::error::Error>> {
+    use waltr::grpc::waltr::session::v1::{
+        CallSessionMcpAppToolRequest, CloseSessionMcpAppRequest, OpenSessionMcpAppRequest,
+        session_service_client::SessionServiceClient,
+    };
+    let fixture = fixture();
+    let channel = Endpoint::from_shared(fixture.server.base_url())?
+        .connect()
+        .await?;
+    let mut client = SessionServiceClient::new(channel);
+    let open = OpenSessionMcpAppRequest {
+        session_id: "unknown".into(),
+        call_id: "unknown".into(),
+    };
+    let call = CallSessionMcpAppToolRequest {
+        app_id: "unknown".into(),
+        name: "status".into(),
+        arguments_json: "{}".into(),
+    };
+    let close = CloseSessionMcpAppRequest {
+        app_id: "unknown".into(),
+    };
+    assert_eq!(
+        client
+            .open_session_mcp_app(open.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .call_session_mcp_app_tool(call.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .close_session_mcp_app(close.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    let authorized = |value| {
+        let mut request = Request::new(value);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", fixture.access_token).parse().unwrap(),
+        );
+        request
+    };
+    // Every admitted identity has the same session access; only ephemeral Apps handles have owners.
+    assert_ne!(
+        client
+            .open_session_mcp_app(authorized(open))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    let mut call = Request::new(call);
+    call.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", fixture.access_token).parse()?,
+    );
+    assert_eq!(
+        client
+            .call_session_mcp_app_tool(call)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let mut close = Request::new(close);
+    close
+        .metadata_mut()
+        .insert("authorization", "Bearer invalid".parse()?);
+    assert_eq!(
+        client
+            .close_session_mcp_app(close)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_and_oidc_routes_are_public() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = fixture();
     let client = reqwest::Client::builder()

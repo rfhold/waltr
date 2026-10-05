@@ -413,6 +413,9 @@ fn known_method(service: &str, method: &str) -> Option<MethodAttributes> {
                 "RollbackSession",
                 "ContinueSession",
                 "SearchSessionTemplates",
+                "OpenSessionMcpApp",
+                "CallSessionMcpAppTool",
+                "CloseSessionMcpApp",
             ]
         ),
         "waltr.routine.v1.RoutineService" => service_methods!(

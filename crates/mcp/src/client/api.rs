@@ -34,6 +34,8 @@ use super::{
 #[derive(Debug, Clone)]
 /// Options used when connecting an MCP client.
 pub struct McpClientOptions {
+    /// Advertise MCP Apps HTML support on every request. Disabled by default.
+    pub apps: bool,
     /// Opt in to the official Skills extension. Disabled by default.
     pub skills: bool,
     /// Client implementation name sent in request metadata.
@@ -57,6 +59,7 @@ impl McpClientOptions {
         timeout: Duration,
     ) -> Self {
         Self {
+            apps: false,
             skills: false,
             client_name: client_name.into(),
             client_version: client_version.into(),
@@ -66,7 +69,14 @@ impl McpClientOptions {
         }
     }
 
-    /// Set request-level trace propagation.
+    /// Advertise the MCP Apps extension with its required HTML MIME type.
+    #[must_use]
+    pub const fn with_apps(mut self) -> Self {
+        self.apps = true;
+        self
+    }
+
+    /// Opt in to the Skills extension.
     #[must_use]
     pub const fn with_skills(mut self) -> Self {
         self.skills = true;
@@ -561,6 +571,25 @@ impl McpClient {
         .map(McpResourceResult::new)
     }
 
+    /// Read and decode an MCP Apps HTML resource with an explicit decoded byte limit.
+    /// This does not enable capability advertisement or authorize/sandbox the app.
+    ///
+    /// # Errors
+    /// Preserves request failures and typed Apps decoding failures separately.
+    pub async fn read_app_resource(
+        &self,
+        uri: &str,
+        max_bytes: usize,
+        cancellation_token: CancellationToken,
+    ) -> std::result::Result<crate::apps::UiResource, crate::apps::ReadAppResourceError> {
+        let result = self
+            .read_resource(uri, cancellation_token)
+            .await
+            .map_err(crate::apps::ReadAppResourceError::Request)?;
+        crate::apps::decode_resource(&result, uri, max_bytes)
+            .map_err(crate::apps::ReadAppResourceError::Apps)
+    }
+
     /// Complete a resource-template argument.
     ///
     /// # Errors
@@ -910,10 +939,19 @@ fn client_request_meta(options: &McpClientOptions) -> serde_json::Map<String, Va
     if let Some(level) = options.log_level {
         meta.insert(MCP_LOG_LEVEL_META_KEY.to_owned(), json!(level.to_string()));
     }
-    if options.skills {
+    if options.skills || options.apps {
+        let mut extensions = serde_json::Map::new();
+        if options.skills {
+            extensions.insert(crate::skills::SKILLS_EXTENSION.to_owned(), json!({}));
+        }
+        if options.apps {
+            extensions.insert(
+                crate::apps::UI_EXTENSION.to_owned(),
+                json!(crate::apps::UiCapability::html()),
+            );
+        }
         meta.get_mut(MCP_CLIENT_CAPABILITIES_META_KEY)
-            .expect("client capabilities")["extensions"] =
-            json!({crate::skills::SKILLS_EXTENSION: {}});
+            .expect("client capabilities")["extensions"] = Value::Object(extensions);
     }
     meta
 }

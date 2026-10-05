@@ -153,6 +153,8 @@ impl McpClientRuntime {
         for server in self.servers.values() {
             let server_name = server.name().to_owned();
             for tool in server.tools().await {
+                let source = app_source(server.name(), server.source(), &tool);
+                let closure_source = source.clone();
                 let runtime = Arc::clone(self);
                 let definition_server_name = server_name.clone();
                 let tool_name = tool.name.clone();
@@ -165,7 +167,7 @@ impl McpClientRuntime {
                     tool.input_schema.clone(),
                 );
                 let closure_server_name = server_name.clone();
-                tools.push(AgentTool::new_async(definition, move |context| {
+                let mut agent_tool = AgentTool::new_async(definition, move |context| {
                     let runtime = Arc::clone(&runtime);
                     let server_name = closure_server_name.clone();
                     let tool_name = tool_name.clone();
@@ -173,17 +175,64 @@ impl McpClientRuntime {
                     let call_id = context.call().id.clone();
                     let progress = context.progress().clone();
                     let cancellation_token = context.cancellation_token().clone();
+                    let source = closure_source.clone();
                     Box::pin(async move {
+                        if !source
+                            .ui
+                            .visibility
+                            .contains(&mcp::apps::UiVisibility::Model)
+                        {
+                            return Err(protocol_error("MCP tool is not model-visible"));
+                        }
+                        if source.ui.resource_uri.is_some()
+                            && !runtime.has_current_app_declaration(&source).await
+                        {
+                            return Err(protocol_error(
+                                "MCP app tool declaration changed before dispatch",
+                            ));
+                        }
+                        let eligible = !source.source.is_empty();
+                        if eligible
+                            && source.ui.resource_uri.is_some()
+                            && !runtime.app_authority_current(&server_name).await
+                        {
+                            return Err(protocol_error(
+                                "MCP app authorization changed before dispatch",
+                            ));
+                        }
                         let result = runtime
                             .call_tool(
                                 &server_name,
                                 &tool_name,
-                                arguments,
+                                arguments.clone(),
                                 &call_id,
                                 progress,
                                 cancellation_token,
                             )
                             .await?;
+                        if eligible
+                            && source.ui.resource_uri.is_some()
+                            && !runtime.app_authority_current(&server_name).await
+                        {
+                            return Err(protocol_error(
+                                "MCP app authorization changed during dispatch",
+                            ));
+                        }
+                        if let (true, Some(capture), Some(uri)) =
+                            (eligible, &context.app_capture, &source.ui.resource_uri)
+                        {
+                            *capture.lock().expect("app capture lock poisoned") =
+                                Some(super::apps::McpAppAssociation {
+                                    version: 1,
+                                    server: source.server,
+                                    tool: source.tool,
+                                    resource_uri: uri.clone(),
+                                    source: source.source,
+                                    declaration: source.declaration,
+                                    arguments,
+                                    result: result.raw.raw.clone(),
+                                });
+                        }
                         Ok(ToolResult::from_content(
                             context.call().id.clone(),
                             context.call().name.clone(),
@@ -191,10 +240,47 @@ impl McpClientRuntime {
                             result.is_error,
                         ))
                     })
-                }));
+                });
+                agent_tool.mcp_app_source = Some(source);
+                tools.push(agent_tool);
             }
         }
         tools
+    }
+
+    async fn has_current_app_declaration(&self, source: &super::apps::McpAppSource) -> bool {
+        let Some(server) = self.servers.get(&source.server) else {
+            return false;
+        };
+        server
+            .tool(&source.tool)
+            .await
+            .is_some_and(|tool| tool_declaration(&tool) == source.declaration)
+    }
+
+    pub(crate) async fn current_app_source(
+        &self,
+        server: &str,
+        tool: &str,
+    ) -> Option<super::apps::McpAppSource> {
+        let server = self.servers.get(server)?;
+        let tool = server.tool(tool).await?;
+        Some(app_source(server.name(), server.source(), &tool))
+    }
+
+    pub(crate) async fn app_authority_current(&self, server: &str) -> bool {
+        match self.servers.get(server) {
+            Some(server) => server.app_authority_current().await,
+            None => false,
+        }
+    }
+
+    pub(crate) fn app_sources(&self) -> BTreeMap<String, Option<String>> {
+        self.servers
+            .iter()
+            .filter(|(_, server)| server.has_app_authority())
+            .map(|(name, server)| (name.clone(), server.source().map(str::to_owned)))
+            .collect()
     }
 
     pub(crate) async fn prompts(&self) -> Vec<McpServerPromptDefinition> {
@@ -391,6 +477,29 @@ impl McpClientRuntime {
             .await
     }
 
+    pub(crate) async fn call_app_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        call: &crate::ToolCall,
+        cancellation: CancellationToken,
+    ) -> Result<(ToolResult, mcp::McpToolResult)> {
+        let result = self
+            .call_tool(
+                server,
+                tool,
+                call.arguments.clone(),
+                &call.id,
+                ToolProgressSink::noop(),
+                cancellation,
+            )
+            .await?;
+        Ok((
+            ToolResult::from_content(&call.id, &call.name, result.content, result.is_error),
+            result.raw,
+        ))
+    }
+
     pub(crate) async fn read_resource(
         &self,
         server_name: &str,
@@ -414,6 +523,20 @@ impl McpClientRuntime {
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
             .read_resource_data(uri, cancellation_token)
+            .await
+    }
+
+    pub(crate) async fn read_app_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+        max_bytes: usize,
+        cancellation_token: CancellationToken,
+    ) -> Result<mcp::apps::UiResource> {
+        self.servers
+            .get(server_name)
+            .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
+            .read_app_resource(uri, max_bytes, cancellation_token)
             .await
     }
 
@@ -451,5 +574,80 @@ impl McpClientRuntime {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn tool_declaration(tool: &mcp::McpToolDefinition) -> Value {
+    serde_json::json!({"name": tool.name, "inputSchema": tool.input_schema, "outputSchema": tool.output_schema, "_meta": tool.meta, "annotations": tool.annotations})
+}
+
+fn app_source(
+    server: &str,
+    source: Option<&str>,
+    tool: &mcp::McpToolDefinition,
+) -> super::apps::McpAppSource {
+    let ui = mcp::apps::UiToolDeclaration::try_from(tool)
+        .map(|declaration| declaration.ui)
+        .unwrap_or_else(|_| mcp::apps::UiToolMeta {
+            visibility: Vec::new(),
+            ..Default::default()
+        });
+    super::apps::McpAppSource {
+        server: server.to_owned(),
+        tool: tool.name.clone(),
+        source: source.unwrap_or_default().to_owned(),
+        declaration: tool_declaration(tool),
+        ui,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_apps_source_preserves_declaration_and_hides_malformed_metadata() {
+        let mut tool = mcp::McpToolDefinition {
+            name: "app-tool".to_owned(),
+            title: None,
+            description: Some("description".to_owned()),
+            icons: Vec::new(),
+            input_schema: json!({}),
+            output_schema: None,
+            annotations: None,
+            meta: None,
+        };
+        let default = app_source("a-b", None, &tool);
+        assert!(default.ui.visible_to(mcp::apps::UiVisibility::App));
+        assert!(default.ui.visible_to(mcp::apps::UiVisibility::Model));
+        assert!(default.ui.resource_uri.is_none());
+        tool.meta = Some(json!({"ui": {"resourceUri": "ui://app", "visibility": ["app"]}}));
+        let source = app_source("a-b", Some("credential-incarnation"), &tool);
+        assert_eq!(source.server, "a-b");
+        assert_eq!(source.tool, "app-tool");
+        assert_eq!(source.source, "credential-incarnation");
+        assert_eq!(source.ui.resource_uri.as_deref(), Some("ui://app"));
+        assert!(source.ui.visible_to(mcp::apps::UiVisibility::App));
+        assert!(!source.ui.visible_to(mcp::apps::UiVisibility::Model));
+        assert_eq!(
+            source.declaration,
+            json!({
+                "name": "app-tool", "inputSchema": {}, "outputSchema": null,
+                "_meta": tool.meta, "annotations": null,
+            })
+        );
+        for ui in [
+            json!({"resourceUri": "https://invalid", "visibility": ["app"]}),
+            json!({"resourceUri": "https://invalid", "visibility": []}),
+            json!({"resourceUri": "https://invalid"}),
+        ] {
+            tool.meta = Some(json!({"ui": ui}));
+            let hidden = app_source("a-b", None, &tool);
+            assert!(hidden.ui.visibility.is_empty());
+            assert!(hidden.ui.resource_uri.is_none());
+            assert!(hidden.source.is_empty());
+            assert_eq!(hidden.declaration["_meta"], tool.meta.clone().unwrap());
+        }
     }
 }

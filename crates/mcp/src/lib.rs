@@ -1,5 +1,7 @@
 //! Generic Model Context Protocol primitives, client transports, and server helpers.
 
+/// Optional MCP Apps metadata, resource decoding, and iframe lifecycle wire types.
+pub mod apps;
 mod capabilities;
 /// MCP client connection and transport helpers.
 pub mod client;

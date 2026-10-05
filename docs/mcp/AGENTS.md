@@ -1,6 +1,8 @@
 # Boundaries
 
 Docs in this directory describe the generic `mcp` crate and protocol-level behavior.
+The explicit exception is [apps-authoring.md](apps-authoring.md), which describes Waltr's static served-app addition workflow.
+Keep that guide clearly Waltr-specific; it does not define generic MCP behavior.
 
 Waltr agent session integration belongs in `docs/agent/mcp.md`. Server/client/web/TUI behavior belongs in those layer-specific docs.
 

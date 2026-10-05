@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Waltr WKWebView Isolation Test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font:16px Georgia,serif;max-width:1000px;margin:32px auto;padding:0 20px;background:#f4f0e7;color:#173b38}button{padding:10px}pre{white-space:pre-wrap;font:12px monospace}iframe{width:100%;height:340px;border:1px solid #173b38}</style>
+</head><body><h1>WKWebView Isolation Verification</h1>
+<p>This disposable macOS build does not enable Apps in ordinary Waltr. No timeout or missing JavaScript API proves native denial.</p>
+<p id="status">Starting trusted native positive control...</p>
+<button id="open" disabled>Continue To Disposable Waltr UI</button>
+<button id="navigation" disabled>Attempt Denied Main Navigation And Popup</button>
+<h2>Native Attack Fixtures</h2><div id="frames"></div>
+<h2>Frame Reports (Not Native Proof)</h2><pre id="results"></pre>
+<script src="native-apps-test.js"></script></body></html>

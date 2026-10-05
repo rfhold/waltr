@@ -1,5 +1,6 @@
 packages:
   - "crates/waltr-app"
+  - "crates/waltr-server"
   - "crates/waltr-web"
 
 onlyBuiltDependencies:

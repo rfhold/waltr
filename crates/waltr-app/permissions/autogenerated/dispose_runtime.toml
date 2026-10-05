@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dispose-runtime"
+description = "Enables the dispose_runtime command without any pre-configured scope."
+commands.allow = ["dispose_runtime"]
+
+[[permission]]
+identifier = "deny-dispose-runtime"
+description = "Denies the dispose_runtime command without any pre-configured scope."
+commands.deny = ["dispose_runtime"]

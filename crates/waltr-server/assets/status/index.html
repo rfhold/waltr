@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Waltr Status</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Georgia, serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: light-dark(#f4f3ed, #202722); color: light-dark(#233b2c, #e8eddf); }
+    main { border-left: 4px solid #70946b; padding-left: 20px; }
+    h1 { margin: 0 0 12px; font-size: 18px; font-weight: normal; }
+    #status { margin: 0 0 12px; font-size: 32px; }
+    #observed, #error { font: 13px monospace; overflow-wrap: anywhere; }
+    #error { color: light-dark(#8c3829, #ffb7a5); }
+    button { font: 14px Georgia, serif; padding: 8px 16px; border: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Waltr / Readiness</h1>
+    <p id="status" role="status">Waiting for observation</p>
+    <p id="observed"></p>
+    <p id="error" role="alert"></p>
+    <button id="refresh" disabled>Refresh</button>
+  </main>
+  <script type="module" src="./status.ts"></script>
+</body>
+</html>

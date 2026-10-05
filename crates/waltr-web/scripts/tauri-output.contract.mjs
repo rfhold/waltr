@@ -51,6 +51,7 @@ assert.ok(outputFiles.some((path) => path.startsWith("assets/") && path.endsWith
 assert.ok(outputFiles.includes("favicon.svg"));
 assert.ok(outputFiles.includes("site.webmanifest"));
 assert.ok(outputFiles.every((path) => !path.toLowerCase().includes("wasm")));
+assert.ok(outputFiles.every((path) => !path.startsWith("app-container/")));
 
 async function walk(directory, prefix = "") {
   const paths = [];

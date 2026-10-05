@@ -17,6 +17,7 @@ pub struct AgentTool {
     definition: ToolDefinition,
     handler: Arc<ToolHandler>,
     sandbox_backed: bool,
+    pub(crate) mcp_app_source: Option<crate::mcp::apps::McpAppSource>,
     #[cfg(feature = "shell")]
     shell_config: Option<crate::shell::ShellConfig>,
 }
@@ -34,6 +35,7 @@ pub struct ToolExecutionContext {
     session_id: Option<SessionId>,
     turn: Option<u64>,
     prepared_sandbox_call: Option<PreparedSandboxCall>,
+    pub(crate) app_capture: Option<crate::mcp::apps::AppCapture>,
 }
 
 impl ToolExecutionContext {
@@ -63,6 +65,7 @@ impl ToolExecutionContext {
             session_id: None,
             turn: None,
             prepared_sandbox_call: None,
+            app_capture: None,
         }
     }
 
@@ -285,6 +288,7 @@ impl AgentTool {
             definition,
             handler: Arc::new(move |context| Box::pin(std::future::ready(handler(context)))),
             sandbox_backed: false,
+            mcp_app_source: None,
             #[cfg(feature = "shell")]
             shell_config: None,
         }
@@ -299,6 +303,7 @@ impl AgentTool {
             definition,
             handler: Arc::new(handler),
             sandbox_backed: false,
+            mcp_app_source: None,
             #[cfg(feature = "shell")]
             shell_config: None,
         }

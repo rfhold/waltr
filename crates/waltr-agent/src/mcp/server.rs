@@ -29,8 +29,22 @@ use super::{config::McpServerConfig, event::McpRuntimeEvent};
 
 const WALTR_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
+struct ProgressRegistration {
+    registry: Arc<std::sync::Mutex<BTreeMap<String, ToolProgressSink>>>,
+    token: String,
+}
+
+impl Drop for ProgressRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.lock() {
+            active.remove(&self.token);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::mcp) struct McpAgentToolResult {
+    pub(in crate::mcp) raw: mcp::McpToolResult,
     pub(in crate::mcp) content: ToolResultContent,
     pub(in crate::mcp) is_error: bool,
 }
@@ -56,6 +70,9 @@ pub(in crate::mcp) struct McpResourceRegistry {
 
 pub(in crate::mcp) struct McpServerRuntime {
     name: String,
+    source: Option<String>,
+    app_authority: Option<super::config::AppAuthority>,
+    app_authority_validator: Option<super::config::AppAuthorityValidator>,
     skills: bool,
     skill_origin: String,
     retired: std::sync::atomic::AtomicBool,
@@ -105,6 +122,9 @@ impl McpServerRuntime {
         cancellation_token: CancellationToken,
     ) -> Result<Arc<Self>> {
         let name = config.name.clone();
+        let source = config.app_source();
+        let app_authority = config.app_authority.clone();
+        let app_authority_validator = config.app_authority_validator.clone();
         let transport_kind = config.transport.kind();
         let active_progress = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let handler = Arc::new(ServerHandler {
@@ -119,7 +139,8 @@ impl McpServerRuntime {
             resources_epoch: Arc::new(AtomicU64::new(0)),
         });
         let mut options = McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
-            .with_trace_propagation(trace_propagation);
+            .with_trace_propagation(trace_propagation)
+            .with_apps();
         if skills {
             options = options.with_skills();
         }
@@ -156,6 +177,9 @@ impl McpServerRuntime {
         .await?;
         let runtime = Arc::new(Self {
             name,
+            source,
+            app_authority,
+            app_authority_validator,
             skills,
             skill_origin: uuid::Uuid::now_v7().to_string(),
             retired: std::sync::atomic::AtomicBool::new(false),
@@ -211,6 +235,29 @@ impl McpServerRuntime {
 
     pub(in crate::mcp) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(in crate::mcp) fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    pub(in crate::mcp) fn has_app_authority(&self) -> bool {
+        self.app_authority.is_some()
+    }
+
+    pub(in crate::mcp) async fn app_authority_current(&self) -> bool {
+        if let Some(validate) = &self.app_authority_validator {
+            if !validate().await {
+                return false;
+            }
+        }
+        if self.source.is_none() {
+            return false;
+        }
+        match &self.app_authority {
+            Some(authority) => authority.token().await.is_ok(),
+            None => true,
+        }
     }
 
     pub(in crate::mcp) fn skills_enabled(&self) -> bool {
@@ -308,6 +355,10 @@ impl McpServerRuntime {
             .collect()
     }
 
+    pub(in crate::mcp) async fn tool(&self, name: &str) -> Option<McpToolDefinition> {
+        self.state.lock().await.tools.tools.get(name).cloned()
+    }
+
     pub(in crate::mcp) async fn prompts(&self) -> Vec<McpPromptDefinition> {
         self.state
             .lock()
@@ -367,6 +418,10 @@ impl McpServerRuntime {
                 .lock()
                 .map_err(|_| protocol_error("MCP progress registry lock poisoned"))?
                 .insert(progress_token.clone(), progress);
+            let registration = ProgressRegistration {
+                registry: Arc::clone(&self.active_progress),
+                token: progress_token.clone(),
+            };
             let response = self
                 .client
                 .call_tool(
@@ -374,11 +429,7 @@ impl McpServerRuntime {
                     cancellation_token,
                 )
                 .await;
-            drop(
-                self.active_progress
-                    .lock()
-                    .map(|mut active| active.remove(&progress_token)),
-            );
+            drop(registration);
             let response = response?;
             mcp_tool_result(&response)
         }
@@ -455,6 +506,50 @@ impl McpServerRuntime {
                     .read_resource(uri, cancellation.clone())
                     .await
                     .map_err(Into::into)
+            };
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                () = self.skill_cancellation.cancelled() => {
+                    cancellation.cancel();
+                    operation.await
+                }
+                result = &mut operation => result,
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    pub(in crate::mcp) async fn read_app_resource(
+        &self,
+        uri: &str,
+        max_bytes: usize,
+        cancellation_token: CancellationToken,
+    ) -> Result<mcp::apps::UiResource> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(protocol_error("MCP runtime is retired"));
+        }
+        let span = tracing::info_span!(
+            "mcp.agent.operation",
+            mcp.server = %self.name,
+            mcp.transport = self.transport_kind,
+            rpc.method = "resources/read",
+            mcp.resource.uri = %uri,
+        );
+        async move {
+            let cancellation = cancellation_token.child_token();
+            let operation = async {
+                self.ensure_initialized(cancellation.clone()).await?;
+                self.client
+                    .read_app_resource(uri, max_bytes, cancellation.clone())
+                    .await
+                    .map_err(|error| match error {
+                        mcp::apps::ReadAppResourceError::Request(error) => error.into(),
+                        mcp::apps::ReadAppResourceError::Apps(error) => {
+                            protocol_error(error.to_string())
+                        }
+                    })
             };
             tokio::pin!(operation);
             tokio::select! {
@@ -695,6 +790,7 @@ fn mcp_tool_result(response: &mcp::McpToolResult) -> Result<McpAgentToolResult> 
     let content = ToolResultContent::from_blocks(blocks)
         .map_err(|error| protocol_error(error.to_string()))?;
     Ok(McpAgentToolResult {
+        raw: response.clone(),
         content,
         is_error: parsed.is_error,
     })

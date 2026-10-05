@@ -17,6 +17,7 @@ use tonic::service::RoutesBuilder;
 pub mod service;
 pub mod storage;
 
+mod mcp_apps;
 mod convert;
 mod error;
 mod inference_settings;

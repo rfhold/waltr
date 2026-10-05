@@ -885,6 +885,28 @@
   letter-spacing: 0.06em;
 }
 
+.sessions__timeline-tool--generic {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+}
+
+.sessions__timeline-tool-label {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sessions .sessions__timeline-app-button {
+  flex-shrink: 0;
+  margin-inline-start: auto;
+  padding: 0.18rem 0.6rem;
+  font-size: 0.75rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
 .sessions__timeline-metrics {
   display: flex;
   flex-wrap: wrap;

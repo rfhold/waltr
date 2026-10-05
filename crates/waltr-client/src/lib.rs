@@ -5,6 +5,7 @@
 
 //! Shared Waltr shell client reducer, executor, and stable view models.
 
+mod apps;
 mod client;
 mod coordination;
 mod error;
@@ -19,6 +20,9 @@ mod view;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm;
 
+pub use apps::{
+    McpAppEffect, McpAppEvent, McpAppOperation, McpAppOperationKind, McpAppView, McpAppsSnapshot,
+};
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
     AccessEvent, AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientEvent,

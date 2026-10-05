@@ -47,6 +47,7 @@ use tonic_web::GrpcWebLayer;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
+#[cfg(test)]
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -74,30 +75,9 @@ struct HealthResponse {
     status: &'static str,
 }
 
-#[derive(Clone, Debug)]
-struct Readiness {
-    persistence: Persistence,
-    oauth: Option<McpOAuthServer>,
-    definitions: tokio::sync::watch::Receiver<DefinitionWatcherHealth>,
-    routines: tokio::sync::watch::Receiver<EngineHealth>,
-    sandbox_alive: Arc<std::sync::atomic::AtomicBool>,
-}
+use crate::readiness::Readiness;
 
 impl Readiness {
-    async fn is_ready(&self) -> bool {
-        let definitions_ready = definition_watcher_ready(&self.definitions);
-        definitions_ready
-            && self
-                .sandbox_alive
-                .load(std::sync::atomic::Ordering::Acquire)
-            && routine_engine_ready(&self.routines)
-            && self.persistence.ready().await.is_ok()
-            && match &self.oauth {
-                Some(oauth) => oauth.ready().await.is_ok(),
-                None => true,
-            }
-    }
-
     async fn response(self) -> axum::response::Response {
         if self.is_ready().await {
             Json(HealthResponse { status: "ready" }).into_response()
@@ -107,13 +87,13 @@ impl Readiness {
     }
 }
 
-fn definition_watcher_ready(
+pub(crate) fn definition_watcher_ready(
     health: &tokio::sync::watch::Receiver<DefinitionWatcherHealth>,
 ) -> bool {
     health.has_changed().is_ok() && matches!(&*health.borrow(), DefinitionWatcherHealth::Running)
 }
 
-fn routine_engine_ready(health: &tokio::sync::watch::Receiver<EngineHealth>) -> bool {
+pub(crate) fn routine_engine_ready(health: &tokio::sync::watch::Receiver<EngineHealth>) -> bool {
     health.has_changed().is_ok() && matches!(&*health.borrow(), EngineHealth::Running)
 }
 
@@ -127,6 +107,7 @@ pub struct ServerApplication {
     readiness: Option<Readiness>,
     test_background: Option<TestBackgroundTask>,
     sandbox: Option<SandboxHost>,
+    app_container: Option<crate::app_container::SpawnedAppsContainer>,
 }
 
 impl fmt::Debug for ServerApplication {
@@ -156,6 +137,7 @@ impl ServerApplication {
             readiness: Some(readiness),
             test_background: None,
             sandbox: Some(sandbox),
+            app_container: None,
         }
     }
 
@@ -193,8 +175,14 @@ impl ServerApplication {
             readiness: _,
             test_background,
             sandbox,
+            app_container,
         } = self;
         drop(router);
+        if let Some(apps) = app_container
+            && let Err(error) = apps.shutdown().await
+        {
+            tracing::warn!(%error, "App container failed to join");
+        }
         shutdown_background_tasks(
             definition_watcher,
             oauth_maintenance,
@@ -229,6 +217,7 @@ impl ServerApplication {
             readiness: None,
             test_background: Some(TestBackgroundTask { cancellation, task }),
             sandbox: None,
+            app_container: None,
         }
     }
 
@@ -266,7 +255,86 @@ impl ServerApplication {
         Ok((self, listener, bound_addr))
     }
 
-    /// Serve until the listener fails or the shutdown signal resolves, then join background work.
+    /// Bind the API and an owned, separate-origin Apps listener using host environment policy.
+    /// Non-loopback APIs require explicit public Apps and parent origins.
+    ///
+    /// # Errors
+    /// Returns an error after joining background work if either listener or policy fails.
+    #[cfg(feature = "web")]
+    pub async fn bind_with_apps(
+        self,
+        addr: std::net::SocketAddr,
+    ) -> io::Result<(Self, tokio::net::TcpListener, std::net::SocketAddr)> {
+        let config = (|| {
+            let mut config = crate::app_container::AppsContainerConfig::default();
+            if let Ok(bind) = std::env::var("WALTR_APP_CONTAINER_ADDR") {
+                config.bind = bind.parse().map_err(io::Error::other)?;
+            }
+            config.public_origin = std::env::var("WALTR_APP_CONTAINER_ORIGIN").ok();
+            config.allowed_host_origins = std::env::var("WALTR_APP_CONTAINER_HOST_ORIGINS")
+                .map(|value| value.split(',').map(str::trim).map(str::to_owned).collect())
+                .unwrap_or_default();
+            Ok::<_, io::Error>(config)
+        })();
+        match config {
+            Ok(config) => self.bind_with_apps_config(addr, config).await,
+            Err(error) => {
+                self.shutdown().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Bind both listeners using explicit Apps policy; empty parents derive only exact loopback origins.
+    ///
+    /// # Errors
+    /// Returns an error after startup rollback when binding or origin validation fails.
+    #[cfg(feature = "web")]
+    pub async fn bind_with_apps_config(
+        self,
+        addr: std::net::SocketAddr,
+        mut config: crate::app_container::AppsContainerConfig,
+    ) -> io::Result<(Self, tokio::net::TcpListener, std::net::SocketAddr)> {
+        let (mut app, listener, bound_addr) = self.bind(addr).await?;
+        let result = async {
+            if !bound_addr.ip().is_loopback()
+                && (config.public_origin.is_none() || config.allowed_host_origins.is_empty())
+            {
+                return Err(io::Error::other("non-loopback bundled API requires WALTR_APP_CONTAINER_ORIGIN and WALTR_APP_CONTAINER_HOST_ORIGINS"));
+            }
+            if bound_addr.ip().is_loopback() {
+                for parent in loopback_parent_origins(bound_addr) {
+                    if !config.allowed_host_origins.contains(&parent) {
+                        config.allowed_host_origins.push(parent);
+                    }
+                }
+            }
+            let apps = crate::app_container::spawn_app_container(config)
+                .await.map_err(io::Error::other)?;
+            let bootstrap = crate::web_assets::AppsBootstrap::new(
+                format!("{}/container.html", apps.public_origin),
+            );
+            let bootstrap = match bootstrap {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    apps.shutdown().await?;
+                    return Err(error);
+                }
+            };
+            app.router = app.router.clone().layer(axum::Extension(bootstrap));
+            app.app_container = Some(apps);
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            drop(listener);
+            app.shutdown().await;
+            return Err(error);
+        }
+        Ok((app, listener, bound_addr))
+    }
+
+    /// Serve until listener failure, owned Apps failure, or shutdown; drain for up to five seconds,
+    /// abort and join remaining HTTP connections, then join background work.
     ///
     /// # Errors
     ///
@@ -288,28 +356,29 @@ impl ServerApplication {
             readiness: _,
             test_background,
             sandbox,
+            app_container,
         } = self;
-        let result = {
-            let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
-            let server = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                let _ = shutdown_started_tx.send(());
-            })
-            .into_future();
-            tokio::pin!(server);
+        let apps_stopped = app_container.as_ref().map(|apps| apps.stopped());
+        let child_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_child_failed = child_failed.clone();
+        let owned_shutdown = async move {
+            tokio::pin!(shutdown);
             tokio::select! {
-                result = &mut server => result,
+                biased;
+                () = &mut shutdown => {},
                 () = async {
-                    if shutdown_started_rx.await.is_err() {
-                        std::future::pending::<()>().await;
+                    match apps_stopped {
+                        Some(token) => token.cancelled_owned().await,
+                        None => std::future::pending::<()>().await,
                     }
-                    tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
-                } => Ok(()),
+                } => { shutdown_child_failed.store(true, std::sync::atomic::Ordering::Release); },
             }
+        };
+        let result =
+            crate::http_lifecycle::serve_owned_connections(listener, router, owned_shutdown).await;
+        let apps_result = match app_container {
+            Some(apps) => apps.shutdown().await,
+            None => Ok(()),
         };
         shutdown_background_tasks(
             definition_watcher,
@@ -320,8 +389,26 @@ impl ServerApplication {
             sandbox,
         )
         .await;
-        result
+        result.and(apps_result)?;
+        if child_failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::other("owned Apps listener stopped unexpectedly"));
+        }
+        Ok(())
     }
+}
+
+#[cfg(feature = "web")]
+fn loopback_parent_origins(addr: std::net::SocketAddr) -> [String; 2] {
+    [
+        format!("http://{addr}"),
+        format!("http://localhost:{}", addr.port()),
+    ]
+    .map(|value| {
+        url::Url::parse(&value)
+            .expect("socket address forms a valid URL")
+            .origin()
+            .ascii_serialization()
+    })
 }
 
 async fn shutdown_background_tasks(
@@ -1104,7 +1191,7 @@ where
         }
     };
     let waltr_mcp = match WaltrMcpServer::new(session_host.clone(), agent_state.clone()) {
-        Ok(server) => Arc::new(server),
+        Ok(server) => server,
         Err(_) => {
             session_host.shutdown().await;
             sandbox.shutdown().await;
@@ -1142,6 +1229,7 @@ where
         sandbox_alive: sandbox.health(),
     };
     let readiness_route = readiness.clone();
+    let waltr_mcp = Arc::new(waltr_mcp.with_readiness(readiness.clone()));
     let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
         Router::new()
             .route("/mcp", any(service_unavailable))
@@ -1278,6 +1366,228 @@ mod tests {
         assert_eq!(method, "GET");
         assert_eq!(path, "/oidc/callback");
         drop(request_span(&request));
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn derived_loopback_origins_are_canonical_even_at_default_http_port() {
+        for (addr, expected) in [
+            ("127.0.0.1:80", ["http://127.0.0.1", "http://localhost"]),
+            ("[::1]:80", ["http://[::1]", "http://localhost"]),
+            (
+                "[::1]:12345",
+                ["http://[::1]:12345", "http://localhost:12345"],
+            ),
+        ] {
+            assert_eq!(loopback_parent_origins(addr.parse().unwrap()), expected);
+        }
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn apps_child_failure_closes_existing_api_keepalive_before_owner_returns() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let count = dispatched.clone();
+        let (mut app, cleaned) = apps_test_application();
+        app.router = Router::new().route(
+            "/",
+            get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let (app, listener, addr) = app
+            .bind_with_apps_config("127.0.0.1:0".parse().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let stop_child = app.app_container.as_ref().unwrap().stopped();
+        let server = tokio::spawn(app.serve_with_shutdown(listener, std::future::pending()));
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(stream.read_u8().await.unwrap());
+        }
+        assert!(response.starts_with(b"HTTP/1.1 204"));
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        stop_child.cancel();
+        assert!(server.await.unwrap().is_err());
+        assert!(cleaned.load(Ordering::SeqCst));
+        drop(stream.write_all(request).await);
+        let mut bytes = [0; 1024];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut bytes))
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "connection remained live: {read:?}"
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "web")]
+    fn apps_test_application() -> (ServerApplication, Arc<AtomicBool>) {
+        let cancellation = CancellationToken::new();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let task_cleaned = cleaned.clone();
+        let task_cancel = cancellation.clone();
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            task_cleaned.store(true, Ordering::SeqCst);
+        });
+        let router = Router::new()
+            .route("/", get(crate::web_assets::serve_root))
+            .route("/{*path}", get(crate::web_assets::serve_path));
+        (
+            ServerApplication::with_router_and_background_task_for_test(router, cancellation, task),
+            cleaned,
+        )
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn apps_bind_failure_and_external_policy_join_background_work() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (app, cleaned) = apps_test_application();
+        let result = app
+            .bind_with_apps_config(
+                "127.0.0.1:0".parse().unwrap(),
+                crate::app_container::AppsContainerConfig {
+                    bind: occupied.local_addr().unwrap(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(cleaned.load(Ordering::SeqCst));
+        let (app, cleaned) = apps_test_application();
+        let error = app
+            .bind_with_apps_config("0.0.0.0:0".parse().unwrap(), Default::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("WALTR_APP_CONTAINER_ORIGIN"));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn apps_startup_failure_joins_real_worker_watcher_and_engine() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let config_service =
+            ConfigService::from_state(state.clone(), crate::test_support::default_catalog_loader());
+        let persistence =
+            Persistence::initialize(crate::persistence::DatabaseConfig::for_tests().unwrap())
+                .await
+                .unwrap();
+        let (worker_tx, worker_rx) = oneshot::channel();
+        let app = assemble_app(
+            AppServices {
+                config_service,
+                persistence,
+                catalog_loader: crate::test_support::default_catalog_loader(),
+                access_authenticator: AccessAuthenticator::disabled(),
+                mcp_oauth: None,
+                outbound_private_origins: Vec::new(),
+                outbound_oauth: OutboundOAuthConfig::default(),
+                automatic_self_mcp_resource: None,
+                agent_state: Some(state),
+                local_admission: None,
+                workspace_root: root,
+            },
+            move |routes, input| {
+                worker_tx.send(input.sandbox.clone()).unwrap();
+                Ok(session::add_store_service(
+                    routes,
+                    waltr_agent::MemorySessionStore::new(),
+                    input,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        let worker = worker_rx.await.unwrap();
+        worker.workspace_info().await.unwrap();
+        let watcher = app.definition_watcher.as_ref().unwrap().health();
+        let engine = app.routine_engine.as_ref().unwrap().health();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            app.bind_with_apps_config(
+                "127.0.0.1:0".parse().unwrap(),
+                crate::app_container::AppsContainerConfig {
+                    bind: occupied.local_addr().unwrap(),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(watcher.has_changed().is_err());
+        assert!(engine.has_changed().is_err());
+        assert!(worker.workspace_info().await.is_err());
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn apps_owned_generation_bootstrap_and_success_or_child_failure_cleanup() {
+        for child_failure in [false, true] {
+            let (app, cleaned) = apps_test_application();
+            let (app, listener, api_addr) = app
+                .bind_with_apps_config("127.0.0.1:0".parse().unwrap(), Default::default())
+                .await
+                .unwrap();
+            let apps = app.app_container.as_ref().unwrap();
+            let origin = apps.public_origin.clone();
+            let child_stop = apps.stopped();
+            let apps_addr: std::net::SocketAddr =
+                origin.strip_prefix("http://").unwrap().parse().unwrap();
+            assert_ne!(api_addr.port(), apps_addr.port());
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
+                let _ = shutdown_rx.await;
+            }));
+            let client = reqwest::Client::new();
+            let container_response = client
+                .get(format!("{origin}/container.html"))
+                .send()
+                .await
+                .unwrap();
+            let csp = container_response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap();
+            assert!(csp.contains(&format!("http://{api_addr}")));
+            assert!(csp.contains(&format!("http://localhost:{}", api_addr.port())));
+            let html = client
+                .get(format!("http://{api_addr}/sessions/example"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(html.headers()["cache-control"], "no-store");
+            assert!(
+                html.text()
+                    .await
+                    .unwrap()
+                    .contains(&format!("content=\"{origin}/container.html\""))
+            );
+            if child_failure {
+                child_stop.cancel();
+            } else {
+                shutdown_tx.send(()).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), child_failure);
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert!(tokio::net::TcpStream::connect(api_addr).await.is_err());
+            assert!(tokio::net::TcpStream::connect(apps_addr).await.is_err());
+        }
     }
 
     #[test]

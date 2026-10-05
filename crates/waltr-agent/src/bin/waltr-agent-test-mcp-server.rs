@@ -130,6 +130,12 @@ impl EchoMarkerServer {
     #[tool(name = "emit_log_marker", definition = emit_log_marker_tool_definition())]
     #[tool(name = "progress_marker", definition = progress_marker_tool_definition())]
     #[tool(name = "large_image", definition = large_image_tool_definition())]
+    #[tool(name = "app_marker", definition = app_tool_definition("app_marker", None))]
+    #[tool(name = "app_only", definition = app_tool_definition("app_only", Some("app")))]
+    #[tool(name = "model_only", definition = app_tool_definition("model_only", Some("model")))]
+    #[tool(name = "malformed_app_only", definition = malformed_app_tool_definition("malformed_app_only", Some("app")))]
+    #[tool(name = "malformed_empty", definition = malformed_app_tool_definition("malformed_empty", Some("empty")))]
+    #[tool(name = "malformed_default", definition = malformed_app_tool_definition("malformed_default", None))]
     #[allow(clippy::too_many_lines)]
     async fn call_tool(
         &self,
@@ -137,6 +143,23 @@ impl EchoMarkerServer {
         context: ServerContext,
     ) -> ServerResult<McpToolResult> {
         match call.name.as_str() {
+            "app_marker" | "app_only" | "model_only" | "malformed_app_only" | "malformed_empty"
+            | "malformed_default" => {
+                if let Some(path) = call
+                    .arguments
+                    .get("execution_marker")
+                    .and_then(Value::as_str)
+                {
+                    std::fs::write(path, "executed")
+                        .map_err(|error| ServerError::invalid_params(error.to_string()))?;
+                }
+                if let Some(delay) = call.arguments.get("delay_ms").and_then(Value::as_u64) {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Ok(McpToolResult::new(
+                    json!({"content": [{"type": "text", "text": call.arguments["value"]}], "structuredContent": {"value": call.arguments["value"]}, "_meta": {"private": "app-secret"}, "isError": call.arguments.get("error").and_then(Value::as_bool).unwrap_or(false)}),
+                ))
+            }
             "echo_marker" => match serde_json::from_value::<EchoMarkerRequest>(call.arguments) {
                 Ok(arguments) => {
                     let mut text = arguments.value;
@@ -256,6 +279,7 @@ impl EchoMarkerServer {
     }
 
     #[resource(uri = "test://status", definition = status_resource_definition())]
+    #[resource(uri = "ui://marker", definition = app_resource_definition())]
     #[resource_template(
         uri_template = "test://items/{id}",
         definition = item_resource_template_definition()
@@ -465,6 +489,34 @@ fn echo_marker_tool_definition() -> McpToolDefinition {
     )
 }
 
+fn app_tool_definition(name: &str, visibility: Option<&str>) -> McpToolDefinition {
+    let mut tool = tool_definition(name, "Apps test tool", string_schema("value"));
+    let mut ui = json!({"resourceUri": "ui://marker"});
+    if let Some(visibility) = visibility {
+        ui["visibility"] = json!([visibility]);
+    }
+    tool.meta = Some(json!({"ui": ui}));
+    tool
+}
+
+fn app_resource_definition() -> McpResourceDefinition {
+    let mut resource = status_resource_definition();
+    resource.uri = "ui://marker".into();
+    resource.name = "app_marker".into();
+    resource.mime_type = Some(mcp::apps::UI_MIME_TYPE.into());
+    resource
+}
+
+fn malformed_app_tool_definition(name: &str, visibility: Option<&str>) -> McpToolDefinition {
+    let mut tool = app_tool_definition(name, visibility);
+    let meta = tool.meta.as_mut().unwrap();
+    meta["ui"]["resourceUri"] = json!(123);
+    if visibility == Some("empty") {
+        meta["ui"]["visibility"] = json!([]);
+    }
+    tool
+}
+
 fn delayed_write_marker_tool_definition() -> McpToolDefinition {
     tool_definition(
         "delayed_write_marker",
@@ -635,6 +687,17 @@ fn item_resource_template_definition() -> McpResourceTemplateDefinition {
 }
 
 fn read_resource(uri: &str, context: &ServerContext) -> ServerResult<McpResourceResult> {
+    if uri == "ui://marker" {
+        if let Ok(marker) = std::env::var("WALTR_TEST_MCP_APP_READ_MARKER") {
+            std::fs::write(marker, "reading").expect("write resource read marker");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        return Ok(McpResourceResult::text(
+            uri,
+            mcp::apps::UI_MIME_TYPE,
+            "<!doctype html><html><head></head><body>App marker</body></html>",
+        ));
+    }
     let mut text = match uri {
         "test://status" => "stdio-mcp-resource-status-616",
         "test://items/42" => "stdio-mcp-resource-template-item-42-717",

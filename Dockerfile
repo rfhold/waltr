@@ -28,6 +28,8 @@ RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/c
     cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION} --locked
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY crates/waltr-app/package.json crates/waltr-app/package.json
+COPY crates/waltr-server/package.json crates/waltr-server/package.json
 COPY crates/waltr-web/package.json crates/waltr-web/package.json
 RUN --mount=type=cache,id=waltr-${TARGETARCH}-pnpm-store,target=/pnpm/store \
     pnpm install --frozen-lockfile --store-dir /pnpm/store --config.dangerouslyAllowAllBuilds=true
@@ -97,7 +99,7 @@ LABEL org.opencontainers.image.source="https://git.holdenitdown.net/rfhold/waltr
 
 COPY --from=server-build /usr/local/bin/waltr-server /usr/local/bin/waltr-server
 
-EXPOSE 14333
+EXPOSE 14333 14334
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/waltr-server"]
 

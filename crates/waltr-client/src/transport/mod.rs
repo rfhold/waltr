@@ -182,6 +182,27 @@ pub trait WaltrTransport {
         projection_mode: SessionTimelineProjectionMode,
     ) -> impl Future<Output = Result<SessionTimelineWatchStream, ClientError>>;
 
+    /// Open an owner-bound app for a durable tool call.
+    fn open_session_mcp_app(
+        &self,
+        _request: waltr::grpc::waltr::session::v1::OpenSessionMcpAppRequest,
+    ) -> impl Future<Output = Result<crate::McpAppView, ClientError>> {
+        async { Err(ClientError::new("MCP Apps transport unavailable")) }
+    }
+    /// Invoke a tool through the server's owner-bound app lane.
+    fn call_session_mcp_app_tool(
+        &self,
+        _request: waltr::grpc::waltr::session::v1::CallSessionMcpAppToolRequest,
+    ) -> impl Future<Output = Result<String, ClientError>> {
+        async { Err(ClientError::new("MCP Apps transport unavailable")) }
+    }
+    /// Close an owner-bound server lease.
+    fn close_session_mcp_app(
+        &self,
+        _request: waltr::grpc::waltr::session::v1::CloseSessionMcpAppRequest,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        async { Err(ClientError::new("MCP Apps transport unavailable")) }
+    }
     /// Search session templates visible to one session.
     fn search_session_templates(
         &self,
@@ -470,6 +491,36 @@ where
         request: SearchSessionTemplatesRequest,
     ) -> Result<SearchSessionTemplatesResponse, ClientError> {
         session::search_session_templates(self, request).await
+    }
+    async fn open_session_mcp_app(
+        &self,
+        request: waltr::grpc::waltr::session::v1::OpenSessionMcpAppRequest,
+    ) -> Result<crate::McpAppView, ClientError> {
+        let response = session::open_session_mcp_app(self, request).await?;
+        Ok(crate::McpAppView {
+            app_id: response.app_id,
+            html: response.html,
+            tool_json: response.tool_json,
+            arguments_json: response.arguments_json,
+            result_json: response.result_json,
+            resource_meta_json: response.resource_meta_json,
+        })
+    }
+    async fn call_session_mcp_app_tool(
+        &self,
+        request: waltr::grpc::waltr::session::v1::CallSessionMcpAppToolRequest,
+    ) -> Result<String, ClientError> {
+        Ok(session::call_session_mcp_app_tool(self, request)
+            .await?
+            .result_json)
+    }
+    async fn close_session_mcp_app(
+        &self,
+        request: waltr::grpc::waltr::session::v1::CloseSessionMcpAppRequest,
+    ) -> Result<(), ClientError> {
+        session::close_session_mcp_app(self, request)
+            .await
+            .map(|_| ())
     }
 
     async fn submit_user_message(

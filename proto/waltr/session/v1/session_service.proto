@@ -8,6 +8,9 @@ import "waltr/auth/v1/auth_service.proto";
 import "waltr/config/v1/config_service.proto";
 
 service SessionService {
+  rpc OpenSessionMcpApp(OpenSessionMcpAppRequest) returns (OpenSessionMcpAppResponse);
+  rpc CallSessionMcpAppTool(CallSessionMcpAppToolRequest) returns (CallSessionMcpAppToolResponse);
+  rpc CloseSessionMcpApp(CloseSessionMcpAppRequest) returns (CloseSessionMcpAppResponse);
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
@@ -25,6 +28,36 @@ service SessionService {
   rpc ContinueSession(ContinueSessionRequest) returns (ContinueSessionResponse);
   rpc SearchSessionTemplates(SearchSessionTemplatesRequest) returns (SearchSessionTemplatesResponse);
 }
+
+message OpenSessionMcpAppRequest {
+  string session_id = 1;
+  string call_id = 2;
+}
+
+message OpenSessionMcpAppResponse {
+  string app_id = 1;
+  string html = 2;
+  string tool_json = 3;
+  string arguments_json = 4;
+  string result_json = 5;
+  string resource_meta_json = 6;
+}
+
+message CallSessionMcpAppToolRequest {
+  string app_id = 1;
+  string name = 2;
+  string arguments_json = 3;
+}
+
+message CallSessionMcpAppToolResponse {
+  string result_json = 1;
+}
+
+message CloseSessionMcpAppRequest {
+  string app_id = 1;
+}
+
+message CloseSessionMcpAppResponse {}
 
 message CreateSessionRequest {
   reserved "runtime_config";

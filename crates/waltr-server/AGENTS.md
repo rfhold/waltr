@@ -7,6 +7,19 @@ Waltr server is a coordination layer so multiple clients can stay on the same pa
 | Path | Info |
 | --- | --- |
 | [src/persistence/](src/persistence/) | SQLite/PostgreSQL selection, Waltr migrations, and MCP store composition. |
+| [../waltr-web/src/mcp-apps/container/](../waltr-web/src/mcp-apps/container/) | Web-owned trusted container source; web also owns the bridge contract and browser fixtures. |
+| [assets/status/](assets/status/) | Server-owned MCP status app source with a Vite module entry. |
+| [package.json](package.json) | `@rfhold/waltr-server` workspace build and served-app contracts. |
+| [vite.config.ts](vite.config.ts) | Shared single-file Vite configuration for independent served-app builds. |
+| [scripts/apps.entries](scripts/apps.entries) | Explicit served-app names and source roots. |
+| [scripts/](scripts/) | Served-app build, actual output/embedding contracts, and mocked Cargo asset orchestration. |
+| [src/mcp_apps_host/](src/mcp_apps_host/) | Consumer isolation, asset routes, view storage, origin policy, and container lifecycle. |
+| [src/session/mcp_apps.rs](src/session/mcp_apps.rs) | Owner-bound session Apps RPC handle registry, independent of asset features. |
+| [src/mcp_service/apps/mod.rs](src/mcp_service/apps/mod.rs) | Static AppResource list, capability checks, descriptors, resource content, and CSP. |
+| [src/mcp_service/apps/status.rs](src/mcp_service/apps/status.rs) | Ordinary MCP status tool linkage, not a special renderer. |
+| [../../docs/mcp/apps-authoring.md](../../docs/mcp/apps-authoring.md) | Waltr-specific static tool-linked app addition workflow. |
+| [src/http_lifecycle.rs](src/http_lifecycle.rs) | Neutral HTTP connection task ownership and bounded shutdown. |
+| [src/standalone_apps.rs](src/standalone_apps.rs) | All-or-none standalone Apps opt-in and exact origin validation. |
 | [src/embedded.rs](src/embedded.rs) | Ambient-free embedded composition with explicit paths, prebound loopback, host policy, and cache source. |
 | [src/local_admission.rs](src/local_admission.rs) | Process-generation bearer admission and host-owned self-MCP credentials. |
 | [src/access_auth/](src/access_auth/) | Waltr access OIDC config, discovery, principals, browser sessions, bearer validation, and SQL domain store. |
@@ -30,6 +43,29 @@ Waltr server is a coordination layer so multiple clients can stay on the same pa
 # Contracts
 
 Server code should coordinate shared state without taking ownership of client-side UI state or reducer behavior.
+
+Keep container assets separate from MCP-served app assets. `apps-assets` selects `apps-host-assets` and `apps-served-assets`; defaults and `web` retain that umbrella.
+For served assets, run `pnpm --filter @rfhold/waltr-server build` for the explicit `scripts/apps.entries` list.
+Keep each `dist/<name>/index.html` self-contained, nonempty, UTF-8, and at most one MiB.
+Generate optional `<NAME>_HTML` constants in `served_app_assets.rs`; no-assets builds use `None`.
+Publish resources through `AppResource` and `RESOURCES`; register tool declarations and execution explicitly in `mcp_service.rs`.
+Consume web Vite container output.
+Without a full web build or an override, run `pnpm --filter @rfhold/waltr-web build:app-container`.
+With `web`, consume container output from one full browser build.
+Do not run a second host-assets build.
+`WALTR_APP_CONTAINER_DIST` bypasses the host-assets Vite build, not the full web or served-app builds.
+Keep exactly `container.html` and `container.js` as the container artifact pair.
+Exclude `/app-container/` and legacy `/apps/` from API web assets.
+Keep `app_container` as the public compatibility reexport; implementation belongs in `mcp_apps_host`.
+Require Node, pnpm, and installed workspace dependencies for asset builds; Cargo installs no Node packages.
+Use `pnpm test:status-app` for actual output, independent second-app embedding, and mocked orchestration checks.
+Keep the second fixture test-only; it has no production build entry or resource registration.
+The orchestration contract alone does not prove a real asset build.
+
+Standalone Apps startup requires all three runtime `WALTR_APP_CONTAINER_*` variables and the `web` feature.
+Keep ordinary unset startup unchanged; reject partial or unsupported configuration.
+Use `bind_with_apps_config` for owned listeners, HTML bootstrap, rollback, and joined shutdown.
+Treat preview/prod Pulumi Apps routes as source configuration, not proof of live DNS, TLS, or deployment.
 
 Keep Waltr access authentication, hosted MCP authorization, and provider/upstream-MCP credential OAuth separate. Authentik authenticates resource owners; the generic MCP server owns downstream grants/tokens, and Waltr's outbound flow is target-scoped.
 

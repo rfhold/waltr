@@ -1822,6 +1822,10 @@ starts: { [key in string]?: RoutineStartOperationView }, };
 
 export type ClientSnapshot = {
 /**
+ * Transient owner-bound Apps results and request tracking.
+ */
+apps: McpAppsSnapshot,
+/**
  * Waltr access authentication snapshot.
  */
 access: AccessSnapshot,
@@ -1853,6 +1857,66 @@ sessions: SessionSnapshot,
  * Session-scoped manual Routine coordination snapshot.
  */
 routines: RoutineSnapshot, };
+
+export type McpAppView = {
+/**
+ * Opaque server lease identity.
+ */
+appId: string,
+/**
+ * Untrusted sandbox document.
+ */
+html: string,
+/**
+ * Original tool declaration JSON.
+ */
+toolJson: string,
+/**
+ * Complete original arguments JSON.
+ */
+argumentsJson: string,
+/**
+ * Complete original result JSON, including private metadata.
+ */
+resultJson: string,
+/**
+ * Resource metadata JSON for sandbox policy, not source stamps.
+ */
+resourceMetaJson: string, };
+
+export type McpAppOperation = {
+/**
+ * Operation performed.
+ */
+kind: McpAppOperationKind,
+/**
+ * Current operation lifecycle.
+ */
+status: string,
+/**
+ * Associated server lease once known.
+ */
+appId: string | null,
+/**
+ * Sanitized operation failure.
+ */
+error: string | null,
+/**
+ * Complete refresh result; never replaces the original open result.
+ */
+resultJson: string | null, };
+
+export type McpAppOperationKind = "open" | "call" | "close";
+
+export type McpAppsSnapshot = {
+/**
+ * Immutable open results by server lease identity.
+ */
+current: { [key in string]?: McpAppView },
+/**
+ * Operation outcomes by caller request identity (close uses an operation key).
+ */
+requests: { [key in string]?: McpAppOperation }, };
 
 export type ClientSessionTemplateKind = "file" | "tool" | "resource" | "prompt";
 
@@ -2120,7 +2184,43 @@ target: ClientSessionTemplateSearchTarget,
 /**
  * Cursor byte offset relative to query for context-aware completions.
  */
-cursor: number | null, } | { "type": "registerSessionTimelineWatchInterest",
+cursor: number | null, } | { "type": "openSessionMcpApp",
+/**
+ * Session containing the completed tool call.
+ */
+sessionId: string,
+/**
+ * Durable tool call identity.
+ */
+callId: string,
+/**
+ * Unique caller-local open correlation identity.
+ */
+requestId: string, } | { "type": "callSessionMcpAppTool",
+/**
+ * Opaque open lease identity.
+ */
+appId: string,
+/**
+ * App-visible tool name.
+ */
+name: string,
+/**
+ * Complete arguments JSON.
+ */
+argumentsJson: string,
+/**
+ * Unique caller-local refresh correlation identity.
+ */
+requestId: string, } | { "type": "closeSessionMcpApp",
+/**
+ * Lease to forget and close.
+ */
+appId: string, } | { "type": "cancelSessionMcpAppOpen",
+/**
+ * Open request to abandon, including a raced ready result.
+ */
+requestId: string, } | { "type": "registerSessionTimelineWatchInterest",
 /**
  * Session id whose timeline should be watched.
  */

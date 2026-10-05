@@ -304,6 +304,19 @@ impl ServerContext {
         self.client_capabilities.as_ref()
     }
 
+    /// Decode the Apps capability from this request, without an initialize handshake.
+    ///
+    /// # Errors
+    /// Returns an explicit error if the advertised Apps capability is malformed.
+    pub fn ui_capability(
+        &self,
+    ) -> std::result::Result<Option<crate::apps::UiCapability>, crate::apps::AppsError> {
+        self.client_capabilities()
+            .map(crate::apps::ui_capability)
+            .transpose()
+            .map(Option::flatten)
+    }
+
     /// Return input responses supplied on an MRTR retry.
     #[must_use]
     pub const fn input_responses(&self) -> Option<&Value> {

@@ -2,6 +2,7 @@ config:
   kubernetes:context: pantheon
   waltr:namespace: waltr-preview
   waltr:hostname: preview-waltr.holdenitdown.net
+  waltr:appsHostname: preview-waltr-apps.holdenitdown.net
   waltr:displayName: Waltr Preview
   waltr:slug: waltr-preview
   waltr:authentikBaseUrl: https://auth.holdenitdown.net

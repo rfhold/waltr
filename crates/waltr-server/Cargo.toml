@@ -5,11 +5,14 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ["profiling", "shell"]
+default = ["profiling", "shell", "apps-assets"]
 profiling = ["dep:pyroscope"]
 shell = ["waltr-agent/shell", "waltr-agent-sandbox/shell"]
 test = []
-web = []
+web = ["apps-assets"]
+apps-assets = ["apps-host-assets", "apps-served-assets"]
+apps-host-assets = []
+apps-served-assets = []
 
 [dependencies]
 aws-sdk-s3.workspace = true
@@ -21,7 +24,8 @@ waltr-agent = { path = "../waltr-agent", version = "0.1.0", default-features = f
 waltr-agent-sandbox = { path = "../waltr-agent-sandbox", version = "0.1.0", default-features = false, features = ["rpc"] }
 futures-util.workspace = true
 http-body.workspace = true
-hyper-util.workspace = true
+hyper-util = { workspace = true, features = ["server-auto", "service"] }
+hyper = { version = "1.10.0", features = ["http2", "server"] }
 jsonwebtoken.workspace = true
 jaq-core.workspace = true
 jaq-interpret.workspace = true
@@ -47,7 +51,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio-rustls", "sqlite"] }
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
 tower.workspace = true
 tower-http = { workspace = true, features = ["trace"] }
@@ -69,7 +73,7 @@ webpki-roots.workspace = true
 workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "http2"] }
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tonic = { workspace = true, features = ["transport"] }

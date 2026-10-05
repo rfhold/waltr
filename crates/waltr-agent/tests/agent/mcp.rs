@@ -40,6 +40,645 @@ use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
 
+fn http_app_credential(endpoint: &str, token: &str) -> waltr_agent::OAuthCredential {
+    waltr_agent::OAuthCredential::mcp(
+        waltr_agent::OAuthTokenSet::bearer(token, None, None),
+        waltr_agent::McpOAuthContext {
+            resource: endpoint.into(),
+            issuer: "https://issuer.example".into(),
+            registration: waltr_agent::McpOAuthRegistration {
+                method: waltr_agent::McpOAuthRegistrationMethod::Dynamic,
+                client_id: "client".into(),
+                redirect_uri: "https://waltr.example/callback".into(),
+                token_endpoint_auth_method: "none".into(),
+                created_at_ms: None,
+                expires_at_ms: None,
+            },
+            endpoints: waltr_agent::McpOAuthEndpoints {
+                authorization: "https://issuer.example/authorize".into(),
+                token: "https://issuer.example/token".into(),
+                revocation: None,
+            },
+        },
+    )
+}
+
+#[tokio::test]
+async fn mcp_apps_anonymous_authority_change_during_io_never_publishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    for operation in ["call", "open", "provider", "connection"] {
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("started");
+        let server = HttpMcpTestServer::start_with_app_read_marker(
+            None,
+            None,
+            (operation == "open").then_some(marker.as_path()),
+        )
+        .await?;
+        let arguments = if operation == "provider" {
+            json!({"value":"original", "execution_marker":marker, "delay_ms":500})
+        } else {
+            json!({"value":"original"})
+        };
+        let provider = Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
+            "anonymous-apps-race",
+            vec![
+                vec![CompletionEvent::ToolCall(ToolCall::new(
+                    "original",
+                    "mcp_http_test_app_marker",
+                    arguments,
+                ))],
+                vec![CompletionEvent::Finished],
+            ],
+        )));
+        let sessions = mcp_sessions(provider.clone()).await;
+        let key = AuthTarget::mcp_server("http_test").credential_key();
+        let replace = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("operation started at the anonymous source");
+            if operation == "connection" {
+                let mut connection = http_runtime_server(&server);
+                connection.url.push_str("/replaced");
+                sessions.set_connections(vec![connection]);
+            } else {
+                sessions
+                    .credentials
+                    .write(&key, http_app_credential(&server.endpoint, "token-b"))
+                    .await
+                    .unwrap();
+            }
+        };
+        let initial = run_session_prompt(&sessions, "app", vec![http_runtime_server(&server)]);
+        let session = if operation == "provider" {
+            let (session, ()) = tokio::join!(initial, replace);
+            let session = session?;
+            assert!(
+                session
+                    .timeline
+                    .iter()
+                    .all(|event| event.metadata.get("mcp_app").is_none())
+            );
+            session
+        } else {
+            let session = initial.await?;
+            let id = session.timeline[0].session_id.clone();
+            let before = sessions.store().load(&id).await?;
+            let token = tokio_util::sync::CancellationToken::new;
+            if operation == "call" || operation == "connection" {
+                let app = sessions
+                    .open_session_mcp_app(&id, "original", token())
+                    .await?;
+                let pending = sessions.call_session_mcp_app_tool(
+                    &app.handle,
+                    "app_only",
+                    json!({"value":"do-not-publish", "execution_marker":marker, "delay_ms":500}),
+                    token(),
+                );
+                let (result, ()) = tokio::join!(pending, replace);
+                assert_eq!(result.unwrap_err(), waltr_agent::McpAppError::Stale);
+            } else {
+                let pending = sessions.open_session_mcp_app(&id, "original", token());
+                let (result, ()) = tokio::join!(pending, replace);
+                assert_eq!(result.unwrap_err(), waltr_agent::McpAppError::Stale);
+            }
+            let after = sessions.store().load(&id).await?;
+            assert_eq!(
+                before.timeline_events().cloned().collect::<Vec<_>>(),
+                after.timeline_events().cloned().collect::<Vec<_>>()
+            );
+            session
+        };
+        let id = session.timeline[0].session_id.clone();
+        if operation != "connection" {
+            assert_eq!(
+                sessions
+                    .open_session_mcp_app(
+                        &id,
+                        "original",
+                        tokio_util::sync::CancellationToken::new()
+                    )
+                    .await
+                    .unwrap_err(),
+                waltr_agent::McpAppError::Stale
+            );
+        }
+        assert_eq!(provider.request_prompts().len(), 2);
+        sessions.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_apps_credential_authority_refresh_replacement_and_legacy_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    for initial in ["authorized", "anonymous", "legacy"] {
+        let server = HttpMcpTestServer::start().await?;
+        let provider = Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
+            "credential-apps",
+            vec![
+                vec![CompletionEvent::ToolCall(ToolCall::new(
+                    "original",
+                    "mcp_http_test_app_marker",
+                    json!({"value":"original"}),
+                ))],
+                vec![CompletionEvent::Finished],
+            ],
+        )));
+        let sessions = mcp_sessions(provider.clone()).await;
+        let key = AuthTarget::mcp_server("http_test").credential_key();
+        let mut credential = http_app_credential(&server.endpoint, "token-a");
+        if initial == "legacy" {
+            credential.authority_id = None;
+        }
+        if initial != "anonymous" {
+            sessions.credentials.write(&key, credential.clone()).await?;
+        }
+        let session =
+            run_session_prompt(&sessions, "app", vec![http_runtime_server(&server)]).await?;
+        assert!(!session.tool_results[0].is_error);
+        let id = session.timeline[0].session_id.clone();
+        let token = tokio_util::sync::CancellationToken::new;
+        if initial == "legacy" {
+            assert!(
+                session
+                    .timeline
+                    .iter()
+                    .all(|event| event.metadata.get("mcp_app").is_none())
+            );
+            assert_eq!(
+                sessions
+                    .open_session_mcp_app(&id, "original", token())
+                    .await
+                    .unwrap_err(),
+                waltr_agent::McpAppError::Stale
+            );
+        } else {
+            let app = sessions
+                .open_session_mcp_app(&id, "original", token())
+                .await?;
+            if initial == "authorized" {
+                credential.token.access_token =
+                    oauth2::AccessToken::new("refreshed-token-a".into());
+                sessions.credentials.write(&key, credential.clone()).await?;
+                let refreshed = sessions
+                    .call_session_mcp_app_tool(
+                        &app.handle,
+                        "app_only",
+                        json!({"value":"refresh"}),
+                        token(),
+                    )
+                    .await?;
+                assert_eq!(refreshed.raw["_meta"]["private"], "app-secret");
+                assert_eq!(
+                    sessions
+                        .open_session_mcp_app(&id, "original", token())
+                        .await?
+                        .association
+                        .source,
+                    app.association.source
+                );
+                let before = sessions.store().load(&id).await?;
+                let pending = sessions.call_session_mcp_app_tool(
+                    &app.handle,
+                    "app_only",
+                    json!({"value":"do-not-publish", "delay_ms":200}),
+                    token(),
+                );
+                let replace = async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let replacement = http_app_credential(&server.endpoint, "token-b");
+                    sessions.credentials.write(&key, replacement).await.unwrap();
+                };
+                let (result, ()) = tokio::join!(pending, replace);
+                assert_eq!(result.unwrap_err(), waltr_agent::McpAppError::Stale);
+                let after = sessions.store().load(&id).await?;
+                assert_eq!(
+                    before.timeline_events().cloned().collect::<Vec<_>>(),
+                    after.timeline_events().cloned().collect::<Vec<_>>()
+                );
+            } else {
+                sessions.credentials.write(&key, credential.clone()).await?;
+            }
+            assert_eq!(
+                sessions
+                    .call_session_mcp_app_tool(
+                        &app.handle,
+                        "app_only",
+                        json!({"value":"stale"}),
+                        token()
+                    )
+                    .await
+                    .unwrap_err(),
+                waltr_agent::McpAppError::Stale
+            );
+            assert_eq!(
+                sessions
+                    .open_session_mcp_app(&id, "original", token())
+                    .await
+                    .unwrap_err(),
+                waltr_agent::McpAppError::Stale
+            );
+        }
+        assert_eq!(provider.request_prompts().len(), 2);
+        sessions.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_apps_malformed_links_fail_closed_for_provider_and_template_invocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let names = ["malformed_app_only", "malformed_empty", "malformed_default"];
+    let directory = tempfile::tempdir()?;
+    let marker = directory.path().join("must-not-execute");
+    let provider_marker = marker.clone();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "malformed-apps",
+        move |request| {
+            assert!(!request.prompt.contains("app-secret"));
+            if request.tool_results().count() == 0 {
+                [
+                    "malformed_app_only",
+                    "malformed_empty",
+                    "malformed_default",
+                    "echo_marker",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    Ok(CompletionEvent::ToolCall(ToolCall::new(
+                        format!("call-{index}"),
+                        format!("mcp_stdio_test_{name}"),
+                        json!({"value":"dispatch-marker", "execution_marker":provider_marker}),
+                    )))
+                })
+                .collect()
+            } else {
+                vec![Ok(CompletionEvent::Finished)]
+            }
+        },
+    )));
+    let sessions = mcp_sessions(provider.clone()).await;
+    let prompt = names
+        .iter()
+        .map(|name| {
+            format!(
+                "@tool(mcp_stdio_test_{name}, {})",
+                json!({"value":"template-marker", "execution_marker":marker})
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let session = run_session_prompt(
+        &sessions,
+        &prompt,
+        vec![stdio_runtime_server(&test_stdio_server_command())],
+    )
+    .await?;
+    for name in names {
+        assert_tool_was_not_surfaced(&provider, &format!("mcp_stdio_test_{name}"));
+        let result = session
+            .tool_results
+            .iter()
+            .find(|result| result.name == format!("mcp_stdio_test_{name}"))
+            .unwrap();
+        assert!(result.is_error);
+        assert!(!result.content.contains("app-secret"));
+    }
+    assert!(
+        session
+            .tool_results
+            .iter()
+            .any(|result| result.name == "mcp_stdio_test_echo_marker"
+                && !result.is_error
+                && result.content.contains("dispatch-marker"))
+    );
+    assert!(
+        session
+            .timeline
+            .iter()
+            .all(|event| event.metadata.get("mcp_app").is_none())
+    );
+    assert!(
+        !marker.exists(),
+        "malformed tool was dispatched by provider or template"
+    );
+    sessions.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_apps_source_name_collisions_never_reconstruct_origin_and_changed_source_is_stale()
+-> Result<(), Box<dyn std::error::Error>> {
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "apps-collision",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "original",
+                "mcp_a_b_app_marker",
+                json!({"value":"original"}),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    ));
+    let sessions = mcp_sessions(provider).await;
+    let mut first = stdio_runtime_server(&test_stdio_server_command());
+    first.key = "a-b".into();
+    let mut second = first.clone();
+    second.key = "a_b".into();
+    let session = run_session_prompt(&sessions, "app", vec![first.clone(), second.clone()]).await?;
+    let id = session.timeline[0].session_id.clone();
+    let app = sessions
+        .open_session_mcp_app(&id, "original", tokio_util::sync::CancellationToken::new())
+        .await?;
+    assert_eq!(app.association.server, "a-b");
+    sessions
+        .call_session_mcp_app_tool(
+            &app.handle,
+            "app_only",
+            json!({"value":"bound"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    let record = sessions.store().load(&id).await?;
+    assert!(record.timeline_events().any(|event| matches!(&event.content, TimelineContent::Json { value } if value["server"] == "a-b" && value["tool"] == "app_only")));
+    assert_eq!(
+        sessions
+            .call_session_mcp_app_tool(
+                &app.handle,
+                "mcp_a_b_app_only",
+                json!({"value":"wrong-name"}),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Denied
+    );
+    first.command.push_str(" --changed-source");
+    sessions.set_connections(vec![first, second]);
+    assert_eq!(
+        sessions
+            .call_session_mcp_app_tool(
+                &app.handle,
+                "app_only",
+                json!({"value":"stale"}),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Stale
+    );
+    sessions.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_apps_preserve_raw_snapshot_refresh_without_inference_and_revoke()
+-> Result<(), Box<dyn std::error::Error>> {
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
+        "apps",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "original-app",
+                "mcp_stdio_test_app_marker",
+                json!({"value": "original", "error": true}),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    )));
+    let sessions = mcp_sessions(provider.clone()).await;
+    let session = run_session_prompt(
+        &sessions,
+        "app",
+        vec![stdio_runtime_server(&test_stdio_server_command())],
+    )
+    .await?;
+    let id = session.timeline[0].session_id.clone();
+    assert_tool_was_surfaced(&provider, "mcp_stdio_test_app_marker");
+    assert_tool_was_surfaced(&provider, "mcp_stdio_test_model_only");
+    assert_tool_was_not_surfaced(&provider, "mcp_stdio_test_app_only");
+    let original = sessions.store().load(&id).await?;
+    let original_result = original.timeline_events().find(|event| matches!(&event.content, TimelineContent::ToolResult { result } if result.call_id == "original-app")).unwrap().clone();
+    let association = &original_result.metadata["mcp_app"];
+    assert_eq!(association["server"], "stdio_test");
+    assert_eq!(association["tool"], "app_marker");
+    assert_eq!(association["arguments"]["value"], "original");
+    assert_eq!(association["result"]["_meta"]["private"], "app-secret");
+    assert_eq!(
+        association["result"]["structuredContent"]["value"],
+        "original"
+    );
+    assert_eq!(association["result"]["isError"], true);
+    let replay: waltr_agent::SessionRecord =
+        serde_json::from_value(serde_json::to_value(&original)?)?;
+    assert_eq!(
+        replay
+            .timeline_events()
+            .find(|event| event.item_id == original_result.item_id)
+            .unwrap()
+            .metadata,
+        original_result.metadata
+    );
+    let app = sessions
+        .open_session_mcp_app(
+            &id,
+            "original-app",
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    assert!(app.resource.html.contains("App marker"));
+    let refresh = sessions
+        .call_session_mcp_app_tool(
+            &app.handle,
+            "app_only",
+            json!({"value":"refresh"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(refresh.raw["structuredContent"]["value"], "refresh");
+    assert_eq!(refresh.raw["_meta"]["private"], "app-secret");
+    let after = sessions.store().load(&id).await?;
+    assert_eq!(after.snapshot().turns, original.snapshot().turns);
+    assert_eq!(
+        after
+            .timeline_events()
+            .find(|event| event.item_id == original_result.item_id)
+            .unwrap(),
+        &original_result
+    );
+    assert!(after.timeline_events().any(|event| {
+        event
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channel.as_str() == "mcp_app_audit")
+    }));
+    assert_eq!(provider.request_prompts().len(), 2);
+    assert_eq!(
+        sessions
+            .call_session_mcp_app_tool(
+                &app.handle,
+                "model_only",
+                json!({"value":"forbidden"}),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Denied
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let call = sessions.call_session_mcp_app_tool(
+        &app.handle,
+        "app_only",
+        json!({"value":"canceled", "delay_ms": 5000}),
+        cancellation.clone(),
+    );
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+    };
+    let (result, ()) = tokio::join!(call, cancel);
+    assert_eq!(result.unwrap_err(), waltr_agent::McpAppError::Canceled);
+    let call = sessions.call_session_mcp_app_tool(
+        &app.handle,
+        "app_only",
+        json!({"value":"closing", "delay_ms": 5000}),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let close = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sessions.close_session_mcp_app(&app.handle);
+    };
+    let (result, ()) = tokio::join!(call, close);
+    assert_eq!(result.unwrap_err(), waltr_agent::McpAppError::Canceled);
+    assert_eq!(
+        sessions
+            .call_session_mcp_app_tool(
+                &app.handle,
+                "app_only",
+                json!({"value":"closed"}),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Canceled
+    );
+    assert_eq!(
+        sessions
+            .open_session_mcp_app(
+                &id,
+                "missing-call",
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Stale
+    );
+    let mut handles = Vec::new();
+    for _ in 0..31 {
+        handles.push(
+            sessions
+                .open_session_mcp_app(
+                    &id,
+                    "original-app",
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?
+                .handle,
+        );
+    }
+    assert_eq!(
+        sessions
+            .open_session_mcp_app(
+                &id,
+                "original-app",
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Limit
+    );
+    drop(handles);
+    sessions.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_apps_current_permissions_and_hidden_calls_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "apps-policy",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "original",
+                "mcp_stdio_test_app_marker",
+                json!({"value":"original"}),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    ));
+    let sessions = mcp_sessions(provider).await;
+    let session = run_session_prompt(
+        &sessions,
+        "app",
+        vec![stdio_runtime_server(&test_stdio_server_command())],
+    )
+    .await?;
+    let id = session.timeline[0].session_id.clone();
+    let app = sessions
+        .open_session_mcp_app(&id, "original", tokio_util::sync::CancellationToken::new())
+        .await?;
+    for (level, expected) in [
+        ("ask", waltr_agent::McpAppError::ApprovalRequired),
+        ("deny", waltr_agent::McpAppError::Denied),
+    ] {
+        let source = format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: apps }}\nspec:\n  features: [{{ featureSetRef: {{ name: apps }} }}]\n  permissions: [{{ permissionSetRef: {{ name: apps }} }}]\n---\napiVersion: waltr.dev/v1alpha1\nkind: FeatureSet\nmetadata: {{ name: apps }}\nspec:\n  mcp: {{ exposeTools: true, defaultPermissions: true }}\n---\napiVersion: waltr.dev/v1alpha1\nkind: PermissionSet\nmetadata: {{ name: apps }}\nspec:\n  tools: [{{ name: mcp_stdio_test_app_only, permission: {level} }}]\n"
+        );
+        sessions
+            .set_agent_definition(
+                &id,
+                Some(waltr_agent::AgentDefinitionBundle::new("apps", vec![source])),
+            )
+            .await?;
+        assert_eq!(
+            sessions
+                .call_session_mcp_app_tool(
+                    &app.handle,
+                    "app_only",
+                    json!({"value":"forbidden"}),
+                    tokio_util::sync::CancellationToken::new()
+                )
+                .await
+                .unwrap_err(),
+            expected
+        );
+    }
+    let record = sessions.store().load(&id).await?;
+    let boundary = record.timeline_events().last().unwrap().cursor;
+    let selected = sessions.capture_latest_completed(&id).await?.through_cursor;
+    let mut mutation = waltr_agent::SessionMaskMutation::new(Some(boundary));
+    mutation.add.push(waltr_agent::SessionMaskAddition::new(
+        "hide-app",
+        waltr_agent::ThroughCursor { cursor: selected },
+        waltr_agent::ReplacementUserContent::new("masked"),
+    ));
+    sessions.store().mutate_masks(&id, mutation).await?;
+    assert_eq!(
+        sessions
+            .open_session_mcp_app(&id, "original", tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err(),
+        waltr_agent::McpAppError::Stale
+    );
+    sessions.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn mcp_skills_durable_permission_workflow_binds_activation_and_cross_origin_call()
 -> waltr_agent::Result<()> {
@@ -1599,6 +2238,7 @@ fn http_runtime_server_with_key(key: &str, server: &HttpMcpTestServer) -> McpRes
 struct TestMcpSessions {
     sessions: SessionCoordinator<MemorySessionStore>,
     connections: Arc<Mutex<Vec<McpResolvedConnection>>>,
+    credentials: waltr_agent::CredentialStore,
     _sandbox: TestSandbox,
 }
 
@@ -1681,10 +2321,11 @@ async fn mcp_sessions_with_store_and_definition(
     let root = tempfile::tempdir().expect("tempdir").keep();
     let sandbox = TestSandbox::new(&root).await;
     let credentials = FileCredentialStore::new(root.join("credentials.json"));
-    let factory = AgentSessionRuntimeFactory::new(sandbox.handle(), root, credentials, definition)
-        .with_runtime_provider(move |_| {
-            Ok(AgentRuntimeProvider::new(test_model(), provider.clone()))
-        });
+    let factory =
+        AgentSessionRuntimeFactory::new(sandbox.handle(), root, credentials.clone(), definition)
+            .with_runtime_provider(move |_| {
+                Ok(AgentRuntimeProvider::new(test_model(), provider.clone()))
+            });
     let connections = Arc::new(Mutex::new(Vec::new()));
     let resolver_connections = Arc::clone(&connections);
     let factory = factory.with_mcp_connection_resolver(move |_| {
@@ -1697,6 +2338,7 @@ async fn mcp_sessions_with_store_and_definition(
     TestMcpSessions {
         sessions: SessionCoordinator::new(store).with_runtime_factory(factory),
         connections,
+        credentials: credentials.into(),
         _sandbox: sandbox,
     }
 }
@@ -1898,6 +2540,14 @@ impl HttpMcpTestServer {
         instructions: Option<&str>,
         required_bearer: Option<&str>,
     ) -> waltr_agent::Result<Self> {
+        Self::start_with_app_read_marker(instructions, required_bearer, None).await
+    }
+
+    async fn start_with_app_read_marker(
+        instructions: Option<&str>,
+        required_bearer: Option<&str>,
+        read_marker: Option<&std::path::Path>,
+    ) -> waltr_agent::Result<Self> {
         let temp = tempfile::tempdir()?;
         let address_file = temp.path().join("mcp-http-address.txt");
         let mut command = std::process::Command::new(test_stdio_server_command());
@@ -1913,6 +2563,9 @@ impl HttpMcpTestServer {
         }
         if let Some(required_bearer) = required_bearer {
             command.env("WALTR_TEST_MCP_REQUIRED_BEARER", required_bearer);
+        }
+        if let Some(read_marker) = read_marker {
+            command.env("WALTR_TEST_MCP_APP_READ_MARKER", read_marker);
         }
         let mut child = command.spawn()?;
         let address = wait_for_http_address(&mut child, &address_file).await?;
