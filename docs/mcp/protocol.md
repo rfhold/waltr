@@ -134,6 +134,18 @@ and issuer identities. Dynamic client registration carries and validates
 callbacks. RFC 9207 `iss` responses are validated before code redemption or error
 display, and persisted registrations remain bound to their authorization-server issuer.
 
+Hosted public-client metadata need not declare the nonstandard
+`code_challenge_methods` extension. Authorization still requires PKCE S256, and code
+redemption verifies the verifier. This applies to preregistered, CIMD, and DCR clients.
+
+The redirect-admission policy must explicitly allow native HTTP loopback callbacks.
+After admission, their port can differ at authorization; the original scheme, host,
+path, query, and all other components must remain identical. `localhost` and
+`127.0.0.1` are not interchangeable. HTTPS and non-loopback redirects remain exact
+matches. The transaction retains the actual authorization redirect, and token
+exchange must repeat that exact URI, including its port. Memory, SQLite, and
+PostgreSQL stores use the same matching rules and immutable CIMD snapshots.
+
 Hosted OAuth persistence remains in the MCP-owned database. Historical migration
 `0001_streamable_http_sessions.sql` is immutable migration history, but its session table
 is inert because the modern protocol has no session runtime.

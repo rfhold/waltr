@@ -34,7 +34,7 @@ pub async fn assert_store_contract(
         transaction_id: "resumed-transaction".to_owned(),
         client_id: "client".to_owned(),
         client_metadata_snapshot_id: None,
-        redirect_uri: "https://client.example/callback".to_owned(),
+        redirect_uri: "http://127.0.0.1:49151/callback".to_owned(),
         resource: "https://resource.example/mcp".to_owned(),
         scopes: vec!["read".to_owned()],
         pkce_challenge: "challenge".to_owned(),
@@ -85,7 +85,7 @@ pub async fn assert_store_contract(
         transaction_id: "transaction".to_owned(),
         client_id: "client".to_owned(),
         client_metadata_snapshot_id: None,
-        redirect_uri: "https://client.example/callback".to_owned(),
+        redirect_uri: "http://127.0.0.1:49152/callback".to_owned(),
         resource: "https://resource.example/mcp".to_owned(),
         scopes: vec!["write".to_owned(), "read".to_owned(), "read".to_owned()],
         pkce_challenge: "challenge".to_owned(),
@@ -96,6 +96,24 @@ pub async fn assert_store_contract(
         created_at_ms: 1_000,
         expires_at_ms: 10_000,
     };
+    for redirect in [
+        "http://localhost:49152/callback",
+        "http://127.0.0.2:49152/callback",
+        "http://127.0.0.1:49152/other",
+        "http://127.0.0.1:49152/callback?extra=1",
+        "http://127.0.0.1:49152/callback#fragment",
+        "http://user@127.0.0.1:49152/callback",
+        "http://example.com:49152/callback",
+        "https://client.example:49152/callback",
+    ] {
+        let mut invalid = transaction.clone();
+        invalid.redirect_uri = redirect.to_owned();
+        assert_eq!(
+            first.create_authorization_transaction(invalid).await,
+            Err(OAuthAuthorizationStoreError::InvalidData),
+            "{redirect}"
+        );
+    }
     assert!(
         first
             .create_authorization_transaction(transaction)
@@ -155,6 +173,18 @@ pub async fn assert_store_contract(
             .unwrap()
     );
 
+    let mut mismatch = issue_request();
+    mismatch.redirect_uri = "http://127.0.0.1:49153/callback".to_owned();
+    assert_eq!(
+        first.redeem_authorization_code(mismatch).await.unwrap(),
+        OAuthIssueGrantResult::InvalidGrant
+    );
+    let mut mismatch = issue_request();
+    mismatch.pkce_challenge = "wrong-challenge".to_owned();
+    assert_eq!(
+        first.redeem_authorization_code(mismatch).await.unwrap(),
+        OAuthIssueGrantResult::InvalidGrant
+    );
     let issue = issue_request();
     let (left, right) = tokio::join!(
         first.redeem_authorization_code(issue.clone()),
@@ -293,7 +323,7 @@ async fn assert_registration_contract(
         transaction_id: "dynamic-transaction".to_owned(),
         client_id: "dynamic-c".to_owned(),
         client_metadata_snapshot_id: None,
-        redirect_uri: "https://client.example/callback".to_owned(),
+        redirect_uri: "http://localhost:49300/callback".to_owned(),
         resource: "https://resource.example/mcp".to_owned(),
         scopes: vec!["read".to_owned()],
         pkce_challenge: "challenge".to_owned(),
@@ -353,7 +383,7 @@ async fn assert_registration_contract(
             .redeem_authorization_code(OAuthIssueGrantRequest {
                 code_digest: digest(23),
                 client_id: "dynamic-c".to_owned(),
-                redirect_uri: "https://client.example/callback".to_owned(),
+                redirect_uri: "http://localhost:49300/callback".to_owned(),
                 resource: "https://resource.example/mcp".to_owned(),
                 pkce_challenge: "challenge".to_owned(),
                 grant_id: "terminal-grant".to_owned(),
@@ -381,7 +411,7 @@ async fn assert_registration_contract(
                 transaction_id: "quota-transaction".to_owned(),
                 client_id: "dynamic-d".to_owned(),
                 client_metadata_snapshot_id: None,
-                redirect_uri: "https://client.example/callback".to_owned(),
+                redirect_uri: "http://localhost:49301/callback".to_owned(),
                 resource: "https://resource.example/mcp".to_owned(),
                 scopes: vec!["read".to_owned()],
                 pkce_challenge: "challenge".to_owned(),
@@ -431,11 +461,11 @@ async fn assert_registration_contract(
     let document = serde_json::json!({
         "client_id": "https://metadata.example/client.json",
         "client_name": "Metadata test client",
-        "redirect_uris": ["https://client.example/callback"],
+        "application_type": "native",
+        "redirect_uris": ["http://127.0.0.1/callback"],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
-        "code_challenge_methods": ["S256"]
+        "token_endpoint_auth_method": "none"
     });
     let snapshot = OAuthCachedClientMetadata {
         snapshot_id: "snapshot".to_owned(),
@@ -459,7 +489,7 @@ async fn assert_registration_contract(
                 transaction_id: "z-referenced-cimd-transaction".to_owned(),
                 client_id: "https://metadata.example/client.json".to_owned(),
                 client_metadata_snapshot_id: Some("snapshot".to_owned()),
-                redirect_uri: "https://client.example/callback".to_owned(),
+                redirect_uri: "http://127.0.0.1:49152/callback".to_owned(),
                 resource: "https://resource.example/mcp".to_owned(),
                 scopes: vec!["read".to_owned()],
                 pkce_challenge: "challenge".to_owned(),
@@ -487,7 +517,7 @@ fn dynamic_registration(client_id: &str, now_ms: i64) -> OAuthDynamicClientRegis
             registration_method: OAuthClientRegistrationMethod::Dynamic,
             display_name: None,
             client_secret_digest: None,
-            redirect_uris: vec!["https://client.example/callback".to_owned()],
+            redirect_uris: vec!["http://localhost/callback".to_owned()],
             created_at_ms: now_ms,
             expires_at_ms: None,
             disabled_at_ms: None,
@@ -637,7 +667,10 @@ fn client(id: &str) -> OAuthClient {
         registration_method: OAuthClientRegistrationMethod::Preconfigured,
         display_name: Some("Client".to_owned()),
         client_secret_digest: Some(vec![31; 32]),
-        redirect_uris: vec!["https://client.example/callback".to_owned()],
+        redirect_uris: vec![
+            "https://client.example/callback".to_owned(),
+            "http://127.0.0.1/callback".to_owned(),
+        ],
         created_at_ms: 1_000,
         expires_at_ms: None,
         disabled_at_ms: None,
@@ -647,7 +680,7 @@ fn issue_request() -> OAuthIssueGrantRequest {
     OAuthIssueGrantRequest {
         code_digest: digest(2),
         client_id: "client".to_owned(),
-        redirect_uri: "https://client.example/callback".to_owned(),
+        redirect_uri: "http://127.0.0.1:49152/callback".to_owned(),
         resource: "https://resource.example/mcp".to_owned(),
         pkce_challenge: "challenge".to_owned(),
         grant_id: "grant".to_owned(),
