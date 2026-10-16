@@ -219,6 +219,7 @@ async fn hosted_authorization_code_refresh_replay_and_revocation_flow() {
 
 #[tokio::test]
 async fn login_resume_and_consent_denial_use_opaque_transaction() {
+    const NATIVE_REDIRECT: &str = "http://127.0.0.1:49152/callback";
     let store = Arc::new(InMemoryOAuthAuthorizationStore::default());
     register_client(&store).await;
     let authenticator = Arc::new(LoginAuthenticator::default());
@@ -233,7 +234,7 @@ async fn login_resume_and_consent_denial_use_opaque_transaction() {
     authorization_url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", "client"),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", NATIVE_REDIRECT),
         ("scope", "files:read"),
         ("state", "denial-state"),
         ("code_challenge", challenge.as_str()),
@@ -283,6 +284,9 @@ async fn login_resume_and_consent_denial_use_opaque_transaction() {
         .unwrap();
     assert_eq!(denied.status(), StatusCode::SEE_OTHER);
     let denied = Url::parse(denied.headers()["location"].to_str().unwrap()).unwrap();
+    assert_eq!(denied.port(), Some(49152));
+    assert_eq!(denied.host_str(), Some("127.0.0.1"));
+    assert_eq!(denied.path(), "/callback");
     let parameters = denied
         .query_pairs()
         .into_owned()
@@ -376,6 +380,7 @@ async fn dcr_advertises_registers_and_completes_public_authorization_flow() {
     .unwrap()
     .with_client_registration(OAuthClientRegistrationOptions {
         dynamic_registration: true,
+        allow_loopback_redirects: true,
         ..OAuthClientRegistrationOptions::default()
     })
     .unwrap();
@@ -447,6 +452,89 @@ async fn dcr_advertises_registers_and_completes_public_authorization_flow() {
     let code = authorize_client(&client, &origin, &registration.client_id).await;
     let issued = token_request_for_client(&client, &origin, &code, &registration.client_id).await;
     assert_eq!(issued.status(), StatusCode::OK);
+    let native = client
+        .post(format!("{origin}/oauth/register"))
+        .json(&serde_json::json!({
+            "application_type": "native",
+            "redirect_uris": ["http://127.0.0.1/callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(native.status(), StatusCode::CREATED);
+    let native: McpClientRegistrationResponse = native.json().await.unwrap();
+    let redirect = "http://127.0.0.1:49200/callback";
+    let code = authorize_client_redirect(&client, &origin, &native.client_id, redirect).await;
+    assert_eq!(
+        token_request_redirect(&client, &origin, &code, &native.client_id, redirect)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn preregistered_loopback_port_exception_preserves_other_components() {
+    let store = Arc::new(InMemoryOAuthAuthorizationStore::default());
+    let server = server_with_hooks(store, Arc::new(Authenticated), Arc::new(ApprovedConsent)).await;
+    let registered = "http://127.0.0.1:49000/callback?fixed=1";
+    let native = OAuthClient {
+        client_id: "native".to_owned(),
+        registration_method: OAuthClientRegistrationMethod::Preconfigured,
+        display_name: None,
+        client_secret_digest: None,
+        redirect_uris: vec![registered.to_owned()],
+        created_at_ms: unix_ms(),
+        expires_at_ms: None,
+        disabled_at_ms: None,
+    };
+    assert!(
+        server
+            .preregister_public_client(native.clone(), false)
+            .await
+            .is_err()
+    );
+    server
+        .preregister_public_client(native, true)
+        .await
+        .unwrap();
+    let (origin, task) = serve(server.router()).await;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .unwrap();
+    for redirect in [
+        "http://127.0.0.1:49152/callback?fixed=2",
+        "http://127.0.0.1:49152/callback",
+        "http://127.0.0.1:49152/other?fixed=1",
+        "http://127.0.0.1:49152/a/../callback?fixed=1",
+        "http://localhost:49152/callback?fixed=1",
+        "https://127.0.0.1:49152/callback?fixed=1",
+    ] {
+        assert_eq!(
+            authorization_response_redirect(&client, &origin, "native", redirect)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "{redirect}"
+        );
+    }
+    for redirect in [
+        "http://127.0.0.1:49152/callback?fixed=1",
+        "http://127.0.0.1/callback?fixed=1",
+    ] {
+        let code = authorize_client_redirect(&client, &origin, "native", redirect).await;
+        assert_eq!(
+            token_request_redirect(&client, &origin, &code, "native", redirect)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
     task.abort();
 }
 
@@ -512,6 +600,7 @@ async fn hardened_cimd_fetcher_refuses_redirect_type_size_and_prohibited_destina
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
+    const NATIVE_REDIRECT: &str = "http://127.0.0.1:49152/callback";
     let version = Arc::new(AtomicU8::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -520,11 +609,11 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
         serde_json::from_value(serde_json::json!({
             "client_id": client_id,
             "client_name": "Snapshot client",
-            "redirect_uris": [REDIRECT],
+            "application_type": "native",
+            "redirect_uris": ["http://127.0.0.1/callback", "http://localhost/callback"],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-            "code_challenge_methods": ["S256"]
+            "token_endpoint_auth_method": "none"
         }))
         .unwrap();
     initial_document
@@ -539,7 +628,7 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
             let version = version_for_route.clone();
             async move {
                 let redirect = if version.load(Ordering::Relaxed) == 0 {
-                    REDIRECT
+                    "http://127.0.0.1/callback"
                 } else {
                     "https://attacker.example/callback"
                 };
@@ -551,11 +640,11 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
                     serde_json::json!({
                         "client_id": client_id,
                         "client_name": "Snapshot client",
+                        "application_type": "native",
                         "redirect_uris": [redirect],
                         "grant_types": ["authorization_code", "refresh_token"],
                         "response_types": ["code"],
-                        "token_endpoint_auth_method": "none",
-                        "code_challenge_methods": ["S256"]
+                        "token_endpoint_auth_method": "none"
                     })
                     .to_string(),
                 )
@@ -598,27 +687,115 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
         .redirect(Policy::none())
         .build()
         .unwrap();
-    let code = authorize_client(&client, &authorization_origin, &client_id).await;
+    for redirect in [
+        "http://localhost:49152/callback",
+        "http://127.0.0.2:49152/callback",
+        "http://127.0.0.1:49152/other",
+        "http://127.0.0.1:49152/callback?extra=1",
+        "http://127.0.0.1:49152/callback#fragment",
+        "http://user@127.0.0.1:49152/callback",
+        "http://example.com/callback",
+    ] {
+        assert_eq!(
+            authorization_response_redirect(&client, &authorization_origin, &client_id, redirect)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "{redirect}"
+        );
+    }
+    for method in [None, Some("plain")] {
+        let mut url = Url::parse(&format!("{authorization_origin}/oauth/authorize")).unwrap();
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        url.query_pairs_mut().extend_pairs([
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", NATIVE_REDIRECT),
+            ("scope", "files:read"),
+            ("state", "pkce-state"),
+            ("code_challenge", challenge.as_str()),
+            ("resource", RESOURCE),
+        ]);
+        if let Some(method) = method {
+            url.query_pairs_mut()
+                .append_pair("code_challenge_method", method);
+        }
+        let rejected = client.get(url).send().await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert!(rejected.headers().get("location").is_none());
+    }
+    let code =
+        authorize_client_redirect(&client, &authorization_origin, &client_id, NATIVE_REDIRECT)
+            .await;
     let first_snapshot = store
         .client_metadata(client_id.clone(), unix_ms())
         .await
         .unwrap()
         .unwrap();
     version.store(1, Ordering::Relaxed);
-    let cached_code = authorize_client(&client, &authorization_origin, &client_id).await;
-    let issued = token_request_for_client(&client, &authorization_origin, &code, &client_id).await;
-    assert_eq!(issued.status(), StatusCode::OK);
+    let cached_code =
+        authorize_client_redirect(&client, &authorization_origin, &client_id, NATIVE_REDIRECT)
+            .await;
     assert_eq!(
-        token_request_for_client(&client, &authorization_origin, &cached_code, &client_id)
-            .await
-            .status(),
+        token_request_redirect(
+            &client,
+            &authorization_origin,
+            &code,
+            &client_id,
+            "http://127.0.0.1:49153/callback"
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let issued = token_request_redirect(
+        &client,
+        &authorization_origin,
+        &code,
+        &client_id,
+        NATIVE_REDIRECT,
+    )
+    .await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    let issued: McpTokenResponse = issued.json().await.unwrap();
+    let refresh = client
+        .post(format!("{authorization_origin}/oauth/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                issued.refresh_token.unwrap().expose_secret(),
+            ),
+            ("client_id", &client_id),
+            ("resource", RESOURCE),
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refresh.status(), StatusCode::OK);
+    assert_eq!(
+        token_request_redirect(
+            &client,
+            &authorization_origin,
+            &cached_code,
+            &client_id,
+            NATIVE_REDIRECT
+        )
+        .await
+        .status(),
         StatusCode::OK
     );
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert_eq!(
-        authorization_response(&client, &authorization_origin, &client_id)
-            .await
-            .status(),
+        authorization_response_redirect(
+            &client,
+            &authorization_origin,
+            &client_id,
+            NATIVE_REDIRECT
+        )
+        .await
+        .status(),
         StatusCode::BAD_REQUEST
     );
     let changed_snapshot = store
@@ -630,9 +807,14 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
     fixture.abort();
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert_eq!(
-        authorization_response(&client, &authorization_origin, &client_id)
-            .await
-            .status(),
+        authorization_response_redirect(
+            &client,
+            &authorization_origin,
+            &client_id,
+            NATIVE_REDIRECT
+        )
+        .await
+        .status(),
         StatusCode::BAD_REQUEST
     );
     task.abort();
@@ -651,7 +833,7 @@ async fn register_client(store: &Arc<InMemoryOAuthAuthorizationStore>) {
             registration_method: OAuthClientRegistrationMethod::Preconfigured,
             display_name: Some("Test client".to_owned()),
             client_secret_digest: None,
-            redirect_uris: vec![REDIRECT.to_owned()],
+            redirect_uris: vec![REDIRECT.to_owned(), "http://127.0.0.1/callback".to_owned()],
             created_at_ms: now,
             expires_at_ms: None,
             disabled_at_ms: None,
@@ -723,7 +905,16 @@ async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn authorize_client(client: &reqwest::Client, origin: &str, client_id: &str) -> String {
-    let response = authorization_response(client, origin, client_id).await;
+    authorize_client_redirect(client, origin, client_id, REDIRECT).await
+}
+
+async fn authorize_client_redirect(
+    client: &reqwest::Client,
+    origin: &str,
+    client_id: &str,
+    redirect: &str,
+) -> String {
+    let response = authorization_response_redirect(client, origin, client_id, redirect).await;
     if response.status() != StatusCode::SEE_OTHER {
         let status = response.status();
         let body = response.text().await.unwrap();
@@ -738,17 +929,18 @@ async fn authorize_client(client: &reqwest::Client, origin: &str, client_id: &st
         .into_owned()
 }
 
-async fn authorization_response(
+async fn authorization_response_redirect(
     client: &reqwest::Client,
     origin: &str,
     client_id: &str,
+    redirect: &str,
 ) -> reqwest::Response {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
     let mut authorization_url = Url::parse(&format!("{origin}/oauth/authorize")).unwrap();
     authorization_url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", client_id),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", redirect),
         ("scope", "files:read"),
         ("state", "registration-state"),
         ("code_challenge", challenge.as_str()),
@@ -764,13 +956,23 @@ async fn token_request_for_client(
     code: &str,
     client_id: &str,
 ) -> reqwest::Response {
+    token_request_redirect(client, origin, code, client_id, REDIRECT).await
+}
+
+async fn token_request_redirect(
+    client: &reqwest::Client,
+    origin: &str,
+    code: &str,
+    client_id: &str,
+    redirect: &str,
+) -> reqwest::Response {
     client
         .post(format!("{origin}/oauth/token"))
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&[
             ("grant_type", "authorization_code"),
             ("code", code),
-            ("redirect_uri", REDIRECT),
+            ("redirect_uri", redirect),
             ("code_verifier", VERIFIER),
             ("client_id", client_id),
             ("resource", RESOURCE),

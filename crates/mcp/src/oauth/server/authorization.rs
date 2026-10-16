@@ -968,8 +968,7 @@ async fn authorize(
     else {
         return local_authorization_error(StatusCode::BAD_REQUEST, "unauthorized_client");
     };
-    if client.client_secret_digest.is_some() || !client.redirect_uris.contains(&parsed.redirect_uri)
-    {
+    if client.client_secret_digest.is_some() || !client.matches_redirect(&parsed.redirect_uri) {
         return local_authorization_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     if let Err(error) = validate_authorization_bindings(&state.config, &parsed) {

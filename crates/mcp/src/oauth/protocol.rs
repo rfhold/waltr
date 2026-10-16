@@ -697,7 +697,7 @@ impl McpClientMetadataDocument {
     ///
     /// # Errors
     ///
-    /// Returns an error when public-client, grant, response, PKCE, or redirect
+    /// Returns an error when public-client, grant, response, or redirect
     /// requirements are not met.
     pub fn validate_public_client(
         &self,
@@ -757,11 +757,6 @@ impl McpClientMetadataDocument {
                 McpOAuthGrantType::RefreshToken,
             ])
             || self.response_types != [McpOAuthResponseType::Code]
-            || self
-                .extra
-                .get("code_challenge_methods")
-                .and_then(Value::as_array)
-                .is_none_or(|methods| methods.len() != 1 || methods[0].as_str() != Some("S256"))
         {
             return Err(McpClientMetadataError::UnsupportedClientMetadata);
         }

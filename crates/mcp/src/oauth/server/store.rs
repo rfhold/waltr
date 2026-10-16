@@ -126,7 +126,7 @@ pub struct OAuthClient {
     pub display_name: Option<String>,
     /// Digest of a confidential client secret, when one is provisioned.
     pub client_secret_digest: Option<Vec<u8>>,
-    /// Exact redirect URI set.
+    /// Admitted redirect URI set; HTTP loopback ports may vary at authorization.
     pub redirect_uris: Vec<String>,
     /// Creation time as Unix milliseconds.
     pub created_at_ms: i64,
@@ -134,6 +134,39 @@ pub struct OAuthClient {
     pub expires_at_ms: Option<i64>,
     /// Disablement time, when disabled.
     pub disabled_at_ms: Option<i64>,
+}
+
+impl OAuthClient {
+    pub(crate) fn matches_redirect(&self, requested: &str) -> bool {
+        self.redirect_uris.iter().any(|registered| {
+            registered == requested
+                || loopback_redirect_parts(registered)
+                    .is_some_and(|parts| loopback_redirect_parts(requested) == Some(parts))
+        })
+    }
+}
+
+// Admission of an HTTP loopback URI is the policy opt-in. Compare the original
+// bytes, excluding only the port, rather than normalizing unrelated components.
+fn loopback_redirect_parts(value: &str) -> Option<(&str, &str)> {
+    crate::validate_public_redirect_uri(value, true).ok()?;
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let authority_start = value.find("://")? + 3;
+    let authority_end = value[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(value.len(), |offset| authority_start + offset);
+    let authority = &value[authority_start..authority_end];
+    let port_start = authority.rsplit_once(':').and_then(|(host, port)| {
+        (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(authority_start + host.len())
+    });
+    Some((
+        &value[..port_start.unwrap_or(authority_end)],
+        &value[authority_end..],
+    ))
 }
 
 /// Validated cached Client ID Metadata Document snapshot.
@@ -1269,7 +1302,7 @@ impl OAuthState {
             return Err(OAuthAuthorizationStoreError::InvalidData);
         }
         if let Some(client) = client
-            && !client.redirect_uris.contains(&transaction.redirect_uri)
+            && !client.matches_redirect(&transaction.redirect_uri)
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
         }
@@ -1279,7 +1312,7 @@ impl OAuthState {
                 .get(snapshot_id)
                 .and_then(metadata_client)
                 .ok_or(OAuthAuthorizationStoreError::InvalidData)?;
-            if !metadata.redirect_uris.contains(&transaction.redirect_uri) {
+            if !metadata.matches_redirect(&transaction.redirect_uri) {
                 return Err(OAuthAuthorizationStoreError::InvalidData);
             }
         }
@@ -1444,7 +1477,7 @@ impl OAuthState {
                 self.metadata.get(id).is_some_and(|metadata| {
                     metadata.client_id == transaction.client_id
                         && metadata_client(metadata).is_some_and(|client| {
-                            client.redirect_uris.contains(&transaction.redirect_uri)
+                            client.matches_redirect(&transaction.redirect_uri)
                         })
                 })
             });

@@ -180,6 +180,28 @@ fn client_metadata_requires_exact_identity_public_profile_and_extensions() {
     document
         .extra
         .insert("code_challenge_methods".to_owned(), json!(["plain"]));
+    document.validate_public_client(client_id, false).unwrap();
+    document.extra.remove("code_challenge_methods");
+    document.validate_public_client(client_id, false).unwrap();
+    let mut confidential = serde_json::to_value(&document).unwrap();
+    confidential["token_endpoint_auth_method"] = json!("client_secret_basic");
+    assert!(serde_json::from_value::<McpClientMetadataDocument>(confidential).is_err());
+}
+
+#[test]
+fn opencode_client_metadata_needs_no_pkce_extension() {
+    let client_id = "https://opencode.ai/oauth/opencode/client.json";
+    let document: McpClientMetadataDocument = serde_json::from_value(json!({
+        "client_id": client_id,
+        "client_name": "OpenCode",
+        "application_type": "native",
+        "redirect_uris": ["http://127.0.0.1/callback", "http://localhost/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    }))
+    .unwrap();
+    document.validate_public_client(client_id, true).unwrap();
     assert!(document.validate_public_client(client_id, false).is_err());
 }
 
