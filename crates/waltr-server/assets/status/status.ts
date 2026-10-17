@@ -1,6 +1,6 @@
 import { App } from "@modelcontextprotocol/ext-apps";
 
-const app = new App({ name: "Waltr Status", version: "0.1.0" }, { availableDisplayModes: ["inline"] }, { autoResize: false });
+const app = new App({ name: "Waltr Status", version: "0.2.0" }, { availableDisplayModes: ["inline"] }, { autoResize: false });
 const status = document.getElementById("status")!;
 const observed = document.getElementById("observed")!;
 const error = document.getElementById("error")!;
