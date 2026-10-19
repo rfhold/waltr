@@ -33,7 +33,7 @@ wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 futures-channel.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
-waltr = { path = "../waltr", version = "0.2.0", default-features = false, features = ["grpc"] }
+waltr = { path = "../waltr", version = "0.2.1", default-features = false, features = ["grpc"] }
 prost-types.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
