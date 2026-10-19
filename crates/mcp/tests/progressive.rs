@@ -40,6 +40,13 @@ struct ListReleasesInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ListRunsInput {
+    repository: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetReleaseInput {
     /// Release id.
     id: String,
@@ -151,6 +158,30 @@ impl ReleaseServer {
             "owner": "platform",
             "notes": ["fix login redirect", "improve deploy telemetry"]
         }))
+    }
+
+    /// Exercise identical input schemas on different actions.
+    #[action(tool = "releases", name = "get-copy")]
+    fn get_copy(&self, input: GetReleaseInput) -> ServerResult<Value> {
+        Ok(json!({ "id": input.id }))
+    }
+
+    /// Exercise overlapping optional input schemas.
+    #[action(tool = "releases", name = "list-runs")]
+    fn list_runs(&self, input: ListRunsInput) -> ServerResult<Value> {
+        Ok(json!({ "repository": input.repository, "limit": input.limit }))
+    }
+
+    /// Exercise nullable typed input after envelope parsing.
+    #[action(tool = "releases", name = "nullable")]
+    fn nullable(&self, input: Option<String>) -> ServerResult<Value> {
+        Ok(json!(input))
+    }
+
+    /// Exercise a typed input whose only schema value is null.
+    #[action(tool = "releases", name = "unit")]
+    fn unit(&self, _input: ()) -> ServerResult<Value> {
+        Ok(Value::Null)
     }
 
     /// List alert rules associated with releases.
@@ -532,6 +563,176 @@ fn progressive_input_schemas_inline_subschemas() {
 }
 
 #[tokio::test]
+async fn advertised_progressive_schemas_validate_action_bound_requests() -> mcp::Result<()> {
+    let server = RunningServer::start_plain(ReleaseServer::default()).await?;
+    let tools = post_json(
+        &server.endpoint,
+        json!({ "jsonrpc": "2.0", "id": "schema-tools", "method": "tools/list" }),
+    )
+    .await?;
+    let schema = &tool_named(&tools.body, "releases")["inputSchema"];
+    let validator = jsonschema::draft202012::new(schema).expect("valid advertised JSON Schema");
+    assert!(
+        validator.is_valid(&json!({
+            "action": "releases.get", "input": { "id": "v1" }
+        })),
+        "identical schemas on different actions must not compete"
+    );
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema["properties"]["input"].get("oneOf").is_none());
+    let discovery_inputs = schema["properties"]["input"]["anyOf"]
+        .as_array()
+        .expect("root payload discovery union");
+    let discovery_validator = jsonschema::draft202012::new(&schema["properties"]["input"])
+        .expect("valid payload discovery schema");
+    assert!(discovery_validator.is_valid(&json!({ "limit": 1 })));
+    assert!(!validator.is_valid(&json!({ "action": "releases.get", "input": { "limit": 1 } })));
+    let get_input = discovery_inputs
+        .iter()
+        .find(|input| input["title"] == "releases.get input")
+        .expect("action-labelled get input");
+    assert!(get_input.get("allOf").is_none());
+    assert_eq!(get_input["properties"]["id"]["type"], "string");
+    let runs_input = discovery_inputs
+        .iter()
+        .find(|input| input["title"] == "list-runs input")
+        .expect("action-labelled runs input");
+    assert!(runs_input.get("allOf").is_none());
+    assert!(runs_input["properties"]["repository"].is_object());
+    assert!(runs_input["properties"]["limit"].is_object());
+    let no_input = discovery_inputs
+        .iter()
+        .find(|input| input["title"] == "alert-rule.list input")
+        .expect("action-labelled no-input shape");
+    assert_eq!(
+        no_input["anyOf"],
+        json!([
+            { "type": "null" },
+            { "type": "object", "maxProperties": 0 }
+        ])
+    );
+    assert!(schema["properties"]["filter"].is_object());
+    assert!(
+        schema["oneOf"]
+            .as_array()
+            .expect("request alternatives")
+            .iter()
+            .all(|branch| branch["properties"]["action"]["const"].is_string())
+    );
+
+    let cases = [
+        (
+            true,
+            json!({ "action": "releases.get", "input": { "id": "v1" } }),
+        ),
+        (
+            true,
+            json!({ "action": "get-copy", "input": { "id": "v1" } }),
+        ),
+        // The optional list shape overlaps other inputs and must not compete with them.
+        (true, json!({ "action": "list", "input": {} })),
+        (true, json!({ "action": "list-runs", "input": {} })),
+        (
+            true,
+            json!({ "action": "list-runs", "input": { "repository": "rfhold/axol", "limit": 1 } }),
+        ),
+        (
+            true,
+            json!({ "action": "list", "input": { "id": "v1", "limit": 1 } }),
+        ),
+        (
+            true,
+            json!({ "action": "list", "input": { "status": "released", "limit": 1 } }),
+        ),
+        (true, json!({ "action": "nullable", "input": "value" })),
+        (true, json!({ "action": "alert-rule.list" })),
+        (true, json!({ "action": "alert-rule.list", "input": null })),
+        (true, json!({ "action": "alert-rule.list", "input": {} })),
+        (true, json!({ "action": "semantic", "input": null })),
+        (true, json!({ "action": "semantic-error", "input": {} })),
+        (true, json!({ "action": "alert-rule.list", "filter": null })),
+        (
+            true,
+            json!({ "action": "alert-rule.list", "filter": ".[0].name" }),
+        ),
+        (false, json!({})),
+        (false, json!({ "input": {} })),
+        (false, json!({ "action": "unknown", "input": {} })),
+        (false, json!({ "action": "releases.get" })),
+        (false, json!({ "action": "releases.get", "input": null })),
+        (false, json!({ "action": "releases.get", "input": {} })),
+        (
+            false,
+            json!({ "action": "releases.get", "input": { "limit": 1 } }),
+        ),
+        (
+            false,
+            json!({ "action": "releases.get", "input": { "id": "v1", "extra": true } }),
+        ),
+        (false, json!({ "action": "list" })),
+        (false, json!({ "action": "list-runs" })),
+        (false, json!({ "action": "list", "input": null })),
+        (
+            false,
+            json!({ "action": "list", "input": { "limit": "one" } }),
+        ),
+        (false, json!({ "action": "nullable" })),
+        (false, json!({ "action": "nullable", "input": null })),
+        (false, json!({ "action": "nullable", "input": 1 })),
+        (false, json!({ "action": "unit" })),
+        (false, json!({ "action": "unit", "input": null })),
+        (false, json!({ "action": "unit", "input": {} })),
+        (
+            false,
+            json!({ "action": "alert-rule.list", "input": { "id": "v1" } }),
+        ),
+        (false, json!({ "action": "alert-rule.list", "input": [] })),
+        (false, json!({ "action": "alert-rule.list", "extra": true })),
+        (false, json!({ "action": "alert-rule.list", "filter": 1 })),
+    ];
+    for (valid, arguments) in cases {
+        assert_eq!(validator.is_valid(&arguments), valid, "schema: {arguments}");
+        let response = call_tool_response(&server.endpoint, "releases", arguments.clone()).await?;
+        assert_eq!(
+            response.body.get("error").is_none(),
+            valid,
+            "dispatch: {arguments}: {}",
+            response.body
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn progressive_input_schema_associates_inputs_by_action_not_position() {
+    use mcp::progressive::{ActionInputSchema, input_schema, json_schema_for};
+
+    let schema = input_schema(
+        &["get", "list"],
+        vec![
+            ActionInputSchema {
+                action: "list",
+                schema: Some(json_schema_for::<ListRunsInput>()),
+            },
+            ActionInputSchema {
+                action: "get",
+                schema: Some(json_schema_for::<GetReleaseInput>()),
+            },
+        ],
+    );
+    let validator = jsonschema::draft202012::new(&schema).expect("valid schema");
+    assert!(validator.is_valid(&json!({ "action": "list", "input": { "limit": 1 } })));
+    assert!(validator.is_valid(&json!({ "action": "get", "input": { "id": "v1" } })));
+    assert!(!validator.is_valid(&json!({ "action": "get", "input": { "limit": 1 } })));
+    assert_eq!(schema["oneOf"][0]["properties"]["action"]["const"], "list");
+    assert_eq!(
+        schema["properties"]["input"]["anyOf"][0]["title"],
+        "list input"
+    );
+}
+
+#[tokio::test]
 async fn progressive_server_isolates_actions_and_resources_without_help() -> mcp::Result<()> {
     let server = RunningServer::start_plain(ReleaseServer::default()).await?;
 
@@ -600,9 +801,9 @@ async fn progressive_server_isolates_actions_and_resources_without_help() -> mcp
         &policy_tool["inputSchema"]["properties"]["action"]["enum"],
         "releases.get",
     );
-    let input_options = releases_tool["inputSchema"]["properties"]["input"]["oneOf"]
+    let input_options = releases_tool["inputSchema"]["oneOf"]
         .as_array()
-        .expect("input oneOf");
+        .expect("request oneOf");
     assert!(
         input_options
             .iter()

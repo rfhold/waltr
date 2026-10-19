@@ -22,7 +22,7 @@ The annotation expression accepts `serde_json::Value` or `Option<serde_json::Val
 
 ## Tool Isolation
 
-Each listed tool has an independent action enum and action-specific `input.oneOf` schema. A call first selects the MCP tool and can then dispatch only an action owned by that tool. The same flat action name may exist in different tools.
+Each tool has its own action enum and request-level `oneOf`. Each branch binds an action `const` to that action's input schema. Identical input types and schemas that overlap remain valid. A call first selects the MCP tool and can then dispatch only an action that the tool owns. The same flat action name can exist in different tools.
 
 Actions accept flat names such as `list` or dot-namespaced names such as `releases.get` and `alert-rule.list`.
 Namespaced actions must use a namespace that their tool declares.
@@ -36,7 +36,10 @@ Skill authors supply workflow prose and supporting files explicitly. The macro d
 
 ## Input Schemas And Filters
 
-Action input types derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build each tool's `input.oneOf` schema.
+Action input types derive `serde::Deserialize` and `schemars::JsonSchema`. The macro pairs each input schema with its action in a request-level `oneOf` branch. The top-level schema remains an object with explicit `action`, `input`, and `filter` properties and `additionalProperties: false`.
+For payload discovery, `properties.input.anyOf` also exposes each raw input schema with an action-specific title and no extra `allOf` wrapper. No-input shapes include both `null` and an empty object. This redundant union permits duplicate schemas; it does not enforce action/input associations.
+For validation, consumers must retain the request-level `oneOf` and select branches by `properties.action.const`, not array position. Those branches enforce the action/input association, required input, and non-null typed input. The root discovery union alone does not describe valid requests.
+Typed actions require a non-null `input`, even for nullable types or types with only optional fields. Request parsing treats explicit `null` as absent before deserialization. No-input actions accept omission, `null`, or an empty object, but reject other values.
 Progressive request parsing rejects unknown envelope fields. Action types control their own input deserialization.
 The optional filter accepts omission or explicit `null`.
 
