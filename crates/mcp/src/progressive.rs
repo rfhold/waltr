@@ -122,19 +122,44 @@ pub fn tool_definition(name: &str, description: &str, input_schema: Value) -> Mc
 /// Build a generated progressive tool input schema.
 #[must_use]
 pub fn input_schema(actions: &[&str], inputs: Vec<ActionInputSchema>) -> Value {
-    let mut input_options = Vec::new();
-    input_options.extend(inputs.into_iter().map(|input| {
-        let mut schema = input.schema.unwrap_or_else(|| json!({ "type": "null" }));
-        if let Value::Object(object) = &mut schema {
-            object
-                .entry("title".to_owned())
-                .or_insert_with(|| Value::String(format!("{} input", input.action)));
-            object
-                .entry("description".to_owned())
-                .or_insert_with(|| Value::String(format!("Use with action `{}`.", input.action)));
-        }
-        schema
-    }));
+    let mut input_options = Vec::with_capacity(inputs.len());
+    let request_options = inputs
+        .into_iter()
+        .map(|input| {
+            let has_input = input.schema.is_some();
+            let mut schema = input.schema.unwrap_or_else(|| {
+                json!({
+                    "anyOf": [
+                        { "type": "null" },
+                        { "type": "object", "maxProperties": 0 }
+                    ]
+                })
+            });
+            if let Value::Object(object) = &mut schema {
+                object.insert(
+                    "title".to_owned(),
+                    Value::String(format!("{} input", input.action)),
+                );
+                object.entry("description".to_owned()).or_insert_with(|| {
+                    Value::String(format!("Use with action `{}`.", input.action))
+                });
+            }
+            input_options.push(schema.clone());
+            let schema = if has_input {
+                json!({ "allOf": [schema, { "not": { "type": "null" } }] })
+            } else {
+                schema
+            };
+            json!({
+                "type": "object",
+                "required": if has_input { vec!["action", "input"] } else { vec!["action"] },
+                "properties": {
+                    "action": { "const": input.action },
+                    "input": schema
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -146,14 +171,15 @@ pub fn input_schema(actions: &[&str], inputs: Vec<ActionInputSchema>) -> Value {
                 "enum": actions
             },
             "input": {
-                "description": "Action-specific input.",
-                "oneOf": input_options
+                "description": "Action-specific input. See the request oneOf branch matching action.",
+                "anyOf": input_options
             },
             "filter": {
                 "type": ["string", "null"],
                 "description": "Optional jq-compatible filter applied to the action JSON output. Examples: `.id`, `.[].id`, `[.[] | .id]`."
             }
-        }
+        },
+        "oneOf": request_options
     })
 }
 

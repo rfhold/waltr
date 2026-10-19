@@ -46,6 +46,7 @@ url.workspace = true
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+jsonschema = { version = "0.33.0", default-features = false }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 rmcp = { version = "3.1.2", features = ["client", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 tempfile.workspace = true
