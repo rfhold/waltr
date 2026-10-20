@@ -193,11 +193,11 @@ Run Tauri host tests:
 
 `cargo test -p waltr-app`
 
-This layer checks embedded paths, source and manifest policy, bridge generations, and native observability privacy.
+This layer checks embedded paths, profile persistence, strict URL policy, identity-bound credential namespaces, deletion fences, bridge generations, and native observability privacy. Source and manifest tests check Android JNI, callback declarations, secure-store retention, and local-only notification gates. They do not exercise real OS credential stores, browser callbacks, Android intents, or WKWebView.
 
 It must remove endpoint and bearer values from every serialized snapshot. An authorization URL that contains the private callback endpoint must also disappear.
 
-The full authorization URL must remain Rust-only. The opener must require the active generation's current opaque attempt ID.
+The full outbound authorization URL that contains the private local endpoint must remain Rust-only. Its opener must require the active generation's current opaque attempt ID.
 
 Android checks must cover off-callback joins, foreground promotion, and permission updates for active and fresh generations.
 
@@ -269,7 +269,7 @@ Compile the Android manifest and Kotlin host layer without the Rust cross-build:
 
 `./gradlew :app:processUniversalDebugMainManifest :app:compileUniversalDebugKotlin -x rustBuildUniversalDebug`
 
-These Gradle checks validate Android source and manifest integration. They do not validate native linking or installed-device behavior. Static Android checks cannot prove notification rendering or runtime Stop-intent delivery.
+These Gradle checks require the Tauri-generated `tauri.settings.gradle` project configuration. A missing generated configuration blocks Gradle before source compilation. The checks validate Android source and manifest integration, not native linking or installed-device behavior. Static checks prove neither real callback intent delivery nor AndroidKeyStore operations. Notification rendering and runtime Stop-intent delivery also require an installed build.
 
 Verify that committed launcher resources are deterministically generated from the web favicon, include legacy and adaptive regular/round assets, and keep the duplicate Android resource trees synchronized:
 
@@ -285,7 +285,7 @@ Package, feature-tree, and Gradle checks do not prove Android runtime behavior. 
 
 On an installed Android build, verify these outcomes:
 
-1. Deny notification permission. Confirm that no server starts and the adapter-private startup sequence remains at the permission gate without changing route presentation.
+1. Select Local, then deny notification permission. Confirm no server starts and the adapter-private sequence stays at the permission gate.
 2. Grant notification permission. Confirm the foreground notification and local client readiness.
 3. Create durable session and Routine state. Confirm that activity pause stops only the client runtime.
 4. Resume the activity. Confirm a fresh client generation reconnects to the same server state.
@@ -302,7 +302,15 @@ On an installed Android build, verify these outcomes:
 15. Tap Stop after readiness. Confirm nonblocking server shutdown, notification removal, service stop, and no automatic sticky restart.
 16. Tap Stop during server startup. Confirm the same shutdown, notification removal, service stop, and no automatic sticky restart.
 17. Start Waltr normally, then remove its task without Stop. Confirm the documented best-effort service continuity remains unchanged.
-18. After Stop completes, reopen or resume Waltr. Confirm that it starts a fresh server generation and does not retain a disabled setting.
+18. After Stop completes, select Local or resume an activity with Local selected. Confirm a fresh server generation and no disabled setting.
+19. On first launch, confirm an explicit server choice and no eager local server. Save a remote profile without an automatic connection.
+20. Select a remote profile. Confirm no local service startup or notification request. Confirm that later launches reconnect only the last successful profile.
+21. Complete remote native login through a warm browser callback. Confirm exact redirect/state rejection, runtime continuity across pause, and successful protected access.
+22. Terminate the process during login, then deliver the callback as a cold start. Confirm no prior attempt resumes; start a new login.
+23. Restart after successful login. Confirm secure refresh restore and rotation without token exposure in snapshots, registry, logs, or WebView storage.
+24. Simulate secure-store unavailability. Confirm no plaintext fallback. Confirm sign-out clears protected state and reports credential deletion failure.
+25. Remove a remote profile. Confirm deletion of every secure credential identity and rejection of stale writes. Confirm Local remains nonremovable.
+26. Start Local, then switch to remote. Confirm that the local server persists and client routes, drafts, and generations reset independently.
 
 Installed-device validation must cover a supported Android version before release. Current local Rust and Gradle checks do not satisfy this gate.
 
@@ -511,10 +519,14 @@ For the current local acceptance, the user tests the normal app before any separ
 This acceptance order does not disable Apps or require the optional diagnostic harness.
 This procedure grants none of those permissions.
 
-1. Record a fresh ordinary self-MCP `status` call/result pair in a session.
+1. Select Local or a compatible remote profile, then record a fresh ordinary self-MCP `status` call/result pair in a session.
 2. Select **Open app** on that complete pair.
 3. Check the initial observation, Refresh, Close, and reopen through the ordinary session RPC path.
-4. Quit the app normally to check listener shutdown.
+4. Switch profiles. Confirm the old asset listener stops and the new runtime supplies a distinct trusted container.
+5. With a remote profile, confirm Apps requires no local embedded server or API credentials in the asset listener.
+6. Quit the app normally to check listener shutdown.
+
+Separately verify native access with the real macOS browser callback and Keychain. Check refresh restore, rotation, sign-out, profile removal, and secure-store denial. Unit tests establish none of these OS-level outcomes.
 
 Older text-only calls do not acquire an Open app action retroactively.
 The normal startup returns the container URL only after the WKNavigationDelegate installation acknowledges success.
