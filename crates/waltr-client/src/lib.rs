@@ -89,9 +89,11 @@ pub use waltr::grpc::waltr::session::v1::{
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
 pub use native_access::{
-    NativeAccessAction, NativeAccessConfig, NativeAccessCoordinator, NativeAccessOutput,
-    NativeAccessProgress, NativeAuthorizationCallback, NativeCallbackPolicy, NativeLoopbackPolicy,
+    NativeAccessAction, NativeAccessBootstrap, NativeAccessConfig, NativeAccessCoordinator,
+    NativeAccessDiscoveryError, NativeAccessOutput, NativeAccessProgress,
+    NativeAuthorizationCallback, NativeCallbackPolicy, NativeLoopbackPolicy,
     NativeRefreshTokenStore, NativeRefreshTokenStoreError, NonPersistentNativeRefreshTokenStore,
+    discover_native_access_config,
 };
 pub use routine::{
     ClientManualRoutineDefinition, ClientRoutineAdmission, ClientRoutineDefinitionSnapshot,
