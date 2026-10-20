@@ -33,7 +33,11 @@ See [macOS Apps verification](../../docs/testing.md#macos-native-apps-verificati
 
 Waltr access login navigates to server-owned `/oidc/login` with a safe local return path; the browser never handles provider tokens or the HttpOnly Waltr session cookie. Logout is same-origin POST before dispatching shared protected-state clearing. Keep this UI separate from provider/upstream-MCP `OAuthDialog`; server-callback MCP attempts poll shared lifecycle state and never expose token or PKCE material.
 
-Route access and readiness only from authoritative shared snapshots; do not add an embedded or topology bypass. `ClientAdapter.access` is a generic optional capability: the browser adapter supplies `openLogin` and same-origin `logout`, while the Tauri adapter supplies neither. A login-required snapshot without access operations shows no sign-in action, and an authenticated shell without them shows no sign-out action.
+Route access and readiness only from authoritative shared snapshots; do not add an embedded or topology bypass. `ClientAdapter.access` is a generic optional capability. The browser supplies server login and same-origin logout; Tauri supplies native access operations only for an explicit non-`local` server ID. Without access operations, login-required snapshots show no sign-in action and authenticated shells show no sign-out action.
+
+`App.tsx` lazy-loads `NativeApp` only for Tauri, except injected loaders and fixtures. `ServerPicker` uses Rust registry IPC for URL plus optional name, explicit first choice, and last-successful-server reconnect. Keep selection outside shared server state. Switch and retry dispose the adapter, remount the keyed provider/router, and reset the route to `/`. Preserve Switch server across startup, access, and authenticated shell surfaces, plus Retry connection on startup failure. See [native server selection](../../docs/architecture/clients.md#native-server-selection-frontend).
+
+Pass the exact current generation to native dispatch, access, opener, and disposal IPC. Dispose late startup by its returned generation; never issue unqualified disposal. Keep platform events adapter-private and reject stale recovery or command results.
 
 Treat native `platform` startup events as adapter-private IPC sequencing inputs, not app context or route presentation. Never expose the loopback endpoint, local bearer, paths, or native failures through WebView state.
 

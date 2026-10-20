@@ -1,6 +1,7 @@
 import { createSignal, Show } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { ServerControls } from "../../app/ServerControls";
 import { InlineAlert } from "../../components/ui";
 
 export type BrowserLocation = Pick<Location, "pathname" | "search" | "hash">;
@@ -125,6 +126,7 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
             <button class="ui-button" type="button" disabled={!access()?.activeAttemptId} onClick={cancel}>Cancel login</button>
           </div>
         </Show>
+        <ServerControls />
       </section>
     </main>
   );

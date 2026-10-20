@@ -38,7 +38,16 @@ type TauriApi = {
   listen: typeof listen;
 };
 
-export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promise<ClientAdapter> {
+export type ServerProfile = { id: string; name: string; url?: string };
+export type ServerRegistry = { servers: ServerProfile[]; lastConnectedId: string | null };
+
+export const serverRegistry = {
+  list: () => invoke<ServerRegistry>("list_servers"),
+  save: (url: string, name?: string) => invoke<ServerProfile>("save_server", { url, name }),
+  remove: (serverId: string) => invoke<void>("remove_server", { serverId }),
+};
+
+export async function loadTauriClient(api: TauriApi = { invoke, listen }, serverId?: string): Promise<ClientAdapter> {
   let currentSnapshot: ClientSnapshot | undefined;
   let generation: number | undefined;
   let announcedGeneration: number | undefined;
@@ -126,9 +135,9 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
         return;
       }
 
-      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown }>("start_runtime");
+      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown }>("start_runtime", { serverId });
       if (disposed) {
-        await api.invoke("dispose_runtime");
+        await api.invoke("dispose_runtime", { generation: runtime.generation });
         return;
       }
       generation = runtime.generation;
@@ -141,11 +150,13 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
       }
       runtimeReady = true;
     } catch (error) {
-      acceptNativeAppsBootstrap(undefined);
+      if (!disposed) acceptNativeAppsBootstrap(undefined);
       started = false;
       unlisten?.();
       unlisten = undefined;
-      await api.invoke("dispose_runtime").catch(() => undefined);
+      if (generation !== undefined) {
+        await api.invoke("dispose_runtime", { generation }).catch(() => undefined);
+      }
       throw error;
     }
   };
@@ -159,7 +170,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
     unlisten?.();
     unlisten = undefined;
     snapshotListeners.clear();
-    await api.invoke("dispose_runtime");
+    if (generation !== undefined) await api.invoke("dispose_runtime", { generation });
   };
 
   return {
@@ -171,7 +182,8 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
       return () => snapshotListeners.delete(listener);
     },
     dispatch: async (command: ClientCommand) => {
-      const event = await api.invoke<BridgeEvent>("client_dispatch", { command });
+      if (disposed || generation === undefined) throw new Error("Native client is not ready");
+      const event = await api.invoke<BridgeEvent>("client_dispatch", { command, generation });
       if (disposed || event.generation !== generation) throw new Error("native command returned stale client state");
       await enqueue(event);
       if (event.payload.type !== "state") throw new Error("native command did not return client state");
@@ -179,8 +191,25 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }): Promi
       return currentSnapshot;
     },
     dispose,
-    openAuthorizationAttempt: (attemptId) => api.invoke("open_authorization_attempt", { attemptId }),
-    openExternalUrl: (url) => api.invoke("open_external_url", { url }),
+    access: serverId && serverId !== "local" ? {
+      openLogin: async () => {
+        if (disposed || generation === undefined) throw new Error("Native client is not ready");
+        await api.invoke("start_access_login", { generation });
+      },
+      logout: async () => {
+        if (disposed || generation === undefined) throw new Error("Native client is not ready");
+        await api.invoke("logout_access", { generation });
+        return true;
+      },
+    } : undefined,
+    openAuthorizationAttempt: async (attemptId) => {
+      if (disposed || generation === undefined) throw new Error("Native client is not ready");
+      await api.invoke("open_authorization_attempt", { attemptId, generation });
+    },
+    openExternalUrl: async (url) => {
+      if (disposed || generation === undefined) throw new Error("Native client is not ready");
+      await api.invoke("open_external_url", { url, generation });
+    },
   };
 }
 

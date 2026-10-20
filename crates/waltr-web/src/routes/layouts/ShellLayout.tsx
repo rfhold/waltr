@@ -3,10 +3,12 @@ import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from
 import type { ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { useServerSelection } from "../../app/serverSelection";
 import { reportApplicationView } from "../../telemetry";
 
 export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   const app = useAppState();
+  const serverSelection = useServerSelection();
   const location = useLocation();
   const snapshot = createMemo(() => app.snapshot());
   const [loggingOut, setLoggingOut] = createSignal(false);
@@ -15,6 +17,8 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   let drawer: HTMLElement | undefined;
   let drawerTrigger: HTMLButtonElement | undefined;
   let previousPath = location.pathname;
+  let mounted = true;
+  onCleanup(() => { mounted = false; });
 
   const closeDrawer = (restoreFocus = true) => {
     if (!drawerOpen()) return;
@@ -95,27 +99,33 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
       return;
     }
 
+    const current = () => mounted && app.accessOperations() === accessOperations;
     try {
-      if (!await accessOperations.logout()) {
+      const signedOut = await accessOperations.logout();
+      if (!current()) return;
+      if (!signedOut) {
         setLogoutError("Waltr could not sign you out. Try again.");
         setLoggingOut(false);
         return;
       }
     } catch {
+      if (!current()) return;
       setLogoutError("Unable to reach Waltr to sign out. Check your connection and try again.");
       setLoggingOut(false);
       return;
     }
 
+    if (!current()) return;
     try {
       await app.dispatch({ type: "logoutWaltr" });
     } catch {
+      if (!current()) return;
       setLogoutError("The server session ended, but the app could not clear local state. Reloading...");
       setLoggingOut(false);
       (props.reload ?? (() => window.location.reload()))();
       return;
     }
-    setLoggingOut(false);
+    if (current()) setLoggingOut(false);
   };
 
   return (
@@ -207,6 +217,9 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
           >
             Config
           </A>
+          <Show when={serverSelection}>
+            <button class="shell__logout" type="button" onClick={() => serverSelection?.switchServer()}>Switch server</button>
+          </Show>
           <Show when={app.accessOperations()}>
             <button class="shell__logout" type="button" disabled={loggingOut()} onClick={logout}>
               {loggingOut() ? "Signing out..." : "Sign out"}

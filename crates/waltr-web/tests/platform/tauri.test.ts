@@ -97,6 +97,7 @@ describe("Tauri client adapter", () => {
     await adapter.start();
 
     await expect(adapter.dispatch({ type: "requestAuthStatuses" })).resolves.toBe(dispatched);
+    expect(invoke).toHaveBeenCalledWith("client_dispatch", { command: { type: "requestAuthStatuses" }, generation: 2 });
     emit(bridgeState(2, 1, dispatched));
     await Promise.resolve();
     expect(seen).toEqual([initial, dispatched]);
@@ -117,6 +118,7 @@ describe("Tauri client adapter", () => {
         emit(bridgeState(6, 0, initial));
         return { generation: 6 };
       }
+      if (command === "open_authorization_attempt") return;
       throw new Error(`unexpected command ${command}`);
     });
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
@@ -125,6 +127,8 @@ describe("Tauri client adapter", () => {
 
     emit(bridgeState(7, 0, resumed));
     await vi.waitFor(() => expect(adapter.snapshot()).toBe(resumed));
+    await adapter.openAuthorizationAttempt!("resumed-attempt");
+    expect(invoke).toHaveBeenCalledWith("open_authorization_attempt", { attemptId: "resumed-attempt", generation: 7 });
     emit(bridgeState(6, 10, namedSnapshot("old-generation")));
     await Promise.resolve();
     expect(adapter.snapshot()).toBe(resumed);
@@ -234,11 +238,86 @@ describe("Tauri client adapter", () => {
     await adapter.dispose();
 
     expect(adapter.access).toBeUndefined();
-    expect(invoke.mock.calls).toContainEqual(["open_authorization_attempt", { attemptId: "attempt-private" }]);
-    expect(invoke.mock.calls).toContainEqual(["open_external_url", { url: "https://auth.example/authorize" }]);
+    expect(invoke).toHaveBeenCalledWith("dispose_runtime", { generation: 4 });
+    expect(invoke.mock.calls).toContainEqual(["open_authorization_attempt", { attemptId: "attempt-private", generation: 4 }]);
+    expect(invoke.mock.calls).toContainEqual(["open_external_url", { url: "https://auth.example/authorize", generation: 4 }]);
     expect(order).toEqual(["unlisten", "dispose"]);
     await adapter.dispose();
     expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  test("selects a server and keeps access login and logout native and generation-fenced", async () => {
+    let emit!: (event: unknown) => void;
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(12, 0, namedSnapshot("remote")));
+        return { generation: 12 };
+      }
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
+    await adapter.start();
+    await adapter.access!.openLogin("/oidc/login?return_to=SECRET");
+    await expect(adapter.access!.logout()).resolves.toBe(true);
+    expect(invoke).toHaveBeenCalledWith("start_runtime", { serverId: "remote" });
+    expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12 });
+    expect(invoke).toHaveBeenCalledWith("logout_access", { generation: 12 });
+    expect(JSON.stringify(invoke.mock.calls)).not.toContain("SECRET");
+    await adapter.dispose();
+    expect(invoke).toHaveBeenCalledWith("dispose_runtime", { generation: 12 });
+    await expect(adapter.access!.logout()).rejects.toThrow("not ready");
+  });
+
+  test("built-in local admission does not expose user access operations", async () => {
+    const api = { invoke: vi.fn() as never, listen: vi.fn() as never };
+    expect((await loadTauriClient(api)).access).toBeUndefined();
+    expect((await loadTauriClient(api, "local")).access).toBeUndefined();
+    expect((await loadTauriClient(api, "remote")).access).toBeDefined();
+  });
+
+  test("dispatch and openers reject before IPC when unstarted or disposed", async () => {
+    let emit!: (event: unknown) => void;
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(30, 0, namedSnapshot("active")));
+        return { generation: 30 };
+      }
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
+    const rejectOperations = async () => {
+      await expect(adapter.dispatch({ type: "requestAuthStatuses" })).rejects.toThrow("not ready");
+      await expect(adapter.openAuthorizationAttempt!("stale-attempt")).rejects.toThrow("not ready");
+      await expect(adapter.openExternalUrl!("https://example.com")).rejects.toThrow("not ready");
+    };
+    await rejectOperations();
+    expect(invoke).not.toHaveBeenCalled();
+    await adapter.start();
+    await adapter.dispose();
+    invoke.mockClear();
+    await rejectOperations();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  test("disposes a late startup by its exact generation, never an unqualified replacement", async () => {
+    let complete!: (value: { generation: number }) => void;
+    const runtime = new Promise<{ generation: number }>((resolve) => { complete = resolve; });
+    const listen = vi.fn(async () => vi.fn());
+    const invoke = vi.fn(async (command) => command === "start_runtime" ? runtime : undefined);
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "old");
+    const starting = adapter.start();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("start_runtime", { serverId: "old" }));
+    await adapter.dispose();
+    expect(invoke).not.toHaveBeenCalledWith("dispose_runtime");
+    complete({ generation: 20 });
+    await starting;
+    expect(invoke).toHaveBeenCalledWith("dispose_runtime", { generation: 20 });
   });
 
   test("replacement during recovery rejects the triggering stale-generation event", async () => {
