@@ -41,7 +41,7 @@ Run the Linux Tauri app with its packaged local web assets:
 
 `pnpm --filter @rfhold/waltr-app dev`
 
-The Tauri app starts its own loopback Waltr server. It has no native Waltr access login. See [docs/deployment.md](docs/deployment.md#tauri-application).
+The Tauri picker selects Local or a saved remote server. Local starts the embedded server on demand; remote selections use native Waltr access OAuth when available. See [docs/deployment.md](docs/deployment.md#tauri-application).
 
 Install and run the bundled TUI with an embedded server and web assets:
 

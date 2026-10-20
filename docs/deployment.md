@@ -424,11 +424,19 @@ The callback and every HTTP OIDC endpoint must then be loopback. These flags are
 
 ## Native Client Registration
 
-Register a separate public native client for remote native clients such as the TUI. It must allow Authorization Code with PKCE S256 and the selected loopback redirects. The shared native protocol sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery can advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not create an app secret or reuse the browser secret.
+Register a separate public native client for the TUI and Tauri remote profiles. It must allow Authorization Code with PKCE S256 and each host's callback policy. The shared native protocol sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery can advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not create an app secret or reuse the browser secret.
 
-The bundled Tauri app does not use this registration. It admits its Rust client to the embedded server with a process-generation local bearer.
+Tauri remote profiles use this public native registration through URL-only bootstrap. Desktop requires ephemeral loopback callbacks; Android requires the exact `dev.waltr.app:/oauth2redirect` callback. Tauri Local instead uses its process-generation local bearer and no access OAuth.
 
-Configure the TUI process with:
+For URL-only bootstrap, set server-side `WALTR_API_OIDC_CLIENT_ID` to the public native client identifier. The API-root protected-resource document then advertises the optional `waltr_native_client` extension with:
+
+- `client_id` from `WALTR_API_OIDC_CLIENT_ID`;
+- deduplicated `openid`, `offline_access`, and `WALTR_API_REQUIRED_SCOPES`;
+- `audience` from `WALTR_API_OIDC_AUDIENCE` or its legacy fallback.
+
+The shared client helper accepts the endpoint and host callback policy, validates discovery, and returns public configuration plus the exact issuer. This Waltr application extension provides neither universal OIDC client discovery nor DCR. It exposes no browser client secret. Older authenticated servers need an update or explicit native-client configuration. See [URL-only native bootstrap](architecture/access-authentication.md#url-only-native-bootstrap) for the contract.
+
+The TUI retains explicit environment configuration; it does not use this helper. Configure the TUI process with:
 
 ```text
 WALTR_SERVER_ENDPOINT=https://waltr.example
@@ -462,7 +470,7 @@ Native telemetry uses standard service-style OpenTelemetry SDK providers: a batc
 
 Native provider setup and export remain fail-open. Initialization failure emits the fixed stderr line `waltr native telemetry initialization failed; continuing without telemetry`. All three exporters share a blocking Rustls client that disables redirects. The client strips inherited or environment-derived request headers and retains only the canonical OTLP protobuf content type. Trace and log shutdown requests use a two-second bound; OpenTelemetry SDK 0.32 metric shutdown uses its fixed five-second bound. Subscriber, TLS, exporter, request, or shutdown failures do not block app startup or use. Operators must not treat application success as proof of telemetry delivery. Local and debug app runs attempt export, but deterministic Rust tests use in-memory exporters and do not contact collectors. Android lifecycle suspension remains nonblocking and does not synchronously flush. Abrupt process termination can discard queued telemetry. Native panic events exclude panic payload text and retain fixed panic metadata.
 
-Native Waltr access and native OTLP use rustls with the ring provider, safe TLS 1.2 or 1.3, and bundled `webpki_roots`. On Android, the same explicit TLS and root policy covers server-owned models.dev catalog refresh and provider and upstream-MCP OAuth discovery, registration, exchange, and revocation; agent provider and MCP OAuth refresh; OpenAI and Anthropic HTTP inference; and Waltr-agent MCP Streamable HTTP through a caller-supplied generic MCP reqwest client. OpenAI websocket already uses explicit ring and bundled roots on every platform. These Android clients retain certificate-chain and hostname checks but exclude Android platform, user, and private roots and `SSL_CERT_FILE`. Non-Android paths retain default/platform reqwest behavior where they previously used it. Other Android networking paths continue to use platform verification initialized by the foreground service. The Tauri Waltr client connects only to its host-created HTTP loopback endpoint. Hosted browser and WebView Faro trust remain platform-owned.
+Native Waltr access and native OTLP use rustls with the ring provider, safe TLS 1.2 or 1.3, and bundled `webpki_roots`. On Android, the same explicit TLS and root policy covers server-owned models.dev catalog refresh and provider and upstream-MCP OAuth discovery, registration, exchange, and revocation; agent provider and MCP OAuth refresh; OpenAI and Anthropic HTTP inference; and Waltr-agent MCP Streamable HTTP through a caller-supplied generic MCP reqwest client. OpenAI websocket already uses explicit ring and bundled roots on every platform. These Android clients retain certificate-chain and hostname checks but exclude Android platform, user, and private roots and `SSL_CERT_FILE`. Non-Android paths retain default/platform reqwest behavior where they previously used it. Other Android networking paths continue to use platform verification initialized by the foreground service. Tauri remote profiles use native HTTPS; only Local uses its host-created HTTP loopback endpoint. Hosted browser and WebView Faro trust remain platform-owned.
 
 Client telemetry follows the boundary in [Clients](architecture/clients.md#client-observability-boundary). Standard Faro data is high-detail personal-use telemetry, not a globally sanitized stream.
 
@@ -478,7 +486,11 @@ Use [Telemetry Smoke Checks](runbooks/telemetry-smoke.md) after a build and runt
 
 ## Tauri Application
 
-`crates/waltr-app/` packages local `crates/waltr-web/` assets and an embedded `waltr-server`. It runs the shared client in Rust against an ephemeral IPv4 loopback endpoint.
+`crates/waltr-app/` always loads packaged local `crates/waltr-web/` assets and runs the shared client in Rust. The picker selects Local or a saved remote profile. First launch requires a choice; later launches reconnect the last server that reached an authenticated shared snapshot.
+
+App-data `servers.json` stores only nonsecret profiles and the last successful ID. Rust requires HTTPS except for exact loopback hosts and rejects URL credentials, queries, and fragments. Profile saves do not connect automatically. Switch server disposes the selected client and clears server-specific routes and drafts. Retry connection remounts the same selection.
+
+Local starts the embedded `waltr-server` lazily on an ephemeral IPv4 loopback endpoint. Switching away retains an active local server and its state. Remote selection starts no embedded server or Android foreground service and requests no notification permission.
 
 Each server generation receives a random 256-bit local bearer. Rust keeps the endpoint and bearer out of IPC, WebView state, logs, and telemetry.
 
@@ -502,14 +514,19 @@ Embedded attempts and MCP credentials persist only an opaque per-generation call
 
 Every embedded server restart rejects stale markers and credentials. Status and cancel return not found for stale attempts, and self-MCP credential logout returns failed precondition because that credential is host-owned. Affected outbound MCP targets require reauthorization and cannot reuse generation-specific DCR registration.
 
-The app has no Waltr endpoint selector or native Waltr access OAuth. Its web adapter supplies no generic Waltr access operations, so an unexpected login-required snapshot offers no sign-in action and the authenticated shell offers no sign-out action. Routes still follow authoritative shared access and readiness snapshots. Provider and upstream-MCP OAuth remain server-owned.
+Remote profiles use [URL-only native bootstrap](architecture/access-authentication.md#url-only-native-bootstrap) and public-client PKCE. The server must advertise compatible native client metadata for sign-in. Local exposes no user access operations. Remote sign-in opens the system browser from Rust; remote sign-out clears access and all secure credentials for that profile.
+
+macOS stores refresh tokens in Keychain. Android uses AndroidKeyStore AES-256-GCM keys and atomic encrypted files under `noBackupFilesDir`. Other desktop targets return secure-storage unavailable; no plaintext fallback exists. Access tokens remain in memory. Switching or runtime disposal retains refresh credentials; profile removal deletes all credential identities before its registry entry. See [Tauri native host adapter](architecture/access-authentication.md#tauri-native-host-adapter) for namespace, refresh, deletion, and callback contracts.
+
+Android warm `onNewIntent` callbacks target the current remote runtime. Cold-start intents do not recover an OAuth attempt; process death requires a new login. Routes follow authoritative shared access and readiness snapshots. The web adapter ignores native access progress for presentation. Provider and upstream-MCP OAuth remain server-owned.
 
 The main WebView loads only packaged local assets. Remote navigation and new windows remain denied. Rust validates credential-free HTTPS URLs before the operating system opens them.
 
 Normal Apple Silicon macOS builds enable Apps without `native-apps-test`, a disposable profile, or a prior diagnostic report.
 Target-specific Cargo dependencies select host assets, served assets, and the WKWebView adapter.
-Rust owns a dedicated ephemeral loopback container and joins its lifecycle with the embedded server.
-An unexpected listener exit fails the owner and triggers cleanup.
+Rust owns a dedicated trusted loopback asset listener per client runtime, independent of the selected API server.
+Local and remote profiles use the same local Apps assets; the listener serves no API and receives no API bearer.
+Switch or disposal detaches its WK navigation policy and shuts down its listener.
 The base `tauri.conf.json` retains `frame-src 'none'`; no automatic macOS configuration relaxes that policy.
 At startup, `app_container.rs` applies compile-target-aware CSP through `context.config_mut()` before the Tauri builder consumes the context.
 Only macOS/aarch64 permits `http://127.0.0.1:*/container.html`; other targets, including Intel macOS, retain `frame-src 'none'`.
@@ -518,7 +535,7 @@ Rust further restricts subframe navigation to exact current-generation ports and
 Empty `about:blank` and `about:srcdoc` frames require a packaged-page or trusted current-generation asset source.
 The `start_runtime` response exposes `nativeApps.containerUrl` only after the WKNavigationDelegate installation acknowledges success.
 That acknowledgement enforces runtime security; it is not a release-validation gate.
-The private API endpoint and generation bearer remain Rust-only; the six application IPC commands retain their packaged-top-frame boundary.
+The private Local API endpoint and bearer remain Rust-only. Every application IPC command retains its packaged-top-frame boundary.
 Other native platforms remain unsupported; no Intel or universal package support follows from this target.
 
 The optional `native-apps-test` diagnostic feature requires `tauri.native-apps-test.conf.json` and identifier `dev.waltr.app.native-apps-test`.
@@ -570,7 +587,7 @@ Focused deterministic checks are listed in [Testing](testing.md). Package creati
 
 ### Android Foreground Service
 
-Android requires notification permission before it starts the embedded server on Android 13 and later. Denial leaves startup at `notificationPermissionRequired`.
+Local selection requires notification permission before embedded-server startup on Android 13 and later. Denial leaves local startup at `notificationPermissionRequired`. Remote mode does not require that permission.
 
 `WaltrForegroundService` is non-exported and runs in the app process. It uses foreground-service type `specialUse`, a persistent notification, and `android:stopWithTask="false"`.
 
@@ -580,11 +597,11 @@ The service enters foreground state before it loads the native library. Native s
 
 The current `specialUse` declaration targets sideload distribution. Play distribution requires separate policy review, declarations, and product work.
 
-Activity pause stops only the client runtime. The service and embedded server survive background and task removal on a best-effort basis.
+In Local mode, activity pause stops only the client runtime. Local resume creates a fresh client generation. The service and embedded server survive background and task removal on a best-effort basis. Remote mode preserves the client across activity pause, including an active native login attempt.
 
-The Stop action does not persist a disabled setting. A later app open or resume starts a fresh embedded server generation after the prior generation stops.
+The Stop action persists no disabled setting. A later Local selection or Local activity resume can start a fresh embedded server generation after the prior generation stops. Remote resume never requests a local server.
 
-Android lifecycle callbacks never wait for Rust client or server thread joins. Reaper threads complete those joins outside callbacks.
+Android Local lifecycle callbacks signal client stop and enqueue retirement without a thread join. Each bridge owns one managed background reaper that joins retired clients and automatically removes completed records. IPC disposal awaits tracked completion barriers off-callback under `selection.operation`; IPC replacement waits for those barriers before a new runtime starts. Server-controller reaper threads retain their separate exact-generation server shutdown contract.
 
 A nonblocking server stop transitions the exact current generation to `Stopping` and detaches its thread under the controller lock. Its reaper joins only that generation and publishes `Stopped` or `Failed` after the join.
 
@@ -592,7 +609,7 @@ New start reservation waits while the controller is `Stopping`, so a replacement
 
 Notification permission changes publish an adapter-private startup control event to an active client generation. A later client generation reads the current permission state at startup.
 
-A fresh generation applies permission state before it can use an existing server connection. Permission-required generations remain disconnected until permission changes.
+A fresh Local generation applies permission state before it can use the current server connection. Permission-required Local generations remain disconnected until permission changes. Remote generations bypass the local notification gate.
 
 Each client-start ticket owns the exact bridge generation that it creates. Suspend invalidates in-progress ownership, and resume creates a replacement ticket.
 
@@ -600,7 +617,7 @@ A stale or suspended completion stops only its own generation. It never stops a 
 
 Foreground-service APIs do not guarantee survival through force-stop, process kill, reboot, or user termination. Android can terminate the process at any time.
 
-After process death, a later service or app start creates a new endpoint and bearer. Durable stores reopen, and Routine restart reconciliation handles unfinished invocations.
+After process death, a later local service start creates a new endpoint and bearer. Durable stores reopen, and Routine restart reconciliation handles unfinished invocations.
 
 Android excludes all app-private files, databases, shared preferences, and root data from cloud backup and device transfer.
 
