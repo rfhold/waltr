@@ -73,7 +73,7 @@ export class AppHost {
         post(message);
       },
     };
-    this.bridge = new AppBridge(null, { name: "Waltr", version: "0.2.1" }, {
+    this.bridge = new AppBridge(null, { name: "Waltr", version: "0.3.0" }, {
       serverTools: {}, sandbox: EMPTY_SANDBOX_CAPABILITIES,
     }, { hostContext: {
       toolInfo: { tool: structuredClone(options.tool) }, theme: options.theme,
