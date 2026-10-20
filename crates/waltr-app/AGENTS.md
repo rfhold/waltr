@@ -3,7 +3,10 @@
 | Path | Info |
 | --- | --- |
 | [src/server_controller.rs](src/server_controller.rs) | Process-owned embedded server, app-private paths, ephemeral loopback endpoint, and generation bearer. |
-| [src/bridge.rs](src/bridge.rs) | Rust-owned local client runtime, generation lifecycle, and bounded publication. |
+| [src/bridge.rs](src/bridge.rs) | Selected Local/remote client runtime, access coordinator, generation lifecycle, and bounded publication. |
+| [src/server_profiles.rs](src/server_profiles.rs) | Nonsecret profile registry, strict endpoint normalization, and last-success persistence. |
+| [src/native_auth.rs](src/native_auth.rs) | Verified discovery binding and native authorization browser policy. |
+| [src/credential_store.rs](src/credential_store.rs) | Identity-bound Keychain/AndroidKeyStore refresh persistence and server-wide deletion fences. |
 | [src/observability.rs](src/observability.rs) | All-build native OTLP traces, logs, and metrics, fail-open lifecycle, test isolation, and privacy controls. |
 | [src/policy.rs](src/policy.rs) | External URL and local navigation security policies. |
 | [capabilities/](capabilities/) | Minimal local main-WebView IPC grants. |
@@ -14,12 +17,15 @@
 | [src/native_apps_navigation.rs](src/native_apps_navigation.rs) | Frame-aware WKNavigationDelegate for Apple Silicon macOS. |
 | [../../docs/testing.md#macos-native-apps-verification](../../docs/testing.md#macos-native-apps-verification) | Normal-app live acceptance and optional sanitized native diagnostics. |
 | [gen/android/app/src/main/AndroidManifest.xml](gen/android/app/src/main/AndroidManifest.xml) | Notification permissions, private foreground service, and backup policy references. |
-| [gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt](gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt) | Notification gate and activity-owned client lifecycle. |
+| [gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt](gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt) | Local notification gate, client lifecycle, warm OAuth callbacks, and secure-store initialization. |
+| [gen/android/app/src/main/java/dev/waltr/app/SecureTokenStore.kt](gen/android/app/src/main/java/dev/waltr/app/SecureTokenStore.kt) | Native-only AndroidKeyStore encryption and atomic refresh-token records. |
 | [gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt](gen/android/app/src/main/java/dev/waltr/app/WaltrForegroundService.kt) | Same-process Android embedded-server service and persistent notification. |
 
 # Boundaries
 
-This crate owns the Tauri shell, embedded server lifecycle, local client transport, and IPC adapter. It never uses native Waltr access OAuth.
+This crate owns the Tauri shell, server profiles, lazy embedded server, native client transport, access host adapters, secure credentials, and IPC.
+
+Local uses the private generation bearer. Remote profiles use shared native access after verified URL-only discovery. See [native access](../../docs/architecture/access-authentication.md#tauri-native-host-adapter) and [server selection](../../docs/architecture/clients.md#native-server-selection-frontend).
 
 Keep the ephemeral loopback endpoint and random 256-bit local bearer in Rust. Never expose either value through IPC, logs, telemetry, Kotlin, or WebView state.
 
@@ -39,6 +45,20 @@ Remove the exact endpoint and bearer from every snapshot before IPC publication.
 
 Keep one active client runtime generation. Preserve initial-before-update delivery, bounded latest-value snapshot coalescing, ordered command dispatch, stale-generation rejection, and complete disposal.
 
+Fence starts with selection tickets. Require the current generation for dispatch, access, openers, and disposal effects.
+
+Start the embedded server only for Local selection. Retain an active local server across remote switches. Remote selection requests no Android service or notification.
+
+Keep profiles nonsecret in app-data `servers.json`. Record last success only from an authenticated shared snapshot. Never remove Local.
+
+Bind refresh storage to server ID, normalized endpoint, exact discovered issuer, client ID, effective scope set, and audience. Use Keychain on macOS and AndroidKeyStore-encrypted atomic files on Android. Other desktop targets report unavailable; add no plaintext fallback.
+
+Stop auth tasks before server-wide credential deletion. Fence old store handles against detached writes. Delete secure credentials before profile removal; preserve the registry entry on deletion failure. Switch and ordinary disposal retain refresh credentials.
+
+Forward only bounded warm Android intents to the current coordinator. Keep exact callback/state validation in shared native access. Do not restore cold-start OAuth attempts.
+
+Keep native access progress private to IPC sequencing; web presentation follows shared snapshots.
+
 Use explicit app data and config roots for all embedded state. Resource overrides live exactly at app config `server/.waltr/resources`.
 
 After the server prebinds loopback, atomically overwrite `server/.waltr/resources/mcp-servers/waltr.yaml` with the generation URL before ordinary catalog load. The endpoint is durable on disk and refreshed each generation; only the bearer remains memory-only.
@@ -49,17 +69,17 @@ Desktop and Android load the same ordinary bundled and persisted resource catalo
 
 Android notification permission gates foreground-service startup. The non-exported same-process `specialUse` service owns the server and survives activity pause or task removal best effort.
 
-Activity pause stops only the client runtime. Activity resume creates a fresh client generation against the current server generation.
+Local activity pause stops only the client runtime. Local resume creates a fresh client generation against the current server generation. Remote pause preserves its runtime and native OAuth attempt; remote resume requests no local server.
 
 Suspend may preserve one unexpired pending outbound authorization attempt for only the immediate replacement client generation against the same server generation. Keep that handoff process-local, single-use, stale-safe, and secret-safe; ordinary stop, disposal, terminal state, skipped generations, and server replacement must clear it.
 
-Never join Rust client or server threads inside Android lifecycle callbacks. Signal stop there and complete joins on reaper threads.
+Never join Rust client or server threads inside Android lifecycle callbacks. Signal stop and enqueue client retirement there. Keep one managed `RetirementQueue` background reaper per bridge. Remove completed retirement records automatically. Await tracked completion barriers under `selection.operation` for IPC disposal and replacement. Preserve exact-generation server reaper threads separately.
 
 For a nonblocking server stop, transition the exact current generation to `Stopping` and detach its thread under the controller lock. Its reaper must join that exact thread before publishing `Stopped` or `Failed`.
 
 Make `reserve_start` wait through `Stopping`. Embedded server generations must never overlap their shared app-private roots, while Android callbacks remain nonblocking because the reaper owns the join.
 
-Apply notification permission before a fresh generation uses an existing server. Keep permission-required generations disconnected until permission changes.
+Apply notification permission before a fresh Local generation uses the current server. Keep permission-required Local generations disconnected until permission changes. Remote generations bypass this gate.
 
 Publish permission transitions to active client generations.
 
@@ -86,7 +106,7 @@ Change only `frame-src` in configured normal and development CSP; optional diagn
 Return `nativeApps.containerUrl` only after the WKNavigationDelegate installation acknowledges success.
 Treat that acknowledgement as runtime security enforcement, not a release-validation gate.
 Restrict optional `native-apps-test` diagnostics to Apple Silicon macOS and the disposable identifier/configuration.
-Keep asset URLs separate from the private API endpoint and bearer.
+Keep asset URLs separate from every selected API endpoint and bearer. Own trusted Apps assets per client runtime, independent of the embedded server. Detach the exact WK policy before asset shutdown on switch or disposal.
 Preserve exact current-generation subframe policy, packaged main navigation, popup denial, and owned listener shutdown.
 Pipe diagnostic-harness output directly through `scripts/native-apps-evidence.mjs`; never retain or `tee` raw invalid-key diagnostics.
 Unit tests and sanitizer reports do not prove live WKWebView behavior; neither is a prerequisite for normal Apps enablement.

@@ -56,6 +56,9 @@ pub enum BridgePayload {
     State { snapshot: Box<serde_json::Value> },
     /// Secret-free embedded platform startup lifecycle.
     Platform { startup: PlatformStartup },
+    Access {
+        progress: waltr_client::NativeAccessProgress,
+    },
 }
 
 /// Bounded startup states understood by the packaged frontend.
@@ -250,6 +253,10 @@ impl<T: Clone + Send + Sync> Publisher<T> {
 }
 
 enum HostRequest {
+    Access(waltr_client::NativeAccessAction),
+    LogoutAccess {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Dispatch {
         command: Box<ClientCommand>,
         reply: oneshot::Sender<Result<BridgeEvent<BridgePayload>, String>>,
@@ -443,12 +450,99 @@ struct RunningGeneration {
     thread: thread::JoinHandle<()>,
 }
 
+#[derive(Debug, Default)]
+struct Retirement {
+    joined: Mutex<Option<bool>>,
+    completed: std::sync::Condvar,
+}
+
+impl Retirement {
+    fn wait(&self) -> bool {
+        let mut joined = self
+            .joined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while joined.is_none() {
+            joined = self
+                .completed
+                .wait(joined)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        joined.unwrap_or(false)
+    }
+}
+
+#[derive(Debug)]
+struct RetirementWork {
+    thread: thread::JoinHandle<()>,
+    retirement: Arc<Retirement>,
+}
+
+struct RetirementQueue {
+    pending: Arc<Mutex<Vec<Arc<Retirement>>>>,
+    sender: Option<std::sync::mpsc::Sender<RetirementWork>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl RetirementQueue {
+    fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<RetirementWork>();
+        let pending = Arc::new(Mutex::new(Vec::<Arc<Retirement>>::new()));
+        let worker_pending = Arc::clone(&pending);
+        let worker = thread::Builder::new()
+            .name("waltr-client-reaper".into())
+            .spawn(move || {
+                for RetirementWork { thread, retirement } in receiver {
+                    let joined = thread.join().is_ok();
+                    worker_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain(|pending| !Arc::ptr_eq(pending, &retirement));
+                    *retirement
+                        .joined
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(joined);
+                    retirement.completed.notify_all();
+                }
+            })
+            .expect("native client reaper could not start");
+        Self {
+            pending,
+            sender: Some(sender),
+            worker: Some(worker),
+        }
+    }
+    fn enqueue(&self, thread: thread::JoinHandle<()>) -> Arc<Retirement> {
+        let retirement = Arc::new(Retirement::default());
+        self.sender
+            .as_ref()
+            .expect("native client reaper is running")
+            .send(RetirementWork {
+                thread,
+                retirement: Arc::clone(&retirement),
+            })
+            .expect("native client reaper is running");
+        retirement
+    }
+}
+
+impl Drop for RetirementQueue {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            drop(worker.join());
+        }
+    }
+}
+
 /// Process-level owner for the single active native client generation.
 pub struct RuntimeBridge {
     active_generation: Arc<AtomicU64>,
     next_generation: AtomicU64,
     running: Mutex<Option<RunningGeneration>>,
+    retiring: RetirementQueue,
     server: EmbeddedServerController,
+    selected: Mutex<RuntimeTarget>,
     notification_permission_required: std::sync::atomic::AtomicBool,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
     authorization_handoff: Mutex<Option<PendingAuthorizationHandoff>>,
@@ -469,7 +563,122 @@ impl fmt::Debug for RuntimeBridge {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct RuntimeTarget {
+    pub id: String,
+    pub endpoint: Option<String>,
+    pub access: Option<crate::native_auth::AccessBinding>,
+    pub app: Option<tauri::AppHandle>,
+    pub profiles: Option<Arc<crate::server_profiles::ServerProfiles>>,
+}
+impl Default for RuntimeTarget {
+    fn default() -> Self {
+        Self {
+            id: "local".into(),
+            endpoint: None,
+            access: None,
+            app: None,
+            profiles: None,
+        }
+    }
+}
+
 impl RuntimeBridge {
+    pub(crate) fn with_current<T>(
+        &self,
+        generation: u64,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if running.as_ref().is_none_or(|r| r.generation != generation) {
+            return Err("Native client generation was replaced".into());
+        }
+        effect()
+    }
+    pub(crate) fn select(&self, target: RuntimeTarget) {
+        *self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = target;
+    }
+    pub(crate) fn selected_id(&self) -> String {
+        self.selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .id
+            .clone()
+    }
+    pub(crate) fn is_remote(&self) -> bool {
+        self.selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .endpoint
+            .is_some()
+    }
+    pub(crate) async fn access_action(
+        &self,
+        generation: u64,
+        action: waltr_client::NativeAccessAction,
+    ) -> Result<(), String> {
+        {
+            let target = self
+                .selected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if target.endpoint.is_none()
+                || target.access.is_none()
+                    && !matches!(action, waltr_client::NativeAccessAction::Logout)
+            {
+                return Err("Native access is unavailable for this server".into());
+            }
+        }
+        let requests = {
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            running
+                .as_ref()
+                .filter(|r| r.generation == generation)
+                .map(|r| r.requests.clone())
+                .ok_or_else(|| "Native client generation was replaced".to_owned())?
+        };
+        if matches!(action, waltr_client::NativeAccessAction::Logout) {
+            let (reply, result) = oneshot::channel();
+            requests
+                .send(HostRequest::LogoutAccess { reply })
+                .await
+                .map_err(|_| "Native access is unavailable")?;
+            return result.await.map_err(|_| "Native access is unavailable")?;
+        }
+        requests
+            .send(HostRequest::Access(action))
+            .await
+            .map_err(|_| "Native access is unavailable".into())
+    }
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn authorization_callback(&self, uri: String) {
+        if uri.len() > 8192 {
+            return;
+        }
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(running) = running
+            .as_ref()
+            .filter(|running| self.is_current(running.generation))
+        {
+            drop(running.requests.try_send(HostRequest::Access(
+                waltr_client::NativeAccessAction::AuthorizationCallback(
+                    waltr_client::NativeAuthorizationCallback::new(uri),
+                ),
+            )));
+        }
+    }
     /// Create a bridge attached to the process-owned embedded server.
     #[must_use]
     pub fn new(server: EmbeddedServerController) -> Self {
@@ -477,7 +686,9 @@ impl RuntimeBridge {
             active_generation: Arc::new(AtomicU64::new(0)),
             next_generation: AtomicU64::new(0),
             running: Mutex::new(None),
+            retiring: RetirementQueue::new(),
             server,
+            selected: Mutex::new(RuntimeTarget::default()),
             notification_permission_required: std::sync::atomic::AtomicBool::new(false),
             authorization_attempt: Arc::new(RwLock::new(None)),
             authorization_handoff: Mutex::new(None),
@@ -562,6 +773,11 @@ impl RuntimeBridge {
         let (requests, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let (stop, stop_receiver) = watch::channel(false);
         let server = self.server.clone();
+        let target = self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let authorization_attempt = Arc::clone(&self.authorization_attempt);
         let initial = self.current_startup();
         let (platform, platform_receiver) = watch::channel(initial);
@@ -574,6 +790,7 @@ impl RuntimeBridge {
                     platform_receiver,
                     publisher,
                     server,
+                    target,
                     authorization_attempt,
                     authorization_handoff,
                     initial,
@@ -598,9 +815,20 @@ impl RuntimeBridge {
     /// Dispatch one frontend command through the generation's serialized queue.
     pub async fn dispatch(
         &self,
+        generation: u64,
         command: ClientCommand,
     ) -> Result<BridgeEvent<BridgePayload>, String> {
-        let requests = self.requests()?;
+        let requests = {
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            running
+                .as_ref()
+                .filter(|r| r.generation == generation)
+                .map(|r| r.requests.clone())
+                .ok_or_else(|| "Native client generation was replaced".to_owned())?
+        };
         let (reply, result) = oneshot::channel();
         requests
             .send(HostRequest::Dispatch {
@@ -643,37 +871,45 @@ impl RuntimeBridge {
     /// Invalidate and synchronously dispose the active client generation.
     pub fn stop(&self) {
         let span = observability::operation_span("bridge.generation.stop", "native_thread");
-        let running = self.signal_stop();
+        let mut retiring = self
+            .retiring
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(running) = self.signal_stop() {
+            retiring.push(self.retiring.enqueue(running.thread));
+        }
         self.clear_authorization_state();
-        let Some(running) = running else {
-            observability::record_outcome(&span, "unchanged");
-            return;
-        };
-        let outcome = if running.thread.join().is_ok() {
-            "ok"
-        } else {
-            "panicked"
-        };
+        let threads = std::mem::take(&mut *retiring);
+        drop(retiring);
+        let mut outcome = "unchanged";
+        for thread in threads {
+            outcome = if thread.wait() && outcome != "panicked" {
+                "ok"
+            } else {
+                "panicked"
+            };
+        }
         observability::record_outcome(&span, outcome);
     }
 
-    /// Invalidate and signal the active generation, joining it away from a lifecycle callback.
+    /// Signal without joining the lifecycle callback; IPC teardown retains the join barrier.
     #[cfg(any(target_os = "android", test))]
     pub fn stop_nonblocking(&self) {
+        let mut retiring = self
+            .retiring
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(running) = self.signal_stop() else {
             self.clear_authorization_state();
             return;
         };
         self.clear_authorization_state();
-        drop(
-            thread::Builder::new()
-                .name("waltr-client-reaper".to_owned())
-                .spawn(move || drop(running.thread.join())),
-        );
+        retiring.push(self.retiring.enqueue(running.thread));
     }
 
     /// Stop only the exact active generation without joining the caller.
-    #[cfg(any(target_os = "android", test))]
     pub fn stop_generation_nonblocking(&self, generation: u64) -> bool {
         self.stop_exact_generation_nonblocking(generation, false)
     }
@@ -684,8 +920,12 @@ impl RuntimeBridge {
         self.stop_exact_generation_nonblocking(generation, true)
     }
 
-    #[cfg(any(target_os = "android", test))]
     fn stop_exact_generation_nonblocking(&self, generation: u64, preserve_auth: bool) -> bool {
+        let mut retiring = self
+            .retiring
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let running = {
             let mut running = self
                 .running
@@ -710,16 +950,13 @@ impl RuntimeBridge {
         );
         running.stop.send_replace(true);
         if preserve_auth {
+            #[cfg(any(target_os = "android", test))]
             self.retain_authorization_handoff(generation);
         } else {
             self.clear_authorization_generation(generation);
             self.clear_authorization_handoff();
         }
-        drop(
-            thread::Builder::new()
-                .name("waltr-client-reaper".to_owned())
-                .spawn(move || drop(running.thread.join())),
-        );
+        retiring.push(self.retiring.enqueue(running.thread));
         true
     }
 
@@ -742,11 +979,15 @@ impl RuntimeBridge {
     /// Resolve the exact current outbound authorization attempt inside Rust memory.
     pub(crate) fn authorization_attempt_url(&self, attempt_id: &str) -> Result<String, String> {
         let generation = self.active_generation.load(Ordering::Acquire);
-        let server_generation = self
-            .server
-            .connection()
-            .map(|connection| connection.generation)
-            .ok_or_else(|| "authorization attempt is unavailable".to_owned())?;
+        let remote = self.is_remote();
+        let server_generation = if remote {
+            generation
+        } else {
+            self.server
+                .connection()
+                .map(|connection| connection.generation)
+                .ok_or_else(|| "authorization attempt is unavailable".to_owned())?
+        };
         if generation == 0 {
             return Err("authorization attempt is unavailable".to_owned());
         }
@@ -763,11 +1004,12 @@ impl RuntimeBridge {
         .ok_or_else(|| "authorization attempt is unavailable".to_owned())?;
         drop(retained);
         if self.active_generation.load(Ordering::Acquire) != generation
-            || self
-                .server
-                .connection()
-                .map(|connection| connection.generation)
-                != Some(server_generation)
+            || (!remote
+                && self
+                    .server
+                    .connection()
+                    .map(|connection| connection.generation)
+                    != Some(server_generation))
         {
             return Err("authorization attempt is unavailable".to_owned());
         }
@@ -775,6 +1017,9 @@ impl RuntimeBridge {
     }
 
     fn current_startup(&self) -> PlatformStartup {
+        if self.is_remote() {
+            return PlatformStartup::Ready;
+        }
         if self
             .notification_permission_required
             .load(Ordering::Acquire)
@@ -791,15 +1036,6 @@ impl RuntimeBridge {
                 PlatformStartup::Starting
             }
         }
-    }
-
-    fn requests(&self) -> Result<mpsc::Sender<HostRequest>, String> {
-        self.running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|running| running.requests.clone())
-            .ok_or_else(|| "native client runtime is stopped".to_owned())
     }
 
     fn signal_stop(&self) -> Option<RunningGeneration> {
@@ -903,6 +1139,7 @@ fn run_thread(
     platform: watch::Receiver<PlatformStartup>,
     publisher: Publisher<BridgePayload>,
     server: EmbeddedServerController,
+    target: RuntimeTarget,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
     authorization_handoff: Option<PendingAuthorizationHandoff>,
     initial: PlatformStartup,
@@ -921,6 +1158,7 @@ fn run_thread(
             platform,
             publisher,
             server,
+            target,
             authorization_attempt,
             authorization_handoff,
             initial,
@@ -940,10 +1178,32 @@ async fn run_generation(
     mut platform: watch::Receiver<PlatformStartup>,
     mut publisher: Publisher<BridgePayload>,
     server: EmbeddedServerController,
+    target: RuntimeTarget,
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
     mut authorization_handoff: Option<PendingAuthorizationHandoff>,
     initial: PlatformStartup,
 ) {
+    if let Some(endpoint) = target.endpoint.clone() {
+        let connection = ServerConnection {
+            generation: publisher.generation,
+            endpoint,
+            bearer: String::new(),
+            first_catalog_download: false,
+        };
+        run_connected_generation(
+            &mut requests,
+            &mut stop,
+            &mut platform,
+            &mut publisher,
+            connection,
+            authorization_attempt,
+            None,
+            true,
+            target,
+        )
+        .await;
+        return;
+    }
     let mut initial_sent = false;
     let mut permission_required = initial == PlatformStartup::NotificationPermissionRequired;
     if let Some(connection) = gated_connection(initial, server.connection()) {
@@ -956,6 +1216,7 @@ async fn run_generation(
             Arc::clone(&authorization_attempt),
             authorization_handoff.take(),
             true,
+            target.clone(),
         )
         .await
         {
@@ -999,6 +1260,7 @@ async fn run_generation(
                 Arc::clone(&authorization_attempt),
                 authorization_handoff.take(),
                 false,
+                target.clone(),
             )
             .await
             {
@@ -1041,6 +1303,8 @@ async fn run_generation(
                 permission_required = startup == PlatformStartup::NotificationPermissionRequired;
             }
             request = requests.recv() => match request {
+                Some(HostRequest::Access(_)) => {},
+                Some(HostRequest::LogoutAccess { reply }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
                     drop(reply.send(Err("embedded server is not ready".to_owned())));
                 }
@@ -1076,6 +1340,7 @@ async fn run_connected_generation(
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
     authorization_handoff: Option<PendingAuthorizationHandoff>,
     initial: bool,
+    target: RuntimeTarget,
 ) -> ConnectedExit {
     let presentation = PresentationState {
         endpoint: connection.endpoint.clone(),
@@ -1086,9 +1351,10 @@ async fn run_connected_generation(
         authorization_attempt,
     };
     let credentials = NativeCredentialProvider::new();
-    if credentials
-        .replace_bearer_token(&connection.bearer)
-        .is_err()
+    if !connection.bearer.is_empty()
+        && credentials
+            .replace_bearer_token(&connection.bearer)
+            .is_err()
     {
         publisher.publish_state(BridgePayload::Platform {
             startup: PlatformStartup::RecoverableFailure,
@@ -1115,7 +1381,24 @@ async fn run_connected_generation(
         publisher.publish_state(initial_payload);
     }
 
+    let mut access = target
+        .access
+        .as_ref()
+        .map(|binding| binding.spawn(credentials.clone()));
+    let mut access_host = crate::native_auth::AccessHost::default();
+    let mut connected_recorded = false;
     let exit = loop {
+        if !publisher.is_current() {
+            break ConnectedExit::Stopped;
+        }
+        if !connected_recorded && snapshot_connected(&stream.snapshot()) {
+            if let (Some(profiles), Some(app)) = (&target.profiles, &target.app) {
+                use tauri::Manager as _;
+                let bridge = app.state::<Arc<RuntimeBridge>>();
+                drop(bridge.with_current(publisher.generation, || profiles.connected(&target.id)));
+            }
+            connected_recorded = true;
+        }
         tokio::select! {
             _ = stop.changed() => break ConnectedExit::Stopped,
             changed = platform.changed() => {
@@ -1128,8 +1411,53 @@ async fn run_connected_generation(
                     break ConnectedExit::PermissionRequired;
                 }
             }
+            output = async { match &mut access { Some(access) => access.next_output().await, None => std::future::pending().await } } => {
+                let Some(output) = output else { break ConnectedExit::Stopped; };
+                if !publisher.is_current() { break ConnectedExit::Stopped; }
+                match output {
+                    waltr_client::NativeAccessOutput::ClientCommand { command, logout_barrier: _ } => {
+                        let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
+                        let result = tokio::select! { biased; _ = stop.changed() => break ConnectedExit::Stopped, result = dispatch_command(&mut stream, *command) => result };
+                        if let Ok(snapshot) = result {
+                            access_host.observe(access.as_ref(), &credentials, &snapshot, started_probe).await;
+                            publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) });
+                        }
+                    }
+                    waltr_client::NativeAccessOutput::Progress(progress) => {
+                        if let waltr_client::NativeAccessProgress::AwaitingBrowser { authorization_url, .. } = &progress
+                            && let (Some(app), Ok(url)) = (&target.app, crate::native_auth::browser_url(authorization_url))
+                        {
+                            use tauri_plugin_opener::OpenerExt as _;
+                            use tauri::Manager as _;
+                            let bridge = app.state::<Arc<RuntimeBridge>>();
+                            drop(bridge.with_current(publisher.generation, || app.opener().open_url(url.to_string(), None::<&str>).map_err(|_| "Authorization browser could not be opened".to_owned())));
+                        }
+                        publisher.publish_control(BridgePayload::Access { progress }).await;
+                    }
+                }
+            }
             request = requests.recv() => match request {
+                Some(HostRequest::LogoutAccess { reply }) => {
+                    if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
+                    if let Some(coordinator) = access.take() { coordinator.stop().await; }
+                    let _ = credentials.clear_bearer_token();
+                    let deleted = crate::credential_store::CredentialStore::delete_server(&target.id).await.map_err(|_| "Secure credentials could not be removed".to_owned());
+                    let result = dispatch_command(&mut stream, ClientCommand::LogoutWaltr).await;
+                    if let Ok(snapshot) = result { publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) }); }
+                    drop(reply.send(deleted));
+                }
+                Some(HostRequest::Access(action)) => {
+                    if !publisher.is_current() { continue; }
+                    if access.is_none() && matches!(action, waltr_client::NativeAccessAction::Start)
+                        && let Some(binding) = &target.access
+                        && let Ok(binding) = binding.fresh()
+                    { access = Some(binding.spawn(credentials.clone())); }
+                    if let Some(access) = &access { drop(access.action_sender().send(action).await); }
+                }
                 Some(HostRequest::Dispatch { command, reply }) => {
+                    if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
+                    access_host.cancel_command(access.as_ref(), &credentials, &stream.snapshot(), &command).await;
+                    let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
                     let dispatch = dispatch_command(&mut stream, *command);
                     tokio::pin!(dispatch);
                     let mut permission_interrupted = false;
@@ -1159,6 +1487,9 @@ async fn run_connected_generation(
                             ConnectedExit::Stopped
                         };
                     };
+                    if let Ok(snapshot) = &result {
+                        access_host.observe(access.as_ref(), &credentials, snapshot, started_probe).await;
+                    }
                     let result = result.and_then(|snapshot| {
                         publisher
                             .publish_state(BridgePayload::State {
@@ -1171,12 +1502,16 @@ async fn run_connected_generation(
                 None => break ConnectedExit::Stopped,
             },
             snapshot = stream.next() => {
+                access_host.observe(access.as_ref(), &credentials, &snapshot, false).await;
                 publisher.publish_state(BridgePayload::State {
                     snapshot: Box::new(presentation.snapshot(&snapshot)),
                 });
             }
         }
     };
+    if let Some(access) = access {
+        access.stop().await;
+    }
     let _ = credentials.clear_bearer_token();
     presentation.clear_authorization_attempt();
     exit
@@ -1215,6 +1550,9 @@ async fn dispatch_command(
         .map_err(|_| "native client command failed".to_owned())
 }
 
+fn snapshot_connected(snapshot: &ClientSnapshot) -> bool {
+    snapshot.access.status == waltr_client::AccessStatus::Authenticated
+}
 fn recovery_after<T: Clone>(
     recovery: &RecoveryState<T>,
     authoritative_generation: u64,
@@ -1338,6 +1676,51 @@ mod tests {
         assert!(bridge.running.lock().unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn remote_selection_bypasses_local_permission_and_stale_effects_cannot_reach_replacement()
+    {
+        let server = EmbeddedServerController::default();
+        let bridge = RuntimeBridge::new(server.clone());
+        bridge.authorization_callback(
+            "dev.waltr.app:/oauth2redirect?state=cold&code=discard".into(),
+        );
+        assert!(bridge.running.lock().unwrap().is_none());
+        bridge.notification_permission_required(true);
+        bridge.select(RuntimeTarget {
+            id: "remote-test".into(),
+            endpoint: Some("http://127.0.0.1:0".into()),
+            ..RuntimeTarget::default()
+        });
+        assert_eq!(bridge.current_startup(), PlatformStartup::Ready);
+        let mut remote = bridge.start().unwrap();
+        let old_generation = remote.generation();
+        assert!(matches!(
+            remote.initial().await.unwrap().payload,
+            BridgePayload::State { .. }
+        ));
+        assert!(server.connection().is_none());
+        assert_eq!(server.phase(), ServerPhase::Stopped);
+        bridge.stop();
+        bridge.select(RuntimeTarget::default());
+        let local = bridge.start().unwrap();
+        let current_generation = local.generation();
+        assert!(current_generation > old_generation);
+        assert!(!bridge.stop_generation_nonblocking(old_generation));
+        assert!(
+            bridge
+                .with_current::<()>(old_generation, || panic!("stale opener ran"))
+                .is_err()
+        );
+        assert!(
+            bridge
+                .access_action(old_generation, waltr_client::NativeAccessAction::Start)
+                .await
+                .is_err()
+        );
+        assert!(bridge.is_current(current_generation));
+        bridge.stop();
+    }
+
     #[test]
     fn fresh_permission_required_generation_gates_existing_connection() {
         let connection = ServerConnection {
@@ -1345,8 +1728,6 @@ mod tests {
             endpoint: "http://127.0.0.1:43123".to_owned(),
             bearer: "local-bearer".to_owned(),
             first_catalog_download: false,
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            native_apps: None,
         };
         assert!(
             gated_connection(
@@ -1589,6 +1970,115 @@ mod tests {
         .expect("stop selection must be prompt");
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn repeated_local_retire_complete_resume_reclaims_joined_retirements() {
+        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+        let reaper = bridge.retiring.worker.as_ref().unwrap().thread().id();
+        for _ in 0..64 {
+            let feed = bridge.start_generation().unwrap();
+            assert!(bridge.retiring.pending.lock().unwrap().is_empty());
+            assert!(bridge.suspend_generation_nonblocking(feed.generation()));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !bridge.retiring.pending.lock().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "managed reaper must reclaim completed Local retirements without another callback"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(
+                bridge.retiring.worker.as_ref().unwrap().thread().id(),
+                reaper
+            );
+            assert!(bridge.retiring.pending.lock().unwrap().is_empty());
+        }
+        assert!(bridge.retiring.pending.lock().unwrap().is_empty());
+        bridge.stop();
+    }
+
+    #[tokio::test]
+    async fn delayed_logout_is_joined_before_same_server_replacement() {
+        let bridge = Arc::new(RuntimeBridge::new(EmbeddedServerController::default()));
+        bridge.select(RuntimeTarget {
+            id: "same-server".into(),
+            endpoint: Some("http://127.0.0.1:0".into()),
+            ..RuntimeTarget::default()
+        });
+        bridge.active_generation.store(1, Ordering::Release);
+        bridge.next_generation.store(2, Ordering::Release);
+        let (requests, mut receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let (stop, mut stopped) = watch::channel(false);
+        let (platform, _) = watch::channel(PlatformStartup::Ready);
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let old_identity = Arc::clone(&epoch);
+        let worker = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let Some(HostRequest::LogoutAccess { reply }) = receiver.recv().await else {
+                        panic!("logout request expected");
+                    };
+                    entered.send(()).unwrap();
+                    // Models delayed coordinator.stop + server-wide credential deletion/fencing.
+                    release_rx.recv().unwrap();
+                    old_identity.fetch_add(1, Ordering::AcqRel);
+                    reply.send(Ok(())).unwrap();
+                    if !*stopped.borrow() {
+                        drop(stopped.changed().await);
+                    }
+                });
+        });
+        *bridge.running.lock().unwrap() = Some(RunningGeneration {
+            generation: 1,
+            requests,
+            stop,
+            platform,
+            recovery: Arc::new(RwLock::new(RecoveryState::new(1))),
+            thread: worker,
+        });
+        let logout_bridge = Arc::clone(&bridge);
+        let logout = tokio::spawn(async move {
+            logout_bridge
+                .access_action(1, waltr_client::NativeAccessAction::Logout)
+                .await
+        });
+        entered_rx.await.unwrap();
+        assert!(bridge.stop_generation_nonblocking(1));
+        assert_eq!(bridge.retiring.pending.lock().unwrap().len(), 1);
+        let replacement_bridge = Arc::clone(&bridge);
+        let replacement_epoch = Arc::clone(&epoch);
+        let replacement = tokio::task::spawn_blocking(move || {
+            let feed = replacement_bridge.start().unwrap();
+            // The replacement's fresh handle must be created after old deletion/fencing.
+            (feed, replacement_epoch.load(Ordering::Acquire))
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !bridge.retiring.pending.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!replacement.is_finished());
+        assert_eq!(epoch.load(Ordering::Acquire), 0);
+        release.send(()).unwrap();
+        assert!(logout.await.unwrap().is_ok());
+        let (feed, fresh_handle_epoch) = replacement.await.unwrap();
+        assert_eq!(fresh_handle_epoch, 1);
+        assert!(bridge.is_current(feed.generation()));
+        assert_eq!(epoch.load(Ordering::Acquire), fresh_handle_epoch);
+        bridge.stop();
+        assert_eq!(
+            epoch.load(Ordering::Acquire),
+            fresh_handle_epoch,
+            "no old teardown can fence the replacement handle"
+        );
     }
 
     #[test]

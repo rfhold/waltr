@@ -344,6 +344,18 @@ pub(crate) async fn install(app: &tauri::AppHandle, bootstrap: &Bootstrap) -> Re
     Ok(())
 }
 
+pub(crate) async fn detach_on_main(app: &tauri::AppHandle) -> Result<(), String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        detach("main");
+        let _ = sender.send(());
+    })
+    .map_err(|_| "Native navigation teardown could not be scheduled".to_owned())?;
+    receiver
+        .await
+        .map_err(|_| "Native navigation teardown was cancelled".to_owned())
+}
+
 pub(crate) fn detach(label: &str) {
     assert!(
         MainThreadMarker::new().is_some(),

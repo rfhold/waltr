@@ -7,6 +7,11 @@
   "permissions": [
     "core:default",
     "allow-start-runtime",
+    "allow-list-servers",
+    "allow-save-server",
+    "allow-remove-server",
+    "allow-start-access-login",
+    "allow-logout-access",
     "allow-client-dispatch",
     "allow-client-state",
     "allow-dispose-runtime",

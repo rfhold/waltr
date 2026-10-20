@@ -21,6 +21,8 @@
 #-renamesourcefileattribute SourceFile
 
 -keep class dev.waltr.app.WaltrForegroundService { *; }
+-keep class dev.waltr.app.SecureTokenStore { *; }
+-keep class dev.waltr.app.SecureTokenStore$Companion { *; }
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
 -keepclasseswithmembernames class dev.waltr.app.MainActivity {
     native <methods>;
