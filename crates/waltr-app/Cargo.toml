@@ -29,7 +29,7 @@ hyper = { version = "1.10.0", features = ["http1", "server"], optional = true }
 hyper-util = { workspace = true, features = ["service"], optional = true }
 futures-channel.workspace = true
 waltr-client = { workspace = true, features = ["native-tracing", "native-access"] }
-waltr-server = { path = "../waltr-server", version = "0.2.1", default-features = false }
+waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false }
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-http = "0.32.0"
@@ -68,10 +68,10 @@ objc2 = { version = "=0.6.4" }
 objc2-foundation = { version = "=0.3.2" }
 objc2-web-kit = { version = "=0.3.2" }
 block2 = { version = "=0.6.2" }
-waltr-server = { path = "../waltr-server", version = "0.2.1", default-features = false, features = ["apps-host-assets", "apps-served-assets"] }
+waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false, features = ["apps-host-assets", "apps-served-assets"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-waltr-server = { path = "../waltr-server", version = "0.2.1", default-features = false, features = ["shell"] }
+waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false, features = ["shell"] }
 
 [lints.rust]
 # Mirror workspace lints, allowing only the macOS WK delegate module to opt into FFI.
