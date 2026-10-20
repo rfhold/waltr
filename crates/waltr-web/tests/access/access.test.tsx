@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { AuthAttemptSnapshot, ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
 import type { AccessOperations } from "../../src/platform/client";
+import { ServerSelectionContext } from "../../src/app/serverSelection";
 import { AccessRoute, waltrLoginUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
 import { ShellRouteWithChildren, testHistory } from "../support/routes";
@@ -571,6 +572,64 @@ describe("Waltr access", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(reload).not.toHaveBeenCalled();
   });
+
+  test.each(["logout success", "logout failure", "dispatch failure"] as const)(
+    "switching servers fences a pending %s from the replacement shell",
+    async (stage) => {
+      const reload = vi.fn();
+      const commands: ClientCommand[] = [];
+      let resolveLogout!: (value: boolean) => void;
+      let rejectLogout!: (reason: Error) => void;
+      const pendingLogout = new Promise<boolean>((resolve, reject) => {
+        resolveLogout = resolve;
+        rejectLogout = reject;
+      });
+      let rejectDispatch!: (reason: Error) => void;
+      const pendingDispatch = new Promise<ClientSnapshot>((_resolve, reject) => { rejectDispatch = reject; });
+      const accessOperations = {
+        ...accessOperationsMock(),
+        logout: vi.fn(() => stage === "dispatch failure" ? Promise.resolve(true) : pendingLogout),
+      };
+      const oldView = renderWithAppState(() => (
+        <ServerSelectionContext.Provider value={{ switchServer: () => oldView.unmount(), retry: vi.fn() }}>
+          <ShellRouteWithChildren reload={reload} />
+        </ServerSelectionContext.Provider>
+      ), {
+        snapshot: accessSnapshot("authenticated"),
+        commands,
+        accessOperations,
+        onDispatch: (command, snapshot) => command.type === "logoutWaltr" ? pendingDispatch : snapshot!,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+      await waitFor(() => expect(accessOperations.logout).toHaveBeenCalledOnce());
+      if (stage === "dispatch failure") {
+        await waitFor(() => expect(commands).toContainEqual({ type: "logoutWaltr" }));
+      }
+      const switchButton = screen.getByRole("button", { name: "Switch server" });
+      expect(switchButton).toHaveProperty("disabled", false);
+      fireEvent.click(switchButton);
+      const replacementCommands: ClientCommand[] = [];
+      renderWithAppState(() => <><ShellRouteWithChildren reload={reload} /><input aria-label="Replacement draft" /></>, {
+        snapshot: accessSnapshot("authenticated"),
+        commands: replacementCommands,
+        accessOperations: accessOperationsMock(),
+      });
+      fireEvent.input(screen.getByLabelText("Replacement draft"), { target: { value: "Keep this draft" } });
+      const commandCount = commands.length;
+      const replacementCommandCount = replacementCommands.length;
+      if (stage === "logout success") resolveLogout(true);
+      else if (stage === "logout failure") rejectLogout(new Error("old native logout failed"));
+      else rejectDispatch(new Error("old native adapter disposed"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(commands).toHaveLength(commandCount);
+      expect(replacementCommands).toHaveLength(replacementCommandCount);
+      expect(replacementCommands.some((command) => command.type === "logoutWaltr")).toBe(false);
+      expect(reload).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByLabelText("Replacement draft")).toHaveProperty("value", "Keep this draft");
+      expect(screen.getByRole("button", { name: "Sign out" })).toHaveProperty("disabled", false);
+    },
+  );
 
   test("an absent access capability suppresses sign out without suppressing provider OAuth", () => {
     const fetchMock = vi.fn();
