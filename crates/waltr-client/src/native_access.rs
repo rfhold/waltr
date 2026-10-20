@@ -95,6 +95,8 @@ pub enum NativeAccessAction {
     },
     /// Deliver an authorization redirect received by the platform host.
     AuthorizationCallback(NativeAuthorizationCallback),
+    /// Request shutdown without aborting an in-flight credential write.
+    Shutdown,
 }
 
 /// An externally delivered authorization redirect kept opaque at the host boundary.
@@ -128,6 +130,92 @@ pub struct NativeAccessConfig {
     pub audience: Option<String>,
     /// Authorization callback delivery policy.
     pub callback: NativeCallbackPolicy,
+}
+
+/// Discovered public configuration and exact issuer for host credential namespacing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeAccessBootstrap {
+    /// Configuration suitable for `NativeAccessCoordinator::spawn_with_store`.
+    pub config: NativeAccessConfig,
+    /// Exact issuer validated against authorization-server discovery.
+    pub issuer: String,
+}
+
+/// Sanitized failure to discover public native access configuration.
+#[derive(Debug)]
+pub struct NativeAccessDiscoveryError(String);
+
+impl fmt::Display for NativeAccessDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NativeAccessDiscoveryError {}
+
+/// Discover the server-advertised public native client using verified API metadata.
+///
+/// # Errors
+///
+/// Returns an error for invalid endpoints, discovery, or missing/invalid native metadata.
+pub async fn discover_native_access_config(
+    endpoint: &str,
+    callback: NativeCallbackPolicy,
+) -> Result<NativeAccessBootstrap, NativeAccessDiscoveryError> {
+    async {
+        let client = http_client()?;
+        let (provider, issuer, native) = discover_with_native(&client, endpoint).await?;
+        let native: NativeClientMetadata = serde_json::from_value(native.ok_or_else(|| {
+            NativeAuthError("Waltr server does not advertise a native client".to_owned())
+        })?)
+        .map_err(|_| NativeAuthError("Waltr native client metadata is invalid".to_owned()))?;
+        if native.client_id.trim().is_empty()
+            || native.client_id.trim() != native.client_id
+            || native.client_id.chars().any(char::is_control)
+            || native.scopes.is_empty()
+            || native.scopes.iter().any(|scope| {
+                scope.is_empty() || scope.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+            || !["openid", "offline_access"]
+                .iter()
+                .all(|scope| native.scopes.iter().any(|s| s == scope))
+            || !provider
+                .scopes_supported
+                .iter()
+                .all(|scope| native.scopes.contains(scope))
+            || native.audience.as_ref().is_some_and(|audience| {
+                audience.trim().is_empty()
+                    || audience.trim() != audience
+                    || audience.chars().any(char::is_control)
+            })
+        {
+            return Err(NativeAuthError(
+                "Waltr native client metadata is invalid".to_owned(),
+            ));
+        }
+        if let NativeCallbackPolicy::Loopback(NativeLoopbackPolicy::Fixed(url)) = &callback {
+            validate_loopback_url(url)?;
+        }
+        Ok(NativeAccessBootstrap {
+            config: NativeAccessConfig {
+                endpoint: endpoint.to_owned(),
+                client_id: native.client_id,
+                scopes: native.scopes,
+                audience: native.audience,
+                callback,
+            },
+            issuer,
+        })
+    }
+    .await
+    .map_err(|error: NativeAuthError| NativeAccessDiscoveryError(error.0))
+}
+
+#[derive(Deserialize)]
+struct NativeClientMetadata {
+    client_id: String,
+    scopes: Vec<String>,
+    audience: Option<String>,
 }
 
 /// Authorization callback policy for native access.
@@ -292,9 +380,17 @@ impl NativeAccessCoordinator {
 
     /// Explicitly stop the coordinator and await credential cleanup.
     pub async fn stop(self) {
-        self.task.abort();
-        drop(self.task.await);
-        let _ = self.credentials.clear_bearer_token();
+        let Self {
+            actions,
+            mut outputs,
+            task,
+            credentials,
+        } = self;
+        outputs.close();
+        drop(outputs);
+        drop(actions.send(NativeAccessAction::Shutdown).await);
+        drop(task.await);
+        let _ = credentials.clear_bearer_token();
     }
 }
 
@@ -355,6 +451,7 @@ struct ProtectedResourceMetadata {
     authorization_servers: Vec<String>,
     #[serde(default)]
     scopes_supported: Vec<String>,
+    waltr_native_client: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -501,6 +598,9 @@ async fn coordinate(
     let mut active_attempt: Option<(AccessAttemptId, NativeCredentialLease)> = None;
     let mut active_callback = None;
     let mut seen_attempts = HashSet::new();
+    // Complete may still be queued while the host cancels its pending reducer attempt.
+    let mut login_persistence: Option<LoginPersistence> = None;
+    let mut completed_attempt = None;
 
     loop {
         tokio::select! {
@@ -515,6 +615,13 @@ async fn coordinate(
                         ) {
                             continue;
                         }
+                        if login_persistence.as_ref().is_some_and(|owned| owned.canceled)
+                            && !compensate_login(&outputs, refresh_store.as_ref(), &mut login_persistence).await
+                        {
+                            continue;
+                        }
+                        login_persistence = None;
+                        completed_attempt = None;
                         abort_owned(&mut restore_task).await;
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
@@ -533,8 +640,12 @@ async fn coordinate(
                         let _ = credentials.clear_bearer_token();
                         pending_lease = None;
                         active_callback = None;
+                        let canceled_attempt = active_attempt.take().map(|(attempt_id, _)| attempt_id).or_else(|| completed_attempt.take());
+                        if login_persistence.as_ref().is_some_and(|owned| Some(&owned.attempt_id) == canceled_attempt.as_ref()) {
+                            compensate_login(&outputs, refresh_store.as_ref(), &mut login_persistence).await;
+                        }
                         send_progress(&outputs, NativeAccessProgress::Canceled).await;
-                        if let Some((attempt_id, _)) = active_attempt.take() {
+                        if let Some(attempt_id) = canceled_attempt {
                             if send_command(&outputs, ClientCommand::CancelWaltrLogin { attempt_id }, false).await.is_err() {
                                 break;
                             }
@@ -612,6 +723,7 @@ async fn coordinate(
                             drop(callbacks.send(callback).await);
                         }
                     }
+                    NativeAccessAction::Shutdown => break,
                 }
             }
             result = result_receiver.recv() => {
@@ -662,28 +774,48 @@ async fn coordinate(
                         if active_attempt.as_ref() != Some(&(attempt_id.clone(), lease)) {
                             continue;
                         }
-                        active_attempt = None;
                         active_callback = None;
                         if login_task.as_ref().is_some_and(|task| task.owner == attempt_id) {
                             login_task = None;
                         }
                         match result {
                             Ok(tokens) => {
-                                persist_refresh_token(
-                                    &outputs,
-                                    refresh_store.as_ref(),
-                                    tokens.refresh_token.as_deref(),
-                                ).await;
+                                if credentials.credential_lease() != lease { continue; }
+                                let previous = if let Ok(previous) = refresh_store.load().await {
+                                    Some(previous)
+                                } else {
+                                    send_store_warning(&outputs).await;
+                                    None
+                                };
+                                if credentials.credential_lease() != lease { continue; }
+                                if let Some(previous) = previous {
+                                    login_persistence = Some(LoginPersistence {
+                                        attempt_id: attempt_id.clone(), lease, token: tokens.refresh_token.as_ref().map(|token| token.as_bytes().to_vec()), previous, canceled: false,
+                                    });
+                                    persist_refresh_token(
+                                        &outputs,
+                                        refresh_store.as_ref(),
+                                        tokens.refresh_token.as_deref(),
+                                    ).await;
+                                }
                                 match credentials.replace_bearer_token_if_current(lease, &tokens.access_token) {
                                     Ok(true) => {}
-                                    Ok(false) => continue,
+                                    Ok(false) => {
+                                        compensate_login(&outputs, refresh_store.as_ref(), &mut login_persistence).await;
+                                        continue;
+                                    }
                                     Err(error) => {
-                                            fail_attempt(&outputs, &credentials, (attempt_id, lease), error.to_string()).await;
+                                        compensate_login(&outputs, refresh_store.as_ref(), &mut login_persistence).await;
+                                        active_attempt = None;
+                                        fail_attempt(&outputs, &credentials, (attempt_id, lease), error.to_string()).await;
                                         continue;
                                     }
                                 }
+                                active_attempt = None;
+                                completed_attempt = Some(attempt_id.clone());
                                 send_progress(&outputs, NativeAccessProgress::Succeeded).await;
-                                if send_command(&outputs, ClientCommand::CompleteWaltrLogin { attempt_id }, false).await.is_err() { break; }
+                                // Output closure must not bypass an already queued Cancel of this persisted login.
+                                if send_command(&outputs, ClientCommand::CompleteWaltrLogin { attempt_id }, false).await.is_err() { continue; }
                                 lifecycle_task = Some(OwnedTask::new(lease, spawn_lifecycle(
                                         *tokens,
                                     lease,
@@ -692,7 +824,8 @@ async fn coordinate(
                                 )));
                             }
                             Err(error) => {
-                                    fail_attempt(&outputs, &credentials, (attempt_id, lease), error.to_string()).await;
+                                active_attempt = None;
+                                fail_attempt(&outputs, &credentials, (attempt_id, lease), error.to_string()).await;
                             }
                         }
                     }
@@ -705,6 +838,11 @@ async fn coordinate(
                         lifecycle_task = None;
                         match result {
                                 LifecycleResult::Refreshed(Ok(tokens)) => {
+                                if let Some(owned) = &mut login_persistence
+                                    && owned.lease == lease
+                                {
+                                    owned.token = tokens.refresh_token.as_ref().map(|token| token.as_bytes().to_vec());
+                                }
                                 persist_refresh_token(
                                     &outputs,
                                     refresh_store.as_ref(),
@@ -751,6 +889,48 @@ async fn coordinate(
     abort_owned(&mut login_task).await;
     abort_owned(&mut lifecycle_task).await;
     let _ = credentials.clear_bearer_token();
+}
+
+struct LoginPersistence {
+    attempt_id: AccessAttemptId,
+    lease: NativeCredentialLease,
+    token: Option<Vec<u8>>,
+    previous: Option<Vec<u8>>,
+    canceled: bool,
+}
+
+async fn compensate_login(
+    outputs: &mpsc::Sender<NativeAccessOutput>,
+    store: &dyn NativeRefreshTokenStore,
+    owned: &mut Option<LoginPersistence>,
+) -> bool {
+    let Some(persistence) = owned else {
+        return true;
+    };
+    persistence.canceled = true;
+    let removed = match store.load().await {
+        Ok(current) if current == persistence.token => match &persistence.previous {
+            Some(previous) if current.as_ref() == Some(previous) => true,
+            Some(previous) => store.store(previous).await.is_ok(),
+            None => store.delete().await.is_ok(),
+        },
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    if removed {
+        *owned = None;
+    } else {
+        send_progress(
+            outputs,
+            NativeAccessProgress::Failed {
+                error:
+                    "Login canceled in memory, but secure credential cleanup could not be confirmed"
+                        .to_owned(),
+            },
+        )
+        .await;
+    }
+    removed
 }
 
 const fn login_start_in_progress(
@@ -962,6 +1142,15 @@ struct DiscoveredProvider {
 }
 
 async fn discover(client: &Client, endpoint: &str) -> Result<DiscoveredProvider, NativeAuthError> {
+    discover_with_native(client, endpoint)
+        .await
+        .map(|(provider, _, _)| provider)
+}
+
+async fn discover_with_native(
+    client: &Client,
+    endpoint: &str,
+) -> Result<(DiscoveredProvider, String, Option<serde_json::Value>), NativeAuthError> {
     let endpoint = parse_secure_url(endpoint, "Waltr server endpoint")?;
     if endpoint.query().is_some() {
         return Err(NativeAuthError(
@@ -1006,15 +1195,19 @@ async fn discover(client: &Client, endpoint: &str) -> Result<DiscoveredProvider,
         ));
     }
     validate_provider_metadata(&metadata)?;
-    Ok(DiscoveredProvider {
-        authorization_endpoint: parse_secure_url(
-            &metadata.authorization_endpoint,
-            "authorization endpoint",
-        )?,
-        token_endpoint: parse_secure_url(&metadata.token_endpoint, "token endpoint")?,
-        resource: protected.resource,
-        scopes_supported: protected.scopes_supported,
-    })
+    Ok((
+        DiscoveredProvider {
+            authorization_endpoint: parse_secure_url(
+                &metadata.authorization_endpoint,
+                "authorization endpoint",
+            )?,
+            token_endpoint: parse_secure_url(&metadata.token_endpoint, "token endpoint")?,
+            resource: protected.resource,
+            scopes_supported: protected.scopes_supported,
+        },
+        metadata.issuer,
+        protected.waltr_native_client,
+    ))
 }
 
 fn waltr_api_resource(endpoint: &Url) -> Url {
@@ -2372,6 +2565,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_bootstrap_requires_valid_public_client_metadata() {
+        let valid = serde_json::json!({
+            "client_id": "native-public",
+            "scopes": ["openid", "offline_access", "waltr:api"],
+            "audience": "waltr-api"
+        });
+        let mut without_audience = valid.clone();
+        without_audience.as_object_mut().unwrap().remove("audience");
+        let mut cases = vec![
+            (Some(valid.clone()), true),
+            (Some(without_audience), true),
+            (None, false),
+            (Some(serde_json::json!({})), false),
+            (Some(serde_json::json!("not-an-object")), false),
+        ];
+        for patch in [
+            serde_json::json!({"client_id": ""}),
+            serde_json::json!({"client_id": " padded "}),
+            serde_json::json!({"client_id": 7}),
+            serde_json::json!({"scopes": []}),
+            serde_json::json!({"scopes": ["openid", "offline_access"]}),
+            serde_json::json!({"scopes": ["openid", "waltr:api"]}),
+            serde_json::json!({"scopes": ["openid", "offline_access", "waltr:api", "bad scope"]}),
+            serde_json::json!({"audience": ""}),
+        ] {
+            let mut native = valid.clone();
+            native
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            cases.push((Some(native), false));
+        }
+        for (native, succeeds) in cases {
+            let expected_audience = native
+                .as_ref()
+                .and_then(|native| native.get("audience"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server_base = base.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request = read_http_request(&mut stream).await;
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let body = if path == "/.well-known/oauth-protected-resource" {
+                        let mut metadata = serde_json::json!({
+                            "resource": server_base,
+                            "authorization_servers": [server_base],
+                            "scopes_supported": ["waltr:api"]
+                        });
+                        if let Some(native) = &native {
+                            metadata["waltr_native_client"] = native.clone();
+                        }
+                        metadata
+                    } else {
+                        assert_eq!(path, "/.well-known/openid-configuration");
+                        serde_json::json!({
+                            "issuer": server_base,
+                            "authorization_endpoint": format!("{server_base}/authorize"),
+                            "token_endpoint": format!("{server_base}/token"),
+                            "response_types_supported": ["code"],
+                            "code_challenge_methods_supported": ["S256"]
+                        })
+                    };
+                    write_json_response(&mut stream, "200 OK", &body.to_string()).await;
+                }
+            });
+            let result = discover_native_access_config(&base, NativeCallbackPolicy::External).await;
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            if let Ok(bootstrap) = result {
+                assert_eq!(bootstrap.issuer, base);
+                assert_eq!(
+                    bootstrap.config,
+                    NativeAccessConfig {
+                        endpoint: base,
+                        client_id: "native-public".to_owned(),
+                        scopes: vec![
+                            "openid".to_owned(),
+                            "offline_access".to_owned(),
+                            "waltr:api".to_owned()
+                        ],
+                        audience: expected_audience,
+                        callback: NativeCallbackPolicy::External,
+                    }
+                );
+            }
+            server.await.unwrap();
+        }
+        for endpoint in [
+            "http://remote.example",
+            "https://user@waltr.example",
+            "https://waltr.example?query",
+            "not-a-url",
+        ] {
+            assert!(
+                discover_native_access_config(endpoint, NativeCallbackPolicy::External)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn issuer_path_discovery_falls_back_only_after_not_found() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3400,6 +3698,404 @@ mod tests {
         assert!(store.token.lock().unwrap().is_none());
         coordinator.stop().await;
         server.await.unwrap();
+    }
+
+    #[derive(Debug, Default)]
+    struct LoginStore {
+        token: std::sync::Mutex<Option<Vec<u8>>>,
+        writes: std::sync::atomic::AtomicUsize,
+        deletes: std::sync::atomic::AtomicUsize,
+        block_first: std::sync::atomic::AtomicBool,
+        fail_delete: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl NativeRefreshTokenStore for LoginStore {
+        async fn load(&self) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
+            Ok(self.token.lock().unwrap().clone())
+        }
+        async fn store(&self, token: &[u8]) -> Result<(), NativeRefreshTokenStoreError> {
+            if self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+                && self.block_first.load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            *self.token.lock().unwrap() = Some(token.to_vec());
+            Ok(())
+        }
+        async fn delete(&self) -> Result<(), NativeRefreshTokenStoreError> {
+            self.deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_delete.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(NativeRefreshTokenStoreError::Unavailable);
+            }
+            *self.token.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    async fn next_login_output(coordinator: &mut NativeAccessCoordinator) -> NativeAccessOutput {
+        time::timeout(Duration::from_secs(3), coordinator.next_output())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn cancel_outputs(coordinator: &mut NativeAccessCoordinator, attempt: &str) {
+        assert_eq!(
+            next_login_output(coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Canceled)
+        );
+        assert!(
+            matches!(next_login_output(coordinator).await, NativeAccessOutput::ClientCommand { command, .. } if *command == ClientCommand::CancelWaltrLogin { attempt_id: attempt.into() })
+        );
+    }
+
+    async fn callback(actions: &mpsc::Sender<NativeAccessAction>, state: &str, code: &str) {
+        actions
+            .send(NativeAccessAction::AuthorizationCallback(
+                NativeAuthorizationCallback::new(format!(
+                    "{EXTERNAL_REDIRECT_URI}?code={code}&state={state}"
+                )),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn login_succeeded(coordinator: &mut NativeAccessCoordinator) {
+        loop {
+            if next_login_output(coordinator).await
+                == NativeAccessOutput::Progress(NativeAccessProgress::Succeeded)
+            {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_exchange_result_after_host_cancel_cannot_touch_prior_durable_credentials() {
+        let (endpoint, _, server) = spawn_test_oauth_server().await;
+        let credentials = NativeCredentialProvider::new();
+        let store = Arc::new(LoginStore::default());
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.callback = NativeCallbackPolicy::External;
+        let (actions, receiver) = mpsc::channel(8);
+        let (outputs, output_receiver) = mpsc::channel(8);
+        let (results, result_receiver) = mpsc::channel(2);
+        let task = tokio::spawn(coordinate(
+            receiver,
+            result_receiver,
+            CoordinatorContext {
+                outputs,
+                config,
+                credentials: credentials.clone(),
+                refresh_store: store.clone(),
+                results: results.clone(),
+            },
+        ));
+        let mut coordinator = NativeAccessCoordinator {
+            actions: actions.clone(),
+            outputs: output_receiver,
+            task,
+            credentials: credentials.clone(),
+        };
+        let url = begin_external_attempt(&mut coordinator, &actions, "canceled").await;
+        *store.token.lock().unwrap() = Some(b"prior-attempt-refresh".to_vec());
+        let lease = credentials.credential_lease();
+        // Both branches become ready without yielding; either selection order must be safe.
+        assert!(
+            results
+                .try_send(CoordinatorResult::Login {
+                    attempt_id: "canceled".into(),
+                    lease,
+                    result: Ok(Box::new(LoginTokens {
+                        access_token: "canceled-access".into(),
+                        refresh_token: Some("canceled-refresh".into()),
+                        expires_in: Duration::from_secs(3600),
+                        token_endpoint: url,
+                        client_id: "native".into(),
+                    }))
+                })
+                .is_ok()
+        );
+        let _ = credentials.clear_bearer_token();
+        actions.try_send(NativeAccessAction::Cancel).unwrap();
+        cancel_outputs(&mut coordinator, "canceled").await;
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(store.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"prior-attempt-refresh".as_slice())
+        );
+        assert!(!credentials.has_bearer_token());
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_store_compensates_before_retry_and_only_new_callback_persists() {
+        let (endpoint, mut requests, server) = spawn_test_oauth_server().await;
+        let credentials = NativeCredentialProvider::new();
+        let store = Arc::new(LoginStore::default());
+        store
+            .block_first
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.callback = NativeCallbackPolicy::External;
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            config,
+            credentials.clone(),
+            store.clone(),
+            8,
+        );
+        let actions = coordinator.action_sender();
+        let url = begin_external_attempt(&mut coordinator, &actions, "first").await;
+        let old_state = query_value(&url, "state");
+        callback(&actions, &old_state, "first-code").await;
+        time::timeout(Duration::from_secs(3), store.entered.notified())
+            .await
+            .unwrap();
+        let _ = credentials.clear_bearer_token();
+        actions.try_send(NativeAccessAction::Cancel).unwrap();
+        store.release.notify_one();
+        // Exchanging is emitted before the store barrier.
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Exchanging)
+        ));
+        cancel_outputs(&mut coordinator, "first").await;
+        assert!(store.token.lock().unwrap().is_none());
+        assert!(!credentials.has_bearer_token());
+        assert_eq!(store.deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let next = begin_external_attempt(&mut coordinator, &actions, "second").await;
+        callback(&actions, &old_state, "late-code").await;
+        callback(&actions, &query_value(&next, "state"), "new-code").await;
+        login_succeeded(&mut coordinator).await;
+        assert!(
+            matches!(next_login_output(&mut coordinator).await, NativeAccessOutput::ClientCommand { command, .. } if *command == ClientCommand::CompleteWaltrLogin { attempt_id: "second".into() })
+        );
+        assert!(requests.recv().await.unwrap().contains("first-code"));
+        assert!(requests.recv().await.unwrap().contains("new-code"));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"test-refresh".as_slice())
+        );
+        coordinator.stop().await;
+        assert!(
+            store.token.lock().unwrap().is_some(),
+            "ordinary stop retains the successful retry"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_after_complete_is_queued_compensates_and_cleanup_failure_blocks_retry() {
+        let (endpoint, _requests, server) = spawn_test_oauth_server().await;
+        let credentials = NativeCredentialProvider::new();
+        let store = Arc::new(LoginStore::default());
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.callback = NativeCallbackPolicy::External;
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            config,
+            credentials.clone(),
+            store.clone(),
+            8,
+        );
+        let actions = coordinator.action_sender();
+        let url = begin_external_attempt(&mut coordinator, &actions, "completed").await;
+        callback(&actions, &query_value(&url, "state"), "complete-code").await;
+        login_succeeded(&mut coordinator).await;
+        assert!(
+            !coordinator.outputs.is_empty(),
+            "Complete is already queued before the host cancellation"
+        );
+        store
+            .fail_delete
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = credentials.clear_bearer_token();
+        actions.send(NativeAccessAction::Cancel).await.unwrap();
+        assert!(
+            matches!(next_login_output(&mut coordinator).await, NativeAccessOutput::ClientCommand { command, .. } if *command == ClientCommand::CompleteWaltrLogin { attempt_id: "completed".into() })
+        );
+        assert!(
+            matches!(next_login_output(&mut coordinator).await, NativeAccessOutput::Progress(NativeAccessProgress::Failed { error }) if error.contains("cleanup could not be confirmed"))
+        );
+        cancel_outputs(&mut coordinator, "completed").await;
+        assert!(!credentials.has_bearer_token());
+        assert!(
+            store.token.lock().unwrap().is_some(),
+            "failure is reported, never claimed as durable deletion"
+        );
+        actions.send(NativeAccessAction::Start).await.unwrap();
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Failed { .. })
+        ));
+        store
+            .fail_delete
+            .store(false, std::sync::atomic::Ordering::Release);
+        actions.send(NativeAccessAction::Start).await.unwrap();
+        assert!(
+            matches!(next_login_output(&mut coordinator).await, NativeAccessOutput::ClientCommand { command, .. } if *command == ClientCommand::StartWaltrLogin)
+        );
+        assert!(store.token.lock().unwrap().is_none());
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backpressured_success_output_cannot_skip_cancel_compensation_on_stop() {
+        for previous in [None, Some(b"previous-refresh".to_vec())] {
+            for cancel in [true, false] {
+                let (endpoint, _requests, server) = spawn_test_oauth_server().await;
+                let credentials = NativeCredentialProvider::new();
+                let store = Arc::new(LoginStore::default());
+                let mut config = test_config();
+                config.endpoint = endpoint;
+                config.callback = NativeCallbackPolicy::External;
+                let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+                    config,
+                    credentials.clone(),
+                    store.clone(),
+                    1,
+                );
+                let actions = coordinator.action_sender();
+                let url = begin_external_attempt(&mut coordinator, &actions, "backpressured").await;
+                *store.token.lock().unwrap() = previous.clone();
+                callback(&actions, &query_value(&url, "state"), "backpressured-code").await;
+                time::timeout(Duration::from_secs(3), async {
+                    while !credentials.has_bearer_token() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                // Exchanging fills the only slot; persistence and bearer installation precede
+                // the blocked Succeeded send. Do not drain that slot before stopping.
+                assert_eq!(coordinator.outputs.len(), 1);
+                assert_eq!(
+                    store.token.lock().unwrap().as_deref(),
+                    Some(b"test-refresh".as_slice())
+                );
+                if cancel {
+                    let _ = credentials.clear_bearer_token();
+                    actions.send(NativeAccessAction::Cancel).await.unwrap();
+                }
+                time::timeout(Duration::from_secs(3), coordinator.stop())
+                    .await
+                    .unwrap();
+                assert!(!credentials.has_bearer_token());
+                let expected = if cancel {
+                    previous.clone()
+                } else {
+                    Some(b"test-refresh".to_vec())
+                };
+                assert_eq!(*store.token.lock().unwrap(), expected);
+                assert_eq!(
+                    store.deletes.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(cancel && expected.is_none())
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_drains_cancel_and_inflight_store_without_dropping_compensation() {
+        let (endpoint, _requests, server) = spawn_test_oauth_server().await;
+        let credentials = NativeCredentialProvider::new();
+        let store = Arc::new(LoginStore::default());
+        store
+            .block_first
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.callback = NativeCallbackPolicy::External;
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            config,
+            credentials.clone(),
+            store.clone(),
+            8,
+        );
+        let actions = coordinator.action_sender();
+        let url = begin_external_attempt(&mut coordinator, &actions, "stopping").await;
+        callback(&actions, &query_value(&url, "state"), "stop-code").await;
+        time::timeout(Duration::from_secs(3), store.entered.notified())
+            .await
+            .unwrap();
+        let _ = credentials.clear_bearer_token();
+        actions.try_send(NativeAccessAction::Cancel).unwrap();
+        let stopped = tokio::spawn(coordinator.stop());
+        store.release.notify_one();
+        time::timeout(Duration::from_secs(3), stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.token.lock().unwrap().is_none());
+        assert!(!credentials.has_bearer_token());
+        assert_eq!(store.deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_compensation_preserves_a_different_durable_owner() {
+        let store = LoginStore::default();
+        *store.token.lock().unwrap() = Some(b"different-attempt".to_vec());
+        let credentials = NativeCredentialProvider::new();
+        let (outputs, _receiver) = mpsc::channel(1);
+        let mut owner = Some(LoginPersistence {
+            attempt_id: "canceled".into(),
+            lease: credentials.credential_lease(),
+            token: Some(b"canceled-refresh".to_vec()),
+            previous: None,
+            canceled: false,
+        });
+        assert!(compensate_login(&outputs, &store, &mut owner).await);
+        assert!(owner.is_none());
+        assert_eq!(store.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"different-attempt".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_persistence_restores_the_previous_attempt_including_reused_token() {
+        for candidate in [
+            Some(b"canceled-refresh".to_vec()),
+            Some(b"previous-refresh".to_vec()),
+            None,
+        ] {
+            let store = LoginStore::default();
+            *store.token.lock().unwrap() = candidate.clone();
+            let credentials = NativeCredentialProvider::new();
+            let (outputs, _receiver) = mpsc::channel(1);
+            let mut owner = Some(LoginPersistence {
+                attempt_id: "canceled".into(),
+                lease: credentials.credential_lease(),
+                token: candidate,
+                previous: Some(b"previous-refresh".to_vec()),
+                canceled: false,
+            });
+            assert!(compensate_login(&outputs, &store, &mut owner).await);
+            assert!(owner.is_none());
+            assert_eq!(
+                store.token.lock().unwrap().as_deref(),
+                Some(b"previous-refresh".as_slice())
+            );
+            assert_eq!(store.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 
     async fn begin_external_attempt(
