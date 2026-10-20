@@ -1070,6 +1070,54 @@ mod configuration_tests {
     }
 
     #[test]
+    fn android_activity_jni_callbacks_are_kept_in_minified_releases() {
+        let rust = include_str!("lib.rs")
+            .split("#[cfg(test)]\nmod configuration_tests")
+            .next()
+            .expect("production Rust source");
+        let activity =
+            include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
+        let proguard = include_str!("../gen/android/app/proguard-rules.pro");
+        let gradle = include_str!("../gen/android/app/build.gradle.kts");
+        let release = gradle
+            .split("getByName(\"release\") {")
+            .nth(1)
+            .expect("release build configuration")
+            .split("\n        }")
+            .next()
+            .unwrap();
+        assert!(release.contains("isMinifyEnabled = true"));
+        assert!(release.contains("proguardFiles("));
+        assert!(release.contains("fileTree(\".\") { include(\"**/*.pro\") }"));
+
+        let kept_callbacks = proguard
+            .split("-keepclassmembers class dev.waltr.app.MainActivity {")
+            .nth(1)
+            .expect("explicit Activity callback keep rule")
+            .split('}')
+            .next()
+            .unwrap();
+        let mut callbacks = Vec::new();
+        for call in rust.split(".call_method(").skip(1) {
+            let mut arguments = call.split(',').map(str::trim);
+            if arguments.next() != Some("activity") {
+                continue;
+            }
+            let method = arguments.next().expect("literal Activity method name");
+            let method = method
+                .strip_prefix('"')
+                .and_then(|method| method.strip_suffix('"'))
+                .expect("literal Activity method name");
+            assert_eq!(arguments.next(), Some("\"()V\""), "{method} JNI signature");
+            assert!(activity.contains(&format!("fun {method}() {{")));
+            assert!(kept_callbacks.contains(&format!("public void {method}();")));
+            callbacks.push(method);
+        }
+        callbacks.sort_unstable();
+        assert_eq!(callbacks, ["requestLocalServer", "selectRemoteServer"]);
+    }
+
+    #[test]
     fn android_embedded_service_contract_is_private_and_permission_gated() {
         let manifest = include_str!("../gen/android/app/src/main/AndroidManifest.xml");
         let activity =

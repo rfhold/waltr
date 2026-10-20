@@ -24,6 +24,11 @@
 -keep class dev.waltr.app.SecureTokenStore { *; }
 -keep class dev.waltr.app.SecureTokenStore$Companion { *; }
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+# Rust calls these Activity methods by name through JNI.
+-keepclassmembers class dev.waltr.app.MainActivity {
+    public void requestLocalServer();
+    public void selectRemoteServer();
+}
 -keepclasseswithmembernames class dev.waltr.app.MainActivity {
     native <methods>;
 }
