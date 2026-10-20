@@ -86,6 +86,16 @@ struct ApiProtectedResourceMetadata<'a> {
     resource: &'a str,
     authorization_servers: [&'a str; 1],
     scopes_supported: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waltr_native_client: Option<ApiNativeClientMetadata<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ApiNativeClientMetadata<'a> {
+    pub client_id: &'a str,
+    pub scopes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<&'a str>,
 }
 
 /// Serve Waltr native API protected-resource metadata.
@@ -100,6 +110,7 @@ pub async fn api_protected_resource(State(auth): State<AccessAuthenticator>) -> 
             resource,
             authorization_servers: [issuer],
             scopes_supported: auth.api_required_scopes(),
+            waltr_native_client: auth.api_native_client(),
         })
         .into_response(),
     )
@@ -821,7 +832,7 @@ mod tests {
                             "jwks_uri": format!("{issuer}/jwks"),
                             "response_types_supported": ["code"],
                             "code_challenge_methods_supported": ["S256"],
-                            "token_endpoint_auth_methods_supported": ["none"],
+                            "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
                             "id_token_signing_alg_values_supported": ["RS256"]
                         }))
                     }
@@ -847,7 +858,7 @@ mod tests {
         let config = OidcConfig::new(
             &issuer,
             "waltr",
-            None,
+            Some("browser-secret".to_owned()),
             "http://127.0.0.1:14333/oidc/callback",
             "api",
             vec!["openid".to_owned()],
@@ -856,6 +867,43 @@ mod tests {
             true,
         )
         .unwrap();
+        let native_config = config
+            .clone()
+            .with_access_domains(
+                "http://127.0.0.1:14333",
+                &issuer,
+                "api",
+                vec!["openid".to_owned(), "waltr:api".to_owned()],
+            )
+            .unwrap()
+            .with_api_client_id("native-public-client")
+            .unwrap();
+        let native_auth = AccessAuthenticator::initialize(
+            AccessAuthConfig::oidc(native_config),
+            &persistence,
+            AccessAuthHttpClient::build(reqwest::Client::builder()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let native_response = api_protected_resource(State(native_auth)).await;
+        assert_eq!(native_response.headers()[header::CACHE_CONTROL], NO_STORE);
+        let native_body = axum::body::to_bytes(native_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let native_metadata: serde_json::Value = serde_json::from_slice(&native_body).unwrap();
+        assert_eq!(
+            native_metadata["waltr_native_client"],
+            serde_json::json!({
+                "client_id": "native-public-client",
+                "scopes": ["openid", "offline_access", "waltr:api"],
+                "audience": "api"
+            })
+        );
+        assert!(
+            !String::from_utf8(native_body.to_vec())
+                .unwrap()
+                .contains("secret")
+        );
         let auth = AccessAuthenticator::initialize(
             AccessAuthConfig::oidc(config),
             &persistence,
@@ -863,6 +911,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let response = api_protected_resource(State(auth.clone())).await;
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(metadata.get("waltr_native_client").is_none());
         let now = SystemTime::now();
         auth.oidc()
             .unwrap()

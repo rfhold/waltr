@@ -69,6 +69,8 @@ Treat preview/prod Pulumi Apps routes as source configuration, not proof of live
 
 Keep Waltr access authentication, hosted MCP authorization, and provider/upstream-MCP credential OAuth separate. Authentik authenticates resource owners; the generic MCP server owns downstream grants/tokens, and Waltr's outbound flow is target-scoped.
 
+API-root protected-resource metadata advertises `waltr_native_client` only when `WALTR_API_OIDC_CLIENT_ID` is configured. Keep public client ID, deduplicated `openid`/`offline_access`/required API scopes, and API audience separate from browser secrets and hosted MCP metadata. See [native bootstrap](../../docs/architecture/access-authentication.md#url-only-native-bootstrap).
+
 `build_app()` owns environment loading and is async/fallible because persistence migrations and OIDC discovery precede binding. Explicit builders receive initialized `Persistence` and, where enabled, `AccessAuthenticator`.
 
 `build_embedded_server()` must use only explicit absolute paths and host policy. It prebinds ephemeral IPv4 loopback and returns one owned lifecycle.
