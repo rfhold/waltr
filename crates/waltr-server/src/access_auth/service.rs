@@ -153,6 +153,22 @@ impl AccessAuthenticator {
             .map_or(&[], |oidc| oidc.config.api_required_scopes())
     }
 
+    pub(super) fn api_native_client(&self) -> Option<super::handlers::ApiNativeClientMetadata<'_>> {
+        let config = self.oidc()?.config();
+        let client_id = config.api_client_id()?;
+        let mut scopes = vec!["openid".to_owned(), "offline_access".to_owned()];
+        for scope in config.api_required_scopes() {
+            if !scopes.contains(scope) {
+                scopes.push(scope.clone());
+            }
+        }
+        Some(super::handlers::ApiNativeClientMetadata {
+            client_id,
+            scopes,
+            audience: Some(config.api_audience()),
+        })
+    }
+
     /// Validate a plaintext bearer token against the configured issuer and scopes.
     ///
     /// # Errors
