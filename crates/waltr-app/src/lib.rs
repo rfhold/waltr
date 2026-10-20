@@ -280,11 +280,9 @@ async fn start_runtime(
     });
     #[cfg(target_os = "android")]
     if bridge.is_remote() {
-        use tauri::RuntimeHandle as _;
-        app.runtime_handle()
-            .run_on_android_context(|env, activity, _| {
-                drop(env.call_method(activity, "selectRemoteServer", "()V", &[]));
-            });
+        tauri::wry::prelude::dispatch(|env, activity, _| {
+            drop(env.call_method(activity, "selectRemoteServer", "()V", &[]));
+        });
     }
     if !bridge.is_remote() {
         #[cfg(not(target_os = "android"))]
@@ -306,7 +304,7 @@ async fn start_runtime(
                 .map_err(|_| "Local server failed")?;
         }
         #[cfg(target_os = "android")]
-        request_android_local_server(&app)?;
+        request_android_local_server()?;
     }
     if selection.ticket.load(Ordering::Acquire) != ticket {
         return Err("Native start was cancelled".into());
@@ -589,12 +587,10 @@ fn deliver_events(
 }
 
 #[cfg(target_os = "android")]
-fn request_android_local_server(app: &tauri::AppHandle) -> Result<(), String> {
-    use tauri::RuntimeHandle as _;
-    app.runtime_handle()
-        .run_on_android_context(|env, activity, _| {
-            drop(env.call_method(activity, "requestLocalServer", "()V", &[]));
-        });
+fn request_android_local_server() -> Result<(), String> {
+    tauri::wry::prelude::dispatch(|env, activity, _| {
+        drop(env.call_method(activity, "requestLocalServer", "()V", &[]));
+    });
     Ok(())
 }
 

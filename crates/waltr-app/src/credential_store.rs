@@ -386,7 +386,7 @@ mod platform {
                     ],
                 )?
                 .l()?;
-            let response = env.cast_local::<JByteArray>(response)?;
+            let response = env.cast_local::<JByteArray<'_>>(response)?;
             let length = response.len(env)?;
             if !(1..=(MAX_TOKEN_BYTES + 1)).contains(&length) {
                 return Ok(vec![3]);
