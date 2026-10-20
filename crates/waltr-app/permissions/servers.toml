@@ -1,0 +1,24 @@
+[[permission]]
+identifier = "allow-list-servers"
+description = "List nonsecret server profiles."
+commands.allow = ["list_servers"]
+
+[[permission]]
+identifier = "allow-save-server"
+description = "Save a validated server profile."
+commands.allow = ["save_server"]
+
+[[permission]]
+identifier = "allow-remove-server"
+description = "Remove a server profile."
+commands.allow = ["remove_server"]
+
+[[permission]]
+identifier = "allow-start-access-login"
+description = "Start native login for the current generation."
+commands.allow = ["start_access_login"]
+
+[[permission]]
+identifier = "allow-logout-access"
+description = "Log out the current native generation."
+commands.allow = ["logout_access"]

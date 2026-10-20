@@ -4348,8 +4348,10 @@ dependencies = [
  "reqwest",
  "rustls 0.23.40",
  "rustls-platform-verifier",
+ "security-framework",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
@@ -4359,6 +4361,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots 1.0.7",
+ "zeroize",
 ]
 
 [[package]]

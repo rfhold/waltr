@@ -6,9 +6,12 @@
 
 mod app_container;
 mod bridge;
+mod credential_store;
+mod native_auth;
 mod observability;
 mod policy;
 mod server_controller;
+mod server_profiles;
 
 #[cfg(all(
     feature = "native-apps-test",
@@ -41,6 +44,100 @@ use tauri_plugin_opener::OpenerExt as _;
 use tracing::Instrument as _;
 
 const BRIDGE_EVENT: &str = "waltr://bridge";
+#[derive(Default)]
+struct RuntimeSelection {
+    operation: tokio::sync::Mutex<()>,
+    ticket: std::sync::atomic::AtomicU64,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct NativeAssetOwner(tokio::sync::Mutex<Option<(u64, native_apps::NativeAssets)>>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+async fn retire_native_assets(app: &tauri::AppHandle, generation: Option<u64>) {
+    let owner = app.state::<NativeAssetOwner>();
+    let mut assets = owner.0.lock().await;
+    if assets
+        .as_ref()
+        .is_some_and(|(current, _)| generation.is_none_or(|generation| generation == *current))
+    {
+        if native_apps_navigation::detach_on_main(app).await.is_err() {
+            app.exit(1);
+        }
+        if let Some((_, assets)) = assets.take() {
+            drop(assets.shutdown().await);
+        }
+    }
+}
+
+#[tauri::command]
+fn list_servers(
+    profiles: State<'_, Arc<server_profiles::ServerProfiles>>,
+) -> server_profiles::ServerList {
+    profiles.list()
+}
+#[tauri::command]
+fn save_server(
+    profiles: State<'_, Arc<server_profiles::ServerProfiles>>,
+    url: String,
+    name: Option<String>,
+) -> Result<server_profiles::ServerProfile, String> {
+    profiles.save(&url, name)
+}
+async fn stop_runtime_tasks(bridge: Arc<RuntimeBridge>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let (ticket, _) = clear_mobile_client_requested();
+        if let Some(ticket) = ticket {
+            bridge.invalidate_start(ticket);
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || bridge.stop())
+        .await
+        .map_err(|_| "Native runtime could not stop".to_owned())
+}
+#[tauri::command]
+async fn remove_server(
+    app: tauri::AppHandle,
+    selection: State<'_, RuntimeSelection>,
+    profiles: State<'_, Arc<server_profiles::ServerProfiles>>,
+    bridge: State<'_, Arc<RuntimeBridge>>,
+    server_id: String,
+) -> Result<(), String> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = &app;
+    if server_id == "local" {
+        return Err("Local cannot be removed".into());
+    }
+    let _operation = selection.operation.lock().await;
+    if bridge.selected_id() == server_id {
+        selection.ticket.fetch_add(1, Ordering::AcqRel);
+        stop_runtime_tasks(Arc::clone(bridge.inner())).await?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        retire_native_assets(&app, None).await;
+    }
+    credential_store::CredentialStore::delete_server(&server_id)
+        .await
+        .map_err(|_| "Secure credentials could not be removed")?;
+    profiles.remove(&server_id)
+}
+#[tauri::command]
+async fn start_access_login(
+    bridge: State<'_, Arc<RuntimeBridge>>,
+    generation: u64,
+) -> Result<(), String> {
+    bridge
+        .access_action(generation, waltr_client::NativeAccessAction::Start)
+        .await
+}
+#[tauri::command]
+async fn logout_access(
+    bridge: State<'_, Arc<RuntimeBridge>>,
+    generation: u64,
+) -> Result<(), String> {
+    bridge
+        .access_action(generation, waltr_client::NativeAccessAction::Logout)
+        .await
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,16 +232,102 @@ impl MobileStartCoordination {
 async fn start_runtime(
     app: tauri::AppHandle,
     bridge: State<'_, Arc<RuntimeBridge>>,
+    server_id: Option<String>,
 ) -> Result<RuntimeStarted, String> {
+    let selection = app.state::<RuntimeSelection>();
+    let ticket = selection
+        .ticket
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    let _operation = selection.operation.lock().await;
+    if selection.ticket.load(Ordering::Acquire) != ticket {
+        return Err("Native start was cancelled".into());
+    }
+    let profile = app
+        .state::<Arc<server_profiles::ServerProfiles>>()
+        .get(server_id.as_deref().unwrap_or("local"))?;
+    stop_runtime_tasks(Arc::clone(bridge.inner())).await?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    retire_native_assets(&app, None).await;
+    let access = if let Some(endpoint) = &profile.url {
+        #[cfg(target_os = "android")]
+        let callback = waltr_client::NativeCallbackPolicy::External;
+        #[cfg(not(target_os = "android"))]
+        let callback = waltr_client::NativeCallbackPolicy::Loopback(
+            waltr_client::NativeLoopbackPolicy::Ephemeral,
+        );
+        match waltr_client::discover_native_access_config(endpoint, callback).await {
+            Ok(bootstrap) => Some(native_auth::AccessBinding::from_bootstrap(
+                profile.id.clone(),
+                bootstrap,
+            )?),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if selection.ticket.load(Ordering::Acquire) != ticket {
+        return Err("Native start was cancelled".into());
+    }
+    bridge.select(bridge::RuntimeTarget {
+        id: profile.id,
+        endpoint: profile.url,
+        access,
+        app: Some(app.clone()),
+        profiles: Some(Arc::clone(
+            app.state::<Arc<server_profiles::ServerProfiles>>().inner(),
+        )),
+    });
+    #[cfg(target_os = "android")]
+    if bridge.is_remote() {
+        use tauri::RuntimeHandle as _;
+        app.runtime_handle()
+            .run_on_android_context(|env, activity, _| {
+                drop(env.call_method(activity, "selectRemoteServer", "()V", &[]));
+            });
+    }
+    if !bridge.is_remote() {
+        #[cfg(not(target_os = "android"))]
+        {
+            let data = app
+                .path()
+                .app_data_dir()
+                .map_err(|_| "App storage is unavailable")?;
+            let config = app
+                .path()
+                .app_config_dir()
+                .map_err(|_| "App storage is unavailable")?;
+            let server = app.state::<EmbeddedServerController>().inner().clone();
+            let roots =
+                AppPrivateRoots::new(data, config).map_err(|_| "App storage is unavailable")?;
+            tauri::async_runtime::spawn_blocking(move || server.start(roots))
+                .await
+                .map_err(|_| "Local server failed")?
+                .map_err(|_| "Local server failed")?;
+        }
+        #[cfg(target_os = "android")]
+        request_android_local_server(&app)?;
+    }
+    if selection.ticket.load(Ordering::Acquire) != ticket {
+        return Err("Native start was cancelled".into());
+    }
     let span = observability::operation_span("runtime.start", "ipc");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let native_apps = {
-        let bootstrap = app
-            .state::<EmbeddedServerController>()
-            .connection()
-            .and_then(|connection| connection.native_apps)
-            .map(|bootstrap| *bootstrap)
-            .ok_or_else(|| "native Apps listener is unavailable".to_owned())?;
+        let owner = app.state::<NativeAssetOwner>();
+        let mut assets = owner.0.lock().await;
+        if let Some((_, previous)) = assets.take() {
+            drop(previous.shutdown().await);
+        }
+        let current = native_apps::NativeAssets::start()
+            .await
+            .map_err(|_| "Native Apps listener is unavailable")?;
+        if selection.ticket.load(Ordering::Acquire) != ticket {
+            drop(current.shutdown().await);
+            return Err("Native start was cancelled".into());
+        }
+        let bootstrap = current.bootstrap();
+        *assets = Some((0, current));
         if let Err(error) = native_apps_navigation::install(&app, &bootstrap).await {
             app.state::<EmbeddedServerController>().stop();
             app.exit(1);
@@ -152,6 +335,11 @@ async fn start_runtime(
         }
         bootstrap
     };
+    if selection.ticket.load(Ordering::Acquire) != ticket {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        retire_native_assets(&app, None).await;
+        return Err("Native start was cancelled".into());
+    }
     let result = (|| {
         #[cfg(target_os = "android")]
         let (ticket, displaced_generation) = begin_mobile_client_request()?;
@@ -175,7 +363,7 @@ async fn start_runtime(
         #[cfg(target_os = "android")]
         match finish_mobile_client_start(ticket, generation) {
             MobileStartDisposition::Deliver => {
-                deliver_events(app, Arc::clone(bridge.inner()), feed);
+                deliver_events(app.clone(), Arc::clone(bridge.inner()), feed);
             }
             MobileStartDisposition::Suspended => {
                 bridge.stop_generation_nonblocking(generation);
@@ -205,17 +393,37 @@ async fn start_runtime(
             native_apps_test: native_apps,
         })
     })();
+    if selection.ticket.load(Ordering::Acquire) != ticket {
+        if let Ok(started) = &result {
+            bridge.stop_generation_nonblocking(started.generation);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        retire_native_assets(&app, None).await;
+        return Err("Native start was cancelled".into());
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Ok(started) = &result {
+        if let Some((generation, _)) = app.state::<NativeAssetOwner>().0.lock().await.as_mut() {
+            *generation = started.generation;
+        }
+    } else {
+        retire_native_assets(&app, None).await;
+    }
     observability::record_result(&span, &result);
     result
 }
 
 #[tauri::command]
 async fn client_dispatch(
+    generation: u64,
     command: ClientCommand,
     bridge: State<'_, Arc<RuntimeBridge>>,
 ) -> Result<BridgeEvent<BridgePayload>, String> {
     let span = observability::operation_span("client.dispatch", "ipc");
-    let result = bridge.dispatch(command).instrument(span.clone()).await;
+    let result = bridge
+        .dispatch(generation, command)
+        .instrument(span.clone())
+        .await;
     observability::record_result(&span, &result);
     result
 }
@@ -240,23 +448,43 @@ fn client_state(
     clippy::needless_pass_by_value,
     reason = "Tauri command injection owns State"
 )]
-fn dispose_runtime(bridge: State<'_, Arc<RuntimeBridge>>) {
-    let span = observability::operation_span("runtime.dispose", "ipc");
-    #[cfg(target_os = "android")]
-    let (ticket, generation) = clear_mobile_client_requested();
-    #[cfg(target_os = "android")]
-    if let Some(ticket) = ticket {
-        bridge.invalidate_start(ticket);
+async fn dispose_runtime(
+    app: tauri::AppHandle,
+    bridge: State<'_, Arc<RuntimeBridge>>,
+    selection: State<'_, RuntimeSelection>,
+    generation: Option<u64>,
+) -> Result<(), String> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = &app;
+    if generation.is_none() {
+        selection.ticket.fetch_add(1, Ordering::AcqRel);
     }
-    #[cfg(target_os = "android")]
+    let _operation = selection.operation.lock().await;
     if let Some(generation) = generation {
-        bridge.stop_generation_nonblocking(generation);
+        if bridge.stop_generation_nonblocking(generation) {
+            selection.ticket.fetch_add(1, Ordering::AcqRel);
+            #[cfg(target_os = "android")]
+            if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
+                let mut lifecycle = lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if lifecycle.coordination.active_generation == Some(generation) {
+                    lifecycle.coordination.cancel();
+                }
+            }
+            stop_runtime_tasks(Arc::clone(bridge.inner())).await?;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            retire_native_assets(&app, Some(generation)).await;
+        }
+        return Ok(());
     }
-    #[cfg(target_os = "android")]
-    bridge.clear_authorization_state();
-    #[cfg(not(target_os = "android"))]
-    stop_client_bridge(bridge.inner());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    retire_native_assets(&app, None).await;
+    selection.ticket.fetch_add(1, Ordering::AcqRel);
+    let span = observability::operation_span("runtime.dispose", "ipc");
+    stop_runtime_tasks(Arc::clone(bridge.inner())).await?;
     observability::record_outcome(&span, "ok");
+    Ok(())
 }
 
 #[cfg(target_os = "android")]
@@ -274,15 +502,22 @@ fn stop_client_bridge(bridge: &RuntimeBridge) {
     clippy::needless_pass_by_value,
     reason = "Tauri command injection owns AppHandle and deserialized arguments"
 )]
-fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+fn open_external_url(
+    app: tauri::AppHandle,
+    url: String,
+    generation: u64,
+    bridge: State<'_, Arc<RuntimeBridge>>,
+) -> Result<(), String> {
     let span = observability::operation_span("external.open", "ipc");
-    let result = policy::external_https_url(&url)
-        .map_err(str::to_owned)
-        .and_then(|url| {
-            app.opener()
-                .open_url(url.as_str(), None::<&str>)
-                .map_err(|_| "external URL could not be opened".to_owned())
-        });
+    let result = bridge.with_current(generation, || {
+        policy::external_https_url(&url)
+            .map_err(str::to_owned)
+            .and_then(|url| {
+                app.opener()
+                    .open_url(url.as_str(), None::<&str>)
+                    .map_err(|_| "external URL could not be opened".to_owned())
+            })
+    });
     observability::record_result(&span, &result);
     result
 }
@@ -295,21 +530,24 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
 fn open_authorization_attempt(
     app: tauri::AppHandle,
     attempt_id: String,
+    generation: u64,
     bridge: State<'_, Arc<RuntimeBridge>>,
 ) -> Result<(), String> {
     let span = observability::operation_span("authorization.open", "ipc");
-    let result = bridge
-        .authorization_attempt_url(&attempt_id)
-        .and_then(|url| {
-            policy::external_https_url(&url)
-                .map_err(str::to_owned)
-                .map(|validated| validated.to_string())
-        })
-        .and_then(|url| {
-            app.opener()
-                .open_url(url, None::<&str>)
-                .map_err(|_| "authorization attempt could not be opened".to_owned())
-        });
+    let result = bridge.with_current(generation, || {
+        bridge
+            .authorization_attempt_url(&attempt_id)
+            .and_then(|url| {
+                policy::external_https_url(&url)
+                    .map_err(str::to_owned)
+                    .map(|validated| validated.to_string())
+            })
+            .and_then(|url| {
+                app.opener()
+                    .open_url(url, None::<&str>)
+                    .map_err(|_| "authorization attempt could not be opened".to_owned())
+            })
+    });
     observability::record_result(&span, &result);
     result
 }
@@ -348,6 +586,16 @@ fn deliver_events(
         }
         .instrument(span),
     );
+}
+
+#[cfg(target_os = "android")]
+fn request_android_local_server(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::RuntimeHandle as _;
+    app.runtime_handle()
+        .run_on_android_context(|env, activity, _| {
+            drop(env.call_method(activity, "requestLocalServer", "()V", &[]));
+        });
+    Ok(())
 }
 
 #[cfg(target_os = "android")]
@@ -536,6 +784,39 @@ pub fn nativeServerStatus(
 
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
+pub fn nativeInitializeCredentialStore(
+    mut env: jni::EnvUnowned<'_>,
+    _activity: jni::objects::JObject<'_>,
+    store: jni::objects::JObject<'_>,
+) {
+    drop(env.with_env(|env| -> jni::errors::Result<()> {
+        drop(credential_store::initialize_android(env, &store));
+        Ok(())
+    }));
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
+pub fn nativeAuthorizationCallback(
+    mut env: jni::EnvUnowned<'_>,
+    _activity: jni::objects::JObject<'_>,
+    uri: jni::objects::JString<'_>,
+) {
+    drop(env.with_env(|env| -> jni::errors::Result<()> {
+        let uri = uri.mutf8_chars(env)?.to_str().into_owned();
+        if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
+            lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bridge
+                .authorization_callback(uri);
+        }
+        Ok(())
+    }));
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Record the notification gate without starting server work.
 pub fn nativeNotificationPermissionRequired(
     _env: jni::EnvUnowned<'_>,
@@ -562,6 +843,9 @@ pub fn nativeClientSuspend(_env: jni::EnvUnowned<'_>, _activity: jni::objects::J
         let mut lifecycle = lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.bridge.is_remote() {
+            return;
+        }
         (
             Arc::clone(&lifecycle.bridge),
             lifecycle.coordination.suspend(),
@@ -632,14 +916,23 @@ pub fn run() {
             let server = {
                 let data = app.path().app_data_dir().map_err(std::io::Error::other)?;
                 let config = app.path().app_config_dir().map_err(std::io::Error::other)?;
-                let roots = AppPrivateRoots::new(data, config).map_err(std::io::Error::other)?;
-                let server = EmbeddedServerController::default();
-                server.start(roots).map_err(std::io::Error::other)?;
-                server
+                let _roots = AppPrivateRoots::new(data, config).map_err(std::io::Error::other)?;
+                EmbeddedServerController::default()
             };
             let bridge = Arc::new(RuntimeBridge::new(server.clone()));
             app.manage(Arc::clone(&bridge));
             app.manage(server);
+            app.manage(RuntimeSelection::default());
+            let registry = app
+                .path()
+                .app_data_dir()
+                .map_err(std::io::Error::other)?
+                .join("servers.json");
+            app.manage(Arc::new(
+                server_profiles::ServerProfiles::open(registry).map_err(std::io::Error::other)?,
+            ));
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            app.manage(NativeAssetOwner(tokio::sync::Mutex::new(None)));
 
             #[cfg(target_os = "android")]
             install_mobile_lifecycle(app.handle().clone(), Arc::clone(&bridge));
@@ -687,6 +980,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_runtime,
+            list_servers,
+            save_server,
+            remove_server,
+            start_access_login,
+            logout_access,
             client_dispatch,
             client_state,
             dispose_runtime,
@@ -800,7 +1098,10 @@ mod configuration_tests {
         assert!(manifest.contains("android:stopWithTask=\"false\""));
         assert!(manifest.contains("android:foregroundServiceType=\"specialUse\""));
         assert!(manifest.contains("PROPERTY_SPECIAL_USE_FGS_SUBTYPE"));
-        assert!(!manifest.contains("android.intent.action.VIEW"));
+        assert!(manifest.contains("android.intent.action.VIEW"));
+        assert!(manifest.contains("android.intent.category.BROWSABLE"));
+        assert!(activity.contains("override fun onNewIntent"));
+        assert!(activity.contains("if (localSelected) ensureNotificationPermissionAndServer()"));
         assert!(activity.contains("Manifest.permission.POST_NOTIFICATIONS"));
         assert!(activity.contains("nativeNotificationPermissionRequired"));
         assert!(service.contains("startForeground("));
@@ -847,9 +1148,9 @@ mod configuration_tests {
             .expect("native library load");
         assert!(foreground < native_load);
         assert!(!service.contains("companion object {\n    init"));
-        assert!(
-            activity.contains("ensureNotificationPermissionAndServer()\n    nativeClientResume()")
-        );
+        assert!(activity.contains(
+            "if (localSelected) ensureNotificationPermissionAndServer()\n    nativeClientResume()"
+        ));
         assert!(proguard.contains("WaltrForegroundService"));
         assert!(proguard.contains("org.rustls.platformverifier.**"));
         assert!(gradle.contains("cargo\",\n            \"metadata"));
@@ -864,7 +1165,10 @@ mod configuration_tests {
         assert!(verifier_init < server_start);
         assert!(rust.contains("record_android_startup_failure("));
         assert!(rust.contains("record_android_startup_panic(&span)"));
-        for forbidden in ["endpoint", "bearer", "token", "127.0.0.1"] {
+        assert!(
+            activity.contains("nativeInitializeCredentialStore(SecureTokenStore.initialize(this))")
+        );
+        for forbidden in ["endpoint", "bearer", "127.0.0.1", "@JavascriptInterface"] {
             assert!(
                 !format!("{activity}\n{service}")
                     .to_ascii_lowercase()
@@ -880,8 +1184,6 @@ mod configuration_tests {
         let source = include_str!("lib.rs");
         let forbidden = [
             ["preview", "-waltr.holdenitdown.net"].concat(),
-            ["NativeAccess", "Coordinator"].concat(),
-            ["NativeRefresh", "TokenStore"].concat(),
             ["access", "_start"].concat(),
             ["access", "_cancel"].concat(),
             ["access", "_logout"].concat(),

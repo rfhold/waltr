@@ -120,24 +120,98 @@ mod tests {
         }
     }
 
+    fn registered_app_commands() -> Vec<&'static str> {
+        let source = include_str!("lib.rs");
+        assert_eq!(source.matches("tauri::generate_handler![").count(), 1);
+        source
+            .split_once("tauri::generate_handler![")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0
+            .split(',')
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .collect()
+    }
+
     #[test]
     fn every_app_command_has_explicit_main_permission() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/main.json")).unwrap();
         let permissions = capability["permissions"].as_array().unwrap();
-        for command in [
+        let commands = registered_app_commands();
+        let mut expected = vec![
             "start_runtime",
             "client_dispatch",
             "client_state",
             "dispose_runtime",
             "open_external_url",
             "open_authorization_attempt",
-        ] {
-            assert!(include_str!("../build.rs").contains(&format!("\"{command}\"")));
-            assert!(permissions.iter().any(|permission| permission.as_str()
-                == Some(&format!("allow-{}", command.replace('_', "-")))));
+            "list_servers",
+            "save_server",
+            "remove_server",
+            "start_access_login",
+            "logout_access",
+        ];
+        expected.sort_unstable();
+        let mut registered = commands.clone();
+        registered.sort_unstable();
+        assert_eq!(
+            registered, expected,
+            "update confinement coverage for handler changes"
+        );
+
+        let generated = include_str!("../build.rs")
+            .split_once(".commands(&[")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0;
+        let custom = include_str!("../permissions/servers.toml");
+        for command in commands {
+            let permission_id = format!("allow-{}", command.replace('_', "-"));
+            let generated_permission = generated.contains(&format!("\"{command}\""));
+            let custom_permission = custom.split("[[permission]]").any(|block| {
+                block.contains(&format!("identifier = \"{permission_id}\""))
+                    && block.contains(&format!("commands.allow = [\"{command}\"]"))
+            });
+            assert!(
+                generated_permission ^ custom_permission,
+                "{command} must have exactly one generated or custom permission"
+            );
+            assert!(
+                permissions
+                    .iter()
+                    .any(|permission| permission.as_str() == Some(permission_id.as_str())),
+                "missing main grant for {command}"
+            );
         }
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
+        assert_eq!(capability["local"], true);
         assert!(capability.get("remote").is_none());
+    }
+
+    #[test]
+    fn diagnostic_probe_covers_every_registered_command_and_channel_fetch() {
+        let probe = include_str!("../tests/native-apps/probe.js");
+        let mut probed: Vec<_> = probe
+            .split_once("const commands = [")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0
+            .split(',')
+            .map(|command| command.trim().trim_matches('\''))
+            .collect();
+        let mut expected = registered_app_commands();
+        expected.push("plugin:__TAURI_CHANNEL__|fetch");
+        expected.sort_unstable();
+        probed.sort_unstable();
+        assert_eq!(probed, expected);
     }
 
     #[test]
@@ -160,11 +234,9 @@ mod tests {
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .unwrap();
-        for command in [
-            "client_state",
-            "plugin:core|bogus",
-            "plugin:__TAURI_CHANNEL__|fetch",
-        ] {
+        let mut commands = registered_app_commands();
+        commands.extend(["plugin:core|bogus", "plugin:__TAURI_CHANNEL__|fetch"]);
+        for command in commands {
             for key in ["", "guessed"] {
                 let responses = Arc::new(AtomicUsize::new(0));
                 let response_count = Arc::clone(&responses);

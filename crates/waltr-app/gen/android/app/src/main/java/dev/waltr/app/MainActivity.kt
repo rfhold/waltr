@@ -13,18 +13,22 @@ class MainActivity : TauriActivity() {
   private external fun nativeNotificationPermissionRequired(required: Boolean)
   private external fun nativeClientSuspend()
   private external fun nativeClientResume()
+  private external fun nativeAuthorizationCallback(uri: String)
+  private external fun nativeInitializeCredentialStore(store: SecureTokenStore)
+  private var localSelected = false
 
   private var permissionRequested = false
   private val notificationPermission = registerForActivityResult(
     ActivityResultContracts.RequestPermission()
   ) { granted ->
     nativeNotificationPermissionRequired(!granted)
-    if (granted) startWaltrService()
+    if (granted && localSelected) startWaltrService()
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    nativeInitializeCredentialStore(SecureTokenStore.initialize(this))
   }
 
   override fun onPause() {
@@ -34,8 +38,27 @@ class MainActivity : TauriActivity() {
 
   override fun onResume() {
     super.onResume()
-    ensureNotificationPermissionAndServer()
+    if (localSelected) ensureNotificationPermissionAndServer()
     nativeClientResume()
+  }
+
+  fun requestLocalServer() {
+    runOnUiThread {
+      localSelected = true
+      ensureNotificationPermissionAndServer()
+    }
+  }
+
+  fun selectRemoteServer() {
+    runOnUiThread { localSelected = false }
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    if (intent.action == Intent.ACTION_VIEW) {
+      val uri = intent.dataString
+      if (uri != null && uri.length <= 8192) nativeAuthorizationCallback(uri)
+    }
   }
 
   private fun ensureNotificationPermissionAndServer() {

@@ -4,11 +4,9 @@ use std::io;
 
 #[cfg(feature = "native-apps-test")]
 use axum::{Router, routing::get};
-use waltr_server::{
-    app_container::{AppsContainerConfig, SpawnedAppsContainer, spawn_app_container},
-    embedded::EmbeddedServer,
-};
+use waltr_server::app_container::{AppsContainerConfig, SpawnedAppsContainer, spawn_app_container};
 use serde::Serialize;
+#[cfg(feature = "native-apps-test")]
 use tokio::sync::oneshot;
 #[cfg(feature = "native-apps-test")]
 use tokio::task::JoinHandle;
@@ -123,70 +121,6 @@ impl NativeAssets {
         let probe = Ok(());
         let container = self_.container.shutdown().await;
         probe.and(container)
-    }
-
-    pub(crate) async fn serve_with_parent(
-        self,
-        server: EmbeddedServer,
-        shutdown: oneshot::Receiver<()>,
-    ) -> io::Result<()> {
-        #[cfg(feature = "native-apps-test")]
-        let mut self_ = self;
-        #[cfg(not(feature = "native-apps-test"))]
-        let self_ = self;
-        let (parent_stop, stop) = oneshot::channel::<()>();
-        let parent = server.serve_with_shutdown(async {
-            let _ = stop.await;
-        });
-        tokio::pin!(parent);
-        tokio::pin!(shutdown);
-        let container_stopped = self_.container.stopped();
-        let probe_wait = async {
-            #[cfg(feature = "native-apps-test")]
-            {
-                drop((&mut self_.probe_task).await);
-            }
-            #[cfg(not(feature = "native-apps-test"))]
-            std::future::pending::<()>().await;
-        };
-        enum Exit {
-            Requested,
-            Parent(io::Result<()>),
-            Probe,
-            Container,
-        }
-        let exit = tokio::select! {
-            _ = &mut shutdown => Exit::Requested,
-            result = &mut parent => Exit::Parent(result),
-            () = probe_wait => Exit::Probe,
-            () = container_stopped.cancelled() => Exit::Container,
-        };
-        let requested = matches!(exit, Exit::Requested);
-        #[cfg(feature = "native-apps-test")]
-        let probe_exited = matches!(exit, Exit::Probe);
-        drop(parent_stop);
-        let parent_result = match exit {
-            Exit::Parent(result) => result,
-            _ => (&mut parent).await,
-        };
-        #[cfg(feature = "native-apps-test")]
-        self_.probe_stop.take();
-        #[cfg(feature = "native-apps-test")]
-        let probe_result = if probe_exited {
-            Ok(())
-        } else {
-            (&mut self_.probe_task)
-                .await
-                .map_err(io::Error::other)
-                .and_then(|result| result)
-        };
-        #[cfg(not(feature = "native-apps-test"))]
-        let probe_result = Ok(());
-        let container_result = self_.container.shutdown().await;
-        if !requested {
-            return Err(io::Error::other("native Apps owner stopped unexpectedly"));
-        }
-        parent_result.and(probe_result).and(container_result)
     }
 }
 
