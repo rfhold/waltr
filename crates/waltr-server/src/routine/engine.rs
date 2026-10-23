@@ -186,6 +186,7 @@ struct WeakAutomaticRoutineAdmission {
 }
 
 struct AutomaticRoutineFinalizer {
+    configuration: Arc<waltr::grpc::waltr::config::v1::Configuration>,
     manual: ManualRoutineHandle,
     snapshot: SessionRunCompletionSnapshot,
     routine: MaterializedRoutine,
@@ -410,12 +411,15 @@ impl RoutineEngine {
                 workers.abort_all();
                 while workers.join_next().await.is_some() {}
             }
-            let children = {
+            // Fence new admissions before waiting; workers may need the lifecycle write gate
+            // themselves to fail closed after a recording error.
+            {
                 let _lifecycle = lifecycle.write().await;
-                invocation_tasks.close_and_wait().await;
-                destination_tasks.close_and_wait().await;
-                active_children.lock().await.drain().collect::<Vec<_>>()
-            };
+                ready.store(false, Ordering::SeqCst);
+            }
+            invocation_tasks.close_and_wait().await;
+            destination_tasks.close_and_wait().await;
+            let children = active_children.lock().await.drain().collect::<Vec<_>>();
             for child in &children {
                 match tokio::time::timeout(SHUTDOWN_INTERRUPT_TIMEOUT, host.interrupt(child)).await
                 {
@@ -526,6 +530,7 @@ impl AutomaticRoutineAdmission {
             reason: routine_pause_reason(routine.name(), "run-completed")?,
             finalizer: Box::new(AutomaticRoutineFinalizer {
                 manual: manual.clone(),
+                configuration: Arc::new(catalog.configuration().clone()),
                 snapshot,
                 routine,
                 trigger_name,
@@ -544,6 +549,7 @@ impl SessionCompletionAdmissionFinalizer for AutomaticRoutineFinalizer {
                 routine,
                 trigger_name,
                 mut context,
+                configuration,
             } = *self;
             let _lifecycle = manual.lifecycle.read().await;
             let pause = super::host::RoutinePause::from_lease(lease);
@@ -600,7 +606,8 @@ impl SessionCompletionAdmissionFinalizer for AutomaticRoutineFinalizer {
                 .map_err(|_| "routine admission persistence failed".to_owned())?;
             drop(manual.wakeups.send(()));
 
-            let recorder = LifecycleRecorder::new(store, invocation_id, manual.wakeups.clone());
+            let recorder =
+                LifecycleRecorder::new(store, invocation_id.clone(), manual.wakeups.clone());
             let host = Arc::clone(&manual.host);
             let active_children = Arc::clone(&manual.active_children);
             let child_admission_closed = Arc::clone(&manual.child_admission_closed);
@@ -608,6 +615,8 @@ impl SessionCompletionAdmissionFinalizer for AutomaticRoutineFinalizer {
             let cancellation = manual.cancellation.clone();
             let failure_control = manual.failure_control.clone();
             let mut invocation = AdmittedInvocation {
+                configuration,
+                invocation_id: Some(invocation_id),
                 routine,
                 trigger: trigger_name,
                 context,
@@ -761,7 +770,65 @@ fn lifecycle_params(
     Ok(params)
 }
 
+pub(crate) struct InteractionOwnership {
+    pub store: RoutineInvocationStore,
+    pub wakeups: broadcast::Sender<()>,
+    pub cancellation: CancellationToken,
+    failure_control: EngineFailureControl,
+}
+
+impl InteractionOwnership {
+    pub(crate) async fn persistence_failed(&self) {
+        self.failure_control.fail_closed().await;
+    }
+}
+
 impl ManualRoutineHandle {
+    /// Reserve engine ownership before any asynchronous durable admission can be abandoned.
+    pub(crate) async fn own_interaction<F, Fut>(&self, make: F) -> Result<(), InvocationError>
+    where
+        F: FnOnce(InteractionOwnership) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut health = self.failure_control.health.subscribe();
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => return Err(InvocationError::new("shutdown", "routine engine is shutting down")),
+            result = health.wait_for(|value| !matches!(value, EngineHealth::Reconciling)) => {
+                if result.is_err() { return Err(InvocationError::new("shutdown", "routine engine health closed")); }
+            }
+        }
+        let _lifecycle = self.lifecycle.read().await;
+        if self.cancellation.is_cancelled() || self.child_admission_closed.load(Ordering::SeqCst) {
+            return Err(InvocationError::new(
+                "shutdown",
+                "routine engine is shutting down",
+            ));
+        }
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(InvocationError::new(
+                "reconciling",
+                "routine engine is not ready",
+            ));
+        }
+        let store = self.store.clone().ok_or_else(|| {
+            InvocationError::new(
+                "routine_persistence",
+                "durable routine store is unavailable",
+            )
+        })?;
+        let ownership = InteractionOwnership {
+            store,
+            wakeups: self.wakeups.clone(),
+            cancellation: self.cancellation.clone(),
+            failure_control: self.failure_control.clone(),
+        };
+        self.invocation_tasks.spawn(tracing::Instrument::instrument(
+            make(ownership),
+            tracing::Span::current(),
+        ));
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn lifecycle_gate_for_test(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.lifecycle)
@@ -798,6 +865,7 @@ impl ManualRoutineHandle {
         })?;
         let mut invocation = self.prepare(request).await?;
         let invocation_id = format!("rinv_{}", uuid::Uuid::new_v4().simple());
+        invocation.invocation_id = Some(invocation_id.clone());
         let admission = RoutineAdmission {
             invocation_id: invocation_id.clone(),
             execution_id: invocation.identity.clone(),
@@ -1058,6 +1126,8 @@ impl ManualRoutineHandle {
             source_values,
         };
         Ok(AdmittedInvocation {
+            configuration: Arc::new(snapshot.configuration().clone()),
+            invocation_id: None,
             routine,
             trigger: trigger_name,
             context,
@@ -1112,8 +1182,15 @@ fn validate_manual_inputs(
     trigger: &crate::resource_catalog::routine::RoutineManualTrigger,
     inputs: &BTreeMap<String, RoutineValue>,
 ) -> Result<BTreeMap<String, Value>, InvocationError> {
-    let exposed = trigger
-        .inputs
+    validate_scalar_inputs(definition, &trigger.inputs, inputs)
+}
+
+pub(crate) fn validate_scalar_inputs(
+    definition: &crate::resource_catalog::routine::RoutineDefinition,
+    declarations: &[crate::resource_catalog::routine::RoutineManualInput],
+    inputs: &BTreeMap<String, RoutineValue>,
+) -> Result<BTreeMap<String, Value>, InvocationError> {
+    let exposed = declarations
         .iter()
         .map(|input| input.name.as_str())
         .collect::<HashSet<_>>();
@@ -1281,6 +1358,8 @@ async fn admit_event(
                 continue;
             }
             let mut admitted = AdmittedInvocation {
+                configuration: Arc::new(snapshot.configuration().clone()),
+                invocation_id: None,
                 routine: routine.clone(),
                 trigger: trigger.name.clone(),
                 context,
@@ -1290,6 +1369,7 @@ async fn admit_event(
             };
             let recorder = if let Some(store) = store {
                 let invocation_id = format!("rinv_{}", uuid::Uuid::new_v4().simple());
+                admitted.invocation_id = Some(invocation_id.clone());
                 let admission = RoutineAdmission {
                     invocation_id: invocation_id.clone(),
                     execution_id: identity.clone(),
@@ -1427,6 +1507,8 @@ async fn execute_and_finalize(
 }
 
 pub(super) struct AdmittedInvocation {
+    pub(super) configuration: Arc<waltr::grpc::waltr::config::v1::Configuration>,
+    pub(super) invocation_id: Option<String>,
     pub(super) routine: MaterializedRoutine,
     pub(super) trigger: String,
     pub(super) context: RoutineInvocationContext,

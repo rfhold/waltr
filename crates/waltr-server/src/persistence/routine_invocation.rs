@@ -24,6 +24,7 @@ pub(super) const ROUTINE_EVENT_SEQUENCE_LOCK_KEY: i64 = 0x4B55_5249_4556_4E54;
 pub(crate) enum RoutineTriggerKind {
     Manual,
     Event,
+    Interaction,
 }
 
 impl RoutineTriggerKind {
@@ -31,6 +32,7 @@ impl RoutineTriggerKind {
         match self {
             Self::Manual => "manual",
             Self::Event => "event",
+            Self::Interaction => "interaction",
         }
     }
 
@@ -38,6 +40,7 @@ impl RoutineTriggerKind {
         match value {
             "manual" => Ok(Self::Manual),
             "event" => Ok(Self::Event),
+            "interaction" => Ok(Self::Interaction),
             _ => Err(invalid_stored_data()),
         }
     }
@@ -1663,6 +1666,232 @@ mod tests {
             code: "provider_failed".to_owned(),
             message: "safe detail".to_owned(),
         }
+    }
+
+    #[test]
+    fn trigger_kinds_keep_stable_storage_and_json_names() {
+        for (kind, name) in [
+            (RoutineTriggerKind::Manual, "manual"),
+            (RoutineTriggerKind::Event, "event"),
+            (RoutineTriggerKind::Interaction, "interaction"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(RoutineTriggerKind::parse(name).unwrap(), kind);
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<RoutineTriggerKind>(&json).unwrap(),
+                kind
+            );
+        }
+        assert!(RoutineTriggerKind::parse("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn interaction_upgrade_rejects_unversioned_schema_without_losing_history() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/sqlite/0006_routine_invocations.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = RoutineInvocationStore::new(PersistencePool::Sqlite(pool.clone()));
+        let (summary, event) = store.admit(admission("retained", &[])).await.unwrap();
+        sqlx::query("CREATE INDEX custom_routine_index ON routine_invocations(trigger_name)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            sqlx::raw_sql(include_str!(
+                "../../migrations/sqlite/0007_routine_interaction_trigger.sql"
+            ))
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        );
+        tx.rollback().await.unwrap();
+        let detail = store.detail("retained").await.unwrap();
+        assert_eq!(detail.summary, summary);
+        assert_eq!(detail.events, [event]);
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'custom_routine_index'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index_count, 1);
+    }
+
+    #[tokio::test]
+    async fn interaction_upgrade_preserves_history_sequences_constraints_and_reconciles() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/sqlite/0006_routine_invocations.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = RoutineInvocationStore::new(PersistencePool::Sqlite(pool.clone()));
+        store
+            .admit(admission("old-manual", &["task"]))
+            .await
+            .unwrap();
+        store.start_invocation("old-manual", 20).await.unwrap();
+        store
+            .transition_task(
+                "old-manual",
+                "task",
+                RoutineTaskTransition::Started {
+                    session_references: BTreeMap::from([(
+                        "helper".to_owned(),
+                        "session".to_owned(),
+                    )]),
+                },
+                30,
+            )
+            .await
+            .unwrap();
+        store
+            .fail_task_and_invocation("old-manual", "task", failure(), 40)
+            .await
+            .unwrap();
+        let mut event = admission("old-event", &[]);
+        event.trigger_kind = RoutineTriggerKind::Event;
+        store.admit(event).await.unwrap();
+        let indexes_before = sqlx::query_as::<_, (String, String)>(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+        ).fetch_all(&pool).await.unwrap();
+        for table in [
+            "routine_invocations",
+            "routine_invocation_metadata",
+            "routine_invocation_events",
+        ] {
+            sqlx::raw_sql(&format!(
+                "CREATE TEMP TABLE expected_{table} AS SELECT * FROM {table}"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Model retention of the highest allocated rows: MAX(row) is not the allocator high-water.
+        sqlx::query("UPDATE sqlite_sequence SET seq = CASE name WHEN 'routine_invocations' THEN 500 ELSE 900 END WHERE name IN ('routine_invocations', 'routine_invocation_events')")
+            .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/sqlite/0007_routine_interaction_trigger.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        for table in [
+            "routine_invocations",
+            "routine_invocation_metadata",
+            "routine_invocation_events",
+        ] {
+            for (left, right) in [
+                (table.to_owned(), format!("expected_{table}")),
+                (format!("expected_{table}"), table.to_owned()),
+            ] {
+                let difference: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM (SELECT * FROM {left} EXCEPT SELECT * FROM {right})"
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(difference, 0, "changed rows in {table}");
+            }
+        }
+        let indexes_after = sqlx::query_as::<_, (String, String)>(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(indexes_before, indexes_after);
+        let foreign_key_errors = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(foreign_key_errors.is_empty());
+        assert!(
+            sqlx::query("DELETE FROM routine_invocations WHERE invocation_id = 'old-event'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE routine_invocations SET trigger_kind = 'unknown'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO routine_invocation_metadata VALUES ('missing', 'key', 'value')"
+            )
+            .execute(&pool)
+            .await
+            .is_err()
+        );
+        let mut interaction = admission("interaction", &["task"]);
+        interaction.trigger_kind = RoutineTriggerKind::Interaction;
+        let (summary, event) = store.admit(interaction).await.unwrap();
+        assert_eq!(summary.admission_sequence, 501);
+        assert_eq!(event.sequence, 901);
+        assert_eq!(
+            event.admission.unwrap().trigger_kind,
+            RoutineTriggerKind::Interaction
+        );
+        let restarted = RoutineInvocationStore::new(PersistencePool::Sqlite(pool));
+        assert_eq!(
+            restarted
+                .detail("old-manual")
+                .await
+                .unwrap()
+                .summary
+                .trigger_kind,
+            RoutineTriggerKind::Manual
+        );
+        assert_eq!(
+            restarted
+                .detail("old-event")
+                .await
+                .unwrap()
+                .summary
+                .trigger_kind,
+            RoutineTriggerKind::Event
+        );
+        restarted
+            .reconcile_unfinished(failure(), 100)
+            .await
+            .unwrap();
+        let detail = restarted.detail("interaction").await.unwrap();
+        assert_eq!(detail.summary.trigger_kind, RoutineTriggerKind::Interaction);
+        assert_eq!(detail.summary.status, RoutineInvocationStatus::Interrupted);
+        assert_eq!(
+            detail.events[0].admission.as_ref().unwrap().trigger_kind,
+            RoutineTriggerKind::Interaction
+        );
+        assert_eq!(
+            detail.events.last().unwrap().kind,
+            RoutineEventKind::InvocationInterrupted
+        );
     }
 
     #[tokio::test]

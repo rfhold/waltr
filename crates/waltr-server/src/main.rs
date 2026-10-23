@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr: SocketAddr = listen_addr.parse()?;
 
     let apps = standalone_apps::from_env()?;
-    let app = build_app().await?;
+    let app = build_app(Default::default()).await?;
     #[cfg(feature = "web")]
     let (app, listener, listen_addr) = match apps {
         Some(config) => app.bind_with_apps_config(listen_addr, config).await?,

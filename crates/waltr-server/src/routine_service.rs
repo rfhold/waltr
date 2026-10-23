@@ -486,6 +486,7 @@ fn summary_to_proto(summary: RoutineInvocationSummary) -> RoutineInvocation {
         trigger_kind: match summary.trigger_kind {
             RoutineTriggerKind::Manual => ProtoTriggerKind::Manual,
             RoutineTriggerKind::Event => ProtoTriggerKind::Event,
+            RoutineTriggerKind::Interaction => ProtoTriggerKind::Interaction,
         } as i32,
         correlation_id: summary.correlation_id,
         source_cursor: summary.source_cursor,
@@ -552,6 +553,7 @@ fn event_to_proto(event: RoutineInvocationEvent) -> ProtoEvent {
                 trigger_kind: match admission.trigger_kind {
                     RoutineTriggerKind::Manual => ProtoTriggerKind::Manual,
                     RoutineTriggerKind::Event => ProtoTriggerKind::Event,
+                    RoutineTriggerKind::Interaction => ProtoTriggerKind::Interaction,
                 } as i32,
                 correlation_id: admission.correlation_id,
                 source_cursor: admission.source_cursor,
@@ -835,6 +837,40 @@ mod tests {
                 .collect(),
             admitted_at_ms: 50,
         }
+    }
+
+    #[tokio::test]
+    async fn history_and_replay_preserve_distinct_interaction_trigger_kind() {
+        let persistence = crate::persistence::Persistence::initialize(
+            crate::persistence::DatabaseConfig::for_tests().unwrap(),
+        )
+        .await
+        .unwrap();
+        let store = persistence.routine_invocation_store();
+        for (id, kind, expected) in [
+            (
+                "manual",
+                RoutineTriggerKind::Manual,
+                ProtoTriggerKind::Manual,
+            ),
+            ("event", RoutineTriggerKind::Event, ProtoTriggerKind::Event),
+            (
+                "interaction",
+                RoutineTriggerKind::Interaction,
+                ProtoTriggerKind::Interaction,
+            ),
+        ] {
+            let mut input = admission(id, &[]);
+            input.trigger_kind = kind;
+            store.admit(input).await.unwrap();
+            let detail = load_detail(&store, id).await.unwrap();
+            assert_eq!(detail.summary.unwrap().trigger_kind, expected as i32);
+            assert_eq!(
+                detail.events[0].admission.as_ref().unwrap().trigger_kind,
+                expected as i32
+            );
+        }
+        assert_eq!(ProtoTriggerKind::Interaction as i32, 3);
     }
 
     #[tokio::test]

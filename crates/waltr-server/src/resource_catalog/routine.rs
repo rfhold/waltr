@@ -9,6 +9,16 @@ use std::{
 
 use super::error::AgentDefinitionLoadError;
 
+#[path = "routine/interaction.rs"]
+mod interaction;
+#[path = "routine/interaction_limits.rs"]
+mod interaction_limits;
+#[cfg(test)]
+#[path = "routine/interaction_tests.rs"]
+mod interaction_tests;
+pub use interaction::*;
+pub use interaction_limits::InteractionLimits;
+
 pub(super) const MAX_ROUTINE_SOURCE_BYTES: usize = 256 * 1024;
 pub(super) const MAX_ROUTINE_COUNT: usize = 256;
 const MAX_ROUTINE_TRIGGERS: usize = 32;
@@ -104,6 +114,10 @@ pub struct RoutineSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_session: Option<RoutineSourceSession>,
     pub tasks: Vec<RoutineTask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_groups: Vec<RoutineWorkGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<RoutineStreamOutput>,
     #[serde(default)]
     pub results: Vec<RoutineResult>,
 }
@@ -140,6 +154,8 @@ pub struct RoutineTrigger {
     pub manual: Option<RoutineManualTrigger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_lifecycle: Option<RoutineSessionLifecycleTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<RoutineInteractionTrigger>,
     #[serde(default)]
     pub when: Vec<RoutineCondition>,
     #[serde(default)]
@@ -287,12 +303,20 @@ pub struct RoutineTask {
     pub run_after: Vec<String>,
     #[serde(default)]
     pub when: Vec<RoutineCondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_group: Option<String>,
     pub task_spec: RoutineTaskSpec,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RoutineTaskSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe: Option<RoutineTranscribe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesize: Option<RoutineSynthesize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect: Option<RoutineCollect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_template: Option<RoutineSessionTemplate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,9 +335,17 @@ pub struct RoutineTaskSpec {
     pub results: Vec<RoutineResult>,
 }
 
+impl RoutineTaskSpec {
+    pub(crate) fn requires_interaction(&self) -> bool {
+        self.transcribe.is_some() || self.synthesize.is_some() || self.collect.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RoutineSessionTemplate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<RoutineModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RoutineSessionTemplateSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +399,8 @@ pub struct RoutineLimits {
 #[serde(deny_unknown_fields)]
 pub struct RoutineOutput {
     pub r#type: RoutineOutputType,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -659,8 +693,13 @@ fn validate_routine(
     for (index, trigger) in definition.spec.triggers.iter().enumerate() {
         let location = format!("spec.triggers[{index}]");
         insert_unique(path, &location, &trigger.name, &mut trigger_names)?;
-        match (&trigger.event, &trigger.manual, &trigger.session_lifecycle) {
-            (Some(event), None, None) => {
+        match (
+            &trigger.event,
+            &trigger.manual,
+            &trigger.session_lifecycle,
+            &trigger.interaction,
+        ) {
+            (Some(event), None, None, None) => {
                 if definition.spec.source_session.is_some() {
                     return Err(invalid(
                         path,
@@ -677,7 +716,7 @@ fn validate_routine(
                     ));
                 }
             }
-            (None, Some(manual), None) => {
+            (None, Some(manual), None, None) => {
                 if definition
                     .spec
                     .source_session
@@ -724,12 +763,15 @@ fn validate_routine(
                     ));
                 }
             }
-            (None, None, Some(_)) => {}
+            (None, None, Some(_), None) => {}
+            (None, None, None, Some(interaction)) => {
+                validate_interaction_trigger(path, interaction, definition)?;
+            }
             _ => {
                 return Err(invalid(
                     path,
                     format!(
-                        "{location} must declare exactly one of event, manual, or sessionLifecycle"
+                        "{location} must declare exactly one of event, manual, sessionLifecycle, or interaction"
                     ),
                 ));
             }
@@ -815,8 +857,21 @@ fn validate_routine(
     }
     for (index, task) in definition.spec.tasks.iter().enumerate() {
         validate_task(path, index, task, &tasks)?;
+        if task.task_spec.requires_interaction()
+            && definition
+                .spec
+                .triggers
+                .iter()
+                .any(|trigger| trigger.interaction.is_none())
+        {
+            return Err(invalid(
+                path,
+                "speech and collector tasks require interaction triggers".to_owned(),
+            ));
+        }
     }
     validate_dag(path, &definition.spec.tasks, &tasks)?;
+    validate_interaction_graph(path, definition)?;
 
     let task_results = definition
         .spec
@@ -864,7 +919,7 @@ fn validate_routine(
             &task_results,
             definition,
             Some(&ancestors),
-            task.task_spec.session_template.is_some(),
+            task.task_spec.session_template.is_some() || task.task_spec.collect.is_some(),
             action_kind,
         )?;
     }
@@ -907,6 +962,22 @@ fn validate_task(
     }
 
     let spec = &task.task_spec;
+    let kinds = [
+        spec.session_template.is_some(),
+        spec.action.is_some(),
+        spec.transcribe.is_some(),
+        spec.synthesize.is_some(),
+        spec.collect.is_some(),
+    ];
+    if kinds.into_iter().filter(|present| *present).count() != 1 {
+        return Err(invalid(
+            path,
+            format!("{location}.taskSpec requires exactly one task kind"),
+        ));
+    }
+    if spec.transcribe.is_some() || spec.synthesize.is_some() || spec.collect.is_some() {
+        return validate_stream_task(path, task);
+    }
     match (&spec.session_template, &spec.action) {
         (Some(session), None) => {
             let features = spec.features.as_ref().ok_or_else(|| {
@@ -954,7 +1025,18 @@ fn validate_task(
                     format!("{location}.taskSpec.output is required for agent tasks"),
                 ));
             }
-            if session.source.is_none() && session.inference.is_none() {
+            if let Some(model) = &session.model {
+                validate_model_ref(path, model)?;
+                if session.source.is_some() || session.inference.is_some() {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "{location}.sessionTemplate.model cannot be combined with source or inference"
+                        ),
+                    ));
+                }
+            }
+            if session.source.is_none() && session.inference.is_none() && session.model.is_none() {
                 return Err(invalid(
                     path,
                     format!("{location}.taskSpec.sessionTemplate requires source or inference"),
@@ -1922,6 +2004,9 @@ fn validate_static_reference_in_context(
                 .manual
                 .as_ref()
                 .is_some_and(|manual| manual.inputs.iter().any(|input| input.name == name))
+                || trigger.interaction.as_ref().is_some_and(|interaction| {
+                    interaction.inputs.iter().any(|input| input.name == name)
+                })
                 || trigger.params.iter().any(|param| param.name == name)
         };
         let exposed = active_trigger.map_or_else(

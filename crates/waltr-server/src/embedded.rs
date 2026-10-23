@@ -8,6 +8,7 @@ use crate::{
     catalog::{CatalogLoader, CatalogMaterializer},
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
+    resource_catalog::routine::InteractionLimits,
     resource_catalog::{AgentDefinitionState, provision_persisted_resource},
     session,
 };
@@ -84,6 +85,8 @@ pub struct EmbeddedServerConfig {
     pub local_bearer: LocalBearer,
     /// Explicit provider/upstream-MCP outbound OAuth policy.
     pub outbound_policy: EmbeddedOutboundPolicy,
+    /// Finite interaction admission and transport bounds; use `InteractionLimits::default()` for defaults.
+    pub interaction_limits: InteractionLimits,
 }
 
 impl fmt::Debug for EmbeddedServerConfig {
@@ -151,6 +154,10 @@ impl EmbeddedServer {
 pub async fn build_embedded_server(
     config: EmbeddedServerConfig,
 ) -> Result<EmbeddedServer, EmbeddedBuildError> {
+    crate::routine_interaction_service::RoutineInteractionService::validate_limits(
+        &config.interaction_limits,
+    )
+    .map_err(|_| EmbeddedBuildError::Application)?;
     validate_paths(&config)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -225,6 +232,8 @@ pub async fn build_embedded_server(
                 self_mcp_url,
             }),
             workspace_root,
+            sandbox_socket: None,
+            interaction_limits: config.interaction_limits,
         },
         move |routes, mut input| {
             input.trusted_mcp_oauth_origins = session_origins;

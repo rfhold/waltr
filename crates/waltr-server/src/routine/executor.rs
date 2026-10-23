@@ -20,7 +20,7 @@ use crate::resource_catalog::routine::{RoutineResult, RoutineResultType, Routine
 
 use super::{
     InvocationError,
-    engine::{AdmittedInvocation, DestinationTaskTracker, short_digest},
+    engine::{AdmittedInvocation, DestinationTaskTracker},
     expression::{
         MAX_EXPANDED_PROMPT_BYTES, conditions_match, ensure_string_bound, scalar_string,
         substitute_scalar, substitute_string, validate_metadata_mutation,
@@ -37,12 +37,9 @@ fn shutdown_error(operation: &str) -> InvocationError {
     )
 }
 
-#[derive(Clone)]
-enum TaskState {
-    Succeeded(BTreeMap<String, Value>),
-    Skipped,
-    Failed,
-}
+use super::task_policy::{
+    DependencyReadiness, TaskOutcome as TaskState, dependency_readiness, successful_results,
+};
 
 struct ActiveChild {
     id: Option<SessionId>,
@@ -162,17 +159,12 @@ async fn execute_invocation_inner(
                     "routine invocation canceled during shutdown",
                 ));
             }
-            if states.contains_key(&task.name)
-                || !task.run_after.iter().all(|name| states.contains_key(name))
-            {
+            let readiness = dependency_readiness(&task.run_after, &states);
+            if states.contains_key(&task.name) || readiness == DependencyReadiness::Waiting {
                 continue;
             }
             progressed = true;
-            if task
-                .run_after
-                .iter()
-                .any(|name| !matches!(states.get(name), Some(TaskState::Succeeded(_))))
-            {
+            if readiness == DependencyReadiness::Blocked {
                 if let Some(recorder) = recorder {
                     recorder
                         .task_blocked(
@@ -345,18 +337,6 @@ pub(super) struct TaskExecution {
     session_references: BTreeMap<String, String>,
 }
 
-fn successful_results(
-    states: &BTreeMap<String, TaskState>,
-) -> BTreeMap<String, BTreeMap<String, Value>> {
-    states
-        .iter()
-        .filter_map(|(name, state)| match state {
-            TaskState::Succeeded(results) => Some((name.clone(), results.clone())),
-            TaskState::Skipped | TaskState::Failed => None,
-        })
-        .collect()
-}
-
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -372,6 +352,12 @@ pub(super) async fn execute_task(
     destination_tasks: &DestinationTaskTracker,
     cancellation: &CancellationToken,
 ) -> Result<TaskExecution, InvocationError> {
+    if task.task_spec.requires_interaction() {
+        return Err(InvocationError::new(
+            "unsupported_task",
+            "task requires interaction execution",
+        ));
+    }
     if let Some(template) = &task.task_spec.session_template {
         let captured = template
             .source
@@ -409,13 +395,9 @@ pub(super) async fn execute_task(
             })
             .transpose()?;
         let source_id = if let Some(capture) = captured {
-            capture.source_id.clone()
-        } else {
-            let inference = template
-                .inference
-                .as_ref()
-                .expect("validated non-source template has inference");
-            session_id_value(
+            Some(capture.source_id.clone())
+        } else if let Some(inference) = &template.inference {
+            Some(session_id_value(
                 &substitute_scalar(
                     &inference.inherit_from,
                     &invocation.context,
@@ -424,7 +406,9 @@ pub(super) async fn execute_task(
                     None,
                 )?,
                 "inference source session",
-            )?
+            )?)
+        } else {
+            None
         };
         let system_prompt = substitute_string(
             &template.system_prompt.text,
@@ -475,47 +459,21 @@ pub(super) async fn execute_task(
             }
         } else if let Some(capture) = captured {
             capture.inference_settings.clone().with_reasoning_disabled()
+        } else if let Some(model) = &template.model {
+            crate::session::pinned_inference_settings(
+                model.provider.clone(),
+                model.model.clone(),
+                &invocation.configuration,
+            )
+            .map_err(|_| {
+                InvocationError::new("invalid_model", "invalid pinned inference selection")
+            })?
         } else {
-            unreachable!("validated agent template has source or inference")
+            return Err(InvocationError::new(
+                "invalid_helper",
+                "helper has no inference selection",
+            ));
         };
-        let child_id = SessionId::new(format!(
-            "routine_{}",
-            short_digest(&format!("{}\0{}", invocation.identity, task.name))
-        ));
-        let mut metadata = BTreeMap::from([
-            ("waltr.session.ephemeral".to_owned(), Value::Bool(true)),
-            (
-                "waltr.session.purpose".to_owned(),
-                Value::String("routine-task".to_owned()),
-            ),
-            (
-                "waltr.routine.name".to_owned(),
-                Value::String(invocation.routine.name().to_owned()),
-            ),
-            (
-                "waltr.routine.revision".to_owned(),
-                Value::String(invocation.routine.source_etag().to_owned()),
-            ),
-            (
-                "waltr.routine.trigger".to_owned(),
-                Value::String(invocation.trigger.clone()),
-            ),
-            (
-                "waltr.routine.task".to_owned(),
-                Value::String(task.name.clone()),
-            ),
-            (
-                "waltr.routine.invocation_id".to_owned(),
-                Value::String(invocation.identity.clone()),
-            ),
-        ]);
-        metadata.insert(
-            "waltr.routine.source_session_id".to_owned(),
-            Value::String(source_id.as_str().to_owned()),
-        );
-        // Ownership precedes every host await that can create or submit work. Cancellation may
-        // drop an ambiguous host future, but final shutdown interruption still targets this ID.
-        let child = ActiveChild::register(child_id.clone(), active_children, host).await;
         let start = match captured {
             None => SessionStart::Fresh {
                 messages: vec![initial_message],
@@ -525,16 +483,27 @@ pub(super) async fn execute_task(
                 messages: vec![initial_message],
             },
         };
+        let request = super::helper::request(
+            super::helper::HelperIdentity {
+                execution_id: &invocation.identity,
+                invocation_id: invocation.invocation_id.as_deref(),
+                routine: invocation.routine.name(),
+                revision: invocation.routine.source_etag(),
+                trigger: &invocation.trigger,
+                task: &task.name,
+                source: source_id.as_ref(),
+            },
+            inference,
+            bundle,
+            start,
+        );
+        let child_id = request.id.clone();
+        // Register before any host await that can create work.
+        let child = ActiveChild::register(child_id.clone(), active_children, host).await;
         let created = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(shutdown_error("child creation")),
-            created = host.create_child(SessionCreateRequest {
-                id: child_id.clone(),
-                inference_settings: Some(inference),
-                agent_definition: Some(bundle),
-                metadata_values: metadata,
-                start,
-            }) => created,
+            created = host.create_child(request) => created,
         };
         if let Err(error) = created {
             return Err(InvocationError::new("child_create", error));
@@ -976,7 +945,7 @@ fn timeline_cursor_value(value: Value) -> Result<TimelineCursor, InvocationError
     Ok(TimelineCursor::new(cursor))
 }
 
-fn collect_results(
+pub(super) fn collect_results(
     declared: &[RoutineResult],
     context: &super::engine::RoutineInvocationContext,
     task_results: &BTreeMap<String, BTreeMap<String, Value>>,
@@ -993,7 +962,10 @@ fn collect_results(
         .collect()
 }
 
-fn validate_result_type(result: &RoutineResult, value: &Value) -> Result<(), InvocationError> {
+pub(super) fn validate_result_type(
+    result: &RoutineResult,
+    value: &Value,
+) -> Result<(), InvocationError> {
     let matches = matches!(
         (result.r#type, value),
         (RoutineResultType::String, Value::String(_))
