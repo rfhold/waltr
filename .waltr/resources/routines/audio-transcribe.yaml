@@ -1,0 +1,32 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: audio-transcribe
+spec:
+  description: Transcribe client audio through Whispers.
+  triggers:
+    - name: dictate
+      interaction:
+        inputPorts:
+          - name: audio
+            required: true
+            format:
+              type: audio
+              encoding: pcmS16le
+              sampleRateHz: 24000
+              channels: 1
+        outputPorts:
+          - name: transcript
+            format:
+              type: text
+  tasks:
+    - name: transcribe
+      taskSpec:
+        transcribe:
+          model:
+            provider: whispers
+            model: dictation
+          input: $(interaction.inputs.audio)
+  outputs:
+    - port: transcript
+      streamFrom: $(tasks.transcribe.output)
