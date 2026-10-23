@@ -1,0 +1,34 @@
+[package]
+name = "waltr-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+waltr-client.workspace = true
+unicode-segmentation = "1.13.2"
+waltr-audio-io.workspace = true
+futures-util.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_yaml_ng.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "time", "sync"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics.workspace = true
+macos-accessibility-client.workspace = true
+global-hotkey.workspace = true
+objc2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { workspace = true, features = ["remote_desktop", "screencast"] }
+reis.workspace = true
+rustix = { workspace = true, features = ["time"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tonic = { workspace = true, features = ["transport"] }
