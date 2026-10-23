@@ -1,0 +1,21 @@
+[package]
+name = "waltr-audio-io"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["native"]
+native = ["dep:cpal"]
+
+[dependencies]
+rubato = { version = "=0.16.2", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = { version = "=0.16.0", optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+cpal = { version = "=0.15.3", optional = true }
+
+[lints]
+workspace = true
