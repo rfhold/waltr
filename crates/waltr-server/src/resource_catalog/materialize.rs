@@ -177,9 +177,20 @@ struct DefaultsResource {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct DefaultsSpec {
     inference: InferenceSpec,
+    #[serde(default)]
+    session_dictation: Option<SessionDictationSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionDictationSpec {
+    routine: String,
+    trigger: String,
+    input: String,
+    output: String,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +239,8 @@ pub(super) fn materialize_provider(
         "openaiChatCompletions" => config_proto::ProviderType::OpenaiChatCompletions,
         "openaiResponses" => config_proto::ProviderType::OpenaiResponses,
         "openaiResponsesWebsocket" => config_proto::ProviderType::OpenaiResponsesWebsocket,
+        "googleSpeechV2" => config_proto::ProviderType::GoogleSpeechV2,
+        "googleTextToSpeechV1" => config_proto::ProviderType::GoogleTextToSpeechV1,
         value => {
             return Err(invalid_value(
                 path,
@@ -235,7 +248,31 @@ pub(super) fn materialize_provider(
             ));
         }
     };
+    let speech = super::speech::is_speech_transport(provider_type as i32);
+    if speech
+        && (resource.spec.catalog.is_some()
+            || resource.spec.oauth.is_some()
+            || !resource.spec.headers.is_empty())
+    {
+        return Err(invalid_value(path, "speech providers require explicit models and do not support catalog, OAuth, or headers".to_owned()));
+    }
     let mut models = resource.spec.models;
+    if !speech
+        && models.values().any(|model| {
+            model.recognition.is_some()
+                || model.synthesis.is_some()
+                || model.speech_capabilities.is_some()
+                || matches!(
+                    config_proto::ModelType::try_from(model.r#type),
+                    Ok(config_proto::ModelType::Stt | config_proto::ModelType::Tts)
+                )
+        })
+    {
+        return Err(invalid_value(
+            path,
+            "speech models require a speech provider transport".to_owned(),
+        ));
+    }
     if let Some(selector) = resource.spec.catalog {
         let materializer = materializer.ok_or_else(|| {
             invalid_value(
@@ -259,7 +296,7 @@ pub(super) fn materialize_provider(
         .oauth
         .map(|oauth| materialize_oauth(oauth, path))
         .transpose()?;
-    Ok(config_proto::Provider {
+    let provider = config_proto::Provider {
         r#type: provider_type as i32,
         name: resource.metadata.name,
         url: materialize_url(&resource.spec.url, "", false, path)?,
@@ -267,7 +304,12 @@ pub(super) fn materialize_provider(
         models,
         oauth_compatible: oauth_settings.is_some(),
         oauth_settings,
-    })
+    };
+    if speech {
+        super::speech::validate_speech_source(source, path)?;
+        super::speech::validate_speech_provider(&provider, path)?;
+    }
+    Ok(provider)
 }
 
 fn materialize_oauth(
@@ -364,14 +406,31 @@ pub(super) fn materialize_mcp_server(
 pub(super) fn materialize_defaults(
     source: &str,
     path: &str,
-) -> Result<config_proto::InferenceDefaults, AgentDefinitionLoadError> {
+) -> Result<
+    (
+        config_proto::InferenceDefaults,
+        Option<config_proto::SessionDictation>,
+    ),
+    AgentDefinitionLoadError,
+> {
     let resource: DefaultsResource = parse_resource(source, path)?;
     validate_envelope(&resource.api_version, &resource.kind, "Defaults", path)?;
-    Ok(config_proto::InferenceDefaults {
-        provider_key: resource.spec.inference.provider,
-        model_key: resource.spec.inference.model,
-        reasoning_effort: resource.spec.inference.reasoning_effort,
-    })
+    let dictation = resource.spec.session_dictation.map(|selection| {
+        for value in [&selection.routine, &selection.trigger, &selection.input, &selection.output] {
+            if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+                return Err(invalid_value(path, "sessionDictation identifiers must be 1-128 ASCII letters, digits, underscores or hyphens".into()));
+            }
+        }
+        Ok(config_proto::SessionDictation { routine: selection.routine, trigger: selection.trigger, input: selection.input, output: selection.output })
+    }).transpose()?;
+    Ok((
+        config_proto::InferenceDefaults {
+            provider_key: resource.spec.inference.provider,
+            model_key: resource.spec.inference.model,
+            reasoning_effort: resource.spec.inference.reasoning_effort,
+        },
+        dictation,
+    ))
 }
 
 pub(super) fn materialize_url(

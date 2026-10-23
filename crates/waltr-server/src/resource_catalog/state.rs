@@ -1105,9 +1105,16 @@ fn build_snapshot(
                 serde_json::to_value(server).expect("generated MCP server serializes")
             }
             ResourceKind::Defaults => {
-                let defaults = materialize_defaults(&source, &path)?;
+                let (defaults, dictation) = materialize_defaults(&source, &path)?;
                 configuration.inference_defaults = Some(defaults.clone());
-                serde_json::to_value(defaults).expect("generated defaults serialize")
+                configuration.session_dictation = dictation.clone();
+                let mut value =
+                    serde_json::to_value(defaults).expect("generated defaults serialize");
+                if let Some(dictation) = dictation {
+                    value["sessionDictation"] =
+                        serde_json::to_value(dictation).expect("generated dictation serializes");
+                }
+                value
             }
             ResourceKind::Routine => {
                 if routines.len() >= MAX_ROUTINE_COUNT {
@@ -1145,6 +1152,59 @@ fn build_snapshot(
     }
     sources.extend_from_slice(external_sources);
 
+    if let Some(selection) = &configuration.session_dictation {
+        use super::routine::{RoutineAudioEncoding, RoutineStreamFormat};
+        let path = "defaults/default.yaml";
+        let interaction = routines
+            .get(&selection.routine)
+            .and_then(|routine| {
+                routine
+                    .definition()
+                    .spec
+                    .triggers
+                    .iter()
+                    .find(|trigger| trigger.name == selection.trigger)
+            })
+            .and_then(|trigger| trigger.interaction.as_ref())
+            .ok_or_else(|| {
+                invalid_value(
+                    path,
+                    "sessionDictation must select an existing interaction trigger".into(),
+                )
+            })?;
+        let audio = RoutineStreamFormat::Audio {
+            encoding: RoutineAudioEncoding::PcmS16Le,
+            sample_rate_hz: 24_000,
+            channels: 1,
+        };
+        if !interaction
+            .input_ports
+            .iter()
+            .any(|port| port.name == selection.input && port.format == audio)
+            || !interaction.output_ports.iter().any(|port| {
+                port.name == selection.output && port.format == RoutineStreamFormat::Text
+            })
+            || interaction
+                .input_ports
+                .iter()
+                .any(|port| port.required && port.name != selection.input)
+            || routines[&selection.routine]
+                .definition()
+                .spec
+                .params
+                .iter()
+                .any(|param| param.required && param.default.is_none())
+        {
+            return Err(invalid_value(path, "sessionDictation requires PCM s16le 24000 Hz mono input, text output, and no other required inputs".into()));
+        }
+    }
+    for routine in routines.values() {
+        super::routine::validate_routine_models(
+            routine.definition(),
+            &configuration,
+            routine.source_path(),
+        )?;
+    }
     let catalog = compile_catalog(&sources, default_agent)?;
     let etag = materialized_snapshot_etag(&entries, &configuration);
     if let Some(defaults) = &configuration.inference_defaults {
@@ -1160,6 +1220,12 @@ fn build_snapshot(
                     ),
                 )
             })?;
+        if super::speech::is_speech_transport(provider.r#type) {
+            return Err(invalid_value(
+                "defaults/default.yaml",
+                "inference defaults cannot select a speech provider".into(),
+            ));
+        }
         if !provider.models.contains_key(&defaults.model_key) {
             return Err(invalid_value(
                 "defaults/default.yaml",

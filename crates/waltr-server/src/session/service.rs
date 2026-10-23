@@ -366,6 +366,13 @@ where
     fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>> {
         Box::pin(self.sessions.watch_sessions())
     }
+
+    fn observe_timeline(
+        &self,
+        id: SessionId,
+    ) -> Option<waltr_agent::SessionTimelineProjectionSubscription> {
+        Some(self.sessions.watch_timeline_projection(id))
+    }
 }
 
 #[tonic::async_trait]

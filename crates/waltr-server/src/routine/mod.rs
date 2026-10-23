@@ -4,9 +4,17 @@ mod engine;
 mod event;
 mod executor;
 mod expression;
+mod helper;
 mod host;
-mod lifecycle;
+pub(crate) mod interaction;
+pub(crate) mod lifecycle;
+mod task_policy;
+pub(crate) mod telemetry;
 
+pub(crate) use engine::{InteractionOwnership, validate_scalar_inputs};
+#[cfg(test)]
+#[path = "../routine_interaction_service/tests.rs"]
+mod interaction_service_tests;
 pub use engine::ManualRoutineHandle;
 pub use engine::{EngineHealth, RoutineEngine};
 pub use event::{EventBus, EventEnvelope, EventSink, EventSource, USER_MESSAGE_CREATED};

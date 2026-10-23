@@ -4,14 +4,14 @@ pub mod access_auth;
 pub mod agent_definition;
 pub mod app;
 pub mod app_container;
-mod http_lifecycle;
-pub mod mcp_apps_host;
 pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod config_service;
 pub mod embedded;
+mod http_lifecycle;
 mod local_admission;
+pub mod mcp_apps_host;
 pub mod mcp_oauth;
 pub mod mcp_service;
 pub mod observability;
@@ -23,6 +23,7 @@ mod readiness;
 pub mod resource_catalog;
 pub mod resource_error;
 pub mod routine;
+pub mod routine_interaction_service;
 pub mod routine_service;
 mod sandbox;
 pub mod session;
@@ -39,11 +40,12 @@ pub use agent_definition::{
     AgentDefinitionWatcher, DefinitionWatcherHealth,
 };
 pub use app::{
-    BuildAppError, ServerApplication, build_app, build_app_with_access_authenticator,
-    build_app_with_access_authenticator_and_mcp_oauth, build_app_with_catalog_loader,
-    build_app_with_services,
+    BuildAppError, BuildAppOptions, ServerApplication, build_app,
+    build_app_with_access_authenticator, build_app_with_access_authenticator_and_mcp_oauth,
+    build_app_with_catalog_loader, build_app_with_services,
 };
 pub use local_admission::{LocalBearer, LocalBearerError};
+pub use resource_catalog::routine::InteractionLimits;
 pub use resource_error::ResourceError;
 /// Default address the server listens on when `WALTR_SERVER_ADDR` is unset.
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:14333";

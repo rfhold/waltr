@@ -21,6 +21,7 @@ base64.workspace = true
 cookie.workspace = true
 waltr = { path = "../waltr", version = "0.3.0", default-features = false, features = ["grpc"] }
 waltr-agent = { path = "../waltr-agent", version = "0.3.0", default-features = false }
+waltr-audio = { path = "../waltr-audio", version = "0.3.0" }
 waltr-agent-sandbox = { path = "../waltr-agent-sandbox", version = "0.3.0", default-features = false, features = ["rpc"] }
 futures-util.workspace = true
 http-body.workspace = true
@@ -73,6 +74,7 @@ webpki-roots.workspace = true
 workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 reqwest = { workspace = true, features = ["json", "http2"] }
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

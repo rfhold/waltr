@@ -18,8 +18,10 @@ use crate::{
     mcp_oauth::{McpOAuthConfig, McpOAuthConfigError, McpOAuthError, McpOAuthServer},
     mcp_service::WaltrMcpServer,
     persistence::{Persistence, PersistenceError},
+    resource_catalog::routine::InteractionLimits,
     resource_error::ResourceError,
     routine::{EngineHealth, EventBus, RoutineEngine},
+    routine_interaction_service::RoutineInteractionService,
     routine_service::RoutineService,
     sandbox::SandboxHost,
     session,
@@ -35,7 +37,10 @@ use axum::{
 use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
 use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
 use waltr::grpc::waltr::resource::v1::resource_service_server::ResourceServiceServer;
-use waltr::grpc::waltr::routine::v1::routine_service_server::RoutineServiceServer;
+use waltr::grpc::waltr::routine::v1::{
+    routine_interaction_service_server::RoutineInteractionServiceServer,
+    routine_service_server::RoutineServiceServer,
+};
 use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
 use serde::Serialize;
 use std::{error::Error, fmt, future::Future, io, path::PathBuf, sync::Arc, time::Duration};
@@ -68,6 +73,15 @@ pub(crate) struct AppServices {
     pub(crate) agent_state: Option<AgentDefinitionState>,
     pub(crate) local_admission: Option<LocalAdmission>,
     pub(crate) workspace_root: PathBuf,
+    pub(crate) sandbox_socket: Option<PathBuf>,
+    pub(crate) interaction_limits: InteractionLimits,
+}
+
+/// Host-owned options for standalone application construction.
+#[derive(Clone, Debug, Default)]
+pub struct BuildAppOptions {
+    /// Finite interaction admission and transport bounds.
+    pub interaction_limits: InteractionLimits,
 }
 
 #[derive(Debug, Serialize)]
@@ -651,7 +665,13 @@ impl From<session::SessionStorageConfigError> for AppAssemblyError {
 ///
 /// Returns an error when persistence, config, authentication, or agent session storage cannot initialize.
 ///
-pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
+pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, BuildAppError> {
+    let interaction_limits = options.interaction_limits;
+    RoutineInteractionService::validate_limits(&interaction_limits).map_err(|_| {
+        BuildAppError::Config(ResourceError::unavailable(
+            "invalid interaction host limits",
+        ))
+    })?;
     tracing::debug!("building app with config service from current directory");
     let config_root = std::env::current_dir()
         .map_err(|error| BuildAppError::Config(ResourceError::current_dir(error)))?;
@@ -705,7 +725,7 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         outbound_private_origins.clone(),
         automatic_self_mcp_resource.as_ref(),
     );
-    let router = assemble_app_with_sandbox(
+    let router = assemble_app(
         AppServices {
             config_service,
             persistence,
@@ -718,12 +738,13 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
             agent_state: Some(agent_state),
             local_admission: None,
             workspace_root,
+            sandbox_socket,
+            interaction_limits,
         },
         |grpc_routes, mut input| {
             input.trusted_mcp_oauth_origins = session_private_origins;
             session::add_storage_service(grpc_routes, storage, input)
         },
-        sandbox_socket,
     )
     .await
     .map_err(|error| match error {
@@ -1074,6 +1095,8 @@ where
             agent_state: None,
             local_admission: None,
             workspace_root: std::env::current_dir().map_err(ResourceError::current_dir)?,
+            sandbox_socket: None,
+            interaction_limits: InteractionLimits::default(),
         },
         add_session_service,
     )
@@ -1094,24 +1117,8 @@ where
         session::SessionRegistrationInput,
     ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
 {
-    assemble_app_with_sandbox(services, add_session_service, None).await
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "router assembly consumes initialized services and OAuth policy in dependency order"
-)]
-async fn assemble_app_with_sandbox<F>(
-    services: AppServices,
-    add_session_service: F,
-    sandbox_socket: Option<PathBuf>,
-) -> Result<ServerApplication, AppAssemblyError>
-where
-    F: FnOnce(
-        &mut RoutesBuilder,
-        session::SessionRegistrationInput,
-    ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
-{
+    RoutineInteractionService::validate_limits(&services.interaction_limits)
+        .map_err(|_| ResourceError::unavailable("invalid interaction host limits"))?;
     tracing::debug!("building app router");
     let AppServices {
         config_service,
@@ -1125,6 +1132,8 @@ where
         agent_state,
         local_admission,
         workspace_root,
+        sandbox_socket,
+        interaction_limits,
     } = services;
     let sandbox = SandboxHost::start(workspace_root.clone(), sandbox_socket)
         .await
@@ -1215,6 +1224,13 @@ where
         session_host.clone(),
         routine_store.clone(),
     );
+    let interaction_service = RoutineInteractionService::new(
+        agent_state.clone(),
+        routine_engine.manual_handle(),
+        session_host.clone(),
+        interaction_limits.clone(),
+    )
+    .expect("interaction limits validated before assembly");
     let routine_service = RoutineService::new(
         agent_state,
         routine_engine.manual_handle(),
@@ -1241,6 +1257,11 @@ where
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
     grpc_routes.add_service(RoutineServiceServer::new(routine_service));
+    grpc_routes.add_service(
+        RoutineInteractionServiceServer::new(interaction_service)
+            .max_decoding_message_size(interaction_limits.complete_request_bytes)
+            .max_encoding_message_size(interaction_limits.complete_request_bytes),
+    );
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()
@@ -1499,6 +1520,8 @@ mod tests {
                 agent_state: Some(state),
                 local_admission: None,
                 workspace_root: root,
+                sandbox_socket: None,
+                interaction_limits: InteractionLimits::default(),
             },
             move |routes, input| {
                 worker_tx.send(input.sandbox.clone()).unwrap();
@@ -1629,6 +1652,8 @@ mod tests {
                 agent_state: Some(state),
                 local_admission: None,
                 workspace_root: root,
+                sandbox_socket: None,
+                interaction_limits: InteractionLimits::default(),
             },
             move |routes, input| {
                 let session::SessionCatalogSource::Dynamic(ref callback_state) = input.catalog
@@ -1726,6 +1751,8 @@ mod tests {
                 agent_state: Some(state),
                 local_admission: None,
                 workspace_root: root,
+                sandbox_socket: None,
+                interaction_limits: InteractionLimits::default(),
             },
             |routes, input| {
                 assert!(matches!(
@@ -1743,6 +1770,93 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, AppAssemblyError::SessionStorage(_)));
+    }
+
+    #[tokio::test]
+    async fn primary_assembly_propagates_custom_interaction_transport_limits() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let catalog_loader = crate::test_support::default_catalog_loader();
+        let config_service = ConfigService::from_state(state.clone(), catalog_loader.clone());
+        let persistence =
+            Persistence::initialize(crate::persistence::DatabaseConfig::for_tests().unwrap())
+                .await
+                .unwrap();
+        let app = assemble_app(
+            AppServices {
+                config_service,
+                persistence,
+                catalog_loader,
+                access_authenticator: AccessAuthenticator::disabled(),
+                mcp_oauth: None,
+                outbound_private_origins: Vec::new(),
+                outbound_oauth: OutboundOAuthConfig::default(),
+                automatic_self_mcp_resource: None,
+                agent_state: Some(state),
+                local_admission: None,
+                workspace_root: root,
+                sandbox_socket: None,
+                interaction_limits: InteractionLimits {
+                    complete_request_bytes: 1024,
+                    chunk_bytes: 512,
+                    ..InteractionLimits::default()
+                },
+            },
+            |routes, input| {
+                Ok(session::add_store_service(
+                    routes,
+                    waltr_agent::MemorySessionStore::new(),
+                    input,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        let mut oversized_frame = vec![0];
+        oversized_frame.extend_from_slice(&2048_u32.to_be_bytes());
+        oversized_frame.resize(2053, 0);
+        let response = tower::ServiceExt::oneshot(
+            app.router(),
+            Request::builder()
+                .method("POST")
+                .uri("/waltr.routine.v1.RoutineInteractionService/Run")
+                .version(axum::http::Version::HTTP_2)
+                .header("content-type", "application/grpc")
+                .body(axum::body::Body::from(oversized_frame))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let status = tonic::Status::from_header_map(response.headers()).unwrap();
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+        assert!(status.message().contains("1024"), "{status}");
+        app.shutdown().await;
+    }
+
+    #[test]
+    fn standalone_options_default_to_the_shared_limits() {
+        let options = BuildAppOptions::default();
+        assert_eq!(
+            serde_json::to_value(options.interaction_limits).unwrap(),
+            serde_json::to_value(InteractionLimits::default()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_rejects_invalid_limits_before_loading_environment() {
+        let options = BuildAppOptions {
+            interaction_limits: InteractionLimits {
+                active_interactions: 0,
+                ..InteractionLimits::default()
+            },
+        };
+        let error = build_app(options).await.unwrap_err();
+        assert!(matches!(error, BuildAppError::Config(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid interaction host limits")
+        );
     }
 
     #[test]

@@ -27,7 +27,34 @@ fn config(root: &std::path::Path, bearer: &str) -> EmbeddedServerConfig {
         default_agent: "coding".to_owned(),
         local_bearer: LocalBearer::new(bearer).unwrap(),
         outbound_policy: EmbeddedOutboundPolicy::default(),
+        interaction_limits: Default::default(),
     }
+}
+
+#[test]
+fn embedded_config_uses_shared_default_interaction_limits() {
+    let root = waltr_server::test_support::temp_root();
+    let config = config(&root, "one-generation-secret");
+    assert_eq!(
+        serde_json::to_value(config.interaction_limits).unwrap(),
+        serde_json::to_value(waltr_server::InteractionLimits::default()).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn embedded_rejects_invalid_limits_before_paths_or_runtime_effects() {
+    let root = waltr_server::test_support::temp_root();
+    let mut config = config(&root, "one-generation-secret");
+    config.interaction_limits.active_interactions = 0;
+    config.workspace_root = "relative-workspace".into();
+    let resources = config.resources_root.clone();
+    let database = config.waltr_database_path.clone();
+    assert!(matches!(
+        build_embedded_server(config).await,
+        Err(waltr_server::embedded::EmbeddedBuildError::Application)
+    ));
+    assert!(!resources.exists());
+    assert!(!database.exists());
 }
 
 #[tokio::test]

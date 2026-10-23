@@ -702,6 +702,89 @@ fn agent(name: &str, description: &str) -> String {
 }
 
 #[tokio::test]
+async fn session_dictation_defaults_validate_and_reload_atomically() {
+    let directory = TestDirectory::new("session-dictation-defaults");
+    let state = unified_state(&directory).await;
+    let original = state.resource_catalog().effective_configuration.unwrap();
+    assert!(original.session_dictation.is_none());
+    let defaults = format!(
+        "{}\n  sessionDictation:\n    routine: audio-transcribe\n    trigger: dictate\n    input: audio\n    output: transcript\n",
+        state
+            .resource_catalog()
+            .resources
+            .iter()
+            .find(|resource| resource.path == "defaults/default.yaml")
+            .unwrap()
+            .active_source
+    );
+    directory.resource("providers/speech.yaml", "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: speech\nspec:\n  transport: googleSpeechV2\n  url: http://localhost:50051\n  models:\n    dictation:\n      name: Dictation\n      type: 3\n      speech_capabilities:\n        unary: true\n        streaming: true\n      recognition:\n        recognizer: projects/test/locations/global/recognizers/_\n        model: chirp_3\n        language_codes: [en-US]\n        sample_rate_hz: 24000\n        channels: 1\n        interim_results: true\n        automatic_punctuation: true\n");
+    let routine = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/examples/routines/audio-transcribe.yaml"
+    ));
+    directory.resource("routines/audio-transcribe.yaml", routine);
+    directory.resource("defaults/default.yaml", &defaults);
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none(), "{:?}", state.reload_error());
+    let config = state.resource_catalog().effective_configuration.unwrap();
+    assert_eq!(config.inference_defaults, original.inference_defaults);
+    assert_eq!(
+        config.session_dictation.as_ref().unwrap().routine,
+        "audio-transcribe"
+    );
+    let before = state.snapshot();
+    for invalid in [
+        defaults.replace("input: audio", "input: missing"),
+        defaults.replace("trigger: dictate", "trigger: missing"),
+        defaults.replace("routine: audio-transcribe", "routine: missing"),
+        defaults.replace("output: transcript", "output: bad/identifier"),
+        defaults.replace(
+            "output: transcript",
+            &format!("output: {}", "x".repeat(129)),
+        ),
+    ] {
+        directory.resource("defaults/default.yaml", &invalid);
+        state.reload_from_disk().await;
+        assert!(state.reload_error().is_some());
+        assert!(Arc::ptr_eq(&before, &state.snapshot()));
+    }
+    directory.resource("defaults/default.yaml", &defaults);
+    directory.resource(
+        "routines/audio-transcribe.yaml",
+        &routine.replace("sampleRateHz: 24000", "sampleRateHz: 16000"),
+    );
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_some());
+    assert!(Arc::ptr_eq(&before, &state.snapshot()));
+    let scalar = routine.replace("  tasks:", "  params:\n    - name: language\n      type: string\n      required: false\n      default: en\n  tasks:").replace("      interaction:\n", "      interaction:\n        inputs:\n          - name: language\n");
+    directory.resource("routines/audio-transcribe.yaml", &scalar);
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none(), "{:?}", state.reload_error());
+    let with_scalar = state.snapshot();
+    directory.resource(
+        "routines/audio-transcribe.yaml",
+        &scalar
+            .replace("      default: en\n", "")
+            .replace("required: false", "required: true"),
+    );
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_some());
+    assert!(Arc::ptr_eq(&with_scalar, &state.snapshot()));
+    directory.resource("routines/audio-transcribe.yaml", routine);
+    directory.resource("defaults/default.yaml", &defaults.replace("  sessionDictation:\n    routine: audio-transcribe\n    trigger: dictate\n    input: audio\n    output: transcript\n", "  sessionDictation: null\n"));
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none());
+    assert!(
+        state
+            .resource_catalog()
+            .effective_configuration
+            .unwrap()
+            .session_dictation
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
     let directory = TestDirectory::new("unified-seven-kinds");
     let state = unified_state(&directory).await;

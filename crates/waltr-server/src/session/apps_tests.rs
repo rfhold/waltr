@@ -76,6 +76,7 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
         default_agent: "coding".into(),
         local_bearer: bearer.clone(),
         outbound_policy: EmbeddedOutboundPolicy::default(),
+        interaction_limits: Default::default(),
     })
     .await
     .unwrap();

@@ -4,11 +4,12 @@ mod agent;
 mod error;
 mod materialize;
 pub(crate) mod routine;
+pub mod speech;
 mod state;
 mod store;
 mod watcher;
 
-pub use routine::{MaterializedRoutine, RoutineDefinition};
+pub use routine::{InteractionLimits, MaterializedRoutine, RoutineDefinition};
 pub use state::{
     AgentDefinitionInspection, AgentDefinitionLoadError, AgentDefinitionSnapshot,
     AgentDefinitionState, DefinitionResourceDetail, DefinitionResourceSummary,

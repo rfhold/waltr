@@ -6,6 +6,8 @@ use super::host::{
 };
 use super::*;
 
+mod completion;
+
 type SubmittedRun = (String, NonZeroU64);
 
 struct AutomaticUsageProvider;
@@ -1729,6 +1731,8 @@ async fn oversized_event_prompt_and_task_result_fail_before_downstream_side_effe
     let catalog = state().await;
     let routine = catalog.snapshot().routine("title").unwrap().clone();
     let invocation = AdmittedInvocation {
+        configuration: Arc::new(Default::default()),
+        invocation_id: None,
         routine,
         trigger: "first-user-message".to_owned(),
         context: event_context(event("oversized-result", false)),
@@ -1770,6 +1774,8 @@ async fn metadata_serialized_bound_rejects_oversize_and_accepts_boundary_value()
     let catalog = state().await;
     let routine = catalog.snapshot().routine("title").unwrap().clone();
     let invocation = AdmittedInvocation {
+        configuration: Arc::new(Default::default()),
+        invocation_id: None,
         routine,
         trigger: "first-user-message".to_owned(),
         context: event_context(event("metadata-bound", false)),

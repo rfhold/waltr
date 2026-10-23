@@ -17,16 +17,32 @@ use tonic::service::RoutesBuilder;
 pub mod service;
 pub mod storage;
 
-mod mcp_apps;
 mod convert;
 mod error;
 mod inference_settings;
+mod mcp_apps;
 mod timeline_convert;
 
 pub use service::{SessionCatalogSource, SessionRegistrationInput, SessionService};
 pub use storage::SessionStorageConfigError;
 
 pub(crate) use storage::SessionStorageConfig;
+
+pub(crate) fn pinned_inference_settings(
+    provider: String,
+    model: String,
+    configuration: &waltr::grpc::waltr::config::v1::Configuration,
+) -> Result<waltr_agent::InferenceSettings, tonic::Status> {
+    inference_settings::resolve_inference_settings(
+        waltr::grpc::waltr::session::v1::InferenceSettingsRequest {
+            provider_key: provider,
+            model_id: model,
+            reasoning_effort: None,
+        },
+        configuration,
+    )
+    .map(waltr_agent::InferenceSettings::with_reasoning_disabled)
+}
 
 /// Object-safe access to the coordinator owned by the registered gRPC session service.
 #[tonic::async_trait]
@@ -106,6 +122,13 @@ pub trait SessionHost: Send + Sync {
     ) -> Result<MetadataSetOutcome, waltr_agent::LlmError>;
     /// Subscribe to coordinator-local session updates.
     fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>>;
+    /// Subscribe before starting a helper; reset notifications must never be ignored.
+    fn observe_timeline(
+        &self,
+        _id: SessionId,
+    ) -> Option<waltr_agent::SessionTimelineProjectionSubscription> {
+        None
+    }
     /// Permanently stop run admission and cancel process-local session work.
     async fn shutdown(&self);
 }

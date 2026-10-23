@@ -153,6 +153,9 @@ fn provider_api(value: i32) -> Result<ModelApi, Status> {
         ProviderType::OpenaiChatCompletions => Ok(ModelApi::OpenAiChatCompletions),
         ProviderType::OpenaiResponses => Ok(ModelApi::OpenAiResponses),
         ProviderType::OpenaiResponsesWebsocket => Ok(ModelApi::OpenAiResponsesWebSocket),
+        ProviderType::GoogleSpeechV2 | ProviderType::GoogleTextToSpeechV1 => Err(
+            Status::invalid_argument("speech provider cannot be used for inference"),
+        ),
         ProviderType::Unspecified => Err(Status::invalid_argument("provider type is unspecified")),
     }
 }
