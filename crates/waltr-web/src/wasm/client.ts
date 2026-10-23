@@ -8,11 +8,13 @@ export type {
 
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 import type { ClientAdapter, ClientSnapshotListener } from "../platform/client";
+import { browserDictation } from "../platform/browser-dictation";
 
 export async function loadBrowserClient(): Promise<ClientAdapter> {
   await init();
 
   const client = WaltrClient.forCurrentOrigin();
+  const dictation = browserDictation(client);
   let currentSnapshot: ClientSnapshot | undefined;
   let currentSnapshotJson: string | undefined;
   let started = false;
@@ -21,6 +23,7 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
   const disposedError = () => new Error("client adapter disposed");
 
   const publish = (snapshot: ClientSnapshot) => {
+    if (!snapshot.status.ready) dictation.cancel();
     currentSnapshot = snapshot;
 
     for (const listener of listeners) {
@@ -98,6 +101,8 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
 
   return {
     snapshot: () => currentSnapshot,
+    dictation,
+    dictationPreferenceScope: window.location.origin,
     start,
     subscribe: (listener) => {
       if (disposed) {
@@ -116,8 +121,9 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
     },
     dispatch,
     access: {
-      openLogin: (url) => window.location.assign(url),
+      openLogin: (url) => { dictation.cancel(); window.location.assign(url); },
       logout: async () => {
+        dictation.cancel();
         const response = await fetch("/oidc/logout", { method: "POST", credentials: "same-origin" });
         return response.ok;
       },
@@ -128,6 +134,7 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
       }
 
       disposed = true;
+      dictation.dispose();
       started = false;
       client.dispose();
       listeners.clear();

@@ -246,6 +246,24 @@ modelId: string,
  */
 reasoningEffort: string | null, };
 
+export type SessionDictationView = {
+/**
+ * Routine catalog key.
+ */
+routine: string,
+/**
+ * Interaction trigger name.
+ */
+trigger: string,
+/**
+ * PCM input port name.
+ */
+input: string,
+/**
+ * Text output port name.
+ */
+output: string, };
+
 export type ProviderView = {
 /**
  * Provider type as a shell-friendly enum.
@@ -292,7 +310,11 @@ mcpServers: { [key in string]?: McpServerView },
 /**
  * Default inference selection for newly created sessions.
  */
-inferenceDefaults: InferenceDefaultsView | null, };
+inferenceDefaults: InferenceDefaultsView | null,
+/**
+ * Optional configured push-to-talk selection; absent disables session dictation.
+ */
+sessionDictation?: SessionDictationView | null, };
 
 export type CatalogModelRefView = {
 /**

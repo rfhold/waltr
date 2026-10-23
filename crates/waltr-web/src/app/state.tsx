@@ -409,6 +409,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         explicitAuthTarget,
         presentedAuthAttemptId,
         authorizationDraft,
+        dictation: () => { snapshot(); return clientAdapter()?.dictation; },
+        dictationPreferenceScope: () => clientAdapter()?.dictationPreferenceScope,
         accessOperations: () => clientAdapter()?.access,
         openAuthorizationAttempt: () => clientAdapter()?.openAuthorizationAttempt,
         openExternalUrl: () => clientAdapter()?.openExternalUrl,

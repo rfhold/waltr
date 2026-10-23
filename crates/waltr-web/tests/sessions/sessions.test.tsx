@@ -111,6 +111,7 @@ describe("sessions route", () => {
     expect(screen.queryByLabelText("Session list")).toBeNull();
     expect(commands.map((command) => command.type)).toEqual([
       "registerSessionWatchInterest",
+      "registerConfigWatchInterest",
       "registerSessionTimelineWatchInterest",
       "registerSessionRoutineInvocationWatchInterest",
     ]);
