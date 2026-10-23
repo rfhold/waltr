@@ -7,6 +7,10 @@
   "permissions": [
     "core:default",
     "allow-start-runtime",
+    "allow-dictation-start",
+    "allow-dictation-finish",
+    "allow-dictation-status",
+    "allow-dictation-cancel",
     "allow-list-servers",
     "allow-save-server",
     "allow-remove-server",

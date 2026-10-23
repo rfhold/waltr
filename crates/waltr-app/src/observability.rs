@@ -203,7 +203,12 @@ fn install_subscriber(
 fn safe_trace_target(metadata: &tracing::Metadata<'_>) -> bool {
     useful_level(metadata)
         && (target_in_module(metadata.target(), APP_TARGET)
-            || target_in_module(metadata.target(), NATIVE_TRACE_TARGET))
+            || target_in_module(metadata.target(), NATIVE_TRACE_TARGET)
+            || (metadata.is_span()
+                && matches!(
+                    metadata.target(),
+                    "waltr_server::routine::telemetry" | "waltr_audio::telemetry"
+                )))
 }
 
 fn safe_log_target(metadata: &tracing::Metadata<'_>) -> bool {
@@ -784,6 +789,17 @@ mod tests {
                 "safe.native.grpc",
                 rpc.system = "grpc",
             ));
+            drop(tracing::info_span!(target: "waltr_server::routine::telemetry", "safe.routine"));
+            drop(tracing::info_span!(target: "waltr_audio::telemetry", "safe.speech"));
+            drop(
+                tracing::info_span!(target: "waltr_server::routine::telemetry::nested", "hostile.routine.nested"),
+            );
+            drop(
+                tracing::info_span!(target: "waltr_audio::telemetry_extra", "hostile.speech.lookalike"),
+            );
+            drop(
+                tracing::info_span!(target: "waltr_server::routine::interaction", "hostile.routine.other"),
+            );
             drop(tracing::debug_span!(
                 target: "waltr_app_lib::bridge",
                 "noisy.app.debug",
@@ -802,7 +818,15 @@ mod tests {
         let exported = spans.get_finished_spans().unwrap();
         let mut names: Vec<_> = exported.iter().map(|span| span.name.as_ref()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["safe.native.grpc", "safe.nested.app"]);
+        assert_eq!(
+            names,
+            [
+                "safe.native.grpc",
+                "safe.nested.app",
+                "safe.routine",
+                "safe.speech"
+            ]
+        );
         let diagnostic = format!("{exported:?}");
         assert!(!diagnostic.contains("SECRET_IPC_MARKER"));
         assert!(!diagnostic.contains("SECRET_ERROR_MARKER"));
@@ -831,6 +855,8 @@ mod tests {
                 "excluded.native.log",
             );
             tracing::info!(target: "waltr_app_lib_extra", "excluded.lookalike");
+            tracing::info!(target: "waltr_server::routine::telemetry", "excluded.routine.log");
+            tracing::info!(target: "waltr_audio::telemetry", "excluded.speech.log");
         });
         provider.force_flush().unwrap();
 
@@ -843,6 +869,213 @@ mod tests {
         assert!(!diagnostic.contains("excluded.native.log"));
         assert!(!diagnostic.contains("excluded.lookalike"));
         drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+    }
+
+    #[test]
+    fn native_audio_diagnostics_are_bounded_parented_and_content_free() {
+        if !crate::dictation_telemetry::isolated_exporter_test(
+            "observability::tests::native_audio_diagnostics_are_bounded_parented_and_content_free",
+        ) {
+            return;
+        }
+        use crate::audio_permissions::PermissionResult;
+        use crate::dictation_telemetry::Operation;
+        use waltr_desktop::host::{Diagnostic, Error, RpcFailure, Stage};
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing::Instrument as _;
+        let collapsed = waltr_client::ClientError::new("SECRET_ERROR_SENTINEL");
+        assert_eq!(
+            RpcFailure::from_client(&collapsed, RpcFailure::Output),
+            RpcFailure::Output
+        );
+        let login = waltr_client::ClientError::waltr_login_required("SECRET_ERROR_SENTINEL");
+        assert_eq!(
+            RpcFailure::from_client(&login, RpcFailure::Output),
+            RpcFailure::LoginRequired
+        );
+        assert_eq!(
+            crate::dictation_telemetry::rpc_category(&login, "rpc_output"),
+            "rpc_login_required"
+        );
+        let logs = InMemoryLogExporter::default();
+        let logger = SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let spans = InMemorySpanExporter::default();
+        let tracer = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(tracer.tracer("test"))
+                    .with_filter(filter_fn(safe_trace_target)),
+            )
+            .with(OpenTelemetryTracingBridge::new(&logger).with_filter(filter_fn(safe_log_target)));
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for case in 0..8 {
+                    let operation = Operation::new(if case % 2 == 0 { "hold" } else { "chat" });
+                    let observer = operation.observer();
+                    async {
+                        operation.permission(if case == 3 { PermissionResult::Denied } else { PermissionResult::Granted });
+                        if case != 3 {
+                            operation.stage(Stage::CaptureRequested);
+                            // The blocking-worker observer retains its local dispatcher and parent.
+                            let worker = observer.clone();
+                            std::thread::spawn(move || worker.emit(Diagnostic::Stage(Stage::CaptureReady))).join().unwrap();
+                            operation.stage(Stage::RpcOpen);
+                            async {}.instrument(tracing::info_span!(target: "waltr_client::transport::native_trace", "test.audio.rpc")).await;
+                            match case {
+                                0 => {
+                                    for _ in 0..100 { operation.stage(Stage::Accepted); operation.stage(Stage::FirstFrameObserved); }
+                                    operation.stage(Stage::InputFinished);
+                                    operation.stage(Stage::OutputFinished);
+                                    operation.primary(Ok(()));
+                                }
+                                1 => operation.primary(Err(Error::Capture(waltr_desktop::capture::Error::Overflow))),
+                                2 => { observer.emit(Diagnostic::RpcFailure(RpcFailure::Open)); operation.primary(Err(Error::Interaction)); }
+                                4 => operation.primary(Err(Error::Cancelled)),
+                                5 => {
+                                    // Arbitrary static inner error text is never exported.
+                                    operation.primary(Err(Error::Command(waltr_desktop::command::CommandError::Invalid("SECRET_ERROR_SENTINEL"))));
+                                }
+                                6 => operation.primary(Ok(())),
+                                7 => {
+                                    operation.stage(Stage::Accepted);
+                                    observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));
+                                    operation.primary(Err(Error::Interaction));
+                                },
+                                _ => unreachable!(),
+                            }
+                            operation.stage(Stage::Cleanup);
+                            operation.capture_cleanup(Ok(()));
+                            observer.emit(Diagnostic::TypingCleanup(if case >= 5 { Err(waltr_desktop::typing::Error::Backend) } else { Ok(()) }));
+                        }
+                    }.instrument(operation.span()).await;
+                    // Production finishes after the instrumented future, sometimes under another scope.
+                    if case % 2 == 0 {
+                        let unrelated = tracing::info_span!(target: "waltr_app_lib::dictation_telemetry", "unrelated");
+                        unrelated.in_scope(|| { operation.finish(); operation.finish(); });
+                    } else {
+                        operation.finish();
+                        operation.finish();
+                    }
+                }
+            });
+        });
+        logger.force_flush().unwrap();
+        tracer.force_flush().unwrap();
+        let exported = spans.get_finished_spans().unwrap();
+        let operations: Vec<_> = exported
+            .iter()
+            .filter(|span| span.name == "native.audio.operation")
+            .collect();
+        assert_eq!(operations.len(), 8);
+        for child in exported.iter().filter(|span| span.name == "test.audio.rpc") {
+            assert!(operations.iter().any(|parent| parent.span_context.span_id()
+                == child.parent_span_id
+                && parent.span_context.trace_id() == child.span_context.trace_id()));
+        }
+        let emitted = logs.get_emitted_logs().unwrap();
+        let diagnostic = format!("{emitted:?} {exported:?}");
+        for category in [
+            "capture_host_overflow",
+            "rpc_open",
+            "rpc_protocol",
+            "permission_denied",
+            "cancelled",
+            "command_invalid",
+            "typing_backend",
+            "succeeded",
+            "failed",
+            "capture_ready",
+        ] {
+            assert!(diagnostic.contains(category), "missing {category}");
+        }
+        assert!(!diagnostic.contains("SECRET_ERROR_SENTINEL"));
+        for log in &emitted {
+            let fields = format!("{log:?}");
+            if fields.contains("native.audio.") {
+                let id = log
+                    .record
+                    .attributes_iter()
+                    .find_map(|(key, value)| {
+                        (key.as_str() == "diagnostic_id").then(|| match value {
+                            opentelemetry::logs::AnyValue::Int(value) => value.to_string(),
+                            _ => panic!("integer log diagnostic id"),
+                        })
+                    })
+                    .expect("operation log has diagnostic id");
+                let parent = operations
+                    .iter()
+                    .find(|span| {
+                        span.attributes.iter().any(|attribute| {
+                            attribute.key.as_str() == "diagnostic_id"
+                                && id == attribute.value.to_string()
+                        })
+                    })
+                    .expect("matching operation");
+                let context = log
+                    .record
+                    .trace_context()
+                    .expect("exported operation log correlation");
+                assert_eq!(context.trace_id, parent.span_context.trace_id());
+                assert_eq!(context.span_id, parent.span_context.span_id());
+            }
+            if fields.contains("native.audio.finished") && fields.contains("cancelled") {
+                assert_eq!(
+                    log.record.severity_number(),
+                    Some(opentelemetry::logs::Severity::Info)
+                );
+            }
+            if fields.contains("native.audio.finished") && fields.contains("command_invalid") {
+                assert_eq!(
+                    log.record.severity_number(),
+                    Some(opentelemetry::logs::Severity::Warn)
+                );
+            }
+        }
+        let terminal: Vec<_> = emitted
+            .iter()
+            .map(|log| format!("{log:?}"))
+            .filter(|log| log.contains("native.audio.finished"))
+            .collect();
+        assert!(
+            terminal
+                .iter()
+                .any(|log| log.contains("command_invalid") && log.contains("typing_backend"))
+        );
+        assert!(terminal.iter().any(|log| log.contains("none")
+            && log.contains("typing_backend")
+            && log.contains("failed")));
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|log| format!("{log:?}").contains("native.audio.finished"))
+                .count(),
+            8
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|log| format!("{log:?}").contains("first_frame_observed"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|log| format!("{log:?}").contains("capture_ready"))
+                .count(),
+            7
+        );
+        drop(logger.shutdown());
+        drop(tracer.shutdown());
     }
 
     #[test]

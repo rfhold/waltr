@@ -143,6 +143,10 @@ mod tests {
         let permissions = capability["permissions"].as_array().unwrap();
         let commands = registered_app_commands();
         let mut expected = vec![
+            "dictation_start",
+            "dictation_finish",
+            "dictation_status",
+            "dictation_cancel",
             "start_runtime",
             "client_dispatch",
             "client_state",

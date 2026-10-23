@@ -253,6 +253,8 @@ impl<T: Clone + Send + Sync> Publisher<T> {
 }
 
 enum HostRequest {
+    Dictation(crate::dictation::Job),
+    Hold(crate::native_audio::Held),
     Access(waltr_client::NativeAccessAction),
     LogoutAccess {
         reply: oneshot::Sender<Result<(), String>>,
@@ -547,6 +549,10 @@ pub struct RuntimeBridge {
     authorization_attempt: Arc<RwLock<Option<RetainedAuthorizationAttempt>>>,
     authorization_handoff: Mutex<Option<PendingAuthorizationHandoff>>,
     start_operation: Mutex<()>,
+    dictation: Arc<crate::dictation::Host>,
+    audio: Arc<crate::native_audio::Host>,
+    activity: crate::activity::ActivityTracker,
+    shortcut_epoch: waltr_desktop::shortcut::IngressEpoch,
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     mobile_start_ticket: AtomicU64,
 }
@@ -599,6 +605,7 @@ impl RuntimeBridge {
         effect()
     }
     pub(crate) fn select(&self, target: RuntimeTarget) {
+        self.shortcut_epoch.bind(0);
         *self
             .selected
             .lock()
@@ -647,6 +654,11 @@ impl RuntimeBridge {
                 .ok_or_else(|| "Native client generation was replaced".to_owned())?
         };
         if matches!(action, waltr_client::NativeAccessAction::Logout) {
+            self.with_current(generation, || {
+                self.shortcut_epoch.set_enabled(generation, false);
+                self.dictation.access(false);
+                Ok(())
+            })?;
             let (reply, result) = oneshot::channel();
             requests
                 .send(HostRequest::LogoutAccess { reply })
@@ -682,6 +694,8 @@ impl RuntimeBridge {
     /// Create a bridge attached to the process-owned embedded server.
     #[must_use]
     pub fn new(server: EmbeddedServerController) -> Self {
+        let activity = crate::activity::ActivityTracker::default();
+        let audio = Arc::new(crate::native_audio::Host::new(activity.clone()));
         Self {
             active_generation: Arc::new(AtomicU64::new(0)),
             next_generation: AtomicU64::new(0),
@@ -693,8 +707,17 @@ impl RuntimeBridge {
             authorization_attempt: Arc::new(RwLock::new(None)),
             authorization_handoff: Mutex::new(None),
             start_operation: Mutex::new(()),
+            dictation: Arc::new(crate::dictation::Host::new(audio.clone())),
+            audio,
+            activity,
+            shortcut_epoch: waltr_desktop::shortcut::IngressEpoch::default(),
             mobile_start_ticket: AtomicU64::new(0),
         }
+    }
+
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub(crate) fn activity(&self) -> crate::activity::ActivityTracker {
+        self.activity.clone()
     }
 
     /// Replace any active generation and return its ordered event feed.
@@ -764,6 +787,7 @@ impl RuntimeBridge {
             .saturating_add(1);
         let authorization_handoff = self.take_authorization_handoff(generation);
         self.active_generation.store(generation, Ordering::Release);
+        self.bind_native_generation(generation);
         let recovery = Arc::new(RwLock::new(RecoveryState::new(generation)));
         let (publisher, feed) = Publisher::new(
             Arc::clone(&self.active_generation),
@@ -810,6 +834,127 @@ impl RuntimeBridge {
         });
         observability::record_outcome(&span, "ok");
         Ok(feed)
+    }
+
+    pub(crate) fn retire_shortcut_backend(&self, worker: thread::JoinHandle<()>) {
+        let mut pending = self
+            .retiring
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.push(self.retiring.enqueue(worker));
+    }
+    fn bind_native_generation(&self, generation: u64) {
+        self.shortcut_epoch.bind(generation);
+        self.dictation.bind(generation);
+    }
+    #[cfg(test)]
+    pub fn synthetic_shortcut_generation(
+        &self,
+        generation: u64,
+    ) -> impl FnMut() -> Option<crate::native_audio::Held> {
+        self.stop();
+        self.bind_native_generation(generation);
+        audio_access(&self.dictation, &self.shortcut_epoch, generation, true);
+        let (requests, mut receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let (stop, _) = watch::channel(false);
+        let (platform, _) = watch::channel(PlatformStartup::Ready);
+        *self.running.lock().unwrap() = Some(RunningGeneration {
+            generation,
+            requests,
+            stop,
+            platform,
+            recovery: Arc::new(RwLock::new(RecoveryState::new(generation))),
+            thread: thread::spawn(|| {}),
+        });
+        move || match receiver.try_recv() {
+            Ok(HostRequest::Hold(held)) => Some(held),
+            Err(_) => None,
+            _ => panic!("unexpected synthetic host request"),
+        }
+    }
+    #[cfg(test)]
+    pub fn synthetic_shortcut_access(&self, generation: u64, allowed: bool) {
+        audio_access(&self.dictation, &self.shortcut_epoch, generation, allowed);
+    }
+    pub(crate) fn shortcut_ingress(&self) -> waltr_desktop::shortcut::IngressEpoch {
+        self.shortcut_epoch.clone()
+    }
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "hold the generation lock through edge admission and enqueue"
+    )]
+    pub(crate) fn shortcut_press(
+        &self,
+        epoch: u64,
+        binding: Arc<waltr_desktop::config::Keybind>,
+    ) -> Option<(
+        waltr_desktop::host::HoldControl,
+        tokio_util::sync::CancellationToken,
+    )> {
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running = running.as_ref()?;
+        self.shortcut_epoch.admit(epoch, || {
+            let (held, control) = self.audio.hold(binding).ok()?;
+            if held.generation != running.generation {
+                return None;
+            }
+            let token = held.token.clone();
+            running.requests.try_send(HostRequest::Hold(held)).ok()?;
+            Some((control, token))
+        })?
+    }
+    pub(crate) fn start_dictation(
+        &self,
+        generation: u64,
+        operation: u64,
+        selection: crate::dictation::Selection,
+        session: &str,
+    ) -> Result<crate::dictation::Status, String> {
+        let (status, job, requests) = self
+            .with_current(generation, || {
+                let (status, job) = self
+                    .dictation
+                    .start(generation, operation, selection, session)?;
+                Ok((status, job))
+            })
+            .and_then(|(status, job)| {
+                let running = self
+                    .running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let requests = running
+                    .as_ref()
+                    .filter(|r| r.generation == generation)
+                    .ok_or("Native client generation was replaced")?
+                    .requests
+                    .clone();
+                Ok((status, job, requests))
+            })?;
+        if let Some(job) = job
+            && requests.try_send(HostRequest::Dictation(job)).is_err()
+        {
+            let _cancelled = self.dictation.control(generation, operation, "cancel");
+            return Err("Native client is busy".into());
+        }
+        Ok(status)
+    }
+    pub(crate) fn dictation_control(
+        &self,
+        generation: u64,
+        operation: u64,
+        action: &str,
+    ) -> Result<crate::dictation::Status, String> {
+        self.with_current(generation, || {
+            self.dictation.control(generation, operation, action)
+        })
+    }
+    pub(crate) fn cancel_audio(&self) {
+        self.shortcut_epoch.bind(0);
+        self.dictation.cancel_all();
     }
 
     /// Dispatch one frontend command through the generation's serialized queue.
@@ -894,7 +1039,6 @@ impl RuntimeBridge {
     }
 
     /// Signal without joining the lifecycle callback; IPC teardown retains the join barrier.
-    #[cfg(any(target_os = "android", test))]
     pub fn stop_nonblocking(&self) {
         let mut retiring = self
             .retiring
@@ -948,6 +1092,7 @@ impl RuntimeBridge {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        self.cancel_audio();
         running.stop.send_replace(true);
         if preserve_auth {
             #[cfg(any(target_os = "android", test))]
@@ -1051,6 +1196,7 @@ impl RuntimeBridge {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            self.cancel_audio();
             running.stop.send_replace(true);
             self.clear_authorization_generation(running.generation);
         }
@@ -1190,7 +1336,7 @@ async fn run_generation(
             bearer: String::new(),
             first_catalog_download: false,
         };
-        run_connected_generation(
+        Box::pin(run_connected_generation(
             &mut requests,
             &mut stop,
             &mut platform,
@@ -1200,14 +1346,14 @@ async fn run_generation(
             None,
             true,
             target,
-        )
+        ))
         .await;
         return;
     }
     let mut initial_sent = false;
     let mut permission_required = initial == PlatformStartup::NotificationPermissionRequired;
     if let Some(connection) = gated_connection(initial, server.connection()) {
-        match run_connected_generation(
+        match Box::pin(run_connected_generation(
             &mut requests,
             &mut stop,
             &mut platform,
@@ -1217,7 +1363,7 @@ async fn run_generation(
             authorization_handoff.take(),
             true,
             target.clone(),
-        )
+        ))
         .await
         {
             ConnectedExit::Stopped => return,
@@ -1251,7 +1397,7 @@ async fn run_generation(
                     startup: PlatformStartup::Ready,
                 })
                 .await;
-            match run_connected_generation(
+            match Box::pin(run_connected_generation(
                 &mut requests,
                 &mut stop,
                 &mut platform,
@@ -1261,7 +1407,7 @@ async fn run_generation(
                 authorization_handoff.take(),
                 false,
                 target.clone(),
-            )
+            ))
             .await
             {
                 ConnectedExit::Stopped => {
@@ -1303,7 +1449,7 @@ async fn run_generation(
                 permission_required = startup == PlatformStartup::NotificationPermissionRequired;
             }
             request = requests.recv() => match request {
-                Some(HostRequest::Access(_)) => {},
+                Some(HostRequest::Access(_) | HostRequest::Dictation(_) | HostRequest::Hold(_)) => {},
                 Some(HostRequest::LogoutAccess { reply }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
                     drop(reply.send(Err("embedded server is not ready".to_owned())));
@@ -1363,6 +1509,7 @@ async fn run_connected_generation(
     }
     let transport =
         NativeGrpcTransport::with_credential_provider(connection.endpoint, credentials.clone());
+    let audio_transport = transport.clone();
     let runtime = match handoff_attempt_for_server(authorization_handoff, connection.generation) {
         Some(attempt) => ClientRuntime::with_transport_and_pending_auth_attempt(transport, attempt),
         None => ClientRuntime::with_transport(transport),
@@ -1386,6 +1533,41 @@ async fn run_connected_generation(
         .as_ref()
         .map(|binding| binding.spawn(credentials.clone()));
     let mut access_host = crate::native_auth::AccessHost::default();
+    let audio = target
+        .app
+        .as_ref()
+        .map(|app| {
+            use tauri::Manager as _;
+            app.state::<Arc<RuntimeBridge>>().dictation.clone()
+        })
+        .unwrap_or_default();
+    let shortcut_epoch = target
+        .app
+        .as_ref()
+        .map(|app| {
+            use tauri::Manager as _;
+            app.state::<Arc<RuntimeBridge>>().shortcut_ingress()
+        })
+        .unwrap_or_default();
+    audio.credentials(credentials.clone());
+    audio_access(
+        &audio,
+        &shortcut_epoch,
+        publisher.generation,
+        snapshot_connected(&stream.snapshot()),
+    );
+    let monitor_stop = tokio_util::sync::CancellationToken::new();
+    let monitoring = monitor_stop.clone();
+    let monitor_audio = audio.clone();
+    let credential_monitor = tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                () = monitoring.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_millis(2)) => monitor_audio.check_credentials(),
+            }
+        }
+    });
+    let mut audio_tasks = tokio::task::JoinSet::new();
     let mut connected_recorded = false;
     let exit = loop {
         if !publisher.is_current() {
@@ -1401,6 +1583,7 @@ async fn run_connected_generation(
         }
         tokio::select! {
             _ = stop.changed() => break ConnectedExit::Stopped,
+            _ = audio_tasks.join_next(), if !audio_tasks.is_empty() => {},
             changed = platform.changed() => {
                 if changed.is_err() {
                     break ConnectedExit::Stopped;
@@ -1416,9 +1599,11 @@ async fn run_connected_generation(
                 if !publisher.is_current() { break ConnectedExit::Stopped; }
                 match output {
                     waltr_client::NativeAccessOutput::ClientCommand { command, logout_barrier: _ } => {
+                        audio_access(&audio, &shortcut_epoch, publisher.generation, false);
                         let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
                         let result = tokio::select! { biased; _ = stop.changed() => break ConnectedExit::Stopped, result = dispatch_command(&mut stream, *command) => result };
                         if let Ok(snapshot) = result {
+                            audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
                             access_host.observe(access.as_ref(), &credentials, &snapshot, started_probe).await;
                             publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) });
                         }
@@ -1437,7 +1622,27 @@ async fn run_connected_generation(
                 }
             }
             request = requests.recv() => match request {
+                Some(HostRequest::Hold(held)) => {
+                    if let Some(app) = target.app.clone() {
+                        let transport = audio_transport.clone();
+                        audio_tasks.spawn_local(async move {
+                            use tauri::Manager as _;
+                            held.run(&transport, &app.state::<crate::audio_permissions::AudioPermissions>(), Arc::new(waltr_desktop::capture::Native)).await;
+                        });
+                    }
+                }
+                Some(HostRequest::Dictation(job)) => {
+                    if let Some(app) = target.app.clone() {
+                        let transport = audio_transport.clone();
+                        audio_tasks.spawn_local(async move {
+                            use tauri::Manager as _;
+                            job.run(&transport, &app.state::<crate::audio_permissions::AudioPermissions>(), Arc::new(waltr_desktop::capture::Native)).await;
+                        });
+                    }
+                }
                 Some(HostRequest::LogoutAccess { reply }) => {
+                    shortcut_epoch.set_enabled(publisher.generation, false);
+                    drain_audio(&audio, &mut audio_tasks).await;
                     if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
                     if let Some(coordinator) = access.take() { coordinator.stop().await; }
                     let _ = credentials.clear_bearer_token();
@@ -1456,6 +1661,9 @@ async fn run_connected_generation(
                 }
                 Some(HostRequest::Dispatch { command, reply }) => {
                     if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
+                    if matches!(*command, ClientCommand::StartWaltrLogin | ClientCommand::CompleteWaltrLogin { .. } | ClientCommand::FailWaltrLogin { .. } | ClientCommand::ReprobeWaltrAccess | ClientCommand::LogoutWaltr | ClientCommand::WaltrAccessExpired { .. }) {
+                        audio_access(&audio, &shortcut_epoch, publisher.generation, false);
+                    }
                     access_host.cancel_command(access.as_ref(), &credentials, &stream.snapshot(), &command).await;
                     let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
                     let dispatch = dispatch_command(&mut stream, *command);
@@ -1488,6 +1696,7 @@ async fn run_connected_generation(
                         };
                     };
                     if let Ok(snapshot) = &result {
+                        audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(snapshot));
                         access_host.observe(access.as_ref(), &credentials, snapshot, started_probe).await;
                     }
                     let result = result.and_then(|snapshot| {
@@ -1502,6 +1711,7 @@ async fn run_connected_generation(
                 None => break ConnectedExit::Stopped,
             },
             snapshot = stream.next() => {
+                audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
                 access_host.observe(access.as_ref(), &credentials, &snapshot, false).await;
                 publisher.publish_state(BridgePayload::State {
                     snapshot: Box::new(presentation.snapshot(&snapshot)),
@@ -1509,12 +1719,37 @@ async fn run_connected_generation(
             }
         }
     };
+    shortcut_epoch.set_enabled(publisher.generation, false);
+    drain_audio(&audio, &mut audio_tasks).await;
+    monitor_stop.cancel();
+    let _joined = credential_monitor.await;
     if let Some(access) = access {
         access.stop().await;
     }
     let _ = credentials.clear_bearer_token();
     presentation.clear_authorization_attempt();
     exit
+}
+
+fn audio_access(
+    audio: &crate::dictation::Host,
+    epoch: &waltr_desktop::shortcut::IngressEpoch,
+    generation: u64,
+    allowed: bool,
+) {
+    // Revoke ingress before access; publish fresh ingress only after access is ready.
+    if !allowed {
+        epoch.set_enabled(generation, false);
+    }
+    audio.access(allowed);
+    if allowed {
+        epoch.set_enabled(generation, true);
+    }
+}
+
+pub async fn drain_audio(audio: &crate::dictation::Host, tasks: &mut tokio::task::JoinSet<()>) {
+    audio.access(false);
+    while tasks.join_next().await.is_some() {}
 }
 
 #[cfg(test)]

@@ -153,6 +153,7 @@ impl AppPrivateRoots {
             default_agent: "coding".to_owned(),
             local_bearer: bearer,
             outbound_policy: EmbeddedOutboundPolicy::default(),
+            interaction_limits: Default::default(),
         }
     }
 
