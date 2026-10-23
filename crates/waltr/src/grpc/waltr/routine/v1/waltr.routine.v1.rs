@@ -394,6 +394,7 @@ pub enum RoutineTriggerKind {
     Unspecified = 0,
     Manual = 1,
     Event = 2,
+    Interaction = 3,
 }
 impl RoutineTriggerKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -405,6 +406,7 @@ impl RoutineTriggerKind {
             Self::Unspecified => "ROUTINE_TRIGGER_KIND_UNSPECIFIED",
             Self::Manual => "ROUTINE_TRIGGER_KIND_MANUAL",
             Self::Event => "ROUTINE_TRIGGER_KIND_EVENT",
+            Self::Interaction => "ROUTINE_TRIGGER_KIND_INTERACTION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -413,6 +415,7 @@ impl RoutineTriggerKind {
             "ROUTINE_TRIGGER_KIND_UNSPECIFIED" => Some(Self::Unspecified),
             "ROUTINE_TRIGGER_KIND_MANUAL" => Some(Self::Manual),
             "ROUTINE_TRIGGER_KIND_EVENT" => Some(Self::Event),
+            "ROUTINE_TRIGGER_KIND_INTERACTION" => Some(Self::Interaction),
             _ => None,
         }
     }
@@ -551,6 +554,336 @@ impl RoutineEventKind {
             "ROUTINE_EVENT_KIND_INVOCATION_SUCCEEDED" => Some(Self::InvocationSucceeded),
             "ROUTINE_EVENT_KIND_INVOCATION_FAILED" => Some(Self::InvocationFailed),
             "ROUTINE_EVENT_KIND_INVOCATION_INTERRUPTED" => Some(Self::InvocationInterrupted),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InteractRequest {
+    #[prost(oneof = "interact_request::Event", tags = "1, 2, 3, 4, 5, 6")]
+    pub event: ::core::option::Option<interact_request::Event>,
+}
+/// Nested message and enum types in `InteractRequest`.
+pub mod interact_request {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Open(super::OpenInteraction),
+        #[prost(message, tag = "2")]
+        InputOpened(super::InteractionInputOpened),
+        #[prost(message, tag = "3")]
+        InputChunk(super::InteractionInputChunk),
+        #[prost(message, tag = "4")]
+        InputClosed(super::InteractionInputClosed),
+        #[prost(message, tag = "5")]
+        InputCompleted(super::InteractionInputCompleted),
+        #[prost(message, tag = "6")]
+        Cancel(super::InteractionCancel),
+    }
+}
+/// Selects one interaction trigger; params remain scalar and separate from ports.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenInteraction {
+    #[prost(string, tag = "1")]
+    pub routine_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub trigger_name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub source_session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub params: ::prost::alloc::vec::Vec<RoutineInputValue>,
+    /// Correlation only; does not deduplicate or make retries idempotent.
+    #[prost(string, optional, tag = "5")]
+    pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Each input names a declared port. Duplicate port names are invalid.
+/// The server implicitly closes every input and completes input after this request.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunInteractionRequest {
+    #[prost(message, optional, tag = "1")]
+    pub open: ::core::option::Option<OpenInteraction>,
+    #[prost(message, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<InteractionInput>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionInput {
+    #[prost(string, tag = "1")]
+    pub port_name: ::prost::alloc::string::String,
+    #[prost(oneof = "interaction_input::Content", tags = "2, 3")]
+    pub content: ::core::option::Option<interaction_input::Content>,
+}
+/// Nested message and enum types in `InteractionInput`.
+pub mod interaction_input {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(message, tag = "2")]
+        Audio(super::InteractionAudioInput),
+        /// One complete committed segment, not a sequence of hypotheses.
+        #[prost(string, tag = "3")]
+        Text(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionAudioInput {
+    #[prost(message, optional, tag = "1")]
+    pub format: ::core::option::Option<InteractionAudioFormat>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+/// The first response is accepted or validation_failure; rejection ends the RPC.
+/// After admission, completed is the sole interaction terminal event.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InteractResponse {
+    #[prost(oneof = "interact_response::Event", tags = "1, 2, 3, 4, 5, 6")]
+    pub event: ::core::option::Option<interact_response::Event>,
+}
+/// Nested message and enum types in `InteractResponse`.
+pub mod interact_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Accepted(super::InteractionAccepted),
+        #[prost(message, tag = "2")]
+        ValidationFailure(super::RoutineValidationFailure),
+        #[prost(message, tag = "3")]
+        OutputOpened(super::InteractionOutputOpened),
+        #[prost(message, tag = "4")]
+        OutputChunk(super::InteractionOutputChunk),
+        #[prost(message, tag = "5")]
+        OutputClosed(super::InteractionOutputClosed),
+        #[prost(message, tag = "6")]
+        Completed(super::InteractionCompleted),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionAccepted {
+    #[prost(string, tag = "1")]
+    pub invocation_id: ::prost::alloc::string::String,
+}
+/// Stream IDs are nonempty and unique within each direction of one interaction.
+/// Input and output can share an ID; their message types disambiguate the direction.
+/// Port names select declared Routine ports; IDs identify individual stream instances.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionInputOpened {
+    #[prost(string, tag = "1")]
+    pub port_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub stream_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub format: ::core::option::Option<InteractionStreamFormat>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionOutputOpened {
+    #[prost(string, tag = "1")]
+    pub port_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub stream_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub format: ::core::option::Option<InteractionStreamFormat>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionStreamFormat {
+    #[prost(oneof = "interaction_stream_format::Content", tags = "1, 2")]
+    pub content: ::core::option::Option<interaction_stream_format::Content>,
+}
+/// Nested message and enum types in `InteractionStreamFormat`.
+pub mod interaction_stream_format {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(message, tag = "1")]
+        Audio(super::InteractionAudioFormat),
+        #[prost(message, tag = "2")]
+        Text(super::InteractionTextFormat),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionTextFormat {
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionAudioFormat {
+    #[prost(enumeration = "InteractionAudioEncoding", tag = "1")]
+    pub encoding: i32,
+    /// Both values must be positive and supported by the selected port.
+    #[prost(uint32, tag = "2")]
+    pub sample_rate_hz: u32,
+    #[prost(uint32, tag = "3")]
+    pub channels: u32,
+}
+/// Chunks follow open and precede close; their content must match the stream format.
+/// Audio chunks contain complete sample frames. Transport order is authoritative.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionInputChunk {
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    #[prost(oneof = "interaction_input_chunk::Content", tags = "2, 3")]
+    pub content: ::core::option::Option<interaction_input_chunk::Content>,
+}
+/// Nested message and enum types in `InteractionInputChunk`.
+pub mod interaction_input_chunk {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(bytes, tag = "2")]
+        Audio(::prost::alloc::vec::Vec<u8>),
+        #[prost(message, tag = "3")]
+        Text(super::TextUpdate),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionOutputChunk {
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    #[prost(oneof = "interaction_output_chunk::Content", tags = "2, 3")]
+    pub content: ::core::option::Option<interaction_output_chunk::Content>,
+}
+/// Nested message and enum types in `InteractionOutputChunk`.
+pub mod interaction_output_chunk {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(bytes, tag = "2")]
+        Audio(::prost::alloc::vec::Vec<u8>),
+        #[prost(message, tag = "3")]
+        Text(super::TextUpdate),
+    }
+}
+/// Segment IDs are nonempty and stream-local. First appearance fixes segment order.
+/// APPEND adds text (initially empty); REPLACE replaces the segment's entire text.
+/// committed freezes this segment after this update, not its durable persistence.
+/// A committed segment accepts no future update, including another commitment.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextUpdate {
+    #[prost(string, tag = "1")]
+    pub segment_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "TextUpdateOperation", tag = "2")]
+    pub operation: i32,
+    #[prost(string, tag = "3")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub committed: bool,
+}
+/// Successful close requires every text segment to be committed.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionInputClosed {
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "InteractionStreamCloseStatus", tag = "2")]
+    pub status: i32,
+    /// Required only for FAILED; absent otherwise.
+    #[prost(message, optional, tag = "3")]
+    pub failure: ::core::option::Option<RoutineFailure>,
+}
+/// A closed stream accepts no later chunks; replacement requires a new stream ID.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionOutputClosed {
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "InteractionStreamCloseStatus", tag = "2")]
+    pub status: i32,
+    /// Required only for FAILED; absent otherwise.
+    #[prost(message, optional, tag = "3")]
+    pub failure: ::core::option::Option<RoutineFailure>,
+}
+/// Requires all input streams closed; forbids subsequent input opens or chunks.
+/// Input completion does not cancel execution or stop output.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionInputCompleted {
+}
+/// Requests cancellation of this interaction, not a reusable invocation lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionCancel {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InteractionCompleted {
+    /// Only SUCCEEDED, FAILED, or INTERRUPTED; cancellation maps to INTERRUPTED.
+    #[prost(enumeration = "RoutineInvocationStatus", tag = "1")]
+    pub status: i32,
+    /// Required for FAILED or INTERRUPTED; absent for SUCCEEDED.
+    #[prost(message, optional, tag = "2")]
+    pub failure: ::core::option::Option<RoutineFailure>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InteractionAudioEncoding {
+    Unspecified = 0,
+    /// Signed interleaved PCM, 16 bits per sample, little-endian, without a container.
+    PcmS16le = 1,
+}
+impl InteractionAudioEncoding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INTERACTION_AUDIO_ENCODING_UNSPECIFIED",
+            Self::PcmS16le => "INTERACTION_AUDIO_ENCODING_PCM_S16LE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INTERACTION_AUDIO_ENCODING_UNSPECIFIED" => Some(Self::Unspecified),
+            "INTERACTION_AUDIO_ENCODING_PCM_S16LE" => Some(Self::PcmS16le),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TextUpdateOperation {
+    Unspecified = 0,
+    Append = 1,
+    Replace = 2,
+}
+impl TextUpdateOperation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TEXT_UPDATE_OPERATION_UNSPECIFIED",
+            Self::Append => "TEXT_UPDATE_OPERATION_APPEND",
+            Self::Replace => "TEXT_UPDATE_OPERATION_REPLACE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TEXT_UPDATE_OPERATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "TEXT_UPDATE_OPERATION_APPEND" => Some(Self::Append),
+            "TEXT_UPDATE_OPERATION_REPLACE" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InteractionStreamCloseStatus {
+    Unspecified = 0,
+    Completed = 1,
+    Cancelled = 2,
+    Failed = 3,
+}
+impl InteractionStreamCloseStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INTERACTION_STREAM_CLOSE_STATUS_UNSPECIFIED",
+            Self::Completed => "INTERACTION_STREAM_CLOSE_STATUS_COMPLETED",
+            Self::Cancelled => "INTERACTION_STREAM_CLOSE_STATUS_CANCELLED",
+            Self::Failed => "INTERACTION_STREAM_CLOSE_STATUS_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INTERACTION_STREAM_CLOSE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "INTERACTION_STREAM_CLOSE_STATUS_COMPLETED" => Some(Self::Completed),
+            "INTERACTION_STREAM_CLOSE_STATUS_CANCELLED" => Some(Self::Cancelled),
+            "INTERACTION_STREAM_CLOSE_STATUS_FAILED" => Some(Self::Failed),
             _ => None,
         }
     }

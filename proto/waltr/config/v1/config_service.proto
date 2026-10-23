@@ -9,6 +9,14 @@ message Configuration {
   string etag = 2;
   map<string, McpServer> mcp_servers = 3;
   InferenceDefaults inference_defaults = 4;
+  SessionDictation session_dictation = 5;
+}
+
+message SessionDictation {
+  string routine = 1;
+  string trigger = 2;
+  string input = 3;
+  string output = 4;
 }
 
 message InferenceDefaults {
@@ -73,6 +81,8 @@ enum ProviderType {
   PROVIDER_TYPE_OPENAI_CHAT_COMPLETIONS = 2;
   PROVIDER_TYPE_OPENAI_RESPONSES = 3;
   PROVIDER_TYPE_OPENAI_RESPONSES_WEBSOCKET = 4;
+  PROVIDER_TYPE_GOOGLE_SPEECH_V2 = 5;
+  PROVIDER_TYPE_GOOGLE_TEXT_TO_SPEECH_V1 = 6;
 }
 
 message Model {
@@ -84,6 +94,34 @@ message Model {
   ModelCapabilities capabilities = 5;
   ModelCatalogMatch catalog_match = 6;
   ModelCost cost = 7;
+  SpeechRecognitionOptions recognition = 8;
+  SpeechSynthesisOptions synthesis = 9;
+  SpeechCapabilities speech_capabilities = 10;
+}
+
+// Explicit configuration only; speech models do not use models.dev defaults.
+message SpeechRecognitionOptions {
+  string recognizer = 1;
+  string model = 2;
+  repeated string language_codes = 3;
+  uint32 sample_rate_hz = 4;
+  uint32 channels = 5;
+  bool interim_results = 6;
+  bool automatic_punctuation = 7;
+}
+
+message SpeechSynthesisOptions {
+  string voice = 1;
+  string language_code = 2;
+  uint32 sample_rate_hz = 3;
+  uint32 channels = 4;
+  optional double speaking_rate = 5;
+  optional double pitch = 6;
+}
+
+message SpeechCapabilities {
+  bool unary = 1;
+  bool streaming = 2;
 }
 
 message ModelCost {
