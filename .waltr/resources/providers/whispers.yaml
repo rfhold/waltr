@@ -1,0 +1,22 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: whispers
+spec:
+  transport: googleSpeechV2
+  url: https://whispers.holdenitdown.net:443
+  models:
+    dictation:
+      name: Kyutai English Dictation
+      type: 3
+      speech_capabilities:
+        unary: true
+        streaming: true
+      recognition:
+        recognizer: projects/whispers/locations/global/recognizers/_
+        model: kyutai-stt-2.6b-en
+        language_codes: [en-US]
+        sample_rate_hz: 24000
+        channels: 1
+        interim_results: true
+        automatic_punctuation: false

@@ -6,3 +6,8 @@ spec:
   inference:
     provider: codex
     model: gpt-5.6-sol
+  sessionDictation:
+    routine: audio-transcribe
+    trigger: dictate
+    input: audio
+    output: transcript
