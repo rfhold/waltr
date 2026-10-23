@@ -17,6 +17,10 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-server/src/sandbox.rs` tests | Private gateway startup, embedded duplex and standalone UDS worker readiness, reconnect, and shutdown. |
 | `crates/waltr-agent/tests/live.rs` and `crates/waltr-agent/tests/live/` | Ignored live-provider and external-service agent tests. |
 | `crates/waltr-server/tests/` | Server contract, coordination, watch, validation, health, persistence, access-auth, and system flows. |
+| `crates/waltr-audio/tests/adapter.rs` and `tests/tls.rs` | Loopback speech method, container, cancellation, deadline, capacity, TLS rejection, and no-plaintext-fallback contracts. |
+| `crates/waltr-server/src/resource_catalog/routine/interaction_tests.rs` | Strict audio examples, explicit model resolution, PCM compatibility, and live-component validation. |
+| `crates/waltr-server/src/routine/interaction/tests.rs` and `tests/` | Internal live-component execution, text revisions, collectors, groups, cancellation, bounds, and lifecycle records. |
+| `crates/waltr-server/src/routine_interaction_service/` | Interaction admission, protocol, quota, capability preflight, transport cancellation, and loopback service contracts. |
 | `crates/waltr-server/tests/embedded.rs` | Embedded composition, local admission, explicit callback metadata, public routes, and workspace isolation. |
 | `crates/waltr-server/src/catalog/mod.rs` tests | Bounded network-first models.dev loading, disk-cache and explicit built-in precedence, stale semantics, and fallback validation. |
 | `crates/waltr-server/src/resource_catalog/state/tests.rs` | Persisted self-MCP provisioning and ordinary resource administration. |
@@ -68,6 +72,34 @@ Run the ignored PostgreSQL OAuth store contract, which requires Docker:
 Run server unit tests:
 
 `cargo test -p waltr-server --lib`
+
+Run focused audio library contracts:
+
+`cargo test -p waltr-audio`
+
+These tests use local scripted Google-compatible servers, not production speech services or credentials. They cover unary and duplex recognition/synthesis, early output, final responses after input close, and raw PCM versus WAV containers. Cancellation, deadline, producer failure, status propagation, response drop, and bounded capacity have separate assertions. TLS tests reject an untrusted localhost certificate and reject plaintext fallback from HTTPS. They do not prove deployment TLS or real upstream model support.
+
+Run strict audio example validation:
+
+`cargo test -p waltr-server --lib interaction_examples_parse_and_validate_explicit_models`
+
+Run internal interaction runtime contracts:
+
+`cargo test -p waltr-server --lib routine::interaction::tests`
+
+These contracts cover concurrent components, external completion gates, atomic queue reservations, skip detachment, text commitments, and one cleanup helper. They also check cancellation ownership, stale-output fences, and lifecycle records. They cover cancellation-aware capacity waits, configurable queue-wait expiry, persistent-saturation failure, unchanged byte/chunk limits, and no silent loss.
+
+Run focused interaction service contracts:
+
+`cargo test -p waltr-server --lib routine::interaction_service_tests`
+
+These tests cover native and unary-request transports, durable acceptance, capability preflight, cross-port progress, large complete inputs, and slow output. Quota assertions distinguish original request bytes from synthetic feeder metadata. Route composition uses the common authentication layers; service fixtures alone do not prove deployed authentication or real upstream compatibility.
+
+Run SQLite interaction migration contracts:
+
+`cargo test -p waltr-server --lib interaction_upgrade`
+
+These tests check history, constraints, indexes, journal sequences, high-water preservation, and restart reconciliation. They do not execute the PostgreSQL migration.
 
 Run server integration tests:
 
@@ -391,6 +423,127 @@ Run ignored live server session tests:
 Run ignored live client session tests:
 
 `cargo test -p waltr-client --test live -- --ignored`
+
+## Client Audio And Dictation
+
+Run deterministic shared interaction and native library contracts from the repository root:
+
+```sh
+cargo test -p waltr-client --test interaction
+cargo test -p waltr-client --lib interaction
+cargo test -p waltr-audio-io --no-default-features
+cargo test -p waltr-audio-io
+cargo test -p waltr-desktop
+cargo check -p waltr-client --target wasm32-unknown-unknown --features wasm
+```
+
+The WASM check requires the installed Rust target and the current workspace build prerequisites.
+The shared tests check duplex progress, complete Run validation, cancellation, access policy, text commitments, and clean EOF.
+A non-UI caller can exercise this shared core without Tauri, web components, or a capture source.
+Native audio tests use synthetic samples and capture seams; they require no microphone prompt.
+Converter tests cover chunk boundaries, exact flush duration, rate conversion, and anti-alias behavior.
+Desktop tests cover strict configuration, literal command templates, direct-child cleanup, hold admission, release, stale generations, and shortcut signals.
+Fake text sinks cover live hypotheses, suffix replacement through Backspace events, duplicate suppression, control rejection, byte limits, and guards immediately before effects.
+They also cover cancellation during a blocked write, capture joins, sink cleanup, and reservation retention through cleanup.
+Late provider or backend failure preserves earlier text and causes no retry.
+Legacy command tests retain the final-success-only execution contract.
+These tests perform no OS text input and prove no installed app, shortcut registration, microphone access, or native text delivery.
+
+Run the bounded core and fake-backend contracts without generated TypeScript output:
+
+```sh
+cargo test -p waltr-client --lib --offline --locked -- --skip exports_web_typescript_bindings
+cargo test -p waltr-desktop --offline --locked
+```
+
+The client export test rewrites generated web bindings; the command above excludes that unrelated output.
+
+Run native app composition and permission contracts without device prompts:
+
+```sh
+cargo test -p waltr-app --lib dictation::
+cargo test -p waltr-app --lib audio_permissions
+cargo test -p waltr-app --lib bridge::tests
+cargo test -p waltr-app --lib native_audio_telemetry::tests --offline --locked
+cargo test -p waltr-app --lib activity::tests --offline --locked
+cargo test -p waltr-app --lib tray::tests --offline --locked
+node --test crates/waltr-app/scripts/audio-permission-launch.test.mjs
+```
+
+The app tests use injected capture, transport, permission replies, and shortcut edges.
+They cover shared chat/hold admission, cancel-before-start identities, empty native preview, successful final text, stale credentials, and worker cleanup.
+Bridge tests cover generation retirement, access transitions, and logout barriers.
+The composition regression keeps generic bridge activity active across audio cancellation and proves that its lease does not reserve the microphone.
+Pure activity tests cover overlap, stale completion, cancellation, and error expiry after all cleanup.
+Tray tests cover frame timing and distinct idle, active, and error glyphs.
+Neither test group proves a visible native tray, panel animation, or installed menu behavior.
+These tests establish local contracts, not signed app permission delivery or hardware acceptance.
+The Node test requires a JDK with `javac` and `java`.
+It executes the production Java launch helper on the host JVM and checks the Kotlin source contract statically.
+It does not execute an Android Activity, permission launcher, or installed application.
+
+Default session dictation tests cover catalog references, invalid reload retention, shared config projection, and push-to-talk draft safety.
+They use catalog fixtures and fake hosts, without microphone access or provider calls.
+
+```sh
+cargo test -p waltr-server --lib resource_catalog::state::tests --offline --locked
+cargo test -p waltr-client --lib --offline --locked
+```
+
+Run browser audio, adapter, and draft-preservation contracts:
+
+```sh
+pnpm --filter @rfhold/waltr-web exec vitest run tests/audio tests/platform/dictation.test.ts tests/sessions/dictation.test.tsx tests/sessions/dictation-control.test.tsx --environment happy-dom
+pnpm --filter @rfhold/waltr-web build
+pnpm build:tauri
+```
+
+Browser tests use deterministic media, worklet, and adapter substitutes.
+They cover finite worklet credits, bounded PCM, cancellation, preference scope, separate preview, and draft-revision fences.
+Asset builds check source integration, not microphone permission, hardware quality, or installed WebView behavior.
+The Tauri asset build checks frontend integration only; Rust app tests cover native composition separately.
+The browser converter uses linear interpolation; native sinc filter tests establish no browser anti-alias guarantee.
+
+### Platform Acceptance Gates
+
+These procedures require separate authority for device prompts and live RPC traffic.
+Do not infer platform acceptance from unit tests, source harnesses, feature trees, or asset builds.
+Native composition and platform capability flags do not establish acceptance of the packaged app.
+
+- **Apple Silicon macOS:** Check signed audio-only permission denial and grant, usage text, the audio-input entitlement, and actual capture.
+- Check hold press/release, run-loop delivery, and main-thread registrar teardown in the normal app.
+- Check manual Accessibility denial/grant for external text, with no automatic trust prompt.
+- Check Unicode text in an authorized target application, focus changes between batches, held modifiers, and applications that ignore events.
+- Check normal release, blocked-write cancellation, access loss, cleanup, and no effects after guard revocation.
+- Confirm that line breaks and tabs become spaces, with no Enter, Tab, clipboard fallback, or automatic submission.
+- Confirm that late failure preserves earlier text and produces no replay.
+- Check the idle tray, active animation, brief error state, Open Waltr, Quit, and normal window-close behavior.
+- An Apple Silicon compile check proves no permission delivery, microphone capture, shortcut acceptance, tray behavior, or external text insertion.
+- Intel macOS exposes no dictation capability; these checks establish no Intel package support.
+- Check final text only after clean EOF, command execution once, busy/repeat behavior, and cancellation during startup or profile changes.
+- **Wayland:** Build on Linux with ALSA development files, pkg-config, and the actual portal dependencies.
+- Check portal denial, accepted subsets, actual effective triggers, Activated/Deactivated/Changed events, session loss, and cleanup on the target compositor.
+- Check RemoteDesktop keyboard consent denial/grant, EI text capability, ready/resumed device state, pause, session loss, and cleanup.
+- Confirm that absent EI text capability returns `Unsupported`, with no X11, keysym, clipboard, or `uinput` fallback.
+- Check repeated per-hold consent and focus changes; the portal parent window must not act as a target lock.
+- Check GTK/AppIndicator runtime libraries and a compatible panel host, such as a GNOME extension or KDE panel.
+- Check status, Open Waltr, and Quit through the tray menu; do not assume Linux icon-click support.
+- A headless check proves no visible tray or compositor text delivery.
+- An isolated portal source/API harness proves no Linux cross-build, EI negotiation, or live portal compatibility.
+- **Android:** Verify the actual NDK/C++ package, installed permission denial/grant, foreground policy, default-device capture, and 48 kHz mono I16 support.
+- Android has no desktop tray or external-text action; native chat dictation acceptance does not establish either capability.
+- Check permission-launch failure cleanup, pause during an OS dialog, stale grants, and cancellation before remote-runtime preservation.
+- Check cancellation across lifecycle changes and permission revocation; unsupported source formats must fail without application fallback.
+- Confirm that resume never restarts audio and that the app uses no microphone foreground service.
+- Feature-tree, host-JVM, and source checks do not establish native linkage, Oboe/API-24 package compatibility, or installed-device behavior.
+- **Browser:** Use a secure-context browser with a real microphone and compatible server Routine.
+- Configure `Defaults.spec.sessionDictation` with a compatible Routine and ports.
+- Check pointer and Space/Enter hold/release, immediate release during startup, permission denial/grant, capture loss, access loss, logout, navigation, and disposal.
+- Confirm that absent configuration disables capture and config changes discard pending output.
+- Check actual AudioContext-rate conversion, worklet availability, payload limits, final EOF, unchanged-draft insertion, and explicit insertion after draft edits.
+- Confirm that send and server switch suppress stale output and that dictation never submits the draft.
+
+See [client architecture](architecture/clients.md#routine-interaction-clients) for contracts and [host prerequisites](deployment.md#client-audio-host-prerequisites) for platform dependencies.
 
 ## MCP Apps
 

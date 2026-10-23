@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Waltr Routines define server-owned event and manual workflows. The Routine service separates live definitions from durable invocation history.
+Waltr Routines define server-owned event, manual, and interaction workflows. The Routine service separates live definitions from durable invocation history. The current server code implements interaction RPCs.
 
 This document defines the Routine lifecycle, persistence, replay, restart, shared-client, and user-interface contracts.
 
@@ -12,6 +12,7 @@ This document defines the Routine lifecycle, persistence, replay, restart, share
 | --- | --- |
 | Resource catalog | Strict Routine source, validation, publication, revision identity, and complete manual-definition projections. |
 | Routine engine | Event and manual admission, immutable invocation capture, task execution, helper sessions, and graceful shutdown. |
+| Internal interaction runtime | Live components, speech adapters, collectors, standalone helpers, explicit groups, resource bounds, and owned cancellation. |
 | Waltr SQL persistence | Invocation aggregates, append-only lifecycle events, pagination, replay, and restart reconciliation. |
 | `waltr-client` | Global and source-session watch interests, independent replay state, history and detail reduction, pagination, start association, and stable views. |
 | Web and TUI | Platform routes, forms, navigation, and presentation from shared client snapshots. |
@@ -31,6 +32,118 @@ Definitions include each Routine revision. An admitted invocation pins its immut
 The bundled `compact-and-continue` Routine is the implemented compaction-prefix workflow. Its manual trigger exposes boolean `continue` with default `false`; its lifecycle trigger assigns `continue: true`.
 
 Later catalog changes affect future admissions only. History and detail remain interpretable after the current definition changes or disappears.
+
+## Interaction Catalog And Runtime
+
+The catalog accepts strict `interaction` triggers, audio/text ports, speech tasks, collectors, stream routes, standalone model selection, and named work groups. The transport-independent `routine::interaction` runtime owns concurrent stream scheduling. It shares task completion policy and helper construction with the sequential event, manual, and completion-lifecycle executor.
+
+The application registers both `RoutineInteractionService` methods under common gRPC/gRPC-web authentication. Native `Interact` accepts bidirectional input; `Run` accepts one bounded request and returns a response stream. Both methods share preflight, capacity admission, pinned catalog/provider settings, durable lifecycle records, and engine-owned shutdown.
+
+This section owns the runtime and admission contract. The [audio examples](../examples/routines/audio-interactions.md) explain YAML and the wire contract. [Speech providers](config.md#speech-provider-contract) owns upstream configuration. Local implementation does not establish release, deployment, or real upstream compatibility.
+
+### Admission And Transports
+
+Shared capability preflight rejects unsupported helpers, actions, source sessions, and speech options before durable history. Helpers require explicit standalone models, one turn, and empty feature, tool, and permission lists. Speech tasks require streaming capability even though `waltr-audio` also exposes unary methods.
+
+Both methods commit durable admission before the service queues `accepted` with the invocation ID. Queue insertion does not prove that the client received acceptance. Disconnect during the transaction does not abandon its outcome. A committed invocation retains history even if cancellation prevents acknowledgment delivery.
+
+`Run` validates the original complete request against its quota before admission. Independent per-port feeders move those bodies and split them into bounded frames. Request order does not block prerequisite inputs. Synthetic segment IDs and protocol metadata do not consume the original request quota again. Native ingress uses per-port workers with one finite aggregate byte/chunk budget, including in-flight sends. This permits cross-port progress within that budget without unbounded per-port storage.
+
+Native request order limits in-band cancellation visibility. A `cancel` behind an entirely full ingress budget cannot reach the reader until capacity returns. Queue-wait, input, and invocation timeouts bound that wait. Transport drop and server shutdown cancel independently of request-reader progress.
+
+`input_completed` closes the input phase, not the output phase. Native half-close implies input completion only after all streams close; an open stream makes half-close invalid. After input completion, clients can keep the request side open for explicit `cancel`. Wire cancellation, response drop, disconnect, and shutdown cancel owned work rather than detach execution. Broken transports cannot guarantee terminal delivery.
+
+Compiler-facing catalog types live under `resource_catalog::routine`:
+
+| Type or accessor | Contract |
+| --- | --- |
+| `RoutineInteractionTrigger { inputs, input_ports, output_ports }` | Scalar exposure separate from typed, single-stream ports. |
+| `RoutineStreamFormat` | Tagged `Text` or `Audio { encoding, sample_rate_hz, channels }`; initial encoding is `PcmS16Le`. |
+| `RoutineStreamRef` | `InteractionInput(String)` or `TaskOutput(String)`, never a scalar. |
+| `RoutineModelRef { provider, model }` | Explicit literal keys checked against the complete snapshot. |
+| `RoutineTaskSpec::{transcribe,synthesize,collect}` | Mutually exclusive with existing session-template/action kinds. |
+| `RoutineTaskSpec::stream_input()` | Optional live dependency; consumer starts before producer completes. |
+| `RoutineTaskSpec::stream_output_format()` | Typed stream output or no stream. |
+| `RoutineTask::run_after` | Completion dependencies only. Both edge kinds must form one acyclic graph. |
+| `RoutineWorkGroup { name, on_busy, max_queued }` | Explicit queue/reject/interrupt policy, with task opt-in via `work_group`. |
+| `InteractionLimits::default()` and `validate()` | Server-owned limits passed explicitly to the runtime; global admission remains a service responsibility. |
+
+### Execution And Ownership
+
+A live-stream component includes task producers, their consumers, and virtual interaction-input producers. Every member waits for all external completion prerequisites before eligibility. The runtime reserves every queue-group resource atomically for the component through completion. Finite queue limits apply; completion-only successors acquire no resources before their prerequisites finish.
+
+Named `queue`, `reject`, and `interrupt` policies apply only through explicit task group selection. Interruption fences suppress stale output; they cannot retract output that a consumer already received. A task starts once per invocation. The runtime adds no automatic ASR turns, debounce, or implicit supersession. Any interrupted task leaves a terminal `task_interrupted` outcome, even if later group work succeeds.
+
+Both executors share task completion policy and helper request construction. `runAfter` requires completion, not success: succeeded and skipped prerequisites permit successors; failed or interrupted prerequisites never enable descendants. Live-component readiness and reservations remain interaction-owned. Sequential admission rejects speech and collector tasks before durable admission. Standalone model helpers in either executor use admission-pinned configuration; source-copy and inherited-inference helpers retain their sequential behavior.
+
+Helper metadata records Routine name, revision, trigger, task, and execution identity. `waltr.routine.invocation_id` associates the helper with its public durable invocation when present; `waltr.routine.execution_id` remains distinct and determines the child ID. Source session metadata is included only when there is a source or inherited-inference session.
+
+The runtime owns producer, consumer, adapter, and helper work through cancellation and join. Output-receiver drop cancels the interaction. Cleanup awaits durable helper creation even after cancellation, then interrupts the helper as required by the host durability contract. The interaction adapter rejects actions and source-backed helpers instead of claiming support. Standalone helpers require one turn and empty feature, tool, and permission lists.
+
+### Speech And Text
+
+Speech tasks use the selected endpoint and model settings from the pinned configuration. Interaction speech requires the model's streaming capability and never falls back to unary calls. Synthesis requires mono and rejects nonzero pitch. Device selection, capture, playback, and codec conversion belong to clients.
+Native chat dictation and holds wait for nonempty PCM before interaction admission; clean zero-input capture creates no invocation or speech request.
+This client safety rule does not change generic interaction empty-input semantics. See [native audio composition](clients.md#native-app-audio-composition).
+
+Transcription maps upstream revisions and final results to request-local channel/ordinal segments. The Routine text contract omits word, timing, and speaker attribution. Segment IDs do not establish stable cross-request identity or speaker identity.
+
+A collector starts with its producer and waits for successful stream close. It resolves revisions and joins committed segments in first-appearance order. Successful close requires every segment committed. One downstream cleanup helper receives the complete transcript, not one call per chunk. Synthesis consumes committed segments early, in first-appearance order, and never consumes speculative revisions.
+
+The collector enforces both task `maxBytes` and the server collector cap. Cleanup compares UTF-8 prompt bytes plus a fixed allowance against known model context metadata. This conservative bound is not a tokenizer. Without context metadata, collector and upstream limits still apply. Oversize text fails; the runtime does not truncate, summarize, or split it.
+
+### Interaction Trace Ownership
+
+The interaction RPC captures trace context before the engine accepts task ownership.
+Async instrumentation carries that context through engine work, the runtime owner, and each task.
+The fixed span chain is `routine.interact` or `routine.run` → `routine.interaction` → `routine.interaction.owner` → `routine.interaction.task` → speech RPC.
+The interaction span covers execution and owned cleanup, even after the RPC handler returns response headers.
+Task spans cover adapter execution and cancellation cleanup.
+Speech spans cover unary completion or the entire duplex operation, not just response headers.
+Dropped or aborted work defaults to `incomplete`, never `success`.
+
+The dedicated targets are exactly `waltr_server::routine::telemetry` and `waltr_audio::telemetry`.
+Native telemetry admits only spans from these targets; it does not admit broader server/audio targets or their logs.
+Embedded spans use the native host's `waltr-app-native` exporter.
+Standalone spans use the server's `waltr-server` exporter.
+Neither library installs another subscriber, exporter, or global propagator.
+
+The RPC reuses an active middleware parent when its trace matches the validated request parent.
+If that parent lacks context or belongs to another trace, the RPC uses the validated version-00 `traceparent` directly.
+Absent or malformed parents create a new local trace.
+Speech requests inject only a valid `traceparent`; they never forward `baggage` or `tracestate`.
+
+Custom span fields contain only literal task kinds, finite outcomes, and numeric gRPC status.
+They exclude identities, configuration, runtime paths, endpoints, content, arbitrary failure codes, and error messages.
+Server admission spans distinguish `accepted`, `rejected`, `failure`, and unfinished work.
+Execution outcomes distinguish `success`, `failure`, `cancelled`, `deadline`, and `incomplete`; speech validation also supports `invalid`.
+These diagnostics do not change client error classification or recover precision that another boundary discards.
+See the [trace smoke checks](../runbooks/telemetry-smoke.md#routine-interaction-trace-chain) for span names and runtime verification limits.
+
+### Bounds And Durable State
+
+| Limit | Default |
+| --- | --- |
+| Complete request | 32 MiB |
+| Chunk | 256 KiB |
+| Buffered edge | 1 MiB |
+| Queued chunks per edge | 8 |
+| Queue wait (`queueWaitSeconds`) | 30 seconds |
+| Active interactions | 16; service admission responsibility |
+| Active tasks per interaction | 8; runtime rejects larger graphs |
+| Input duration | 900 seconds |
+| Invocation duration | 1,200 seconds |
+| Collector | 1 MiB, also subject to task and context bounds |
+
+The runtime and transport queues enforce cancellation-aware bounded backpressure. Each capacity wait respects the queue-wait bound and applicable input or invocation deadlines. Persistent queue-wait expiry produces `resource_exhausted`; the runtime never silently drops media or committed text. Byte and chunk limits apply together.
+
+Hosts supply limits through `BuildAppOptions.interaction_limits` for `build_app` or `EmbeddedServerConfig.interaction_limits` for `build_embedded_server`. `BuildAppOptions::default()` supplies default limits; embedded hosts explicitly select `InteractionLimits::default()` or custom limits. Both primary builders validate limits before startup effects. The Rust field `queue_wait_seconds` serializes as `queueWaitSeconds`; this does not establish a YAML host-configuration path.
+
+A skipped consumer explicitly detaches its edge, so it cannot stall an active producer.
+
+The runtime accepts an optional lifecycle recorder and records ordinary invocation/task events through it. The wire enum assigns interaction trigger kind `3`; persistence stores `interaction`. Migration `0007_routine_interaction_trigger.sql` extends the database constraint. SQLite rebuilds the invocation table and preserves metadata, journal, indexes, and sequence high-water state. PostgreSQL migration behavior still requires live-database verification.
+
+Waltr stores no audio or text stream chunks, stream events, or chunk replay. Declared scalar results follow ordinary Routine history rules and can contain final transcript text. Cleanup helpers retain their prompts and replies through ordinary session storage. Durable lifecycle replay does not resume media execution. `OpenInteraction.request_id` remains optional correlation only, without deduplication or retry semantics. The service enforces admission, whole-interaction cancellation, and stream protocol validation.
 
 ## Manual Admission
 
@@ -110,7 +223,7 @@ Startup reconciles every unfinished invocation before the Routine engine reports
 
 Waltr does not resume interrupted Routine execution or retry an armed continuation after restart. Graceful shutdown stops admission, interrupts active helper sessions, joins owned work, and records `server_shutdown` interruptions.
 
-Waltr exposes no explicit Routine cancellation RPC. Interruption currently comes from shutdown or restart reconciliation.
+Waltr exposes no separate Routine cancellation RPC. Detached event/manual invocations receive interruption through shutdown or restart reconciliation. Interactions also support in-band `cancel` and transport-owned cancellation.
 
 The deployment contract assumes one active Routine engine for each Waltr database. Current traits permit a future external coordination implementation.
 
@@ -170,7 +283,14 @@ Session Context panels show summaries from their server-filtered source-session 
 | --- | --- |
 | [../../proto/waltr/routine/v1/routine_service.proto](../../proto/waltr/routine/v1/routine_service.proto) | Routine service, definition, lifecycle, history, and replay contract. |
 | [../../crates/waltr-server/src/routine/](../../crates/waltr-server/src/routine/) | Engine, canonical executor, lifecycle recorder, events, expressions, and host boundary. |
-| [../../crates/waltr-server/src/routine_service.rs](../../crates/waltr-server/src/routine_service.rs) | gRPC service and stream behavior. |
+| [../../crates/waltr-server/src/routine/interaction/](../../crates/waltr-server/src/routine/interaction/) | Internal live-component runtime, stream state, groups, reservations, and adapters. |
+| [../../crates/waltr-audio/](../../crates/waltr-audio/) | Google speech library, generated client reexports, and loopback contracts. |
+| [../testing.md](../testing.md) | Audio library, strict example, runtime, and SQLite migration checks. |
+| [../../crates/waltr-server/src/routine_service.rs](../../crates/waltr-server/src/routine_service.rs) | Durable Routine gRPC service and stream behavior. |
+| [../../crates/waltr-server/src/routine_interaction_service.rs](../../crates/waltr-server/src/routine_interaction_service.rs) | Shared interaction preflight, durable admission, and transport ownership. |
+| [../../crates/waltr-server/src/routine_interaction_service/](../../crates/waltr-server/src/routine_interaction_service/) | Stream protocol, per-port ingress, transport credits, and focused service tests. |
+| [../../crates/waltr-server/src/app.rs](../../crates/waltr-server/src/app.rs) | Common authenticated route composition and explicit standalone limits injection. |
+| [../../crates/waltr-server/src/embedded.rs](../../crates/waltr-server/src/embedded.rs) | Embedded composition and explicit limits injection. |
 | [../../crates/waltr-server/src/persistence/routine_invocation.rs](../../crates/waltr-server/src/persistence/routine_invocation.rs) | Aggregate, journal, replay, and restart reconciliation store. |
 | [../../crates/waltr-client/src/coordination/routine.rs](../../crates/waltr-client/src/coordination/routine.rs) | Shared watch, replay, history, detail, pagination, and start reducer. |
 | [config.md](config.md) | Routine resource schema and catalog publication. |

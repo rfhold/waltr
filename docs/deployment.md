@@ -14,7 +14,7 @@ When `WALTR_MCP_DATABASE_URL` is absent or empty, file-backed SQLite derives sib
 
 These databases are not the agent session store configured by `WALTR_SESSION_STORE`. The Waltr database is the authoritative store for both provider and upstream-MCP OAuth credentials; the environment-owned server has no credential-file setting.
 
-Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, outbound OAuth attempts/credentials, and Routine history in `waltr.sqlite3`, while MCP history, inert session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, `0004_outbound_oauth`, `0005_unified_oauth_credentials`, and `0006_routine_invocations`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. V5 is a hard cutover that discards existing MCP SQL credentials and stops reading legacy provider credential files; all targets must authorize again after upgrade. Legacy `auth.json` files are not deleted automatically and should be securely removed after rollback is no longer required. V6 adds exactly the Routine aggregate and append-only event-journal tables, with no task table or pruning. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
+Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, outbound OAuth attempts/credentials, and Routine history in `waltr.sqlite3`, while MCP history, inert session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, `0004_outbound_oauth`, `0005_unified_oauth_credentials`, `0006_routine_invocations`, and `0007_routine_interaction_trigger`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. V5 is a hard cutover that discards existing MCP SQL credentials and stops reading legacy provider credential files; all targets must authorize again after upgrade. Legacy `auth.json` files are not deleted automatically and should be securely removed after rollback is no longer required. V6 adds exactly the Routine aggregate and append-only event-journal tables, with no task table or pruning. V7 extends the stored Routine trigger kind to include interactions and preserves prior invocation history. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
 
 ## Container Runtime And Local Compose
 
@@ -450,6 +450,85 @@ Only the native client ID is required at login. The TUI discovers only the API-r
 
 Native tokens and refresh tokens are process-memory only. Restarting the TUI requires login again. The TUI refreshes before expiry when a refresh token is returned and returns to login-required state when refresh fails or no refresh token remains after expiry.
 
+## Client Audio Host Prerequisites
+
+The native app composes shared capture and shortcut libraries through its Rust bridge, separate from upstream speech providers.
+See [Clients](architecture/clients.md#routine-interaction-clients) for ownership and [desktop configuration](architecture/config.md#desktop-client-configuration) for startup YAML.
+The [example client file](examples/client.yaml) does not install its server Routine or providers.
+A compatible server must expose `RoutineInteractionService` and the exact configured PCM ports.
+
+| Platform | Prerequisites and limits |
+| --- | --- |
+| macOS | CPAL 0.16; `global-hotkey` 0.9 requires a main-thread registrar and an active host run loop. |
+| Wayland Linux | CPAL 0.15.3 requires ALSA development files and pkg-config; PipeWire requires ALSA compatibility. GlobalShortcuts requires a compatible portal and compositor. |
+| Android | CPAL 0.15.3 uses Oboe 0.6 and Android API 24. The application must verify NDK/C++ linkage and package compatibility. |
+| Hosted browser | Secure context, AudioWorklet support, microphone permission, and explicit user activation. Serve the static worklet with the browser assets. |
+
+The native converter pins rubato 0.16.2 without default features.
+Android requests explicit 48 kHz mono I16 source capture on the default device, with no Java-context discovery or application fallback.
+The host owns `RECORD_AUDIO` permission and foreground policy; library compilation proves neither permission delivery nor device capture.
+Native capture startup and teardown require host workers. OS driver calls have no portable hard deadline.
+Wayland portal approval can alter or reject requested shortcuts; the host must expose actual effective triggers.
+No X11 or media-key interception fallback exists.
+Secure Linux credential-store unavailability does not authorize plaintext credential storage.
+
+Native app dictation uses the current Rust transport and a shared chat/hold audio gate.
+Apple Silicon macOS includes audio-only AVFoundation permission support, `NSMicrophoneUsageDescription`, and the hardened-runtime `audio-input` entitlement.
+Intel macOS reports dictation unavailable; this implementation adds no Intel package promise.
+Android includes `RECORD_AUDIO` permission and a dedicated launcher; it adds no microphone foreground service.
+Android pause cancels audio even when the remote auth runtime survives. Resume never restarts audio automatically.
+Desktop startup loads the strict XDG client file, including on macOS; Android chat loads no XDG client configuration.
+Source and host tests establish no signed permission prompt, installed-device capture, Linux portal acceptance, or Android NDK/C++ package compatibility.
+Browser capture uses bounded complete uploads, not native duplex capture or mobile XDG configuration.
+Browser resampling uses linear interpolation without an anti-alias filter; native conversion uses a stateful sinc filter.
+Hardware, portal, packaged-app, and browser acceptance remain separate [test gates](testing.md#client-audio-and-dictation).
+
+### Desktop Tray And External Text
+
+The desktop tray reports only [client-owned Routine activity](architecture/clients.md#client-routine-activity-tray), not server-wide work.
+Its menu contains status, Open Waltr, and Quit; normal window-close and exit behavior do not change.
+Tray creation is optional and nonfatal.
+macOS requires main-thread tray ownership and uses template icons.
+Android supplies neither a tray nor the desktop external-text action.
+
+The pinned Tauri 2.10.1 and `tray-icon` 0.21.3 Linux path uses GTK/AppIndicator, not a native `ksni` backend.
+At runtime, it loads `libayatana-appindicator3.so.1` or `libappindicator3.so.1` and requires a compatible panel host.
+GNOME generally requires an AppIndicator extension; KDE requires a compatible panel configuration.
+A headless session or absent panel host provides no tray acceptance evidence.
+Wayland alone does not guarantee tray support.
+Use the Open Waltr menu item; Linux icon-click behavior supplies no portable window-open contract.
+
+`typing: {}` requires an authorized native backend; schema acceptance and fake-backend tests do not establish installed-platform support.
+The core returns `Unsupported` when the host supplies no backend.
+The following requirements define platform acceptance, not a compile or live-delivery claim.
+
+| Platform | External-text requirements and limits |
+| --- | --- |
+| macOS | CoreGraphics Unicode events require Accessibility trust; trust checks must not trigger an automatic permission prompt. |
+| Wayland Linux | RemoteDesktop portal keyboard consent, a ready/resumed EI device, and EI text capability are mandatory. |
+| Android | No desktop external-text action. Native chat dictation remains separate. |
+
+If macOS reports no trust, grant Waltr access manually under System Settings → Privacy & Security → Accessibility.
+CoreGraphics event posts provide best-effort delivery; applications can ignore Unicode events or interpret keycodes differently.
+The action provides no held-modifier release or exact insertion guarantee.
+Live hypotheses arrive before provider commitment; macOS replaces revised suffixes with unmodified physical Backspace key pairs.
+The host counts extended graphemes, but target applications need not delete exactly one grapheme per Backspace pair.
+A focus or cursor change can redirect deletions away from this hold's prior text.
+
+Wayland backend acceptance requires `ashpd` RemoteDesktop portal consent and `reis` EI text delivery.
+Native EI text batches permit at most 254 UTF-8 bytes.
+Wayland supports append-only live output; revisions return `Unsupported` before any deletion or replacement.
+The EI text interface exposes keysyms but no backward-text deletion API; the backend adds no keysym fallback.
+Absent EI text capability must return `Unsupported`; no X11, keysym, clipboard, or `uinput` fallback exists.
+The portal session belongs to one hold and retains no persistent consent; the portal can request consent again on later holds.
+The portal parent window identifies the consent request, not an injection target.
+Neither backend pins keyboard focus; focus changes can redirect later batches.
+No backend adds Enter, Tab, paste, shortcuts, or automatic submission.
+
+Compile checks cannot prove Accessibility delivery, portal negotiation, panel behavior, or application insertion.
+Perform live checks only with explicit authority for OS consent, input effects, capture, and any server traffic.
+See [platform acceptance gates](testing.md#platform-acceptance-gates) for the separate checks.
+
 ## Client Observability
 
 Production web bundles initialize Grafana Faro at `https://faro.holdenitdown.net/collect`. Hosted browser bundles use application name `waltr-spa`; Tauri WebView release bundles use `waltr-tauri`. Both report the version from `crates/waltr-web/package.json` and use the fixed `production` environment. Vite development, Tauri development, and test builds do not initialize Faro. Tauri development uses the explicit `tauri-dev` asset mode because a normal `vite build` is production-form even when launched by `cargo tauri dev`. A locally served release bundle still has release behavior and attempts Faro export. This WebView gate does not control native Rust telemetry.
@@ -666,7 +745,9 @@ The prerelease PipelineRun references the shared homelab Tasks from the homelab 
 
 ## Startup And Operation
 
-The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and routine engine, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
+The public `waltr_server::build_app(BuildAppOptions)` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and routine engine, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
+
+`BuildAppOptions::default()` supplies default interaction limits; hosts select custom bounds through its `interaction_limits` field. Embedded hosts set the same `InteractionLimits` type through `EmbeddedServerConfig.interaction_limits`. Both primary builders reject invalid limits before initialization or runtime effects.
 
 Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS` once as a boolean.
 
