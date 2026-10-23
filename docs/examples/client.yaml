@@ -1,0 +1,17 @@
+# Native desktop startup configuration; requires an authorized external-text backend.
+# Requires the server Routine in routines/audio-transcribe-cleanup.yaml.
+version: 1
+keybinds:
+  - id: dictate-type
+    key: Ctrl+Alt+Space
+    mode: hold
+    routine:
+      name: audio-transcribe-cleanup
+      trigger: dictate
+      input: audio
+      output: clean-text
+    audio:
+      device: default
+      sampleRateHz: 24000
+      channels: 1
+    typing: {}

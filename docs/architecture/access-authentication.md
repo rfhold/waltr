@@ -257,7 +257,7 @@ OIDC migration V2 adds backend-equivalent login-attempt and browser-session tabl
 
 OIDC back-channel requests do not follow redirects. Deployments behind a reverse proxy may configure `WALTR_TRUSTED_PROXIES` with exact CIDRs; only peers in that allowlist may supply forwarded client addresses, and the proxy must overwrite untrusted forwarding headers.
 
-Environment-owned `build_app()` is intentionally async and fallible because database migrations, OIDC discovery, and initial key loading precede listener binding. Explicit app builders are synchronous composition APIs and require initialized `Persistence`; builders that enable access authentication also require an initialized `AccessAuthenticator`.
+Environment-owned `build_app(BuildAppOptions)` is intentionally async and fallible because database migrations, OIDC discovery, and initial key loading precede listener binding. Explicit app builders are synchronous composition APIs and require initialized `Persistence`; builders that enable access authentication also require an initialized `AccessAuthenticator`.
 
 Standalone startup snapshots only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It separately snapshots the private-test switch as a boolean.
 

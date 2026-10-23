@@ -1,0 +1,34 @@
+# Implemented catalog, runtime, and RPC support; requires compatible configured providers.
+# Requires an explicit Provider `speech` with streaming STT model `dictation`.
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: audio-transcribe
+spec:
+  description: Transcribe client audio into live text revisions and committed transcript segments.
+  triggers:
+    - name: dictate
+      interaction:
+        inputPorts:
+          - name: audio
+            required: true
+            format:
+              type: audio
+              encoding: pcmS16le
+              sampleRateHz: 24000
+              channels: 1
+        outputPorts:
+          - name: transcript
+            format:
+              type: text
+  tasks:
+    - name: transcribe
+      taskSpec:
+        transcribe:
+          model:
+            provider: speech
+            model: dictation
+          input: $(interaction.inputs.audio)
+  outputs:
+    - port: transcript
+      streamFrom: $(tasks.transcribe.output)

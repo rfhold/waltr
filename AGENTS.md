@@ -4,9 +4,12 @@
 | --- | --- |
 | [crates/waltr-server/](crates/waltr-server/) | Server coordination layer. |
 | [crates/waltr-agent/](crates/waltr-agent/) | Isolated agent library. |
+| [crates/waltr-audio/](crates/waltr-audio/) | Bounded Google speech adapters; no auth, devices, or codec conversion. |
+| [crates/waltr-audio-io/](crates/waltr-audio-io/) | Native capture and PCM conversion, independent of UI and network transports. |
+| [crates/waltr-desktop/](crates/waltr-desktop/) | Desktop configuration, hold lifecycle, shortcuts, commands, and live external-text actions. |
 | [crates/waltr-agent-sandbox/](crates/waltr-agent-sandbox/) | Workspace worker, private RPC, and standalone worker runtime; isolation depends on deployment. |
 | [crates/mcp/](crates/mcp/) | Generic Model Context Protocol primitives, client, server, transports, and spec tests. |
-| [crates/waltr-app/](crates/waltr-app/) | Tauri desktop and Android shell, native runtime bridge, security policy, and packaging. |
+| [crates/waltr-app/](crates/waltr-app/) | Tauri shell, native client hooks and activity, audio hold/chat consumers, security policy, and packaging. |
 | [crates/waltr-client/](crates/waltr-client/) | Shared client state machine. |
 | [crates/waltr-tui/](crates/waltr-tui/) | Terminal UI client. |
 | [crates/waltr-web/](crates/waltr-web/) | Web UI client. |

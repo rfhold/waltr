@@ -115,7 +115,7 @@ The MCP database and every wrapping-key version still referenced by an encrypted
 
 Any failure before router construction prevents the server from binding or reporting readiness. Errors identify the failing subsystem without including credentials or database URLs.
 
-The environment-owned `build_app()` is therefore async and fallible. Explicit builders are synchronous composition APIs: they require initialized `Persistence`, and authenticated variants require an initialized `AccessAuthenticator`. All builders return a server-owned application lifecycle whose hosted-OAuth maintenance is cancelled and joined with server shutdown, independent of any external `Persistence` clones. There is no MCP protocol-session store or cleanup loop.
+The environment-owned `build_app(BuildAppOptions)` is therefore async and fallible. Explicit builders are synchronous composition APIs: they require initialized `Persistence`, and authenticated variants require an initialized `AccessAuthenticator`. All builders return a server-owned application lifecycle whose hosted-OAuth maintenance is cancelled and joined with server shutdown, independent of any external `Persistence` clones. There is no MCP protocol-session store or cleanup loop.
 
 ## Boundaries
 

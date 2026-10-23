@@ -1,6 +1,6 @@
 # Routine Examples
 
-These Tekton-inspired files are Waltr Routine resources, not Tekton resources. The server executes [`title.yaml`](title.yaml), [`compact-and-continue.yaml`](compact-and-continue.yaml), and [`fork.yaml`](fork.yaml). Every other fixture and all unsupported syntax remain proposals.
+These Tekton-inspired files are Waltr Routine resources, not Tekton resources. The server executes [`title.yaml`](title.yaml), [`compact-and-continue.yaml`](compact-and-continue.yaml), and [`fork.yaml`](fork.yaml). Audio fixtures have implemented catalog, runtime, and RPC support. Other fixtures and unsupported syntax remain proposals.
 
 | Fixture | Status | Purpose |
 | --- | --- | --- |
@@ -12,6 +12,9 @@ These Tekton-inspired files are Waltr Routine resources, not Tekton resources. T
 | `manage-category-context.yaml` | Proposed | Re-evaluate and optionally replace one category mask. |
 | `permission-evaluation.yaml` | Proposed | Review replied permission prompts on a daily schedule. |
 | `configuration.yaml` | Proposed | Run a named configuration agent from a session tool. |
+| [`audio-transcribe.yaml`](audio-transcribe.yaml) | Implemented; requires compatible providers | Transcribe client audio with live revisions and committed transcript segments. |
+| [`audio-transcribe-cleanup.yaml`](audio-transcribe-cleanup.yaml) | Implemented; requires compatible providers | Collect all committed transcript text, then stream one cleanup agent's text. |
+| [`audio-synthesize.yaml`](audio-synthesize.yaml) | Implemented; requires compatible providers | Synthesize committed text into PCM audio. |
 
 ## Implemented Title Routine
 
@@ -68,6 +71,21 @@ The delivery limits above apply to the title event path. Manual invocation uses 
 - Definitions preserve declared input and result order. Admission pins the Routine revision and ordered task descriptors.
 - A request ID correlates traffic only. It provides no idempotency, retry, or duplicate suppression.
 - See [Routines](../../architecture/routines.md) for restart, replay, persistence, client, and UI contracts.
+
+## Implemented Audio Interactions
+
+See [Routine Audio Interactions](audio-interactions.md) for catalog syntax and the wire contract.
+See [Routines](../../architecture/routines.md#interaction-catalog-and-runtime) for runtime semantics, shared admission, and bounds.
+`RoutineInteractionService` implements native bidirectional `Interact` and bounded-upload, server-streamed `Run` for gRPC-web.
+The detached `StartManualRoutine` contract stays unchanged.
+The [desktop client example](../client.yaml) selects the cleanup fixture's exact identifiers and PCM format.
+See [desktop configuration](../../architecture/config.md#desktop-client-configuration) for the separate local schema and trust boundary.
+
+All three audio fixtures pass the strict Routine parser. Complete catalog publication also requires their explicit provider/model references: `speech/dictation`, `inference/cleanup`, and `voice/reader`, as applicable. Speech settings must match the declared PCM format; the catalog does not probe an upstream endpoint.
+The cleanup fixture explicitly collects **all final committed transcript text** before **one inference-only agent invocation**.
+It does not concatenate hypotheses or invoke an agent per chunk.
+Its prompt preserves language and tone, removes clear STT noise, and returns only clean text.
+Local code support establishes no release, deployment, or real upstream-model compatibility.
 
 ## Proposed Resource And Task Model
 

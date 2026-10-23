@@ -1,0 +1,39 @@
+# Implemented catalog, runtime, and RPC support; requires compatible configured providers.
+# Requires an explicit Provider `voice` with streaming TTS model `reader`.
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: audio-synthesize
+spec:
+  description: Synthesize committed client text into PCM audio.
+  triggers:
+    - name: speak
+      interaction:
+        inputPorts:
+          - name: text
+            required: true
+            format:
+              type: text
+        outputPorts:
+          - name: audio
+            format:
+              type: audio
+              encoding: pcmS16le
+              sampleRateHz: 24000
+              channels: 1
+  tasks:
+    - name: synthesize
+      taskSpec:
+        synthesize:
+          model:
+            provider: voice
+            model: reader
+          input: $(interaction.inputs.text)
+          format:
+            type: audio
+            encoding: pcmS16le
+            sampleRateHz: 24000
+            channels: 1
+  outputs:
+    - port: audio
+      streamFrom: $(tasks.synthesize.output)

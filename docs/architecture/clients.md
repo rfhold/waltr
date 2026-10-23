@@ -8,6 +8,8 @@ Waltr client architecture keeps server data coordination in `crates/waltr-client
 | --- | --- |
 | `crates/waltr-server/` | Shared server state, RPC services, persistence, watches, validation, and concurrency checks. |
 | `crates/waltr-client/` | Shell-neutral reducer state, server-facing commands, effect intents, transport adapters, stable view models, runtime orchestration, and optional native access for remote hosts. |
+| `crates/waltr-audio-io/` | Native device capture and PCM conversion, independent of UI and network transports. |
+| `crates/waltr-desktop/` | Desktop startup configuration, hold lifecycle, global shortcuts, and trusted local commands. |
 | `crates/waltr-web/` | Shared Solid routes, forms, transitions, and DOM state; build-time platform selection between hosted browser WASM and Tauri IPC adapters. |
 | `crates/waltr-tui/` | Terminal routes, input handling, rendering, snapshots, environment configuration, and terminal effects around shared native access. |
 | `crates/waltr-app/` | Server profiles, lazy embedded server, native access and secure credentials, Rust client runtime, ordered IPC, navigation policy, and platform packaging. |
@@ -95,6 +97,258 @@ Session detail timeline commands explicitly request the Effective projection. Th
 
 Hosted MCP resources `waltr://sessions` and `waltr://sessions/{id}`, plus tool `query` action `session.wait`, expose the same complete metadata map.
 This feature requires no generic MCP behavior; `crates/mcp` remains unchanged.
+
+## Routine Interaction Clients
+
+[`RoutineInteractionTransport`](../../crates/waltr-client/src/transport/interaction.rs) reuses the current native credential or browser cookie policy.
+`interact` exposes native duplex input and output; `run_interaction` accepts a complete upload on native and WASM transports.
+These caller-owned operations bypass the reducer command lane; media never enters snapshots.
+The shared core requires no Tauri, web UI, or capture implementation.
+
+Hosts must preserve these lifecycle rules:
+
+- Poll duplex output concurrently with input production.
+- Observe `Accepted` before any input event.
+- Close every input stream before `finish_input`.
+- Retain the input handle after `finish_input` until output completes.
+- Retain `InteractionControl` for cancellation on access loss, logout, or host disposal.
+- After Run cancellation, poll or drop output to disconnect the response RPC.
+- Never automatically retry or replay an interaction.
+
+Drop of either duplex half cancels the operation, even after input completion.
+`final_text(port)` requires `SUCCEEDED`, clean response EOF, and exactly one successfully closed text stream on that port.
+Every segment must carry a commitment before successful stream close. Preview text supplies no completion guarantee.
+`source_session_id` must remain `None`: the server rejects every `Some` value, even an empty string.
+Chat session identity serves only as a local draft fence, not interaction source context.
+
+Default core limits cover eight queued messages, one MiB of encoded queue data, and 256 KiB per chunk.
+Complete Run requests have a 32 MiB encoded-body limit.
+Text state permits one MiB, 4,096 segments, and 64 lifetime stream IDs per direction.
+Hosts can select tighter limits; desktop text state uses 256 KiB and each output action accepts at most 128 KiB.
+`committed_prefix(port)` exposes only contiguous frozen segments in first-appearance order, up to the first draft segment.
+The accessor rejects ambiguous selected-port streams; it supplies no terminal-success guarantee.
+`live_text(port)` applies the same selected-stream validation and exposes the current hypothesis, including drafts.
+Native chat preview remains separate and can contain revisable hypotheses.
+
+### Native Audio Library
+
+[`waltr-audio-io`](../../crates/waltr-audio-io/src/lib.rs) owns native CPAL capture and PCM conversion, independent of UI, Tauri, and network transports.
+The separate `waltr-audio` crate owns upstream Google speech adapters, not devices or conversion.
+The native default output uses headerless 24 kHz mono S16LE PCM.
+The rubato converter uses stateful sinc resampling, an anti-alias filter, delay removal, and an exact final flush.
+The conversion-only build requires no CPAL dependency.
+
+Desktop device selection accepts the default device or one exact, unique display name; duplicate names fail.
+The library exposes no stable device-ID selector.
+Android permits only the default device and explicit 48 kHz mono I16 source capture, then converts to the target rate.
+Android uses no device discovery, default-configuration query, name lookup, JNI context, or Activity reference.
+Unsupported hardware returns an ordinary backend error; the application adds no rate or device fallback.
+Android `input_devices` returns `UnsupportedDeviceSelection`.
+
+Hosts own microphone permission and foreground policy. The library adds no automatic device recovery.
+Run capture start, shutdown, and owner Drop on a host worker, never the UI or audio callback thread.
+Shutdown joins native work; OS driver calls have no portable hard deadline.
+Default native bounds permit five minutes, one MiB of queued output, 64 output items, and eight raw queue items.
+The capture owner parks when idle instead of an idle polling interval.
+Callbacks, output consumption, stop, cancellation, and backend errors wake the owner through retained notifications.
+Native capture initializes conversion before stream construction, because some CPAL backends can invoke callbacks during construction.
+Callbacks copy into preallocated blocks without a wait for the owner; accepted blocks remain drainable after callback quiescence.
+
+### Desktop Host And Shortcuts
+
+[`waltr-desktop`](../../crates/waltr-desktop/src/lib.rs) supplies startup configuration, hold lifecycle, native shortcut backends, and local output actions.
+The native app composes these libraries through its Rust runtime bridge.
+The libraries remain Tauri-independent; no standalone headless executable, button host, or wake-word host exists.
+See [desktop configuration](config.md#desktop-client-configuration) for the schema and command trust boundary.
+
+A press reserves the single audio gate without a queue, then starts capture.
+The first nonempty audio frame admits `Interact`; release without input starts no RPC.
+Repeated presses for the current hold do nothing; other presses return busy.
+Release requests a normal capture flush and input completion, not cancellation.
+Command mode waits for clean EOF, successful final-text validation, capture cleanup, and current guards before one command execution.
+Typing mode delivers each current hypothesis while duplex input continues, even before provider commitment.
+Repeated hypotheses and identical final text add no duplicate output.
+Revisions replace only the changed suffix of this hold's sanitized output through Backspace events.
+Both modes require clean EOF, `SUCCEEDED`, and exact selected-stream validation for terminal success.
+The desktop pre-admission contract limits conservative aggregate library/host retained-audio capacity to one target-rate second.
+Actual-format preflight selects the largest reserve of one through eight queued raw blocks that fits that capacity, plus one callback/converter owner block.
+This selection precedes callback pool allocation and stream construction.
+The budget includes all pool capacities, converter history and transient output, native output slots and pending send, and six host frame credits.
+For 24 kHz output and 48 kHz mono input, this selects four queued 4096-sample blocks plus the owner block.
+Smaller callback slices still consume a whole lease.
+Preflight rejects an otherwise supported format with `PreacceptBudgetExceeded` if even the minimum reserve exceeds the limit.
+This reserve tolerates only a finite callback burst or owner delay, not arbitrary scheduler stalls or sustained downstream backpressure.
+The bound excludes the borrowed OS callback slice and opaque driver/device buffers that CPAL cannot expose or constrain.
+Overflow fails the operation rather than silently discarding audio.
+Profile, access, generation, and credential revision changes cancel the operation and suppress stale effects.
+The host closes the RPC and awaits capture joins plus output-action cleanup before reservation release.
+Normal release preserves the final audio flush and continued live output.
+Cancellation never rolls back text that already reached another application.
+
+#### Live External Text
+
+[`typing`](../../crates/waltr-desktop/src/typing.rs) defines a local-capable asynchronous factory/session boundary, independent of any OS backend.
+The host awaits bounded writes directly, with no unbounded delivery queue.
+Each write contains at most 1 KiB of UTF-8.
+One hold permits 128 KiB of cumulative work: inserted UTF-8 bytes plus deleted graphemes.
+Each actual backend batch rechecks cancellation, generation, access, and credential revision immediately before its effect.
+The backend owns startup and cleanup; the host awaits cleanup even after a blocked write or failed startup.
+No backend means `Unsupported`, never a command fallback.
+Errors use fixed categories; diagnostics expose no output text or raw backend messages.
+
+Text targets the current keyboard focus for each batch, not the application that had focus at key press.
+Focus changes can redirect later batches into another application.
+No target lock or application-level insertion acknowledgement exists.
+The action adds no Enter, Tab, shortcut, paste, clipboard, or automatic message submission.
+The action offers no draft controls, retry, replay, or final-text duplication.
+Revisions use the longest common prefix at an extended grapheme boundary and count deleted graphemes.
+Every replacement passes complete sanitization, capability checks, and cumulative work bounds before any deletion.
+A partial deletion or write failure stops the hold; the host never retries unknown target state.
+
+The sanitizer maps CR, LF, tab, U+2028, and U+2029 to spaces.
+CRLF produces one space, even across hypothesis updates.
+All other control characters, including DEL and C0/C1 controls, reject the entire hypothesis before any replacement effect.
+A later provider, stream, or backend failure leaves prior effects in place, including any partial revision deletion.
+macOS sends unmodified physical Backspace pairs for revisions; target applications need not match Unicode grapheme deletion behavior.
+Wayland supports append-only UTF-8 output and rejects revisions with `Unsupported` before any deletion or replacement.
+The EI text interface exposes keysyms but no backward-text deletion API; this backend deliberately adds no keysym fallback.
+Native chat preview and its draft-edit fences do not change.
+
+macOS uses `global-hotkey` with main-thread construction and destruction, one process-wide dispatcher, and a bounded event queue.
+The host must supply a macOS run loop. No media-key or interception fallback exists.
+Wayland uses the GlobalShortcuts portal through `ashpd`.
+The backend retains the accepted subset and actual effective triggers; `preferred_trigger` remains a hint.
+Activated, Deactivated, Changed, session loss, and backend errors affect the current shortcut generation.
+No X11 fallback exists. Backend capability errors remain runtime results, not compile-time support guarantees.
+
+### Native App Audio Composition
+
+The bridge composes native client hooks: shortcut signals, text-free activity, runtime fences, and owned cleanup.
+These boundaries do not define a device-context API or support arbitrary native input.
+The current shortcut adapter implements audio holds; chat dictation remains a separate audio consumer.
+
+[`native_audio::Host`](../../crates/waltr-app/src/native_audio/mod.rs) owns microphone admission and audio runtime fences.
+Its `Held` adapter composes desktop audio holds, permission, and output actions.
+[`dictation::Host`](../../crates/waltr-app/src/dictation.rs) owns chat operation identities, status, preview, jobs, and IPC.
+Both consumers share one nonqueued `AudioAdmission` gate; this gate excludes only concurrent microphone operations.
+The desktop `interaction` driver below `Hold` owns capture startup, first-nonempty-frame admission, Accepted-gated audio input, concurrent output through EOF, cancellation, and capture joins for both consumers.
+Its typed output consumer seam separates chat preview/status from live external typing; chat does not construct a shortcut binding or command.
+Successful remote EOF before input completion fails the operation and joins cancelled capture without waiting for key-up; it cannot authorize a terminal command or chat final text.
+`Actor::new` accepts command-only configurations. `Actor::with_effects` also installs an explicit typing factory and synchronous effect fence, rejecting typing configurations without that capability before device access.
+The app retains its process-owned shortcut registrar and ingress/permission adapter across runtime generations rather than replacing it with the caller-driven actor.
+The reservation covers permission, capture startup, RPC work, and cleanup.
+The bridge clones the same credential-aware `NativeGrpcTransport` before it moves the transport into `ClientRuntime`.
+Native audio uses full-duplex `Interact`, not a second endpoint, credential source, or WebView media channel.
+`source_session_id` remains `None`; the frontend session ID serves only as a local draft fence.
+
+`start_runtime` advertises `dictation: true` on Apple Silicon macOS, Linux, and Android.
+This flag describes the implemented consumer, not live platform acceptance.
+Intel macOS advertises no dictation capability; its permission adapter returns `Unavailable`.
+No Intel or universal-package support promise follows from shared library support.
+
+The IPC accepts positive JavaScript-safe generation and operation IDs.
+A bounded monotonic high-water mark rejects stale starts; cancel-before-start creates a tombstone.
+Late identities cannot affect a replacement operation or generation.
+Status replies contain only identity, phase, `preview`, and optional `finalText`.
+They contain no PCM, endpoint, bearer, or backend error detail; command rejection uses fixed messages.
+Native `preview` contains the latest bounded selected-port text hypothesis from the validated duplex output state.
+Ambiguous selected-port streams clear the preview; cancellation, failure, and terminal success also clear it.
+Preview publication rechecks generation, operation, access, cancellation, and credential revision.
+Final text requires successful committed selected-port output, clean EOF, capture cleanup, and current identity/access guards.
+The shared frontend preserves the [draft fences](#browser-chat-dictation) and never submits a chat message automatically.
+
+[`AudioPermissions`](../../crates/waltr-app/src/audio_permissions.rs) owns audio-only authorization with generation, foreground epoch, and exact request tickets.
+Cancellation resolves the waiter but cannot dismiss OS permission UI.
+The dialog slot stays busy until its callback; a stale grant never starts capture.
+Resume restores eligibility only; it never restarts an old operation.
+Apple Silicon macOS uses a dedicated AVFoundation audio-only adapter.
+Android uses a dedicated `RECORD_AUDIO` launcher with exact-ticket failure cleanup, not a microphone foreground service.
+Linux reports permission granted without an application-level OS prompt; device and portal failures remain ordinary failures.
+
+[`shortcuts::Owner`](../../crates/waltr-app/src/shortcuts.rs) owns desktop registration for the process, independent of runtime credential leases.
+macOS creates and drops its registrar on the main run loop.
+Wayland owns its portal session on a worker and closes that session on shutdown.
+The shortcut router stamps physical edges with an `IngressEpoch` before queue admission.
+Replacement, access loss, and renewed access establish ordered epoch barriers; old presses cannot target a new runtime.
+A key-up retains its original press epoch and cannot finish a newer operation.
+Release during permission or startup requests normal completion, not cancellation.
+Native chat dictation and holds defer interaction admission until the first nonempty PCM frame.
+Normal stop drains accepted audio and converter tail before input completion, even after release during permission or startup.
+Clean capture with no nonempty frames produces the local `no_input` diagnostic outcome after worker cleanup.
+It opens no interaction or upstream speech request and performs no external text or command action.
+Chat preserves its terminal `succeeded` phase with no `finalText`; holds return success without an action.
+Capture failure remains a failure, even with zero frames. Cancellation and identity guards still apply.
+The preaccept aggregate memory bound and queue capacities remain unchanged.
+
+Holds recheck generation, access, cancellation, and credential revision at capture, RPC, and output-action boundaries.
+The credential monitor provides cleanup, not effect authority.
+Final-text validation precedes the single configured command; live external text can precede terminal completion.
+The host adds no replay or rollback of irreversible effects.
+The runtime owns audio jobs in a local `JoinSet` and drains them before exit or explicit logout credential deletion and reply.
+Desktop exit, WebView destruction, and reload callbacks request nonblocking retirement; they never join capture workers on the UI thread.
+Async disposal and replacement await retirement barriers.
+Android pause cancels active audio before the remote-runtime preservation branch; a remote auth runtime can survive, but audio never resumes automatically.
+
+### Client Routine Activity Tray
+
+[`RuntimeBridge`](../../crates/waltr-app/src/bridge.rs) owns the generic activity tracker independently of its audio host.
+It injects a clone into the audio composition; other client hooks need no audio host to access activity.
+[`ActivityTracker`](../../crates/waltr-app/src/activity.rs) accounts for process-local client operations through owned, text-free leases.
+Native chat dictation and desktop holds retain a lease across permission, RPC, output actions, and cleanup.
+Future client hooks must use the same lease API across their complete lifecycle.
+The tracker does not represent all server Routines or global server activity.
+Busy or duplicate requests create no activity lease.
+Overlapping leases retain active status until the last operation completes; stale completion cannot clear another operation.
+Failures wait for all active cleanup, then produce a two-second error state.
+Ordinary cancellation produces no error state.
+
+The optional desktop [tray owner](../../crates/waltr-app/src/tray.rs) renders a quiet idle icon, a four-frame active animation, and a distinct error icon.
+The active animation requests four updates per second; a static active frame remains distinct if the panel throttles updates.
+The menu contains only status, **Open Waltr**, and **Quit**.
+Open Waltr shows, restores, and focuses the current window; Quit uses normal app exit.
+The tray adds no history, settings, transcript, close-to-hide behavior, or residency guarantee.
+It requires no WebView state, and tray failure does not prevent app startup.
+Android has no tray.
+Platform panel requirements belong in [Deployment](../deployment.md#desktop-tray-and-external-text).
+
+### Browser Chat Dictation
+
+The hosted browser uses [`audio/`](../../crates/waltr-web/src/audio/) with a static AudioWorklet, not MediaRecorder.
+Capture requires a secure context, a user gesture, and browser microphone permission.
+The browser converts the actual AudioContext rate to 24 kHz mono PCM through linear interpolation, without an anti-alias filter.
+Default bounds permit five minutes and 16 MiB of PCM.
+The hard PCM ceiling reserves 64 KiB below 32 MiB; shared-client validation separately checks the actual encoded Run body.
+Eight worklet credits bound 128 KiB of sample messages, plus 16 KiB of local staging.
+
+The browser sends PCM as a `Uint8Array` directly into the current WASM client, not JSON or the snapshot command lane.
+Stop completes capture before the bounded Run upload. This path provides no live microphone upload.
+Cancellation aborts pending admission, response output, and capture on access loss, logout, or disposal.
+
+[`DictationControl`](../../crates/waltr-web/src/components/DictationControl.tsx) exposes one hold-to-talk microphone button without inline Routine fields.
+Pointer press or Space/Enter press starts capture within the user gesture; release finishes capture, even during startup.
+Pointer cancellation, lost capture, blur, access loss, navigation, and server switch cancel the operation.
+The component rejects repeated keys and synthetic clicks; transcript processing prevents another start.
+The composer blocks Send until dictation reaches a terminal state.
+Native hypotheses replace the captured draft selection directly, including revisions to empty text; updates continue after release until final completion.
+The hosted browser retains its final-only Run path.
+Only hosts with `DictationHost.livePreview === true` apply hypotheses to the composer; native hosts opt in, and absent capability defaults off.
+A local draft transaction distinguishes its own text and caret updates from user edits without microphone focus changes.
+Each new dictation advances the draft revision once before transaction capture, so older submit or edit-message completions cannot overwrite it.
+Typing, IME composition, caret movement, and other draft edits permanently detach automatic updates for that operation.
+After detachment, successful text remains available through explicit **Insert dictation** at the current selection or **Discard dictation**.
+Detached draft text stays intact; explicit Insert replaces only the current selection, so users can select provisional text before insertion.
+Cancellation or failure restores the original draft and captured selection only while exact text, caret, and user-revision ownership remain valid.
+Session and scope changes retire owned provisional text before draft invalidation; late output never writes into a new context.
+Final text replaces owned provisional text without duplication and never submits a chat message automatically.
+Configuration changes cancel the operation and discard retained text.
+
+The shared frontend consumes `ConfigView.sessionDictation` through the shared client snapshot in browsers, desktop, and Android.
+Absent configuration disables the microphone button. Configuration load never requests microphone access.
+The composer ignores browser-local Routine preferences and supplies no hardcoded Routine fallback.
+The explicit `DictationHost.start` selection API and desktop keybind configuration remain independent.
+The native app uses the same frontend draft rules through its separate [Rust audio consumer](#native-app-audio-composition).
+
+See [client audio tests](../testing.md#client-audio-and-dictation) for deterministic contracts and separate platform acceptance gates.
 
 ## Reducer State Machine
 
@@ -223,7 +477,9 @@ The adapter listens before runtime start and preserves generation/sequence check
 | `list_servers` | None. |
 | `save_server` | `{ url, name }`. |
 | `remove_server` | `{ serverId }`. |
-| `start_runtime` | `{ serverId }`. |
+| `start_runtime` | `{ serverId }`; returns the generation and platform-gated `dictation` capability. |
+| `dictation_start` | `{ generation, operationId, selection: { routine, trigger, input, output }, sessionId }`; session identity stays local. |
+| `dictation_finish`, `dictation_status`, `dictation_cancel` | `{ generation, operationId }`; no media crosses IPC. |
 | `client_state` | `{ afterSequence }`; the adapter validates the returned generation. |
 | `client_dispatch` | `{ command, generation }`. |
 | `start_access_login`, `logout_access` | `{ generation }`; only explicit remote selections expose these access operations. |
@@ -236,6 +492,18 @@ Native login ignores the browser login URL argument and invokes Rust with only t
 Frontend contract tests cover [picker/remount behavior](../../crates/waltr-web/tests/platform/server-picker.test.tsx) and [adapter IPC/generation checks](../../crates/waltr-web/tests/platform/tauri.test.ts). These tests do not establish native Rust or Android lifecycle behavior.
 
 ## Client Observability Boundary
+
+Native shortcut holds and chat microphones share content-free app diagnostics through [`native_audio_telemetry`](../../crates/waltr-app/src/native_audio_telemetry.rs).
+The literal target remains `waltr_app_lib::dictation_telemetry` for telemetry continuity; native audio span and event schemas remain unchanged.
+Each admitted operation owns a `native.audio.operation` async span through permission, RPC, external actions, and complete cleanup.
+The span parents the native transport spans; app events record bounded admission outcomes, permission results, milestones, and one terminal summary.
+Synchronous event scopes restore the saved dispatcher and operation context, so worker milestones and post-await terminal logs export the operation's exact trace and span IDs.
+The literal interaction RPC catalog names `routine_interaction.Interact` and `routine_interaction.Run`; unknown paths remain private.
+Validated remote failure, interruption, and rejection remain distinct from invalid selected output; opaque stream errors retain their observed RPC boundary without parsing messages.
+Primary and cleanup categories remain separate, including when the same capture worker error supplies both. Cleanup-only failures do not become primary failures.
+Process-local numeric diagnostic identifiers never copy IPC or configuration identifiers.
+The desktop observer defaults to no-op and does not expand either exporter target allowlist.
+See [native audio diagnostics](../runbooks/telemetry-smoke.md#native-audio-diagnostics) for exact fields, milestone semantics, privacy limits, and artifact requirements.
 
 Client observability has separate WebView and native Rust paths:
 
