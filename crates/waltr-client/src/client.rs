@@ -2325,6 +2325,7 @@ mod tests {
             providers: providers([provider("anthropic")]),
             mcp_servers: mcp_servers([mcp_server("filesystem")]),
             inference_defaults: None,
+            session_dictation: None,
         });
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(

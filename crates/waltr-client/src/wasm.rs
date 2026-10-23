@@ -14,6 +14,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::{ClientCommand, ClientCommandRequest, ClientRuntime, ClientStateStreamEvent};
 
+mod interaction;
+
 #[wasm_bindgen(
     inline_js = "export function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }"
 )]
@@ -27,6 +29,8 @@ unsafe extern "C" {
 #[wasm_bindgen]
 pub struct WaltrClient {
     endpoint: String,
+    interaction_transport: crate::coordination::runtime::InteractionRuntimeTransport,
+    interactions: Rc<RefCell<interaction::Host>>,
     commands: mpsc::UnboundedSender<ClientCommandRequest>,
     latest_snapshot: Rc<RefCell<String>>,
     snapshots: Rc<Mutex<mpsc::UnboundedReceiver<String>>>,
@@ -52,8 +56,9 @@ impl WaltrClient {
     #[must_use]
     pub fn new(endpoint: Option<String>) -> Self {
         let endpoint = normalize_endpoint(endpoint);
-        let runtime =
-            ClientRuntime::for_endpoint(endpoint.clone()).into_state_stream(browser_sleep);
+        let runtime = ClientRuntime::for_endpoint(endpoint.clone());
+        let interaction_transport = runtime.interaction_transport();
+        let runtime = runtime.into_state_stream(browser_sleep);
         let latest_snapshot = Rc::new(RefCell::new(
             serde_json::to_string(&runtime.snapshot()).unwrap_or_else(|error| error.to_string()),
         ));
@@ -61,8 +66,10 @@ impl WaltrClient {
         let (snapshots, snapshot_receiver) = mpsc::unbounded();
         let (stop, stop_receiver) = oneshot::channel();
 
+        let interactions = Rc::new(RefCell::new(interaction::Host::default()));
         spawn_client_loop(
             runtime,
+            Rc::clone(&interactions),
             command_receiver,
             snapshots,
             Rc::clone(&latest_snapshot),
@@ -71,6 +78,8 @@ impl WaltrClient {
 
         Self {
             endpoint,
+            interaction_transport,
+            interactions,
             commands,
             latest_snapshot,
             snapshots: Rc::new(Mutex::new(snapshot_receiver)),
@@ -102,6 +111,14 @@ impl WaltrClient {
     #[wasm_bindgen(js_name = dispatchJson)]
     pub async fn dispatch_json(&self, command_json: String) -> Result<String, JsValue> {
         let command: ClientCommand = serde_json::from_str(&command_json).map_err(js_error)?;
+        if matches!(
+            command,
+            ClientCommand::LogoutWaltr
+                | ClientCommand::WaltrAccessExpired { .. }
+                | ClientCommand::StartWaltrLogin
+        ) {
+            self.interactions.borrow_mut().cancel();
+        }
         let (result, receiver) = oneshot::channel();
 
         self.commands
@@ -116,6 +133,8 @@ impl WaltrClient {
     /// Close the command source and stop the shared runtime.
     #[wasm_bindgen(js_name = dispose)]
     pub fn dispose(&self) {
+        self.interactions.borrow_mut().cancel();
+        self.interactions.borrow_mut().disposed = true;
         let latest = self.latest_snapshot.borrow().clone();
         if let Ok(mut snapshot) = serde_json::from_str::<serde_json::Value>(&latest) {
             snapshot["apps"] = serde_json::json!({ "current": {}, "requests": {} });
@@ -163,6 +182,7 @@ impl WaltrClient {
 
 fn spawn_client_loop(
     mut runtime: crate::ClientStateStream,
+    interactions: Rc<RefCell<interaction::Host>>,
     mut commands: mpsc::UnboundedReceiver<ClientCommandRequest>,
     snapshots: mpsc::UnboundedSender<String>,
     latest_snapshot: Rc<RefCell<String>>,
@@ -176,6 +196,9 @@ fn spawn_client_loop(
                     return;
                 };
 
+                if !snapshot.status.ready {
+                    interactions.borrow_mut().cancel();
+                }
                 let Ok(snapshot_json) = serde_json::to_string(snapshot.as_ref()) else {
                     return;
                 };

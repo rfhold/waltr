@@ -10,6 +10,7 @@ mod client;
 mod coordination;
 mod error;
 mod executor;
+pub mod interaction;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
 mod native_access;
 mod resource;
@@ -111,8 +112,9 @@ pub use routine::{
 pub use transport::{
     AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
     GenericAuthAttemptStatus, WaltrTransport, RoutineDefinitionWatchStream,
-    RoutineInvocationWatchStream, SessionTimelinePage, SessionTimelineProjectionMode,
-    SessionTimelineWatchEvent, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
+    RoutineInteractionTransport, RoutineInvocationWatchStream, SessionTimelinePage,
+    SessionTimelineProjectionMode, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
+    SessionWatchEvent, SessionWatchUpdate,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
@@ -127,8 +129,8 @@ pub use view::{
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
     ProviderView, SelectableAgentView, SessionAssociationsView, SessionCapabilitiesView,
     SessionCoordinationPhaseView, SessionCoordinationReasonView, SessionCoordinationView,
-    SessionMetricsView, SessionPhaseView, SessionProgressPhaseView, SessionProgressView,
-    SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
+    SessionDictationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
+    SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
     SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
     TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
     TimelineStatusView, TimestampView,
