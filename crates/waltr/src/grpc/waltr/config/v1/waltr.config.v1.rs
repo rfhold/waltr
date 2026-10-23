@@ -11,6 +11,20 @@ pub struct Configuration {
     pub mcp_servers: ::std::collections::HashMap<::prost::alloc::string::String, McpServer>,
     #[prost(message, optional, tag = "4")]
     pub inference_defaults: ::core::option::Option<InferenceDefaults>,
+    #[prost(message, optional, tag = "5")]
+    pub session_dictation: ::core::option::Option<SessionDictation>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionDictation {
+    #[prost(string, tag = "1")]
+    pub routine: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub trigger: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub input: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub output: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -102,6 +116,55 @@ pub struct Model {
     pub catalog_match: ::core::option::Option<ModelCatalogMatch>,
     #[prost(message, optional, tag = "7")]
     pub cost: ::core::option::Option<ModelCost>,
+    #[prost(message, optional, tag = "8")]
+    pub recognition: ::core::option::Option<SpeechRecognitionOptions>,
+    #[prost(message, optional, tag = "9")]
+    pub synthesis: ::core::option::Option<SpeechSynthesisOptions>,
+    #[prost(message, optional, tag = "10")]
+    pub speech_capabilities: ::core::option::Option<SpeechCapabilities>,
+}
+/// Explicit configuration only; speech models do not use models.dev defaults.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpeechRecognitionOptions {
+    #[prost(string, tag = "1")]
+    pub recognizer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub language_codes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint32, tag = "4")]
+    pub sample_rate_hz: u32,
+    #[prost(uint32, tag = "5")]
+    pub channels: u32,
+    #[prost(bool, tag = "6")]
+    pub interim_results: bool,
+    #[prost(bool, tag = "7")]
+    pub automatic_punctuation: bool,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpeechSynthesisOptions {
+    #[prost(string, tag = "1")]
+    pub voice: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub language_code: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "3")]
+    pub sample_rate_hz: u32,
+    #[prost(uint32, tag = "4")]
+    pub channels: u32,
+    #[prost(double, optional, tag = "5")]
+    pub speaking_rate: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "6")]
+    pub pitch: ::core::option::Option<f64>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpeechCapabilities {
+    #[prost(bool, tag = "1")]
+    pub unary: bool,
+    #[prost(bool, tag = "2")]
+    pub streaming: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -255,6 +318,8 @@ pub enum ProviderType {
     OpenaiChatCompletions = 2,
     OpenaiResponses = 3,
     OpenaiResponsesWebsocket = 4,
+    GoogleSpeechV2 = 5,
+    GoogleTextToSpeechV1 = 6,
 }
 impl ProviderType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -268,6 +333,8 @@ impl ProviderType {
             Self::OpenaiChatCompletions => "PROVIDER_TYPE_OPENAI_CHAT_COMPLETIONS",
             Self::OpenaiResponses => "PROVIDER_TYPE_OPENAI_RESPONSES",
             Self::OpenaiResponsesWebsocket => "PROVIDER_TYPE_OPENAI_RESPONSES_WEBSOCKET",
+            Self::GoogleSpeechV2 => "PROVIDER_TYPE_GOOGLE_SPEECH_V2",
+            Self::GoogleTextToSpeechV1 => "PROVIDER_TYPE_GOOGLE_TEXT_TO_SPEECH_V1",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -278,6 +345,8 @@ impl ProviderType {
             "PROVIDER_TYPE_OPENAI_CHAT_COMPLETIONS" => Some(Self::OpenaiChatCompletions),
             "PROVIDER_TYPE_OPENAI_RESPONSES" => Some(Self::OpenaiResponses),
             "PROVIDER_TYPE_OPENAI_RESPONSES_WEBSOCKET" => Some(Self::OpenaiResponsesWebsocket),
+            "PROVIDER_TYPE_GOOGLE_SPEECH_V2" => Some(Self::GoogleSpeechV2),
+            "PROVIDER_TYPE_GOOGLE_TEXT_TO_SPEECH_V1" => Some(Self::GoogleTextToSpeechV1),
             _ => None,
         }
     }

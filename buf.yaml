@@ -4,6 +4,8 @@ modules:
 lint:
   use:
     - STANDARD
+  ignore:
+    - proto/google
 breaking:
   use:
     - FILE

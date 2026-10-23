@@ -3,6 +3,7 @@ plugins:
   - local: protoc-gen-prost
     out: crates/waltr/src/grpc
     opt:
+      - disable_comments=.google
       - type_attribute=.waltr.config.v1=#[derive(serde::Serialize\, serde::Deserialize)]
       - type_attribute=.waltr.status.v1=#[derive(serde::Serialize\, serde::Deserialize)]
       - field_attribute=.waltr.config.v1.ModelOptions.reasoning_efforts=#[serde(default)]

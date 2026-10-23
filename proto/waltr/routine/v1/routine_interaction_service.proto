@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package waltr.routine.v1;
+
+import "waltr/routine/v1/routine_service.proto";
+
+// Executes a Routine interaction through streamed input and output.
+// Admission pins the Routine revision. Routine policy owns queue and cancellation behavior.
+// RPC cancellation or disconnect requests cancellation; execution does not detach.
+// No reconnect, replay, idempotency, or chunk persistence guarantee exists.
+service RoutineInteractionService {
+  // Native bidirectional transport. Open must be the first and only open request.
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Interact(stream InteractRequest) returns (stream InteractResponse);
+  // gRPC-web fallback: complete bounded inputs, followed by streamed output.
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Run(RunInteractionRequest) returns (stream InteractResponse);
+}
+
+message InteractRequest {
+  oneof event {
+    OpenInteraction open = 1;
+    InteractionInputOpened input_opened = 2;
+    InteractionInputChunk input_chunk = 3;
+    InteractionInputClosed input_closed = 4;
+    InteractionInputCompleted input_completed = 5;
+    InteractionCancel cancel = 6;
+  }
+}
+
+// Selects one interaction trigger; params remain scalar and separate from ports.
+message OpenInteraction {
+  string routine_name = 1;
+  string trigger_name = 2;
+  optional string source_session_id = 3;
+  repeated RoutineInputValue params = 4;
+  // Correlation only; does not deduplicate or make retries idempotent.
+  optional string request_id = 5;
+}
+
+// Each input names a declared port. Duplicate port names are invalid.
+// The server implicitly closes every input and completes input after this request.
+message RunInteractionRequest {
+  OpenInteraction open = 1;
+  repeated InteractionInput inputs = 2;
+}
+
+message InteractionInput {
+  string port_name = 1;
+  oneof content {
+    InteractionAudioInput audio = 2;
+    // One complete committed segment, not a sequence of hypotheses.
+    string text = 3;
+  }
+}
+
+message InteractionAudioInput {
+  InteractionAudioFormat format = 1;
+  bytes data = 2;
+}
+
+// The first response is accepted or validation_failure; rejection ends the RPC.
+// After admission, completed is the sole interaction terminal event.
+message InteractResponse {
+  oneof event {
+    InteractionAccepted accepted = 1;
+    RoutineValidationFailure validation_failure = 2;
+    InteractionOutputOpened output_opened = 3;
+    InteractionOutputChunk output_chunk = 4;
+    InteractionOutputClosed output_closed = 5;
+    InteractionCompleted completed = 6;
+  }
+}
+
+message InteractionAccepted {
+  string invocation_id = 1;
+}
+
+// Stream IDs are nonempty and unique within each direction of one interaction.
+// Input and output can share an ID; their message types disambiguate the direction.
+// Port names select declared Routine ports; IDs identify individual stream instances.
+message InteractionInputOpened {
+  string port_name = 1;
+  string stream_id = 2;
+  InteractionStreamFormat format = 3;
+}
+
+message InteractionOutputOpened {
+  string port_name = 1;
+  string stream_id = 2;
+  InteractionStreamFormat format = 3;
+}
+
+message InteractionStreamFormat {
+  oneof content {
+    InteractionAudioFormat audio = 1;
+    InteractionTextFormat text = 2;
+  }
+}
+
+message InteractionTextFormat {}
+
+message InteractionAudioFormat {
+  InteractionAudioEncoding encoding = 1;
+  // Both values must be positive and supported by the selected port.
+  uint32 sample_rate_hz = 2;
+  uint32 channels = 3;
+}
+
+enum InteractionAudioEncoding {
+  INTERACTION_AUDIO_ENCODING_UNSPECIFIED = 0;
+  // Signed interleaved PCM, 16 bits per sample, little-endian, without a container.
+  INTERACTION_AUDIO_ENCODING_PCM_S16LE = 1;
+}
+
+// Chunks follow open and precede close; their content must match the stream format.
+// Audio chunks contain complete sample frames. Transport order is authoritative.
+message InteractionInputChunk {
+  string stream_id = 1;
+  oneof content {
+    bytes audio = 2;
+    TextUpdate text = 3;
+  }
+}
+
+message InteractionOutputChunk {
+  string stream_id = 1;
+  oneof content {
+    bytes audio = 2;
+    TextUpdate text = 3;
+  }
+}
+
+// Segment IDs are nonempty and stream-local. First appearance fixes segment order.
+// APPEND adds text (initially empty); REPLACE replaces the segment's entire text.
+// committed freezes this segment after this update, not its durable persistence.
+// A committed segment accepts no future update, including another commitment.
+message TextUpdate {
+  string segment_id = 1;
+  TextUpdateOperation operation = 2;
+  string text = 3;
+  bool committed = 4;
+}
+
+enum TextUpdateOperation {
+  TEXT_UPDATE_OPERATION_UNSPECIFIED = 0;
+  TEXT_UPDATE_OPERATION_APPEND = 1;
+  TEXT_UPDATE_OPERATION_REPLACE = 2;
+}
+
+// Successful close requires every text segment to be committed.
+message InteractionInputClosed {
+  string stream_id = 1;
+  InteractionStreamCloseStatus status = 2;
+  // Required only for FAILED; absent otherwise.
+  RoutineFailure failure = 3;
+}
+
+// A closed stream accepts no later chunks; replacement requires a new stream ID.
+message InteractionOutputClosed {
+  string stream_id = 1;
+  InteractionStreamCloseStatus status = 2;
+  // Required only for FAILED; absent otherwise.
+  RoutineFailure failure = 3;
+}
+
+enum InteractionStreamCloseStatus {
+  INTERACTION_STREAM_CLOSE_STATUS_UNSPECIFIED = 0;
+  INTERACTION_STREAM_CLOSE_STATUS_COMPLETED = 1;
+  INTERACTION_STREAM_CLOSE_STATUS_CANCELLED = 2;
+  INTERACTION_STREAM_CLOSE_STATUS_FAILED = 3;
+}
+
+// Requires all input streams closed; forbids subsequent input opens or chunks.
+// Input completion does not cancel execution or stop output.
+message InteractionInputCompleted {}
+
+// Requests cancellation of this interaction, not a reusable invocation lookup.
+message InteractionCancel {}
+
+message InteractionCompleted {
+  // Only SUCCEEDED, FAILED, or INTERRUPTED; cancellation maps to INTERRUPTED.
+  RoutineInvocationStatus status = 1;
+  // Required for FAILED or INTERRUPTED; absent for SUCCEEDED.
+  RoutineFailure failure = 2;
+}
