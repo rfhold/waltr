@@ -42,6 +42,8 @@ import type {
   TimestampView,
 } from "../../generated/waltr-client";
 import { SessionCommandPalette } from "./SessionCommandPalette";
+import { DictationControl } from "../../components/DictationControl";
+import { dictationDraft, type DictationDraft } from "../../components/dictation-draft";
 
 const TIMELINE_CHANNELS = [
   "user_text",
@@ -141,6 +143,9 @@ export function SessionsRoute(props: ParentProps) {
     untrack(() => dispatchSessionWatchCommand(app.dispatch, {
       type: "registerSessionWatchInterest",
     }));
+    untrack(() => dispatchSessionWatchCommand(app.dispatch, {
+      type: "registerConfigWatchInterest",
+    }));
   }));
 
   createEffect(() => {
@@ -159,6 +164,9 @@ export function SessionsRoute(props: ParentProps) {
 
     dispatchSessionWatchCommand(app.dispatch, {
       type: "releaseSessionWatchInterest",
+    });
+    dispatchSessionWatchCommand(app.dispatch, {
+      type: "releaseConfigWatchInterest",
     });
   });
 
@@ -469,7 +477,21 @@ function SessionDetail(props: { session: SessionView }) {
   const [editingInferenceSettings, setEditingInferenceSettings] = createSignal(false);
   const [editingAgent, setEditingAgent] = createSignal(false);
   const [openedApp, setOpenedApp] = createSignal<{ sessionId: string; callId: string }>();
-  const [draft, setDraft] = createSignal("");
+  const [draft, writeDraft] = createSignal("");
+  const [draftRevision, setDraftRevision] = createSignal(0);
+  const [dictationInvalidation, setDictationInvalidation] = createSignal(0);
+  const [dictationActive, setDictationActive] = createSignal(false);
+  let activeDictationDraft: DictationDraft | undefined;
+  const setDraft = (value: string) => {
+    setDraftRevision(revision => revision + 1);
+    writeDraft(value);
+  };
+  createEffect(on(() => [props.session.id, app.dictationPreferenceScope?.()] as const, () => {
+    activeDictationDraft?.rollback();
+    activeDictationDraft = undefined;
+    setDraftRevision(value => value + 1);
+    setDictationInvalidation(value => value + 1);
+  }));
   const [caret, setCaret] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
   const [resourceInputVersion, setResourceInputVersion] = createSignal(0);
   const [resourceRequestId, setResourceRequestId] = createSignal<string>();
@@ -548,6 +570,7 @@ function SessionDetail(props: { session: SessionView }) {
 
     return status === "opened" || status === "received";
   });
+  const dictationReady = createMemo(() => app.systemReady() && timelineReady());
 
   createEffect(() => {
     const sessionId = props.session.id;
@@ -813,16 +836,21 @@ function SessionDetail(props: { session: SessionView }) {
 
   const submit = async () => {
     const text = draft().trim();
-    if (!text || !timelineReady() || !canSubmitPrompt(props.session)) {
+    if (dictationActive() || !text || !timelineReady() || !canSubmitPrompt(props.session)) {
       return;
     }
 
+    setDictationInvalidation(value => value + 1);
+    const submittedRevision = draftRevision();
+    const submittedSession = props.session.id;
     setCommandError(undefined);
     try {
-      await app.dispatchSubmitUserMessage(props.session.id, text);
-      setDraft("");
-      setCaret({ start: 0, end: 0 });
-      clearResourceAutocomplete();
+      await app.dispatchSubmitUserMessage(submittedSession, text);
+      if (props.session.id === submittedSession && draftRevision() === submittedRevision) {
+        setDraft("");
+        setCaret({ start: 0, end: 0 });
+        clearResourceAutocomplete();
+      }
     } catch (error) {
       const current = app.snapshot();
       setCommandError({
@@ -879,6 +907,9 @@ function SessionDetail(props: { session: SessionView }) {
   };
 
   const rememberTextareaSelection = (textarea: HTMLTextAreaElement) => {
+    if (caret().start !== textarea.selectionStart || caret().end !== textarea.selectionEnd) {
+      setDraftRevision(value => value + 1);
+    }
     setCaret({ start: textarea.selectionStart, end: textarea.selectionEnd });
     setResourceInputVersion((version) => version + 1);
   };
@@ -1020,10 +1051,17 @@ function SessionDetail(props: { session: SessionView }) {
   };
 
   const editUserMessage = async (item: TextTimelineItem) => {
+    const revision = draftRevision();
+    const sessionId = props.session.id;
     setCommandError(undefined);
     try {
-      await app.dispatch({ type: "rollbackSessionBeforeCursor", sessionId: props.session.id, cursor: item.cursor });
-      setDraft(retemplatizeUserMessage(item.text));
+      await app.dispatch({ type: "rollbackSessionBeforeCursor", sessionId, cursor: item.cursor });
+      if (props.session.id === sessionId && draftRevision() === revision) {
+        const text = retemplatizeUserMessage(item.text);
+        setDraft(text);
+        setCaret({ start: text.length, end: text.length });
+        clearResourceAutocomplete();
+      }
     } catch (error) {
       setCommandError({ message: error instanceof Error ? error.message : "Unable to edit message." });
     }
@@ -1158,6 +1196,7 @@ function SessionDetail(props: { session: SessionView }) {
               aria-expanded={visibleResourceOptions().length > 0}
               placeholder="Send a message..."
               value={draft()}
+              onCompositionStart={() => setDraftRevision(value => value + 1)}
               onInput={(event) => {
                 setDraft(event.currentTarget.value);
                 rememberTextareaSelection(event.currentTarget);
@@ -1176,6 +1215,38 @@ function SessionDetail(props: { session: SessionView }) {
             {(message) => <p class="sessions__resource-status sessions__resource-status--error">{message()}</p>}
           </Show>
         </div>
+        <Show when={app.dictation?.()}>{host => <DictationControl
+          host={host()} scope={app.dictationPreferenceScope?.() ?? "browser"} sessionId={props.session.id}
+          invalidation={dictationInvalidation()} ready={dictationReady()}
+          configuredSelection={app.snapshot()?.config.current?.sessionDictation}
+          configurationVersion={app.snapshot()?.config.current?.etag}
+          revision={draftRevision()} selection={caret()}
+          onActive={active => { setDictationActive(active); if (!active) activeDictationDraft = undefined; }}
+          beginDraft={() => {
+            setDraftRevision(value => value + 1);
+            activeDictationDraft = dictationDraft({
+              read: () => ({ text: draft(), revision: draftRevision(), selection: caret() }),
+              write: (text, selection) => {
+                writeDraft(text);
+                setCaret(selection);
+                clearResourceAutocomplete();
+                // Do not focus: live updates must not blur the held microphone.
+                if (messageTextarea) {
+                  messageTextarea.value = text;
+                  messageTextarea.setSelectionRange(selection.start, selection.end);
+                }
+              },
+            });
+            return activeDictationDraft;
+          }}
+          insert={(text, selection) => {
+            setDraft(draft().slice(0, selection.start) + text + draft().slice(selection.end));
+            const end = selection.start + text.length;
+            setCaret({ start: end, end });
+            clearResourceAutocomplete();
+            queueMicrotask(() => { messageTextarea?.focus(); messageTextarea?.setSelectionRange(end, end); });
+          }}
+        />}</Show>
         <div class="sessions__composer-actions">
           <button
             type="button"
@@ -1187,7 +1258,7 @@ function SessionDetail(props: { session: SessionView }) {
           >
             Stop
           </button>
-          <button type="submit" disabled={!draft().trim() || !timelineReady() || !canSubmitPrompt(props.session)}>
+          <button type="submit" disabled={dictationActive() || !draft().trim() || !timelineReady() || !canSubmitPrompt(props.session)}>
             Send
           </button>
         </div>

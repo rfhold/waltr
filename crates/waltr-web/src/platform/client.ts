@@ -13,6 +13,8 @@ export type ClientAdapter = {
   subscribe: (listener: ClientSnapshotListener) => () => void;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispose: () => void | Promise<void>;
+  dictation?: import("./dictation").DictationHost;
+  dictationPreferenceScope?: string;
   access?: AccessOperations;
   openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
   openExternalUrl?: (url: string) => Promise<void>;

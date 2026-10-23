@@ -24,6 +24,9 @@ export function renderWithAppState(
     routePath?: string;
     explicitAuthTarget?: ClientAuthTarget;
     accessOperations?: AccessOperations | null;
+    dictation?: import("../../src/platform/dictation").DictationHost;
+    dictationPreferenceScope?: string;
+    submitUserMessage?: (sessionId: string, text: string) => Promise<ClientSnapshot>;
     openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
     openExternalUrl?: (url: string) => Promise<void>;
     configPatchError?: string;
@@ -500,7 +503,9 @@ export function renderWithAppState(
           dispatchWipeSessions,
           dispatchUpdateSessionInferenceSettings,
           dispatchUpdateSessionAgent,
-          dispatchSubmitUserMessage,
+          dictation: () => options.dictation,
+          dictationPreferenceScope: () => options.dictationPreferenceScope ?? "test-server",
+          dispatchSubmitUserMessage: options.submitUserMessage ?? dispatchSubmitUserMessage,
           dispatchRespondExternalRequest,
           dispatchInterruptSession,
           dispatchContinueSession,

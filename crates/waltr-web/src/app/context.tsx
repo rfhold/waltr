@@ -21,6 +21,8 @@ export type AppState = {
   explicitAuthTarget: Accessor<ClientAuthTarget | undefined>;
   presentedAuthAttemptId: Accessor<string | undefined>;
   authorizationDraft: Accessor<{ attemptId: string; input: string } | undefined>;
+  dictation?: Accessor<import("../platform/dictation").DictationHost | undefined>;
+  dictationPreferenceScope?: Accessor<string | undefined>;
   accessOperations: Accessor<AccessOperations | undefined>;
   openAuthorizationAttempt: Accessor<((attemptId: string) => Promise<void>) | undefined>;
   openExternalUrl: Accessor<((url: string) => Promise<void>) | undefined>;

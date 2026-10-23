@@ -8,6 +8,9 @@ import type {
   ClientSnapshotListener,
 } from "./client";
 
+import { nativeDictation } from "./native-dictation";
+import type { DictationHost } from "./dictation";
+
 const BRIDGE_EVENT = "waltr://bridge";
 
 type BridgeEvent = {
@@ -49,6 +52,8 @@ export const serverRegistry = {
 
 export async function loadTauriClient(api: TauriApi = { invoke, listen }, serverId?: string): Promise<ClientAdapter> {
   let currentSnapshot: ClientSnapshot | undefined;
+  let dictation: DictationHost | undefined;
+  let dictationSupported = false;
   let generation: number | undefined;
   let announcedGeneration: number | undefined;
   let sequence = -1;
@@ -61,6 +66,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   const snapshotListeners = new Set<ClientSnapshotListener>();
 
   const publishSnapshot = (snapshot: ClientSnapshot) => {
+    if (!snapshot.status.ready) dictation?.cancel();
     currentSnapshot = snapshot;
     for (const listener of snapshotListeners) listener(snapshot);
   };
@@ -68,6 +74,8 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     sequence = event.sequence;
     if (event.payload.type === "state") {
       publishSnapshot(event.payload.snapshot);
+    } else if (event.payload.startup !== "ready") {
+      dictation?.cancel();
     }
   };
   const recover = async () => {
@@ -97,7 +105,9 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         && event.generation > generation
         && canAnnounceGeneration(event);
       if (!resumesFreshGeneration) return;
+      dictation?.dispose();
       generation = event.generation;
+      dictation = dictationSupported ? nativeDictation(api.invoke, generation) : undefined;
       announcedGeneration = event.generation;
       sequence = -1;
     }
@@ -135,12 +145,14 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         return;
       }
 
-      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown }>("start_runtime", { serverId });
+      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown; dictation?: boolean }>("start_runtime", { serverId });
       if (disposed) {
         await api.invoke("dispose_runtime", { generation: runtime.generation });
         return;
       }
       generation = runtime.generation;
+      dictationSupported = runtime.dictation === true;
+      dictation = dictationSupported ? nativeDictation(api.invoke, generation) : undefined;
       acceptNativeAppsBootstrap(runtime.nativeApps);
       announcedGeneration = runtime.generation;
       for (const event of pendingEvents.splice(0)) await enqueue(event);
@@ -164,6 +176,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   const dispose = async () => {
     if (disposed) return;
     disposed = true;
+    dictation?.dispose();
     acceptNativeAppsBootstrap(undefined);
     runtimeReady = false;
     announcedGeneration = undefined;
@@ -175,6 +188,8 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
 
   return {
     snapshot: () => currentSnapshot,
+    get dictation() { return dictation; },
+    dictationPreferenceScope: `native:${serverId ?? "local"}`,
     start,
     subscribe: (listener) => {
       snapshotListeners.add(listener);
@@ -194,10 +209,12 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     access: serverId && serverId !== "local" ? {
       openLogin: async () => {
         if (disposed || generation === undefined) throw new Error("Native client is not ready");
+        dictation?.cancel();
         await api.invoke("start_access_login", { generation });
       },
       logout: async () => {
         if (disposed || generation === undefined) throw new Error("Native client is not ready");
+        dictation?.cancel();
         await api.invoke("logout_access", { generation });
         return true;
       },
