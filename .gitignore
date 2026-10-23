@@ -7,3 +7,4 @@ crates/waltr-web/generated/.wasm-store/
 .dev/
 tests/web/k6/snapshots/
 .worktrees/
+.playwright-mcp/

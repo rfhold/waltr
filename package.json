@@ -4,6 +4,7 @@
   "packageManager": "pnpm@11.5.0",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:install": "node scripts/dev-install.mjs",
     "dev:web": "node scripts/dev-web.mjs",
     "build": "pnpm --filter @rfhold/waltr-web build",
     "build:tauri": "pnpm --filter @rfhold/waltr-web build:tauri",

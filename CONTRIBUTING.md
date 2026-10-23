@@ -94,6 +94,47 @@ open target/macos-default/aarch64-apple-darwin/debug/bundle/macos/Waltr.app
 
 These commands describe a procedure, not a successful build or live test.
 
+To build and install the local debug app at the stable `~/Applications/Waltr.app` path:
+
+```sh
+pnpm dev:install
+```
+
+Quit Waltr before each install, including any copy open from the build directory.
+The installer supports native Apple Silicon macOS only.
+It requires the build prerequisites above, Xcode command-line tools, and the Cargo Tauri CLI.
+It uses the normal unsigned debug build, packaged web assets, and `--locked` Cargo dependencies.
+It sets `CARGO_TARGET_DIR` to the repository's `target/macos-default`, regardless of your shell's current directory or target-directory override.
+It stages a complete bundle with `ditto`, then validates the bundle identity and executable.
+It signs the staged bundle with identifier `dev.waltr.app` and the microphone entitlement from `crates/waltr-app/Entitlements.plist`.
+It verifies the complete staged bundle with `codesign --verify --deep --strict` before replacement.
+The default signature is ad-hoc (`codesign --sign -`).
+To use an available stable codesign identity, set `WALTR_DEV_SIGNING_IDENTITY` to its name or certificate hash.
+The installer rejects blank values and does not discover identities or create certificates.
+A supplied identity can trigger a macOS Keychain prompt when you run the installer.
+Build, copy, signature, or verification failure preserves the current app; a failed replacement attempts rollback.
+An unsuccessful rollback reports the backup path for manual recovery.
+If cleanup fails after installation, the command exits nonzero and reports that the new app occupies the installed path.
+Cleanup errors also report the transaction path and possible backup location; a concurrent installation error retains its original cause.
+The installer changes only the staged bundle's signature, not the build output or current installed app.
+It never stops or launches Waltr, requests app permissions, resets TCC grants, or registers the app with LaunchServices.
+
+After installation, open the stable path manually:
+
+```sh
+open "$HOME/Applications/Waltr.app"
+```
+
+The app keeps the `dev.waltr.app` identity and the same app data, profiles, and configuration.
+This command creates no separate development profile and requires no Vite server or hot reload.
+Ad-hoc signatures cover one code version, so rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.
+A consistent certificate identity matters across rebuilds, but neither a stable path nor successful signature verification guarantees permission retention.
+`pnpm dev` continues to start the server, web client, and TUI; its behavior does not change.
+
+Use `pnpm dev:install --dry-run` to print paths and the build/sign/verify plan without filesystem changes or subprocesses.
+Use `pnpm dev:install --help` for usage.
+Run deterministic installer tests with `node --test scripts/dev-install.test.mjs`; these tests use temporary bundles and fake subprocesses.
+
 Build a Rust crate:
 
 `cargo build -p <crate>`
