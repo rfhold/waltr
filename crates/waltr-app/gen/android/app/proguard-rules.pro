@@ -28,6 +28,7 @@
 -keepclassmembers class dev.waltr.app.MainActivity {
     public void requestLocalServer();
     public void selectRemoteServer();
+    public void requestRecordAudioPermission(long);
 }
 -keepclasseswithmembernames class dev.waltr.app.MainActivity {
     native <methods>;

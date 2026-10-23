@@ -5,7 +5,8 @@
     document.getElementById('results').textContent += JSON.stringify(value) + '\n'
     window.parent.postMessage(value, '*')
   }
-  const commands = ['start_runtime', 'client_dispatch', 'client_state', 'dispose_runtime',
+  const commands = ['dictation_start', 'dictation_finish', 'dictation_status', 'dictation_cancel',
+    'start_runtime', 'client_dispatch', 'client_state', 'dispose_runtime',
     'open_external_url', 'open_authorization_attempt', 'list_servers', 'save_server',
     'remove_server', 'start_access_login', 'logout_access', 'plugin:__TAURI_CHANNEL__|fetch']
   for (const ancestor of [window.parent, window.top]) {

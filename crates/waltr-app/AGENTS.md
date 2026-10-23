@@ -4,6 +4,16 @@
 | --- | --- |
 | [src/server_controller.rs](src/server_controller.rs) | Process-owned embedded server, app-private paths, ephemeral loopback endpoint, and generation bearer. |
 | [src/bridge.rs](src/bridge.rs) | Selected Local/remote client runtime, access coordinator, generation lifecycle, and bounded publication. |
+| [src/native_audio/](src/native_audio/) | Shared microphone admission, audio runtime fences, and desktop audio hold adapter. |
+| [src/dictation.rs](src/dictation.rs) | Chat dictation identities, status, preview, IPC, and shared native interaction consumer. |
+| [src/native_audio_telemetry.rs](src/native_audio_telemetry.rs) | Shared audio diagnostics; preserves the literal historical telemetry target. |
+| [src/shortcuts.rs](src/shortcuts.rs) | Process-owned desktop registration and ingress-epoch runtime routing. |
+| [src/activity.rs](src/activity.rs) | Text-free client-operation leases through permission, effects, and cleanup. |
+| [src/tray.rs](src/tray.rs) | Optional desktop status icon and minimal status/Open Waltr/Quit menu. |
+| [../../docs/architecture/clients.md#client-routine-activity-tray](../../docs/architecture/clients.md#client-routine-activity-tray) | Client-owned activity scope and tray lifecycle. |
+| [src/audio_permissions.rs](src/audio_permissions.rs) | Audio-only permission tickets, foreground policy, and stale-grant rejection. |
+| [src/audio_permissions_macos.rs](src/audio_permissions_macos.rs) | Apple Silicon AVFoundation audio-only permission adapter. |
+| [../../docs/architecture/clients.md#native-app-audio-composition](../../docs/architecture/clients.md#native-app-audio-composition) | Native audio ownership, IPC, lifecycle, and platform capability contract. |
 | [src/server_profiles.rs](src/server_profiles.rs) | Nonsecret profile registry, strict endpoint normalization, and last-success persistence. |
 | [src/native_auth.rs](src/native_auth.rs) | Verified discovery binding and native authorization browser policy. |
 | [src/credential_store.rs](src/credential_store.rs) | Identity-bound Keychain/AndroidKeyStore refresh persistence and server-wide deletion fences. |
@@ -46,6 +56,29 @@ Remove the exact endpoint and bearer from every snapshot before IPC publication.
 Keep one active client runtime generation. Preserve initial-before-update delivery, bounded latest-value snapshot coalescing, ordered command dispatch, stale-generation rejection, and complete disposal.
 
 Fence starts with selection tickets. Require the current generation for dispatch, access, openers, and disposal effects.
+
+Share one nonqueued audio reservation across chat and holds. Keep PCM and credentials outside IPC.
+Use the desktop `interaction` driver for capture, Accepted-gated audio upload, concurrent output, cancellation, and native joins in both consumers.
+Keep chat status/preview and desktop typing/commands as separate output consumers, not shortcut-shaped chat bindings.
+Retain the app's process-owned shortcut registrar, ingress epochs, and permission tickets across runtime generations; the caller-driven desktop Actor is not its replacement.
+Recheck generation, access, cancellation, and credential revision before capture, RPC, and output-action effects.
+Require the same guards immediately before each actual native text batch.
+Keep live external text with suffix revisions separate from native chat preview.
+Preserve exactly one command or `typing` action; never add a fallback, retry, replay, clipboard path, or automatic submission.
+Cancel audio before teardown or Android remote-pause preservation. Drain audio tasks before logout credential deletion and disposal completion.
+Keep UI lifecycle retirement nonblocking. Publish bounded selected-port preview only through current identity, access, cancellation, and credential guards.
+Clear preview on cancellation or terminal completion. Publish final text only after successful clean completion.
+
+Keep generic client-hook activity in the bridge, independent of the audio host.
+Keep microphone admission audio-only; do not gate unrelated hooks behind it.
+The current shortcut adapter supports audio holds, not arbitrary device context.
+Use `ActivityTracker::begin` for each admitted client hook operation.
+Retain its lease through permission, RPC, output actions, and complete cleanup.
+Mark failures explicitly; ordinary cancellation is not an error.
+Keep activity text-free and independent of server-wide Routine history or WebView state.
+Keep the tray optional and its menu limited to status, Open Waltr, and Quit.
+Preserve normal window-close and exit behavior.
+See [external text](../../docs/architecture/clients.md#live-external-text) and [platform prerequisites](../../docs/deployment.md#desktop-tray-and-external-text) for canonical constraints.
 
 Start the embedded server only for Local selection. Retain an active local server across remote switches. Remote selection requests no Android service or notification.
 
@@ -133,7 +166,7 @@ On Android, use the ring provider, safe TLS 1.2/1.3, and bundled `webpki_roots` 
 
 Use standard OpenTelemetry SDK providers: batched span and log exporters plus a periodic metric exporter. Keep the fixed OTLP/HTTP protobuf URLs at `/v1/traces`, `/v1/logs`, and `/v1/metrics` under `https://telemetry.holdenitdown.net:4318`. Preserve service name `waltr-app-native` and resource version, sanitized revision, and target. Keep the bounded `app.startup` log and `waltr.app.startups` metric.
 
-Allow trace targets only from this app or `waltr_client::transport::native_trace`. Allow log targets only from this app. Use the shared blocking Rustls client for all exporters. Configure it explicitly with the ring provider, TLS 1.2/1.3, and bundled `webpki_roots`; retain normal chain and hostname verification. Do not add platform roots, private or user CAs, or `SSL_CERT_FILE` to that telemetry client. Disable redirects and strip every inherited or environment-derived header except the canonical protobuf content type.
+Allow trace targets from this app and `waltr_client::transport::native_trace`, plus spans with the exact targets `waltr_server::routine::telemetry` and `waltr_audio::telemetry`. Those server/audio targets admit spans only, not logs. Allow log targets only from this app. Use the shared blocking Rustls client for all exporters. Configure it explicitly with the ring provider, TLS 1.2/1.3, and bundled `webpki_roots`; retain normal chain and hostname verification. Do not add platform roots, private or user CAs, or `SSL_CERT_FILE` to that telemetry client. Disable redirects and strip every inherited or environment-derived header except the canonical protobuf content type.
 
 Telemetry must exclude credentials, local endpoints, query strings, commands, snapshots, content, arbitrary error or panic text, bodies, and stable user or device IDs. Keep provider setup and export fail-open. Bound trace and log shutdown requests to two seconds. Preserve the OpenTelemetry SDK 0.32 fixed five-second metric shutdown bound. Keep automated Rust tests isolated through disabled native initialization and deterministic in-memory exporters. Do not synchronously flush native telemetry from Android suspend callbacks.
 

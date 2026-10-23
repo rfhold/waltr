@@ -4,7 +4,18 @@
     forbid(unsafe_code)
 )]
 
+mod activity;
 mod app_container;
+pub mod audio_permissions;
+mod dictation;
+mod native_audio;
+mod native_audio_telemetry;
+#[cfg(test)]
+use native_audio_telemetry as dictation_telemetry;
+mod shortcuts;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod tray;
+use dictation::{dictation_cancel, dictation_finish, dictation_start, dictation_status};
 mod bridge;
 mod credential_store;
 mod native_auth;
@@ -142,6 +153,7 @@ async fn logout_access(
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeStarted {
+    dictation: bool,
     generation: u64,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     native_apps: native_apps::Bootstrap,
@@ -358,6 +370,8 @@ async fn start_runtime(
         #[cfg(not(target_os = "android"))]
         let feed = bridge.start()?;
         let generation = feed.generation();
+        app.state::<audio_permissions::AudioPermissions>()
+            .invalidate(generation);
         #[cfg(target_os = "android")]
         match finish_mobile_client_start(ticket, generation) {
             MobileStartDisposition::Deliver => {
@@ -380,6 +394,11 @@ async fn start_runtime(
         ))]
         eprintln!("WALTR_NATIVE_PROBE positive-control");
         Ok(RuntimeStarted {
+            dictation: cfg!(any(
+                all(target_os = "macos", target_arch = "aarch64"),
+                target_os = "linux",
+                target_os = "android"
+            )),
             generation,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             native_apps: native_apps.clone(),
@@ -485,14 +504,8 @@ async fn dispose_runtime(
     Ok(())
 }
 
-#[cfg(target_os = "android")]
 fn stop_client_bridge(bridge: &RuntimeBridge) {
     bridge.stop_nonblocking();
-}
-
-#[cfg(not(target_os = "android"))]
-fn stop_client_bridge(bridge: &RuntimeBridge) {
-    bridge.stop();
 }
 
 #[tauri::command]
@@ -609,6 +622,8 @@ fn start_and_deliver(
         }
     };
     let generation = feed.generation();
+    app.state::<audio_permissions::AudioPermissions>()
+        .invalidate(generation);
     match finish_mobile_client_start(ticket, generation) {
         MobileStartDisposition::Deliver => {
             deliver_events(app, bridge, feed);
@@ -813,6 +828,29 @@ pub fn nativeAuthorizationCallback(
 
 #[cfg(target_os = "android")]
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
+/// Check queued microphone work against the current foreground waiter.
+pub fn nativeRecordAudioPermissionCurrent(
+    _env: jni::EnvUnowned<'_>,
+    _activity: jni::objects::JObject<'_>,
+    ticket: jni::sys::jlong,
+) -> jni::sys::jboolean {
+    audio_permissions::android_current(ticket)
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
+/// Deliver only the original microphone permission dialog identity.
+pub fn nativeRecordAudioPermissionResult(
+    _env: jni::EnvUnowned<'_>,
+    _activity: jni::objects::JObject<'_>,
+    ticket: jni::sys::jlong,
+    granted: jni::sys::jboolean,
+) {
+    audio_permissions::android_result(ticket, granted);
+}
+
+#[cfg(target_os = "android")]
+#[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Record the notification gate without starting server work.
 pub fn nativeNotificationPermissionRequired(
     _env: jni::EnvUnowned<'_>,
@@ -832,6 +870,7 @@ pub fn nativeNotificationPermissionRequired(
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Stop only the activity-owned client generation during backgrounding.
 pub fn nativeClientSuspend(_env: jni::EnvUnowned<'_>, _activity: jni::objects::JObject<'_>) {
+    audio_permissions::android_foreground(false);
     let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
         return;
     };
@@ -839,6 +878,7 @@ pub fn nativeClientSuspend(_env: jni::EnvUnowned<'_>, _activity: jni::objects::J
         let mut lifecycle = lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.bridge.cancel_audio();
         if lifecycle.bridge.is_remote() {
             return;
         }
@@ -860,6 +900,7 @@ pub fn nativeClientSuspend(_env: jni::EnvUnowned<'_>, _activity: jni::objects::J
 #[jni_fn::jni_fn("dev.waltr.app.MainActivity")]
 /// Start a fresh client generation only after an already-active activity resumes.
 pub fn nativeClientResume(_env: jni::EnvUnowned<'_>, _activity: jni::objects::JObject<'_>) {
+    audio_permissions::android_foreground(true);
     let Some(lifecycle) = MOBILE_LIFECYCLE.get() else {
         return;
     };
@@ -919,6 +960,7 @@ pub fn run() {
             app.manage(Arc::clone(&bridge));
             app.manage(server);
             app.manage(RuntimeSelection::default());
+            app.manage(audio_permissions::host(app.handle(), 0));
             let registry = app
                 .path()
                 .app_data_dir()
@@ -972,10 +1014,21 @@ pub fn run() {
             let result = window.build();
             observability::record_result(&setup, &result);
             result?;
+            app.manage(shortcuts::Owner::install(&bridge).map_err(std::io::Error::other)?);
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Ok(Ok(tray)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tray::Owner::install(app.handle(), bridge.activity())
+            })) {
+                app.manage(tray);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             start_runtime,
+            dictation_start,
+            dictation_finish,
+            dictation_status,
+            dictation_cancel,
             list_servers,
             save_server,
             remove_server,
@@ -994,6 +1047,13 @@ pub fn run() {
     drop(startup);
     app.run(|app, event| match event {
         tauri::RunEvent::Exit => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Some(tray) = app.try_state::<tray::Owner>() {
+                tray.shutdown();
+            }
+            app.state::<shortcuts::Owner>()
+                .shutdown(app.state::<Arc<RuntimeBridge>>().inner());
+            app.state::<audio_permissions::AudioPermissions>().dispose();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             native_apps_navigation::detach("main");
             observability::lifecycle_event("app.shutdown", "lifecycle", "exit");
@@ -1006,6 +1066,7 @@ pub fn run() {
             event: tauri::WindowEvent::Destroyed,
             ..
         } if label == "main" => {
+            app.state::<audio_permissions::AudioPermissions>().pause();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             native_apps_navigation::detach("main");
             observability::lifecycle_event("webview.destroyed", "lifecycle", "client_stopped");
@@ -1071,10 +1132,11 @@ mod configuration_tests {
 
     #[test]
     fn android_activity_jni_callbacks_are_kept_in_minified_releases() {
-        let rust = include_str!("lib.rs")
+        let main = include_str!("lib.rs")
             .split("#[cfg(test)]\nmod configuration_tests")
             .next()
             .expect("production Rust source");
+        let rust = format!("{main}\n{}", include_str!("audio_permissions.rs"));
         let activity =
             include_str!("../gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt");
         let proguard = include_str!("../gen/android/app/proguard-rules.pro");
@@ -1108,13 +1170,25 @@ mod configuration_tests {
                 .strip_prefix('"')
                 .and_then(|method| method.strip_suffix('"'))
                 .expect("literal Activity method name");
-            assert_eq!(arguments.next(), Some("\"()V\""), "{method} JNI signature");
-            assert!(activity.contains(&format!("fun {method}() {{")));
-            assert!(kept_callbacks.contains(&format!("public void {method}();")));
+            let (signature, kotlin_arguments, java_arguments) = match method {
+                "requestLocalServer" | "selectRemoteServer" => ("\"()V\"", "", ""),
+                "requestRecordAudioPermission" => ("\"(J)V\"", "ticket: Long", "long"),
+                _ => panic!("unexpected Activity JNI method"),
+            };
+            assert_eq!(arguments.next(), Some(signature), "{method} JNI signature");
+            assert!(activity.contains(&format!("fun {method}({kotlin_arguments}) {{")));
+            assert!(kept_callbacks.contains(&format!("public void {method}({java_arguments});")));
             callbacks.push(method);
         }
         callbacks.sort_unstable();
-        assert_eq!(callbacks, ["requestLocalServer", "selectRemoteServer"]);
+        assert_eq!(
+            callbacks,
+            [
+                "requestLocalServer",
+                "requestRecordAudioPermission",
+                "selectRemoteServer"
+            ]
+        );
     }
 
     #[test]

@@ -17,6 +17,10 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "start_runtime",
+            "dictation_start",
+            "dictation_finish",
+            "dictation_status",
+            "dictation_cancel",
             "client_dispatch",
             "client_state",
             "dispose_runtime",
