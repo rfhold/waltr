@@ -219,9 +219,11 @@ impl EmbeddedServer {
 
 #[cfg(feature = "server")]
 async fn start_embedded_server(addr: SocketAddr) -> io::Result<EmbeddedServer> {
-    let app = waltr_server::build_app().await.map_err(|error| {
-        io::Error::other(format!("embedded server initialization failed: {error}"))
-    })?;
+    let app = waltr_server::build_app(Default::default())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("embedded server initialization failed: {error}"))
+        })?;
     start_embedded_server_with_app(app, addr).await
 }
 
