@@ -1150,6 +1150,9 @@ pub struct OperationSnapshot {
     pub key: Option<OperationKey>,
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+pub(crate) type InteractionRuntimeTransport = crate::DefaultGrpcTransport;
+
 /// Shared reducer plus effect executor loop used by shells.
 pub struct ClientRuntime {
     reducer: Client,
@@ -1293,6 +1296,13 @@ impl ClientRuntime {
     #[must_use]
     pub fn for_endpoint(endpoint: impl Into<String>) -> Self {
         Self::with_executor(GrpcEffectExecutor::for_endpoint(endpoint))
+    }
+
+    /// Clone the runtime-selected transport for caller-owned bounded interactions.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    #[must_use]
+    pub(crate) fn interaction_transport(&self) -> InteractionRuntimeTransport {
+        self.executor.transport().clone()
     }
 
     /// Return the current reducer snapshot.

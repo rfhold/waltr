@@ -22,6 +22,24 @@ pub struct ConfigView {
     pub mcp_servers: BTreeMap<String, McpServerView>,
     /// Default inference selection for newly created sessions.
     pub inference_defaults: Option<InferenceDefaultsView>,
+    /// Optional configured push-to-talk selection; absent disables session dictation.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub session_dictation: Option<SessionDictationView>,
+}
+
+/// Default interaction selection for session push-to-talk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDictationView {
+    /// Routine catalog key.
+    pub routine: String,
+    /// Interaction trigger name.
+    pub trigger: String,
+    /// PCM input port name.
+    pub input: String,
+    /// Text output port name.
+    pub output: String,
 }
 
 /// Stable inference defaults view shared by Waltr shells.
@@ -325,6 +343,12 @@ impl From<Configuration> for ConfigView {
                 .map(|(name, server)| (name, McpServerView::from(server)))
                 .collect(),
             inference_defaults: config.inference_defaults.map(InferenceDefaultsView::from),
+            session_dictation: config.session_dictation.map(|value| SessionDictationView {
+                routine: value.routine,
+                trigger: value.trigger,
+                input: value.input,
+                output: value.output,
+            }),
         }
     }
 }
@@ -350,6 +374,14 @@ impl From<ConfigView> for Configuration {
                 .map(|(name, server)| (name, McpServer::from(server)))
                 .collect(),
             inference_defaults: view.inference_defaults.map(InferenceDefaults::from),
+            session_dictation: view.session_dictation.map(|value| {
+                waltr::grpc::waltr::config::v1::SessionDictation {
+                    routine: value.routine,
+                    trigger: value.trigger,
+                    input: value.input,
+                    output: value.output,
+                }
+            }),
         }
     }
 }
@@ -514,7 +546,9 @@ impl From<i32> for ProviderKindView {
             Ok(ProviderType::OpenaiChatCompletions) => Self::OpenAiChatCompletions,
             Ok(ProviderType::OpenaiResponses) => Self::OpenAiResponses,
             Ok(ProviderType::OpenaiResponsesWebsocket) => Self::OpenAiResponsesWebsocket,
-            Err(_) => Self::Unknown,
+            Ok(ProviderType::GoogleSpeechV2 | ProviderType::GoogleTextToSpeechV1) | Err(_) => {
+                Self::Unknown
+            }
         }
     }
 }
@@ -786,6 +820,9 @@ impl From<ModelView> for Model {
             capabilities: Some(view.capabilities.into()),
             catalog_match: view.catalog_match.map(ModelCatalogMatch::from),
             cost: view.cost.map(ModelCost::from),
+            recognition: None,
+            synthesis: None,
+            speech_capabilities: None,
         }
     }
 }

@@ -418,6 +418,12 @@ fn known_method(service: &str, method: &str) -> Option<MethodAttributes> {
                 "CloseSessionMcpApp",
             ]
         ),
+        "waltr.routine.v1.RoutineInteractionService" => service_methods!(
+            method,
+            "waltr.routine.v1.RoutineInteractionService",
+            "routine_interaction",
+            ["Interact", "Run"]
+        ),
         "waltr.routine.v1.RoutineService" => service_methods!(
             method,
             "waltr.routine.v1.RoutineService",
@@ -637,6 +643,70 @@ mod tests {
     }
 
     #[test]
+    fn interaction_rpc_catalog_exports_literal_names_and_operation_parent() {
+        let spans = capture_spans(|| {
+            let parent = tracing::info_span!("native.audio.operation");
+            parent.in_scope(|| {
+                for method in ["Interact", "Run", "SECRET_UNKNOWN_METHOD"] {
+                    let mut service = NativeTraceLayer.layer(ReadyService {
+                        response: Some(response(
+                            http::StatusCode::OK,
+                            None,
+                            TestBody::trailers("0"),
+                        )),
+                    });
+                    let request = http::Request::builder()
+                        .uri(format!(
+                            "/waltr.routine.v1.RoutineInteractionService/{method}"
+                        ))
+                        .body(())
+                        .unwrap();
+                    let mut future = service.call(request);
+                    let mut context = Context::from_waker(test_waker());
+                    let Poll::Ready(Ok(response)) = Pin::new(&mut future).poll(&mut context) else {
+                        panic!("ready response");
+                    };
+                    poll_response_body(response);
+                }
+            });
+        });
+        let parent = spans
+            .iter()
+            .find(|span| span.name == "native.audio.operation")
+            .unwrap();
+        for (name, method, service) in [
+            (
+                "routine_interaction.Interact",
+                "Interact",
+                "waltr.routine.v1.RoutineInteractionService",
+            ),
+            (
+                "routine_interaction.Run",
+                "Run",
+                "waltr.routine.v1.RoutineInteractionService",
+            ),
+            ("grpc.unknown", "unknown", "unknown"),
+        ] {
+            let child = spans.iter().find(|span| span.name == name).unwrap();
+            assert_eq!(child.parent_span_id, parent.span_context.span_id());
+            assert_eq!(
+                child.span_context.trace_id(),
+                parent.span_context.trace_id()
+            );
+            for (key, expected) in [("rpc.method", method), ("rpc.service", service)] {
+                assert!(
+                    child
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.key.as_str() == key
+                            && attribute.value.to_string() == expected)
+                );
+            }
+        }
+        assert!(!format!("{spans:?}").contains("SECRET_UNKNOWN_METHOD"));
+    }
+
+    #[test]
     fn dropping_pending_response_future_records_cancelled_once() {
         let spans = capture_spans(|| {
             let mut service = NativeTraceLayer.layer(PendingService);
@@ -783,6 +853,23 @@ mod tests {
 
         let known = method_attributes("/waltr.session.v1.SessionService/ListSessions");
         assert_eq!(known.operation, "session.ListSessions");
+        for method in ["Interact", "Run"] {
+            let known = method_attributes(&format!(
+                "/waltr.routine.v1.RoutineInteractionService/{method}"
+            ));
+            assert_eq!(known.service, "waltr.routine.v1.RoutineInteractionService");
+            assert_eq!(known.method, method);
+            assert_eq!(known.operation, format!("routine_interaction.{method}"));
+        }
+        for path in [
+            "/private.UserService/GetUser",
+            "/waltr.routine.v1.RoutineInteractionService/SECRET_UNKNOWN_METHOD",
+        ] {
+            let unknown = method_attributes(path);
+            assert_eq!(unknown.operation, "grpc.unknown");
+            assert_eq!(unknown.method, "unknown");
+            assert_eq!(unknown.service, "unknown");
+        }
         let unknown = method_attributes("/private.UserService/GetUser");
         assert_eq!(unknown.operation, "grpc.unknown");
         assert_eq!(unknown.service, "unknown");

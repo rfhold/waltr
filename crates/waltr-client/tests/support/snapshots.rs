@@ -58,6 +58,7 @@ pub fn config_with_provider(name: &str) -> ConfigView {
         mcp_servers: BTreeMap::new(),
         etag: String::new(),
         inference_defaults: None,
+        session_dictation: None,
     }
 }
 

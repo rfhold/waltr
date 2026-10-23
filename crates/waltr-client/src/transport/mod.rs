@@ -3,6 +3,8 @@
 mod auth;
 mod catalog;
 mod config;
+mod interaction;
+pub use interaction::RoutineInteractionTransport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
 mod native_trace;
 mod routine;
@@ -19,6 +21,7 @@ pub use waltr::grpc::waltr::resource::v1::ResourceCatalog as ConfigWatchUpdate;
 use waltr::grpc::waltr::resource::v1::{
     ResourceCatalog, resource_service_client::ResourceServiceClient,
 };
+use waltr::grpc::waltr::routine::v1::routine_interaction_service_client::RoutineInteractionServiceClient;
 use waltr::grpc::waltr::routine::v1::routine_service_client::RoutineServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
@@ -316,6 +319,11 @@ trait RemoteTransport {
         &self,
         credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<RoutineServiceClient<Self::Inner>, ClientError>>;
+
+    fn interaction_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> impl Future<Output = Result<RoutineInteractionServiceClient<Self::Inner>, ClientError>>;
 }
 
 #[derive(Clone, Default)]
@@ -1061,6 +1069,16 @@ impl RemoteTransport for NativeGrpcTransport {
             Self::interceptor_for(credentials),
         ))
     }
+
+    async fn interaction_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<RoutineInteractionServiceClient<Self::Inner>, ClientError> {
+        Ok(RoutineInteractionServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
+    }
 }
 
 /// Browser gRPC-web transport backed by `fetch`.
@@ -1137,6 +1155,15 @@ impl RemoteTransport for WasmGrpcTransport {
     ) -> Result<RoutineServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(RoutineServiceClient::new(transport))
+    }
+
+    async fn interaction_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<RoutineInteractionServiceClient<Self::Inner>, ClientError> {
+        Ok(RoutineInteractionServiceClient::new(
+            tonic_web_wasm_client::Client::new(self.api_base.clone()),
+        ))
     }
 }
 

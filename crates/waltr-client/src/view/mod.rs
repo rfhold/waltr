@@ -14,6 +14,7 @@ pub use config::{
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
+    SessionDictationView,
 };
 pub use session::{
     ExternalRequestView, InferenceProviderSettingsView, InferenceSettingsMatchView,
@@ -74,6 +75,12 @@ mod tests {
             etag: "v1".to_owned(),
             mcp_servers: HashMap::new(),
             inference_defaults: None,
+            session_dictation: Some(waltr::grpc::waltr::config::v1::SessionDictation {
+                routine: "dictation".into(),
+                trigger: "hold".into(),
+                input: "audio".into(),
+                output: "text".into(),
+            }),
         };
 
         let view = ConfigView::from(config.clone());
@@ -84,6 +91,28 @@ mod tests {
 
         let round_trip = Configuration::from(view);
         assert_eq!(round_trip, config);
+    }
+
+    #[test]
+    fn session_dictation_config_view_accepts_absent_and_null_and_projects_selection() {
+        let base = serde_json::json!({"etag":"v1", "providers":{}, "mcpServers":{}, "inferenceDefaults":null});
+        let absent: ConfigView = serde_json::from_value(base.clone()).unwrap();
+        assert!(absent.session_dictation.is_none());
+        let mut null = base.clone();
+        null["sessionDictation"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<ConfigView>(null)
+                .unwrap()
+                .session_dictation
+                .is_none()
+        );
+        let mut selected = base;
+        selected["sessionDictation"] =
+            serde_json::json!({"routine":"r", "trigger":"t", "input":"audio", "output":"text"});
+        let view: ConfigView = serde_json::from_value(selected).unwrap();
+        let config = Configuration::from(view.clone());
+        assert_eq!(config.session_dictation.as_ref().unwrap().routine, "r");
+        assert_eq!(ConfigView::from(config), view);
     }
 
     #[test]
@@ -215,6 +244,7 @@ mod tests {
             McpServerTypeView::decl(),
             McpServerView::decl(),
             InferenceDefaultsView::decl(),
+            SessionDictationView::decl(),
             ProviderView::decl(),
             ConfigView::decl(),
             CatalogModelRefView::decl(),
