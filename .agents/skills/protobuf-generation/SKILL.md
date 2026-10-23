@@ -33,18 +33,23 @@ Do not use this skill for service implementation changes that do not alter proto
 | `protoc-gen-prost` | `crates/waltr/src/grpc` | Generates message and enum types. Adds serde derives for `.waltr.config.v1` and `.waltr.status.v1`. |
 | `protoc-gen-tonic` | `crates/waltr/src/grpc` | Generates service and client code with `no_transport=true`; transport setup stays in client/server crates. |
 
-Generation is explicit, not wired into Cargo builds. Regenerate after changing protos and commit the updated generated files with the proto change.
+Generation remains explicit; Cargo builds consume committed generated Rust and never regenerate it. Run `sh scripts/check-protobuf-tools.sh` before Buf commands. The preflight requires `protoc-gen-prost` 0.5.0 and `protoc-gen-tonic` 0.5.0. These generator versions differ from Prost and Tonic runtime crate versions.
+
+Use `sh scripts/check-protobuf-tools.sh --versions` to report pins without a tool probe. Install each plugin through `cargo install --locked <plugin> --version 0.5.0` if the preflight reports a mismatch.
+
+The homelab General CI contract supplies these plugins with Buf 1.47.2. Local Buf 1.73.0 comparison found only Prost attribute `=` spacing differences, not byte-exact output. Image-based regeneration remains unverified. Preserve canonical generated files until a regeneration comparison explains every diff. See [protobuf toolchain checks](../../../docs/testing.md#protobuf-toolchain).
 
 ## Workflow
 
 1. Inspect the current proto package and generated module paths before editing.
 2. Change source `.proto` files under `proto/` and keep package paths versioned, such as `waltr.config.v1`.
-3. Run `buf lint` after proto or Buf config changes.
-4. Run `buf breaking --against <base>` when checking compatibility against a base branch or commit.
-5. Run `buf generate` after source proto changes.
-6. If a new package or version is added, update `crates/waltr/src/grpc/mod.rs` so crates can include the generated modules.
-7. Build at least the affected Rust crate, commonly `cargo build -p waltr-server` for server-facing RPC changes.
-8. Run relevant server/client tests for changed service behavior.
+3. Run `sh scripts/check-protobuf-tools.sh` before Buf commands.
+4. Run `buf lint` after proto or Buf config changes.
+5. Run `buf breaking --against <base>` for compatibility checks against a base branch or commit.
+6. Run `buf generate` after source proto changes.
+7. If a package or version changes, update `crates/waltr/src/grpc/mod.rs` so crates include the generated modules.
+8. Build the affected Rust crate, commonly `cargo build -p waltr-server` for RPC changes.
+9. Run relevant server/client tests for changed service behavior.
 
 ## Compatibility Expectations
 
@@ -84,6 +89,6 @@ Build the server after server-facing RPC changes:
 | [../../../crates/waltr/src/grpc/](../../../crates/waltr/src/grpc/) | Committed generated Rust. |
 | [../../../crates/waltr/src/grpc/mod.rs](../../../crates/waltr/src/grpc/mod.rs) | Generated module include tree. |
 | [../../../crates/waltr-server/src/app.rs](../../../crates/waltr-server/src/app.rs) | Server route registration for generated services. |
-| [../../../crates/waltr-client/src/transport.rs](../../../crates/waltr-client/src/transport.rs) | Shared client transport over generated service clients. |
+| [../../../crates/waltr-client/src/transport/](../../../crates/waltr-client/src/transport/) | Shared client transport over generated service clients. |
 | [../../../docs/architecture/config.md](../../../docs/architecture/config.md) | Config RPC architecture and watch behavior. |
 | [../../../docs/architecture/clients.md](../../../docs/architecture/clients.md) | Client transport boundaries for native gRPC and gRPC-web. |
