@@ -1,31 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-ARG NODE_VERSION=24.18.0
 ARG RUST_VERSION=1.96.0
 ARG REVISION=unknown
 
-FROM node:${NODE_VERSION}-bookworm-slim AS node
+FROM cr.holdenitdown.net/rfhold/rust-web-ci@sha256:472959b480ef0f974ba75be2ee5aef4b6e20fd3f5fd1491b03559826ca1f30ce AS build-base
 
-FROM rust:${RUST_VERSION}-slim-bookworm AS build-base
-
-ARG PNPM_VERSION=11.5.0
-ARG WASM_BINDGEN_VERSION=0.2.122
 ARG TARGETARCH
 
-ENV PNPM_HOME=/pnpm
-ENV PATH=${PNPM_HOME}:/usr/local/bin:${PATH}
 WORKDIR /workspace
-
-COPY --from=node /usr/local /usr/local
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential ca-certificates git pkg-config && \
-    rm -rf /var/lib/apt/lists/*
-RUN npm install -g pnpm@${PNPM_VERSION}
-RUN rustup target add wasm32-unknown-unknown
-RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \
-    cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION} --locked
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY crates/waltr-app/package.json crates/waltr-app/package.json

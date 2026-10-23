@@ -49,6 +49,73 @@ Generic protocol/library tests validate reusable crates such as `mcp`. Agent tes
 
 # Commands
 
+## Protobuf Toolchain
+
+[`scripts/check-protobuf-tools.sh`](../scripts/check-protobuf-tools.sh) defines the local generator contract. It requires `protoc-gen-prost` 0.5.0 and `protoc-gen-tonic` 0.5.0, not the Prost or Tonic runtime crate versions.
+
+If either plugin lacks the required version, install the pinned tools:
+
+```sh
+cargo install --locked protoc-gen-prost --version 0.5.0
+cargo install --locked protoc-gen-tonic --version 0.5.0
+```
+
+Run the preflight before explicit protobuf regeneration:
+
+```sh
+sh scripts/check-protobuf-tools.sh
+buf lint
+buf generate
+```
+
+Use `sh scripts/check-protobuf-tools.sh --versions` to report the pins without a tool probe. Ordinary application builds consume committed files under `crates/waltr/src/grpc/`; they do not invoke Buf.
+
+The homelab General CI image contract pins these plugins and Buf 1.47.2. Local offline comparison used Buf 1.73.0 and found only Prost attribute `=` spacing differences. That comparison does not establish raw byte-exact regeneration with the image toolchain. An image-based regeneration comparison remains open; preserve canonical generated files until the comparison explains any diff.
+
+Run homelab's cross-repository contract test from the homelab repository root:
+
+```sh
+python3 docker/general-ci/test_protobuf_image_contract.py /path/to/waltr
+```
+
+This test checks source agreement and mock-backed preflight behavior. It does not build the image or prove generated output equivalence.
+
+## Dedicated Browser Image
+
+[`scripts/test-browser-image.mjs`](../scripts/test-browser-image.mjs) provides an opt-in Linux amd64 launcher for the dedicated homelab Playwright image. Current Waltr CI does not adopt this image. Publication and adoption require separate approval and a verified digest.
+
+The image contract is `bw-pw1.63.0-r1.96.0-n24.18.0-p11.5.0-v1-amd64`: Bookworm, Playwright 1.63.0, Rust 1.96.0, Node.js 24.18.0, and pnpm 11.5.0. Chromium revision, version, and executable path come from the exact package metadata, not an independent browser revision pin.
+
+The image supplies Chromium and browser verification, not repository dependencies. Before offline commands, obtain separate authorization for dependency installation and locked Cargo prefetch. Prepare repository dependencies with:
+
+```sh
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 pnpm install --frozen-lockfile
+cargo fetch --locked --manifest-path crates/waltr-server/Cargo.toml
+```
+
+The Cargo cache must cover the Apps host-assets harness and its locked dependencies. Provide a checkout and cache writable by UID/GID `10001:10001`. Provide a functional Chromium user-namespace sandbox and adequate `/dev/shm`; the publication verifier uses a 1 GiB memory-backed mount.
+
+Inside the verified image, run from the repository root:
+
+```sh
+node scripts/test-browser-image.mjs --verify-only
+node scripts/test-browser-image.mjs
+```
+
+The launcher validates image pins, repository-local Playwright/core versions, browser metadata, and the executable path. It sets `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` and uses the actual image executable. Its wrapper imports the current Apps harness, forces `chromiumSandbox: true`, and adds `--locked --offline` to Cargo commands. It does not download browsers or packages.
+
+Use nonroot execution, dropped capabilities, no privilege escalation, and `RuntimeDefault` seccomp. If the kernel rejects the sandbox, stop; do not substitute root, `Unconfined`, or `--no-sandbox`.
+
+Run launcher unit tests outside the image with:
+
+```sh
+node --test scripts/test-browser-image.test.mjs
+```
+
+Local unit tests do not establish image contents or browser launch success. Image launch, kernel sandbox compatibility, and the full offline harness remain unverified.
+
+## MCP
+
 Run MCP spec tests:
 
 `cargo test -p mcp --test spec`

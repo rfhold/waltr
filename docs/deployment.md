@@ -743,6 +743,32 @@ The shared build Task publishes exactly `waltr-X.Y.Z-rc.N-android-universal.apk`
 
 The prerelease PipelineRun references the shared homelab Tasks from the homelab `main` branch so each run uses the current Task definitions. Deploy those Tasks and their ServiceAccounts, OpenBao roles/policies, and secret payloads before pushing an RC tag. Review homelab Task changes as part of release readiness because later changes apply to future Waltr release runs without a Waltr repository update. These definitions and their static checks do not establish that a stack or application release has been deployed successfully.
 
+#### CI Image Adoption Boundaries
+
+The homelab Rust/web contract provides Bookworm, Rust 1.96.0, Node.js 24.18.0, pnpm 11.5.0, and wasm-bindgen CLI 0.2.122. Its pipeline defines native amd64/arm64 verification before a unique multi-architecture manifest and an immutable `image-reference` result. It publishes no `latest` tag.
+
+Waltr's Dockerfile pins `build-base` to `cr.holdenitdown.net/rfhold/rust-web-ci@sha256:472959b480ef0f974ba75be2ee5aef4b6e20fd3f5fd1491b03559826ca1f30ce` after successful native amd64/arm64 verification and manifest publication. The server and test builds inherit Node, system packages, pnpm, the WASM target, and wasm-bindgen CLI from this image. The image supplies `/pnpm` on `PATH` and retains Cargo home at `/usr/local/cargo`, compatible with the application cache mounts. Its Cargo configuration replaces crates.io with the internal sparse mirror at `https://mirrors.holdenitdown.net/cargo/api/v1/cratesio/`; npm uses `https://mirrors.holdenitdown.net/npm/`. Dependency builds require access to these mirrors. The worker build retains its separate Rust base; Bookworm runtime images and application cache mounts remain unchanged. Offline contract tests check this adoption, but do not prove a Waltr image build or deployment.
+
+The separate browser image supports Linux amd64 only. It supplies exact Playwright 1.63.0 Chromium, not application dependencies or an arm64 manifest. Its pipeline verifies a unique candidate under nonroot sandbox restrictions before digest promotion to a unique final tag. See [dedicated browser image checks](testing.md#dedicated-browser-image) for the opt-in consumer and offline prerequisites. Current Waltr CI does not adopt it; kernel sandbox compatibility remains unverified.
+
+#### Tauri Release Builder Contract
+
+[`.tekton/waltr-app-prerelease.yaml`](../.tekton/waltr-app-prerelease.yaml) selects `cr.holdenitdown.net/rfhold/tauri-release-ci:rust1.96.0-tauri2.10.1-pnpm11.5.0-wasm0.2.122-android36`. The shared homelab Task uses `imagePullPolicy: Always` for this tag-based builder.
+
+The source contract includes Rust 1.96.0, Clippy, rustfmt, Java 17, Android API 36, build-tools 36.0.0, and NDK 29.0.14206865. It also includes Tauri CLI 2.10.1, pnpm 11.5.0, wasm-bindgen CLI 0.2.122, and the required Android, WebAssembly, and Linux Rust targets.
+
+The release image adds `libasound2-dev` and `pkg-config` for native audio dependencies. Its final Dockerfile runs a verifier that compiles, links, and executes an ALSA C probe without audio hardware. This does not prove device access or an application release build.
+
+The shared Task also extracts the actual AppImage without FUSE or application startup before APK signature operations and final asset installation. It resolves the main amd64 ELF64 executable from the root desktop entry and checks its direct, transitive, and version dependencies. Resolution uses AppDir `usr/lib`, ELF RPATH/RUNPATH, and builder-host defaults; any unresolved dependency fails the check.
+
+If the main dependency closure includes ALSA, the Task requires resolution and reports `bundled` or `builder-host`. A valid non-audio application reports `not-linked` and passes. The Task does not inspect unrelated plugins as part of this closure.
+
+The check requires coreutils `timeout`/`realpath`, binutils `readelf`, and libc-bin `ldd`. Bounded private output, time limits, clean probe environments, and cleanup constrain inspection. These commands still require verification inside the actual builder.
+
+This proves builder dependency resolution only. It does not prove target-OS portability, startup, dynamic plugin loads, device access, Wayland, permissions, or audio acceptance.
+
+Local source and mock-backed tests do not establish image contents or registry availability. Publication and adoption require separate approval, a verified image digest, and consumer validation. The current builder tag remains unchanged; no release retry follows from these checks.
+
 ## Startup And Operation
 
 The public `waltr_server::build_app(BuildAppOptions)` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and routine engine, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.

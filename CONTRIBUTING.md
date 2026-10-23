@@ -181,13 +181,23 @@ Application prereleases are produced only from signed annotated tags exactly mat
 
 Proto contracts live under `proto/`, Buf configuration lives at the repository root, and generated Rust is committed under `crates/waltr/src/grpc/`.
 
-Run `buf lint` and `buf generate` after changing proto files.
+After proto changes, run these commands from the repository root:
+
+```sh
+sh scripts/check-protobuf-tools.sh
+buf lint
+buf generate
+```
+
+The preflight requires `protoc-gen-prost` 0.5.0 and `protoc-gen-tonic` 0.5.0. Ordinary application builds use committed generated Rust and never regenerate it. See [protobuf toolchain checks](docs/testing.md#protobuf-toolchain) for installation commands and verification limits.
 
 # Testing
 
 See [docs/testing.md](docs/testing.md) for test structure, commands, layering expectations, live-test setup, and container-backed test notes.
 
 The canonical guide also covers Tauri host checks, Android feature checks, Gradle checks, and installed-device requirements.
+
+For the opt-in sandboxed Chromium launcher, see [dedicated browser image checks](docs/testing.md#dedicated-browser-image). Current CI does not adopt that image; dependency preparation and image publication require separate authorization.
 
 Run MCP spec tests:
 
