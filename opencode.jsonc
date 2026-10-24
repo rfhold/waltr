@@ -5,6 +5,7 @@
       "waltr": {
         "type": "remote",
         "url": "https://waltr.holdenitdown.net/mcp",
+        "protocol": "2026-07-28",
         "disabled": false
       },
       "waltr-local": {
@@ -17,6 +18,7 @@
       "waltr-preview": {
         "type": "remote",
         "url": "https://preview-waltr.holdenitdown.net/mcp",
+        "protocol": "2026-07-28",
         "disabled": true
       }
     }

@@ -24,6 +24,7 @@ export type AppState = {
   dictation?: Accessor<import("../platform/dictation").DictationHost | undefined>;
   dictationPreferenceScope?: Accessor<string | undefined>;
   accessOperations: Accessor<AccessOperations | undefined>;
+  accessDiagnostic?: Accessor<import("../platform/client").AccessDiagnostic | undefined>;
   openAuthorizationAttempt: Accessor<((attemptId: string) => Promise<void>) | undefined>;
   openExternalUrl: Accessor<((url: string) => Promise<void>) | undefined>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;

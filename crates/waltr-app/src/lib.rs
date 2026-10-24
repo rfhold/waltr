@@ -42,7 +42,6 @@ use std::sync::{
 use std::sync::{Mutex, OnceLock};
 
 use bridge::{BridgeEvent, BridgePayload, BridgeRecovery, EventFeed, RuntimeBridge};
-use waltr_client::ClientCommand;
 use serde::Serialize;
 #[cfg(not(target_os = "android"))]
 use server_controller::AppPrivateRoots;
@@ -53,6 +52,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, State, WebviewUrl};
 use tauri_plugin_opener::OpenerExt as _;
 use tracing::Instrument as _;
+use waltr_client::ClientCommand;
 
 const BRIDGE_EVENT: &str = "waltr://bridge";
 #[derive(Default)]
@@ -240,6 +240,96 @@ impl MobileStartCoordination {
     }
 }
 
+async fn anonymous_status_available(endpoint: &str) -> bool {
+    use futures_util::StreamExt as _;
+    use waltr_client::WaltrTransport as _;
+
+    let endpoint = endpoint.to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_native_status_probe(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let transport = waltr_client::NativeGrpcTransport::new(endpoint);
+                let Ok(mut status) = transport.watch_status().await else {
+                    return false;
+                };
+                matches!(status.next().await, Some(Ok(_)))
+            })
+            .await
+            .unwrap_or(false)
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn run_native_status_probe(probe: impl std::future::Future<Output = bool>) -> bool {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    let result = runtime.block_on(probe);
+    // Timed-out DNS work can outlive its future; never join it on the selection path.
+    runtime.shutdown_background();
+    result
+}
+
+#[cfg(test)]
+mod native_bootstrap_tests {
+    #[test]
+    fn probe_shutdown_does_not_wait_for_blocked_runtime_tasks() {
+        use std::{sync::mpsc, time::Duration};
+
+        let (release, blocked) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let (result, outcome) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let available = super::run_native_status_probe(async move {
+                let (started, ready) = tokio::sync::oneshot::channel();
+                drop(tokio::task::spawn_blocking(move || {
+                    started.send(()).expect("probe should await task admission");
+                    blocked.recv().expect("test should release blocked task");
+                    finished
+                        .send(())
+                        .expect("test should await task completion");
+                }));
+                ready.await.expect("blocking task should start");
+                false
+            });
+            result
+                .send(available)
+                .expect("test should await probe result");
+        });
+
+        let returned = outcome.recv_timeout(Duration::from_secs(5));
+        release.send(()).expect("test should release blocked task");
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked task should finish");
+        worker.join().expect("probe worker should finish");
+        assert_eq!(returned, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_only_permits_anonymous_status_servers() {
+        let public = waltr_server::test_support::setup_server();
+        assert!(
+            waltr_client::discover_native_access_config(
+                &public.base_url(),
+                waltr_client::NativeCallbackPolicy::External
+            )
+            .await
+            .is_err()
+        );
+        assert!(super::anonymous_status_available(&public.base_url()).await);
+
+        let protected = waltr_server::test_support::setup_access_auth_server();
+        assert!(!super::anonymous_status_available(&protected.server.base_url()).await);
+        assert!(!super::anonymous_status_available("not-an-endpoint").await);
+    }
+}
+
 #[tauri::command]
 async fn start_runtime(
     app: tauri::AppHandle,
@@ -269,11 +359,34 @@ async fn start_runtime(
             waltr_client::NativeLoopbackPolicy::Ephemeral,
         );
         match waltr_client::discover_native_access_config(endpoint, callback).await {
-            Ok(bootstrap) => Some(native_auth::AccessBinding::from_bootstrap(
-                profile.id.clone(),
-                bootstrap,
-            )?),
-            Err(_) => None,
+            Ok(bootstrap) => {
+                tracing::info!(
+                    event = "native.auth.discovery",
+                    category = "success",
+                    generation = ticket
+                );
+                Some(native_auth::AccessBinding::from_bootstrap(
+                    profile.id.clone(),
+                    bootstrap,
+                )?)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "native.auth.discovery",
+                    category = "failed",
+                    generation = ticket
+                );
+                // Disabled-auth servers admit anonymous status; discovery failure alone is ambiguous.
+                if !anonymous_status_available(endpoint).await {
+                    return Err("Native access discovery failed. Retry connection.".into());
+                }
+                tracing::info!(
+                    event = "native.auth.discovery",
+                    category = "anonymous_fallback",
+                    generation = ticket
+                );
+                None
+            }
         }
     } else {
         None
@@ -1229,8 +1342,9 @@ mod configuration_tests {
                 .contains("private const val STOP_ACTION = \"dev.waltr.app.action.STOP_SERVER\"")
         );
         assert!(
-            service
-                .contains("Intent(this, WaltrForegroundService::class.java).setAction(STOP_ACTION)")
+            service.contains(
+                "Intent(this, WaltrForegroundService::class.java).setAction(STOP_ACTION)"
+            )
         );
         assert!(service.contains("PendingIntent.getService("));
         assert!(service.contains("private const val STOP_REQUEST_CODE = 14334"));

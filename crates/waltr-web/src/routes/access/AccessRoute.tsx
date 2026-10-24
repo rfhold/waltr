@@ -50,6 +50,20 @@ export function waltrLoginUrl(location: BrowserLocation) {
   return `/oidc/login?${query}`;
 }
 
+export function NativeAccessDiagnostic() {
+  const app = useAppState();
+  return (
+    <>
+      <Show when={app.accessDiagnostic?.()?.persistenceWarning}>
+        <InlineAlert tone="info">Secure sign-in storage is unavailable. Access may work for this session, but you may need to sign in again after restarting Waltr.</InlineAlert>
+      </Show>
+      <Show when={app.accessDiagnostic?.()?.failed}>
+        <InlineAlert tone="danger">Native sign-in or saved-session restoration failed. Try signing in again.</InlineAlert>
+      </Show>
+    </>
+  );
+}
+
 export function AccessRoute(props: { navigate?: (url: string) => void | Promise<void> }) {
   const app = useAppState();
   const [localError, setLocalError] = createSignal<string>();
@@ -108,6 +122,7 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
             : "Your Waltr session is missing or has expired. Sign in to restore access."}
         </p>
 
+        <NativeAccessDiagnostic />
         <Show when={access()?.error ?? localError()}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>

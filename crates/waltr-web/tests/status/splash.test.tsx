@@ -6,6 +6,22 @@ import { SplashRouteWithRouter } from "../support/routes";
 import { snapshotWithConfig } from "../support/snapshots";
 
 describe("splash status", () => {
+  test("shows the bounded native discovery explanation", () => {
+    renderWithAppState(() => <SplashRouteWithRouter />, {
+      clientError: new Error("Native access discovery failed. Retry connection."),
+      snapshot: undefined,
+    });
+    expect(screen.getByText("Unable to discover native sign-in configuration. Retry connection or switch server.")).toBeTruthy();
+  });
+
+  test("does not expose arbitrary startup failure details", () => {
+    renderWithAppState(() => <SplashRouteWithRouter />, {
+      clientError: new Error("SECRET https://secret.invalid/token"),
+      snapshot: undefined,
+    });
+    expect(screen.getByText("Unable to connect to Waltr.")).toBeTruthy();
+    expect(screen.queryByText(/SECRET/)).toBeNull();
+  });
   test("renders the Waltr splash logo before the app is ready", () => {
     renderWithAppState(() => <SplashRouteWithRouter />, {
       routePath: "/",

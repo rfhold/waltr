@@ -4,6 +4,7 @@ import { acceptNativeAppsBootstrap } from "../mcp-apps/policy";
 
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 import type {
+  AccessDiagnostic,
   ClientAdapter,
   ClientSnapshotListener,
 } from "./client";
@@ -26,7 +27,8 @@ type BridgeRecovery = {
 
 type BridgePayload =
   | { type: "state"; snapshot: ClientSnapshot }
-  | { type: "platform"; startup: unknown };
+  | { type: "platform"; startup: unknown }
+  | { type: "access"; diagnostic: AccessDiagnostic };
 
 type BridgeStartupState =
   | "starting"
@@ -64,6 +66,12 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   let eventQueue = Promise.resolve();
   const pendingEvents: BridgeEvent[] = [];
   const snapshotListeners = new Set<ClientSnapshotListener>();
+  let accessDiagnostic: AccessDiagnostic | undefined;
+  const diagnosticListeners = new Set<(diagnostic: AccessDiagnostic | undefined) => void>();
+  const publishDiagnostic = (diagnostic: AccessDiagnostic | undefined) => {
+    accessDiagnostic = diagnostic;
+    for (const listener of diagnosticListeners) listener(diagnostic);
+  };
 
   const publishSnapshot = (snapshot: ClientSnapshot) => {
     if (!snapshot.status.ready) dictation?.cancel();
@@ -74,7 +82,12 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     sequence = event.sequence;
     if (event.payload.type === "state") {
       publishSnapshot(event.payload.snapshot);
-    } else if (event.payload.startup !== "ready") {
+    } else if (event.payload.type === "access") {
+      publishDiagnostic({
+        persistenceWarning: event.payload.diagnostic?.persistenceWarning === true,
+        failed: event.payload.diagnostic?.failed === true,
+      });
+    } else if (event.payload.type === "platform" && event.payload.startup !== "ready") {
       dictation?.cancel();
     }
   };
@@ -106,6 +119,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         && canAnnounceGeneration(event);
       if (!resumesFreshGeneration) return;
       dictation?.dispose();
+      publishDiagnostic(undefined);
       generation = event.generation;
       dictation = dictationSupported ? nativeDictation(api.invoke, generation) : undefined;
       announcedGeneration = event.generation;
@@ -169,7 +183,9 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
       if (generation !== undefined) {
         await api.invoke("dispose_runtime", { generation }).catch(() => undefined);
       }
-      throw error;
+      throw new Error(error === "Native access discovery failed. Retry connection."
+        ? "Native access discovery failed. Retry connection."
+        : "Unable to start native client.");
     }
   };
 
@@ -183,6 +199,8 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     unlisten?.();
     unlisten = undefined;
     snapshotListeners.clear();
+    publishDiagnostic(undefined);
+    diagnosticListeners.clear();
     if (generation !== undefined) await api.invoke("dispose_runtime", { generation });
   };
 
@@ -206,6 +224,13 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
       return currentSnapshot;
     },
     dispose,
+    accessDiagnostic: {
+      subscribe: (listener) => {
+        diagnosticListeners.add(listener);
+        listener(accessDiagnostic);
+        return () => diagnosticListeners.delete(listener);
+      },
+    },
     access: serverId && serverId !== "local" ? {
       openLogin: async () => {
         if (disposed || generation === undefined) throw new Error("Native client is not ready");
@@ -235,7 +260,7 @@ export const loadClientAdapter = loadTauriClient;
 function canAnnounceGeneration(event: BridgeEvent) {
   return event.sequence === 0
     && (event.payload.type === "state"
-      || isBridgeStartupState(event.payload.startup));
+      || (event.payload.type === "platform" && isBridgeStartupState(event.payload.startup)));
 }
 
 function isBridgeStartupState(startup: unknown): startup is BridgeStartupState {

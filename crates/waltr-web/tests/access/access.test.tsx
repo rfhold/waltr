@@ -1,8 +1,10 @@
-import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
+import { render, fireEvent, screen, waitFor } from "@solidjs/testing-library";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { AuthAttemptSnapshot, ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
-import type { AccessOperations } from "../../src/platform/client";
+import type { AccessDiagnostic, AccessOperations, ClientAdapter } from "../../src/platform/client";
+import { AppStateProvider } from "../../src/app/state";
+import { AppLayout } from "../../src/routes/layouts/AppLayout";
 import { ServerSelectionContext } from "../../src/app/serverSelection";
 import { AccessRoute, waltrLoginUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
@@ -15,6 +17,32 @@ afterEach(() => {
 });
 
 describe("Waltr access", () => {
+  test("shows restoration failure on access screen and retains persistence warning after login succeeds", async () => {
+    let publish!: (snapshot: ClientSnapshot) => void;
+    let diagnostic!: (value: AccessDiagnostic | undefined) => void;
+    const adapter: ClientAdapter = {
+      snapshot: () => accessSnapshot("loginRequired"),
+      subscribe: (listener) => { publish = listener; return () => {}; },
+      start: async () => {},
+      dispose: () => {},
+      dispatch: async () => accessSnapshot("loginRequired"),
+      accessDiagnostic: { subscribe: (listener) => {
+        diagnostic = listener;
+        listener({ persistenceWarning: true, failed: true });
+        return () => {};
+      } },
+    };
+    render(() => <AppStateProvider loadClientAdapter={async () => adapter}>
+      <AppLayout><div>Authenticated shell</div></AppLayout>
+    </AppStateProvider>);
+    await screen.findByText("Native sign-in or saved-session restoration failed. Try signing in again.");
+    expect(screen.getByText(/Secure sign-in storage is unavailable/)).toBeTruthy();
+    diagnostic({ persistenceWarning: true, failed: false });
+    publish(accessSnapshot("authenticated"));
+    await screen.findByText("Authenticated shell");
+    expect(screen.getByText(/Secure sign-in storage is unavailable/)).toBeTruthy();
+    expect(screen.queryByText(/Native sign-in or saved-session restoration failed/)).toBeNull();
+  });
   test("starts login with the returned attempt ID and preserves the fragment", async () => {
     window.history.replaceState({}, "", "/sessions/session-a?panel=activity#turn-3");
     const commands: ClientCommand[] = [];

@@ -786,6 +786,7 @@ impl NativeCredentialProvider {
     }
 
     /// Clear credentials only when both the lease and token revision are current.
+    /// A current anonymous credential snapshot succeeds without invalidating its lease.
     #[must_use]
     pub fn clear_bearer_token_if_current(
         &self,
@@ -797,6 +798,9 @@ impl NativeCredentialProvider {
             || state.credential_revision != credential_revision
         {
             return false;
+        }
+        if state.authorization.is_none() {
+            return true;
         }
         state.lease_generation = state.lease_generation.saturating_add(1);
         state.credential_revision = state.credential_revision.saturating_add(1);
@@ -1552,6 +1556,48 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn anonymous_waltr_401_preserves_pending_credential_lease() {
+        let credentials = NativeCredentialProvider::new();
+        let lease = credentials.begin_credential_lease();
+        let revision = credentials.credential_revision();
+        let request = credentials.request_credentials();
+
+        let error = status_error(&waltr_access_status("login required"), &request);
+
+        assert!(error.is_waltr_login_required());
+        assert_eq!(credentials.credential_lease(), lease);
+        assert_eq!(credentials.credential_revision(), revision);
+        assert!(!credentials.has_bearer_token());
+        assert!(
+            credentials
+                .replace_bearer_token_if_current(lease, "restored-token")
+                .unwrap()
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stale_anonymous_waltr_401_does_not_reject_restored_credentials() {
+        let credentials = NativeCredentialProvider::new();
+        let lease = credentials.begin_credential_lease();
+        let request = credentials.request_credentials();
+        assert!(
+            credentials
+                .replace_bearer_token_if_current(lease, "restored-token")
+                .unwrap()
+        );
+        let revision = credentials.credential_revision();
+
+        let error = status_error(&waltr_access_status("login required"), &request);
+
+        assert_eq!(error.kind(), crate::ClientErrorKind::Other);
+        assert_eq!(credentials.credential_lease(), lease);
+        assert_eq!(credentials.credential_revision(), revision);
+        assert!(credentials.has_bearer_token());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn stale_waltr_401_does_not_clear_replacement_credentials() {
         let credentials = NativeCredentialProvider::new();
         credentials
@@ -1575,12 +1621,21 @@ mod tests {
         credentials
             .replace_bearer_token("current-token")
             .expect("token should install");
+        let lease = credentials.credential_lease();
+        let revision = credentials.credential_revision();
         let request = credentials.request_credentials();
 
         let error = status_error(&waltr_access_status("expired"), &request);
 
         assert!(error.is_waltr_login_required());
         assert!(!credentials.has_bearer_token());
+        assert_ne!(credentials.credential_lease(), lease);
+        assert!(credentials.credential_revision() > revision);
+        assert!(
+            !credentials
+                .replace_bearer_token_if_current(lease, "stale-refresh")
+                .unwrap()
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
