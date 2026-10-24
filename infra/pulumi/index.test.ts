@@ -623,11 +623,11 @@ describe("hosted MCP OAuth deployment", () => {
     assert.match(production, /^\s*waltr:protectData: true$/m);
     assert.match(
       preview,
-      /^\s*waltr:androidNativeRedirectUri: dev\.rfhold\.waltr:\/oauth2redirect$/m,
+      /^\s*waltr:androidNativeRedirectUri: dev\.waltr\.app:\/oauth2redirect$/m,
     );
     assert.match(
       production,
-      /^\s*waltr:androidNativeRedirectUri: dev\.rfhold\.waltr:\/oauth2redirect$/m,
+      /^\s*waltr:androidNativeRedirectUri: dev\.waltr\.app:\/oauth2redirect$/m,
     );
     assert.match(
       preview,

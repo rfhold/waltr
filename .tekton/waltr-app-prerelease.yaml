@@ -9,12 +9,12 @@ metadata:
 spec:
   taskRunSpecs:
     - pipelineTaskName: build-release-assets
-      serviceAccountName: waltr-tauri-build-v1
+      serviceAccountName: tauri-release-build-v1
       podTemplate:
         nodeSelector:
           kubernetes.io/arch: amd64
     - pipelineTaskName: publish-prerelease
-      serviceAccountName: waltr-forgejo-release-v1
+      serviceAccountName: forgejo-release-v1
   timeouts:
     pipeline: 3h0m0s
   params:
@@ -94,7 +94,7 @@ spec:
           volumes:
             - name: trusted-signers
               secret:
-                secretName: waltr-release-trusted-signers
+                secretName: release-trusted-signers
           steps:
             - name: policy
               image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
@@ -177,6 +177,8 @@ spec:
         params:
           - name: app-path
             value: crates/waltr-app
+          - name: artifact-prefix
+            value: waltr
           - name: version
             value: $(tasks.validate-prerelease.results.version)
           - name: android-version-code
@@ -184,13 +186,13 @@ spec:
           - name: builder-image
             value: cr.holdenitdown.net/rfhold/tauri-release-ci:rust1.96.0-tauri2.10.1-pnpm11.5.0-wasm0.2.122-android36
           - name: expected-signing-cert-sha256
-            value: "{{ WALTR_ANDROID_SIGNING_CERT_SHA256 }}"
+            value: "{{ ANDROID_SIGNING_CERT_SHA256 }}"
           - name: openbao-role
-            value: waltr-tauri-build-v1
+            value: tauri-release-build-v1
           - name: openbao-policy
-            value: waltr-tauri-build-v1
+            value: tauri-release-build-v1
           - name: openbao-signing-secret-path
-            value: kv/data/ci/waltr/android-signing
+            value: kv/data/ci/signing/android/release
         workspaces:
           - name: source
             workspace: source
@@ -259,11 +261,11 @@ spec:
               - waltr-$(tasks.validate-prerelease.results.version)-android-universal.apk
               - waltr-$(tasks.validate-prerelease.results.version)-linux-amd64.AppImage
           - name: openbao-role
-            value: waltr-forgejo-release-v1
+            value: forgejo-release-v1
           - name: openbao-policy
-            value: waltr-forgejo-release-v1
+            value: forgejo-release-v1
           - name: openbao-token-secret-path
-            value: kv/data/ci/waltr/forgejo-release
+            value: kv/data/ci/forgejo/release
         workspaces:
           - name: input
             workspace: source
