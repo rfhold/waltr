@@ -15,6 +15,7 @@ impl Factory for NativeFactory {
     }
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 pub(super) fn chunk_end(text: &str, limit: usize, utf16: bool) -> usize {
     let mut used = 0;
     for (offset, ch) in text.char_indices() {
