@@ -745,7 +745,9 @@ The prerelease PipelineRun references the shared homelab Tasks from the homelab 
 
 #### CI Image Adoption Boundaries
 
-The homelab Rust/web contract provides Bookworm, Rust 1.96.0, Node.js 24.18.0, pnpm 11.5.0, and wasm-bindgen CLI 0.2.122. Its pipeline defines native amd64/arm64 verification before a unique multi-architecture manifest and an immutable `image-reference` result. It publishes no `latest` tag.
+Maintained CI tool images use `latest` with `imagePullPolicy: Always`; the deployment steps select `cr.holdenitdown.net/rfhold/general-ci:latest`. Third-party tool images retain their exact version and digest pins, including the Alpine manifest-tool image and its shell scripts. Dockerfile bases, application runtime parameters, and verified deployment digests remain unchanged. The maintained Tauri builder also selects `latest`, subject to the publication prerequisite below.
+
+The homelab Rust/web contract provides Bookworm, Rust 1.96.0, Node.js 24.18.0, pnpm 11.5.0, and wasm-bindgen CLI 0.2.122. Its pipeline defines native amd64/arm64 verification before a unique multi-architecture manifest and an immutable `image-reference` result. After digest validation, the pipeline copies that verified manifest digest to `latest`; the unique tag and immutable result remain intact.
 
 Waltr's Dockerfile pins `build-base` to `cr.holdenitdown.net/rfhold/rust-web-ci@sha256:472959b480ef0f974ba75be2ee5aef4b6e20fd3f5fd1491b03559826ca1f30ce` after successful native amd64/arm64 verification and manifest publication. The server and test builds inherit Node, system packages, pnpm, the WASM target, and wasm-bindgen CLI from this image. The image supplies `/pnpm` on `PATH` and retains Cargo home at `/usr/local/cargo`, compatible with the application cache mounts. Its Cargo configuration replaces crates.io with the internal sparse mirror at `https://mirrors.holdenitdown.net/cargo/api/v1/cratesio/`; npm uses `https://mirrors.holdenitdown.net/npm/`. Dependency builds require access to these mirrors. The worker build retains its separate Rust base; Bookworm runtime images and application cache mounts remain unchanged. Offline contract tests check this adoption, but do not prove a Waltr image build or deployment.
 
@@ -753,7 +755,9 @@ The separate browser image supports Linux amd64 only. It supplies exact Playwrig
 
 #### Tauri Release Builder Contract
 
-[`.tekton/waltr-app-prerelease.yaml`](../.tekton/waltr-app-prerelease.yaml) selects `cr.holdenitdown.net/rfhold/tauri-release-ci:rust1.96.0-tauri2.10.1-pnpm11.5.0-wasm0.2.122-android36`. The shared homelab Task uses `imagePullPolicy: Always` for this tag-based builder.
+[`.tekton/waltr-app-prerelease.yaml`](../.tekton/waltr-app-prerelease.yaml) selects `cr.holdenitdown.net/rfhold/tauri-release-ci:latest`. The shared homelab Task retains `imagePullPolicy: Always` for this maintained CI image.
+
+Prerelease execution requires Homelab to publish the `latest` tag first. The Homelab publication change adds that tag; the local Waltr change neither publishes it nor proves registry availability. Until publication completes, the builder image cannot resolve.
 
 The source contract includes Rust 1.96.0, Clippy, rustfmt, Java 17, Android API 36, build-tools 36.0.0, and NDK 29.0.14206865. It also includes Tauri CLI 2.10.1, pnpm 11.5.0, wasm-bindgen CLI 0.2.122, and the required Android, WebAssembly, and Linux Rust targets.
 

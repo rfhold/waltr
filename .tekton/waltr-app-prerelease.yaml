@@ -184,7 +184,7 @@ spec:
           - name: android-version-code
             value: $(tasks.validate-prerelease.results.android-version-code)
           - name: builder-image
-            value: cr.holdenitdown.net/rfhold/tauri-release-ci:rust1.96.0-tauri2.10.1-pnpm11.5.0-wasm0.2.122-android36
+            value: cr.holdenitdown.net/rfhold/tauri-release-ci:latest
           - name: expected-signing-cert-sha256
             value: "{{ ANDROID_SIGNING_CERT_SHA256 }}"
           - name: openbao-role
