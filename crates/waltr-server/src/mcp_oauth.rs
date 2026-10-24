@@ -401,16 +401,10 @@ impl McpOAuthServer {
         .map_err(|_| McpOAuthError::Configuration)?;
         if config.allow_dcr || config.allow_cimd {
             let metadata_fetcher = if config.allow_cimd {
-                let fetcher = HardenedOAuthClientMetadataFetcher::production();
-                let fetcher = if config.allow_private_test_destinations {
-                    fetcher
-                        .with_destination_policy(Arc::new(PrivateNetworkOAuthCimdDestinationPolicy))
-                } else {
-                    let origins = cimd_trusted_origins(&config);
-                    let policy = TrustedPrivateOAuthCimdDestinationPolicy::new(origins)
-                        .map_err(|_| McpOAuthError::Configuration)?;
-                    fetcher.with_destination_policy(Arc::new(policy))
-                };
+                let fetcher = configure_cimd_metadata_fetcher(
+                    &config,
+                    HardenedOAuthClientMetadataFetcher::production(),
+                )?;
                 Some(Arc::new(fetcher) as _)
             } else {
                 None
@@ -623,6 +617,20 @@ impl McpOAuthServer {
             }
         }
         Ok(())
+    }
+}
+
+fn configure_cimd_metadata_fetcher(
+    config: &McpOAuthEnabledConfig,
+    fetcher: HardenedOAuthClientMetadataFetcher,
+) -> Result<HardenedOAuthClientMetadataFetcher, McpOAuthError> {
+    let fetcher = fetcher.with_loopback_redirects(config.allow_loopback_redirects);
+    if config.allow_private_test_destinations {
+        Ok(fetcher.with_destination_policy(Arc::new(PrivateNetworkOAuthCimdDestinationPolicy)))
+    } else {
+        let policy = TrustedPrivateOAuthCimdDestinationPolicy::new(cimd_trusted_origins(config))
+            .map_err(|_| McpOAuthError::Configuration)?;
+        Ok(fetcher.with_destination_policy(Arc::new(policy)))
     }
 }
 
@@ -1374,6 +1382,86 @@ mod tests {
             McpOAuthConfig::from_values(&access_config(), &values),
             Err(McpOAuthConfigError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn cimd_native_loopback_metadata_follows_hosted_configuration() {
+        use mcp::oauth::{LoopbackOAuthCimdDestinationPolicy, OAuthClientMetadataFetcher as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("metadata listener");
+        let client_id = format!(
+            "http://{}/oauth/client.json",
+            listener.local_addr().expect("metadata address")
+        );
+        let redirects = [
+            "http://127.0.0.1:64539/callback",
+            "http://127.0.0.1:64539/mcp/oauth/callback",
+        ];
+        let document = serde_json::json!({
+            "client_id": client_id,
+            "client_name": "Native test client",
+            "application_type": "native",
+            "redirect_uris": redirects,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        });
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/oauth/client.json",
+            get(move || {
+                let document = document.clone();
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(document)
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        for allow in [true, false] {
+            let values = HashMap::from([
+                ("WALTR_MCP_REQUIRED_SCOPES", "mcp:use".to_owned()),
+                (
+                    "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
+                    "/run/secrets/mcp-keys".to_owned(),
+                ),
+                ("WALTR_MCP_OAUTH_ALLOW_CIMD", "true".to_owned()),
+                ("WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS", allow.to_string()),
+            ]);
+            let McpOAuthConfig::Enabled(config) =
+                McpOAuthConfig::from_values(&access_config(), &values).expect("hosted config")
+            else {
+                panic!("OIDC mode should enable hosted OAuth");
+            };
+            assert!(config.allow_cimd);
+            assert!(!config.allow_dcr);
+            let fetcher = configure_cimd_metadata_fetcher(
+                &config,
+                HardenedOAuthClientMetadataFetcher::loopback_for_tests(),
+            )
+            .expect("metadata fetcher")
+            .with_destination_policy(Arc::new(LoopbackOAuthCimdDestinationPolicy));
+            let result = fetcher.fetch(client_id.clone()).await;
+            if allow {
+                let fetched = result.expect("enabled native loopback metadata");
+                assert_eq!(fetched.document.redirect_uris, redirects);
+            } else {
+                assert!(result.is_err(), "disabled native loopback metadata");
+            }
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("metadata server stopped")
+                .is_cancelled()
+        );
     }
 
     #[test]
