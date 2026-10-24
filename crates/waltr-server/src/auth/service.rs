@@ -3554,7 +3554,6 @@ mod tests {
                 post(|| async {
                     Json(serde_json::json!({
                         "client_id": "registered-client",
-                        "application_type": "web",
                         "redirect_uris": ["https://waltr.example/outbound-oauth/callback"],
                         "grant_types": ["authorization_code", "refresh_token"],
                         "response_types": ["code"],
@@ -3590,6 +3589,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(registration.client_id, "registered-client");
+        assert_eq!(registration.application_type, None);
         server.abort();
     }
 

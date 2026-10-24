@@ -129,9 +129,12 @@ continues to use `reqwest::Client::new()` behavior; stdio ignores the HTTP clien
 
 Authorization is optional and applies only to HTTP. Protected-resource and issuer URLs
 require HTTPS except for loopback development URLs. Discovery validates exact resource
-and issuer identities. Dynamic client registration carries and validates
-`application_type`; Waltr uses `web` for HTTPS callbacks and `native` for loopback/native
-callbacks. RFC 9207 `iss` responses are validated before code redemption or error
+and issuer identities. Dynamic client registration requests require `application_type`.
+Responses can omit this metadata; an explicit value must match the request.
+Public-client validation still requires identical redirect URIs, grant types, response
+types, and client name, plus authentication method `none` and no client or registration credentials.
+The hosted server echoes the requested `application_type`.
+RFC 9207 `iss` responses are validated before code redemption or error
 display, and persisted registrations remain bound to their authorization-server issuer.
 
 Hosted public-client metadata need not declare the nonstandard
