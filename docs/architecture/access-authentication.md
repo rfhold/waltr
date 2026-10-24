@@ -271,6 +271,8 @@ Every embedded server restart creates another marker. It rejects stale attempts 
 
 Outbound MCP authorization honors configured and reusable saved preregistrations first. When upstream offers both CIMD and DCR, Waltr checks its own metadata hostname through local DNS with a two-second bound. Private, loopback, link-local, mixed public/private, empty, failed, or timed-out results prefer DCR, even after a saved CIMD registration. Public results retain CIMD preference, even after a saved DCR registration. Waltr reuses a suitable saved registration within the selected method. CIMD-only servers retain CIMD; hosts without a metadata URI retain preregistration or DCR. This heuristic does not prove remote reachability and does not weaken outbound HTTP or SSRF protections. Selection applies to new authorization; current credentials remain intact until a successful flow replaces them.
 
+Outbound DCR requests use `web` for HTTPS callbacks and `native` for loopback/native callbacks. Upstream responses can omit `application_type`; Waltr does not infer a value. An explicit value must match the request. Redirect URIs, grants, response types, and client name must still match. Waltr still requires authentication method `none` and rejects client secrets and registration credentials.
+
 Same-generation embedded reauthorization can reuse its valid DCR registration. That registration cannot transfer to a replacement generation, which performs fresh DCR when selected. Standalone durable attempts, credentials, and registration reuse retain their current behavior.
 
 See [Server Persistence](persistence.md), [Clients](clients.md), and [Deployment](../deployment.md).

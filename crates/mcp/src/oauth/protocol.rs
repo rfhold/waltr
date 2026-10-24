@@ -522,8 +522,9 @@ pub struct McpClientRegistrationResponse {
     /// Client identifier issue time as Unix seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id_issued_at: Option<u64>,
-    /// Registered application type.
-    pub application_type: McpOAuthApplicationType,
+    /// Registered application type, when supported by the authorization server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_type: Option<McpOAuthApplicationType>,
     /// Registered redirect URIs.
     pub redirect_uris: Vec<String>,
     /// Registered grant types.
@@ -603,7 +604,9 @@ impl McpClientRegistrationResponse {
             || self.client_secret_expires_at.is_some()
             || self.registration_access_token.is_some()
             || self.registration_client_uri.is_some()
-            || self.application_type != request.application_type
+            || self
+                .application_type
+                .is_some_and(|application_type| application_type != request.application_type)
             || canonical(&self.redirect_uris) != canonical(&request.redirect_uris)
             || response_grants != request_grants
             || self.response_types != request.response_types

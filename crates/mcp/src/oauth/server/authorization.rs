@@ -880,7 +880,7 @@ async fn register(
                         registration_access_token: None,
                         registration_client_uri: None,
                         client_id_issued_at: u64::try_from(now / 1000).ok(),
-                        application_type: registration.application_type,
+                        application_type: Some(registration.application_type),
                         redirect_uris: registration.redirect_uris,
                         grant_types: vec![
                             McpOAuthGrantType::AuthorizationCode,

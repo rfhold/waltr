@@ -254,7 +254,7 @@ fn registration_response_rejects_credentials_mismatches_and_redacts_secrets() {
         registration_access_token: None,
         registration_client_uri: None,
         client_id_issued_at: Some(1),
-        application_type: request.application_type,
+        application_type: Some(request.application_type),
         redirect_uris: request.redirect_uris.clone(),
         grant_types: request.grant_types.clone(),
         response_types: request.response_types.clone(),
@@ -268,8 +268,102 @@ fn registration_response_rejects_credentials_mismatches_and_redacts_secrets() {
     assert!(response.validate_public_response(&request).is_err());
     assert!(!format!("{response:?}").contains("registration-secret"));
     response.registration_access_token = None;
-    response.application_type = McpOAuthApplicationType::Native;
+    response.application_type = Some(McpOAuthApplicationType::Native);
     assert!(response.validate_public_response(&request).is_err());
+    response.application_type = None;
+    response.validate_public_response(&request).unwrap();
+
+    let valid = response;
+    for (field, value) in [
+        ("client_id", json!("")),
+        ("client_secret", json!("client-secret")),
+        ("client_secret_expires_at", json!(0)),
+        ("registration_access_token", json!("registration-secret")),
+        (
+            "registration_client_uri",
+            json!("https://auth.example/register/client"),
+        ),
+        ("redirect_uris", json!(["https://other.example/callback"])),
+        ("grant_types", json!(["authorization_code"])),
+        ("response_types", json!([])),
+        ("client_name", json!("Other client")),
+    ] {
+        let mut invalid = serde_json::to_value(&valid).unwrap();
+        invalid[field] = value;
+        let invalid: McpClientRegistrationResponse = serde_json::from_value(invalid).unwrap();
+        assert!(
+            invalid.validate_public_response(&request).is_err(),
+            "{field}"
+        );
+    }
+    let mut confidential = serde_json::to_value(&valid).unwrap();
+    confidential["token_endpoint_auth_method"] = json!("client_secret_basic");
+    assert!(serde_json::from_value::<McpClientRegistrationResponse>(confidential).is_err());
+}
+
+#[test]
+fn registration_response_accepts_omitted_application_type_without_inference() {
+    for (application_type, redirect_uri) in [
+        (
+            McpOAuthApplicationType::Web,
+            "https://client.example/callback",
+        ),
+        (
+            McpOAuthApplicationType::Native,
+            "http://127.0.0.1:49152/callback",
+        ),
+    ] {
+        let mut request = web_registration();
+        request.application_type = application_type;
+        request.redirect_uris = vec![redirect_uri.to_owned()];
+        let wire = json!({
+            "client_id": "chikin-client",
+            "client_id_issued_at": 1,
+            "redirect_uris": request.redirect_uris,
+            "grant_types": request.grant_types,
+            "response_types": request.response_types,
+            "token_endpoint_auth_method": "none",
+            "client_name": request.client_name
+        });
+        let response: McpClientRegistrationResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(response.application_type, None);
+        response.validate_public_response(&request).unwrap();
+        assert!(
+            serde_json::to_value(&response)
+                .unwrap()
+                .get("application_type")
+                .is_none()
+        );
+
+        let mut present = wire.clone();
+        present["application_type"] = json!(application_type);
+        let response: McpClientRegistrationResponse = serde_json::from_value(present).unwrap();
+        response.validate_public_response(&request).unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["application_type"],
+            json!(application_type)
+        );
+
+        let mut mismatched = wire.clone();
+        mismatched["application_type"] = json!(match application_type {
+            McpOAuthApplicationType::Web => McpOAuthApplicationType::Native,
+            McpOAuthApplicationType::Native => McpOAuthApplicationType::Web,
+        });
+        let response: McpClientRegistrationResponse = serde_json::from_value(mismatched).unwrap();
+        assert!(response.validate_public_response(&request).is_err());
+
+        let mut null = wire.clone();
+        null["application_type"] = serde_json::Value::Null;
+        let response: McpClientRegistrationResponse = serde_json::from_value(null).unwrap();
+        assert_eq!(response.application_type, None);
+        response.validate_public_response(&request).unwrap();
+
+        for invalid in [json!("unsupported"), json!(true), json!(42), json!({})] {
+            let mut invalid_wire = wire.clone();
+            invalid_wire["application_type"] = invalid;
+            assert!(serde_json::from_value::<McpClientRegistrationResponse>(invalid_wire).is_err());
+        }
+    }
 }
 
 #[test]
