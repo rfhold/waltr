@@ -1772,6 +1772,9 @@ where
                     start.token,
                 )
                 .await;
+                if let Err(error) = &outcome {
+                    tracing::error!(session_id = %session_id.as_str(), run_id, %error, "session run failed");
+                }
                 let terminal_state = terminal_state(&outcome);
                 tracing::Span::current().record("terminal_state", terminal_state);
                 tracing::info!(session_id = %session_id.as_str(), run_id, terminal_state, "session run completed");
@@ -2426,16 +2429,32 @@ where
         }
     }
 
-    async fn persist_authentication_failure(
+    async fn persist_run_failure(
         &self,
         session_id: &SessionId,
-        message: String,
-        failure: crate::AuthenticationFailure,
+        error: &AgentSessionRunError,
+        incarnation: super::SessionIncarnation,
+        token: &CancellationToken,
     ) -> Result<()> {
-        let operation = self.control.session(session_id.clone()).operation().await;
+        let operation = self
+            .control
+            .session(session_id.clone())
+            .operation_for_incarnation(incarnation)
+            .await
+            .ok_or_else(|| crate::LlmError::Protocol {
+                provider: "session",
+                message: "session changed during runtime resolution".to_owned(),
+            })?;
+        if token.is_cancelled() {
+            return Ok(());
+        }
         AgentSessionRuntime::new(&self.store)
             .with_session_run_context(self.run_context(session_id), operation.incarnation())
-            .fail_authentication(session_id, message, failure)
+            .fail_run(
+                session_id,
+                error.to_string(),
+                error.authentication_failure(),
+            )
             .await?;
         Ok(())
     }
@@ -2850,20 +2869,34 @@ where
     async {
         let runtime = match runtime {
             Some(runtime) => runtime,
-            None => match coordinator.resolve_runtime_with_identity(&session_id).await {
-                Ok((runtime, identity)) => {
-                    coordinator
-                        .set_active_inference_identity(&session_id, run_id, identity.clone())
-                        .await;
-                    runtime
-                }
-                Err(error) => {
-                    if let Some(failure) = error.authentication_failure() {
+            None => {
+                let incarnation = coordinator
+                    .control
+                    .session(session_id.clone())
+                    .operation()
+                    .await
+                    .incarnation();
+                match coordinator.resolve_runtime_with_identity(&session_id).await {
+                    Ok((runtime, identity)) => {
                         coordinator
-                            .persist_authentication_failure(&session_id, error.to_string(), failure)
-                            .await?;
+                            .set_active_inference_identity(&session_id, run_id, identity.clone())
+                            .await;
+                        runtime
                     }
-                    return Err(error);
+                    Err(error) => {
+                        if let Err(persistence_error) = coordinator
+                            .persist_run_failure(
+                                &session_id,
+                                &error,
+                                incarnation,
+                                &token,
+                            )
+                            .await
+                        {
+                            tracing::error!(session_id = %session_id.as_str(), %error, %persistence_error, "failed to persist session runtime failure");
+                        }
+                        return Err(error);
+                    }
                 }
             },
         };
@@ -4546,7 +4579,9 @@ spec: { systemPrompt: gamma prompt }
         let factory = AgentSessionRuntimeFactory::new(
             worker_handle(std::env::temp_dir()).await,
             std::env::temp_dir(),
-            FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-switch-test-auth.json")),
+            FileCredentialStore::new(
+                std::env::temp_dir().join("waltr-agent-switch-test-auth.json"),
+            ),
             catalog.resolved("alpha").unwrap().clone(),
         )
         .with_agent_catalog(catalog)
@@ -4873,7 +4908,9 @@ spec:
         let factory = AgentSessionRuntimeFactory::new(
             worker_handle(std::env::temp_dir()).await,
             std::env::temp_dir(),
-            FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-switch-task-auth.json")),
+            FileCredentialStore::new(
+                std::env::temp_dir().join("waltr-agent-switch-task-auth.json"),
+            ),
             catalog.resolved("alpha").unwrap().clone(),
         )
         .with_agent_catalog(catalog)
@@ -5820,6 +5857,97 @@ spec: {}"
     }
 
     #[tokio::test]
+    async fn queued_runtime_failure_is_published_before_release_and_next_run_survives() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let resolutions = Arc::new(AtomicU64::new(0));
+        let runtime_provider = provider.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let factory = AgentSessionRuntimeFactory::new(
+            worker_handle(directory.path()).await,
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
+        )
+        .with_runtime_provider(move |_| {
+            if resolutions.fetch_add(1, Ordering::SeqCst) == 1 {
+                Err(crate::AgentSessionRuntimeError::FailedPrecondition(
+                    "runtime construction failed".to_owned(),
+                ))
+            } else {
+                Ok(crate::AgentRuntimeProvider::new(
+                    ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                    runtime_provider.clone(),
+                ))
+            }
+        });
+        let sessions =
+            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        let active = sessions
+            .submit_prompt(id.clone(), "active", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let failed = sessions
+            .submit(
+                id.clone(),
+                AgentSessionRunInput::Continue,
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        let next = sessions
+            .submit_prompt(id.clone(), "next", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let mut watch = sessions.watch_sessions();
+        provider.release_active();
+        active.handle.wait().await.unwrap();
+        failed.handle.wait().await.expect_err("runtime should fail");
+        next.handle.wait().await.unwrap();
+        let record = sessions.load(&id).await.unwrap().record;
+        assert_eq!(record.summary().status, SessionStatus::Finished);
+        assert_eq!(
+            record
+                .journal
+                .iter()
+                .filter(|event| matches!(event, SessionJournalEvent::Failed { .. }))
+                .count(),
+            1
+        );
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let SessionListEvent::Upsert(summary) = update.event
+                && let SessionStatus::Failed {
+                    message,
+                    authentication_failure,
+                } = summary.status
+            {
+                assert!(message.contains("runtime construction failed"));
+                assert!(authentication_failure.is_none());
+                assert!(
+                    summary.coordination.phase == crate::SessionCoordinationPhase::Running,
+                    "failure is published before releasing ownership"
+                );
+                break;
+            }
+        }
+        assert_eq!(provider.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
     async fn continue_authentication_preflight_does_not_append_rollback() {
         let directory = tempfile::tempdir().expect("temp directory");
         let factory = AgentSessionRuntimeFactory::new(
@@ -5862,6 +5990,184 @@ spec: {}"
         let after = sessions.load(&session_id).await.unwrap().record;
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.journal, before.journal);
+    }
+
+    struct PreparationFailure {
+        template: bool,
+        authentication: bool,
+    }
+
+    impl PreparationFailure {
+        fn error(&self) -> LlmError {
+            if self.authentication {
+                LlmError::AuthenticationFailure {
+                    failure: crate::AuthenticationFailure {
+                        target: crate::AuthTarget::provider("preparation"),
+                        reason: crate::AuthenticationFailureReason::CredentialRejected,
+                        mcp_authorization: None,
+                    },
+                    message: "preparation failed".to_owned(),
+                }
+            } else {
+                LlmError::Protocol {
+                    provider: "test",
+                    message: "preparation failed".to_owned(),
+                }
+            }
+        }
+    }
+
+    impl crate::middleware::AgentMiddleware for PreparationFailure {
+        async fn before_provider_request(
+            &self,
+            _ctx: &mut crate::middleware::context::RequestContext<'_>,
+            _request: &mut crate::middleware::context::ModelRequestDraft,
+        ) -> crate::Result<crate::middleware::HookOutcome> {
+            assert!(
+                !self.template,
+                "template failure must occur during initialization"
+            );
+            Err(self.error())
+        }
+
+        async fn render_template_reference(
+            &self,
+            _ctx: &mut crate::middleware::context::TemplateRenderContext<'_>,
+            _reference: &crate::template::TemplateReference,
+        ) -> crate::Result<crate::template::TemplateReferenceRender> {
+            if self.template {
+                Err(self.error())
+            } else {
+                Ok(crate::template::TemplateReferenceRender::Continue)
+            }
+        }
+    }
+
+    struct NeverDispatchedProvider;
+
+    impl LlmStream for NeverDispatchedProvider {
+        fn name(&self) -> &'static str {
+            "never_dispatched"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            panic!("request preparation must fail before dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_failure_publishes_durable_failed_summary_without_dispatch() {
+        for (template, authentication, prior_outcome) in [
+            (false, false, None),
+            (false, true, None),
+            (true, false, None),
+            (true, false, Some(SessionJournalEvent::Finished)),
+            (
+                true,
+                false,
+                Some(SessionJournalEvent::Failed {
+                    message: "prior failure".to_owned(),
+                    authentication_failure: None,
+                }),
+            ),
+            (
+                true,
+                false,
+                Some(SessionJournalEvent::Suspended {
+                    suspension: crate::Suspension::Interrupted { work: Vec::new() },
+                }),
+            ),
+        ] {
+            assert_preparation_failure(template, authentication, prior_outcome).await;
+        }
+    }
+
+    async fn assert_preparation_failure(
+        template: bool,
+        authentication: bool,
+        prior_outcome: Option<SessionJournalEvent>,
+    ) {
+        let agent = AgentRuntime::builder(
+            ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+            Arc::new(NeverDispatchedProvider),
+        )
+        .with_middleware(PreparationFailure {
+            template,
+            authentication,
+        })
+        .build();
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let mut request = SessionCreateRequest::new(SessionId::generate());
+        request.start = crate::SessionStart::Fresh {
+            messages: vec![crate::SessionStartMessage::user("durable prompt").unwrap()],
+        };
+        let created = sessions.create(request).await.unwrap().record;
+        let id = created.id;
+        let prior_failures = usize::from(matches!(
+            &prior_outcome,
+            Some(SessionJournalEvent::Failed { .. })
+        ));
+        if let Some(event) = prior_outcome {
+            sessions
+                .store
+                .append_journal(&id, created.revision, vec![event])
+                .await
+                .unwrap();
+        }
+        let mut watch = sessions.watch_sessions();
+        let prompt = if template {
+            r#"@resource(test, "failure")"#
+        } else {
+            "durable prompt"
+        };
+        let mut run = sessions.prompt(&agent, id.clone(), prompt).stream();
+        let mut errors = 0;
+        while let Some(event) = run.next().await {
+            if let Err(error) = event {
+                errors += 1;
+                assert!(error.to_string().contains("preparation failed"));
+                assert_eq!(error.authentication_failure().is_some(), authentication);
+                let summary = sessions.load(&id).await.unwrap().record.summary();
+                assert!(
+                    matches!(summary.status, SessionStatus::Failed { message, .. } if message.contains("preparation failed"))
+                );
+            }
+        }
+        assert_eq!(errors, 1);
+        let record = sessions.load(&id).await.unwrap().record;
+        assert_eq!(record.snapshot().prompts[0], "durable prompt");
+        assert_eq!(
+            record
+                .journal
+                .iter()
+                .filter(|event| matches!(event, SessionJournalEvent::Failed { .. }))
+                .count(),
+            prior_failures + 1
+        );
+        assert!(
+            !record
+                .journal
+                .iter()
+                .any(|event| matches!(event, SessionJournalEvent::ProviderRequestRecorded { .. }))
+        );
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let SessionListEvent::Upsert(summary) = update.event
+                && let SessionStatus::Failed {
+                    message,
+                    authentication_failure,
+                } = &summary.status
+                && message.contains("preparation failed")
+            {
+                assert_eq!(authentication_failure.is_some(), authentication);
+                assert!(!summary.progress.running);
+                assert_eq!(summary.progress.phase, crate::SessionProgressPhase::Failed);
+                break;
+            }
+        }
     }
 
     #[tokio::test]

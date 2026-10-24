@@ -333,18 +333,24 @@ where
             .map_err(session_store_error)
     }
 
-    pub(crate) async fn fail_authentication(
+    pub(crate) async fn fail_run(
         &self,
         id: &SessionId,
         message: String,
-        authentication_failure: AuthenticationFailure,
+        authentication_failure: Option<AuthenticationFailure>,
     ) -> Result<SessionRecord> {
         let record = self.load_session(id).await?;
+        if matches!(
+            record.snapshot().status,
+            SessionStatus::Failed { .. } | SessionStatus::Suspended(_)
+        ) {
+            return Ok(record);
+        }
         self.append_journal_and_reload(
             record,
             vec![SessionJournalEvent::Failed {
                 message,
-                authentication_failure: Some(authentication_failure),
+                authentication_failure,
             }],
         )
         .await

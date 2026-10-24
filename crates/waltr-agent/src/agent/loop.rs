@@ -55,7 +55,8 @@ use super::{
         RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionContextMode,
         SessionCreateRequest, SessionId, SessionIncarnation, SessionJournalEvent, SessionOperation,
         SessionRecord, SessionRollbackTarget, SessionRunContext, SessionSnapshot, SessionStart,
-        SessionStartMessage, SessionStore, SessionStoreError, Suspension as SessionSuspension,
+        SessionStartMessage, SessionStatus, SessionStore, SessionStoreError,
+        Suspension as SessionSuspension,
     },
 };
 use super::{ProviderRetryConfig, tool::ToolFuture};
@@ -89,6 +90,7 @@ where
     session_run_context: Option<SessionRunContext>,
     session_incarnation: Option<SessionIncarnation>,
     session_initialized: bool,
+    template_submission_journal_len: Option<usize>,
     session_metadata_values: BTreeMap<String, Value>,
     middleware_state: MiddlewareStateLog,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
@@ -201,6 +203,7 @@ where
             session_run_context: run.session_run_context,
             session_incarnation: None,
             session_initialized: false,
+            template_submission_journal_len: None,
             session_metadata_values: BTreeMap::new(),
             middleware_state: MiddlewareStateLog::default(),
             system_prompt_override: run.system_prompt_override,
@@ -217,9 +220,22 @@ where
         }
     }
 
+    pub(super) async fn next(self) -> Option<(Result<AgentTimelineEvent>, Self)> {
+        let (result, mut state) = self.next_event().await?;
+        if let Err(error) = &result {
+            tracing::error!(session_id = %state.session_id.as_str(), %error, "agent run failed");
+            if let Err(persistence_error) = state.record_run_failure(error).await {
+                tracing::error!(session_id = %state.session_id.as_str(), %error, %persistence_error, "failed to persist agent run failure");
+            }
+            state.pending.clear();
+            state.phase = AgentLoopPhase::Done;
+        }
+        Some((result, state))
+    }
+
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::needless_continue, clippy::single_match_else)]
-    pub(super) async fn next(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
+    async fn next_event(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
         loop {
             if self.cancellation_token.is_cancelled() {
                 if let Err(error) = self.record_interrupted().await {
@@ -1472,7 +1488,12 @@ where
             })
             .map_err(session_store_error)?,
         );
-        self.flush_middleware_state().await
+        self.flush_middleware_state().await?;
+        self.template_submission_journal_len = self
+            .session_record
+            .as_ref()
+            .map(|record| record.journal.len());
+        Ok(())
     }
 
     async fn render_pending_template_prompts(&mut self, superseding_prompt: bool) -> Result<bool> {
@@ -1857,22 +1878,80 @@ where
         Ok(event)
     }
 
-    async fn pending_failed_session_event(&mut self, error: &LlmError) {
-        if self.session_initialized {
-            drop(
-                self.append_journal_event(SessionJournalEvent::Failed {
-                    message: error.to_string(),
-                    authentication_failure: error.authentication_failure().cloned(),
-                })
-                .await,
-            );
-        }
+    async fn record_run_failure(&mut self, error: &LlmError) -> Result<()> {
         self.close_turn_span("error");
+        if self.cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+        let operation = match &self.session_run_context {
+            Some(context) => Some(context.operation().await),
+            None => None,
+        };
+        if self.cancellation_token.is_cancelled()
+            || operation
+                .as_ref()
+                .is_some_and(|operation| Some(operation.incarnation()) != self.session_incarnation)
+        {
+            return Ok(());
+        }
+        // Resume can append a prompt before a later initialization step fails.
+        if !self.session_initialized && self.session_record.is_some() {
+            let record = self
+                .session_store
+                .load(&self.session_id)
+                .await
+                .map_err(session_store_error)?;
+            self.hydrate_from_record(&record);
+        }
+        let Some(record) = &self.session_record else {
+            return Ok(());
+        };
+        // Template submission retains the prior status until rendering appends a prompt.
+        // Preserve only terminal outcomes established after this submission.
+        let inherited_outcome = !self.session_initialized
+            && self.template_submission_journal_len.is_some_and(|start| {
+                !record.journal.iter().skip(start).any(|event| match event {
+                    SessionJournalEvent::Finished
+                    | SessionJournalEvent::Failed { .. }
+                    | SessionJournalEvent::Suspended { .. }
+                    | SessionJournalEvent::Interrupted
+                    | SessionJournalEvent::TurnInterrupted { .. } => true,
+                    SessionJournalEvent::Timeline(event)
+                        if event.kind == TimelineEventKind::SessionStatusChanged =>
+                    {
+                        matches!(
+                            event.status,
+                            Some(
+                                TimelineStatus::Finished
+                                    | TimelineStatus::Failed
+                                    | TimelineStatus::AwaitingExternalInput
+                                    | TimelineStatus::AwaitingToolResults
+                                    | TimelineStatus::Interrupted
+                            )
+                        )
+                    }
+                    _ => false,
+                })
+            });
+        if !inherited_outcome
+            && matches!(
+                record.snapshot().status,
+                SessionStatus::Finished
+                    | SessionStatus::Failed { .. }
+                    | SessionStatus::Suspended(_)
+            )
+        {
+            return Ok(());
+        }
+        self.append_journal_event(SessionJournalEvent::Failed {
+            message: error.to_string(),
+            authentication_failure: error.authentication_failure().cloned(),
+        })
+        .await
     }
 
     async fn retry_or_fail_provider_error(&mut self, error: LlmError) -> Result<()> {
         let Some(decision) = self.retry_config.classify(&error, self.provider_attempt) else {
-            self.pending_failed_session_event(&error).await;
             return Err(error);
         };
 
