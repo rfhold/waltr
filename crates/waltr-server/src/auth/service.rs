@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -7,6 +7,16 @@ use axum::{
     response::{Html, IntoResponse, Response as AxumResponse},
     routing::get,
 };
+use mcp::oauth::{
+    McpBearerChallenge, McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret,
+    McpPublicClientRegistrationRequest, McpRevocationRequest, McpRevocationTokenTypeHint,
+    McpTokenEndpointAuthMethod, authorization_server_metadata_urls,
+    protected_resource_metadata_urls,
+};
+use prost::Message;
+use tokio::sync::Mutex;
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
 use waltr::grpc::waltr::auth::v1::{
     AuthAttemptLifecycle, AuthAttemptStatus, AuthCompletionMode, AuthMethod, AuthStatus,
     AuthStatusKind, AuthTarget as ProtoAuthTarget, AuthenticationDomain, AuthenticationFailure,
@@ -22,16 +32,6 @@ use waltr_agent::{
     CredentialRefreshError, CredentialStore, McpConnectionKind, McpOAuthRegistration,
     McpOAuthRegistrationMethod, McpResolvedConnection, OAuthCredential, RefreshMode,
 };
-use mcp::oauth::{
-    McpBearerChallenge, McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret,
-    McpPublicClientRegistrationRequest, McpRevocationRequest, McpRevocationTokenTypeHint,
-    McpTokenEndpointAuthMethod, authorization_server_metadata_urls,
-    protected_resource_metadata_urls,
-};
-use prost::Message;
-use tokio::sync::Mutex;
-use tonic::{Request, Response, Status};
-use uuid::Uuid;
 
 #[cfg(test)]
 use waltr_agent::{
@@ -50,6 +50,65 @@ use super::outbound_http::{
 use super::{AuthTarget, oauth};
 
 const OAUTH_COMPLETION_LEASE_MS: i64 = 30_000;
+const CLIENT_METADATA_DNS_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Preference only: local DNS cannot establish reachability from an authorization server.
+async fn client_metadata_is_public<F, Fut>(uri: &str, lookup: F) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<Vec<IpAddr>>>,
+{
+    let Ok(url) = url::Url::parse(uri) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => metadata_address_is_public(IpAddr::V4(address)),
+        Some(url::Host::Ipv6(address)) => metadata_address_is_public(IpAddr::V6(address)),
+        Some(url::Host::Domain(hostname)) => {
+            match tokio::time::timeout(CLIENT_METADATA_DNS_TIMEOUT, lookup(hostname.to_owned()))
+                .await
+            {
+                Ok(Ok(addresses)) => {
+                    !addresses.is_empty() && addresses.into_iter().all(metadata_address_is_public)
+                }
+                _ => false,
+            }
+        }
+        None => false,
+    }
+}
+
+fn metadata_address_is_public(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return metadata_address_is_public(IpAddr::V4(mapped));
+            }
+            let segments = address.segments();
+            // Conservatively exclude special-purpose and transition prefixes from global unicast.
+            (segments[0] & 0xe000) == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] < 0x0200)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] < 0x1000)
+        }
+    }
+}
 
 /// gRPC auth service for provider credentials.
 #[derive(Debug)]
@@ -671,7 +730,23 @@ impl AuthService {
         &self,
         request: McpRegistrationRequest<'_>,
     ) -> Result<McpOAuthRegistration, Status> {
-        let persisted = self.reusable_mcp_registration(&request).await?;
+        self.resolve_mcp_registration_with_lookup(request, |hostname| async move {
+            tokio::net::lookup_host((hostname.as_str(), 443))
+                .await
+                .map(|addresses| addresses.map(|address| address.ip()).collect())
+        })
+        .await
+    }
+
+    async fn resolve_mcp_registration_with_lookup<F, Fut>(
+        &self,
+        request: McpRegistrationRequest<'_>,
+        lookup: F,
+    ) -> Result<McpOAuthRegistration, Status>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<IpAddr>>>,
+    {
         if let Some(registration) = configured_mcp_registration(
             &self.outbound_oauth,
             request.server_key,
@@ -680,15 +755,11 @@ impl AuthService {
         )? {
             return Ok(registration);
         }
+        let persisted = self.reusable_mcp_registration(&request).await?;
         if let Some(registration) = persisted
             .as_ref()
             .filter(|registration| registration.method == McpOAuthRegistrationMethod::Preregistered)
         {
-            return Ok(registration.clone());
-        }
-        if let Some(registration) = persisted.as_ref().filter(|registration| {
-            registration.method == McpOAuthRegistrationMethod::ClientMetadata
-        }) {
             return Ok(registration.clone());
         }
         if request
@@ -696,7 +767,15 @@ impl AuthService {
             .client_id_metadata_document_supported
             == Some(true)
             && let Some(client_id) = self.outbound_oauth.client_metadata_uri.clone()
+            && (request.authorization_server.registration_endpoint.is_none()
+                || client_metadata_is_public(&client_id, lookup).await)
         {
+            if let Some(registration) = persisted.as_ref().filter(|registration| {
+                registration.method == McpOAuthRegistrationMethod::ClientMetadata
+                    && registration.client_id == client_id
+            }) {
+                return Ok(registration.clone());
+            }
             return Ok(McpOAuthRegistration {
                 method: McpOAuthRegistrationMethod::ClientMetadata,
                 client_id,
@@ -1953,6 +2032,304 @@ mod tests {
         local_admission::{LocalBearer, LocalCredentialStore},
         persistence::{DatabaseConfig, Persistence},
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn client_metadata_dns_heuristic_is_bounded_and_conservative() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "2001:db8::1",
+            "2001:2::1",
+            "3fff::1",
+        ] {
+            assert!(
+                !metadata_address_is_public(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for address in ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(
+                metadata_address_is_public(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for uri in [
+            "https://127.0.0.1/client",
+            "https://[::1]/client",
+            "invalid",
+        ] {
+            assert!(
+                !client_metadata_is_public(uri, |_| async { panic!("literal needs no DNS") }).await
+            );
+        }
+        assert!(
+            client_metadata_is_public("https://[2606:4700:4700::1111]/client", |_| async {
+                panic!("literal needs no DNS")
+            })
+            .await
+        );
+        for addresses in [
+            vec![],
+            vec!["8.8.8.8", "10.0.0.1"],
+            vec!["8.8.8.8", "fc00::1"],
+        ] {
+            assert!(
+                !client_metadata_is_public("https://waltr.example/client", |_| async {
+                    Ok(addresses
+                        .into_iter()
+                        .map(|address| address.parse().unwrap())
+                        .collect())
+                })
+                .await
+            );
+        }
+        let start = tokio::time::Instant::now();
+        assert!(
+            !client_metadata_is_public("https://waltr.example/client", |_| {
+                std::future::pending::<std::io::Result<Vec<IpAddr>>>()
+            })
+            .await
+        );
+        assert_eq!(start.elapsed(), CLIENT_METADATA_DNS_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn mcp_registration_preference_matrix_preserves_credentials() {
+        use McpOAuthRegistrationMethod::{ClientMetadata, Dynamic, Preregistered};
+
+        // name, public DNS, DNS error, DCR offered, metadata URI, saved method, configured, expected
+        for (name, public, dns_error, dcr, metadata_uri, saved, configured, expected) in [
+            (
+                "configured first",
+                false,
+                false,
+                true,
+                true,
+                Some(ClientMetadata),
+                true,
+                Preregistered,
+            ),
+            (
+                "saved prereg first",
+                false,
+                true,
+                true,
+                true,
+                Some(Preregistered),
+                false,
+                Preregistered,
+            ),
+            (
+                "private both",
+                false,
+                false,
+                true,
+                true,
+                None,
+                false,
+                Dynamic,
+            ),
+            (
+                "public both",
+                true,
+                false,
+                true,
+                true,
+                None,
+                false,
+                ClientMetadata,
+            ),
+            ("DNS failure", false, true, true, true, None, false, Dynamic),
+            (
+                "private saved CIMD",
+                false,
+                false,
+                true,
+                true,
+                Some(ClientMetadata),
+                false,
+                Dynamic,
+            ),
+            (
+                "private saved DCR",
+                false,
+                false,
+                true,
+                true,
+                Some(Dynamic),
+                false,
+                Dynamic,
+            ),
+            (
+                "public saved DCR",
+                true,
+                false,
+                true,
+                true,
+                Some(Dynamic),
+                false,
+                ClientMetadata,
+            ),
+            (
+                "public saved CIMD",
+                true,
+                false,
+                true,
+                true,
+                Some(ClientMetadata),
+                false,
+                ClientMetadata,
+            ),
+            (
+                "CIMD only",
+                false,
+                true,
+                false,
+                true,
+                None,
+                false,
+                ClientMetadata,
+            ),
+            (
+                "saved CIMD only",
+                false,
+                true,
+                false,
+                true,
+                Some(ClientMetadata),
+                false,
+                ClientMetadata,
+            ),
+            ("embedded", false, true, true, false, None, false, Dynamic),
+        ] {
+            let (mut service, server, requests) = successful_lifecycle_service().await;
+            let service_mut = Arc::get_mut(&mut service).unwrap();
+            let client_id = "https://waltr.example/client";
+            service_mut.outbound_oauth.client_metadata_uri =
+                metadata_uri.then(|| client_id.to_owned());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app =
+                successful_oauth_router(&base, "https://resource.example/mcp", requests.clone());
+            let registration_server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let mut metadata = mcp::McpAuthorizationServerMetadata::new(&base);
+            metadata.client_id_metadata_document_supported = Some(true);
+            metadata.registration_endpoint = dcr.then(|| format!("{base}/register"));
+            let redirect = "https://waltr.example/callback";
+            let target = AuthTarget::mcp_server("remote");
+            let resource = "https://resource.example/mcp";
+            if configured {
+                service_mut.outbound_oauth.environment = Arc::new(HashMap::from([
+                    (
+                        "WALTR_MCP_REMOTE_OAUTH_CLIENT_ID".into(),
+                        "configured-client".into(),
+                    ),
+                    ("WALTR_MCP_REMOTE_OAUTH_ISSUER".into(), base.clone().into()),
+                ]));
+            }
+            if let Some(method) = saved {
+                service
+                    .credential_store
+                    .write(
+                        &target.credential_key(),
+                        OAuthCredential::mcp(
+                            OAuthTokenSet::bearer("old-access", None, None),
+                            McpOAuthContext {
+                                resource: resource.to_owned(),
+                                issuer: base.clone(),
+                                registration: McpOAuthRegistration {
+                                    method,
+                                    client_id: if method == ClientMetadata {
+                                        client_id
+                                    } else {
+                                        "saved-client"
+                                    }
+                                    .to_owned(),
+                                    redirect_uri: redirect.to_owned(),
+                                    ..McpOAuthRegistration::default()
+                                },
+                                endpoints: McpOAuthEndpoints::default(),
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let registration = service
+                .resolve_mcp_registration_with_lookup(
+                    McpRegistrationRequest {
+                        server_key: "remote",
+                        target: &target,
+                        resource,
+                        authorization_server: &metadata,
+                        redirect_uri: redirect,
+                        policy: OutboundHttpPolicy::loopback_test(),
+                    },
+                    |_| async move {
+                        assert!(
+                            !configured && saved != Some(Preregistered) && dcr && metadata_uri,
+                            "{name}"
+                        );
+                        if dns_error {
+                            Err(std::io::Error::other("synthetic DNS failure"))
+                        } else {
+                            Ok(vec![
+                                if public { "8.8.8.8" } else { "10.0.0.1" }.parse().unwrap(),
+                            ])
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(registration.method, expected, "{name}");
+            let fresh_dcr = expected == Dynamic && saved != Some(Dynamic);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                usize::from(fresh_dcr),
+                "{name}"
+            );
+            if expected == Dynamic && saved == Some(Dynamic)
+                || expected == Preregistered && !configured
+            {
+                assert_eq!(registration.client_id, "saved-client", "{name}");
+            }
+            if configured {
+                assert_eq!(registration.client_id, "configured-client");
+            }
+            if saved.is_some() {
+                let old = service
+                    .credential_store
+                    .read(&target.credential_key())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    old.credential.token.access_token.secret(),
+                    "old-access",
+                    "{name}"
+                );
+                let old_registration = &old.credential.mcp_context().unwrap().registration;
+                assert_eq!(old_registration.method, saved.unwrap(), "{name}");
+                if saved == Some(expected) && !configured {
+                    assert_eq!(&registration, old_registration, "{name}");
+                }
+            }
+            registration_server.abort();
+            server.abort();
+        }
+    }
 
     #[test]
     fn missing_per_server_mcp_registration_allows_discovery_mechanisms() {

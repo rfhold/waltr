@@ -269,6 +269,8 @@ Embedded attempts and MCP credentials persist an opaque per-generation callback 
 
 Every embedded server restart creates another marker. It rejects stale attempts and hides stale marked credentials. Status and cancel return not found for stale attempts without mutating them. Outbound MCP targets therefore require reauthorization after restart.
 
+Outbound MCP authorization honors configured and reusable saved preregistrations first. When upstream offers both CIMD and DCR, Waltr checks its own metadata hostname through local DNS with a two-second bound. Private, loopback, link-local, mixed public/private, empty, failed, or timed-out results prefer DCR, even after a saved CIMD registration. Public results retain CIMD preference, even after a saved DCR registration. Waltr reuses a suitable saved registration within the selected method. CIMD-only servers retain CIMD; hosts without a metadata URI retain preregistration or DCR. This heuristic does not prove remote reachability and does not weaken outbound HTTP or SSRF protections. Selection applies to new authorization; current credentials remain intact until a successful flow replaces them.
+
 Same-generation embedded reauthorization can reuse its valid DCR registration. That registration cannot transfer to a replacement generation, which performs fresh DCR when selected. Standalone durable attempts, credentials, and registration reuse retain their current behavior.
 
 See [Server Persistence](persistence.md), [Clients](clients.md), and [Deployment](../deployment.md).
