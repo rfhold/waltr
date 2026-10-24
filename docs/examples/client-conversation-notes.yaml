@@ -1,0 +1,20 @@
+# macOS clipboard-only example; does not type or paste into another application.
+version: 1
+keybinds:
+  - id: conversation-notes-copy
+    key: Ctrl+Alt+Shift+Space
+    mode: hold
+    maxCaptureSeconds: 3600
+    routine:
+      name: audio-conversation-notes
+      trigger: record-notes
+      input: audio
+      output: notes
+    audio:
+      device: default
+      sampleRateHz: 24000
+      channels: 1
+    command:
+      argv: [/usr/bin/pbcopy]
+      stdin: '{{ text }}'
+      timeoutSeconds: 10

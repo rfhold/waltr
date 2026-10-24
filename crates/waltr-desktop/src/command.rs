@@ -23,9 +23,9 @@ pub const MAX_ARGUMENTS: usize = 64;
 /// Maximum bytes per argument or stdin template before expansion.
 pub const MAX_TEMPLATE_BYTES: usize = 16 * 1024;
 /// Maximum final text input size, in bytes.
-pub const MAX_TEXT_BYTES: usize = 128 * 1024;
+pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 /// Maximum combined argv and stdin size after expansion, in bytes.
-pub const MAX_EXPANDED_BYTES: usize = 256 * 1024;
+pub const MAX_EXPANDED_BYTES: usize = 1024 * 1024;
 /// Maximum captured size per output stream, in bytes.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// Maximum configurable command deadline, in seconds.

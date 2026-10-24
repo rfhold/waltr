@@ -228,6 +228,7 @@ pub struct CaptureWorker {
     worker: tokio::task::JoinHandle<Result<(), Error>>,
     result: Arc<std::sync::Mutex<Option<Result<(), Error>>>>,
     joined: bool,
+    started: Arc<Mutex<Option<std::time::Instant>>>,
 }
 impl std::fmt::Debug for CaptureWorker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -266,11 +267,17 @@ impl CaptureWorker {
         let frames = tx.clone();
         let result = Arc::new(std::sync::Mutex::new(None));
         let terminal = result.clone();
+        let started = Arc::new(Mutex::new(None));
+        let ready = started.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let run = || {
                 config.validate().map_err(|_| Error::Unsupported)?;
                 let max_chunk = config.limits.max_chunk_bytes;
                 let mut source = factory.open(config)?;
+                *ready
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now());
                 observer.emit(crate::host::Diagnostic::Stage(
                     crate::host::Stage::CaptureReady,
                 ));
@@ -333,6 +340,7 @@ impl CaptureWorker {
             worker,
             result,
             joined: false,
+            started,
         }
     }
     /// Request flush, including if initialization has not yet returned.
@@ -389,6 +397,9 @@ impl CaptureWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .unwrap_or(Ok(()))
+    }
+    pub(crate) fn started_lane(&self) -> Arc<Mutex<Option<std::time::Instant>>> {
+        self.started.clone()
     }
     pub(crate) fn stop_lane(&self) -> Arc<AtomicU8> {
         self.control.clone()

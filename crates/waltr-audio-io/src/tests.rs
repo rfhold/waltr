@@ -83,6 +83,24 @@ fn formats_clipping_and_nonfinite() {
 }
 
 #[test]
+fn hour_duration_ceiling_is_explicit_and_bounded() {
+    let mut config = Config::default();
+    assert_eq!(config.limits.max_duration_seconds, 300);
+    for seconds in [3600, 3660] {
+        config.limits.max_duration_seconds = seconds;
+        assert_eq!(config.validate(), Ok(()));
+        assert_eq!(
+            config.max_output_bytes().unwrap(),
+            u64::from(seconds) * 24_000 * 2
+        );
+    }
+    for seconds in [0, 3661, u32::MAX] {
+        config.limits.max_duration_seconds = seconds;
+        assert_eq!(config.validate(), Err(Error::InvalidConfig));
+    }
+}
+
+#[test]
 fn limits_and_alignment() {
     let mut config = Config::default();
     config.target_channels = 2;

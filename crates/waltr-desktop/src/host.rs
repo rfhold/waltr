@@ -343,6 +343,7 @@ impl Hold {
                 trigger: &binding.routine.trigger,
                 input: &binding.routine.input,
                 output: &binding.routine.output,
+                max_capture_seconds: binding.max_capture_seconds,
             },
             &self.control.release,
             &guard,

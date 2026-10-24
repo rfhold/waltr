@@ -1,9 +1,9 @@
 //! Strict configuration contract tests without environment mutation.
+use std::path::Path;
 use waltr_desktop::{
     command::CommandSpec,
     config::{self, ConfigError},
 };
-use std::path::Path;
 
 const VALID: &str = "version: 1\nkeybinds:\n  - id: dictate-copy\n    key: Ctrl+Alt+Space\n    mode: hold\n    routine: { name: audio-transcribe-cleanup, trigger: dictate, input: audio, output: clean-text }\n    audio: { device: default, sampleRateHz: 24000, channels: 1 }\n    command: { argv: [pbcopy], stdin: '{{ text }}', timeoutSeconds: 10 }\n";
 
@@ -19,6 +19,52 @@ fn documented_typing_example_uses_cleanup_routine() {
     assert_eq!(binding.routine.trigger, "dictate");
     assert_eq!(binding.routine.input, "audio");
     assert_eq!(binding.routine.output, "clean-text");
+}
+
+#[test]
+fn conversation_notes_example_copies_only_final_notes() {
+    let config = config::parse(
+        include_str!("../../../docs/examples/client-conversation-notes.yaml").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(config.keybinds.len(), 1);
+    let binding = &config.keybinds[0];
+    assert!(binding.typing.is_none());
+    assert_eq!(binding.routine.name, "audio-conversation-notes");
+    assert_eq!(binding.routine.trigger, "record-notes");
+    assert_eq!(binding.routine.input, "audio");
+    assert_eq!(binding.routine.output, "notes");
+    let command = binding.command.as_ref().unwrap();
+    assert_eq!(command.argv, ["/usr/bin/pbcopy"]);
+    assert_eq!(command.stdin, "{{ text }}");
+    assert_eq!(binding.audio.sample_rate_hz, 24000);
+    assert_eq!(binding.audio.channels, 1);
+    assert_eq!(binding.max_capture_seconds, Some(3600));
+}
+
+#[test]
+fn capture_deadline_is_opt_in_and_bounded() {
+    assert_eq!(
+        config::parse(VALID.as_bytes()).unwrap().keybinds[0].max_capture_seconds,
+        None
+    );
+    for seconds in [1, 3600] {
+        let yaml = VALID.replace(
+            "mode: hold",
+            &format!("mode: hold\n    maxCaptureSeconds: {seconds}"),
+        );
+        assert_eq!(
+            config::parse(yaml.as_bytes()).unwrap().keybinds[0].max_capture_seconds,
+            Some(seconds)
+        );
+    }
+    for seconds in ["0", "3601", "-1", "1.5"] {
+        let yaml = VALID.replace(
+            "mode: hold",
+            &format!("mode: hold\n    maxCaptureSeconds: {seconds}"),
+        );
+        assert!(config::parse(yaml.as_bytes()).is_err());
+    }
 }
 
 #[test]

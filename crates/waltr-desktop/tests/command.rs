@@ -1,7 +1,7 @@
 //! Local ephemeral process fixtures; no clipboard or live services.
 #![cfg(unix)]
-use waltr_desktop::command::{self, CommandError, CommandSpec, Stream};
 use tokio_util::sync::CancellationToken;
+use waltr_desktop::command::{self, CommandError, CommandSpec, Stream};
 
 fn fixture(script: &str, arguments: &[&str], stdin: &str) -> CommandSpec {
     // Only static test fixture scripts are executed by the shell. Template
@@ -37,7 +37,7 @@ async fn literal_stdin_arguments_and_nonrecursive_templates() {
 
 #[tokio::test]
 async fn pre_spawn_bounds_and_cancel() {
-    let spec = fixture("exit 99", &[], "{{ text }}{{ text }}");
+    let spec = fixture("exit 99", &[], "{{ text }}{{ text }}x");
     let cancel = CancellationToken::new();
     assert_eq!(
         command::run(

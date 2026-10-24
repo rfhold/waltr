@@ -124,7 +124,11 @@ Chat session identity serves only as a local draft fence, not interaction source
 Default core limits cover eight queued messages, one MiB of encoded queue data, and 256 KiB per chunk.
 Complete Run requests have a 32 MiB encoded-body limit.
 Text state permits one MiB, 4,096 segments, and 64 lifetime stream IDs per direction.
-Hosts can select tighter limits; desktop text state uses 256 KiB and each output action accepts at most 128 KiB.
+Hosts can select tighter limits; native chat and default desktop holds retain at most 256 KiB of text state.
+Desktop holds with `maxCaptureSeconds` retain at most 512 KiB of text and segment IDs, with a 512 KiB encoded chunk bound.
+Direct commands accept at most 512 KiB of final text.
+The combined command argv/stdin expansion budget is one MiB; templates and command stdout/stderr keep their separate bounds.
+Live external typing keeps its separate 128 KiB work budget.
 `committed_prefix(port)` exposes only contiguous frozen segments in first-appearance order, up to the first draft segment.
 The accessor rejects ambiguous selected-port streams; it supplies no terminal-success guarantee.
 `live_text(port)` applies the same selected-stream validation and exposes the current hypothesis, including drafts.
@@ -197,7 +201,20 @@ The native/transient reserve already counts the consumer's pending chunk.
 An independent **20-second absolute deadline** runs from RPC open through Accepted, including credential/transport setup and response headers.
 Expiration reports the fixed `AcceptanceTimeout` diagnostic (`rpc_acceptance_timeout`), cancels the RPC, discards the backlog, and joins capture.
 Accepted disarms this deadline; it does not limit hold duration, output processing, model runtime, or native cleanup.
-The native capture duration limit remains independently bounded at 300 seconds.
+Default native capture retains its independent 300-second sample ceiling; sample overflow remains an error, not a successful stop.
+An optional keybind-level `maxCaptureSeconds` accepts integer values from 1 through 3600; omission preserves default hold and chat policies.
+The [conversation-notes example](../examples/client-conversation-notes.yaml) opts into 3600 seconds and a final clipboard command.
+The timer starts when the capture factory returns a ready source and counts wall-clock time, even during silence.
+During startup, the same duration also bounds the wait before the host requests a normal stop.
+A stop request during startup remains effective when the source opens; OS initialization and teardown still lack portable hard deadlines.
+The timer requests the same idempotent stop as key release; it does not cancel the RPC or impose an output deadline.
+The native sample ceiling permits the selected capture duration plus 60 seconds for stop/drain, with a library maximum of 3660 seconds.
+Queue sizes and backpressure remain unchanged; the allowance does not authorize extra retained audio or silent truncation.
+The host drains all accepted audio, sends successful `InputClosed` then `InputCompleted`, and awaits final output with the RPC open.
+The notes Routine can then finish diarization and both helper agents before one successful clipboard command.
+Earlier release stops capture normally; a release after automatic completion cannot repeat the command.
+Cancellation, access loss, and shutdown still suppress output actions and take precedence over normal stop.
+Local limits do not guarantee one-hour provider acceptance, remote processing time, or live microphone and clipboard behavior.
 No timeout or failure automatically retries or replays dispatched remote work.
 RPC input remains empty until Accepted; all buffered PCM precedes subsequently captured samples.
 Normal release before Accepted stops capture, retains and drains its complete flush after acceptance, then closes and finishes input once.

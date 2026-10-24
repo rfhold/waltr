@@ -157,6 +157,12 @@ impl Config {
             ] {
                 field(value)?;
             }
+            if binding
+                .max_capture_seconds
+                .is_some_and(|seconds| !(1..=3600).contains(&seconds))
+            {
+                return Err(ConfigError::Invalid("maxCaptureSeconds must be 1..3600"));
+            }
             match &binding.audio.device {
                 DeviceSelector::Default => {}
                 DeviceSelector::Id(value) | DeviceSelector::Name(value) => field(value)?,
@@ -265,6 +271,9 @@ pub struct Keybind {
     pub key: String,
     /// Initial interaction mode.
     pub mode: Mode,
+    /// Optional wall-clock capture deadline; normal flush, not interaction cancellation.
+    #[serde(default, rename = "maxCaptureSeconds")]
+    pub max_capture_seconds: Option<u32>,
     /// User-selected remote identifiers; no discovery is performed.
     pub routine: Routine,
     /// Requested native capture format and device.

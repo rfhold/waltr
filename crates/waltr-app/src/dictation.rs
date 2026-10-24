@@ -415,6 +415,7 @@ impl Job {
                 trigger: &self.selection.trigger,
                 input: &self.selection.input,
                 output: &self.selection.output,
+                max_capture_seconds: None,
             },
             &self.finish,
             &guard,

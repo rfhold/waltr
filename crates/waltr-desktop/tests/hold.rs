@@ -209,6 +209,7 @@ impl RoutineInteractionService for Fake {
             0
         };
         let tail = stream::once(async move {
+            let mut closed = false;
             while let Some(message) = input.message().await? {
                 match message.event {
                     Some(wire::interact_request::Event::InputChunk(chunk)) => {
@@ -219,7 +220,16 @@ impl RoutineInteractionService for Fake {
                             fake.pcm.lock().unwrap().extend(bytes);
                         }
                     }
-                    Some(wire::interact_request::Event::InputCompleted(_)) => break,
+                    Some(wire::interact_request::Event::InputClosed(value)) => {
+                        assert!(!closed);
+                        assert_eq!(value.status, 1);
+                        assert!(value.failure.is_none());
+                        closed = true;
+                    }
+                    Some(wire::interact_request::Event::InputCompleted(_)) => {
+                        assert!(closed, "normal input close must precede completion");
+                        break;
+                    }
                     Some(wire::interact_request::Event::Cancel(_)) => {
                         return Err(RpcStatus::cancelled("cancelled"));
                     }
@@ -284,6 +294,7 @@ async fn fixture() -> (
 #[derive(Default)]
 struct Mock {
     started: AtomicBool,
+    duration_ceiling: AtomicUsize,
     stopped: AtomicBool,
     joined: AtomicBool,
     burst: AtomicBool,
@@ -301,8 +312,12 @@ struct Samples {
 }
 struct MockFactory(Arc<Mock>);
 impl Factory for MockFactory {
-    fn open(&self, _config: waltr_audio_io::Config) -> Result<Box<dyn Source>, capture::Error> {
+    fn open(&self, config: waltr_audio_io::Config) -> Result<Box<dyn Source>, capture::Error> {
         let state = &self.0;
+        state.duration_ceiling.store(
+            config.limits.max_duration_seconds as usize,
+            Ordering::SeqCst,
+        );
         state.started.store(true, Ordering::SeqCst);
         let startup = state.startup.lock().unwrap().take();
         if let Some(rx) = startup {
@@ -390,6 +405,127 @@ keybinds:
     b.command.as_mut().unwrap().argv[4] = path.to_str().unwrap().into();
     b
 }
+#[tokio::test]
+async fn capture_auto_stop_drains_silence_tail_and_long_notes_once_with_release_and_cancel_races() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    for case in [
+        "no-release",
+        "early-release",
+        "racing-release",
+        "cancel",
+        "access-loss",
+    ] {
+        fake.completed.store(false, Ordering::SeqCst);
+        fake.uploads.store(0, Ordering::SeqCst);
+        let path = dir.path().join(case);
+        let mut binding = binding(&path, "hour-notes");
+        let seconds = if case == "early-release" { 3600 } else { 1 };
+        binding.max_capture_seconds = Some(seconds);
+        let mock = Arc::new(Mock {
+            tail_only: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let (hold, control) = Hold::press(&AudioAdmission::default()).unwrap();
+        let generation = CancellationToken::new();
+        let drive = async {
+            match case {
+                "no-release" => (),
+                "early-release" => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    control.release();
+                }
+                _ => {
+                    while !mock.stopped.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    match case {
+                        "racing-release" => control.release(),
+                        "cancel" => control.cancel(),
+                        "access-loss" => generation.cancel(),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                hold.run(
+                    &binding,
+                    &transport,
+                    Arc::new(MockFactory(mock.clone())),
+                    &generation
+                ),
+                drive
+            )
+        })
+        .await
+        .unwrap();
+        assert!(mock.joined.load(Ordering::SeqCst));
+        assert_eq!(
+            mock.duration_ceiling.load(Ordering::SeqCst),
+            seconds as usize + 60
+        );
+        if matches!(case, "cancel" | "access-loss") {
+            assert_eq!(result, Err(Error::Cancelled));
+            assert!(!path.exists());
+        } else {
+            assert_eq!(result, Ok(()));
+            assert!(fake.completed.load(Ordering::SeqCst));
+            assert_eq!(fake.uploads.load(Ordering::SeqCst), 100);
+            assert_eq!(std::fs::read(&path).unwrap(), vec![b'x'; 512 * 1024 - 64]);
+            // Late key-up after successful automatic completion cannot repeat the command.
+            control.release();
+            control.release();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 512 * 1024 - 64);
+        }
+    }
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_stop_during_startup_remains_pending_until_native_open_returns() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty");
+    let mut binding = binding(&path, "test");
+    binding.max_capture_seconds = Some(1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mock = Arc::new(Mock {
+        startup: Mutex::new(Some(rx)),
+        empty: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let (hold, _control) = Hold::press(&AudioAdmission::default()).unwrap();
+    let startup = async {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!mock.joined.load(Ordering::SeqCst));
+        tx.send(()).unwrap();
+    };
+    let generation = CancellationToken::new();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            hold.run(
+                &binding,
+                &transport,
+                Arc::new(MockFactory(mock.clone())),
+                &generation
+            ),
+            startup
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(mock.stopped.load(Ordering::SeqCst));
+    assert!(mock.joined.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 0);
+    assert!(!path.exists());
+    stop.cancel();
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn empty_capture_never_opens_rpc_or_runs_command_and_next_hold_works() {
     use waltr_desktop::host::{Diagnostic, Observer};
@@ -620,12 +756,7 @@ async fn failed_and_stale_postrelease_output_never_execute() {
         );
         assert!(result.is_err());
         if name == "large" {
-            assert_eq!(
-                result,
-                Err(Error::Command(
-                    waltr_desktop::command::CommandError::InputLimit
-                ))
-            );
+            assert_eq!(result, Err(Error::Interaction));
         }
         assert!(!path.exists());
         assert!(mock.joined.load(Ordering::SeqCst));
@@ -1062,7 +1193,8 @@ async fn shared_chat_consumer_releases_or_cancels_with_small_frames_before_admis
                         routine: "delay-accepted-250",
                         trigger: "dictate",
                         input: "audio",
-                        output: "clean-text"
+                        output: "clean-text",
+                        max_capture_seconds: None,
                     },
                     &release,
                     &guard,
@@ -1229,6 +1361,21 @@ async fn actor_requires_explicit_typing_capability_and_delivers_with_current_fen
 }
 
 fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
+    if name == "hour-notes" {
+        let mut events = vec![text_event("one", &"x".repeat(512 * 1024 - 64), true)];
+        events.extend([
+            event(Event::OutputClosed(wire::InteractionOutputClosed {
+                stream_id: "out".into(),
+                status: 1,
+                failure: None,
+            })),
+            event(Event::Completed(wire::InteractionCompleted {
+                status: wire::RoutineInvocationStatus::Succeeded as i32,
+                failure: None,
+            })),
+        ]);
+        return events;
+    }
     if name.starts_with("typing") {
         return vec![
             text_event("two", "\nsecond\t界", true),
@@ -1250,7 +1397,7 @@ fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
                 wire::TextUpdate {
                     segment_id: "one".into(),
                     text: if name == "large" {
-                        "x".repeat(128 * 1024 + 1)
+                        "x".repeat(256 * 1024 + 1)
                     } else {
                         "literal $(touch nope); '{{ invocationId }}'".into()
                     },

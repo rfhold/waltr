@@ -97,11 +97,11 @@ impl Default for Config {
     }
 }
 
-/// Hard resource limits. Values may be lowered, but cannot exceed the defaults except
-/// `max_chunk_bytes` (up to 256 KiB). Raw buffers contain at most 4096 interleaved samples.
+/// Hard resource limits. Defaults can be lowered; duration may be raised to 3660 seconds
+/// and `max_chunk_bytes` to 256 KiB. Raw buffers contain at most 4096 interleaved samples.
 #[derive(Clone, Debug)]
 pub struct Limits {
-    /// Maximum accepted input duration, up to 300 seconds.
+    /// Maximum accepted input duration, default 300, up to 3660 seconds.
     pub max_duration_seconds: u32,
     /// Upper bound on queued wire bytes, up to 1 MiB.
     pub output_queue_bytes: usize,
@@ -141,7 +141,7 @@ impl Config {
         if !(8_000..=48_000).contains(&self.target_rate)
             || self.target_channels != 1
             || l.max_duration_seconds == 0
-            || l.max_duration_seconds > 300
+            || l.max_duration_seconds > 3660
             || l.output_queue_bytes < 2
             || l.output_queue_bytes > 1024 * 1024
             || l.output_queue_items == 0

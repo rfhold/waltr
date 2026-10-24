@@ -157,6 +157,10 @@ models:
 
 Model keys, recognition model IDs, recognizers, languages, and voices are explicit operator configuration, not discovery or a guarantee that an upstream endpoint supports them. At least one capability must be true. Recognition accepts 1–3 nonempty language codes, 8–48 kHz PCM, and 1–8 channels. Synthesis accepts 8–48 kHz mono PCM. Capability declarations are checked locally; they do not probe upstream support. The interaction adapter maps speaking rate, requires streaming capability, and rejects nonzero pitch. It never substitutes unary speech calls.
 
+Recognition supports the optional boolean `recognition.diarization`, which defaults to `false` when absent. For an endpoint with cumulative diarization support, `true` sends an empty Google `RecognitionFeatures.diarization_config`; no speaker-count constraints accompany it. The Routine adapter expects provisional cumulative text followed by one final cumulative response with attributed words. This opt-in does not probe backend support or enable diarization on current models. See the [Routine transcript contract](routines.md#speech-and-text) for text output and limits.
+
+The [conversation-notes example](../examples/routines/audio-conversation-notes.yaml) selects a separate `speech/diarized-dictation` model with `recognition.diarization: true`. Keep the ordinary `speech/dictation` model disabled for diarization to preserve plain transcription and cleanup behavior.
+
 Speech models reject inference options, token limits, LLM capabilities, cost/catalog matching fields, wrong transport/model kinds, and mismatched option families. Inference providers cannot contain STT/TTS models or speech options. Inference defaults cannot select a speech provider. Existing LLM resources need no new fields.
 
 `resource_catalog::speech::resolve_speech_model(configuration, provider_key, model_key, expected_kind, streaming)` returns owned `ResolvedSpeechModel { provider_key, model_key, endpoint, capabilities, settings }`. `SpeechSettings` is `Recognition(SpeechRecognitionOptions)` or `Synthesis(SpeechSynthesisOptions)`. Resolution uses a pinned snapshot and performs no network calls. The interaction runtime constructs adapters from those resolved settings. Complete catalog validation checks Routine selections and exact model/port PCM compatibility before publication.
@@ -269,6 +273,12 @@ Each keybind requires `id`, `key`, `mode`, `routine`, `audio`, and exactly one o
 Absent actions, explicit nulls, unknown action fields, and both actions together are invalid.
 Version 1 retains the legacy `command: { argv, stdin, timeoutSeconds }` syntax without implicit defaults between actions.
 Only `mode: hold` exists.
+An optional keybind-level `maxCaptureSeconds` accepts 1–3,600 seconds.
+At that deadline, the hold uses normal release: stop capture, drain accepted audio, close input, and continue receiving the Routine result.
+It does not cancel finalization or run the output action before successful completion.
+Earlier release still finishes normally; a later release causes no second output action.
+Without this option, native capture retains its existing five-minute safety limit.
+The [conversation-notes client example](../examples/client-conversation-notes.yaml) selects 3,600 seconds and copies only the final notes.
 This schema configures the current audio hold adapter, not arbitrary native hooks or device context.
 Chords use unique modifiers in `Ctrl`, `Alt`, `Shift`, `Super` order, followed by a supported key.
 Native registration still depends on platform capabilities and user approval.
@@ -309,7 +319,7 @@ The action delivers interim hypotheses immediately; identical updates and final 
 Revisions replace the changed suffix through Backspace events, with common-prefix and deletion counts at extended grapheme boundaries.
 The action permits 128 KiB of cumulative work per hold: inserted UTF-8 bytes plus deleted graphemes.
 Each awaited write contains at most 1 KiB.
-The source state retains the desktop 256 KiB text limit.
+The source state retains 256 KiB by default, or 512 KiB when `maxCaptureSeconds` is configured; the separate 128 KiB typing-work limit is unchanged.
 
 CR, LF, tab, and Unicode line/paragraph separators become spaces; CRLF becomes one space.
 All other control characters, including DEL and C0/C1 controls, reject the complete hypothesis before any deletion or replacement.
@@ -340,7 +350,7 @@ The executor expands no environment variables, shell syntax, or tildes.
 An explicitly configured shell still grants arbitrary local code execution.
 
 The default command timeout is ten seconds; valid values span 1–300 seconds.
-Limits permit 64 argv items, 16 KiB per template, 128 KiB final text, and 256 KiB total expanded argv plus stdin.
+Limits permit 64 argv items, 16 KiB per template, 512 KiB final text, and 1 MiB total expanded argv plus stdin.
 Each output pipe permits 64 KiB. Diagnostics exclude command values, text, and output contents.
 Timeout and cancellation kill and wait for the direct child.
 The host must await that result; kill-on-drop does not acknowledge shutdown.

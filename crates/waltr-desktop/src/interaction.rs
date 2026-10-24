@@ -16,7 +16,7 @@ use waltr_client::{
 /// Absolute deadline from RPC open through Accepted, independent of PCM backlog capacity.
 pub const ACCEPTANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// The selected Routine ports, independent of shortcut configuration.
+/// The selected Routine ports and local capture policy, independent of output consumers.
 pub struct Selection<'a> {
     /// Routine name.
     pub routine: &'a str,
@@ -26,6 +26,8 @@ pub struct Selection<'a> {
     pub input: &'a str,
     /// Text output port.
     pub output: &'a str,
+    /// Local opt-in capture deadline, in 1..=3600 seconds. None preserves default policy.
+    pub max_capture_seconds: Option<u32>,
 }
 impl std::fmt::Debug for Selection<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -87,7 +89,16 @@ pub async fn run<T: RoutineInteractionTransport>(
     observer: &Observer,
     consumer: &dyn Consumer,
 ) -> Result<Option<Output>, Error> {
-    let config = capture::native_config(audio).map_err(|_| Error::Unsupported)?;
+    let mut config = capture::native_config(audio).map_err(|_| Error::Unsupported)?;
+    let duration = match selection.max_capture_seconds {
+        Some(seconds @ 1..=3600) => {
+            // Keep the sample ceiling independent of normal wall-clock stop and native flush.
+            config.limits.max_duration_seconds = seconds + 60;
+            Some(std::time::Duration::from_secs(u64::from(seconds)))
+        }
+        Some(_) => return Err(Error::Unsupported),
+        None => None,
+    };
     guard.check().map_err(|_| Error::Cancelled)?;
     observer.emit(Diagnostic::Stage(Stage::CaptureRequested));
     guard.check().map_err(|_| Error::Cancelled)?;
@@ -95,6 +106,8 @@ pub async fn run<T: RoutineInteractionTransport>(
     if release.is_cancelled() {
         capture.stop();
     }
+    let requested = std::time::Instant::now();
+    let started = capture.started_lane();
     let stop = capture.stop_lane();
     let failure = capture.failure_lane();
     let result = {
@@ -112,11 +125,16 @@ pub async fn run<T: RoutineInteractionTransport>(
             capture.check_failure().map_err(Error::Capture)?;
             observer.emit(Diagnostic::Stage(Stage::FirstFrameObserved));
             guard.check().map_err(|_| Error::Cancelled)?;
+            let text_bytes = if duration.is_some() {
+                512 * 1024
+            } else {
+                256 * 1024
+            };
             let limits = InteractionLimits {
                 input_bytes: audio.sample_rate_hz as usize / 2,
                 input_items: 4,
-                chunk_bytes: 256 * 1024,
-                text_bytes: 256 * 1024,
+                chunk_bytes: text_bytes,
+                text_bytes,
                 ..Default::default()
             };
             observer.emit(Diagnostic::Stage(Stage::RpcOpen));
@@ -160,7 +178,14 @@ pub async fn run<T: RoutineInteractionTransport>(
                     if guard.check().is_err() { break Err(Error::Cancelled); }
                     let failed = *failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(Err(error)) = failed { break Err(Error::Capture(error)); }
-                    if release.is_cancelled() {
+                    // A source that has not finished opening still receives a pending stop.
+                    // OS initialization itself cannot be interrupted or given a hard join deadline.
+                    let expired = duration.is_some_and(|duration| {
+                        let start = started.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .unwrap_or(requested);
+                        start.elapsed() >= duration
+                    });
+                    if release.is_cancelled() || expired {
                         let _result = stop.compare_exchange(0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
                     }
                 }
