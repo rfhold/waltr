@@ -1,5 +1,15 @@
 //! Local fake RPC and synthetic capture only. No device, key, clipboard, or remote service access.
 use futures_util::{Stream, StreamExt, stream};
+use std::{
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
+use tonic::{Request, Response, Status as RpcStatus};
 use waltr_audio_io::Terminal;
 use waltr_client::{
     NativeGrpcTransport,
@@ -16,22 +26,13 @@ use waltr_desktop::{
     config,
     host::{AudioAdmission, Error, Hold, Status},
 };
-use std::{
-    pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status as RpcStatus};
 type Responses = Pin<Box<dyn Stream<Item = Result<wire::InteractResponse, RpcStatus>> + Send>>;
 #[derive(Clone, Default)]
 struct Fake {
     admissions: Arc<AtomicUsize>,
     uploads: Arc<AtomicUsize>,
     completed: Arc<AtomicBool>,
+    pcm: Arc<Mutex<Vec<u8>>>,
 }
 #[allow(
     clippy::unnecessary_wraps,
@@ -158,6 +159,16 @@ impl RoutineInteractionService for Fake {
                 })),
             ]))));
         }
+        if open.routine_name.starts_with("delay-open-") {
+            let ms = open
+                .routine_name
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
         let fake = self.clone();
         let mut prefix = vec![
             event(Event::Accepted(wire::InteractionAccepted {
@@ -180,6 +191,16 @@ impl RoutineInteractionService for Fake {
                 text_event("two", "draft", false),
             ]);
         }
+        let delay = if open.routine_name.starts_with("delay-accepted-") {
+            open.routine_name
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        } else {
+            0
+        };
         let tail = stream::once(async move {
             while let Some(message) = input.message().await? {
                 match message.event {
@@ -188,6 +209,7 @@ impl RoutineInteractionService for Fake {
                             chunk.content
                         {
                             fake.uploads.fetch_add(bytes.len(), Ordering::SeqCst);
+                            fake.pcm.lock().unwrap().extend(bytes);
                         }
                     }
                     Some(wire::interact_request::Event::InputCompleted(_)) => break,
@@ -206,7 +228,12 @@ impl RoutineInteractionService for Fake {
         })
         .map(|result| stream::iter(result.unwrap_or_else(|e| vec![Err(e)])))
         .flatten();
-        Ok(Response::new(Box::pin(stream::iter(prefix).chain(tail))))
+        let prefix = stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            stream::iter(prefix)
+        })
+        .flatten();
+        Ok(Response::new(Box::pin(prefix.chain(tail))))
     }
     type RunStream = Responses;
     async fn run(
@@ -251,6 +278,8 @@ struct Mock {
     stopped: AtomicBool,
     joined: AtomicBool,
     burst: AtomicBool,
+    small_chunks: AtomicBool,
+    admit_burst: Mutex<Option<Arc<AtomicUsize>>>,
     fail_on_stop: AtomicBool,
     empty: AtomicBool,
     tail_only: AtomicBool,
@@ -273,7 +302,9 @@ impl Factory for MockFactory {
         Ok(Box::new(Samples {
             state: state.clone(),
             remaining: if state.burst.load(Ordering::SeqCst) {
-                100
+                1000
+            } else if state.small_chunks.load(Ordering::SeqCst) {
+                120
             } else {
                 1
             },
@@ -282,6 +313,17 @@ impl Factory for MockFactory {
 }
 impl Source for Samples {
     fn frame(&mut self) -> Option<Vec<u8>> {
+        if self.remaining < 1000
+            && self
+                .state
+                .admit_burst
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|admissions| admissions.load(Ordering::SeqCst) == 0)
+        {
+            return None;
+        }
         if self.remaining > 0
             && !self.state.empty.load(Ordering::SeqCst)
             && (!self.state.tail_only.load(Ordering::SeqCst)
@@ -289,7 +331,11 @@ impl Source for Samples {
                 || self.state.burst.load(Ordering::SeqCst))
         {
             self.remaining -= 1;
-            Some(vec![0; 100])
+            if self.state.small_chunks.load(Ordering::SeqCst) {
+                Some(vec![self.remaining as u8; 96])
+            } else {
+                Some(vec![0; 100])
+            }
         } else {
             None
         }
@@ -626,12 +672,13 @@ async fn blocked_startup_cancel_and_release_retain_worker_until_join() {
 }
 #[tokio::test]
 async fn preaccept_full_queue_fails_and_joins_without_command() {
-    let (transport, _fake, stop, server) = fixture().await;
+    let (transport, fake, stop, server) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("never");
     let binding = binding(&path, "pending");
     let mock = Arc::new(Mock {
         burst: AtomicBool::new(true),
+        admit_burst: Mutex::new(Some(fake.admissions.clone())),
         ..Default::default()
     });
     let (hold, _control) = Hold::press(&AudioAdmission::default()).unwrap();
@@ -654,6 +701,8 @@ async fn preaccept_full_queue_fails_and_joins_without_command() {
         )
         .await;
     assert_eq!(result, Err(Error::Capture(capture::Error::Overflow)));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.uploads.load(Ordering::SeqCst), 0);
     {
         use waltr_desktop::host::{Diagnostic, Stage};
         let diagnostics = diagnostics.lock().unwrap();
@@ -885,6 +934,144 @@ async fn shared_pipeline_waits_for_acceptance_then_closes_and_finishes_in_order(
     assert!(path.exists());
     stop.cancel();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn small_frames_survive_delayed_open_and_accepted_with_exact_pcm_after_release() {
+    for routine in [
+        "delay-open-100",
+        "delay-open-250",
+        "delay-accepted-100",
+        "delay-accepted-250",
+    ] {
+        let (transport, fake, stop, server) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("once");
+        let binding = binding(&path, routine);
+        let mock = Arc::new(Mock {
+            small_chunks: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let (hold, control) = Hold::press(&AudioAdmission::default()).unwrap();
+        let release = async {
+            while fake.admissions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            control.release();
+        };
+        let generation = CancellationToken::new();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                hold.run(
+                    &binding,
+                    &transport,
+                    Arc::new(MockFactory(mock.clone())),
+                    &generation
+                ),
+                release
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, Ok(()), "{routine}");
+        let expected: Vec<u8> = (0..120u8).rev().flat_map(|value| vec![value; 96]).collect();
+        assert_eq!(*fake.pcm.lock().unwrap(), expected, "{routine}");
+        assert!(mock.joined.load(Ordering::SeqCst));
+        assert!(path.exists());
+        stop.cancel();
+        server.await.unwrap();
+    }
+}
+
+struct ChatConsumer(AtomicUsize);
+impl waltr_desktop::interaction::Consumer for ChatConsumer {
+    fn progress(&self, _: waltr_desktop::interaction::Progress) {}
+    fn output<'a>(
+        &'a self,
+        _: &'a waltr_client::interaction::InteractionOutput,
+        _: &'a str,
+        final_text: Option<&'a str>,
+        guard: &'a waltr_desktop::typing::Guard<'_>,
+    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            guard.check().map_err(|_| Error::Cancelled)?;
+            if final_text.is_some() {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn shared_chat_consumer_releases_or_cancels_with_small_frames_before_admission() {
+    use waltr_desktop::{host::Observer, interaction, typing::Guard};
+    for cancel_before_acceptance in [false, true] {
+        let (transport, fake, stop, server) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let binding = binding(&dir.path().join("unused"), "delay-accepted-250");
+        let mock = Arc::new(Mock {
+            small_chunks: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let generation = CancellationToken::new();
+        let release = CancellationToken::new();
+        let guard = Guard {
+            cancel: &cancel,
+            generation: &generation,
+            valid: &|| true,
+        };
+        let consumer = ChatConsumer(AtomicUsize::new(0));
+        let control = async {
+            while fake.admissions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            // Give the source time to queue all 120 small frames, without admission.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if cancel_before_acceptance {
+                cancel.cancel();
+            } else {
+                release.cancel();
+            }
+        };
+        let observer = Observer::default();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                interaction::run(
+                    &transport,
+                    Arc::new(MockFactory(mock.clone())),
+                    &binding.audio,
+                    interaction::Selection {
+                        routine: "delay-accepted-250",
+                        trigger: "dictate",
+                        input: "audio",
+                        output: "clean-text"
+                    },
+                    &release,
+                    &guard,
+                    &observer,
+                    &consumer,
+                ),
+                control
+            )
+        })
+        .await
+        .unwrap();
+        assert!(mock.joined.load(Ordering::SeqCst));
+        if cancel_before_acceptance {
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(fake.uploads.load(Ordering::SeqCst), 0);
+            assert_eq!(consumer.0.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(result.unwrap().is_some());
+            let expected: Vec<u8> = (0..120u8).rev().flat_map(|value| vec![value; 96]).collect();
+            assert_eq!(*fake.pcm.lock().unwrap(), expected);
+            assert_eq!(consumer.0.load(Ordering::SeqCst), 1);
+        }
+        stop.cancel();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
