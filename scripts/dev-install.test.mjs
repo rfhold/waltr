@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { cpSync, readFileSync } from "node:fs";
+import { cpSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -71,6 +72,98 @@ test("build uses exact packaged debug command, absolute cwd and explicit target;
   assert.ok(f.logs.at(-1).includes(`open ${JSON.stringify(f.destination)}`));
   assert.ok(f.calls.every((call) => ["cargo", "/usr/bin/ditto", "/usr/libexec/PlistBuddy", "/usr/bin/codesign"].includes(call.command)));
   await f.clean();
+});
+
+test("copy with a different executable is rejected before signing", async (t) => {
+  const f = await fixture(t);
+  const runner = f.options.runner;
+  f.options.runner = (...args) => {
+    const result = runner(...args);
+    if (args[0] === "/usr/bin/ditto") writeFileSync(path.join(args[1][1], "Contents/MacOS/waltr"), "wrong copy");
+    return result;
+  };
+  await assert.rejects(main([], f.options), /Staged executable differs/);
+  assert.ok(!f.calls.some((call) => call.command === "/usr/bin/codesign"));
+  assert.equal(await f.marker(), "old");
+  await f.clean();
+});
+
+test("signed executable digest is verified after promotion without claiming a revision or running identity", async (t) => {
+  const f = await fixture(t);
+  f.options.env.WALTR_APP_REVISION = "abcdef123";
+  const runner = f.options.runner;
+  f.options.runner = (...args) => {
+    const result = runner(...args);
+    if (args[0] === "/usr/bin/codesign" && args[1].includes("--sign")) {
+      writeFileSync(path.join(args[1].at(-1), "Contents/MacOS/waltr"), "signed executable");
+    }
+    return result;
+  };
+  await main([], f.options);
+  assert.equal(await f.marker(), "signed executable");
+  const digest = createHash("sha256").update("signed executable").digest("hex");
+  assert.ok(f.logs.at(-1).includes(`Installed executable SHA-256: ${digest}`));
+  assert.match(f.logs.at(-1), /Embedded revision and running-process identity were not checked/);
+  assert.ok(f.logs.every((message) => !message.includes("abcdef123")));
+  assert.equal(f.calls.find((call) => call.command === "cargo").options.env.WALTR_APP_REVISION, "abcdef123");
+  await f.clean();
+});
+
+for (const installed of [true, false]) {
+  test(`post-promotion executable mismatch restores ${installed ? "previous app" : "empty destination"}`, async (t) => {
+    const f = await fixture(t, { installed });
+    f.options.io = { ...fs, rename: async (from, to) => {
+      await fs.rename(from, to);
+      if (from.endsWith("/Waltr.app") && from.includes(".waltr-install-")) {
+        await fs.writeFile(path.join(to, "Contents/MacOS/waltr"), "tampered");
+      }
+    } };
+    await assert.rejects(main([], f.options), /Installed executable differs/);
+    if (installed) {
+      assert.equal(await f.marker(), "old");
+      await f.clean();
+    } else {
+      await assert.rejects(fs.lstat(f.destination), { code: "ENOENT" });
+      assert.deepEqual(await fs.readdir(path.dirname(f.destination)), []);
+    }
+    assert.ok(!f.logs.some((message) => message.startsWith("Installed:")));
+  });
+}
+
+test("post-promotion mismatch and rollback removal failure retain the previous app backup", async (t) => {
+  const f = await fixture(t);
+  f.options.io = { ...fs,
+    rename: async (from, to) => {
+      await fs.rename(from, to);
+      if (from.endsWith("/Waltr.app") && from.includes(".waltr-install-")) {
+        await fs.writeFile(path.join(to, "Contents/MacOS/waltr"), "tampered");
+      }
+    },
+    rm: async (target, options) => {
+      if (target === f.destination) throw new Error("fake rollback removal failure");
+      return fs.rm(target, options);
+    },
+  };
+  await assert.rejects(main([], f.options), /Previous app preserved at/);
+  const transaction = (await fs.readdir(path.dirname(f.destination))).find((name) => name.startsWith(".waltr-install-"));
+  assert.ok(transaction);
+  assert.equal(await fs.readFile(path.join(path.dirname(f.destination), transaction, "previous.app/Contents/MacOS/waltr"), "utf8"), "old");
+});
+
+test("destination substitution after promotion refuses rollback removal and retains backup", async (t) => {
+  const f = await fixture(t);
+  f.options.io = { ...fs, rename: async (from, to) => {
+    await fs.rename(from, to);
+    if (from.endsWith("/Waltr.app") && from.includes(".waltr-install-")) {
+      await fs.rename(to, `${to}.displaced`);
+      await bundle(to, "external app");
+    }
+  } };
+  await assert.rejects(main([], f.options), /Previous app preserved at/);
+  assert.equal(await f.marker(), "external app");
+  const transaction = (await fs.readdir(path.dirname(f.destination))).find((name) => name.startsWith(".waltr-install-"));
+  assert.ok(transaction);
+  assert.equal(await fs.readFile(path.join(path.dirname(f.destination), transaction, "previous.app/Contents/MacOS/waltr"), "utf8"), "old");
 });
 
 test("repeated installs replace only the verified destination", async (t) => {
@@ -263,7 +356,7 @@ test("help and dry-run perform no filesystem operations or subprocesses and desc
   await main(["--dry-run"], options);
   assert.match(logs[0], /WALTR_DEV_SIGNING_IDENTITY/);
   assert.match(logs[0], /ad-hoc/);
-  assert.match(logs[1], /Sign staged bundle: ad-hoc \(-\); identifier dev\.rfhold\.waltr/);
+  assert.match(logs[1], /Sign staged bundle: ad-hoc \(-\); identifier dev\.waltr\.app/);
   assert.match(logs[1], /Entitlements: \/fake repo\/crates\/waltr-app\/Entitlements\.plist/);
   assert.match(logs[1], /codesign --verify --deep --strict before destination replacement/);
   assert.match(logs[1], /do not guarantee.*Accessibility/);
@@ -299,7 +392,8 @@ test("complete staged bundle is validated, signed and verified before destinatio
   };
   await main([], f.options);
   assert.deepEqual(events.slice(0, 6), ["copy", "Print :CFBundleIdentifier", "Print :CFBundleExecutable", "sign", "verify", "destination guard"]);
-  assert.deepEqual(events.slice(-2), ["backup", "promote"]);
+  assert.ok(events.indexOf("backup") > events.indexOf("destination guard"));
+  assert.ok(events.indexOf("promote") > events.indexOf("backup"));
   const [sign, verify] = f.calls.filter((call) => call.command === "/usr/bin/codesign");
   const staged = f.calls.find((call) => call.command === "/usr/bin/ditto").args[1];
   assert.deepEqual(sign.args, ["--force", "--sign", "-", "--identifier", "dev.waltr.app", "--entitlements", path.join(f.root, "crates/waltr-app/Entitlements.plist"), staged]);

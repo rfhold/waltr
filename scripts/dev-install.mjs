@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -42,7 +43,11 @@ async function validateBundle(bundle, io, runner) {
   if (!stat?.isFile() || stat.isSymbolicLink() || !(stat.mode & 0o111)) {
     throw new Error(`Missing or invalid app executable: ${bundle}`);
   }
-  return io.lstat(bundle);
+  return { stat: await io.lstat(bundle), executable: path.join("Contents/MacOS", executable) };
+}
+
+async function executableDigest(bundle, executable, io) {
+  return createHash("sha256").update(await io.readFile(path.join(bundle, executable))).digest("hex");
 }
 
 export async function main(args = process.argv.slice(2), {
@@ -71,7 +76,7 @@ export async function main(args = process.argv.slice(2), {
   const destination = path.join(parent, "Waltr.app");
   const cwd = path.resolve(root, "crates/waltr-app");
   if (args.includes("--dry-run")) {
-    log(`Build directory: ${cwd}\nCARGO_TARGET_DIR=${target}\ncargo ${buildArgs.join(" ")}\nSource: ${source}\nInstall: ${destination}\n${signingPlan}\nEntitlements: ${entitlements}\nVerify staged bundle: /usr/bin/codesign --verify --deep --strict before destination replacement.\nAd-hoc rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.\nQuit Waltr before a real install. No build, sign, verify or install performed.`);
+    log(`Build directory: ${cwd}\nCARGO_TARGET_DIR=${target}\ncargo ${buildArgs.join(" ")}\nSource: ${source}\nInstall: ${destination}\n${signingPlan}\nEntitlements: ${entitlements}\nCompare copied executable with build output; verify staged bundle: /usr/bin/codesign --verify --deep --strict before destination replacement.\nVerify installed executable SHA-256 against the signed staged copy. Embedded revision and running-process identity are not checked.\nAd-hoc rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.\nQuit Waltr before a real install. No build, sign, verify or install performed.`);
     return;
   }
 
@@ -80,11 +85,12 @@ export async function main(args = process.argv.slice(2), {
     throw new Error(`Refusing unsafe Applications directory: ${parent}`);
   }
   let previous = await statOrMissing(io, destination);
-  if (previous) previous = await validateBundle(destination, io, runner);
+  if (previous) previous = (await validateBundle(destination, io, runner)).stat;
   log("Quit Waltr before installation. Building the normal unsigned debug app...");
   log(`${signingPlan}\nAd-hoc rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.`);
   runner("cargo", buildArgs, { cwd, env: { ...env, CARGO_TARGET_DIR: target }, stdio: "inherit" });
-  await validateBundle(source, io, runner);
+  const sourceBundle = await validateBundle(source, io, runner);
+  const sourceDigest = await executableDigest(source, sourceBundle.executable, io);
   await io.mkdir(parent, { recursive: true });
   const installParent = await io.lstat(parent);
   if (!installParent.isDirectory() || installParent.isSymbolicLink()) {
@@ -97,11 +103,16 @@ export async function main(args = process.argv.slice(2), {
   let preserveTransaction = false;
   let promoted = false;
   let installError;
+  let installedDigest;
   try {
     runner("/usr/bin/ditto", [source, staged]);
-    await validateBundle(staged, io, runner);
+    const stagedBundle = await validateBundle(staged, io, runner);
+    if (stagedBundle.executable !== sourceBundle.executable || await executableDigest(staged, stagedBundle.executable, io) !== sourceDigest) {
+      throw new Error("Staged executable differs from the built executable; refusing installation.");
+    }
     runner("/usr/bin/codesign", ["--force", "--sign", signingIdentity, "--identifier", bundleIdentifier, "--entitlements", entitlements, staged]);
     runner("/usr/bin/codesign", ["--verify", "--deep", "--strict", staged]);
+    installedDigest = await executableDigest(staged, stagedBundle.executable, io);
     const current = await statOrMissing(io, destination);
     if (previous ? !current || current.dev !== previous.dev || current.ino !== previous.ino : current) {
       throw new Error(`Destination changed during build; refusing replacement: ${destination}`);
@@ -114,15 +125,28 @@ export async function main(args = process.argv.slice(2), {
     try {
       await io.rename(staged, destination);
       promoted = true;
+      const installedBundle = await validateBundle(destination, io, runner);
+      if (installedBundle.stat.dev !== stagedBundle.stat.dev || installedBundle.stat.ino !== stagedBundle.stat.ino || installedBundle.executable !== stagedBundle.executable || await executableDigest(destination, installedBundle.executable, io) !== installedDigest) {
+        throw new Error("Installed executable differs from the verified staged executable.");
+      }
     } catch (error) {
-      if (backedUp) {
-        try {
+      try {
+        if (promoted) {
+          const current = await statOrMissing(io, destination);
+          if (current && (current.dev !== stagedBundle.stat.dev || current.ino !== stagedBundle.stat.ino)) {
+            throw new Error("Destination changed after promotion; refusing rollback removal.");
+          }
+          await io.rm(destination, { recursive: true, force: true });
+          promoted = false;
+        }
+        if (backedUp) {
           await io.rename(backup, destination);
           backedUp = false;
-        } catch {
-          preserveTransaction = true;
-          throw new Error(`Install and rollback failed. Previous app preserved at ${backup}`, { cause: error });
         }
+      } catch {
+        preserveTransaction = true;
+        const recovery = backedUp ? `Previous app preserved at ${backup}` : `Inspect ${destination} and ${transaction}`;
+        throw new Error(`Install and rollback failed. ${recovery}`, { cause: error });
       }
       throw error;
     }
@@ -143,7 +167,7 @@ export async function main(args = process.argv.slice(2), {
     }
   }
   if (installError) throw installError;
-  log(`Installed: ${destination}\nOpen manually: open ${JSON.stringify(destination)}`);
+  log(`Installed: ${destination}\nInstalled executable SHA-256: ${installedDigest}\nExecutable matches the signed, verified staged copy. Embedded revision and running-process identity were not checked.\nQuit any old Waltr process before opening manually: open ${JSON.stringify(destination)}`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
