@@ -353,6 +353,57 @@ async fn client_opt_in_and_cache_metadata_survive_skills_dispatch() -> mcp::Resu
     Ok(())
 }
 
+// Compatibility coverage, not Agent Skills conformance: the spec expects metadata
+// strings, but servers also publish arrays and other JSON values.
+#[tokio::test]
+async fn metadata_json_values_survive_client_discovery_and_byte_verification() -> mcp::Result<()> {
+    let markdown = b"---\r\nname: inspect\r\ndescription: Inspect state.\r\nmetadata: {owner: ops, tags: [infra, ops], count: 3, score: 1.5, enabled: true, missing: null, nested: {items: [false, null, {key: value}]}}\r\n---\r\nExact body\r\n";
+    let catalog = SkillCatalog::new().with_skill("ops/inspect", &[("SKILL.md", markdown)])?;
+    let expected = catalog.get("skill://ops/inspect/SKILL.md").unwrap().skill;
+    let server = SpecServer::start(Arc::new(SkillServer {
+        catalog: Arc::new(catalog),
+        meta: Arc::default(),
+        advertise: true,
+    }))
+    .await?;
+    let client = McpClient::connect(
+        "metadata-compatibility",
+        McpTransportConfig::StreamableHttp {
+            endpoint: server.endpoint(),
+            bearer_token: None,
+        },
+        Arc::new(ClientHandler),
+        McpClientOptions::new("metadata-compatibility", "1", Duration::from_secs(2)).with_skills(),
+        CancellationToken::new(),
+    )
+    .await?;
+    let page = client.list_skills(None, CancellationToken::new()).await?;
+    assert_eq!(page.skills, vec![expected.clone()]);
+    assert_eq!(
+        page.skills[0].frontmatter["metadata"],
+        json!({"owner": "ops", "tags": ["infra", "ops"], "count": 3, "score": 1.5,
+            "enabled": true, "missing": null, "nested": {"items": [false, null, {"key": "value"}]}})
+    );
+    let held = client
+        .get_skill(&expected.uri, CancellationToken::new())
+        .await?;
+    assert_eq!(held.skill, expected);
+    let read = client
+        .read_resource(&expected.uri, CancellationToken::new())
+        .await?;
+    let bytes = read.raw["contents"][0]["text"].as_str().unwrap().as_bytes();
+    assert_eq!(bytes, markdown);
+    mcp::skills::verify_skill_bytes(&held.skill, &held.skill.uri, bytes)?;
+    let mut changed = held.skill.clone();
+    changed.frontmatter["metadata"]["tags"] = json!(["changed"]);
+    assert!(mcp::skills::verify_skill_bytes(&changed, &changed.uri, bytes).is_err());
+    let mut tampered = bytes.to_vec();
+    *tampered.last_mut().unwrap() = b'!';
+    assert!(mcp::skills::verify_skill_bytes(&held.skill, &held.skill.uri, &tampered).is_err());
+    client.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn http_capability_gate_and_unknown_entry_errors() -> mcp::Result<()> {
     for advertised in [false, true] {

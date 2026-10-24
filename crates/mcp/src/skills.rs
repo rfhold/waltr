@@ -61,6 +61,7 @@ pub struct McpSkill {
     /// Absolute entrypoint URI ending in `/SKILL.md`.
     pub uri: String,
     /// Verbatim YAML frontmatter represented as a JSON object.
+    /// Agent Skills expects metadata strings, but servers publish other JSON values too.
     pub frontmatter: Map<String, Value>,
     /// Complete manifest or dynamic marker.
     pub resources: McpSkillResources,
@@ -260,11 +261,10 @@ fn validate_frontmatter(object: &Map<String, Value>) -> Result<()> {
         }
     }
     if let Some(metadata) = object.get("metadata") {
-        if !metadata
-            .as_object()
-            .is_some_and(|map| map.values().all(Value::is_string))
-        {
-            return Err(invalid("metadata must map strings to strings"));
+        // Agent Skills expects string values, but servers publish other JSON values.
+        // Preserve them without coercion while retaining the string-keyed object boundary.
+        if !metadata.is_object() {
+            return Err(invalid("metadata must be an object"));
         }
     }
     Ok(())

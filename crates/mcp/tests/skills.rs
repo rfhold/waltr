@@ -117,7 +117,11 @@ fn catalog_rejects_traversal_duplicates_and_bad_frontmatter() {
         "name: inspect",
         "name: inspect\ndescription: ''",
         "name: inspect\ndescription: [x]",
-        "name: inspect\ndescription: x\nmetadata: {owner: 1}",
+        "name: inspect\ndescription: x\nmetadata: scalar",
+        "name: inspect\ndescription: x\nmetadata: 1",
+        "name: inspect\ndescription: x\nmetadata: true",
+        "name: inspect\ndescription: x\nmetadata: [ops]",
+        "name: inspect\ndescription: x\nmetadata: null",
         "name: inspect\ndescription: x\ncompatibility: ''",
         "name: inspect\nname: other\ndescription: x",
     ] {
@@ -128,13 +132,64 @@ fn catalog_rejects_traversal_duplicates_and_bad_frontmatter() {
     }
     assert!(parse_skill_frontmatter(b"name: inspect").is_err());
     assert!(parse_skill_frontmatter(b"---\nname: inspect").is_err());
-    for extension in ["custom: .nan", "custom: {1: value}", "custom: !tag value"] {
+    for extension in [
+        "custom: .nan",
+        "custom: {1: value}",
+        "custom: !tag value",
+        "metadata: {nested: .nan}",
+        "metadata: {nested: {1: value}}",
+        "metadata: {nested: !tag value}",
+    ] {
         assert!(
             parse_skill_frontmatter(
                 format!("---\nname: inspect\ndescription: x\n{extension}\n---\n").as_bytes()
             )
             .is_err()
         );
+    }
+}
+
+// Agent Skills expects metadata strings; compatibility with servers requires JSON values.
+#[test]
+fn metadata_json_values_are_preserved_without_weakening_integrity() {
+    for metadata in [
+        "{}",
+        "{owner: ops}",
+        "{owner: 1, tags: [infra, ops], score: 1.5, enabled: true, missing: null, nested: {items: [false, null, {key: value}]}}",
+    ] {
+        let entry = format!(
+            "---\r\nname: inspect\r\ndescription: Inspect state.\r\nmetadata: {metadata}\r\n---\r\nExact body\r\n"
+        );
+        let expected: serde_json::Value = serde_yaml_ng::from_str(metadata).unwrap();
+        let parsed = parse_skill_frontmatter(entry.as_bytes()).unwrap();
+        assert_eq!(parsed["metadata"], expected);
+        let catalog = SkillCatalog::new()
+            .with_skill("ops/inspect", &[("SKILL.md", entry.as_bytes())])
+            .unwrap();
+        let skill = catalog.get("skill://ops/inspect/SKILL.md").unwrap().skill;
+        assert_eq!(skill.frontmatter, parsed);
+        assert_eq!(catalog.list(None).unwrap().skills, vec![skill.clone()]);
+        let read = catalog.read(&skill.uri).unwrap();
+        let bytes = read.raw["contents"][0]["text"].as_str().unwrap().as_bytes();
+        assert_eq!(bytes, entry.as_bytes());
+        verify_skill_bytes(&skill, &skill.uri, bytes).unwrap();
+        let mut changed = skill.clone();
+        changed.frontmatter["metadata"] = json!({"tampered": true});
+        assert!(verify_skill_bytes(&changed, &changed.uri, bytes).is_err());
+        let mut tampered = bytes.to_vec();
+        *tampered.last_mut().unwrap() = b'!';
+        assert!(verify_skill_bytes(&skill, &skill.uri, &tampered).is_err());
+        for invalid in [
+            json!("scalar"),
+            json!(1),
+            json!(true),
+            json!([]),
+            json!(null),
+        ] {
+            let mut changed = skill.clone();
+            changed.frontmatter["metadata"] = invalid;
+            assert!(validate_skill(&changed).is_err());
+        }
     }
 }
 

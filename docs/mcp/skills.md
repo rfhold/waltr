@@ -55,6 +55,12 @@ Frontmatter requires a valid `name` and nonempty `description`. The parser prese
 It rejects YAML that cannot retain its values in JSON, including tagged values and non-string mapping keys.
 `SKILL.md` must contain UTF-8 YAML frontmatter.
 
+The [Agent Skills specification](https://agentskills.io/specification#metadata-field) expects `metadata` to map string keys to string values.
+Some servers publish arrays and other JSON values instead.
+For compatibility, this crate accepts a string-keyed `metadata` object with arbitrary JSON values: strings, arrays, numbers, booleans, null, and nested objects.
+It preserves those values without coercion and rejects non-object `metadata` roots.
+The parser's lossless JSON checks and raw-byte integrity checks still apply.
+
 The catalog preserves original bytes. `resources/read` returns UTF-8 text without normalization, or Base64 for binary files.
 Verification applies to decoded raw bytes, not transport encoding.
 Generic transport limits still apply; callers choose explicit limits for larger resources.
