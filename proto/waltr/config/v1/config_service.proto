@@ -108,6 +108,8 @@ message SpeechRecognitionOptions {
   uint32 channels = 5;
   bool interim_results = 6;
   bool automatic_punctuation = 7;
+  // Opt-in cumulative streaming speaker attribution; disabled by default.
+  bool diarization = 8;
 }
 
 message SpeechSynthesisOptions {

@@ -1,6 +1,8 @@
 use super::*;
 mod capabilities;
 mod completion;
+mod diarization;
+mod diarization_wire;
 mod fixtures;
 mod limits;
 mod recording;

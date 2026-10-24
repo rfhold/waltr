@@ -1,11 +1,15 @@
 use super::super::*;
 use crate::session::SessionHost;
 use futures_util::Stream;
-use waltr_agent::*;
 use std::result::Result;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use waltr_agent::*;
 
 pub async fn request(source: &str) -> Request {
+    request_with_diarization(source, false).await
+}
+
+pub async fn request_with_diarization(source: &str, diarization: bool) -> Request {
     let loader = crate::test_support::default_catalog_loader();
     let materializer = crate::catalog::CatalogMaterializer::load(&loader)
         .await
@@ -37,6 +41,14 @@ pub async fn request(source: &str) -> Request {
             "transport: openaiChatCompletions\n  url: http://127.0.0.1:1/v1\n  models:\n    cleanup:\n      name: Test\n      type: 1\n      limits: {context: 65536, output: 1024}",
         ),
     ] {
+        let spec = if diarization && name == "speech" {
+            spec.replace(
+                "automatic_punctuation: true",
+                "automatic_punctuation: true, diarization: true",
+            )
+        } else {
+            spec.to_owned()
+        };
         std::fs::write(resources.join(format!("providers/{name}.yaml")), format!("apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata: {{name: {name}}}\nspec:\n  {spec}\n")).unwrap();
     }
     let state =
@@ -499,7 +511,57 @@ impl waltr_audio::stt::speech_server::Speech for Speech {
     ) -> Result<tonic::Response<Self::StreamingRecognizeStream>, tonic::Status> {
         use waltr_audio::stt::*;
         let mut input = request.into_inner();
-        assert_eq!(input.message().await?.unwrap().recognizer, "recognizer");
+        let first = input.message().await?.unwrap();
+        assert_eq!(first.recognizer, "recognizer");
+        if let Some(streaming_recognize_request::StreamingRequest::StreamingConfig(config)) =
+            first.streaming_request
+        {
+            if let Some(diarization) = config
+                .config
+                .and_then(|config| config.features)
+                .and_then(|features| features.diarization_config)
+            {
+                assert_eq!(diarization, SpeakerDiarizationConfig::default());
+                let output = futures_util::stream::try_unfold(
+                    (input, false),
+                    |(mut input, finalized)| async move {
+                        if finalized {
+                            return Ok(None);
+                        }
+                        let is_final = input.message().await?.is_none();
+                        let response = StreamingRecognizeResponse {
+                            results: vec![StreamingRecognitionResult {
+                                alternatives: vec![SpeechRecognitionAlternative {
+                                    transcript: "Hello, there!".into(),
+                                    words: if is_final {
+                                        vec![
+                                            WordInfo {
+                                                word: "Hello,".into(),
+                                                speaker_label: "S1".into(),
+                                                ..Default::default()
+                                            },
+                                            WordInfo {
+                                                word: "there!".into(),
+                                                speaker_label: "S2".into(),
+                                                ..Default::default()
+                                            },
+                                        ]
+                                    } else {
+                                        Vec::new()
+                                    },
+                                    ..Default::default()
+                                }],
+                                is_final,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        };
+                        Ok(Some((response, (input, is_final))))
+                    },
+                );
+                return Ok(tonic::Response::new(Box::pin(output)));
+            }
+        }
         let output =
             futures_util::stream::try_unfold((input, 0), |(mut input, ordinal)| async move {
                 let Some(_) = input.message().await? else {

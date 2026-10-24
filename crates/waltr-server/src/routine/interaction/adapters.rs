@@ -7,12 +7,12 @@ use crate::{
     session::SessionHost,
 };
 use futures_util::{StreamExt, stream};
+use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 use waltr_agent::{
     AgentRunLimits, CHANNEL_ASSISTANT_TEXT, SessionId, SessionStart, SessionStartMessage,
     SessionTimelineProjectionUpdateEvent, TimelineContent,
 };
 use waltr_audio::{audio::PcmS16Le, client::Client, config::Config, stt, tts};
-use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 
 /// Production adapters use the existing durable helper host and explicit pinned speech settings.
 pub(crate) struct SessionAdapters {
@@ -236,14 +236,56 @@ async fn connect(endpoint: String, context: &TaskContext) -> Result<Client, Erro
     }
 }
 
-/// Google results are mapped to request-local channel/ordinal segments. Interim hypotheses
-/// replace one pending segment; only upstream `is_final` commits it. Timing/word attribution
-/// are intentionally omitted by this text-only contract; channel IDs are not speaker IDs.
+/// Plain results use channel/ordinal segments; diarized results replace one cumulative segment.
+/// Channel IDs are never speaker IDs.
 #[derive(Default)]
 pub(super) struct Transcripts {
     channels: BTreeMap<i32, u64>,
+    diarization: bool,
+    finalized: bool,
 }
 impl Transcripts {
+    pub(super) fn new(diarization: bool) -> Self {
+        Self {
+            diarization,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn update(
+        &mut self,
+        response: stt::StreamingRecognizeResponse,
+    ) -> Result<Vec<Text>, Error> {
+        if !self.diarization {
+            return Ok(self.map(response));
+        }
+        let mut output = Vec::new();
+        for result in response.results {
+            if self.finalized {
+                return Err(Error::new(
+                    "invalid_stream",
+                    "response after final cumulative diarization",
+                ));
+            }
+            let alternative = result.alternatives.first().ok_or_else(|| {
+                Error::new("invalid_stream", "diarization response missing alternative")
+            })?;
+            let text = if result.is_final {
+                speaker_text(alternative)?
+            } else {
+                alternative.transcript.clone()
+            };
+            output.push(Text {
+                segment: "diarization".into(),
+                text,
+                replace: true,
+                committed: result.is_final,
+            });
+            self.finalized = result.is_final;
+        }
+        Ok(output)
+    }
+
     pub(super) fn map(&mut self, response: stt::StreamingRecognizeResponse) -> Vec<Text> {
         let mut output: Vec<Text> = Vec::new();
         let mut interim: BTreeMap<i32, usize> = BTreeMap::new();
@@ -278,6 +320,61 @@ impl Transcripts {
         output
     }
 }
+fn speaker_text(alternative: &stt::SpeechRecognitionAlternative) -> Result<String, Error> {
+    let invalid = || {
+        Error::new(
+            "invalid_stream",
+            "invalid cumulative diarization words or labels",
+        )
+    };
+    if !alternative
+        .transcript
+        .split_whitespace()
+        .eq(alternative.words.iter().map(|word| word.word.as_str()))
+    {
+        return Err(invalid());
+    }
+    let mut text = String::new();
+    let mut previous = None;
+    for word in &alternative.words {
+        if word.word.is_empty()
+            || word.word.chars().any(char::is_whitespace)
+            || word.speaker_label.len() > 256
+            || word.speaker_label.chars().any(char::is_control)
+        {
+            return Err(invalid());
+        }
+        let speaker = if word.speaker_label.trim().is_empty() {
+            "unknown"
+        } else {
+            word.speaker_label.as_str()
+        };
+        if previous != Some(speaker) {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(speaker);
+            text.push(':');
+            previous = Some(speaker);
+        }
+        text.push(' ');
+        text.push_str(&word.word);
+    }
+    Ok(text)
+}
+
+pub(super) fn recognition_features(
+    options: &waltr::grpc::waltr::config::v1::SpeechRecognitionOptions,
+) -> stt::RecognitionFeatures {
+    stt::RecognitionFeatures {
+        enable_automatic_punctuation: options.automatic_punctuation,
+        diarization_config: options
+            .diarization
+            .then(stt::SpeakerDiarizationConfig::default),
+        ..Default::default()
+    }
+}
+
 async fn transcribe(task: &RoutineTask, context: &mut TaskContext) -> Result<TaskResult, Error> {
     let task = task.task_spec.transcribe.as_ref().expect("transcribe task");
     let resolved = resolve_speech_model(
@@ -316,14 +413,13 @@ async fn transcribe(task: &RoutineTask, context: &mut TaskContext) -> Result<Tas
             }
         },
     );
+    let features = recognition_features(&options);
+    let mut transcripts = Transcripts::new(options.diarization);
     let config = stt::StreamingRecognitionConfig {
         config: Some(stt::RecognitionConfig {
             model: options.model,
             language_codes: options.language_codes,
-            features: Some(stt::RecognitionFeatures {
-                enable_automatic_punctuation: options.automatic_punctuation,
-                ..Default::default()
-            }),
+            features: Some(features),
             ..Default::default()
         }),
         streaming_features: Some(stt::StreamingRecognitionFeatures {
@@ -343,13 +439,18 @@ async fn transcribe(task: &RoutineTask, context: &mut TaskContext) -> Result<Tas
             context.cancellation.clone(),
         )
         .map_err(provider_error)?;
-    let mut transcripts = Transcripts::default();
     while let Some(response) = responses.next().await {
-        for text in transcripts.map(response.map_err(|e| status.provider_error(e))?) {
+        for text in transcripts.update(response.map_err(|e| status.provider_error(e))?)? {
             context.output.publish(Chunk::Text(text)).await?;
         }
     }
     status.finish()?;
+    if options.diarization && !transcripts.finalized {
+        return Err(Error::new(
+            "invalid_stream",
+            "missing final cumulative diarization",
+        ));
+    }
     Ok(TaskResult::default())
 }
 async fn synthesize(task: &RoutineTask, context: &mut TaskContext) -> Result<TaskResult, Error> {

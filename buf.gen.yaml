@@ -7,6 +7,7 @@ plugins:
       - type_attribute=.waltr.config.v1=#[derive(serde::Serialize\, serde::Deserialize)]
       - type_attribute=.waltr.status.v1=#[derive(serde::Serialize\, serde::Deserialize)]
       - field_attribute=.waltr.config.v1.ModelOptions.reasoning_efforts=#[serde(default)]
+      - field_attribute=.waltr.config.v1.SpeechRecognitionOptions.diarization=#[serde(default)]
   - local: protoc-gen-tonic
     out: crates/waltr/src/grpc
     opt: [no_transport=true]

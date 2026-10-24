@@ -109,6 +109,7 @@ pub(super) fn validate_speech_source(
                         "channels",
                         "interim_results",
                         "automatic_punctuation",
+                        "diarization",
                     ],
                     path,
                 )?;
