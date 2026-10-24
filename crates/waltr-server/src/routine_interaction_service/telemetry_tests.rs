@@ -1,9 +1,9 @@
 use super::*;
-use waltr_audio::{client::Client, config::Config, tts};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use tokio::sync::{Semaphore, mpsc};
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+use waltr_audio::{client::Client, config::Config, tts};
 
 fn headers<T>(mut request: Request<T>, parent: Option<&str>, duplicate: bool) -> Request<T> {
     if let Some(parent) = parent {
@@ -460,7 +460,48 @@ async fn trace_chain_survives_handler_return_in_standalone_and_embedded_composit
                     span.name
                 );
             }
-            let diagnostic = format!("{audited:?}");
+            let stages: Vec<_> = spans
+                .iter()
+                .filter(|span| span.name == "server.admission.stage")
+                .collect();
+            for stage in [
+                "prepare",
+                "engine_health_wait",
+                "engine_lifecycle_wait",
+                "durable_admission",
+                "durable_start",
+                "accepted_enqueue",
+            ] {
+                let span = stages
+                    .iter()
+                    .find(|span| {
+                        span.attributes.iter().any(|field| {
+                            field.key.as_str() == "stage" && field.value.as_str() == stage
+                        })
+                    })
+                    .unwrap();
+                assert!(
+                    span.attributes
+                        .iter()
+                        .any(|field| field.key.as_str() == "outcome"
+                            && field.value.as_str() == "success")
+                );
+                assert!(
+                    span.attributes
+                        .iter()
+                        .any(|field| field.key.as_str() == "duration_ms")
+                );
+                assert_eq!(span.span_context.trace_id(), rpc.span_context.trace_id());
+            }
+            assert_eq!(
+                stages.iter().any(|span| span
+                    .attributes
+                    .iter()
+                    .any(|field| field.key.as_str() == "stage"
+                        && field.value.as_str() == "open_read")),
+                live
+            );
+            let diagnostic = format!("{audited:?} {stages:?}");
             for secret in [
                 "SECRET_CONTENT_MARKER",
                 "SECRET_INPUT_MARKER",

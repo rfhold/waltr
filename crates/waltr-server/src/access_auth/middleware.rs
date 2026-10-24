@@ -13,11 +13,13 @@ use axum::{
     response::IntoResponse,
 };
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use prost::Message;
+use tower::{Layer, Service};
 use waltr::grpc::waltr::auth::v1::{
     AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
 };
-use prost::Message;
-use tower::{Layer, Service};
+
+use crate::routine::telemetry::{AdmissionStage, admission_result};
 
 use super::{
     AccessAuthenticator, RequestAuthFailure,
@@ -149,14 +151,19 @@ where
             {
                 GrpcTransport::Native => {
                     let required_scopes = authenticator.api_required_scopes().to_vec();
-                    authenticator
-                        .authenticate_bearer_headers(request.headers(), &required_scopes)
-                        .await
+                    admission_result(
+                        AdmissionStage::NativeAuth,
+                        authenticator
+                            .authenticate_bearer_headers(request.headers(), &required_scopes),
+                    )
+                    .await
                 }
                 GrpcTransport::Web => {
-                    authenticator
-                        .authenticate_browser_session_headers(request.headers())
-                        .await
+                    admission_result(
+                        AdmissionStage::BrowserAuth,
+                        authenticator.authenticate_browser_session_headers(request.headers()),
+                    )
+                    .await
                 }
             };
             match result {

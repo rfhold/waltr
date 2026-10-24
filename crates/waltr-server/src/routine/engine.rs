@@ -10,16 +10,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{broadcast, watch};
+use tokio_util::sync::CancellationToken;
 use waltr_agent::{
     CompletedSessionCapture, SessionCompletionAdmissionFinalizer,
     SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
     SessionCompletionCoordinationPreparation, SessionCompletionFinalizationFuture,
     SessionCoordinationReason, SessionId, SessionPauseLease, SessionRunCompletionSnapshot,
 };
-use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
-use tokio::sync::{broadcast, watch};
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     persistence::routine_invocation::{
@@ -790,14 +790,19 @@ impl ManualRoutineHandle {
         F: FnOnce(InteractionOwnership) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        use super::telemetry::{AdmissionStage, admission_result, admission_wait};
         let mut health = self.failure_control.health.subscribe();
-        tokio::select! { biased;
-            () = self.cancellation.cancelled() => return Err(InvocationError::new("shutdown", "routine engine is shutting down")),
-            result = health.wait_for(|value| !matches!(value, EngineHealth::Reconciling)) => {
-                if result.is_err() { return Err(InvocationError::new("shutdown", "routine engine health closed")); }
+        admission_result(AdmissionStage::EngineHealthWait, async {
+            tokio::select! { biased;
+                () = self.cancellation.cancelled() => return Err(InvocationError::new("shutdown", "routine engine is shutting down")),
+                result = health.wait_for(|value| !matches!(value, EngineHealth::Reconciling)) => {
+                    if result.is_err() { return Err(InvocationError::new("shutdown", "routine engine health closed")); }
+                }
             }
-        }
-        let _lifecycle = self.lifecycle.read().await;
+            Ok(())
+        }).await?;
+        let _lifecycle =
+            admission_wait(AdmissionStage::EngineLifecycleWait, self.lifecycle.read()).await;
         if self.cancellation.is_cancelled() || self.child_admission_closed.load(Ordering::SeqCst) {
             return Err(InvocationError::new(
                 "shutdown",

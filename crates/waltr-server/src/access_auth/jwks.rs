@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use super::oidc::{AccessAuthHttpClient, OidcError, read_bounded_body};
+use crate::routine::telemetry::{AdmissionStage, admission_result, admission_wait};
 
 const DEFAULT_CACHE_AGE: Duration = Duration::from_mins(5);
 const MIN_CACHE_AGE: Duration = Duration::from_secs(30);
@@ -70,12 +71,17 @@ impl JwksCache {
     ///
     /// Unknown IDs never select a fallback key and their refresh path is rate limited.
     pub(super) async fn key(&self, kid: &str) -> Result<Jwk, OidcError> {
+        admission_result(AdmissionStage::JwksLookup, self.key_inner(kid)).await
+    }
+
+    async fn key_inner(&self, kid: &str) -> Result<Jwk, OidcError> {
         if kid.is_empty() {
             return Err(OidcError::InvalidToken("JWT kid is missing"));
         }
         let now = Instant::now();
         let refresh_for_unknown = {
-            let mut state = self.inner.state.lock().await;
+            let mut state =
+                admission_wait(AdmissionStage::JwksStateWait, self.inner.state.lock()).await;
             if let Some(key) = state.keys.get(kid) {
                 if now < state.expires_at {
                     return Ok(key.clone());
@@ -93,9 +99,11 @@ impl JwksCache {
             }
         };
 
-        let _refresh = self.inner.refresh.lock().await;
+        let _refresh =
+            admission_wait(AdmissionStage::JwksRefreshWait, self.inner.refresh.lock()).await;
         {
-            let state = self.inner.state.lock().await;
+            let state =
+                admission_wait(AdmissionStage::JwksStateWait, self.inner.state.lock()).await;
             if let Some(key) = state.keys.get(kid)
                 && (refresh_for_unknown || Instant::now() < state.expires_at)
             {
@@ -106,7 +114,8 @@ impl JwksCache {
         let (keys, max_age) =
             fetch_keys(&self.inner.client, &self.inner.uri, &self.inner.algorithms).await?;
         let key = keys.get(kid).cloned();
-        let mut state = self.inner.state.lock().await;
+        let mut state =
+            admission_wait(AdmissionStage::JwksStateWait, self.inner.state.lock()).await;
         state.keys = keys;
         state.expires_at = Instant::now() + max_age;
         drop(state);
@@ -145,6 +154,18 @@ impl JwksCache {
 }
 
 async fn fetch_keys(
+    client: &AccessAuthHttpClient,
+    uri: &Url,
+    algorithms: &HashSet<String>,
+) -> Result<(HashMap<String, Jwk>, Duration), OidcError> {
+    admission_result(
+        AdmissionStage::JwksFetch,
+        fetch_keys_inner(client, uri, algorithms),
+    )
+    .await
+}
+
+async fn fetch_keys_inner(
     client: &AccessAuthHttpClient,
     uri: &Url,
     algorithms: &HashSet<String>,
@@ -304,6 +325,74 @@ mod tests {
 
     fn http_client() -> AccessAuthHttpClient {
         AccessAuthHttpClient::build(reqwest::Client::builder()).unwrap()
+    }
+
+    #[test]
+    fn diagnostics_observe_cache_hit_and_cancelled_refresh_wait_without_key_id() {
+        if !crate::routine::telemetry::isolated_exporter_test(
+            "access_auth::jwks::tests::diagnostics_observe_cache_hit_and_cancelled_refresh_wait_without_key_id",
+        ) {
+            return;
+        }
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cache = JwksCache::fixture(rsa_set("SECRET_KID")).unwrap();
+                    assert!(cache.key("SECRET_KID").await.is_ok());
+                    let spans = exporter.get_finished_spans().unwrap();
+                    assert_eq!(spans.len(), 2);
+                    assert!(spans.iter().all(|span| {
+                        span.attributes.iter().any(|field| {
+                            field.key.as_str() == "outcome" && field.value.as_str() == "success"
+                        })
+                    }));
+                    exporter.reset();
+                    cache.inner.state.lock().await.expires_at =
+                        Instant::now() - Duration::from_secs(1);
+                    let _refresh = cache.inner.refresh.lock().await;
+                    let mut lookup = Box::pin(cache.key("SECRET_KID"));
+                    assert!(futures_util::poll!(lookup.as_mut()).is_pending());
+                    drop(lookup);
+                });
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        for stage in ["jwks_lookup", "jwks_refresh_wait"] {
+            let span = spans
+                .iter()
+                .find(|span| {
+                    span.attributes
+                        .iter()
+                        .any(|field| field.key.as_str() == "stage" && field.value.as_str() == stage)
+                })
+                .unwrap();
+            assert!(span.attributes.iter().any(
+                |field| field.key.as_str() == "outcome" && field.value.as_str() == "incomplete"
+            ));
+            assert!(
+                span.attributes
+                    .iter()
+                    .any(|field| field.key.as_str() == "duration_ms")
+            );
+        }
+        assert!(!spans.iter().any(|span| {
+            span.attributes
+                .iter()
+                .any(|field| field.key.as_str() == "stage" && field.value.as_str() == "jwks_fetch")
+        }));
+        assert!(!format!("{spans:?}").contains("SECRET_KID"));
+        provider.shutdown().unwrap();
     }
 
     #[tokio::test]

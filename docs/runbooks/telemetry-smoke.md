@@ -160,6 +160,56 @@ These fields contain no Routine, task, invocation, session, or provider identiti
 The client-side failed-stream classification limit remains separate; server and speech spans do not change that client contract.
 See [interaction trace ownership](../architecture/routines.md#interaction-trace-ownership) for lifecycle boundaries.
 
+## Server Pre-Accepted Diagnostics
+
+Use a server artifact that contains `server.admission.stage` spans.
+These INFO spans use the exact target `waltr_server::routine::telemetry`, including access-auth stages.
+Their only application fields are `stage`, `outcome`, and numeric `duration_ms`.
+Outcomes are `success`, `failure`, or `incomplete`.
+A dropped await records `incomplete` and its elapsed duration; this does not distinguish cancellation, task abort, or panic.
+Spans surround the awaited work, rather than just its completion.
+Exporters normally report them after completion or drop, not while a wait remains active.
+
+| Stage | Boundary |
+| --- | --- |
+| `native_auth` | Native gRPC bearer authentication, before the handler. Includes JWT validation and any JWKS work. |
+| `browser_auth` | gRPC-web browser-session authentication, before the handler. |
+| `jwks_lookup` | Key lookup, cache checks, refresh serialization, and any fetch. No key ID or cache contents. |
+| `jwks_state_wait` | Each JWKS cache-state mutex acquisition; excludes the subsequent critical section. |
+| `jwks_refresh_wait` | JWKS refresh mutex acquisition; excludes the refresh itself. |
+| `jwks_fetch` | JWKS HTTP request, bounded response body, decode, and validation. Also occurs during startup. |
+| `open_read` | Interact handler's first request-message await. Includes request-body availability and decode; not authentication. |
+| `prepare` | Synchronous catalog snapshot, capabilities, inputs, and model validation for Interact or Run. |
+| `engine_health_wait` | Engine reconciliation wait or shutdown rejection before interaction ownership. |
+| `engine_lifecycle_wait` | Engine lifecycle read-lock acquisition; excludes the subsequent critical section. |
+| `durable_admission` | Durable interaction admission transaction. Pool, SQL, and transaction waits remain combined. |
+| `durable_start` | Durable Running lifecycle transition before Accepted. |
+| `accepted_enqueue` | Nonblocking Accepted response enqueue. Success does not establish transport delivery. |
+
+Use Tempo Explore:
+
+```traceql
+{ resource.service.name = "waltr-server" && name = "server.admission.stage" }
+{ resource.service.name = "waltr-server" && name = "server.admission.stage" && span.stage = "native_auth" }
+{ resource.service.name = "waltr-server" && name = "server.admission.stage" && span.stage = "jwks_refresh_wait" }
+{ resource.service.name = "waltr-server" && name = "server.admission.stage" && span.stage = "durable_admission" }
+```
+
+For an embedded server, use resource service name `waltr-app-native` instead.
+Inspect the stage spans within one trace; nested durations overlap and must not sum into total latency.
+A successful `jwks_lookup` without `jwks_fetch` does not prove that every concurrent request avoided a fetch.
+A failed stage records no underlying error text or auth reason.
+Stages add no token, claim, key, URL, body, audio, transcript, or user-identity fields.
+
+The HTTP response boundary and handler admission outcome `accepted` only establish engine ownership and response construction.
+They do not establish durable admission, the Accepted enqueue, the first transport frame, or client receipt.
+The native `accepted` milestone records client observation of the actual Accepted event.
+Compare that milestone with `accepted_enqueue` and its durable predecessors; network and transport delays remain outside these stage spans.
+Authentication spans precede the handler and use its outer server trace context.
+Without a valid propagated parent, the handler's explicit local trace root can separate authentication from interaction spans.
+Missing sampled spans do not prove that a stage did not execute.
+These diagnostics do not identify the cause of historical latency or change auth, cache, persistence, or cancellation behavior.
+
 ## Expected Result
 
 Each enabled signal returns recent data from the runtime that produced the test activity. Missing disabled signals do not indicate failure. Tauri Faro contains no request telemetry; native traces contain its gRPC activity.

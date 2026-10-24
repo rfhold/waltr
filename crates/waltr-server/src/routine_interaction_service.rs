@@ -4,7 +4,7 @@ mod ingress;
 mod protocol;
 mod queue;
 
-use crate::routine::telemetry;
+use crate::routine::telemetry::{self, AdmissionStage, admission_result, admission_sync};
 use crate::{
     persistence::routine_invocation::{
         RoutineAdmission, RoutineFailure, RoutineTaskDescriptor, RoutineTriggerKind,
@@ -20,15 +20,15 @@ use crate::{
     },
     session::SessionHost,
 };
-use waltr::grpc::waltr::routine::v1::{
-    self as wire, routine_interaction_service_server::RoutineInteractionService as Api,
-};
 use prost::Message as _;
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::{Stream, StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::Instrument as _;
+use waltr::grpc::waltr::routine::v1::{
+    self as wire, routine_interaction_service_server::RoutineInteractionService as Api,
+};
 
 type Responses = Pin<Box<dyn Stream<Item = Result<wire::InteractResponse, Status>> + Send>>;
 type Requests = Pin<Box<dyn Stream<Item = Result<wire::InteractRequest, Status>> + Send>>;
@@ -234,8 +234,7 @@ impl Api for RoutineInteractionService {
         let operation = telemetry::rpc(request.metadata(), false);
         let result = async {
             let mut requests = request.into_inner();
-            let first = requests
-                .message()
+            let first = admission_result(AdmissionStage::OpenRead, requests.message())
                 .await?
                 .ok_or_else(|| Status::invalid_argument("first request must open interaction"))?;
             let initial_bytes = first.encoded_len();
@@ -250,7 +249,7 @@ impl Api for RoutineInteractionService {
                     &operation,
                 ));
             };
-            let prepared = match self.prepare(open) {
+            let prepared = match admission_sync(AdmissionStage::Prepare, || self.prepare(open)) {
                 Ok(v) => v,
                 Err(error) => return Ok(validation(error, &operation)),
             };
@@ -291,7 +290,7 @@ impl Api for RoutineInteractionService {
             let Some(open) = request.open else {
                 return Ok(validation("open is required", &operation));
             };
-            let prepared = match self.prepare(open) {
+            let prepared = match admission_sync(AdmissionStage::Prepare, || self.prepare(open)) {
                 Ok(v) => v,
                 Err(error) => return Ok(validation(error, &operation)),
             };
@@ -381,7 +380,13 @@ async fn drive(
         admitted_at_ms: now_ms(),
     };
     // Commit is never abandoned: disconnect during the transaction is handled after its outcome.
-    if owner.store.admit(admission).await.is_err() {
+    if admission_result(
+        AdmissionStage::DurableAdmission,
+        owner.store.admit(admission),
+    )
+    .await
+    .is_err()
+    {
         operation.outcome("failure");
         drop(
             tx.try_send(queue::QueuedResponse::control(Err(Status::unavailable(
@@ -409,7 +414,10 @@ async fn drive(
         return;
     }
     // Input drivers may fail immediately; their task transitions require Running history.
-    if recorder.started().await.is_err() {
+    if admission_result(AdmissionStage::DurableStart, recorder.started())
+        .await
+        .is_err()
+    {
         operation.outcome("failure");
         drop(
             tx.try_send(queue::QueuedResponse::control(Err(Status::unavailable(
@@ -420,13 +428,14 @@ async fn drive(
         return;
     }
     // This queue is empty, so acceptance cannot be overtaken by runtime output.
-    if tx
-        .try_send(queue::QueuedResponse::control(Ok(response(
+    if admission_sync(AdmissionStage::AcceptedEnqueue, || {
+        tx.try_send(queue::QueuedResponse::control(Ok(response(
             wire::interact_response::Event::Accepted(wire::InteractionAccepted {
                 invocation_id: id.clone(),
             }),
         ))))
-        .is_err()
+    })
+    .is_err()
     {
         operation.outcome("cancelled");
         if recorder

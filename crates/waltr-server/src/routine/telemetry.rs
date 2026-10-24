@@ -45,6 +45,105 @@ impl Operation {
     }
 }
 
+/// Fixed, content-free stages shared by access authentication and interaction admission.
+#[derive(Clone, Copy)]
+pub(crate) enum AdmissionStage {
+    NativeAuth,
+    BrowserAuth,
+    JwksLookup,
+    JwksStateWait,
+    JwksRefreshWait,
+    JwksFetch,
+    OpenRead,
+    Prepare,
+    EngineHealthWait,
+    EngineLifecycleWait,
+    DurableAdmission,
+    DurableStart,
+    AcceptedEnqueue,
+}
+
+impl AdmissionStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::NativeAuth => "native_auth",
+            Self::BrowserAuth => "browser_auth",
+            Self::JwksLookup => "jwks_lookup",
+            Self::JwksStateWait => "jwks_state_wait",
+            Self::JwksRefreshWait => "jwks_refresh_wait",
+            Self::JwksFetch => "jwks_fetch",
+            Self::OpenRead => "open_read",
+            Self::Prepare => "prepare",
+            Self::EngineHealthWait => "engine_health_wait",
+            Self::EngineLifecycleWait => "engine_lifecycle_wait",
+            Self::DurableAdmission => "durable_admission",
+            Self::DurableStart => "durable_start",
+            Self::AcceptedEnqueue => "accepted_enqueue",
+        }
+    }
+}
+
+pub(crate) struct AdmissionTiming {
+    operation: Operation,
+    started: std::time::Instant,
+}
+
+impl AdmissionTiming {
+    pub(crate) fn new(stage: AdmissionStage) -> Self {
+        Self {
+            operation: Operation::new(
+                tracing::info_span!(target: "waltr_server::routine::telemetry", "server.admission.stage", stage = stage.name(), outcome = tracing::field::Empty, duration_ms = tracing::field::Empty),
+            ),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn result<T, E>(&self, result: &Result<T, E>) {
+        self.operation
+            .outcome(if result.is_ok() { "success" } else { "failure" });
+    }
+}
+
+impl Drop for AdmissionTiming {
+    fn drop(&mut self) {
+        self.operation
+            .span
+            .record("duration_ms", self.started.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+pub(crate) async fn admission_result<T, E>(
+    stage: AdmissionStage,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    use tracing::Instrument as _;
+    let timing = AdmissionTiming::new(stage);
+    let result = future.instrument(timing.operation.span.clone()).await;
+    timing.result(&result);
+    result
+}
+
+pub(crate) async fn admission_wait<T>(
+    stage: AdmissionStage,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    use tracing::Instrument as _;
+    let timing = AdmissionTiming::new(stage);
+    let result = future.instrument(timing.operation.span.clone()).await;
+    timing.operation.outcome("success");
+    result
+}
+
+pub(crate) fn admission_sync<T, E>(
+    stage: AdmissionStage,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let timing = AdmissionTiming::new(stage);
+    let result = timing.operation.span.in_scope(work);
+    timing.result(&result);
+    result
+}
+
 pub(crate) fn rpc(metadata: &tonic::metadata::MetadataMap, run: bool) -> Operation {
     let span = if run {
         tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.run", outcome = tracing::field::Empty, grpc_status = tracing::field::Empty)
@@ -178,6 +277,75 @@ pub(crate) fn isolated_exporter_test(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_stage_exports_success_failure_and_dropped_wait() {
+        if !isolated_exporter_test(
+            "routine::telemetry::tests::admission_stage_exports_success_failure_and_dropped_wait",
+        ) {
+            return;
+        }
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    assert_eq!(
+                        admission_result(AdmissionStage::NativeAuth, async { Ok::<_, ()>(7) })
+                            .await,
+                        Ok(7)
+                    );
+                    assert_eq!(
+                        admission_sync(AdmissionStage::Prepare, || Err::<(), _>("SECRET_ERROR")),
+                        Err("SECRET_ERROR")
+                    );
+                    let mutex = tokio::sync::Mutex::new(());
+                    let _held = mutex.lock().await;
+                    let mut wait = Box::pin(admission_wait(
+                        AdmissionStage::JwksRefreshWait,
+                        mutex.lock(),
+                    ));
+                    assert!(futures_util::poll!(wait.as_mut()).is_pending());
+                    assert_eq!(exporter.get_finished_spans().unwrap().len(), 2);
+                    drop(wait);
+                });
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 3);
+        for (stage, outcome) in [
+            ("native_auth", "success"),
+            ("prepare", "failure"),
+            ("jwks_refresh_wait", "incomplete"),
+        ] {
+            let span = spans
+                .iter()
+                .find(|span| {
+                    span.attributes
+                        .iter()
+                        .any(|field| field.key.as_str() == "stage" && field.value.as_str() == stage)
+                })
+                .unwrap();
+            assert_eq!(span.name, "server.admission.stage");
+            assert!(span.attributes.iter().any(|field| field.key.as_str() == "outcome" && field.value.as_str() == outcome));
+            assert!(
+                span.attributes
+                    .iter()
+                    .any(|field| field.key.as_str() == "duration_ms"
+                        && field.value.as_str().parse::<f64>().unwrap().is_finite())
+            );
+            assert!(!format!("{span:?}").contains("SECRET_ERROR"));
+        }
+        provider.shutdown().unwrap();
+    }
 
     #[test]
     fn rpc_reuses_an_existing_extracted_middleware_parent() {
