@@ -204,6 +204,7 @@ fn safe_trace_target(metadata: &tracing::Metadata<'_>) -> bool {
     useful_level(metadata)
         && (target_in_module(metadata.target(), APP_TARGET)
             || target_in_module(metadata.target(), NATIVE_TRACE_TARGET)
+            || safe_native_auth_target(metadata)
             || (metadata.is_span()
                 && matches!(
                     metadata.target(),
@@ -212,7 +213,17 @@ fn safe_trace_target(metadata: &tracing::Metadata<'_>) -> bool {
 }
 
 fn safe_log_target(metadata: &tracing::Metadata<'_>) -> bool {
-    useful_level(metadata) && target_in_module(metadata.target(), APP_TARGET)
+    useful_level(metadata)
+        && (target_in_module(metadata.target(), APP_TARGET) || safe_native_auth_target(metadata))
+}
+
+fn safe_native_auth_target(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.is_event()
+        && metadata.target() == "waltr_client::native_access::telemetry"
+        && matches!(
+            *metadata.level(),
+            tracing::Level::INFO | tracing::Level::WARN
+        )
 }
 
 fn useful_level(metadata: &tracing::Metadata<'_>) -> bool {
@@ -792,6 +803,9 @@ mod tests {
             drop(tracing::info_span!(target: "waltr_server::routine::telemetry", "safe.routine"));
             drop(tracing::info_span!(target: "waltr_audio::telemetry", "safe.speech"));
             drop(
+                tracing::info_span!(target: "waltr_client::native_access::telemetry", "excluded.auth.span"),
+            );
+            drop(
                 tracing::info_span!(target: "waltr_server::routine::telemetry::nested", "hostile.routine.nested"),
             );
             drop(
@@ -843,7 +857,12 @@ mod tests {
             .with_simple_exporter(logs.clone())
             .build();
         let subscriber = tracing_subscriber::registry().with(
-            OpenTelemetryTracingBridge::new(&provider).with_filter(filter_fn(safe_log_target)),
+            OpenTelemetryTracingBridge::new(&provider).with_filter(filter_fn(|metadata| {
+                if metadata.target().starts_with("waltr_client::native_access") {
+                    assert_eq!(safe_trace_target(metadata), safe_log_target(metadata));
+                }
+                safe_log_target(metadata)
+            })),
         );
 
         tracing::subscriber::with_default(subscriber, || {
@@ -857,17 +876,111 @@ mod tests {
             tracing::info!(target: "waltr_app_lib_extra", "excluded.lookalike");
             tracing::info!(target: "waltr_server::routine::telemetry", "excluded.routine.log");
             tracing::info!(target: "waltr_audio::telemetry", "excluded.speech.log");
+            tracing::info!(target: "waltr_client::native_access::telemetry", "safe.auth.info");
+            tracing::warn!(target: "waltr_client::native_access::telemetry", "safe.auth.warn");
+            tracing::error!(target: "waltr_client::native_access::telemetry", "SECRET_AUTH_ERROR");
+            tracing::debug!(target: "waltr_client::native_access::telemetry", "SECRET_AUTH_DEBUG");
+            tracing::info!(target: "waltr_client::native_access::telemetry::nested", "SECRET_AUTH_NESTED");
+            tracing::info!(target: "waltr_client::native_access::telemetry_extra", "SECRET_AUTH_LOOKALIKE");
+            tracing::warn!(target: "waltr_client::native_access", "SECRET_CLIENT_ERROR");
         });
         provider.force_flush().unwrap();
 
         let emitted = logs.get_emitted_logs().unwrap();
         let diagnostic = format!("{emitted:?}");
-        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted.len(), 4);
+        assert!(diagnostic.contains("safe.auth.info"));
+        assert!(diagnostic.contains("safe.auth.warn"));
+        assert!(!diagnostic.contains("SECRET_"));
         assert!(diagnostic.contains("safe.app"));
         assert!(diagnostic.contains("safe.app.error"));
         assert!(!diagnostic.contains("noisy.app.debug"));
         assert!(!diagnostic.contains("excluded.native.log"));
         assert!(!diagnostic.contains("excluded.lookalike"));
+        drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
+    }
+
+    #[test]
+    fn native_auth_production_events_reach_the_privacy_filtered_exporter() {
+        if !crate::dictation_telemetry::isolated_exporter_test(
+            "observability::tests::native_auth_production_events_reach_the_privacy_filtered_exporter",
+        ) {
+            return;
+        }
+        let logs = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            OpenTelemetryTracingBridge::new(&provider).with_filter(filter_fn(|metadata| {
+                safe_log_target(metadata) && safe_trace_target(metadata)
+            })),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    assert!(
+                        crate::native_auth::AccessBinding::from_bootstrap(
+                            "SECRET_SERVER_SENTINEL".into(),
+                            waltr_client::NativeAccessBootstrap {
+                                config: waltr_client::NativeAccessConfig {
+                                    endpoint: "SECRET_INVALID_ENDPOINT_SENTINEL".into(),
+                                    client_id: "SECRET_CLIENT_SENTINEL".into(),
+                                    scopes: vec![],
+                                    audience: None,
+                                    callback: waltr_client::NativeCallbackPolicy::External,
+                                },
+                                issuer: "SECRET_ISSUER_SENTINEL".into(),
+                            },
+                        )
+                        .is_err()
+                    );
+                    let credentials = waltr_client::NativeCredentialProvider::new();
+                    let coordinator = waltr_client::NativeAccessCoordinator::spawn(
+                        waltr_client::NativeAccessConfig {
+                            endpoint: "https://SECRET_ENDPOINT_SENTINEL.invalid".into(),
+                            client_id: "SECRET_CLIENT_SENTINEL".into(),
+                            scopes: vec!["SECRET_SCOPE_SENTINEL".into()],
+                            audience: Some("SECRET_AUDIENCE_SENTINEL".into()),
+                            callback: waltr_client::NativeCallbackPolicy::External,
+                        },
+                        credentials,
+                        8,
+                    );
+                    for _ in 0..16 {
+                        tokio::task::yield_now().await;
+                    }
+                    coordinator
+                        .action_sender()
+                        .send(waltr_client::NativeAccessAction::CredentialRejected)
+                        .await
+                        .unwrap();
+                    coordinator.stop().await;
+                });
+        });
+        provider.force_flush().unwrap();
+        let emitted = logs.get_emitted_logs().unwrap();
+        let diagnostic = format!("{emitted:?}");
+        for value in [
+            "native.auth",
+            "store_load",
+            "restore",
+            "miss",
+            "credential",
+            "rejected",
+            "store_delete",
+            "success",
+            "generation",
+            "native.auth.store_binding",
+            "malformed",
+        ] {
+            assert!(diagnostic.contains(value), "missing {value}: {diagnostic}");
+        }
+        assert!(!diagnostic.contains("SECRET_"), "{diagnostic}");
+        assert!(!diagnostic.contains("https://"));
         drop(provider.shutdown_with_timeout(TRACE_LOG_SHUTDOWN_TIMEOUT));
     }
 

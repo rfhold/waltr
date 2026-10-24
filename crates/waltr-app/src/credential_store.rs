@@ -154,12 +154,27 @@ impl CredentialStore {
     pub async fn delete_server(server_id: &str) -> Result<(), NativeRefreshTokenStoreError> {
         let server = server_namespace(server_id)?;
         let fence = server_fence(&server)?;
-        blocking(move || {
+        let result = blocking(move || {
             let _guard = fence.io.lock().map_err(|_| Unavailable)?;
             fence.generation.fetch_add(1, Ordering::SeqCst);
             platform::delete_server(&server)
         })
-        .await
+        .await;
+        match result {
+            Ok(()) => tracing::info!(
+                event = "native.auth.store_delete_server",
+                category = "success"
+            ),
+            Err(Unavailable) => tracing::warn!(
+                event = "native.auth.store_delete_server",
+                category = "unavailable"
+            ),
+            Err(Malformed) => tracing::warn!(
+                event = "native.auth.store_delete_server",
+                category = "malformed"
+            ),
+        }
+        result
     }
 
     fn with_current<T>(
@@ -168,6 +183,11 @@ impl CredentialStore {
     ) -> Result<T, NativeRefreshTokenStoreError> {
         let _guard = self.fence.io.lock().map_err(|_| Unavailable)?;
         if self.generation != self.fence.generation.load(Ordering::SeqCst) {
+            tracing::warn!(
+                event = "native.auth.store_fence",
+                category = "stale",
+                generation = self.generation
+            );
             return Err(Unavailable);
         }
         operation()
@@ -537,6 +557,48 @@ mod tests {
         let fresh = CredentialStore::new(input).unwrap();
         assert_eq!(fresh.with_current(|| Ok(())), Ok(()));
         assert_eq!(old.server, server_namespace("fence-test").unwrap());
+    }
+
+    #[test]
+    fn stale_store_fence_emits_only_bounded_diagnostics() {
+        if !crate::dictation_telemetry::isolated_exporter_test(
+            "credential_store::tests::stale_store_fence_emits_only_bounded_diagnostics",
+        ) {
+            return;
+        }
+        use opentelemetry_sdk::logs::{SdkLoggerProvider, InMemoryLogExporter};
+        use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let logs = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&provider));
+        tracing::subscriber::with_default(subscriber, || {
+            let store = CredentialStore::new(CredentialIdentity {
+                server_id: "SECRET_SERVER_SENTINEL",
+                client_id: "SECRET_CLIENT_SENTINEL",
+                audience: Some("SECRET_AUDIENCE_SENTINEL"),
+                ..identity(&["SECRET_SCOPE_SENTINEL".into()])
+            })
+            .unwrap();
+            store.fence.generation.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                store.with_current(|| -> Result<(), NativeRefreshTokenStoreError> {
+                    panic!("stale handles must not perform secure-store I/O")
+                }),
+                Err(Unavailable)
+            );
+        });
+        provider.force_flush().unwrap();
+        let emitted = logs.get_emitted_logs().unwrap();
+        assert_eq!(emitted.len(), 1);
+        let diagnostic = format!("{emitted:?}");
+        assert!(diagnostic.contains("native.auth.store_fence"));
+        assert!(diagnostic.contains("stale"));
+        assert!(diagnostic.contains("generation"));
+        assert!(!diagnostic.contains("SECRET_"));
     }
 
     #[test]

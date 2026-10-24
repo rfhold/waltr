@@ -25,6 +25,9 @@ use url::{Position, Url};
 
 use crate::{AccessAttemptId, ClientCommand, NativeCredentialLease, NativeCredentialProvider};
 
+mod telemetry;
+use telemetry::{Outcome, Stage};
+
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_SKEW: Duration = Duration::from_mins(1);
@@ -514,6 +517,7 @@ enum LifecycleResult {
 enum RestoreResult {
     None,
     Refreshed(Result<Box<LoginTokens>, NativeAuthError>),
+    DiscoveryFailed(NativeAuthError),
     Malformed,
     Unavailable,
 }
@@ -572,6 +576,7 @@ async fn coordinate(
         results,
     } = context;
     let restore_lease = credentials.begin_credential_lease();
+    telemetry::emit(Stage::Restore, Outcome::Started, restore_lease.generation());
     let restore_results = results.clone();
     let restore_config = config.clone();
     let restore_outputs = outputs.clone();
@@ -579,7 +584,13 @@ async fn coordinate(
     let mut restore_task = Some(OwnedTask::new(
         restore_lease,
         tokio::spawn(async move {
-            let result = restore(restore_config, restore_outputs, restore_store).await;
+            let result = restore(
+                restore_config,
+                restore_outputs,
+                restore_store,
+                restore_lease,
+            )
+            .await;
             drop(
                 restore_results
                     .send(CoordinatorResult::Restore {
@@ -660,7 +671,7 @@ async fn coordinate(
                         pending_lease = None;
                         active_callback = None;
                         let _ = credentials.clear_bearer_token();
-                        if refresh_store.delete().await.is_err() {
+                        if delete_refresh_token(refresh_store.as_ref()).await.is_err() {
                             send_progress(&outputs, NativeAccessProgress::Failed {
                                 error: "Waltr signed out in memory, but secure credential deletion could not be confirmed".to_owned(),
                             }).await;
@@ -673,10 +684,11 @@ async fn coordinate(
                         }
                     }
                     NativeAccessAction::CredentialRejected => {
+                        telemetry::emit(Stage::Credential, Outcome::Rejected, credentials.credential_lease().generation());
                         abort_owned(&mut restore_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         let _ = credentials.clear_bearer_token();
-                        if refresh_store.delete().await.is_err() {
+                        if delete_refresh_token(refresh_store.as_ref()).await.is_err() {
                             send_progress(&outputs, NativeAccessProgress::Failed {
                                 error: "Waltr access was rejected, but secure credential deletion could not be confirmed".to_owned(),
                             }).await;
@@ -733,16 +745,26 @@ async fn coordinate(
                         if restore_task.as_ref().is_none_or(|task| task.owner != lease)
                             || credentials.credential_lease() != lease
                         {
+                            telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
                             continue;
                         }
                         restore_task = None;
+                        let outcome = match &result {
+                            RestoreResult::None => Outcome::Miss,
+                            RestoreResult::Unavailable => Outcome::Unavailable,
+                            RestoreResult::Malformed => Outcome::Malformed,
+                            RestoreResult::DiscoveryFailed(_) => Outcome::Discovery,
+                            RestoreResult::Refreshed(Ok(_)) => Outcome::Success,
+                            RestoreResult::Refreshed(Err(error)) => telemetry::failure(error),
+                        };
+                        telemetry::emit(Stage::Restore, outcome, lease.generation());
                         match result {
                             RestoreResult::None => {}
                             RestoreResult::Unavailable => {
                                 send_store_warning(&outputs).await;
                             }
                             RestoreResult::Malformed => {
-                                if refresh_store.delete().await.is_err() {
+                                if delete_refresh_token(refresh_store.as_ref()).await.is_err() {
                                     send_progress(&outputs, NativeAccessProgress::Failed {
                                         error: "Malformed secure credentials could not be deleted".to_owned(),
                                     }).await;
@@ -750,7 +772,7 @@ async fn coordinate(
                             }
                             RestoreResult::Refreshed(Ok(tokens)) => {
                                 persist_refresh_token(&outputs, refresh_store.as_ref(), tokens.refresh_token.as_deref()).await;
-                                if credentials.replace_bearer_token_if_current(lease, &tokens.access_token).unwrap_or(false)
+                                if install_bearer(&credentials, lease, &tokens.access_token).unwrap_or(false)
                                 {
                                     send_progress(&outputs, NativeAccessProgress::RefreshSucceeded).await;
                                     if send_command(&outputs, ClientCommand::ReprobeWaltrAccess, false).await.is_err() { break; }
@@ -759,7 +781,7 @@ async fn coordinate(
                                     )));
                                 }
                             }
-                            RestoreResult::Refreshed(Err(error)) => {
+                            RestoreResult::Refreshed(Err(error)) | RestoreResult::DiscoveryFailed(error) => {
                                 let error = terminal_refresh_error(
                                     refresh_store.as_ref(),
                                     error,
@@ -772,6 +794,7 @@ async fn coordinate(
                     }
                     CoordinatorResult::Login { attempt_id, lease, result } => {
                         if active_attempt.as_ref() != Some(&(attempt_id.clone(), lease)) {
+                            telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
                             continue;
                         }
                         active_callback = None;
@@ -780,14 +803,20 @@ async fn coordinate(
                         }
                         match result {
                             Ok(tokens) => {
-                                if credentials.credential_lease() != lease { continue; }
-                                let previous = if let Ok(previous) = refresh_store.load().await {
+                                if credentials.credential_lease() != lease {
+                                    telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
+                                    continue;
+                                }
+                                let previous = if let Ok(previous) = load_refresh_token(refresh_store.as_ref()).await {
                                     Some(previous)
                                 } else {
                                     send_store_warning(&outputs).await;
                                     None
                                 };
-                                if credentials.credential_lease() != lease { continue; }
+                                if credentials.credential_lease() != lease {
+                                    telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
+                                    continue;
+                                }
                                 if let Some(previous) = previous {
                                     login_persistence = Some(LoginPersistence {
                                         attempt_id: attempt_id.clone(), lease, token: tokens.refresh_token.as_ref().map(|token| token.as_bytes().to_vec()), previous, canceled: false,
@@ -798,7 +827,7 @@ async fn coordinate(
                                         tokens.refresh_token.as_deref(),
                                     ).await;
                                 }
-                                match credentials.replace_bearer_token_if_current(lease, &tokens.access_token) {
+                                match install_bearer(&credentials, lease, &tokens.access_token) {
                                     Ok(true) => {}
                                     Ok(false) => {
                                         compensate_login(&outputs, refresh_store.as_ref(), &mut login_persistence).await;
@@ -833,6 +862,7 @@ async fn coordinate(
                         if lifecycle_task.as_ref().is_none_or(|task| task.owner != lease)
                             || credentials.credential_lease() != lease
                         {
+                            telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
                             continue;
                         }
                         lifecycle_task = None;
@@ -848,7 +878,7 @@ async fn coordinate(
                                     refresh_store.as_ref(),
                                     tokens.refresh_token.as_deref(),
                                 ).await;
-                                match credentials.replace_bearer_token_if_current(lease, &tokens.access_token) {
+                                match install_bearer(&credentials, lease, &tokens.access_token) {
                                     Ok(true) => {
                                         send_progress(&outputs, NativeAccessProgress::RefreshSucceeded).await;
                                         lifecycle_task = Some(OwnedTask::new(lease, spawn_lifecycle(
@@ -908,11 +938,11 @@ async fn compensate_login(
         return true;
     };
     persistence.canceled = true;
-    let removed = match store.load().await {
+    let removed = match load_refresh_token(store).await {
         Ok(current) if current == persistence.token => match &persistence.previous {
             Some(previous) if current.as_ref() == Some(previous) => true,
-            Some(previous) => store.store(previous).await.is_ok(),
-            None => store.delete().await.is_ok(),
+            Some(previous) => save_refresh_token(store, previous).await.is_ok(),
+            None => delete_refresh_token(store).await.is_ok(),
         },
         Ok(_) => true,
         Err(_) => false,
@@ -956,6 +986,7 @@ async fn fail_attempt(
     let (attempt_id, lease) = attempt;
     let revision = credentials.credential_revision();
     if !credentials.clear_bearer_token_if_current(lease, revision) {
+        telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
         return;
     }
     send_progress(
@@ -983,6 +1014,7 @@ async fn expire_access(
 ) {
     let revision = credentials.credential_revision();
     if !credentials.clear_bearer_token_if_current(lease, revision) {
+        telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
         return;
     }
     send_progress(
@@ -993,6 +1025,61 @@ async fn expire_access(
     )
     .await;
     drop(send_command(outputs, ClientCommand::WaltrAccessExpired { error }, false).await);
+}
+
+async fn load_refresh_token(
+    store: &dyn NativeRefreshTokenStore,
+) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
+    let result = store.load().await;
+    let outcome = match &result {
+        Ok(Some(_)) => Outcome::Hit,
+        Ok(None) => Outcome::Miss,
+        Err(NativeRefreshTokenStoreError::Unavailable) => Outcome::Unavailable,
+        Err(NativeRefreshTokenStoreError::Malformed) => Outcome::Malformed,
+    };
+    telemetry::emit(Stage::Load, outcome, 0);
+    result
+}
+
+async fn save_refresh_token(
+    store: &dyn NativeRefreshTokenStore,
+    token: &[u8],
+) -> Result<(), NativeRefreshTokenStoreError> {
+    let result = store.store(token).await;
+    emit_store_result(Stage::Save, &result);
+    result
+}
+
+async fn delete_refresh_token(
+    store: &dyn NativeRefreshTokenStore,
+) -> Result<(), NativeRefreshTokenStoreError> {
+    let result = store.delete().await;
+    emit_store_result(Stage::Delete, &result);
+    result
+}
+
+fn emit_store_result(stage: Stage, result: &Result<(), NativeRefreshTokenStoreError>) {
+    let outcome = match result {
+        Ok(()) => Outcome::Success,
+        Err(NativeRefreshTokenStoreError::Unavailable) => Outcome::Unavailable,
+        Err(NativeRefreshTokenStoreError::Malformed) => Outcome::Malformed,
+    };
+    telemetry::emit(stage, outcome, 0);
+}
+
+fn install_bearer(
+    credentials: &NativeCredentialProvider,
+    lease: NativeCredentialLease,
+    token: &str,
+) -> Result<bool, crate::ClientError> {
+    let result = credentials.replace_bearer_token_if_current(lease, token);
+    let outcome = match &result {
+        Ok(true) => Outcome::Success,
+        Ok(false) => Outcome::Stale,
+        Err(_) => Outcome::Rejected,
+    };
+    telemetry::emit(Stage::Bearer, outcome, lease.generation());
+    result
 }
 
 async fn send_store_warning(outputs: &mpsc::Sender<NativeAccessOutput>) {
@@ -1009,7 +1096,7 @@ async fn terminal_refresh_error(
     store: &dyn NativeRefreshTokenStore,
     error: NativeAuthError,
 ) -> String {
-    if error.is_invalid_grant() && store.delete().await.is_err() {
+    if error.is_invalid_grant() && delete_refresh_token(store).await.is_err() {
         DELETE_UNCONFIRMED.to_owned()
     } else {
         error.to_string()
@@ -1022,8 +1109,8 @@ async fn persist_refresh_token(
     refresh_token: Option<&str>,
 ) {
     let result = match refresh_token {
-        Some(token) => store.store(token.as_bytes()).await,
-        None => store.delete().await,
+        Some(token) => save_refresh_token(store, token.as_bytes()).await,
+        None => delete_refresh_token(store).await,
     };
     if result.is_err() {
         send_store_warning(outputs).await;
@@ -1034,8 +1121,9 @@ async fn restore(
     config: NativeAccessConfig,
     outputs: mpsc::Sender<NativeAccessOutput>,
     store: Arc<dyn NativeRefreshTokenStore>,
+    lease: NativeCredentialLease,
 ) -> RestoreResult {
-    let bytes = match store.load().await {
+    let bytes = match load_refresh_token(store.as_ref()).await {
         Ok(None) => return RestoreResult::None,
         Ok(Some(bytes)) => bytes,
         Err(NativeRefreshTokenStoreError::Unavailable) => return RestoreResult::Unavailable,
@@ -1059,7 +1147,7 @@ async fn restore(
     };
     let discovered = match discover(&client, &config.endpoint).await {
         Ok(discovered) => discovered,
-        Err(error) => return RestoreResult::Refreshed(Err(error)),
+        Err(error) => return RestoreResult::DiscoveryFailed(error),
     };
     send_progress(&outputs, NativeAccessProgress::Refreshing).await;
     let tokens = LoginTokens {
@@ -1070,7 +1158,7 @@ async fn restore(
         client_id: config.client_id,
     };
     RestoreResult::Refreshed(
-        refresh_token_request(&tokens, &refresh_token)
+        refresh_token_request_with_generation(&tokens, &refresh_token, lease.generation())
             .await
             .map(Box::new),
     )
@@ -1739,7 +1827,7 @@ fn spawn_lifecycle(
             time::sleep(tokens.expires_in.saturating_sub(advance)).await;
             send_progress(&outputs, NativeAccessProgress::Refreshing).await;
             LifecycleResult::Refreshed(
-                refresh_token_request(&tokens, refresh_token)
+                refresh_token_request_with_generation(&tokens, refresh_token, lease.generation())
                     .await
                     .map(Box::new),
             )
@@ -1755,7 +1843,30 @@ fn spawn_lifecycle(
     })
 }
 
+#[cfg(test)]
 async fn refresh_token_request(
+    tokens: &LoginTokens,
+    refresh_token: &str,
+) -> Result<LoginTokens, NativeAuthError> {
+    refresh_token_request_with_generation(tokens, refresh_token, 0).await
+}
+
+async fn refresh_token_request_with_generation(
+    tokens: &LoginTokens,
+    refresh_token: &str,
+    generation: u64,
+) -> Result<LoginTokens, NativeAuthError> {
+    telemetry::emit(Stage::Refresh, Outcome::Started, generation);
+    let result = refresh_token_request_inner(tokens, refresh_token).await;
+    let outcome = match &result {
+        Ok(_) => Outcome::Success,
+        Err(error) => telemetry::failure(error),
+    };
+    telemetry::emit(Stage::Refresh, outcome, generation);
+    result
+}
+
+async fn refresh_token_request_inner(
     tokens: &LoginTokens,
     refresh_token: &str,
 ) -> Result<LoginTokens, NativeAuthError> {
@@ -2027,6 +2138,195 @@ mod tests {
             audience: None,
             callback: NativeCallbackPolicy::Loopback(NativeLoopbackPolicy::Ephemeral),
         }
+    }
+
+    #[cfg(feature = "native-tracing")]
+    #[test]
+    fn native_auth_production_events_are_bounded_and_secret_free() {
+        use tracing_subscriber::{Layer, layer::SubscriberExt as _};
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "waltr_client::native_access::telemetry" {
+                    return;
+                }
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn fmt::Debug,
+                    ) {
+                        assert!(matches!(
+                            field.name(),
+                            "event" | "stage" | "category" | "generation"
+                        ));
+                        self.0.push_str(&format!(" {}={value:?}", field.name()));
+                    }
+                }
+                let mut fields = Fields(event.metadata().level().to_string());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        struct MalformedStore;
+        #[async_trait]
+        impl NativeRefreshTokenStore for MalformedStore {
+            async fn load(&self) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
+                Err(NativeRefreshTokenStoreError::Malformed)
+            }
+            async fn store(&self, _: &[u8]) -> Result<(), NativeRefreshTokenStoreError> {
+                Err(NativeRefreshTokenStoreError::Malformed)
+            }
+            async fn delete(&self) -> Result<(), NativeRefreshTokenStoreError> {
+                Err(NativeRefreshTokenStoreError::Malformed)
+            }
+        }
+        let captured = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                assert!(load_refresh_token(&MalformedStore).await.is_err());
+                assert!(save_refresh_token(&MalformedStore, b"SECRET_MALFORMED_SENTINEL").await.is_err());
+                assert!(delete_refresh_token(&MalformedStore).await.is_err());
+                let store = MockRefreshStore::default();
+                assert!(load_refresh_token(&store).await.unwrap().is_none());
+                save_refresh_token(&store, b"SECRET_REFRESH_SENTINEL").await.unwrap();
+                assert!(load_refresh_token(&store).await.unwrap().is_some());
+                delete_refresh_token(&store).await.unwrap();
+                store.fail.store(true, std::sync::atomic::Ordering::Release);
+                assert!(load_refresh_token(&store).await.is_err());
+                assert!(save_refresh_token(&store, b"SECRET_SAVE_SENTINEL").await.is_err());
+                assert!(delete_refresh_token(&store).await.is_err());
+
+                let credentials = NativeCredentialProvider::new();
+                let lease = credentials.begin_credential_lease();
+                assert!(install_bearer(&credentials, lease, "SECRET_BEARER_SENTINEL").unwrap());
+                let _ = credentials.begin_credential_lease();
+                assert!(!install_bearer(&credentials, lease, "SECRET_STALE_SENTINEL").unwrap());
+                let current = credentials.credential_lease();
+                assert!(install_bearer(&credentials, current, "invalid\nSECRET_HEADER_SENTINEL").is_err());
+
+                for (status, body, expected) in [
+                    ("200 OK", r#"{"access_token":"SECRET_ACCESS_SENTINEL","refresh_token":"SECRET_ROTATION_SENTINEL","expires_in":3600,"token_type":"Bearer"}"#, true),
+                    ("400 Bad Request", r#"{"error":"invalid_grant","error_description":"SECRET_PROVIDER_SENTINEL"}"#, false),
+                    ("400 Bad Request", r#"{"error":"SECRET_OTHER_SENTINEL"}"#, false),
+                ] {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let endpoint = Url::parse(&format!("http://{}/SECRET_URL_SENTINEL", listener.local_addr().unwrap())).unwrap();
+                    let server = tokio::spawn(async move {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        read_http_request(&mut stream).await;
+                        write_json_response(&mut stream, status, body).await;
+                    });
+                    let tokens = LoginTokens {
+                        access_token: "SECRET_OLD_SENTINEL".into(), refresh_token: None,
+                        expires_in: Duration::from_secs(3600), token_endpoint: endpoint,
+                        client_id: "SECRET_CLIENT_SENTINEL".into(),
+                    };
+                    assert_eq!(refresh_token_request_with_generation(&tokens, "SECRET_REFRESH_SENTINEL", lease.generation()).await.is_ok(), expected);
+                    server.await.unwrap();
+                }
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = Url::parse(&format!("http://{}/SECRET_URL_SENTINEL", listener.local_addr().unwrap())).unwrap();
+                drop(listener);
+                let tokens = LoginTokens {
+                    access_token: String::new(), refresh_token: None,
+                    expires_in: Duration::ZERO, token_endpoint: endpoint,
+                    client_id: "SECRET_CLIENT_SENTINEL".into(),
+                };
+                assert!(refresh_token_request_with_generation(&tokens, "SECRET_REFRESH_SENTINEL", lease.generation()).await.is_err());
+
+                for (index, store) in [
+                    MockRefreshStore { token: Mutex::new(Some(vec![255])), ..Default::default() },
+                    MockRefreshStore { fail: std::sync::atomic::AtomicBool::new(true), ..Default::default() },
+                    MockRefreshStore { token: Mutex::new(Some(b"SECRET_DISCOVERY_REFRESH_SENTINEL".to_vec())), ..Default::default() },
+                ].into_iter().enumerate() {
+                    let mut coordinator = NativeAccessCoordinator::spawn_with_store(test_config(), NativeCredentialProvider::new(), Arc::new(store), 8);
+                    if index == 0 {
+                        for _ in 0..32 { tokio::task::yield_now().await; }
+                    } else {
+                        loop {
+                            let output = time::timeout(Duration::from_secs(3), coordinator.next_output()).await.unwrap().unwrap();
+                            if matches!(output, NativeAccessOutput::Progress(NativeAccessProgress::Failed { .. } | NativeAccessProgress::Warning { .. })) { break; }
+                        }
+                    }
+                    coordinator.stop().await;
+                }
+                let (actions, receiver) = mpsc::channel(8);
+                let (results, result_receiver) = mpsc::channel(8);
+                let (outputs, _output_receiver) = mpsc::channel(8);
+                let task = tokio::spawn(coordinate(receiver, result_receiver, CoordinatorContext {
+                    outputs, config: test_config(), credentials: credentials.clone(),
+                    refresh_store: Arc::new(MockRefreshStore::default()), results: results.clone(),
+                }));
+                for _ in 0..8 { tokio::task::yield_now().await; }
+                results.send(CoordinatorResult::Lifecycle { lease, result: LifecycleResult::Expired }).await.unwrap();
+                for _ in 0..8 { tokio::task::yield_now().await; }
+                actions.send(NativeAccessAction::CredentialRejected).await.unwrap();
+                actions.send(NativeAccessAction::Shutdown).await.unwrap();
+                task.await.unwrap();
+            });
+        });
+        let events = captured.0.lock().unwrap();
+        let diagnostic = events.join("\n");
+        for (stage, category) in [
+            ("store_load", "malformed"),
+            ("store_save", "malformed"),
+            ("store_delete", "malformed"),
+            ("store_load", "hit"),
+            ("store_load", "miss"),
+            ("store_load", "unavailable"),
+            ("store_save", "success"),
+            ("store_save", "unavailable"),
+            ("store_delete", "success"),
+            ("store_delete", "unavailable"),
+            ("bearer_install", "success"),
+            ("bearer_install", "stale"),
+            ("bearer_install", "rejected"),
+            ("restore", "started"),
+            ("restore", "miss"),
+            ("restore", "malformed"),
+            ("restore", "unavailable"),
+            ("restore", "discovery"),
+            ("result", "stale"),
+            ("refresh", "started"),
+            ("refresh", "success"),
+            ("refresh", "invalid_grant"),
+            ("refresh", "other"),
+            ("refresh", "transport"),
+            ("credential", "rejected"),
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.contains(&format!("stage={stage:?}"))
+                        && event.contains(&format!("category={category:?}"))),
+                "missing {stage}/{category}: {diagnostic}"
+            );
+        }
+        for event in events.iter() {
+            let informational = ["started", "success", "hit", "miss"]
+                .iter()
+                .any(|category| event.contains(&format!("category={category:?}")));
+            assert!(
+                event.starts_with(if informational { "INFO" } else { "WARN" }),
+                "{event}"
+            );
+            assert!(event.contains("event=\"native.auth\""));
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("stage=\"refresh\"") && event.contains("generation=1"))
+        );
+        assert!(!diagnostic.contains("SECRET_"), "{diagnostic}");
+        assert!(!diagnostic.contains("http"));
     }
 
     #[test]
@@ -3563,6 +3863,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anonymous_status_rejection_during_startup_does_not_cancel_restoration() {
+        use crate::{NativeGrpcTransport, WaltrTransport};
+        use futures_util::stream;
+        use prost::Message as _;
+        use waltr::grpc::waltr::{
+            auth::v1::{AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason},
+            status::v1::{
+                WatchStatusRequest, WatchStatusResponse,
+                status_service_server::{StatusService, StatusServiceServer},
+            },
+        };
+
+        struct LoginRequiredStatus;
+
+        #[tonic::async_trait]
+        impl StatusService for LoginRequiredStatus {
+            type WatchStatusStream = stream::Empty<Result<WatchStatusResponse, tonic::Status>>;
+
+            async fn watch_status(
+                &self,
+                request: tonic::Request<WatchStatusRequest>,
+            ) -> Result<tonic::Response<Self::WatchStatusStream>, tonic::Status> {
+                assert!(request.metadata().get("authorization").is_none());
+                let failure = AuthenticationFailure {
+                    version: 1,
+                    domain: AuthenticationDomain::WaltrAccess as i32,
+                    reason: AuthenticationFailureReason::CredentialRequired as i32,
+                    target: None,
+                    mcp_authorization: None,
+                };
+                Err(tonic::Status::with_details(
+                    tonic::Code::Unauthenticated,
+                    "login required",
+                    failure.encode_to_vec().into(),
+                ))
+            }
+        }
+
+        time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let status_endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let incoming = stream::unfold(listener, |listener| async {
+                Some((listener.accept().await.map(|(stream, _)| stream), listener))
+            });
+            let status_server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(StatusServiceServer::new(LoginRequiredStatus))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+            let (release, token_gate) = oneshot::channel();
+            let (endpoint, mut token_requests, oauth_server) =
+                spawn_test_oauth_server_with_token_gate(Some(token_gate)).await;
+            let store = Arc::new(MockRefreshStore::default());
+            *store.token.lock().unwrap() = Some(b"stored-refresh".to_vec());
+            let credentials = NativeCredentialProvider::new();
+            *store.credential_probe.lock().unwrap() = Some(credentials.clone());
+            let mut config = test_config();
+            config.endpoint = endpoint;
+            let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+                config,
+                credentials.clone(),
+                store.clone(),
+                8,
+            );
+            let request = token_requests.recv().await.unwrap();
+            assert!(request.contains("refresh_token=stored-refresh"));
+            let lease = credentials.credential_lease();
+            let revision = credentials.credential_revision();
+            let transport =
+                NativeGrpcTransport::with_credential_provider(status_endpoint, credentials.clone());
+
+            let error = match transport.watch_status().await {
+                Ok(_) => panic!("anonymous status should require login"),
+                Err(error) => error,
+            };
+            assert!(error.is_waltr_login_required());
+            assert_eq!(credentials.credential_lease(), lease);
+            assert_eq!(credentials.credential_revision(), revision);
+            assert!(!credentials.has_bearer_token());
+            release.send(()).unwrap();
+
+            for progress in [
+                NativeAccessProgress::Discovering,
+                NativeAccessProgress::Refreshing,
+                NativeAccessProgress::RefreshSucceeded,
+            ] {
+                assert_eq!(
+                    coordinator.next_output().await,
+                    Some(NativeAccessOutput::Progress(progress))
+                );
+            }
+            assert_eq!(
+                coordinator.next_output().await,
+                Some(NativeAccessOutput::ClientCommand {
+                    command: Box::new(ClientCommand::ReprobeWaltrAccess),
+                    logout_barrier: false,
+                })
+            );
+            assert!(credentials.has_bearer_token());
+            assert_eq!(credentials.credential_lease(), lease);
+            assert_eq!(*store.bearer_seen_during_store.lock().unwrap(), Some(false));
+            assert_eq!(
+                store.token.lock().unwrap().as_deref(),
+                Some(b"test-refresh".as_slice())
+            );
+            assert!(!store.operations.lock().unwrap().contains(&"delete"));
+            coordinator.stop().await;
+            status_server.abort();
+            oauth_server.abort();
+        })
+        .await
+        .expect("startup race should complete without waiting for another login");
+    }
+
+    #[tokio::test]
     async fn malformed_storage_and_terminal_rejection_delete_durable_state() {
         let store = Arc::new(MockRefreshStore::default());
         *store.token.lock().unwrap() = Some(vec![0xff]);
@@ -4139,6 +4556,12 @@ mod tests {
     }
 
     async fn spawn_test_oauth_server() -> (String, mpsc::Receiver<String>, JoinHandle<()>) {
+        spawn_test_oauth_server_with_token_gate(None).await
+    }
+
+    async fn spawn_test_oauth_server_with_token_gate(
+        mut token_gate: Option<oneshot::Receiver<()>>,
+    ) -> (String, mpsc::Receiver<String>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server_endpoint = endpoint.clone();
@@ -4157,6 +4580,9 @@ mod tests {
                     ),
                     "/token" => {
                         token_requests.send(request).await.unwrap();
+                        if let Some(gate) = token_gate.take() {
+                            gate.await.unwrap();
+                        }
                         r#"{"access_token":"test-access","refresh_token":"test-refresh","expires_in":3600,"token_type":"Bearer"}"#.to_owned()
                     }
                     _ => panic!("unexpected OAuth test request: {path}"),

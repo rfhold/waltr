@@ -12,7 +12,10 @@ export function SplashRoute() {
     }
 
     if (app.clientError()) {
-      return "Unable to connect to Waltr.";
+      const error = app.clientError();
+      return error instanceof Error && error.message === "Native access discovery failed. Retry connection."
+        ? "Unable to discover native sign-in configuration. Retry connection or switch server."
+        : "Unable to connect to Waltr.";
     }
 
     const statusError = app.snapshot()?.status.watch.error;

@@ -4454,307 +4454,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "waltr"
-version = "0.3.0"
-dependencies = [
- "prost",
- "prost-types",
- "serde",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "waltr-agent"
-version = "0.3.0"
-dependencies = [
- "aws-config",
- "aws-sdk-s3",
- "axum",
- "base64 0.22.1",
- "futures-util",
- "http 1.4.1",
- "httpdate",
- "hyper-util",
- "jsonwebtoken",
- "waltr",
- "waltr-agent-sandbox",
- "mcp",
- "oauth2",
- "opendal",
- "opentelemetry",
- "opentelemetry_sdk",
- "refinery",
- "reqwest",
- "rustix",
- "rustls 0.23.40",
- "scylla",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "tempfile",
- "testcontainers",
- "tokio",
- "tokio-postgres",
- "tokio-stream",
- "tokio-tungstenite",
- "tokio-util",
- "tonic",
- "tower",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-bash",
- "uuid",
- "webpki-roots 1.0.7",
-]
-
-[[package]]
-name = "waltr-agent-sandbox"
-version = "0.3.0"
-dependencies = [
- "globset",
- "hyper-util",
- "ignore",
- "waltr",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tower",
- "tree-sitter",
- "tree-sitter-bash",
- "uuid",
-]
-
-[[package]]
-name = "waltr-app"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "axum",
- "block2",
- "futures-channel",
- "futures-util",
- "hyper 1.10.0",
- "hyper-util",
- "jni 0.22.4",
- "jni_fn",
- "waltr-audio-io",
- "waltr-client",
- "waltr-desktop",
- "waltr-server",
- "objc2",
- "objc2-av-foundation",
- "objc2-foundation",
- "objc2-web-kit",
- "opentelemetry",
- "opentelemetry-appender-tracing",
- "opentelemetry-http",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "rand 0.9.4",
- "reqwest",
- "rustls 0.23.40",
- "rustls-platform-verifier",
- "security-framework",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tokio",
- "tokio-util",
- "tonic",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "webpki-roots 1.0.7",
- "zeroize",
-]
-
-[[package]]
-name = "waltr-audio"
-version = "0.3.0"
-dependencies = [
- "futures-core",
- "futures-util",
- "waltr",
- "opentelemetry",
- "opentelemetry_sdk",
- "prost",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "waltr-audio-io"
-version = "0.3.0"
-dependencies = [
- "cpal 0.15.3",
- "cpal 0.16.0",
- "rubato",
-]
-
-[[package]]
-name = "waltr-client"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "futures-channel",
- "futures-core",
- "futures-util",
- "http 1.4.1",
- "http-body 1.0.1",
- "hyper-util",
- "waltr",
- "waltr-agent",
- "waltr-server",
- "opentelemetry",
- "opentelemetry_sdk",
- "pin-project-lite",
- "prost",
- "prost-types",
- "rand 0.9.4",
- "reqwest",
- "rustls 0.23.40",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "tokio",
- "tonic",
- "tonic-web-wasm-client",
- "tower",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "ts-rs",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "webpki-roots 1.0.7",
-]
-
-[[package]]
-name = "waltr-desktop"
-version = "0.3.0"
-dependencies = [
- "ashpd",
- "core-graphics",
- "futures-util",
- "global-hotkey",
- "waltr-audio-io",
- "waltr-client",
- "macos-accessibility-client",
- "objc2",
- "reis",
- "rustix",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "tokio",
- "tokio-util",
- "tonic",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "waltr-server"
-version = "0.3.0"
-dependencies = [
- "aws-sdk-s3",
- "axum",
- "base64 0.22.1",
- "cookie",
- "futures-util",
- "http-body 1.0.1",
- "hyper 1.10.0",
- "hyper-util",
- "jaq-core",
- "jaq-interpret",
- "jaq-parse",
- "jaq-std",
- "jsonwebtoken",
- "waltr",
- "waltr-agent",
- "waltr-agent-sandbox",
- "waltr-audio",
- "mcp",
- "notify",
- "oauth2",
- "opentelemetry",
- "opentelemetry-appender-tracing",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "p256",
- "prost",
- "prost-types",
- "pyroscope",
- "rand 0.9.4",
- "reqwest",
- "rustls 0.23.40",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "sqlx",
- "testcontainers",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-otel-layer",
- "tonic-tracing-opentelemetry",
- "tonic-web",
- "tower",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "uuid",
- "webpki-roots 1.0.7",
-]
-
-[[package]]
-name = "waltr-tui"
-version = "0.3.0"
-dependencies = [
- "insta",
- "waltr-client",
- "waltr-server",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "syntect",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "waltr-web"
-version = "0.3.0"
-
-[[package]]
 name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10550,6 +10249,307 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
+
+[[package]]
+name = "waltr"
+version = "0.3.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "serde",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "waltr-agent"
+version = "0.3.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-s3",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "http 1.4.1",
+ "httpdate",
+ "hyper-util",
+ "jsonwebtoken",
+ "mcp",
+ "oauth2",
+ "opendal",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "refinery",
+ "reqwest",
+ "rustix",
+ "rustls 0.23.40",
+ "scylla",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tokio-postgres",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "uuid",
+ "waltr",
+ "waltr-agent-sandbox",
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "waltr-agent-sandbox"
+version = "0.3.0"
+dependencies = [
+ "globset",
+ "hyper-util",
+ "ignore",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "uuid",
+ "waltr",
+]
+
+[[package]]
+name = "waltr-app"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "block2",
+ "futures-channel",
+ "futures-util",
+ "hyper 1.10.0",
+ "hyper-util",
+ "jni 0.22.4",
+ "jni_fn",
+ "objc2",
+ "objc2-av-foundation",
+ "objc2-foundation",
+ "objc2-web-kit",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rand 0.9.4",
+ "reqwest",
+ "rustls 0.23.40",
+ "rustls-platform-verifier",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "waltr-audio-io",
+ "waltr-client",
+ "waltr-desktop",
+ "waltr-server",
+ "webpki-roots 1.0.7",
+ "zeroize",
+]
+
+[[package]]
+name = "waltr-audio"
+version = "0.3.0"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "waltr",
+]
+
+[[package]]
+name = "waltr-audio-io"
+version = "0.3.0"
+dependencies = [
+ "cpal 0.15.3",
+ "cpal 0.16.0",
+ "rubato",
+]
+
+[[package]]
+name = "waltr-client"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "http 1.4.1",
+ "http-body 1.0.1",
+ "hyper-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "pin-project-lite",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "reqwest",
+ "rustls 0.23.40",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tokio",
+ "tonic",
+ "tonic-web-wasm-client",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "ts-rs",
+ "url",
+ "waltr",
+ "waltr-agent",
+ "waltr-server",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "waltr-desktop"
+version = "0.3.0"
+dependencies = [
+ "ashpd",
+ "core-graphics",
+ "futures-util",
+ "global-hotkey",
+ "macos-accessibility-client",
+ "objc2",
+ "reis",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "unicode-segmentation",
+ "waltr-audio-io",
+ "waltr-client",
+]
+
+[[package]]
+name = "waltr-server"
+version = "0.3.0"
+dependencies = [
+ "aws-sdk-s3",
+ "axum",
+ "base64 0.22.1",
+ "cookie",
+ "futures-util",
+ "http-body 1.0.1",
+ "hyper 1.10.0",
+ "hyper-util",
+ "jaq-core",
+ "jaq-interpret",
+ "jaq-parse",
+ "jaq-std",
+ "jsonwebtoken",
+ "mcp",
+ "notify",
+ "oauth2",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "p256",
+ "prost",
+ "prost-types",
+ "pyroscope",
+ "rand 0.9.4",
+ "reqwest",
+ "rustls 0.23.40",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "sqlx",
+ "testcontainers",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-otel-layer",
+ "tonic-tracing-opentelemetry",
+ "tonic-web",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "waltr",
+ "waltr-agent",
+ "waltr-agent-sandbox",
+ "waltr-audio",
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "waltr-tui"
+version = "0.3.0"
+dependencies = [
+ "insta",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tokio",
+ "tracing",
+ "url",
+ "waltr-client",
+ "waltr-server",
+]
+
+[[package]]
+name = "waltr-web"
+version = "0.3.0"
 
 [[package]]
 name = "want"

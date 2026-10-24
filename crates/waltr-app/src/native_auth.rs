@@ -38,7 +38,14 @@ impl AccessBinding {
             scopes: &config.scopes,
             audience: config.audience.as_deref(),
         })
-        .map_err(|_| "Secure credentials are unavailable")?;
+        .map_err(|error| {
+            let category = match error {
+                waltr_client::NativeRefreshTokenStoreError::Unavailable => "unavailable",
+                waltr_client::NativeRefreshTokenStoreError::Malformed => "malformed",
+            };
+            tracing::warn!(event = "native.auth.store_binding", category);
+            "Secure credentials are unavailable"
+        })?;
         Ok(Self {
             config,
             store,

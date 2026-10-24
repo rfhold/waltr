@@ -1,7 +1,7 @@
 import { Show, type ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { AccessRoute } from "../access/AccessRoute";
+import { AccessRoute, NativeAccessDiagnostic } from "../access/AccessRoute";
 import { OAuthDialog } from "../auth/OAuthDialog";
 import { SplashRoute } from "../splash/SplashRoute";
 
@@ -18,6 +18,7 @@ export function AppLayout(props: ParentProps) {
   return (
     <div class="app" data-app-phase={app.phase()}>
       <Show when={authenticated()}>
+        <NativeAccessDiagnostic />
         {props.children}
         <OAuthDialog />
       </Show>

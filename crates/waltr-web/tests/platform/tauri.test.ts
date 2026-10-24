@@ -5,6 +5,48 @@ import { loadTauriClient } from "../../src/platform/tauri";
 import { emptyConfig, snapshotWithConfig } from "../support/snapshots";
 
 describe("Tauri client adapter", () => {
+  test("recovers bounded access diagnostics, replays them to subscribers, and clears on generation replacement", async () => {
+    let emit!: (event: unknown) => void;
+    const listen = vi.fn(async (_name, handler) => {
+      emit = (payload) => handler({ payload });
+      return vi.fn();
+    });
+    const diagnostic = { persistenceWarning: true, failed: true };
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") return { generation: 3, dictation: true };
+      if (command === "client_state") return { generation: 3, events: [
+        { generation: 3, sequence: 5, payload: { type: "access", diagnostic: { ...diagnostic, error: "SECRET https://secret.invalid" } } },
+        bridgeState(3, 8, namedSnapshot("recovered")),
+      ] };
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
+    await adapter.start();
+    const cancel = vi.spyOn(adapter.dictation!, "cancel");
+    const listener = vi.fn();
+    adapter.accessDiagnostic!.subscribe(listener);
+    expect(listener).toHaveBeenLastCalledWith(diagnostic);
+    expect(JSON.stringify(listener.mock.calls)).not.toContain("SECRET");
+    emit({ generation: 3, sequence: 9, payload: { type: "access", diagnostic: { persistenceWarning: true, failed: false } } });
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith({ persistenceWarning: true, failed: false }));
+    expect(cancel).not.toHaveBeenCalled();
+    emit({ generation: 2, sequence: 10, payload: { type: "access", diagnostic } });
+    emit(bridgeState(4, 0, namedSnapshot("resumed")));
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith(undefined));
+    emit({ generation: 3, sequence: 11, payload: { type: "access", diagnostic } });
+    await Promise.resolve();
+    expect(listener).toHaveBeenLastCalledWith(undefined);
+  });
+
+  test("exposes only the fixed discovery startup explanation, never arbitrary IPC errors", async () => {
+    for (const error of ["Native access discovery failed. Retry connection.", "SECRET https://secret.invalid/token"]) {
+      const adapter = await loadTauriClient({
+        invoke: vi.fn(async () => { throw error; }) as never,
+        listen: vi.fn(async () => vi.fn()) as never,
+      }, "remote");
+      await expect(adapter.start()).rejects.toThrow(error.startsWith("Native access") ? error : "Unable to start native client.");
+    }
+  });
   test("keeps platform control events and access topology adapter-private", async () => {
     let emit!: (event: unknown) => void;
     const listen = vi.fn(async (_name, handler) => {

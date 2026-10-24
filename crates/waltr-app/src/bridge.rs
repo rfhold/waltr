@@ -11,13 +11,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::Serialize;
+use tokio::sync::{mpsc, oneshot, watch};
+use tracing::Instrument as _;
 use waltr_client::{
     AuthAttemptSnapshot, ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, NativeCredentialProvider, NativeGrpcTransport,
 };
-use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, watch};
-use tracing::Instrument as _;
 
 use crate::{
     observability,
@@ -53,12 +53,38 @@ pub struct BridgeRecovery<T> {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum BridgePayload {
     /// Shared Waltr client state.
-    State { snapshot: Box<serde_json::Value> },
-    /// Secret-free embedded platform startup lifecycle.
-    Platform { startup: PlatformStartup },
-    Access {
-        progress: waltr_client::NativeAccessProgress,
+    State {
+        snapshot: Box<serde_json::Value>,
     },
+    /// Secret-free embedded platform startup lifecycle.
+    Platform {
+        startup: PlatformStartup,
+    },
+    Access {
+        diagnostic: AccessDiagnostic,
+    },
+}
+
+/// Adapter-only diagnostic flags; arbitrary provider and operating-system text stays native.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessDiagnostic {
+    persistence_warning: bool,
+    failed: bool,
+}
+
+impl AccessDiagnostic {
+    fn observe(&mut self, progress: &waltr_client::NativeAccessProgress) {
+        use waltr_client::NativeAccessProgress as Progress;
+        match progress {
+            Progress::Warning { .. } => self.persistence_warning = true,
+            Progress::Failed { .. } => self.failed = true,
+            Progress::Discovering | Progress::Succeeded | Progress::RefreshSucceeded => {
+                self.failed = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Bounded startup states understood by the packaged frontend.
@@ -137,6 +163,7 @@ impl<T: Clone + Send + Sync> EventFeed<T> {
 struct RecoveryState<T> {
     generation: u64,
     latest_state: Option<BridgeEvent<T>>,
+    latest_access: Option<BridgeEvent<T>>,
     controls: VecDeque<BridgeEvent<T>>,
 }
 
@@ -145,6 +172,7 @@ impl<T> RecoveryState<T> {
         Self {
             generation,
             latest_state: None,
+            latest_access: None,
             controls: VecDeque::with_capacity(CHANNEL_CAPACITY),
         }
     }
@@ -1533,6 +1561,7 @@ async fn run_connected_generation(
         .as_ref()
         .map(|binding| binding.spawn(credentials.clone()));
     let mut access_host = crate::native_auth::AccessHost::default();
+    let mut access_diagnostic = AccessDiagnostic::default();
     let audio = target
         .app
         .as_ref()
@@ -1617,7 +1646,11 @@ async fn run_connected_generation(
                             let bridge = app.state::<Arc<RuntimeBridge>>();
                             drop(bridge.with_current(publisher.generation, || app.opener().open_url(url.to_string(), None::<&str>).map_err(|_| "Authorization browser could not be opened".to_owned())));
                         }
-                        publisher.publish_control(BridgePayload::Access { progress }).await;
+                        access_diagnostic.observe(&progress);
+                        // Pin the cumulative diagnostic independently of the bounded control history.
+                        if let Some(event) = publisher.publish_control(BridgePayload::Access { diagnostic: access_diagnostic }).await {
+                            publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_access = Some(event);
+                        }
                     }
                 }
             }
@@ -1805,11 +1838,15 @@ fn recovery_after<T: Clone>(
         .filter(|event| after_sequence.is_none_or(|sequence| event.sequence > sequence))
         .cloned()
         .collect::<Vec<_>>();
-    if let Some(state) = &recovery.latest_state
-        && after_sequence.is_none_or(|sequence| state.sequence > sequence)
-        && events.iter().all(|event| event.sequence != state.sequence)
+    for state in [&recovery.latest_state, &recovery.latest_access]
+        .into_iter()
+        .flatten()
     {
-        events.push(state.clone());
+        if after_sequence.is_none_or(|sequence| state.sequence > sequence)
+            && events.iter().all(|event| event.sequence != state.sequence)
+        {
+            events.push(state.clone());
+        }
     }
     events.sort_unstable_by_key(|event| event.sequence);
     BridgeRecovery {
@@ -1822,6 +1859,57 @@ fn recovery_after<T: Clone>(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn access_diagnostic_is_bounded_and_warning_survives_success() {
+        use waltr_client::NativeAccessProgress as Progress;
+        let mut diagnostic = AccessDiagnostic::default();
+        diagnostic.observe(&Progress::Warning {
+            warning: "SECRET https://secret.invalid/token".into(),
+        });
+        diagnostic.observe(&Progress::Failed {
+            error: "SECRET provider error".into(),
+        });
+        assert!(diagnostic.failed);
+        diagnostic.observe(&Progress::Succeeded);
+        assert!(diagnostic.persistence_warning);
+        assert!(!diagnostic.failed);
+        diagnostic.observe(&Progress::AwaitingBrowser {
+            authorization_url: "https://secret.invalid/SECRET".into(),
+            timeout_millis: 100,
+        });
+        let json = serde_json::to_string(&BridgePayload::Access { diagnostic }).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"access","diagnostic":{"persistenceWarning":true,"failed":false}}"#
+        );
+    }
+
+    #[test]
+    fn latest_access_diagnostic_recovers_after_control_history_eviction() {
+        let mut recovery = RecoveryState::new(1);
+        recovery.latest_access = Some(BridgeEvent {
+            generation: 1,
+            sequence: 2,
+            payload: "warning",
+        });
+        recovery.latest_state = Some(BridgeEvent {
+            generation: 1,
+            sequence: 99,
+            payload: "state",
+        });
+        let recovered = recovery_after(&recovery, 1, None);
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .map(|event| event.payload)
+                .collect::<Vec<_>>(),
+            vec!["warning", "state"]
+        );
+        assert_eq!(recovery_after(&recovery, 1, Some(2)).events.len(), 1);
+        assert!(recovery_after(&recovery, 2, None).events.is_empty());
+    }
 
     #[tokio::test]
     async fn initial_is_first_and_later_updates_coalesce_to_latest() {
@@ -1882,6 +1970,7 @@ mod tests {
                 sequence: 1,
                 payload: "old",
             }),
+            latest_access: None,
             controls: VecDeque::new(),
         };
         let recovered = recovery_after(&recovery, 5, None);
@@ -1916,9 +2005,8 @@ mod tests {
     {
         let server = EmbeddedServerController::default();
         let bridge = RuntimeBridge::new(server.clone());
-        bridge.authorization_callback(
-            "dev.waltr.app:/oauth2redirect?state=cold&code=discard".into(),
-        );
+        bridge
+            .authorization_callback("dev.waltr.app:/oauth2redirect?state=cold&code=discard".into());
         assert!(bridge.running.lock().unwrap().is_none());
         bridge.notification_permission_required(true);
         bridge.select(RuntimeTarget {
