@@ -754,7 +754,7 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .fetch_one(pool)
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (7, 4));
+    assert_eq!((waltr_count, mcp_count), (8, 4));
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT to_regclass('waltr.outbound_oauth_attempts')::text"
@@ -1298,7 +1298,7 @@ async fn assert_component_histories(persistence: &Persistence) {
         .fetch_one(persistence.mcp_sqlite_pool().expect("MCP pool"))
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (7, 4));
+    assert_eq!((waltr_count, mcp_count), (8, 4));
 }
 
 async fn sqlite_tables(pool: &SqlitePool) -> Vec<String> {

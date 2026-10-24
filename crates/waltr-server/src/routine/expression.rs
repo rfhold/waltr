@@ -7,9 +7,9 @@ use crate::resource_catalog::routine::{RoutineCondition, RoutineConditionOperato
 use super::{InvocationError, engine::RoutineInvocationContext};
 
 /// Maximum UTF-8 bytes in any fully expanded scalar string.
-pub(super) const MAX_EXPANDED_STRING_BYTES: usize = 16 * 1024;
+pub(super) const MAX_EXPANDED_STRING_BYTES: usize = 512 * 1024;
 /// Maximum UTF-8 bytes in a fully expanded system or user prompt.
-pub(super) const MAX_EXPANDED_PROMPT_BYTES: usize = 16 * 1024;
+pub(super) const MAX_EXPANDED_PROMPT_BYTES: usize = 512 * 1024;
 /// Maximum UTF-8 bytes in a metadata key presented to durable storage.
 const MAX_METADATA_KEY_BYTES: usize = 16 * 1024;
 /// Maximum JSON-encoded bytes in a metadata value presented to durable storage.
@@ -320,6 +320,42 @@ fn resolve_reference(
             .map(|value| Value::String(value.to_owned()))
             .ok_or_else(|| InvocationError::new("substitution", "output.text is unavailable"));
     }
+    if let Some(field) = expression.strip_prefix("output.json.") {
+        if field.is_empty()
+            || !field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(InvocationError::new(
+                "substitution",
+                "unsupported output JSON field",
+            ));
+        }
+        let output = output
+            .ok_or_else(|| InvocationError::new("substitution", "output JSON is unavailable"))?;
+        ensure_string_bound(
+            output,
+            MAX_EXPANDED_STRING_BYTES,
+            "output_json_size",
+            "output JSON",
+        )?;
+        let value: Value = serde_json::from_str(output)
+            .map_err(|_| InvocationError::new("output_json", "output must be a JSON object"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| InvocationError::new("output_json", "output must be a JSON object"))?;
+        let selected = object.get(field).ok_or_else(|| {
+            InvocationError::new("output_json_field", "output JSON field is missing")
+        })?;
+        if !matches!(selected, Value::String(_) | Value::Bool(_)) {
+            return Err(InvocationError::new(
+                "output_json_type",
+                "output JSON field must be a string or boolean",
+            ));
+        }
+        ensure_expanded_value_bound(selected)?;
+        return Ok(selected.clone());
+    }
     if let Some(path) = expression.strip_prefix("action.") {
         return resolve_path(
             action.ok_or_else(|| {
@@ -391,6 +427,111 @@ mod tests {
             operator: RoutineConditionOperator::GreaterThanOrEqual,
             values: vec![value],
         })
+    }
+
+    fn extract(output: Option<&str>, field: &str) -> Result<Value, InvocationError> {
+        substitute_scalar(
+            &RoutineScalar::String(format!("$(output.json.{field})")),
+            &context(Value::Null),
+            &BTreeMap::new(),
+            output,
+            None,
+        )
+    }
+
+    #[test]
+    fn output_json_extracts_only_bounded_top_level_strings_and_booleans() {
+        assert_eq!(
+            extract(Some(r#"{"text":"Speaker 1: hello","ok":true}"#), "text").unwrap(),
+            json!("Speaker 1: hello")
+        );
+        assert_eq!(
+            extract(Some(r#"{"ok":false}"#), "ok").unwrap(),
+            json!(false)
+        );
+        for output in [
+            "not JSON",
+            "```json\n{}\n```",
+            "{} trailing",
+            "[]",
+            "null",
+            "true",
+            "{}",
+            r#"{"text":{}}"#,
+            r#"{"text":[]}"#,
+            r#"{"text":null}"#,
+            r#"{"text":1}"#,
+            r#"{"secret-payload":"unterminated}"#,
+        ] {
+            let error = extract(Some(output), "text").unwrap_err();
+            assert!(!format!("{error:?}").contains("secret-payload"));
+        }
+        assert!(extract(None, "text").is_err());
+        for field in ["", "text.nested", "text[0]", "*"] {
+            assert!(extract(Some(r#"{"text":"ok"}"#), field).is_err());
+        }
+        let boundary =
+            serde_json::to_string(&json!({"text": "x".repeat(MAX_EXPANDED_STRING_BYTES - 11)}))
+                .unwrap();
+        assert_eq!(boundary.len(), MAX_EXPANDED_STRING_BYTES);
+        assert!(extract(Some(&boundary), "text").is_ok());
+        let error = extract(Some(&(boundary + " ")), "text").unwrap_err();
+        assert_eq!(error.class, "output_json_size");
+        assert!(!format!("{error:?}").contains("xxxxx"));
+        assert!(ensure_expanded_value_bound(&json!("x".repeat(MAX_EXPANDED_STRING_BYTES))).is_ok());
+        assert!(
+            ensure_expanded_value_bound(&json!("x".repeat(MAX_EXPANDED_STRING_BYTES + 1))).is_err()
+        );
+    }
+
+    #[test]
+    fn expanded_text_and_prompt_budgets_do_not_raise_metadata_limits() {
+        assert_eq!(MAX_EXPANDED_STRING_BYTES, 512 * 1024);
+        assert_eq!(MAX_EXPANDED_PROMPT_BYTES, 512 * 1024);
+        assert_eq!(MAX_METADATA_KEY_BYTES, 16 * 1024);
+        assert_eq!(MAX_SERIALIZED_METADATA_VALUE_BYTES, 16 * 1024);
+        let source = "secret-payload".repeat(MAX_EXPANDED_STRING_BYTES / 14 + 1);
+        let error = ensure_expanded_value_bound(&json!(source)).unwrap_err();
+        assert_eq!(error.class, "expanded_string");
+        assert!(!format!("{error:?}").contains("secret-payload"));
+        let boundary = "x".repeat(MAX_EXPANDED_PROMPT_BYTES);
+        assert!(
+            substitute_string(
+                &boundary,
+                &context(Value::Null),
+                &BTreeMap::new(),
+                None,
+                None
+            )
+            .is_ok()
+        );
+        let error = substitute_string(
+            &(boundary + "x"),
+            &context(Value::Null),
+            &BTreeMap::new(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.class, "expanded_string");
+        assert!(
+            validate_metadata_mutation(&"k".repeat(MAX_METADATA_KEY_BYTES), &json!(true)).is_ok()
+        );
+        let error =
+            validate_metadata_mutation(&"k".repeat(MAX_METADATA_KEY_BYTES + 1), &json!(true))
+                .unwrap_err();
+        assert_eq!(error.class, "metadata_key_size");
+        assert!(
+            validate_metadata_mutation(
+                "key",
+                &json!("x".repeat(MAX_SERIALIZED_METADATA_VALUE_BYTES - 2))
+            )
+            .is_ok()
+        );
+        let error =
+            validate_metadata_mutation("key", &json!("secret-payload".repeat(2000))).unwrap_err();
+        assert_eq!(error.class, "metadata_value_size");
+        assert!(!format!("{error:?}").contains("secret-payload"));
     }
 
     #[test]

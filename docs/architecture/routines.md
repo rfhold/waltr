@@ -33,6 +33,12 @@ The bundled `compact-and-continue` Routine is the implemented compaction-prefix 
 
 Later catalog changes affect future admissions only. History and detail remain interpretable after the current definition changes or disappears.
 
+### Agent Output Results
+
+Agent task results accept `$(output.text)` for raw assistant text or `$(output.json.FIELD)` for a top-level JSON field. `FIELD` contains only ASCII letters, digits, and underscores. JSON extraction requires one strict object and selects only strings or booleans. Declared result types still apply. Nested paths, JSONPath, jq, Markdown fences, repair, retries, and fallback remain unsupported. Output references work only in task-output contexts; dependent tasks use `$(tasks.<task>.results.<name>)`.
+
+The raw JSON limit is 512 KiB UTF-8 before parse. Expanded scalar strings and each expanded prompt also have 512 KiB bounds. Metadata keys and JSON-encoded metadata values retain separate 16 KiB limits. Extraction errors omit source payloads: `output_json_size` identifies raw overflow, `output_json` identifies invalid JSON or a non-object root, `output_json_field` identifies an absent field, and `output_json_type` identifies a non-string/non-boolean field. Unavailable output or unsupported selector syntax uses `substitution`. Invalid extraction fails the producer task before any dependent helper starts. The [conversation-notes example](../examples/routines/audio-conversation-notes.yaml) uses separate retained-transcript and deletion-audit results; only its final helper feeds the desktop text port.
+
 ## Interaction Catalog And Runtime
 
 The catalog accepts strict `interaction` triggers, audio/text ports, speech tasks, collectors, stream routes, standalone model selection, and named work groups. The transport-independent `routine::interaction` runtime owns concurrent stream scheduling. It shares task completion policy and helper construction with the sequential event, manual, and completion-lifecycle executor.
@@ -86,7 +92,11 @@ Speech tasks use the selected endpoint and model settings from the pinned config
 Native chat dictation and holds wait for nonempty PCM before interaction admission; clean zero-input capture creates no invocation or speech request.
 This client safety rule does not change generic interaction empty-input semantics. See [native audio composition](clients.md#native-app-audio-composition).
 
-Transcription maps upstream revisions and final results to request-local channel/ordinal segments. The Routine text contract omits word, timing, and speaker attribution. Segment IDs do not establish stable cross-request identity or speaker identity.
+Plain transcription maps upstream revisions and final results to request-local channel/ordinal segments. It ignores word and speaker attribution and preserves the upstream transcript. Segment IDs do not establish stable cross-request identity or speaker identity.
+
+With `recognition.diarization: true`, transcription uses one request-local cumulative segment. Provisional plain text replaces earlier revisions; only the final cumulative response commits speaker-labeled text. Contiguous words with the same `WordInfo.speaker_label` form a line such as `S1: Hello, world!`. A speaker change starts a new line; empty or whitespace-only labels produce `unknown: ...`. Labels identify no real person and apply only within the recording. Channel tags never supply speaker labels. The adapter preserves punctuation within each whitespace word and separates words with one space. It rejects final words that disagree with the transcript, missing attribution, unsafe labels, and responses after the final result. Empty final transcripts remain valid. The text contract exposes no word offsets.
+
+Diarization retains the finite interaction limits. The Google response decode bound equals `chunkBytes + 16 KiB`, or 1 MiB plus 16 KiB by default. The complete text segment, including its ID, must fit the default 1 MiB `chunkBytes` cap. The server collector cap remains 1 MiB. A long cumulative response can exceed these bounds before the upstream 4 MiB response ceiling. Operators must budget chunks, edges, collectors, deadlines, and helper context for the complete recording. Overflow fails explicitly, without truncation.
 
 A collector starts with its producer and waits for successful stream close. It resolves revisions and joins committed segments in first-appearance order. Successful close requires every segment committed. One downstream cleanup helper receives the complete transcript, not one call per chunk. Synthesis consumes committed segments early, in first-appearance order, and never consumes speculative revisions.
 
@@ -124,16 +134,20 @@ See the [trace smoke checks](../runbooks/telemetry-smoke.md#routine-interaction-
 
 | Limit | Default |
 | --- | --- |
-| Complete request | 32 MiB |
-| Chunk | 256 KiB |
-| Buffered edge | 1 MiB |
+| Complete request and cumulative native request | 256 MiB |
+| Chunk | 1 MiB |
+| Buffered edge | 2 MiB |
 | Queued chunks per edge | 8 |
 | Queue wait (`queueWaitSeconds`) | 30 seconds |
 | Active interactions | 16; service admission responsibility |
 | Active tasks per interaction | 8; runtime rejects larger graphs |
-| Input duration | 900 seconds |
-| Invocation duration | 1,200 seconds |
+| Input hard deadline | 3,900 seconds (65 minutes) |
+| Invocation hard deadline | 5,400 seconds (90 minutes) |
 | Collector | 1 MiB, also subject to task and context bounds |
+
+These defaults apply to every interaction, including complete `Run` requests, not only conversation notes. One hour of 24 kHz mono PCM16 contains 172,800,000 raw bytes, below 256 MiB with room for protocol overhead. Native ingress counts cumulative encoded request bytes without a full-recording buffer. `Run` still requires one complete request in memory.
+
+The native desktop closes capture normally at 3,600 seconds, then permits transcription finalization and helper output. Server input timeout remains a hard failure, not a normal close or automatic finalization. Input and invocation deadlines remain independent; input completion does not reset the total invocation deadline. The 90-minute total budget includes capture, transcription finalization, and both notes helpers. Live backend duration, diarization, and model behavior remain unverified.
 
 The runtime and transport queues enforce cancellation-aware bounded backpressure. Each capacity wait respects the queue-wait bound and applicable input or invocation deadlines. Persistent queue-wait expiry produces `resource_exhausted`; the runtime never silently drops media or committed text. Byte and chunk limits apply together.
 
@@ -143,7 +157,7 @@ A skipped consumer explicitly detaches its edge, so it cannot stall an active pr
 
 The runtime accepts an optional lifecycle recorder and records ordinary invocation/task events through it. The wire enum assigns interaction trigger kind `3`; persistence stores `interaction`. Migration `0007_routine_interaction_trigger.sql` extends the database constraint. SQLite rebuilds the invocation table and preserves metadata, journal, indexes, and sequence high-water state. PostgreSQL migration behavior still requires live-database verification.
 
-Waltr stores no audio or text stream chunks, stream events, or chunk replay. Declared scalar results follow ordinary Routine history rules and can contain final transcript text. Cleanup helpers retain their prompts and replies through ordinary session storage. Durable lifecycle replay does not resume media execution. `OpenInteraction.request_id` remains optional correlation only, without deduplication or retry semantics. The service enforces admission, whole-interaction cancellation, and stream protocol validation.
+Waltr stores no audio or text stream chunks, stream events, or chunk replay. Declared scalar results follow ordinary Routine history rules and can contain final transcript text. Durable Routine result JSON envelopes have a separate 8 MiB cap for result arrays and JSON escapes. Other durable JSON envelopes retain their 64 KiB cap. Migration `0008_routine_result_budget.sql` raises only the result column constraint, preserving existing history and sequence high-water marks. This cap does not raise the 512 KiB expression limit or 16 KiB metadata limits. Cleanup helpers retain their prompts and replies through ordinary session storage. Durable lifecycle replay does not resume media execution. `OpenInteraction.request_id` remains optional correlation only, without deduplication or retry semantics. The service enforces admission, whole-interaction cancellation, and stream protocol validation.
 
 ## Manual Admission
 

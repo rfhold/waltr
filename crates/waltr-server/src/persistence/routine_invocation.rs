@@ -6,6 +6,8 @@ use sqlx::{Postgres, QueryBuilder, Sqlite};
 
 const JSON_VERSION: u8 = 1;
 const MAX_JSON_BYTES: usize = 65_536;
+// Allow bounded notes and audit results, JSON escapes, and the durable envelope.
+const MAX_RESULT_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASKS: usize = 64;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4_096;
@@ -1512,10 +1514,13 @@ fn encode_values(values: &[StoredRoutineResult]) -> Result<Option<String>, Routi
             values,
             RoutineStoreError::Invalid("routine result is invalid"),
         )?;
-        encode_json(&VersionedValues {
-            version: JSON_VERSION,
-            values: values.to_vec(),
-        })
+        encode_json_with_limit(
+            &VersionedValues {
+                version: JSON_VERSION,
+                values: values.to_vec(),
+            },
+            MAX_RESULT_JSON_BYTES,
+        )
         .map(Some)
     }
 }
@@ -1542,7 +1547,7 @@ fn encode_sessions(
 }
 
 fn decode_values(json: &str) -> Result<Vec<StoredRoutineResult>, RoutineStoreError> {
-    let payload: VersionedValues = decode_json(json)?;
+    let payload: VersionedValues = decode_json_with_limit(json, MAX_RESULT_JSON_BYTES)?;
     if payload.version != JSON_VERSION {
         return Err(invalid_stored_data());
     }
@@ -1599,9 +1604,16 @@ fn decode_sessions(json: &str) -> Result<BTreeMap<String, String>, RoutineStoreE
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<String, RoutineStoreError> {
+    encode_json_with_limit(value, MAX_JSON_BYTES)
+}
+
+fn encode_json_with_limit<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<String, RoutineStoreError> {
     let encoded = serde_json::to_string(value)
         .map_err(|_| RoutineStoreError::Invalid("routine JSON payload is invalid"))?;
-    if encoded.len() > MAX_JSON_BYTES {
+    if encoded.len() > maximum {
         return Err(RoutineStoreError::Invalid(
             "routine JSON payload is too large",
         ));
@@ -1610,7 +1622,14 @@ fn encode_json<T: Serialize>(value: &T) -> Result<String, RoutineStoreError> {
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T, RoutineStoreError> {
-    if json.len() > MAX_JSON_BYTES {
+    decode_json_with_limit(json, MAX_JSON_BYTES)
+}
+
+fn decode_json_with_limit<T: for<'de> Deserialize<'de>>(
+    json: &str,
+    maximum: usize,
+) -> Result<T, RoutineStoreError> {
+    if json.len() > maximum {
         return Err(invalid_stored_data());
     }
     serde_json::from_str(json).map_err(|_| invalid_stored_data())
@@ -1795,12 +1814,12 @@ mod tests {
         sqlx::query("UPDATE sqlite_sequence SET seq = CASE name WHEN 'routine_invocations' THEN 500 ELSE 900 END WHERE name IN ('routine_invocations', 'routine_invocation_events')")
             .execute(&pool).await.unwrap();
         let mut tx = pool.begin().await.unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../migrations/sqlite/0007_routine_interaction_trigger.sql"
-        ))
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+        for migration in [
+            include_str!("../../migrations/sqlite/0007_routine_interaction_trigger.sql"),
+            include_str!("../../migrations/sqlite/0008_routine_result_budget.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&mut *tx).await.unwrap();
+        }
         tx.commit().await.unwrap();
         for table in [
             "routine_invocations",
@@ -1984,6 +2003,71 @@ mod tests {
         assert_eq!(stored.status, RoutineInvocationStatus::Succeeded);
         assert_eq!(stored.declared_tasks, summary.declared_tasks);
         assert_eq!(store.events_for_invocation("one").await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn large_notes_and_audit_results_survive_durable_round_trip() {
+        let (_persistence, store) = store().await;
+        store
+            .admit(admission("long-notes", &["prepare"]))
+            .await
+            .unwrap();
+        store.start_invocation("long-notes", 20).await.unwrap();
+        store
+            .transition_task(
+                "long-notes",
+                "prepare",
+                RoutineTaskTransition::Started {
+                    session_references: BTreeMap::new(),
+                },
+                30,
+            )
+            .await
+            .unwrap();
+        let values = vec![
+            StoredRoutineResult {
+                name: "text".into(),
+                value: StoredRoutineValue::String("\0".repeat(512 * 1024)),
+            },
+            StoredRoutineResult {
+                name: "deleted_items".into(),
+                value: StoredRoutineValue::String("\0".repeat(512 * 1024)),
+            },
+        ];
+        let encoded = encode_values(&values).unwrap().unwrap();
+        assert!(encoded.len() > 6 * 1024 * 1024);
+        assert!(encoded.len() < MAX_RESULT_JSON_BYTES);
+        assert_eq!(decode_values(&encoded).unwrap(), values);
+        store
+            .transition_task(
+                "long-notes",
+                "prepare",
+                RoutineTaskTransition::Succeeded {
+                    values: values.clone(),
+                    session_references: BTreeMap::new(),
+                },
+                40,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_success("long-notes", values.clone(), 50)
+            .await
+            .unwrap();
+        let events = store.events_for_invocation("long-notes").await.unwrap();
+        assert_eq!(events.last().unwrap().values.as_ref().unwrap(), &values);
+        assert_eq!(
+            store.detail("long-notes").await.unwrap().summary.status,
+            RoutineInvocationStatus::Succeeded
+        );
+        let error = encode_values(&[StoredRoutineResult {
+            name: "text".into(),
+            value: StoredRoutineValue::String(
+                "secret-payload".repeat(MAX_RESULT_JSON_BYTES / 14 + 1),
+            ),
+        }])
+        .unwrap_err();
+        assert!(!format!("{error:?}").contains("secret-payload"));
     }
 
     #[tokio::test]

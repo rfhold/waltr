@@ -14,6 +14,7 @@ These Tekton-inspired files are Waltr Routine resources, not Tekton resources. T
 | `configuration.yaml` | Proposed | Run a named configuration agent from a session tool. |
 | [`audio-transcribe.yaml`](audio-transcribe.yaml) | Implemented; requires compatible providers | Transcribe client audio with live revisions and committed transcript segments. |
 | [`audio-transcribe-cleanup.yaml`](audio-transcribe-cleanup.yaml) | Implemented; requires compatible providers | Collect all committed transcript text, then stream one cleanup agent's text. |
+| [`audio-conversation-notes.yaml`](audio-conversation-notes.yaml) | Implemented; requires diarization-capable speech provider | Retain all substantive topics, audit deletions, then produce notes with two helpers. |
 | [`audio-synthesize.yaml`](audio-synthesize.yaml) | Implemented; requires compatible providers | Synthesize committed text into PCM audio. |
 
 ## Implemented Title Routine
@@ -81,7 +82,14 @@ The detached `StartManualRoutine` contract stays unchanged.
 The [desktop client example](../client.yaml) selects the cleanup fixture's exact identifiers and PCM format.
 See [desktop configuration](../../architecture/config.md#desktop-client-configuration) for the separate local schema and trust boundary.
 
-All three audio fixtures pass the strict Routine parser. Complete catalog publication also requires their explicit provider/model references: `speech/dictation`, `inference/cleanup`, and `voice/reader`, as applicable. Speech settings must match the declared PCM format; the catalog does not probe an upstream endpoint.
+The [conversation notes fixture](audio-conversation-notes.yaml) adds two sequential one-turn helpers after transcript collection.
+The first returns the full retained transcript and a separate deletion audit as JSON string fields.
+The second receives both values and checks deleted content for context or mistaken exclusions.
+Only the second helper feeds the `notes` text port; `deleted_items` remains a separate top-level Routine result.
+The [clipboard-only desktop example](../client-conversation-notes.yaml) copies final notes with `/usr/bin/pbcopy`; it never types or pastes.
+See [conversation notes prerequisites and limits](audio-interactions.md#conversation-notes) before use.
+
+All four audio fixtures pass the strict Routine parser. Complete catalog publication also requires their explicit provider/model references: `speech/dictation`, `speech/diarized-dictation`, `inference/cleanup`, and `voice/reader`, as applicable. Speech settings must match the declared PCM format; the catalog does not probe an upstream endpoint.
 The cleanup fixture explicitly collects **all final committed transcript text** before **one inference-only agent invocation**.
 It does not concatenate hypotheses or invoke an agent per chunk.
 Its prompt preserves language and tone, removes clear STT noise, and returns only clean text.

@@ -2029,7 +2029,17 @@ fn validate_static_reference_in_context(
             return Ok(());
         }
     }
-    if expression == "output.text" && output_allowed {
+    if output_allowed
+        && (expression == "output.text"
+            || expression
+                .strip_prefix("output.json.")
+                .is_some_and(|field| {
+                    !field.is_empty()
+                        && field
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                }))
+    {
         return Ok(());
     }
     if expression == "action.sessionMetadata.changed"

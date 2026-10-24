@@ -31,15 +31,15 @@ pub struct InteractionLimits {
 impl Default for InteractionLimits {
     fn default() -> Self {
         Self {
-            complete_request_bytes: 32 * 1024 * 1024,
-            chunk_bytes: 256 * 1024,
-            edge_bytes: 1024 * 1024,
+            complete_request_bytes: 256 * 1024 * 1024,
+            chunk_bytes: 1024 * 1024,
+            edge_bytes: 2 * 1024 * 1024,
             queued_chunks: 8,
             active_interactions: 16,
             active_tasks_per_interaction: 8,
             queue_wait_seconds: 30,
-            input_seconds: 15 * 60,
-            invocation_seconds: 20 * 60,
+            input_seconds: 65 * 60,
+            invocation_seconds: 90 * 60,
             collector_bytes: 1024 * 1024,
         }
     }

@@ -4,7 +4,7 @@ use waltr::grpc::waltr::config::v1 as proto;
 
 #[test]
 fn sequential_triggers_reject_stream_tasks_even_on_mixed_trigger_definitions() {
-    for source in [TRANSCRIBE, CLEANUP, SYNTHESIZE] {
+    for source in [TRANSCRIBE, CLEANUP, CONVERSATION_NOTES, SYNTHESIZE] {
         for trigger in [
             "{name: manual, manual: {displayName: Test, scope: session, inputs: []}}",
             "{name: event, event: {type: waltr.session.user-message.created}}",
@@ -32,6 +32,10 @@ const TRANSCRIBE: &str = include_str!(concat!(
 const CLEANUP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/examples/routines/audio-transcribe-cleanup.yaml"
+));
+const CONVERSATION_NOTES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/examples/routines/audio-conversation-notes.yaml"
 ));
 const SYNTHESIZE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -62,7 +66,19 @@ spec:
 ";
 
 fn configuration() -> proto::Configuration {
-    let provider = materialize_provider(PROVIDER, "providers/speech.yaml", None).unwrap();
+    let mut provider = materialize_provider(PROVIDER, "providers/speech.yaml", None).unwrap();
+    let diarized = materialize_provider(
+        &PROVIDER
+            .replace("dictation:", "diarized-dictation:")
+            .replace(
+                "automatic_punctuation: true",
+                "automatic_punctuation: true\n        diarization: true",
+            ),
+        "providers/speech.yaml",
+        None,
+    )
+    .unwrap();
+    provider.models.extend(diarized.models);
     let synthesis = materialize_provider(
         r"apiVersion: waltr.dev/v1alpha1
 kind: Provider
@@ -129,7 +145,7 @@ fn existing_bundled_routine_schemas_remain_valid() {
 #[test]
 fn interaction_examples_parse_and_validate_explicit_models() {
     let config = configuration();
-    for source in [TRANSCRIBE, CLEANUP, SYNTHESIZE] {
+    for source in [TRANSCRIBE, CLEANUP, CONVERSATION_NOTES, SYNTHESIZE] {
         let definition = materialize_routine(source, "routines/example.yaml").unwrap();
         validate_routine_models(&definition, &config, "routines/example.yaml").unwrap();
         let serialized = serde_yaml_ng::to_string(&definition).unwrap();
@@ -143,6 +159,43 @@ fn interaction_examples_parse_and_validate_explicit_models() {
         resolved.settings,
         crate::resource_catalog::speech::SpeechSettings::Recognition(_)
     ));
+}
+
+#[test]
+fn output_json_references_reject_nesting_and_non_output_contexts() {
+    for reference in [
+        "$(output.json.)",
+        "$(output.json.text.nested)",
+        "$(output.json.text[0])",
+    ] {
+        assert!(
+            materialize_routine(
+                &CONVERSATION_NOTES.replace("$(output.json.retained_transcript)", reference),
+                "routines/notes.yaml",
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        materialize_routine(
+            &CONVERSATION_NOTES.replace(
+                "$(tasks.collect-transcript.results.transcript)",
+                "$(output.json.retained_transcript)",
+            ),
+            "routines/notes.yaml",
+        )
+        .is_err()
+    );
+    assert!(
+        materialize_routine(
+            &CONVERSATION_NOTES.replace(
+                "$(tasks.write-notes.results.text)",
+                "$(output.json.retained_transcript)",
+            ),
+            "routines/notes.yaml",
+        )
+        .is_err()
+    );
 }
 
 fn invalid_change(source: &str, change: impl FnOnce(&mut RoutineDefinition)) {
@@ -647,10 +700,26 @@ fn work_groups_and_server_limits_are_explicit_and_bounded() {
     }
     let limits = InteractionLimits::default();
     assert!(limits.validate().is_ok());
-    assert_eq!(limits.complete_request_bytes, 32 * 1024 * 1024);
-    assert_eq!(limits.chunk_bytes, 256 * 1024);
-    assert_eq!(limits.edge_bytes, 1024 * 1024);
+    assert_eq!(limits.complete_request_bytes, 256 * 1024 * 1024);
+    assert_eq!(limits.chunk_bytes, 1024 * 1024);
+    assert_eq!(limits.edge_bytes, 2 * 1024 * 1024);
+    assert_eq!(limits.queued_chunks, 8);
+    assert_eq!(limits.active_interactions, 16);
     assert_eq!(limits.active_tasks_per_interaction, 8);
+    assert_eq!(limits.queue_wait_seconds, 30);
+    assert_eq!(limits.input_seconds, 3900);
+    assert_eq!(limits.invocation_seconds, 5400);
+    assert_eq!(limits.collector_bytes, 1024 * 1024);
+    let notes = materialize_routine(CONVERSATION_NOTES, "test").unwrap();
+    assert_eq!(
+        notes.spec.tasks[1]
+            .task_spec
+            .collect
+            .as_ref()
+            .unwrap()
+            .max_bytes,
+        262144
+    );
     assert!(
         InteractionLimits {
             chunk_bytes: 0,
@@ -669,7 +738,7 @@ fn work_groups_and_server_limits_are_explicit_and_bounded() {
     );
     assert!(
         InteractionLimits {
-            input_seconds: 2000,
+            input_seconds: 5401,
             ..limits
         }
         .validate()

@@ -592,7 +592,8 @@ async fn automatic_failed_durable_admission_fails_open_without_history_or_pause(
     }
 
     let mut registry = waltr_agent::AgentDefinitionRegistry::new();
-    let source = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n";
+    let source =
+        "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n";
     registry.load_yaml(source).unwrap();
     let sandbox = crate::sandbox::LocalSandbox::start(std::env::temp_dir())
         .await
@@ -1701,6 +1702,121 @@ async fn dropping_manual_caller_after_prompt_durability_retains_ordinary_destina
     engine.shutdown().await;
     assert_eq!(host.destinations.lock().unwrap().len(), 1);
     assert_eq!(host.interrupts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn conversation_notes_extraction_feeds_both_values_and_fails_before_second_helper() {
+    use crate::resource_catalog::routine::RoutineDefinition;
+    let catalog = state().await;
+    let title = catalog.snapshot().routine("title").unwrap().clone();
+    let mut definition: RoutineDefinition = serde_yaml_ng::from_str(include_str!(
+        "../../../../docs/examples/routines/audio-conversation-notes.yaml"
+    ))
+    .unwrap();
+    definition.spec.triggers = title.definition().spec.triggers.clone();
+    definition.spec.tasks.drain(..2);
+    definition.spec.outputs.clear();
+    for task in &mut definition.spec.tasks {
+        let template = task.task_spec.session_template.as_mut().unwrap();
+        template.model = None;
+        template.inference = title.definition().spec.tasks[0]
+            .task_spec
+            .session_template
+            .as_ref()
+            .unwrap()
+            .inference
+            .clone();
+        task.task_spec.output.as_mut().unwrap().stream = false;
+    }
+    definition.spec.tasks[0].run_after.clear();
+    definition.spec.tasks[0]
+        .task_spec
+        .session_template
+        .as_mut()
+        .unwrap()
+        .user_prompt
+        .text = "Speaker 1: substantive source".to_owned();
+    definition.metadata.name = "title".to_owned();
+    let crate::resource_catalog::AgentDefinitionInspection::Resource(detail) =
+        catalog.inspect(Some("routines/title.yaml")).unwrap()
+    else {
+        panic!("routine detail expected");
+    };
+    catalog
+        .replace(
+            "routines/title.yaml",
+            serde_yaml_ng::to_string(&definition).unwrap(),
+            &detail.persisted_etag,
+        )
+        .await
+        .unwrap();
+    let routine = catalog.snapshot().routine("title").unwrap().clone();
+    let retained = "Speaker 1: substantive topic, uncertainty, 日本語\n".repeat(2000);
+    let deleted = "Speaker 2: incidental noise; unrelated topic; removal reason\n".repeat(1000);
+    let large_response = serde_json::to_string(&json!({
+        "retained_transcript": retained,
+        "deleted_items": deleted,
+    }))
+    .unwrap();
+    assert!(large_response.len() > 16 * 1024);
+    let oversized_response = format!(
+        "{{\"retained_transcript\":\"{}\",\"deleted_items\":\"None\"}}",
+        "secret-payload".repeat(MAX_EXPANDED_STRING_BYTES / 14 + 1)
+    );
+    for (response, expected_children) in [
+        (large_response.as_str(), 2),
+        (oversized_response.as_str(), 1),
+        (
+            r#"{"retained_transcript":"Speaker 1: Keep this","deleted_items":"Speaker 2: noise; incidental; unrelated"}"#,
+            2,
+        ),
+        ("not JSON", 1),
+        (r#"{"retained_transcript":"keep"}"#, 1),
+        (r#"{"retained_transcript":true,"deleted_items":"noise"}"#, 1),
+    ] {
+        let host = Arc::new(FakeHost::with_response(Ok(Some(response))));
+        let routine_host: Arc<dyn RoutineHost> = host.clone();
+        let mut invocation = AdmittedInvocation {
+            configuration: Arc::new(Default::default()),
+            invocation_id: None,
+            routine: routine.clone(),
+            trigger: "first-user-message".to_owned(),
+            context: event_context(event("notes", false)),
+            identity: "notes-invocation".to_owned(),
+            correlation_id: "notes".to_owned(),
+            pause: None,
+        };
+        let result = super::executor::execute_invocation(
+            &mut invocation,
+            &routine_host,
+            &Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            &Arc::new(AtomicBool::new(false)),
+            &DestinationTaskTracker::default(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await;
+        let children = host.children.lock().unwrap();
+        assert_eq!(children.len(), expected_children);
+        if expected_children == 2 {
+            assert!(result.is_ok());
+            let SessionStart::Fresh { messages } = &children[1].start else {
+                panic!("fresh helper expected")
+            };
+            let fields: Value = serde_json::from_str(response).unwrap();
+            assert_eq!(
+                messages[0].text(),
+                format!(
+                    "retained_transcript:\n{}\n\ndeleted_items:\n{}\n",
+                    fields["retained_transcript"].as_str().unwrap(),
+                    fields["deleted_items"].as_str().unwrap()
+                )
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(!format!("{error:?}").contains("secret-payload"));
+        }
+    }
 }
 
 #[tokio::test]
