@@ -4,13 +4,57 @@ use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use std::{collections::VecDeque, sync::Mutex};
+use tokio::sync::Notify;
 use waltr_audio_io::{Capture, CaptureOutput, Terminal};
 
-const BRIDGE_CHUNKS: usize = 8;
+/// Maximum queued PCM duration, independent of the RPC admission deadline.
+pub const BACKLOG_SECONDS: usize = 30;
 
-/// Byte-credited PCM lane. Dequeue releases queue credit; one consumer frame is budgeted separately.
-pub struct Frames(mpsc::Receiver<(Vec<u8>, OwnedSemaphorePermit)>);
+struct Lane {
+    bytes: VecDeque<u8>,
+    closed: bool,
+    receiver_closed: bool,
+    cancelled: bool,
+}
+struct PcmQueue {
+    lane: Mutex<Lane>,
+    ready: Notify,
+    capacity: usize,
+    chunk: usize,
+}
+impl PcmQueue {
+    fn send(&self, frame: &[u8]) -> Result<(), Error> {
+        let mut lane = self
+            .lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lane.cancelled {
+            return Err(Error::Cancelled);
+        }
+        if lane.receiver_closed {
+            return Err(Error::ReceiverClosed);
+        }
+        if frame.len() > self.capacity - lane.bytes.len() {
+            return Err(Error::Overflow);
+        }
+        lane.bytes.extend(frame);
+        drop(lane);
+        self.ready.notify_one();
+        Ok(())
+    }
+    fn close(&self) {
+        self.lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+        self.ready.notify_one();
+    }
+}
+
+/// Byte-bounded PCM FIFO. Frame boundaries may coalesce; sample order is unchanged.
+/// A single ring avoids per-frame metadata growth for two-byte callback fragments.
+pub struct Frames(Arc<PcmQueue>);
 impl std::fmt::Debug for Frames {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Frames").finish_non_exhaustive()
@@ -19,7 +63,35 @@ impl std::fmt::Debug for Frames {
 impl Frames {
     /// Read the next frame, preserving source order.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.0.recv().await.map(|(frame, _credit)| frame)
+        loop {
+            let ready = self.0.ready.notified();
+            {
+                let mut lane = self
+                    .0
+                    .lane
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !lane.bytes.is_empty() {
+                    let count = lane.bytes.len().min(self.0.chunk);
+                    return Some(lane.bytes.drain(..count).collect());
+                }
+                if lane.closed {
+                    return None;
+                }
+            }
+            ready.await;
+        }
+    }
+}
+impl Drop for Frames {
+    fn drop(&mut self) {
+        let mut lane = self
+            .0
+            .lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lane.receiver_closed = true;
+        lane.bytes.clear();
     }
 }
 
@@ -28,7 +100,7 @@ impl Frames {
 pub enum Error {
     /// Unsupported configuration, before device access.
     Unsupported,
-    /// Actual input format exceeds the aggregate one-second retained-audio budget.
+    /// Actual input format exceeds the one-second native/transient audio reserve.
     PreacceptBudgetExceeded,
     /// Backend initialization or streaming failure.
     Backend,
@@ -119,6 +191,9 @@ fn native_error(error: waltr_audio_io::Error) -> Error {
 /// # Errors
 /// Rejects stable IDs, stereo, and rates above 48 kHz without fallback.
 pub fn native_config(audio: &crate::config::Audio) -> Result<waltr_audio_io::Config, Error> {
+    if !(8_000..=48_000).contains(&audio.sample_rate_hz) || audio.channels != 1 {
+        return Err(Error::Unsupported);
+    }
     let device = match &audio.device {
         crate::config::DeviceSelector::Default => waltr_audio_io::DeviceSelection::Default,
         crate::config::DeviceSelector::Name(name) => {
@@ -133,10 +208,11 @@ pub fn native_config(audio: &crate::config::Audio) -> Result<waltr_audio_io::Con
         ..Default::default()
     };
     // Actual-format native preflight includes raw/history/transients, before stream construction.
-    // Eight chunks of byte credit, one worker-pending chunk, and one consumer frame.
+    // The separate 30-second host ring is added to this one-second native reserve.
+    // Include one worker-pending chunk and one consumer frame in the native reserve.
     // RPC PCM is empty before Accepted; its post-admission queue is budgeted separately.
     config.limits.raw_queue_items = 8;
-    config.limits.preaccept_external_chunks = Some(BRIDGE_CHUNKS + 2);
+    config.limits.preaccept_external_chunks = Some(2);
     let budget = audio.sample_rate_hz as usize * 2;
     config.limits.output_queue_bytes = budget / 4;
     config.limits.output_queue_items = 4;
@@ -175,10 +251,19 @@ impl CaptureWorker {
         let control = Arc::new(AtomicU8::new(0));
         let state = control.clone();
         // Bound setup even for configurations that the worker subsequently rejects.
-        let bytes = config.limits.max_chunk_bytes.clamp(2, 256 * 1024) * BRIDGE_CHUNKS;
-        let credit = Arc::new(Semaphore::new(bytes));
-        // Nonempty aligned frames consume at least two bytes, bounding metadata as well as PCM.
-        let (tx, frames) = mpsc::channel(bytes / 2);
+        let bytes = (config.target_rate as usize).clamp(8_000, 48_000) * 2 * BACKLOG_SECONDS;
+        let tx = Arc::new(PcmQueue {
+            lane: Mutex::new(Lane {
+                bytes: VecDeque::with_capacity(bytes),
+                closed: false,
+                receiver_closed: false,
+                cancelled: false,
+            }),
+            ready: Notify::new(),
+            capacity: bytes,
+            chunk: config.limits.max_chunk_bytes.clamp(2, 256 * 1024) / 2 * 2,
+        });
+        let frames = tx.clone();
         let result = Arc::new(std::sync::Mutex::new(None));
         let terminal = result.clone();
         let worker = tokio::task::spawn_blocking(move || {
@@ -196,17 +281,7 @@ impl CaptureWorker {
                     if frame.is_empty() {
                         return Ok(());
                     }
-                    if tx.is_closed() {
-                        return Err(Error::ReceiverClosed);
-                    }
-                    let permit = credit
-                        .clone()
-                        .try_acquire_many_owned(frame.len() as u32)
-                        .map_err(|_| Error::Overflow)?;
-                    tx.try_send((frame, permit)).map_err(|error| match error {
-                        mpsc::error::TrySendError::Closed(_) => Error::ReceiverClosed,
-                        mpsc::error::TrySendError::Full(_) => Error::Overflow,
-                    })
+                    tx.send(&frame)
                 };
                 let result = (|| {
                     loop {
@@ -249,6 +324,7 @@ impl CaptureWorker {
             *terminal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+            tx.close();
             outcome
         });
         Self {
@@ -268,6 +344,17 @@ impl CaptureWorker {
     /// Invalidate capture, including pending initialization.
     pub fn cancel(&self) {
         self.control.store(2, Ordering::Release);
+        let mut lane = self
+            .frames
+            .0
+            .lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lane.bytes.clear();
+        lane.cancelled = true;
+        lane.closed = true;
+        drop(lane);
+        self.frames.0.ready.notify_one();
     }
     /// Await all native teardown. OS calls have no promised hard deadline.
     /// # Errors
@@ -351,7 +438,7 @@ mod tests {
             Arc::new(Deferred(std::sync::Mutex::new(rx))),
             waltr_audio_io::Config::default(),
         );
-        worker.frames.0.close();
+        worker.frames.0.lane.lock().unwrap().receiver_closed = true;
         tx.send(()).unwrap();
         assert_eq!(worker.join().await, Err(Error::ReceiverClosed));
     }

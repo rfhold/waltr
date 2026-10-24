@@ -170,22 +170,40 @@ Typing mode delivers each current hypothesis while duplex input continues, even 
 Repeated hypotheses and identical final text add no duplicate output.
 Revisions replace only the changed suffix of this hold's sanitized output through Backspace events.
 Both modes require clean EOF, `SUCCEEDED`, and exact selected-stream validation for terminal success.
-The desktop pre-admission contract limits conservative aggregate library/host retained-audio capacity to one target-rate second.
-Actual-format preflight selects the largest reserve of one through eight queued raw blocks that fits that capacity, plus one callback/converter owner block.
-This selection precedes callback pool allocation and stream construction.
-The budget includes all pool capacities, converter history and transient output, native output slots and pending send, and ten host chunk credits.
-Eight host credits form a byte-bounded PCM queue; the worker and consumer each retain at most one additional chunk.
-Small frames consume their actual byte length, not a whole chunk credit.
-At 24 kHz, each chunk holds at most 1,500 bytes, and the host queue holds 12,000 bytes: 250 ms of PCM16 mono.
-The bridge continues to drain native capture while RPC open or Accepted waits, without a second admission buffer.
-RPC input remains empty until Accepted; normal release preserves queued PCM and drains it after acceptance.
-Cancellation discards queued PCM and joins capture; byte-credit exhaustion fails explicitly and also joins capture.
-For 24 kHz output and 48 kHz mono input, preflight selects three queued 4096-sample blocks plus the owner block.
-Smaller native callback slices still consume a whole raw pool lease.
-Preflight rejects an otherwise supported format with `PreacceptBudgetExceeded` if even the minimum reserve exceeds the limit.
-This reserve tolerates only a finite callback burst or owner delay, not arbitrary scheduler stalls or sustained downstream backpressure.
-The bound excludes the borrowed OS callback slice and opaque driver/device buffers that CPAL cannot expose or constrain.
-Overflow fails the operation rather than silently discarding audio.
+The desktop host PCM backlog holds at most 30 target-rate seconds of PCM16 mono in one byte-bounded ring.
+At 24 kHz, its capacity is 1,440,000 bytes; at the supported maximum of 48 kHz, it is 2,880,000 bytes.
+The ring has no per-frame metadata queue: two-byte fragments consume two bytes.
+Dequeue coalesces samples into chunks and preserves their order.
+The chunk limit remains one thirty-second of a target-rate second (1,500 bytes at 24 kHz); it is not enlarged to accommodate admission delays.
+The blocking bridge drains native capture while RPC open or Accepted waits, without a second admission buffer.
+
+A separate one-second conservative target-rate audio reserve covers the native path and two host transient chunks.
+Actual-format preflight selects the largest reserve of one through eight queued raw blocks that fits, plus one callback/converter owner block.
+Preflight precedes callback pool allocation and stream construction.
+This reserve counts all raw pool capacities, converter history and transient output, and native output slots plus one send chunk.
+It also counts one host worker-pending chunk and one consumer-owned frame.
+The aggregate pre-Accepted retained-audio capacity is therefore **at most 31 target-rate seconds**, not 30 seconds overall.
+At 24 kHz with 48 kHz mono input, preflight selects six queued 4096-sample blocks plus the owner block.
+Native/transient capacity totals 23,070 target PCM frames, in addition to the 720,000-frame host ring.
+Raw blocks use preallocated float storage (at most nine blocks of 4096 samples, 147,456 allocation bytes across supported input layouts); smaller callbacks still consume a whole lease.
+The native output queue has four item slots and at most one quarter-second of PCM byte credit (6,000 bytes at 24 kHz).
+The one-second reserve includes this queue.
+These duration-equivalent capacities count duplicate audio representations separately; they are not a claim that float/converter storage uses only PCM16 allocation bytes.
+Preflight rejects a format with `PreacceptBudgetExceeded` if even the minimum native/transient reserve cannot fit.
+The bound excludes borrowed OS callback slices, opaque driver/device buffers, and transport-owned encoding/network buffers.
+After Accepted, the RPC input lane adds at most four queued messages and one quarter-second of encoded byte credit (12,000 bytes at 24 kHz).
+The native/transient reserve already counts the consumer's pending chunk.
+
+An independent **20-second absolute deadline** runs from RPC open through Accepted, including credential/transport setup and response headers.
+Expiration reports the fixed `AcceptanceTimeout` diagnostic (`rpc_acceptance_timeout`), cancels the RPC, discards the backlog, and joins capture.
+Accepted disarms this deadline; it does not limit hold duration, output processing, model runtime, or native cleanup.
+The native capture duration limit remains independently bounded at 300 seconds.
+No timeout or failure automatically retries or replays dispatched remote work.
+RPC input remains empty until Accepted; all buffered PCM precedes subsequently captured samples.
+Normal release before Accepted stops capture, retains and drains its complete flush after acceptance, then closes and finishes input once.
+Cancellation discards queued PCM, cancels pending RPC work (including before response headers), and joins capture without submitting input completion.
+Byte-capacity exhaustion reports `Overflow`, fails the operation, and joins capture rather than silently discarding audio.
+The reserves tolerate only finite callback bursts or owner delays, not arbitrary scheduler stalls or sustained downstream backpressure.
 Profile, access, generation, and credential revision changes cancel the operation and suppress stale effects.
 The host closes the RPC and awaits capture joins plus output-action cleanup before reservation release.
 Normal release preserves the final audio flush and continued live output.

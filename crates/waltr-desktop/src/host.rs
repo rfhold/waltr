@@ -1,10 +1,10 @@
 //! Local-future hold pipeline. Pin a transport/profile lease at press; cancel its generation
 //! token before any server/profile/access transition. Retain and await every `Hold::run` future.
 use crate::{capture, config::Keybind};
-use waltr_client::RoutineInteractionTransport;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use waltr_client::RoutineInteractionTransport;
 
 /// Fixed milestones; first frame means observed by the host, not callback time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,8 @@ pub enum Diagnostic {
 pub enum RpcFailure {
     /// Opening the RPC failed.
     Open,
+    /// The independent RPC-open/Accepted deadline elapsed.
+    AcceptanceTimeout,
     /// Sending input failed.
     Input,
     /// Reading output failed.

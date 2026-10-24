@@ -6,12 +6,15 @@ use crate::{
     typing::{Guard, LocalFuture},
 };
 use futures_util::StreamExt;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use waltr_client::{
     RoutineInteractionTransport,
     interaction::{InteractionLimits, InteractionOutput, wire},
 };
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
+
+/// Absolute deadline from RPC open through Accepted, independent of PCM backlog capacity.
+pub const ACCEPTANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The selected Routine ports, independent of shortcut configuration.
 pub struct Selection<'a> {
@@ -118,17 +121,21 @@ pub async fn run<T: RoutineInteractionTransport>(
             };
             observer.emit(Diagnostic::Stage(Stage::RpcOpen));
             guard.check().map_err(|_| Error::Cancelled)?;
-            let mut session = transport
-                .interact(
+            let deadline = tokio::time::Instant::now() + ACCEPTANCE_TIMEOUT;
+            let mut session = tokio::time::timeout_at(
+                deadline,
+                transport.interact(
                     wire::OpenInteraction {
                         routine_name: selection.routine.into(),
                         trigger_name: selection.trigger.into(),
                         ..Default::default()
                     },
                     limits,
-                )
-                .await
-                .map_err(|error| rpc(observer, &error, RpcFailure::Open))?;
+                ),
+            )
+            .await
+            .map_err(|_| acceptance_timeout(observer))?
+            .map_err(|error| rpc(observer, &error, RpcFailure::Open))?;
             duplex(
                 &mut session,
                 &mut capture,
@@ -138,6 +145,7 @@ pub async fn run<T: RoutineInteractionTransport>(
                 observer,
                 consumer,
                 first,
+                deadline,
             )
             .await
             .map(Some)
@@ -176,6 +184,10 @@ pub async fn run<T: RoutineInteractionTransport>(
     }
     Ok(output)
 }
+fn acceptance_timeout(observer: &Observer) -> Error {
+    observer.emit(Diagnostic::RpcFailure(RpcFailure::AcceptanceTimeout));
+    Error::Interaction
+}
 fn rpc(observer: &Observer, error: &waltr_client::ClientError, boundary: RpcFailure) -> Error {
     observer.emit(Diagnostic::RpcFailure(RpcFailure::from_client(
         error, boundary,
@@ -202,6 +214,7 @@ async fn duplex(
     observer: &Observer,
     consumer: &dyn Consumer,
     first: Vec<u8>,
+    deadline: tokio::time::Instant,
 ) -> Result<Output, Error> {
     let (accepted, ready) = tokio::sync::oneshot::channel();
     let input_finished = std::cell::Cell::new(false);
@@ -243,10 +256,13 @@ async fn duplex(
         Ok::<_, Error>(Output { text, invocation })
     };
     let send = async {
-        ready.await.map_err(|_| {
-            observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));
-            Error::Interaction
-        })?;
+        tokio::time::timeout_at(deadline, ready)
+            .await
+            .map_err(|_| acceptance_timeout(observer))?
+            .map_err(|_| {
+                observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));
+                Error::Interaction
+            })?;
         session
             .input
             .send(wire::interact_request::Event::InputOpened(

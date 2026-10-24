@@ -181,6 +181,7 @@ impl Operation {
                 if snapshot.rpc.is_none() {
                     let category = match error {
                         RpcFailure::Open => "rpc_open",
+                        RpcFailure::AcceptanceTimeout => "rpc_acceptance_timeout",
                         RpcFailure::Input => "rpc_input",
                         RpcFailure::Output => "rpc_output",
                         RpcFailure::Protocol => "rpc_protocol",
@@ -510,6 +511,19 @@ mod tests {
             );
             assert_eq!(snapshot.capture_cleanup, "capture_backend");
         }
+    }
+
+    #[test]
+    fn acceptance_timeout_has_a_distinct_content_free_category() {
+        let operation = Operation::new("hold");
+        let observer = operation.observer();
+        observer.emit(Diagnostic::Stage(Stage::RpcOpen));
+        observer.emit(Diagnostic::RpcFailure(RpcFailure::AcceptanceTimeout));
+        observer.emit(Diagnostic::Primary(Err(Error::Interaction)));
+        operation.finish();
+        let snapshot = operation.lock();
+        assert_eq!(snapshot.primary, "rpc_acceptance_timeout");
+        assert_eq!(snapshot.failure_stage, "rpc_open");
     }
 
     #[test]

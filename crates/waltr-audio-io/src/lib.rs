@@ -111,8 +111,9 @@ pub struct Limits {
     pub max_chunk_bytes: usize,
     /// Raw callback queue capacity, one through eight.
     pub raw_queue_items: usize,
-    /// Opt-in aggregate one-second pre-admission audio bound. Credits include all host chunks:
-    /// queue slots, pending worker send, and consumer-owned frame. At most 64 external chunks.
+    /// Opt-in one-second native/transient audio reserve, including these external chunks.
+    /// Include pending worker sends and consumer-owned frames (at most 64 chunks). Any separate
+    /// host backlog must be bounded and added to this reserve by the caller, not counted twice.
     /// Native actual-format preflight rejects excess before pool allocation or stream construction.
     pub preaccept_external_chunks: Option<usize>,
 }

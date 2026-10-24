@@ -32,6 +32,7 @@ struct Fake {
     admissions: Arc<AtomicUsize>,
     uploads: Arc<AtomicUsize>,
     completed: Arc<AtomicBool>,
+    delay_waiting: Arc<AtomicBool>,
     pcm: Arc<Mutex<Vec<u8>>>,
 }
 #[allow(
@@ -134,6 +135,11 @@ impl RoutineInteractionService for Fake {
             events.extend(final_events("test"));
             return Ok(Response::new(Box::pin(stream::iter(events))));
         }
+        if open.routine_name == "disconnect-before-accepted" {
+            return Ok(Response::new(Box::pin(stream::iter([Err(
+                RpcStatus::unavailable("synthetic disconnect"),
+            )]))));
+        }
         if open.routine_name == "early-rejected" {
             return Ok(Response::new(Box::pin(stream::iter([event(
                 Event::ValidationFailure(Default::default()),
@@ -167,6 +173,7 @@ impl RoutineInteractionService for Fake {
                 .unwrap()
                 .parse::<u64>()
                 .unwrap();
+            self.delay_waiting.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
         let fake = self.clone();
@@ -228,7 +235,9 @@ impl RoutineInteractionService for Fake {
         })
         .map(|result| stream::iter(result.unwrap_or_else(|e| vec![Err(e)])))
         .flatten();
+        let waiting = self.delay_waiting.clone();
         let prefix = stream::once(async move {
+            waiting.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(delay)).await;
             stream::iter(prefix)
         })
@@ -302,7 +311,7 @@ impl Factory for MockFactory {
         Ok(Box::new(Samples {
             state: state.clone(),
             remaining: if state.burst.load(Ordering::SeqCst) {
-                1000
+                20_000
             } else if state.small_chunks.load(Ordering::SeqCst) {
                 120
             } else {
@@ -313,7 +322,7 @@ impl Factory for MockFactory {
 }
 impl Source for Samples {
     fn frame(&mut self) -> Option<Vec<u8>> {
-        if self.remaining < 1000
+        if self.remaining < 20_000
             && self
                 .state
                 .admit_burst
@@ -939,10 +948,12 @@ async fn shared_pipeline_waits_for_acceptance_then_closes_and_finishes_in_order(
 #[tokio::test]
 async fn small_frames_survive_delayed_open_and_accepted_with_exact_pcm_after_release() {
     for routine in [
-        "delay-open-100",
-        "delay-open-250",
-        "delay-accepted-100",
-        "delay-accepted-250",
+        "delay-open-500",
+        "delay-open-5000",
+        "delay-open-19900",
+        "delay-accepted-500",
+        "delay-accepted-5000",
+        "delay-accepted-19900",
     ] {
         let (transport, fake, stop, server) = fixture().await;
         let dir = tempfile::tempdir().unwrap();
@@ -954,13 +965,18 @@ async fn small_frames_survive_delayed_open_and_accepted_with_exact_pcm_after_rel
         });
         let (hold, control) = Hold::press(&AudioAdmission::default()).unwrap();
         let release = async {
-            while fake.admissions.load(Ordering::SeqCst) == 0 {
+            while !fake.delay_waiting.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }
+            assert_eq!(fake.uploads.load(Ordering::SeqCst), 0);
             control.release();
+            let millis = routine.rsplit('-').next().unwrap().parse::<u64>().unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_millis(millis)).await;
+            tokio::time::resume();
         };
         let generation = CancellationToken::new();
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
             tokio::join!(
                 hold.run(
                     &binding,
@@ -1370,6 +1386,261 @@ impl waltr_desktop::typing::Session for TypingSink {
         })
     }
 }
+#[tokio::test]
+async fn preaccepted_disconnect_or_rejection_never_uploads_or_runs_an_action() {
+    for routine in ["disconnect-before-accepted", "early-rejected"] {
+        let (transport, fake, stop, server) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never");
+        let binding = binding(&path, routine);
+        let gate = AudioAdmission::default();
+        let (hold, _control) = Hold::press(&gate).unwrap();
+        let mock = Arc::new(Mock {
+            small_chunks: AtomicBool::new(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            hold.run(
+                &binding,
+                &transport,
+                Arc::new(MockFactory(mock.clone())),
+                &CancellationToken::new()
+            )
+            .await,
+            Err(Error::Interaction)
+        );
+        assert_eq!(fake.uploads.load(Ordering::SeqCst), 0);
+        assert!(mock.joined.load(Ordering::SeqCst));
+        assert!(!path.exists());
+        assert!(gate.reserve().is_ok());
+        stop.cancel();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn delayed_acceptance_typing_drains_all_pcm_and_closes_its_backend() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("never-command");
+    let binding = typing_binding(&path, "delay-accepted-5000");
+    let gate = AudioAdmission::default();
+    let (hold, control) = Hold::press(&gate).unwrap();
+    let state = std::rc::Rc::new(Typed::default());
+    let factory = TypingFactory {
+        state: state.clone(),
+        control: control.clone(),
+    };
+    let mock = Arc::new(Mock {
+        small_chunks: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let generation = CancellationToken::new();
+    let run = hold.run_guarded_with_typing(
+        &binding,
+        &transport,
+        Arc::new(MockFactory(mock.clone())),
+        &generation,
+        &|| true,
+        Some(&factory),
+    );
+    let clock = async {
+        while !fake.delay_waiting.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(state.text.borrow().is_empty());
+        control.release();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::resume();
+    };
+    let (result, ()) = tokio::join!(run, clock);
+    assert_eq!(result, Ok(()));
+    let expected: Vec<u8> = (0..120u8).rev().flat_map(|value| vec![value; 96]).collect();
+    assert_eq!(*fake.pcm.lock().unwrap(), expected);
+    assert!(!state.text.borrow().is_empty());
+    assert!(state.closed.get());
+    assert!(mock.joined.load(Ordering::SeqCst));
+    assert!(gate.reserve().is_ok());
+    assert!(!path.exists());
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn acceptance_deadline_covers_open_and_accepted_and_joins_without_upload() {
+    use waltr_desktop::host::{Diagnostic, Observer, RpcFailure};
+    for routine in ["delay-open-20100", "delay-accepted-20100"] {
+        let (transport, fake, stop, server) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never");
+        let binding = binding(&path, routine);
+        let gate = AudioAdmission::default();
+        let (hold, control) = Hold::press(&gate).unwrap();
+        control.release();
+        let mock = Arc::new(Mock::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let generation = CancellationToken::new();
+        let run = hold
+            .observed(Observer::new(move |event| seen.lock().unwrap().push(event)))
+            .run(
+                &binding,
+                &transport,
+                Arc::new(MockFactory(mock.clone())),
+                &generation,
+            );
+        let clock = async {
+            while !fake.delay_waiting.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::pause();
+            tokio::time::advance(waltr_desktop::interaction::ACCEPTANCE_TIMEOUT).await;
+            tokio::time::resume();
+        };
+        let (result, ()) = tokio::join!(run, clock);
+        assert_eq!(result, Err(Error::Interaction), "{routine}");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&Diagnostic::RpcFailure(RpcFailure::AcceptanceTimeout))
+        );
+        assert!(mock.joined.load(Ordering::SeqCst));
+        assert_eq!(fake.uploads.load(Ordering::SeqCst), 0);
+        assert!(!path.exists());
+        assert!(gate.reserve().is_ok());
+        stop.cancel();
+        server.await.unwrap();
+    }
+}
+
+struct LongFactory {
+    uploaded: Arc<AtomicUsize>,
+    joined: Arc<AtomicBool>,
+}
+struct LongSamples {
+    uploaded: Arc<AtomicUsize>,
+    joined: Arc<AtomicBool>,
+    sent: usize,
+    stopped: AtomicBool,
+}
+const LONG_PCM_BYTES: usize = 90 * 24_000 * 2;
+impl Factory for LongFactory {
+    fn open(&self, _: waltr_audio_io::Config) -> Result<Box<dyn Source>, capture::Error> {
+        Ok(Box::new(LongSamples {
+            uploaded: self.uploaded.clone(),
+            joined: self.joined.clone(),
+            sent: 0,
+            stopped: AtomicBool::new(false),
+        }))
+    }
+}
+impl Source for LongSamples {
+    fn frame(&mut self) -> Option<Vec<u8>> {
+        // Permit a finite two-second burst, then wait for downstream acknowledgement.
+        if self.sent == LONG_PCM_BYTES
+            || self
+                .sent
+                .saturating_sub(self.uploaded.load(Ordering::SeqCst))
+                >= 96_000
+        {
+            return None;
+        }
+        let bytes = (0..750)
+            .flat_map(|index| ((self.sent / 2 + index) as u16).to_le_bytes())
+            .collect();
+        self.sent += 1500;
+        Some(bytes)
+    }
+    fn terminal(&self) -> Terminal {
+        if self.stopped.load(Ordering::SeqCst) {
+            Terminal::Completed
+        } else {
+            Terminal::Running
+        }
+    }
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+    fn shutdown(self: Box<Self>) {
+        self.joined.store(true, Ordering::SeqCst);
+    }
+}
+#[tokio::test]
+async fn ninety_seconds_of_pcm_streams_beyond_backlog_capacity_without_loss_or_duplicates() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let binding = binding(&dir.path().join("once"), "test");
+    let gate = AudioAdmission::default();
+    let (hold, control) = Hold::press(&gate).unwrap();
+    let joined = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(LongFactory {
+        uploaded: fake.uploads.clone(),
+        joined: joined.clone(),
+    });
+    let generation = CancellationToken::new();
+    let run = hold.run(&binding, &transport, factory, &generation);
+    let release = async {
+        while fake.uploads.load(Ordering::SeqCst) < LONG_PCM_BYTES {
+            tokio::task::yield_now().await;
+        }
+        control.release();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(run, release)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    let pcm = fake.pcm.lock().unwrap();
+    assert_eq!(pcm.len(), LONG_PCM_BYTES);
+    for (index, sample) in pcm.chunks_exact(2).enumerate() {
+        assert_eq!(u16::from_le_bytes([sample[0], sample[1]]), index as u16);
+    }
+    drop(pcm);
+    assert!(joined.load(Ordering::SeqCst));
+    assert!(gate.reserve().is_ok());
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_capture_can_outlive_startup_deadline_then_release_cleanly() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("once");
+    let binding = binding(&path, "test");
+    let gate = AudioAdmission::default();
+    let (hold, control) = Hold::press(&gate).unwrap();
+    let status = control.status();
+    let mock = Arc::new(Mock::default());
+    let generation = CancellationToken::new();
+    let run = hold.run(
+        &binding,
+        &transport,
+        Arc::new(MockFactory(mock.clone())),
+        &generation,
+    );
+    let clock = async {
+        while *status.borrow() != Status::Streaming {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(90)).await;
+        tokio::time::resume();
+        control.release();
+    };
+    let (result, ()) = tokio::join!(run, clock);
+    assert_eq!(result, Ok(()));
+    assert_eq!(fake.uploads.load(Ordering::SeqCst), 100);
+    assert!(mock.joined.load(Ordering::SeqCst));
+    assert!(path.exists());
+    assert!(gate.reserve().is_ok());
+    stop.cancel();
+    server.await.unwrap();
+}
+
 fn typing_binding(path: &std::path::Path, name: &str) -> config::Keybind {
     let mut binding = binding(path, name);
     binding.command = None;

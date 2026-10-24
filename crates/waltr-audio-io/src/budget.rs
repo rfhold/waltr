@@ -37,9 +37,10 @@ fn ceil(n: u64, d: u64) -> Result<u64, Error> {
 impl Config {
     /// Calculate the actual-format capacity before allocating raw blocks or opening a stream.
     ///
-    /// This includes the whole capture path even before RPC admission. RPC audio input is empty
-    /// until Accepted; after admission its separately bounded queue belongs to the RPC contract.
-    /// `external_chunks` must include every host queue slot, pending send, and consumer frame.
+    /// This includes native retention plus the supplied external chunk credits. A separately
+    /// bounded host backlog must be added by the caller. RPC audio input is empty until Accepted;
+    /// after admission its separately bounded queue belongs to the RPC contract.
+    /// `external_chunks` includes pending sends and consumer frames outside that backlog.
     ///
     /// # Errors
     /// Rejects invalid config/layout/credit counts or checked-arithmetic overflow.

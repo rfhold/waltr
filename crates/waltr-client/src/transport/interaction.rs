@@ -93,6 +93,8 @@ where
             .max_decoding_message_size(limits.output_message_bytes);
         let queue = InteractionQueue::new();
         queue.seed(request);
+        // Own cancellation before awaiting headers; a dropped open must close the request lane.
+        let input = InteractionInputHandle::new(queue.clone(), limits.clone());
         let response = client
             .interact(InteractionRequests(queue.clone()))
             .await
@@ -101,7 +103,7 @@ where
             .into_inner()
             .map(move |event| event.map_err(|e| status_error(&e, &credentials)));
         Ok(InteractionSession {
-            input: InteractionInputHandle::new(queue.clone(), limits.clone()),
+            input,
             output: InteractionOutput::new(Box::pin(stream), queue, limits),
         })
     }

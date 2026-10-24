@@ -48,20 +48,20 @@ async fn many_small_frames_fill_exact_byte_credit_not_item_credit() {
         Arc::new(FactoryBurst(expected.clone(), joined.clone())),
         config(),
     );
-    // No receiver polls until the source exhausts its exact 800-byte queue credit.
+    // No receiver polls until the source completes; byte fragments coalesce without metadata.
     assert_eq!(worker.join().await, Ok(()));
     assert!(joined.load(Ordering::SeqCst));
     let mut actual = Vec::new();
     while let Some(frame) = worker.frames.recv().await {
-        actual.push(frame);
+        actual.extend(frame);
     }
-    assert_eq!(actual, expected);
+    assert_eq!(actual, expected.concat());
 }
 
 #[tokio::test]
 async fn byte_exhaustion_and_malformed_frames_are_distinct_and_join_source() {
     for (frames, error) in [
-        (vec![vec![0; 2]; 401], Error::Overflow),
+        (vec![vec![0; 100]; 14_401], Error::Overflow),
         (vec![vec![0; 102]], Error::MalformedFrame),
         (vec![vec![0; 3]], Error::MalformedFrame),
     ] {
