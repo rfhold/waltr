@@ -173,9 +173,15 @@ Both modes require clean EOF, `SUCCEEDED`, and exact selected-stream validation 
 The desktop pre-admission contract limits conservative aggregate library/host retained-audio capacity to one target-rate second.
 Actual-format preflight selects the largest reserve of one through eight queued raw blocks that fits that capacity, plus one callback/converter owner block.
 This selection precedes callback pool allocation and stream construction.
-The budget includes all pool capacities, converter history and transient output, native output slots and pending send, and six host frame credits.
-For 24 kHz output and 48 kHz mono input, this selects four queued 4096-sample blocks plus the owner block.
-Smaller callback slices still consume a whole lease.
+The budget includes all pool capacities, converter history and transient output, native output slots and pending send, and ten host chunk credits.
+Eight host credits form a byte-bounded PCM queue; the worker and consumer each retain at most one additional chunk.
+Small frames consume their actual byte length, not a whole chunk credit.
+At 24 kHz, each chunk holds at most 1,500 bytes, and the host queue holds 12,000 bytes: 250 ms of PCM16 mono.
+The bridge continues to drain native capture while RPC open or Accepted waits, without a second admission buffer.
+RPC input remains empty until Accepted; normal release preserves queued PCM and drains it after acceptance.
+Cancellation discards queued PCM and joins capture; byte-credit exhaustion fails explicitly and also joins capture.
+For 24 kHz output and 48 kHz mono input, preflight selects three queued 4096-sample blocks plus the owner block.
+Smaller native callback slices still consume a whole raw pool lease.
 Preflight rejects an otherwise supported format with `PreacceptBudgetExceeded` if even the minimum reserve exceeds the limit.
 This reserve tolerates only a finite callback burst or owner delay, not arbitrary scheduler stalls or sustained downstream backpressure.
 The bound excludes the borrowed OS callback slice and opaque driver/device buffers that CPAL cannot expose or constrain.
@@ -278,7 +284,7 @@ Clean capture with no nonempty frames produces the local `no_input` diagnostic o
 It opens no interaction or upstream speech request and performs no external text or command action.
 Chat preserves its terminal `succeeded` phase with no `finalText`; holds return success without an action.
 Capture failure remains a failure, even with zero frames. Cancellation and identity guards still apply.
-The preaccept aggregate memory bound and queue capacities remain unchanged.
+Both consumers share the pre-admission byte queue and aggregate one-second retained-audio bound described above.
 
 Holds recheck generation, access, cancellation, and credential revision at capture, RPC, and output-action boundaries.
 The credential monitor provides cleanup, not effect authority.

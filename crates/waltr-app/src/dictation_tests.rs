@@ -257,7 +257,7 @@ impl Factory for MockFactory {
         Ok(Box::new(Samples {
             state: state.clone(),
             remaining: if state.burst.load(Ordering::SeqCst) {
-                100
+                1000
             } else {
                 1
             },

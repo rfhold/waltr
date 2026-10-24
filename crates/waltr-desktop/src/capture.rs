@@ -1,13 +1,27 @@
 //! Owned blocking capture bridge. Retain and await `CaptureWorker::join` after cancellation.
 //! Native initialization and teardown have no portable deadline. Dropping the future is not shutdown.
-use waltr_audio_io::{Capture, CaptureOutput, Terminal};
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use waltr_audio_io::{Capture, CaptureOutput, Terminal};
 
-const BRIDGE_ITEMS: usize = 4;
+const BRIDGE_CHUNKS: usize = 8;
+
+/// Byte-credited PCM lane. Dequeue releases queue credit; one consumer frame is budgeted separately.
+pub struct Frames(mpsc::Receiver<(Vec<u8>, OwnedSemaphorePermit)>);
+impl std::fmt::Debug for Frames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Frames").finish_non_exhaustive()
+    }
+}
+impl Frames {
+    /// Read the next frame, preserving source order.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.0.recv().await.map(|(frame, _credit)| frame)
+    }
+}
 
 /// Static, sample-free capture errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,8 +44,12 @@ pub enum Error {
     ResourceLimit,
     /// Native worker panicked or could not be joined.
     Worker,
-    /// Consumer exhausted its finite credit.
+    /// Host PCM queue exhausted its byte credit.
     Overflow,
+    /// Source frame exceeds the configured chunk bound or is not PCM16 aligned.
+    MalformedFrame,
+    /// Host PCM receiver closed unexpectedly.
+    ReceiverClosed,
     /// Explicit cancellation.
     Cancelled,
 }
@@ -115,10 +133,10 @@ pub fn native_config(audio: &crate::config::Audio) -> Result<waltr_audio_io::Con
         ..Default::default()
     };
     // Actual-format native preflight includes raw/history/transients, before stream construction.
-    // Six host credits: four queued, one worker-pending, one consumer frame. RPC PCM is empty
-    // before Accepted; after admission its finite input queue has a separate transport contract.
+    // Eight chunks of byte credit, one worker-pending chunk, and one consumer frame.
+    // RPC PCM is empty before Accepted; its post-admission queue is budgeted separately.
     config.limits.raw_queue_items = 8;
-    config.limits.preaccept_external_chunks = Some(BRIDGE_ITEMS + 2);
+    config.limits.preaccept_external_chunks = Some(BRIDGE_CHUNKS + 2);
     let budget = audio.sample_rate_hz as usize * 2;
     config.limits.output_queue_bytes = budget / 4;
     config.limits.output_queue_items = 4;
@@ -130,7 +148,7 @@ pub fn native_config(audio: &crate::config::Audio) -> Result<waltr_audio_io::Con
 pub struct CaptureWorker {
     control: Arc<AtomicU8>,
     /// Finite PCM lane; never expose its contents in status snapshots.
-    pub frames: mpsc::Receiver<Vec<u8>>,
+    pub frames: Frames,
     worker: tokio::task::JoinHandle<Result<(), Error>>,
     result: Arc<std::sync::Mutex<Option<Result<(), Error>>>>,
     joined: bool,
@@ -156,7 +174,11 @@ impl CaptureWorker {
     ) -> Self {
         let control = Arc::new(AtomicU8::new(0));
         let state = control.clone();
-        let (tx, frames) = mpsc::channel(BRIDGE_ITEMS);
+        // Bound setup even for configurations that the worker subsequently rejects.
+        let bytes = config.limits.max_chunk_bytes.clamp(2, 256 * 1024) * BRIDGE_CHUNKS;
+        let credit = Arc::new(Semaphore::new(bytes));
+        // Nonempty aligned frames consume at least two bytes, bounding metadata as well as PCM.
+        let (tx, frames) = mpsc::channel(bytes / 2);
         let result = Arc::new(std::sync::Mutex::new(None));
         let terminal = result.clone();
         let worker = tokio::task::spawn_blocking(move || {
@@ -167,6 +189,25 @@ impl CaptureWorker {
                 observer.emit(crate::host::Diagnostic::Stage(
                     crate::host::Stage::CaptureReady,
                 ));
+                let send = |frame: Vec<u8>| {
+                    if frame.len() > max_chunk || !frame.len().is_multiple_of(2) {
+                        return Err(Error::MalformedFrame);
+                    }
+                    if frame.is_empty() {
+                        return Ok(());
+                    }
+                    if tx.is_closed() {
+                        return Err(Error::ReceiverClosed);
+                    }
+                    let permit = credit
+                        .clone()
+                        .try_acquire_many_owned(frame.len() as u32)
+                        .map_err(|_| Error::Overflow)?;
+                    tx.try_send((frame, permit)).map_err(|error| match error {
+                        mpsc::error::TrySendError::Closed(_) => Error::ReceiverClosed,
+                        mpsc::error::TrySendError::Full(_) => Error::Overflow,
+                    })
+                };
                 let result = (|| {
                     loop {
                         match state.load(Ordering::Acquire) {
@@ -175,10 +216,12 @@ impl CaptureWorker {
                             _ => {}
                         }
                         while let Some(frame) = source.frame() {
-                            if frame.len() > max_chunk || !frame.len().is_multiple_of(2) {
-                                return Err(Error::Overflow);
+                            match state.load(Ordering::Acquire) {
+                                2 => return Err(Error::Cancelled),
+                                1 => source.stop(),
+                                _ => {}
                             }
-                            tx.try_send(frame).map_err(|_| Error::Overflow)?;
+                            send(frame)?;
                         }
                         match source.terminal() {
                             Terminal::Running => {
@@ -186,10 +229,10 @@ impl CaptureWorker {
                             }
                             Terminal::Completed => {
                                 while let Some(frame) = source.frame() {
-                                    if frame.len() > max_chunk || !frame.len().is_multiple_of(2) {
-                                        return Err(Error::Overflow);
+                                    if state.load(Ordering::Acquire) == 2 {
+                                        return Err(Error::Cancelled);
                                     }
-                                    tx.try_send(frame).map_err(|_| Error::Overflow)?;
+                                    send(frame)?;
                                 }
                                 return Ok(());
                             }
@@ -210,7 +253,7 @@ impl CaptureWorker {
         });
         Self {
             control,
-            frames,
+            frames: Frames(frames),
             worker,
             result,
             joined: false,
@@ -279,3 +322,37 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct ClosedSource;
+    impl Source for ClosedSource {
+        fn frame(&mut self) -> Option<Vec<u8>> {
+            Some(vec![0, 0])
+        }
+        fn terminal(&self) -> Terminal {
+            Terminal::Running
+        }
+        fn stop(&self) {}
+        fn shutdown(self: Box<Self>) {}
+    }
+    struct Deferred(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    impl Factory for Deferred {
+        fn open(&self, _: waltr_audio_io::Config) -> Result<Box<dyn Source>, Error> {
+            self.0.lock().unwrap().recv().unwrap();
+            Ok(Box::new(ClosedSource))
+        }
+    }
+    #[tokio::test]
+    async fn receiver_closure_is_not_byte_exhaustion() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut worker = CaptureWorker::start(
+            Arc::new(Deferred(std::sync::Mutex::new(rx))),
+            waltr_audio_io::Config::default(),
+        );
+        worker.frames.0.close();
+        tx.send(()).unwrap();
+        assert_eq!(worker.join().await, Err(Error::ReceiverClosed));
+    }
+}

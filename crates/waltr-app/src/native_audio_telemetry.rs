@@ -1,15 +1,15 @@
 //! Content-free native audio diagnostics. All labels are fixed literals, never IPC/config values.
 use crate::audio_permissions::PermissionResult;
-use waltr_desktop::{
-    capture,
-    host::{Diagnostic, Error, Observer, RpcFailure, Stage},
-};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
 use tracing::Span;
+use waltr_desktop::{
+    capture,
+    host::{Diagnostic, Error, Observer, RpcFailure, Stage},
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 const TARGET: &str = "waltr_app_lib::dictation_telemetry";
@@ -276,6 +276,8 @@ pub const fn capture_category(error: capture::Error) -> &'static str {
         capture::Error::ResourceLimit => "capture_resource_limit",
         capture::Error::Worker => "capture_worker",
         capture::Error::Overflow => "capture_host_overflow",
+        capture::Error::MalformedFrame => "capture_malformed_frame",
+        capture::Error::ReceiverClosed => "capture_receiver_closed",
         capture::Error::Cancelled => "cancelled",
     }
 }
@@ -450,6 +452,9 @@ mod tests {
             (capture::Error::Conversion, "capture_conversion"),
             (capture::Error::ResourceLimit, "capture_resource_limit"),
             (capture::Error::Worker, "capture_worker"),
+            (capture::Error::Overflow, "capture_host_overflow"),
+            (capture::Error::MalformedFrame, "capture_malformed_frame"),
+            (capture::Error::ReceiverClosed, "capture_receiver_closed"),
             (capture::Error::Backend, "capture_backend"),
         ] {
             let operation = Operation::new("chat");

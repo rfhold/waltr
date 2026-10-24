@@ -205,12 +205,24 @@ fn native_actual_format_preflight_includes_host_queue_and_inflight_credits() {
                 channels: 1
             })
             .unwrap(),
-        4
+        3
     );
-    assert_eq!(config.limits.preaccept_external_chunks, Some(6));
+    assert_eq!(config.limits.preaccept_external_chunks, Some(10));
+    let budget = config
+        .audio_budget(
+            waltr_audio_io::InputFormat {
+                rate: 48_000,
+                channels: 1,
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(budget.external, 7_500); // 12,000 queue bytes plus two 1,500-byte frames.
+    assert_eq!(budget.native_output, 3_750);
+    assert_eq!(budget.total, 22_926);
     for (rate, channels) in [(8_000, 1), (48_000, 1), (192_000, 32)] {
         let input = waltr_audio_io::InputFormat { rate, channels };
-        let budget = config.audio_budget(input, 6).unwrap();
+        let budget = config.audio_budget(input, 10).unwrap();
         let result = waltr_audio_io::Converter::new(config.clone(), input);
         if rate == 8_000 {
             assert!(budget.total > 24_000);

@@ -64,8 +64,11 @@ That event order does not imply a new capture request or a cleanup failure.
 Clean zero-input capture reports outcome and category `no_input`, after cleanup, without `first_frame_observed`, `rpc_open`, or `accepted`.
 It creates no upstream speech request, final text, external text, or command action.
 Zero frames with a capture failure still report that failure, not `no_input`.
-Capture categories distinguish `capture_host_overflow`, `capture_budget`, `capture_unsupported`, `capture_backend`, `capture_callback_overflow`, `capture_callback_pool_exhausted`, `capture_callback_queue_full`, `capture_conversion`, `capture_resource_limit`, and `capture_worker`.
-Host overflow includes host credit, frame-size, alignment, or closed-consumer failures; it does not identify a native callback overflow.
+Capture categories distinguish `capture_host_overflow`, `capture_malformed_frame`, `capture_receiver_closed`, `capture_budget`, `capture_unsupported`, `capture_backend`, `capture_callback_overflow`, `capture_callback_pool_exhausted`, `capture_callback_queue_full`, `capture_conversion`, `capture_resource_limit`, and `capture_worker`.
+`capture_host_overflow` means that the host PCM queue exhausted its byte credit, not its frame count.
+`capture_malformed_frame` identifies an oversized or misaligned source frame; `capture_receiver_closed` identifies a closed host receiver.
+These categories contain no sample, device, endpoint, or backend error text.
+Host overflow does not identify a native callback overflow.
 Native callbacks report `capture_callback_pool_exhausted` when no free block remains, including converter-owned blocks, or `capture_callback_queue_full` when a leased block cannot enter the raw queue. The generic `capture_callback_overflow` remains accepted for compatibility.
 These fixed literals contain no device identity, audio, or backend error text. They identify the exhausted resource, not the physical cause of a scheduling delay or backpressure.
 Conversion includes nonfinite samples or misalignment; resource limits cover native limits.
