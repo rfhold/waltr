@@ -6,12 +6,14 @@
         "type": "remote",
         "url": "https://waltr.holdenitdown.net/mcp",
         "protocol": "2026-07-28",
+        "pool": true,
         "disabled": false
       },
       "waltr-local": {
         "type": "remote",
         "url": "http://127.0.0.1:14333/mcp",
         "protocol": "2026-07-28",
+        "pool": true,
         "oauth": false,
         "disabled": false
       },
@@ -19,6 +21,7 @@
         "type": "remote",
         "url": "https://preview-waltr.holdenitdown.net/mcp",
         "protocol": "2026-07-28",
+        "pool": true,
         "disabled": true
       }
     }
