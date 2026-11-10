@@ -1,0 +1,60 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: audio-synthesize
+description: committed-text-only PCM speech synthesis
+spec:
+  source: |
+    export default async function (input) {
+      await host.call('media.synthesize', {port: 'text', output: 'audio', speech: input.speech});
+      await host.call('media.finish', {});
+      return {completed: true};
+    }
+  entrypoints:
+    speak:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        speech:
+          type: object
+          properties:
+            model: {type: string, maxLength: 128}
+            voice: {type: string, maxLength: 256}
+            language: {type: string, maxLength: 64}
+            rate: {type: number, min: 0.25, max: 4}
+          required: [model, voice, language, rate]
+      required: [speech]
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        completed:
+          type: boolean
+      required:
+      - completed
+  capabilities:
+  - media.execute
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 32
+    inFlight: 4
+    deadlineMs: 5400000
+  ports:
+    text:
+      direction: input
+      media: text
+      required: true
+      maxBytes: 1048576
+      formats:
+      - utf8
+    audio:
+      direction: output
+      media: audio
+      required: true
+      maxBytes: 268435456
+      formats:
+      - pcm16le-24000-mono

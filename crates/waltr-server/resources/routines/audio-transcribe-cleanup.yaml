@@ -1,0 +1,69 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: audio-transcribe-cleanup
+description: single-collect speech cleanup with one normal helper
+spec:
+  source: |
+    export default async function () {
+      const transcript = await host.call('media.collect', {port: 'audio', cap: 1048576});
+      const helper = await host.call('helper.run', {selection: {kind: 'named', name: 'routine-cleanup'}, task: 'Clean the attached transcript and capture the clean text in chosen.', capture: 'clean-text', maxTurns: 3, deadlineMs: 120000, responseBytes: 65536, completionBytes: 4194304}, null, null, transcript);
+      const clean = await host.call('media.select', {field: '/chosen'}, null, null, helper);
+      await host.call('media.publish', {name: 'clean-text'}, null, null, clean);
+      await host.call('media.emit', {output: 'clean-text'}, null, null, clean);
+      await host.call('media.finish', {});
+      return {completed: true};
+    }
+  entrypoints:
+    dictate:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties: {}
+      required: []
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        completed:
+          type: boolean
+      required:
+      - completed
+  capabilities:
+  - media.execute
+  - helper.run
+  - helper.named.routine-cleanup
+  - helper.capture.clean-text
+  captures:
+    clean-text:
+      selection: {kind: named, name: routine-cleanup}
+      contract:
+        schemaVersion: waltr.value/v1
+        schema:
+          type: object
+          properties:
+            chosen: {type: string, maxLength: 1048576}
+          required: [chosen]
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 32
+    inFlight: 4
+    deadlineMs: 5400000
+  ports:
+    audio:
+      direction: input
+      media: audio
+      required: true
+      maxBytes: 268435456
+      formats:
+      - pcm16le-24000-mono
+    clean-text:
+      direction: output
+      media: text
+      required: true
+      maxBytes: 1048576
+      formats:
+      - utf8

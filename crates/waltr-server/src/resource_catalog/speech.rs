@@ -124,6 +124,7 @@ pub(super) fn validate_speech_source(
                         "channels",
                         "speaking_rate",
                         "pitch",
+                        "model_name",
                     ],
                     path,
                 )?;
@@ -134,6 +135,68 @@ pub(super) fn validate_speech_source(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::materialize::materialize_provider;
+    use super::*;
+
+    const SOURCE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata: {name: speech}\nspec:\n  transport: googleTextToSpeechV1\n  url: http://localhost:50051\n  models:\n    reader:\n      name: Reader\n      type: 4\n      speech_capabilities: {unary: true, streaming: true}\n      synthesis:\n        voice: expresso-happy\n        language_code: en-US\n        sample_rate_hz: 24000\n        channels: 1\n";
+
+    #[test]
+    fn synthesis_model_name_yaml_and_config_roundtrip() {
+        for model_name in [None, Some("kyutai-tts-1.6b-en-fr")] {
+            let mut source = SOURCE.to_owned();
+            if let Some(name) = model_name {
+                source.push_str(&format!("        model_name: {name}\n"));
+            }
+            let provider = materialize_provider(&source, "test", None).unwrap();
+            let yaml = serde_yaml_ng::to_string(&provider).unwrap();
+            let restored: proto::Provider = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(provider, restored);
+            let json = serde_json::to_value(&provider).unwrap();
+            assert_eq!(
+                serde_json::from_value::<proto::Provider>(json).unwrap(),
+                provider
+            );
+            let configuration = proto::Configuration {
+                providers: [("speech".into(), restored)].into(),
+                ..Default::default()
+            };
+            let resolved =
+                resolve_speech_model(&configuration, "speech", "reader", ModelType::Tts, true)
+                    .unwrap();
+            let SpeechSettings::Synthesis(options) = resolved.settings else {
+                panic!("synthesis")
+            };
+            assert_eq!(options.model_name.as_deref(), model_name);
+            assert_eq!(resolved.model_key, "reader");
+        }
+    }
+
+    #[test]
+    fn synthesis_model_name_rejects_empty_wrong_type_and_unknown_fields() {
+        for extra in [
+            "model_name: ''",
+            "model_name: '   '",
+            "model_name: []",
+            "modelName: upstream",
+        ] {
+            assert!(
+                materialize_provider(&format!("{SOURCE}        {extra}\n"), "test", None).is_err(),
+                "{extra}"
+            );
+        }
+        assert!(
+            materialize_provider(
+                &SOURCE.replace("googleTextToSpeechV1", "openaiChatCompletions"),
+                "test",
+                None
+            )
+            .is_err()
+        );
+    }
 }
 
 fn check_keys(
@@ -251,6 +314,10 @@ pub(super) fn validate_speech_provider(
                     ));
                 }
                 if options.voice.trim().is_empty()
+                    || options
+                        .model_name
+                        .as_ref()
+                        .is_some_and(|name| name.trim().is_empty())
                     || options.language_code.trim().is_empty()
                     || !(8000..=48000).contains(&options.sample_rate_hz)
                     || options.channels != 1
@@ -262,7 +329,7 @@ pub(super) fn validate_speech_provider(
                         .is_some_and(|pitch| !pitch.is_finite() || !(-20.0..=20.0).contains(&pitch))
                 {
                     return Err(fail(
-                        "invalid synthesis voice, language, PCM format, rate, or pitch",
+                        "invalid synthesis voice, model name, language, PCM format, rate, or pitch",
                     ));
                 }
             }

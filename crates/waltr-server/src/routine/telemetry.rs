@@ -1,4 +1,4 @@
-//! Content-free interaction tracing, independent of host exporter ownership.
+//! Content-free v2 invocation tracing, independent of host exporter ownership.
 use opentelemetry::trace::{
     SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
 };
@@ -32,17 +32,6 @@ impl Operation {
         self.finished.store(true, Ordering::Relaxed);
         self.span.record("outcome", outcome);
     }
-
-    pub(crate) fn result<T>(&self, result: &Result<T, super::interaction::Error>) {
-        self.outcome(match result {
-            Ok(_) => "success",
-            Err(error) => match error.code {
-                "cancelled" | "task_interrupted" => "cancelled",
-                "deadline_exceeded" => "deadline",
-                _ => "failure",
-            },
-        });
-    }
 }
 
 /// Fixed, content-free stages shared by access authentication and interaction admission.
@@ -54,13 +43,7 @@ pub(crate) enum AdmissionStage {
     JwksStateWait,
     JwksRefreshWait,
     JwksFetch,
-    OpenRead,
     Prepare,
-    EngineHealthWait,
-    EngineLifecycleWait,
-    DurableAdmission,
-    DurableStart,
-    AcceptedEnqueue,
 }
 
 impl AdmissionStage {
@@ -72,13 +55,7 @@ impl AdmissionStage {
             Self::JwksStateWait => "jwks_state_wait",
             Self::JwksRefreshWait => "jwks_refresh_wait",
             Self::JwksFetch => "jwks_fetch",
-            Self::OpenRead => "open_read",
             Self::Prepare => "prepare",
-            Self::EngineHealthWait => "engine_health_wait",
-            Self::EngineLifecycleWait => "engine_lifecycle_wait",
-            Self::DurableAdmission => "durable_admission",
-            Self::DurableStart => "durable_start",
-            Self::AcceptedEnqueue => "accepted_enqueue",
         }
     }
 }
@@ -146,9 +123,9 @@ pub(crate) fn admission_sync<T, E>(
 
 pub(crate) fn rpc(metadata: &tonic::metadata::MetadataMap, run: bool) -> Operation {
     let span = if run {
-        tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.run", outcome = tracing::field::Empty, grpc_status = tracing::field::Empty)
+        tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.v2.start", outcome = tracing::field::Empty, grpc_status = tracing::field::Empty)
     } else {
-        tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.interact", outcome = tracing::field::Empty, grpc_status = tracing::field::Empty)
+        tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.v2.interact", outcome = tracing::field::Empty, grpc_status = tracing::field::Empty)
     };
     let mut values = metadata.get_all("traceparent").iter();
     let parsed = values
@@ -403,7 +380,7 @@ mod tests {
             .unwrap();
         let rpc = spans
             .iter()
-            .find(|span| span.name == "routine.interact")
+            .find(|span| span.name == "routine.v2.interact")
             .unwrap();
         assert_eq!(
             middleware.span_context.trace_state().header(),
@@ -421,7 +398,7 @@ mod tests {
         );
         let unrelated = spans
             .iter()
-            .find(|span| span.name == "routine.run")
+            .find(|span| span.name == "routine.v2.start")
             .unwrap();
         assert_eq!(
             unrelated.span_context.trace_id().to_string(),
@@ -455,7 +432,7 @@ mod tests {
             drop(operation);
             let spans = exporter.get_finished_spans().unwrap();
             assert_eq!(spans.len(), 1);
-            assert_eq!(spans[0].name, "routine.run");
+            assert_eq!(spans[0].name, "routine.v2.start");
             assert!(spans[0].attributes.iter().any(|field| {
                 field.key.as_str() == "outcome" && field.value.as_str() == "accepted"
             }));

@@ -1,0 +1,35 @@
+export default async function (input) {
+  const snapshot = (await host.call('context.original', {})).result;
+  const checkpoint = snapshot.metadata['routine.categories.v1'];
+  if (!checkpoint || checkpoint.version !== 1 || checkpoint.through !== snapshot.boundary) throw new Error('stale category checkpoint');
+  const category = Array.from(checkpoint.categories).find(category => category.key === input.key);
+  const itemIds = Array.from(snapshot.items).filter(item => (snapshot.itemMetadata[item.item_id] || {})['routine.category.v1'] === input.key).map(item => item.item_id);
+  if (!category || !itemIds.length) throw new Error('unknown or empty category');
+  const source = (await host.call('context.history', {source: snapshot.source, itemIds})).result;
+  const active = Array.from(snapshot.masks).find(mask => mask.key === 'category.' + input.key);
+  const selected = {category, activeMaskId: active ? active.id : null,
+    summary: active ? active.replacement : null,
+    background: Array.from(snapshot.items).filter(item => !itemIds.includes(item.item_id)).map(item => ({item_id: item.item_id, excerpt: JSON.stringify(item).slice(0, 240)})).slice(-16)};
+  const helper = (await host.call('helper.run', {
+    selection: {kind: 'named', name: 'routine-category-context'},
+    source: source.source,
+    task: JSON.stringify({selected, instruction: input.instruction}),
+    capture: 'mask-decision',
+    maxTurns: 3,
+    deadlineMs: 20000, responseBytes: 65536, completionBytes: 65536
+  })).result;
+  if (helper.captures.length !== 1) throw new Error('one mask decision required');
+  const decision = helper.captures[0].value;
+  if (decision.kind !== 'keep' && decision.kind !== 'replace') throw new Error('invalid mask decision');
+  if (decision.kind === 'keep' && selected.activeMaskId === null) throw new Error('keep requires an active mask');
+  if (decision.kind === 'replace' && (typeof decision.summary !== 'string' || !decision.summary.trim())) throw new Error('replacement required');
+  const result = {key: input.key, decision: decision.kind, applied: false, maskId: null, summary: decision.kind === 'replace' ? decision.summary : null};
+  if (input.planOnly === true || decision.kind === 'keep') return result;
+  const commit = (await host.call('context.transact', {
+    source: snapshot.source, expectedRevision: snapshot.revision,
+    predicates: [{key: 'routine.categories.v1', value: {state: 'present', value: checkpoint}}], updates: [],
+    masks: {expected: Array.from(snapshot.masks).map(mask => [mask.key, mask.id]), removeKeys: ['category.' + input.key], removeOverlaps: [],
+      add: [{key: 'category.' + input.key, through: snapshot.boundary, itemIds, replacement: decision.summary}]}
+  })).result;
+  return {...result, applied: true, maskId: commit.addedMasks[0].id};
+}

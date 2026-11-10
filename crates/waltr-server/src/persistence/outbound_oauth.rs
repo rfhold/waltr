@@ -1,4 +1,4 @@
-use waltr_agent::{
+use crate::auth::{
     OAuthCredential, OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture,
     OAuthRefreshClaim, OAuthRefreshClaimResult,
 };
@@ -503,7 +503,7 @@ fn now_ms() -> i64 {
 mod tests {
     use std::sync::Arc;
 
-    use waltr_agent::{
+    use crate::auth::{
         McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, OAuthCredentialStore as _,
         OAuthTokenSet,
     };

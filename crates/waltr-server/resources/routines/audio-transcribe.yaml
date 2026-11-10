@@ -1,0 +1,52 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: audio-transcribe
+description: live ordered speech transcription
+spec:
+  source: |
+    export default async function () {
+      await host.call('media.transcribe', {port: 'audio', output: 'transcript'});
+      await host.call('media.finish', {});
+      return {completed: true};
+    }
+  entrypoints:
+    dictate:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties: {}
+      required: []
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        completed:
+          type: boolean
+      required:
+      - completed
+  capabilities:
+  - media.execute
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 32
+    inFlight: 4
+    deadlineMs: 5400000
+  ports:
+    audio:
+      direction: input
+      media: audio
+      required: true
+      maxBytes: 268435456
+      formats:
+      - pcm16le-24000-mono
+    transcript:
+      direction: output
+      media: text
+      required: true
+      maxBytes: 1048576
+      formats:
+      - utf8

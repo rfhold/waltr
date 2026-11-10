@@ -1,0 +1,35 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: configuration
+description: Run the ordinary named configuration agent for a requested change.
+spec:
+  source: |
+    export default async function (input) {
+      if (!input.prompt.trim()) throw new Error('prompt required');
+      const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'configuration'}, task: input.prompt, maxTurns: 12, deadlineMs: 25000, responseBytes: 65536, completionBytes: 65536})).result;
+      return helper.response;
+    }
+  entrypoints:
+    manual:
+      trigger: manual
+    tool:
+      trigger: tool
+      selector: configure-waltr
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        prompt:
+          type: string
+          maxLength: 12288
+      required:
+      - prompt
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: string
+      maxLength: 16384
+  capabilities:
+  - helper.run
+  - helper.named.configuration

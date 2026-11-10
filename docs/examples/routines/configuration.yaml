@@ -1,36 +1,35 @@
-apiVersion: waltr.dev/v1alpha1
+apiVersion: waltr.routine/v1
 kind: Routine
-metadata:
-  name: configuration
+name: configuration
+description: Run the ordinary named configuration agent for a requested change.
 spec:
-  description: Ask the configured Waltr agent to make a configuration change.
-  params:
-    - name: prompt
+  source: |
+    export default async function (input) {
+      if (!input.prompt.trim()) throw new Error('prompt required');
+      const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'configuration'}, task: input.prompt, maxTurns: 12, deadlineMs: 25000, responseBytes: 65536, completionBytes: 65536})).result;
+      return helper.response;
+    }
+  entrypoints:
+    manual:
+      trigger: manual
+    tool:
+      trigger: tool
+      selector: configure-waltr
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        prompt:
+          type: string
+          maxLength: 12288
+      required:
+      - prompt
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
       type: string
-      required: true
-  triggers:
-    - name: tool
-      tool:
-        name: configure-waltr
-        displayName: Configure Waltr
-        scope: session
-        completion: wait
-        description: Describe a desired Waltr configuration change.
-        inputs:
-          - name: prompt
-  tasks:
-    - name: configure
-      taskSpec:
-        agentRef:
-          name: configuration
-        prompt: $(params.prompt)
-        output:
-          type: text
-        results:
-          - name: text
-            type: string
-            value: $(output.text)
-  results:
-    - name: text
-      type: string
-      value: $(tasks.configure.results.text)
+      maxLength: 16384
+  capabilities:
+  - helper.run
+  - helper.named.configuration

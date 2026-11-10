@@ -1,34 +1,52 @@
-# Implemented catalog, runtime, and RPC support; requires compatible configured providers.
-# Requires an explicit Provider `speech` with streaming STT model `dictation`.
-apiVersion: waltr.dev/v1alpha1
+apiVersion: waltr.routine/v1
 kind: Routine
-metadata:
-  name: audio-transcribe
+name: audio-transcribe
+description: live ordered speech transcription
 spec:
-  description: Transcribe client audio into live text revisions and committed transcript segments.
-  triggers:
-    - name: dictate
-      interaction:
-        inputPorts:
-          - name: audio
-            required: true
-            format:
-              type: audio
-              encoding: pcmS16le
-              sampleRateHz: 24000
-              channels: 1
-        outputPorts:
-          - name: transcript
-            format:
-              type: text
-  tasks:
-    - name: transcribe
-      taskSpec:
-        transcribe:
-          model:
-            provider: speech
-            model: dictation
-          input: $(interaction.inputs.audio)
-  outputs:
-    - port: transcript
-      streamFrom: $(tasks.transcribe.output)
+  source: |
+    export default async function () {
+      await host.call('media.transcribe', {port: 'audio', output: 'transcript'});
+      await host.call('media.finish', {});
+      return {completed: true};
+    }
+  entrypoints:
+    dictate:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties: {}
+      required: []
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        completed:
+          type: boolean
+      required:
+      - completed
+  capabilities:
+  - media.execute
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 32
+    inFlight: 4
+    deadlineMs: 5400000
+  ports:
+    audio:
+      direction: input
+      media: audio
+      required: true
+      maxBytes: 268435456
+      formats:
+      - pcm16le-24000-mono
+    transcript:
+      direction: output
+      media: text
+      required: true
+      maxBytes: 1048576
+      formats:
+      - utf8

@@ -1,0 +1,8 @@
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: routine-helper-capture
+spec:
+  tools:
+    - name: _helper_capture
+      permission: allow

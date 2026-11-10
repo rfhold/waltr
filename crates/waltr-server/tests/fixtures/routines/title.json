@@ -1,0 +1,13 @@
+{
+  "apiVersion": "waltr.routine/v1",
+  "kind": "Routine",
+  "name": "title-js",
+  "description": "Unregistered first-durable-message title workflow",
+  "spec": {
+    "source": "export default async function () { const snapshot = (await host.call('context.snapshot', {})).result; const key = 'title'; if (Object.prototype.hasOwnProperty.call(snapshot.metadata, key)) return false; const first = Array.from(snapshot.items).find(item => item.channel === 'user_text'); if (!first) return false; const helper = (await host.call('helper.run', {selection:{kind:'restricted',profile:'title'},task:JSON.stringify(first),maxTurns:1,deadlineMs:10000,responseBytes:4096,completionBytes:8192})).result; const title = helper.response.trim(); if (!title || title.length > 60) throw new Error('invalid title'); return (await host.call('context.transact', {source:snapshot.source,expectedRevision:snapshot.revision,predicates:[{key,value:{state:'absent'}}],updates:[{key,value:{state:'present',value:title}}]})).result.committed; }",
+    "entrypoints": {"first-message": {"trigger": "event", "selector": "session.user-message-created"}},
+    "parameters": {"schemaVersion": "waltr.value/v1", "schema": {"type": "null"}},
+    "result": {"schemaVersion": "waltr.value/v1", "schema": {"type": "boolean"}},
+    "capabilities": ["context.snapshot", "context.transact", "helper.run", "helper.restricted.title"]
+  }
+}

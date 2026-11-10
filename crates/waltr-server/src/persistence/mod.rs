@@ -1,11 +1,17 @@
 //! Server-owned database configuration and initialization.
 
+#[cfg(test)]
+mod cutover_tests;
+#[cfg(test)]
+mod object_cutover_tests;
+pub mod external_dispatch;
 mod migrations;
 mod outbound_oauth;
-pub(crate) mod routine_invocation;
+pub mod script_code_dispatch;
+pub mod script_invocation;
+pub mod script_text_result;
 
 pub(crate) use outbound_oauth::{DurableAttemptRecord, OutboundOAuthStore};
-use routine_invocation::RoutineInvocationStore;
 
 use std::{
     env,
@@ -204,7 +210,10 @@ impl DatabaseConfig {
         self.mcp.sqlite_path()
     }
 
-    fn from_optional_urls(waltr_url: &str, mcp_url: Option<&str>) -> Result<Self, PersistenceError> {
+    fn from_optional_urls(
+        waltr_url: &str,
+        mcp_url: Option<&str>,
+    ) -> Result<Self, PersistenceError> {
         let waltr = parse_target(waltr_url, ENV_DATABASE_URL)?;
         let mcp = match mcp_url {
             Some(mcp_url) => parse_target(mcp_url, ENV_MCP_DATABASE_URL)?,
@@ -215,7 +224,9 @@ impl DatabaseConfig {
 
     fn new(waltr: DatabaseTarget, mcp: DatabaseTarget) -> Result<Self, PersistenceError> {
         if let (
-            DatabaseTarget::Sqlite { identity: waltr, .. },
+            DatabaseTarget::Sqlite {
+                identity: waltr, ..
+            },
             DatabaseTarget::Sqlite { identity: mcp, .. },
         ) = (&waltr, &mcp)
         {
@@ -253,6 +264,7 @@ impl DatabaseConfig {
 pub struct Persistence {
     pool: PersistencePool,
     mcp_pool: PersistencePool,
+    objects: Arc<dyn crate::routine_objects::ImmutableObjects>,
 }
 
 #[derive(Clone)]
@@ -288,6 +300,25 @@ impl fmt::Debug for Persistence {
 }
 
 impl Persistence {
+    /// Durable journal for sessionless capability effects; never used as a replay queue.
+    pub fn external_dispatch_store(&self) -> Arc<external_dispatch::SqlExternalDispatchStore> {
+        Arc::new(external_dispatch::SqlExternalDispatchStore::new(
+            self.pool.clone(),
+        ))
+    }
+    /// Durable outer agent/MCP code-call associations, with no automatic redispatch.
+    pub fn script_code_dispatch_store(&self) -> Arc<script_code_dispatch::SqlCodeDispatchStore> {
+        Arc::new(script_code_dispatch::SqlCodeDispatchStore::new(
+            self.pool.clone(),
+        ))
+    }
+    /// Shared-pool script invocation history adapter.
+    pub fn script_invocation_store(&self) -> Arc<script_invocation::SqlInvocationStore> {
+        Arc::new(script_invocation::SqlInvocationStore::with_objects(
+            self.pool.clone(),
+            self.objects.clone(),
+        ))
+    }
     /// Initialize independent Waltr and MCP pools and run their owned migrations.
     ///
     /// # Errors
@@ -295,6 +326,17 @@ impl Persistence {
     /// Returns a sanitized error if directories cannot be created, a database is unavailable, or
     /// migration history is invalid.
     pub async fn initialize(config: DatabaseConfig) -> Result<Self, PersistenceError> {
+        let root = match config.sqlite_path().and_then(Path::parent) {
+            Some(parent) => normalized_absolute_path(parent)?.join("routine-objects"),
+            None => standalone_data_directory()?.join("routine-objects"),
+        };
+        let objects = Arc::new(crate::routine_objects::FilesystemObjects::new(root)
+            .map_err(|_| PersistenceError::Configuration("invalid Routine object root"))?);
+        Self::initialize_with_objects(config, objects).await
+    }
+
+    /// Explicit object backend; embedded hosts must not resolve standalone environment settings.
+    pub async fn initialize_with_objects(config: DatabaseConfig, objects: Arc<dyn crate::routine_objects::ImmutableObjects>) -> Result<Self, PersistenceError> {
         tracing::info!(
             backend = %config.backend(),
             mcp_backend = %config.mcp_backend(),
@@ -308,7 +350,7 @@ impl Persistence {
 
         let pool = initialize_waltr_pool(config.waltr).await?;
         match initialize_mcp_pool(config.mcp).await {
-            Ok(mcp_pool) => Ok(Self { pool, mcp_pool }),
+            Ok(mcp_pool) => Ok(Self { pool, mcp_pool, objects }),
             Err(error) => {
                 pool.close().await;
                 Err(error)
@@ -386,10 +428,6 @@ impl Persistence {
     pub(crate) fn outbound_oauth_store(&self) -> Arc<OutboundOAuthStore> {
         Arc::new(OutboundOAuthStore::new(self.pool.clone()))
     }
-
-    pub(crate) fn routine_invocation_store(&self) -> RoutineInvocationStore {
-        RoutineInvocationStore::new(self.pool.clone())
-    }
 }
 
 async fn check_pool(pool: &PersistencePool) -> Result<(), PersistenceError> {
@@ -410,6 +448,8 @@ async fn check_pool(pool: &PersistencePool) -> Result<(), PersistenceError> {
 /// Failure to configure or initialize server persistence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceError {
+    /// Retained Routine payloads require separately approved disposition before upgrade.
+    IncompatibleRoutineState,
     /// Database configuration is invalid.
     Configuration(&'static str),
     /// A required local data directory could not be created.
@@ -423,6 +463,7 @@ pub enum PersistenceError {
 impl fmt::Display for PersistenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IncompatibleRoutineState => formatter.write_str("incompatible populated Routine SQL payload state; startup refused without deleting data. Separately authorize archive/reset of exact Routine state before upgrading; preserve sessions, credentials, MCP, access state and external-dispatch receipts"),
             Self::Configuration(message) | Self::Directory(message) => formatter.write_str(message),
             Self::Connection(backend) => write!(
                 formatter,
@@ -438,7 +479,9 @@ impl fmt::Display for PersistenceError {
 
 impl Error for PersistenceError {}
 
-async fn initialize_waltr_pool(target: DatabaseTarget) -> Result<PersistencePool, PersistenceError> {
+async fn initialize_waltr_pool(
+    target: DatabaseTarget,
+) -> Result<PersistencePool, PersistenceError> {
     match target {
         DatabaseTarget::Sqlite {
             options, in_memory, ..
@@ -811,6 +854,10 @@ fn normalize_component(path: &mut PathBuf, component: &Path) {
     }
 }
 
+pub(crate) fn standalone_data_directory() -> Result<PathBuf, PersistenceError> {
+    default_data_directory(env::var_os("XDG_DATA_HOME").as_deref(), env::var_os("HOME").as_deref())
+}
+
 fn default_data_directory(
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
@@ -883,5 +930,7 @@ fn sqlite_memory_identity(
     }
 }
 
+#[cfg(test)]
+mod test_history;
 #[cfg(test)]
 mod tests;

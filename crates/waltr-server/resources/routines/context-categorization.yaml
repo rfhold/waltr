@@ -1,0 +1,125 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: context-categorization
+description: Exact-context category checkpoint with a normal named helper
+spec:
+  source: |
+    export default async function () {
+      const input = (await host.call('context.original', {})).result;
+      const checkpointKey = 'routine.categories.v1', itemKey = 'routine.category.v1';
+      const present = Object.prototype.hasOwnProperty.call(input.metadata, checkpointKey);
+      const previous = present ? input.metadata[checkpointKey] : null;
+      if (previous !== null) {
+        if (previous.version !== 1 || !Array.isArray(previous.categories) || previous.categories.length > 128 || typeof previous.through !== 'string' || !/^[0-9]+$/.test(previous.through) || typeof previous.note !== 'string' || previous.note.length > 8192) throw new Error('incompatible category checkpoint');
+        const keys = new Set();
+        for (const category of Array.from(previous.categories)) {
+          if (!category || !/^[A-Za-z0-9_.-]{1,119}$/.test(category.key) || keys.has(category.key) || typeof category.description !== 'string' || !category.description.trim() || category.description.length > 2048) throw new Error('invalid stored category');
+          keys.add(category.key);
+        }
+      }
+      if (!input.items.length) return 'No items';
+      const ids = new Set(Array.from(input.items).map(item => item.item_id));
+      if (ids.size !== input.items.length) throw new Error('duplicate item identity');
+      if (previous && previous.through === input.boundary && Array.from(input.items).every(item => {
+        const value = (input.itemMetadata[item.item_id] || {})[itemKey];
+        return typeof value === 'string' && Array.from(previous.categories).some(category => category.key === value);
+      })) return previous.note;
+      const itemUpdates = [], oldCategories = Object.create(null), categories = [], categoryKeys = Object.create(null);
+      if (previous) for (let i = 0; i < previous.categories.length; i++) oldCategories[previous.categories[i].key] = previous.categories[i];
+      let note = '';
+      for (let start = 0; start < input.items.length; start += 4) {
+        const items = [], byId = Object.create(null);
+        for (let i = start; i < Math.min(start + 4, input.items.length); i++) {
+          const id = input.items[i].item_id;
+          items.push({item_id: id});
+          const entry = {itemId: id, key: itemKey, value: {state: 'present', value: null}};
+          itemUpdates.push(entry);
+          byId[id] = entry;
+        }
+        const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'routine-categorization'}, source: input.source, task: JSON.stringify({items, previous}), capture: 'categories', maxTurns: 3, deadlineMs: 20000, responseBytes: 65536, completionBytes: 65536})).result;
+        if (helper.captures.length !== 1) throw new Error('one category capture required');
+        const update = helper.captures[0].value;
+        if (!Array.isArray(update.categories) || !Array.isArray(update.assignments) || typeof update.note !== 'string') throw new Error('invalid category capture');
+        const batchKeys = Object.create(null);
+        for (let i = 0; i < update.categories.length; i++) {
+          const category = update.categories[i];
+          if (!/^[A-Za-z0-9_.-]{1,119}$/.test(category.key) || batchKeys[category.key] || !category.description.trim()) throw new Error('invalid category');
+          batchKeys[category.key] = true;
+          if (!categoryKeys[category.key]) {
+            const old = oldCategories[category.key];
+            categories.push({key: category.key, description: old ? old.description : category.description});
+            categoryKeys[category.key] = true;
+          }
+        }
+        if (categories.length > 128) throw new Error('too many categories');
+        for (let i = 0; i < update.assignments.length; i++) {
+          const assignment = update.assignments[i], entry = byId[assignment.item_id];
+          if (!entry || entry.value.value !== null || !batchKeys[assignment.category]) throw new Error('invalid assignment');
+          entry.value.value = assignment.category;
+        }
+        if (update.assignments.length !== items.length) throw new Error('incomplete category coverage');
+        note = update.note;
+      }
+      const checkpoint = {version: 1, through: input.boundary, categories, note};
+      await host.call('context.transact', {source: input.source, expectedRevision: input.revision,
+        predicates: [{key: checkpointKey, value: present ? {state: 'present', value: previous} : {state: 'absent'}}],
+        updates: [{key: checkpointKey, value: {state: 'present', value: checkpoint}}, ...itemUpdates]});
+      return note;
+    }
+  entrypoints:
+    run:
+      trigger: manual
+    child:
+      trigger: inline
+    turn-batch:
+      trigger: event
+      selector: session.turn-batch
+    delegated-task-batch:
+      trigger: event
+      selector: session.delegated-task-batch
+    idle-flush:
+      trigger: event
+      selector: session.idle-flush
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: 'null'
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: string
+      maxLength: 8192
+  capabilities:
+  - context.original
+  - context.transact
+  - helper.run
+  - helper.named.routine-categorization
+  - helper.capture.categories
+  captures:
+    categories:
+      selection: {kind: named, name: routine-categorization}
+      contract:
+        schemaVersion: waltr.value/v1
+        schema:
+          type: object
+          properties:
+            categories:
+              type: array
+              maxItems: 128
+              items:
+                type: object
+                properties:
+                  key: {type: string, maxLength: 119}
+                  description: {type: string, maxLength: 2048}
+                required: [key, description]
+            assignments:
+              type: array
+              maxItems: 4096
+              items:
+                type: object
+                properties:
+                  item_id: {type: string, maxLength: 128}
+                  category: {type: string, maxLength: 119}
+                required: [item_id, category]
+            note: {type: string, maxLength: 8192}
+          required: [categories, assignments, note]

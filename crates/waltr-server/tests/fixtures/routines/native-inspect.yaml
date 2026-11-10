@@ -1,0 +1,30 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: native-inspect
+description: Unregistered native attachment helper composition
+spec:
+  source: |
+    export default async function () {
+      const source = await host.call('media.upload', {port: 'source'});
+      const helper = await host.call('helper.run', {selection: {kind: 'named', name: 'routine-inspect'}, task: 'Inspect the attached source. Capture the answer in chosen.', capture: 'inspection', maxTurns: 3, deadlineMs: 20000, responseBytes: 65536, completionBytes: 4194304}, null, null, source);
+      const answer = await host.call('media.select', {field: '/chosen'}, null, null, helper);
+      await host.call('media.publish', {name: 'answer'}, null, null, answer);
+      await host.call('media.emit', {output: 'answer'}, null, null, answer);
+      await host.call('media.finish', {});
+      return {completed: true};
+    }
+  entrypoints:
+    inspect: {trigger: interactive}
+  parameters: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {}, required: []}}
+  result: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {completed: {type: boolean}}, required: [completed]}}
+  capabilities: [media.execute, helper.run, helper.named.routine-inspect, helper.capture.inspection]
+  captures:
+    inspection:
+      selection: {kind: named, name: routine-inspect}
+      contract:
+        schemaVersion: waltr.value/v1
+        schema: {type: object, properties: {chosen: {type: string, maxLength: 1048576}}, required: [chosen]}
+  budgets: {valueBytes: 65536, resultBytes: 65536, hostCalls: 32, inFlight: 4, deadlineMs: 30000}
+  ports:
+    source: {direction: input, media: file, required: true, maxBytes: 67108864, formats: [blob]}
+    answer: {direction: output, media: text, required: true, maxBytes: 1048576, formats: [utf8]}
