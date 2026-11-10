@@ -21,7 +21,7 @@ export default async function () {
     const authenticationFailure = await waitForText(
       page,
       ".sessions__auth-failure",
-      "Authentication failed for MCP server protected",
+      "Authentication failed for MCP server waltr",
     );
     await waitForText(page, ".sessions__auth-failure", "Open MCP server Config");
     const retainedDraft = await textareaValue(page, '[aria-label="Session message"]');
@@ -30,9 +30,9 @@ export default async function () {
     await screenshot(page, "sessions-mcp-oauth-required");
 
     await page.locator('.sessions__auth-failure a').click();
-    await waitForPathname(page, "/config/mcp/edit/protected");
-    await waitForText(page, '[aria-label="Authentication for protected"]', "Authentication");
-    await clickAuthorizationButton(page, '[aria-label="Authentication for protected"]');
+    await waitForPathname(page, "/config/mcp/edit/waltr");
+    await waitForText(page, '[aria-label="Authentication for waltr"]', "Authentication");
+    await clickAuthorizationButton(page, '[aria-label="Authentication for waltr"]');
     await waitForText(page, '.oauth-dialog', "Open authorization URL");
     const authUrl = await page.evaluate(() => {
       const link = document.querySelector(".oauth-dialog__open");
@@ -122,7 +122,8 @@ export default async function () {
     await waitForPathname(page, sessionPath);
     await typeAndKeepFocus(page, '[aria-label="Session message"]', protectedPrompt);
     await page.locator('[aria-label="Send session message"] button[type="submit"]').click();
-    await waitForTextareaValue(page, '[aria-label="Session message"]', "");
+    const retryTimeline = await waitForText(page, '[aria-label="Session timeline"]', protectedPrompt);
+    const retryFailure = await waitForText(page, '[aria-label="Session activity status"]', "example.invalid/v1");
     const noRetryDialog = await page.locator('.oauth-dialog').count() === 0;
 
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
@@ -133,9 +134,9 @@ export default async function () {
     const suggestions = await waitForText(
       page,
       '[aria-label="Resource suggestions"]',
-      "mcp_protected_exec",
+      "waltr:resource.source",
     );
-    await clickResourceSuggestion(page, "mcp_protected_exec");
+    await clickResourceSuggestion(page, "waltr:resource.source");
     const selectedOperation = await waitForTextareaValueChange(
       page,
       '[aria-label="Session message"]',
@@ -150,18 +151,21 @@ export default async function () {
 
     check(null, {
       "MCP failure is inline and target scoped": () =>
-        includesText(authenticationFailure, "Authentication failed for MCP server protected"),
+        includesText(authenticationFailure, "Authentication failed for MCP server waltr"),
       "MCP failure retains the draft without opening OAuth": () =>
         retainedDraft === protectedPrompt && noRuntimeDialog,
       "server callback lifecycle reaches shared-client terminal state": () =>
         includesText(pendingDialog, "Waiting for the server callback") && noReauthorization,
       "persisted credential is reused without reauthorization": () => noReauthorization,
-      "explicit retry is admitted without another MCP auth blocker": () => noRetryDialog,
+      "explicit retry is admitted and reaches the deliberately unavailable provider": () =>
+        noRetryDialog && includesText(retryTimeline, protectedPrompt)
+        && includesText(retryFailure, "http error") && includesText(retryFailure, "example.invalid/v1")
+        && !includesText(retryFailure, "Authentication failed for MCP server"),
       "dynamic bearer reaches the protected Waltr MCP resource": () =>
         authorizationContract.callbackUri === `${baseUrl}/outbound-oauth/callback` &&
-        includesText(suggestions, "mcp_protected_exec"),
-      "protected Waltr dispatcher is selectable": () =>
-        includesText(suggestions, "mcp_protected_exec") && selectedOperation !== "@resources",
+        includesText(suggestions, "waltr:resource.source"),
+      "protected Waltr resource template is selectable": () =>
+        includesText(suggestions, "waltr:resource.source") && selectedOperation !== "@resources",
       "authorization URL omits the PKCE verifier": () => authorizationContract.codeVerifier === "",
       "authorization request carries callback state": () => authorizationContract.state.length >= 8,
       "authorization request carries an S256 challenge": () => authorizationContract.codeChallenge.length >= 8,

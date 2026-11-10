@@ -63,6 +63,7 @@ services:
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: disabled
+      TMPDIR: /run/waltr-private
       WALTR_PUBLIC_URL: http://127.0.0.1:14333
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
@@ -78,6 +79,9 @@ services:
       retries: 30
     tmpfs:
       - /data:mode=0700,uid=65532,gid=65532
+      # Namespace-local path guard only; the worker workspace is not shared or mirrored.
+      - /workspace:mode=0700,uid=65532,gid=65532
+      - /run/waltr-private:mode=0700,uid=65532,gid=65532
     networks:
       test:
         aliases:
@@ -126,7 +130,7 @@ services:
       context: .
       dockerfile: Dockerfile
       target: test-runtime
-    command: ["waltr-agent-test-mcp-server", "--http", "0.0.0.0:14666"]
+    command: ["waltr-server-test-mcp-server", "--http", "0.0.0.0:14666"]
     depends_on:
       dex:
         condition: service_healthy
@@ -146,6 +150,8 @@ services:
       dockerfile: Dockerfile
       target: k6-browser
     depends_on:
+      test-proxy:
+        condition: service_healthy
       dex:
         condition: service_healthy
       waltr-test:
@@ -156,7 +162,7 @@ services:
     environment:
       K6_BROWSER_HEADLESS: "true"
       WALTR_WEB_ACCESS_AUTH: disabled
-      WALTR_WEB_BASE_URL: http://waltr-test:14333
+      WALTR_WEB_BASE_URL: https://waltr.test
       WALTR_WEB_SCREENSHOTS: "0"
       WALTR_WEB_SCREENSHOTS_DIR: /screenshots
       WALTR_AGENT_LIVE_GATEWAY: "0"
@@ -166,13 +172,38 @@ services:
       WALTR_OAUTH_REDIRECT_URI: http://waltr:14333/oauth/callback
       WALTR_OAUTH_USERNAME: waltr@example.test
       WALTR_OAUTH_PASSWORD: password
+      SSL_CERT_FILE: /test-ca-public/ca.crt
     networks:
       - test
     volumes:
       - .:/workspace:ro
+      - test-ca-public:/test-ca-public:ro
+
+  test-proxy:
+    profiles:
+      - test
+    image: caddy:2.10.2-alpine
+    depends_on:
+      test-ca:
+        condition: service_completed_successfully
+      waltr-test:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:2015/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      test:
+        aliases:
+          - waltr.test
+    volumes:
+      - ./tests/web/k6/support/Caddyfile.test:/etc/caddy/Caddyfile:ro
+      - test-ca-caddy:/test-ca-caddy:ro
 
   test-ca:
     profiles:
+      - test
       - test-auth
     build:
       context: .
@@ -244,6 +275,7 @@ services:
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: oidc
+      TMPDIR: /run/waltr-private
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
       WALTR_SESSION_STORE: filesystem
@@ -258,7 +290,8 @@ services:
       WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL: "86400"
       WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: "2592000"
       WALTR_MCP_OAUTH_CODE_TTL: "300"
-      WALTR_MCP_OAUTH_ALLOW_DCR: "true"
+      # The browser fixture exercises CIMD, including on private test DNS.
+      WALTR_MCP_OAUTH_ALLOW_DCR: "false"
       WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true"
       WALTR_MCP_OAUTH_ALLOW_CIMD: "true"
       WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS: "true"
@@ -277,6 +310,9 @@ services:
     tmpfs:
       - /data:mode=0700,uid=65532,gid=65532
       - /run/waltr-mcp-oauth:mode=0750,uid=65532,gid=65532
+      # Namespace-local path guard only; the worker workspace is not shared or mirrored.
+      - /workspace:mode=0700,uid=65532,gid=65532
+      - /run/waltr-private:mode=0700,uid=65532,gid=65532
     networks:
       - test-auth
     volumes:
@@ -313,7 +349,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-agent-test-mcp-server --http 0.0.0.0:14666
+      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-server-test-mcp-server --http 0.0.0.0:14666
     depends_on:
       auth-proxy:
         condition: service_healthy

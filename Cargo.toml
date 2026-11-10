@@ -9,6 +9,7 @@ members = [
     "crates/waltr-client",
     "crates/waltr-desktop",
     "crates/waltr-server",
+    "crates/waltr-script",
     "crates/waltr-tui",
     "crates/waltr-web",
     "crates/mcp",
@@ -55,6 +56,8 @@ waltr-audio-io = { version = "0.3.0", path = "crates/waltr-audio-io" }
 waltr-client = { version = "0.3.0", path = "crates/waltr-client" }
 waltr-desktop = { version = "0.3.0", path = "crates/waltr-desktop" }
 waltr-server = { version = "0.3.0", path = "crates/waltr-server" }
+waltr-script = { version = "0.3.0", path = "crates/waltr-script" }
+wasmi = { version = "=0.46.0", default-features = false, features = ["std"] }
 macos-accessibility-client = "=0.0.2"
 mcp = { version = "0.3.0", path = "crates/mcp" }
 mcp-macros = { version = "0.3.0", path = "crates/mcp-macros" }

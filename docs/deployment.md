@@ -1,5 +1,9 @@
 # Deployment
 
+## Coordinated Upgrades
+
+Upgrade server, worker, browser, TUI, and native/embedded clients together for server-owned capabilities and typed live interactions. Old external-response APIs, history variants, and tool aliases have no compatibility path. Pending waits and private grants do not survive restart. Use the [cutover runbook](runbooks/server-capability-cutover.md) for exact retained-session and override targets, preservation boundaries, and separately authorized resets. Never remove a data volume or credential store as an implicit upgrade step.
+
 ## Persistence
 
 `WALTR_DATABASE_URL` selects the Waltr-owned database used for access-auth, outbound OAuth, and Routine invocation history. Optional `WALTR_MCP_DATABASE_URL` independently selects the database used for the hosted MCP authorization server.
@@ -14,7 +18,11 @@ When `WALTR_MCP_DATABASE_URL` is absent or empty, file-backed SQLite derives sib
 
 These databases are not the agent session store configured by `WALTR_SESSION_STORE`. The Waltr database is the authoritative store for both provider and upstream-MCP OAuth credentials; the environment-owned server has no credential-file setting.
 
-Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, outbound OAuth attempts/credentials, and Routine history in `waltr.sqlite3`, while MCP history, inert session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, `0004_outbound_oauth`, `0005_unified_oauth_credentials`, `0006_routine_invocations`, and `0007_routine_interaction_trigger`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. V5 is a hard cutover that discards existing MCP SQL credentials and stops reading legacy provider credential files; all targets must authorize again after upgrade. Legacy `auth.json` files are not deleted automatically and should be securely removed after rollback is no longer required. V6 adds exactly the Routine aggregate and append-only event-journal tables, with no task table or pruning. V7 extends the stored Routine trigger kind to include interactions and preserves prior invocation history. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
+Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, outbound OAuth attempts/credentials, and Routine history in `waltr.sqlite3`. MCP history, inert session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL applies migrations through separate `waltr` and `mcp` search paths in the default shared logical database.
+
+Waltr migrations 9–11 and 13 introduce script invocation journals, text results, observations and neutral code-dispatch associations. The unshipped deferred migration 12 is removed without renumbering; retained local databases that applied it need separate migration-history handling. Additive migration 14 removes only the three legacy Routine task-history tables, children first and without `CASCADE`; current JavaScript history, sessions/masks, resource overrides, OAuth and MCP state remain intact. This is a coordinated binary/resource/database cutover, not permission to run conversion against live state. MCP has four migrations, through `0004_oidc_resource_owner`. Both owners use embedded `sqlx::migrate!()` migrators and complete before binding. Invalid URLs, unavailable databases, validation or application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
+
+The earlier V5 credential cutover discards existing MCP SQL credentials and stops reading legacy provider credential files; affected targets must authorize again. Legacy `auth.json` files are not deleted automatically and should be securely removed only after rollback is no longer required. V6 introduced the original Routine aggregate and event journal; V7 added interaction trigger history without discarding earlier records.
 
 ## Container Runtime And Local Compose
 
@@ -45,6 +53,56 @@ The static profile does not consume ambient `WALTR_*` deployment settings. Chang
 The `dev` volume contains both SQLite files, including unified outbound credentials in `waltr.sqlite3`, and filesystem agent sessions. It is disposable local state, not a production backup contract.
 
 The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. Their `WALTR_OAUTH_*` and `WALTR_TEST_MCP_*` values are test-fixture settings, not server deployment variables. The authenticated Waltr fixture enables the hosted MCP issuer, generates an ephemeral keyring in tmpfs, and sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` only so HTTPS Waltr-to-Waltr CIMD and token requests can reach private Compose aliases. Production deployments must leave this deterministic test exception unset. The fixture does not configure a direct MCP issuer or a preregistered self client.
+
+## Standalone Routine Speech
+
+The `waltr-server` binary enables Routine speech only through explicit process environment selections. Provider resources alone do not enable it. Configure each direction independently:
+
+| Setting | Contract |
+| --- | --- |
+| `WALTR_ROUTINE_STT_PROVIDER`, `WALTR_ROUTINE_STT_MODEL` | Exact catalog provider/model keys for streaming recognition. Set both or neither. |
+| `WALTR_ROUTINE_STT_SNAPSHOT_PROVIDER`, `WALTR_ROUTINE_STT_SNAPSHOT_MODEL` | Separate exact STT keys for transcript snapshots. Requires streaming support and `recognition.diarization: true`. Set both or neither. |
+| `WALTR_ROUTINE_TTS_PROVIDER`, `WALTR_ROUTINE_TTS_MODEL` | Exact catalog provider/model keys for streaming synthesis. Set both or neither. |
+| `WALTR_ROUTINE_TTS_CHOICES` | Optional JSON array of 1–128 exact `{ "model": "reader", "voice": "voice-id", "language": "en-US", "rate": 1.0 }` choices, at most 131072 bytes. Requires the TTS pair; every model must equal its selected model key. Unknown fields are rejected. |
+
+Unset ordinary STT and TTS pairs leave their direction disabled. Partial, empty, non-UTF-8, oversized or malformed settings fail startup without value disclosure. Provider/model identities are at most 256 bytes, with no surrounding whitespace or control characters. Voices are nonempty and at most 256 bytes, languages nonempty and at most 64 bytes, and rates range from 0.25 through 2.0.
+
+The snapshot pair affects only typed transcript snapshots, not ordinary transcription or cleanup.
+When the snapshot pair is absent, an explicitly diarized ordinary STT selection retains its prior snapshot support.
+A non-diarized ordinary selection supplies no snapshot support.
+An explicit snapshot selection requires valid resources, STT kind, streaming support and diarization at startup and invocation admission.
+An invalid explicit snapshot selection fails closed; the host never substitutes the ordinary selection.
+Snapshot-only configuration works without the ordinary STT pair; it grants no ordinary transcription.
+Media admission accepts PCM that matches either available STT path; JavaScript chooses the operation after admission.
+Each operation checks its own selection and PCM before a provider connection.
+A snapshot-only host can admit snapshot-compatible input, but an ordinary transcription call still fails before provider effects.
+
+Absent `WALTR_ROUTINE_TTS_CHOICES` permits only the selected catalog model's configured voice, language and rate (default rate 1.0). A supplied list replaces that choice; it adds no provider or model wildcard. Per-call choices retain the pinned endpoint, credentials and optional catalog `synthesis.model_name`. Missing resources, wrong model kinds or unavailable streaming support fail at Routine admission against its pinned catalog snapshot, not by choosing a fallback provider.
+
+These speech settings grant no helper input/model authority, tools, code access or capture permission. Embedded hosts and external `build_app(BuildAppOptions)` callers keep their explicitly supplied `routine_authority`; the generic runtime does not read these variables. Restart the standalone process after changing its environment. See the [speech provider contract](architecture/config.md#speech-provider-contract) for catalog configuration.
+
+Standalone media helpers require separate, explicit host ceilings:
+
+| Setting | Contract |
+| --- | --- |
+| `WALTR_ROUTINE_HELPER_INPUTS` | JSON array of 1–128 unique `{ "provider": "codex", "model": "gpt-5.6-sol", "text": true, "max_body_bytes": 8388608 }` entries. Identities match exact inference provider/model keys. Unknown fields fail startup. |
+| `WALTR_ROUTINE_MEDIA_TOOLS` | JSON array of unique, exact builtin capture tool names. The only supported name is `_helper_capture`. Wildcards, shell tools and MCP identities fail startup. |
+
+Each variable accepts at most 131072 bytes. Present empty arrays, malformed values and duplicate identities fail startup without value disclosure.
+Helper provider/model identities follow the 256-byte identity rules above. `text` must equal `true`; `max_body_bytes` ranges from 1 through 33554432.
+No entry enables image, audio or PDF attachments. An absent helper-input variable denies native attachments, including transcript snapshots.
+An absent media-tool variable denies every helper tool. A supplied tool list retains default-deny for all other tools.
+The host ceiling intersects the normal named agent's permissions; neither resource capture declarations nor host ceilings override an agent denial.
+Neither variable grants code access, selects inference defaults, or derives authority from catalog model capabilities.
+
+For text cleanup on `codex/gpt-5.6-sol`, use the helper entry above and `WALTR_ROUTINE_MEDIA_TOOLS='["_helper_capture"]'`.
+The 8 MiB ceiling accommodates JSON escaping for a 1 MiB transcript plus its request envelope.
+Cleanup collects an ordinary transcript and does not require diarization. The conversation-notes Routine still requires a typed transcript snapshot.
+Conversation notes require `recognition.diarization: true` and an endpoint that implements the cumulative, attributed-word contract.
+Keep the ordinary STT pair on the plain dictation model.
+Set the snapshot pair to a separate diarized model key for conversation notes.
+Both selections use the same catalog snapshot; each retains its own endpoint and recognition options.
+The diarization flag alone does not establish backend support or live conversation-note compatibility.
 
 ## Workspace Worker Deployment
 
@@ -247,6 +305,8 @@ Hosted opt-in sources: [standalone policy](../crates/waltr-server/src/standalone
 
 ## Agent Session Storage
 
+Session revision cutover requires one coordinated writer version per store. Mixed old/new complete-record writers are unsupported, even with physical CAS. Stop old writers before any new writer starts. Compatible retained JSON needs no scan, SQL migration or reset; reads seed absent execution sequences without writes. The next authorized write persists the field. Records without a durable incarnation remain readable/listable but cannot supply execution tokens. Preserve retained sessions and app data; never delete them to bypass `ExecutionCompatibility`. See [revision cutover](runbooks/server-capability-cutover.md#session-revision-cutover) and [storage compatibility](agent/storage.md#stored-record-compatibility).
+
 `WALTR_SESSION_STORE` selects agent session storage independently of the Waltr and MCP SQL databases:
 
 | Value | Configuration |
@@ -272,17 +332,37 @@ The Pulumi workload definition uses S3 session storage backed by Ceph RGW, which
 
 The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not modify either Waltr or MCP SQL data, authentication sessions, OAuth credentials, or configuration. The operation is a blind delete without active-run or cross-replica coordination; stop session activity before invoking it or concurrent work may recreate records.
 
+## Routine Payload Storage
+
+Routine program envelopes and selected text bodies use immutable storage, independently of session storage and SQL targets.
+
+| Variable | Contract |
+| --- | --- |
+| `WALTR_ROUTINE_OBJECT_STORE` | Optional exact `filesystem` or `s3`; default `filesystem`. |
+| `WALTR_ROUTINE_OBJECT_ROOT` | Optional absolute filesystem root outside the worker workspace. Default `$XDG_DATA_HOME/waltr/routine-objects` or `$HOME/.local/share/waltr/routine-objects`. |
+| `WALTR_ROUTINE_OBJECT_S3_ENDPOINT` | Required for S3: HTTPS origin; HTTP only on loopback. No credentials, path, query or fragment. |
+| `WALTR_ROUTINE_OBJECT_S3_REGION` | Required nonempty S3 region. |
+| `WALTR_ROUTINE_OBJECT_S3_BUCKET` | Required existing bucket name. |
+| `WALTR_ROUTINE_OBJECT_S3_PREFIX` | Required nonempty relative prefix; no empty, `.` or `..` segments. |
+| `WALTR_ROUTINE_OBJECT_S3_ACCESS_KEY_ID` | Required nonempty static access-key ID. |
+| `WALTR_ROUTINE_OBJECT_S3_SECRET_ACCESS_KEY` | Required nonempty static secret access key. |
+| `WALTR_ROUTINE_OBJECT_S3_FORCE_PATH_STYLE` | Required exact `true` or `false`. |
+
+S3 keys use `<prefix>/routine-objects/program/<sha256>` and `<prefix>/routine-objects/text/<sha256>`. The backend must support conditional creation and verified reads. No session-store single-writer fallback applies. Embedded hosts explicitly select the database parent's `routine-objects` root and ignore these standalone variables.
+
+Backup and retention cover both SQL references and payload objects. Failed publication can leave retained unreferenced objects; no collector exists. Migration 0016 rejects populated incompatible Routine state before destructive schema changes. No automatic conversion or wipe exists. Use the [cutover runbook](runbooks/server-capability-cutover.md) for separate archive/reset approval boundaries. See [persistence](architecture/persistence.md#routine-payload-objects) for integrity and publication ordering.
+
 ## Resource Catalog
 
 The server embeds one YAML catalog under [`crates/waltr-server/resources`](../crates/waltr-server/resources/). Persisted overrides live under `.waltr/resources` at the server root.
 
 The catalog uses `agents`, `features`, `permissions`, `providers`, `mcp-servers`, `defaults`, and `routines`. Only `defaults/default.yaml` is valid in the defaults category.
 
-Each persisted file contains one strict YAML document. Its category, `kind`, filename stem, and `metadata.name` must identify the same resource.
+Each persisted file contains one strict YAML document. Its category, `kind`, filename stem, and identity must agree. Routine identity is top-level `name` under `apiVersion: waltr.routine/v1`; other resources use `metadata.name`.
 
 Bundled resources supply defaults. A persisted exact-path file replaces its bundle. Reset removes the persisted override and reveals the bundle.
 
-The server always registers bundled `routines/title.yaml` and `routines/fork.yaml`. A persisted same-path file overrides either resource, and reset restores its bundled definition.
+The server bundles all eleven shipped [JavaScript Routine examples](examples/routines/README.md). The historical permission-evaluation proposal is documentation only. A persisted same-path file overrides its bundle; reset restores the bundled definition. Old task-DSL overrides fail production configuration preflight. Supply reviewed current-schema replacements; no converter or old executor exists.
 
 Waltr validates the complete catalog before startup. Invalid YAML, identity mismatches, unresolved references, invalid models.dev selectors, and invalid environment templates fail startup.
 
@@ -290,9 +370,41 @@ Models.dev loading is network-first with fixed request bounds. A valid configure
 
 The environment-owned bundled self-MCP resource requires `WALTR_PUBLIC_URL` in every access-auth mode. It consumes the variable independently of OIDC, joins `/mcp` through URL parsing, and preserves a deployment path prefix. With access auth disabled, actual partial browser, API, or hosted-MCP OIDC settings still fail startup.
 
+With `WALTR_AUTH_MODE=disabled`, standalone `/mcp` accepts anonymous clients without bearer tokens or OAuth, provided hosted OAuth and embedded local admission are absent. Any client that can reach the server can use its configured enabled tools and administration/session operations; there is no per-client isolation. Bind development servers to `127.0.0.1`. Do not expose no-auth mode to untrusted networks. This does not change global bind policy, hosted authentication, or embedded/private self-MCP generation-bearer requirements. Optional code profiles and Routine helper/media authority still require explicit configuration.
+
 The server watches `.waltr/resources` after startup. An invalid reload preserves the last-known-good snapshot and exposes the reload error.
 
-Routine resources use strict YAML and stay outside durable agent-definition bundles. The Routine service exposes definitions and durable invocation history globally.
+Routine resources use strict YAML and stay outside durable agent-definition bundles. The v2 service exposes source-free definitions and principal-scoped observations. Standalone and embedded constructors install one shared invocation service behind the existing access-auth and local-admission layers; old v1 Routine routes are unavailable.
+
+Hosts configure `RoutineAuthority` through `BuildAppOptions` or `EmbeddedServerConfig`.
+Code grants match exact issuer and subject; each operation retains its original authentication lease.
+No implicit code grant exists.
+Code grants also name exact durable sessions and operator profiles; the normal agent must explicitly enable `codeMode`.
+The standalone CLI adds no implicit grants.
+Unattended daily permission evaluation stays disabled: no service identity or daily driver exists.
+The historical permission-evaluation proposal supplies no executable entrypoint or audit authority.
+Public MCP code stays off unless `RoutineCodeGrant.public_mcp_session` selects one of that grant's durable sessions.
+Hosted grants use the configured OAuth issuer and validated opaque OAuth subject.
+Each request retains its original token expiry and revocation lease through a fresh adapter over the selected session's normal runtime.
+Request metadata and guest arguments select neither identity nor profile.
+
+Media hosts also set explicit `RoutineAuthority` fields:
+
+| Field | Contract |
+| --- | --- |
+| `recognition` | Exact provider/model keys for ordinary streaming speech recognition. |
+| `recognition_snapshot` | Optional separate streaming STT selection with diarization. Absence retains snapshot support from an explicitly diarized `recognition` selection. |
+| `synthesis` | Exact provider/model keys for a current streaming speech-synthesis model. No implicit provider or codec fallback exists. |
+| `helper_inputs` | Exact inference provider/model pairs and `TransientModelCapabilities`; absent entries deny attachments. |
+| `synthesis_choices` | Explicit allowed `{model,voice,language,rate}` choices; Routine input must supply `{speech:{...}}`. |
+| `media_restriction` | Normal tool-policy ceiling for media helpers. Absence grants no tools; a source session also imposes its caller policy. |
+
+Routine JavaScript selects named helpers, tasks, capture names, source handles, turns, deadlines and response/completion budgets explicitly.
+`spec.captures` declares exact named selections and bounded `waltr.value/v1` contracts.
+The bundled filter uses `conversation-filter`; normal helper policy and the operator ceiling must both permit `_helper_capture`.
+Declaration supplies no approval. Definite denial fails before speech effects; Ask requires ordinary live consent.
+Retained transcript, notes and deletion audit use separate durable text results.
+Host options retain credentials and allowed models; Routine input cannot select credentials or an unapproved speech choice.
 
 Public `/mcp` resources and uniform tools provide resource administration:
 
@@ -329,11 +441,11 @@ New sessions snapshot provider inference settings. They also store exact agent-d
 
 After the first durable user prompt, the bundled title routine starts best-effort work. It has no enable setting, backfill, replay, recovery, or retry mechanism.
 
-The routine creates a visible durable auxiliary session. It copies only provider connection and model settings, disables reasoning, and runs one provider turn. It uses replacement prompts with empty feature, tool, and permission lists.
+The routine creates a visible durable auxiliary session. It copies provider connection and model settings, disables reasoning, and runs one provider turn with the normal named `routine-title` agent.
 
-The title task uses an inference-only template. Its durable helper starts with only the task prompt and receives no source history.
+The title helper starts with only the task prompt containing the first durable user message; it receives no other source history.
 
-The routine writes the exact final text to source metadata key `title` only when that key is absent. Its declared ephemeral metadata condition excludes auxiliary recursion.
+The routine writes the final text to source metadata key `title` only when that key is absent. The host excludes helper and ephemeral sessions from first-message triggers.
 
 Event delivery and duplicate-attempt suppression before admission are process-local and bounded. Admitted event and manual invocations use one durable lifecycle recorder.
 
@@ -455,7 +567,7 @@ Native tokens and refresh tokens are process-memory only. Restarting the TUI req
 The native app composes shared capture and shortcut libraries through its Rust bridge, separate from upstream speech providers.
 See [Clients](architecture/clients.md#routine-interaction-clients) for ownership and [desktop configuration](architecture/config.md#desktop-client-configuration) for startup YAML.
 The [example client file](examples/client.yaml) does not install its server Routine or providers.
-A compatible server must expose `RoutineInteractionService` and the exact configured PCM ports.
+A compatible server must expose `waltr.routine.v2.RoutineService` and the exact configured PCM ports. Speech models and normal named media-helper profiles require explicit host configuration; absent speech selection denies speech operations rather than choosing a provider.
 
 | Platform | Prerequisites and limits |
 | --- | --- |
@@ -783,9 +895,9 @@ Local source and mock-backed tests do not establish image contents or registry a
 
 ## Startup And Operation
 
-The public `waltr_server::build_app(BuildAppOptions)` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and routine engine, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
+The public `waltr_server::build_app(BuildAppOptions)` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and shared JavaScript invocation service, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
 
-`BuildAppOptions::default()` supplies default interaction limits; hosts select custom bounds through its `interaction_limits` field. Embedded hosts set the same `InteractionLimits` type through `EmbeddedServerConfig.interaction_limits`. Both primary builders reject invalid limits before initialization or runtime effects.
+V2 resource contracts and registries supply the accepted interaction bounds. The obsolete server `interaction_limits` fields are removed. `routine_private_parent` supplies an existing private-storage parent outside the workspace for standalone embedding hosts. Embedded composition derives this parent from its explicit Waltr database path. The owned temporary child is removed only after joined shutdown.
 
 Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS` once as a boolean.
 
@@ -805,13 +917,13 @@ Embedded outbound OAuth uses the exact callback derived from that same prebound 
 
 Embedded configuration contains no client metadata URI. Therefore its local `/.well-known/oauth-client/waltr` route returns `404 Not Found`.
 
-`/health` reports process liveness. `/ready` checks worker connection in addition to persistence, routine engine health, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy. Startup requires a connected worker with a usable canonical root; after disconnect readiness fails until reconnection, without retrying an uncertain tool execution.
+`/health` reports process liveness. `/ready` checks worker connection, persistence, the shared invocation gate and quarantine state, catalog coordination, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content preserves the last-known-good snapshot; failure to coordinate an accepted Routine catalog closes admission and fails readiness. Startup requires a connected worker with a usable canonical root; after disconnect readiness fails until reconnection, without retrying an uncertain tool execution.
 
-Startup interrupts unfinished Routine invocations before the engine reports ready. Waltr does not resume them.
+Startup reconciles unfinished script invocations before the service reports ready. It does not replay uncertain code or tool effects.
 
-Deploy one active Routine engine for each Waltr database. Clustered Routine leases and cross-engine execution coordination are not implemented.
+Use one active invocation service per Waltr database. The filesystem blob owner is also process-exclusive. Clustered invocation ownership is not implemented.
 
-`ServerApplication` owns the definition watcher, routine engine, session host, and hosted OAuth maintenance. Graceful shutdown stops Routine work, invokes `SessionCoordinator::shutdown`, and joins the other owned tasks. Coordinator shutdown rejects new work, cancels active and queued work, waits for run ownership to drain, atomically drains MCP caches under the lifecycle gate, and awaits each cached runtime's explicit shutdown. Stdio runtimes therefore use the generic MCP client's shutdown/reap path; no stronger bounded-termination guarantee is made. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+`ServerApplication` owns the definition watcher, production Routine composition, session host, and hosted OAuth maintenance. Graceful shutdown closes admission, revokes code grants, cancels and joins invocations, media readers, and completion handlers, then stops the session host and sandbox. Failed cleanup remains uncertain and quarantined rather than being reported as success. Coordinator shutdown rejects new work, cancels active and queued work, waits for run ownership to drain, atomically drains MCP caches under the lifecycle gate, and awaits each cached runtime's explicit shutdown. Stdio runtimes therefore use the generic MCP client's shutdown/reap path; no stronger bounded-termination guarantee is made. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
 
 Environment-owned startup loads models.dev from `WALTR_MODELS_DEV_PATH`, `WALTR_MODELS_DEV_URL`, or the default URL. The disk cache can satisfy an unavailable source.
 

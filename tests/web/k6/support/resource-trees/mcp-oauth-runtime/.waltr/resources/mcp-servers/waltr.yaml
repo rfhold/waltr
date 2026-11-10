@@ -1,7 +1,7 @@
 apiVersion: waltr.dev/v1alpha1
 kind: McpServer
 metadata:
-  name: protected
+  name: waltr
 spec:
   transport: streamableHttp
   url: https://waltr.test/mcp

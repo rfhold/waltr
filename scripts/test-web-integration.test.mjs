@@ -135,7 +135,7 @@ test("phase and profile mapping is exact", () => {
     profile: "test",
     waltrService: "waltr-test",
     k6Service: "k6",
-    upServices: ["waltr-test"],
+    upServices: ["test-proxy"],
   });
   assert.deepEqual(profileForPhase("oidc"), {
     profile: "test-auth",
@@ -169,6 +169,14 @@ test("script selection only schedules phases where the script exists", () => {
     "access/trust.browser.js",
   ]));
   assert.deepEqual(trustPlan[0].scripts, ["tests/web/k6/access/trust.browser.js"]);
+  const bothTrustPlan = buildRunPlan(parseCliArgs(["--access", "both", "--script", "access/trust.browser.js"]));
+  assert.deepEqual(bothTrustPlan.map(({ phase, scripts }) => ({ phase, scripts })), [
+    { phase: "disabled", scripts: ["tests/web/k6/access/trust.browser.js"] },
+    { phase: "oidc", scripts: ["tests/web/k6/access/trust.browser.js"] },
+  ]);
+  const disabledPlan = buildRunPlan(parseCliArgs(["--access", "disabled"]));
+  assert.equal(disabledPlan[0].scripts[0], "tests/web/k6/access/trust.browser.js");
+  assert.equal(disabledPlan[0].scripts.at(-1), "tests/web/k6/routines/routines.browser.js");
 
   const oidcPlan = buildRunPlan(parseCliArgs(["--access", "oidc"]));
   assert.equal(

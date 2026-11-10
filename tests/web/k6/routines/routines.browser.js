@@ -14,7 +14,6 @@ import { includesText } from "../support/text.js";
 export const options = browserOptions;
 
 const ROUTINE_NAME = "screenshot-metadata";
-const ROUTINE_DISPLAY_NAME = "Prepare screenshot metadata";
 
 export default async function () {
   await withPage(async (page) => {
@@ -28,35 +27,35 @@ export default async function () {
 
     await page.keyboard.press("Control+P");
     await waitForText(page, '[role="dialog"]', "Session commands");
-    await typeAndKeepFocus(page, "#session-command-search", ROUTINE_DISPLAY_NAME);
-    await waitForText(page, '[aria-label="Session command list"]', ROUTINE_DISPLAY_NAME);
-    await page.locator('[aria-label="Session command list"] button').click();
-    await waitForText(page, '[role="dialog"]', ROUTINE_DISPLAY_NAME);
-    await page.locator('form[aria-label="Prepare screenshot metadata command"] button[type="submit"]').click();
-    await waitForText(page, '[role="dialog"]', "Command admitted.");
-    await page.locator(".sessions__commands-result .sessions__commands-actions button:first-child").click();
+    await typeAndKeepFocus(page, '[role="dialog"] input', ROUTINE_NAME);
+    const command = `form[aria-label="${ROUTINE_NAME} command"]`;
+    await waitForText(page, command, `Start ${ROUTINE_NAME}`);
+    await page.locator(`${command} button[type="submit"]`).click();
+    await waitForText(page, command, "View invocation");
+    await page.locator(`${command} a`).click();
 
     const detailPath = await waitForRoutineCompletion(page);
-    const detailText = await waitForText(page, '[aria-label="Routine invocation detail"]', "layout-verified");
-    const detailHasList = await page.locator("#routine-definitions-title").count();
+    const detailText = await waitForText(page, '[aria-label="Routine invocation detail"]', '"screenshotLayout":true');
+    const detailHasList = await page.locator("#routines-title").count();
     const collapsed = await disclosureState(page);
     await normalizeScreenshotValues(page);
     await screenshotMatrix(page, "routines-detail-collapsed");
 
-    await page.locator(".routine-task:first-child summary").click();
+    await page.locator('[aria-label="Routine operations"] li:first-child summary').click();
     const expanded = await disclosureState(page);
-    await waitForText(page, '[aria-label="mark-screenshot-ready results"]', "true");
+    await waitForText(page, '[aria-label="Routine operations"] li:first-child details', '"operation":"context.snapshot"');
+    await waitForText(page, '[aria-label="Routine operations"] li:first-child details', '"status":"completed"');
     await normalizeScreenshotValues(page);
     await screenshotMatrix(page, "routines-detail-expanded");
 
-    await page.locator(".routine-task:first-child summary").click();
+    await page.locator('[aria-label="Routine operations"] li:first-child summary').click();
     await setResponsiveViewport(page, responsiveViewports.phone);
     const mobileCollapsed = await disclosureState(page);
     await setResponsiveViewport(page, responsiveViewports.desktop);
 
     await page.locator(".routine-invocation__back").click();
     await waitForPathname(page, "/routines");
-    await waitForText(page, ".routine-definitions", ROUTINE_DISPLAY_NAME);
+    await waitForText(page, ".routines", ROUTINE_NAME);
     const listText = await waitForText(page, '[aria-label="Routine invocation history"]', ROUTINE_NAME);
     const listHasDetail = await page.locator('[aria-label="Routine invocation detail"]').count();
     await normalizeScreenshotValues(page);
@@ -64,9 +63,9 @@ export default async function () {
 
     check(null, {
       "Routine View invocation reaches detail-only route": () => detailPath.startsWith("/routines/") && detailHasList === 0,
-      "Routine completes with deterministic task results": () => includesText(detailText, "Succeeded") && includesText(detailText, "layout-verified"),
-      "Routine tasks are initially collapsed": () => collapsed === false,
-      "Routine task summary expands one task": () => expanded === true,
+      "Routine completes with deterministic metadata results": () => includesText(detailText, "Succeeded") && includesText(detailText, '"screenshotReady":true') && includesText(detailText, '"screenshotLayout":true'),
+      "Routine operations are initially collapsed": () => collapsed === false,
+      "Routine operation summary expands one operation": () => expanded === true,
       "Routine mobile detail returns to collapsed state": () => mobileCollapsed === false,
       "Routine list-only route contains succeeded invocation": () => includesText(listText, "Succeeded") && listHasDetail === 0,
     });
@@ -77,6 +76,7 @@ async function createSession(page) {
   await page.locator(".sessions__header button").click();
   const dialog = page.locator('[role="dialog"][aria-label="Create session dialog"]');
   await dialog.waitFor();
+  await dialog.locator('input[name="session-agent"][value="routine-metadata"]').check();
   await dialog.locator('button[type="submit"]').click();
 }
 
@@ -89,7 +89,7 @@ async function waitForRoutineCompletion(page) {
     pathname = await page.evaluate(() => window.location.pathname);
     if (pathname.startsWith("/routines/")) {
       text = await page.locator('[aria-label="Routine invocation detail"]').textContent().catch(() => "");
-      if (includesText(text, "Succeeded") && includesText(text, "mark-layout-verified")) return pathname;
+      if (includesText(text, "Succeeded") && includesText(text, "context.transact")) return pathname;
     }
     sleep(0.25);
   }
@@ -98,14 +98,14 @@ async function waitForRoutineCompletion(page) {
 }
 
 async function disclosureState(page) {
-  return page.evaluate(() => Boolean(document.querySelector(".routine-task:first-child details")?.open));
+  return page.evaluate(() => Boolean(document.querySelector('[aria-label="Routine operations"] li:first-child details')?.open));
 }
 
 async function normalizeScreenshotValues(page) {
   await page.evaluate(() => {
-    for (const row of document.querySelectorAll(".routine-detail__metadata > div")) {
-      const label = row.querySelector("dt")?.textContent;
-      const value = row.querySelector("dd");
+    for (const term of document.querySelectorAll(".routine-detail > dl > dt")) {
+      const label = term.textContent;
+      const value = term.nextElementSibling;
       if (!value) continue;
       if (label === "Invocation") value.textContent = "rinv_screenshot";
       if (label === "Source session") {

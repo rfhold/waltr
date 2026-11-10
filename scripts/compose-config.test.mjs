@@ -18,14 +18,25 @@ const caScript = readFileSync(caScriptPath, "utf8");
 const k6Entrypoint = readFileSync(`${repoRoot}/tests/web/k6/support/k6-entrypoint.sh`, "utf8");
 const trustScript = readFileSync(`${repoRoot}/tests/web/k6/access/trust.browser.js`, "utf8");
 const hostedOauthScript = readFileSync(`${repoRoot}/tests/web/k6/sessions/mcp-oauth.browser.js`, "utf8");
-const hostedOauthMcpFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/mcp-servers/protected.yaml`, "utf8");
+const hostedOauthMcpFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/mcp-servers/waltr.yaml`, "utf8");
 const hostedOauthCodingFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/features/coding.yaml`, "utf8");
 const hostedOauthDefaultsFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/defaults/default.yaml`, "utf8");
+const routineMetadataAgentFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/sessions-runtime/.waltr/resources/agents/routine-metadata.yaml`, "utf8");
+const routineBrowserScript = readFileSync(`${repoRoot}/tests/web/k6/routines/routines.browser.js`, "utf8");
+
+test("metadata Routine selects an ordinary source agent without unrelated MCP features or grants", () => {
+  assert.match(routineMetadataAgentFixture, /kind: Agent/);
+  assert.match(routineMetadataAgentFixture, /name: routine-metadata/);
+  assert.match(routineMetadataAgentFixture, /features: \[\]/);
+  assert.match(routineMetadataAgentFixture, /permissions: \[\]/);
+  assert.doesNotMatch(routineMetadataAgentFixture, /inheritsFrom|codeMode|mcp|permissionSetRef/);
+  assert.match(routineBrowserScript, /input\[name="session-agent"\]\[value="routine-metadata"\]/);
+});
 const config = composeConfig("*");
 
 const expectedServicesByProfile = {
   dev: ["waltr", "waltr-worker"],
-  test: ["dex", "k6", "waltr-test", "waltr-test-worker", "mcp"],
+  test: ["dex", "k6", "waltr-test", "waltr-test-worker", "mcp", "test-ca", "test-proxy"],
   "test-auth": ["auth-proxy", "dex-auth", "k6-auth", "waltr-auth", "waltr-auth-worker", "mcp-auth", "test-ca"],
 };
 
@@ -34,17 +45,18 @@ test("compose has the exact static profile topology", () => {
   const servicesByProfile = {};
 
   for (const [serviceName, service] of Object.entries(config.services)) {
-    assert.equal(service.profiles?.length, 1, `${serviceName} must have exactly one profile`);
-    const [profile] = service.profiles;
-    profiles.add(profile);
-    servicesByProfile[profile] ??= [];
-    servicesByProfile[profile].push(serviceName);
+    assert.equal(service.profiles?.length, serviceName === "test-ca" ? 2 : 1, serviceName);
+    for (const profile of service.profiles) {
+      profiles.add(profile);
+      servicesByProfile[profile] ??= [];
+      servicesByProfile[profile].push(serviceName);
+    }
   }
 
   assert.deepEqual([...profiles].sort(), ["dev", "test", "test-auth"]);
   for (const [profile, expectedServices] of Object.entries(expectedServicesByProfile)) {
-    assert.deepEqual(servicesByProfile[profile].sort(), expectedServices);
-    assert.deepEqual(Object.keys(composeConfig(profile).services).sort(), expectedServices);
+    assert.deepEqual(servicesByProfile[profile].sort(), [...expectedServices].sort());
+    assert.deepEqual(Object.keys(composeConfig(profile).services).sort(), [...expectedServices].sort());
   }
 });
 
@@ -91,11 +103,13 @@ test("all Waltr services have exact static environments", () => {
     },
     "waltr-test": {
       ...expectedCommonEnvironment,
+      TMPDIR: "/run/waltr-private",
       WALTR_AUTH_MODE: "disabled",
       WALTR_PUBLIC_URL: "http://127.0.0.1:14333",
     },
     "waltr-auth": {
       ...expectedCommonEnvironment,
+      TMPDIR: "/run/waltr-private",
       WALTR_AUTH_MODE: "oidc",
       WALTR_MCP_REQUIRED_SCOPES: "mcp:use",
       WALTR_MCP_OAUTH_ISSUER: "https://waltr.test/oauth",
@@ -104,7 +118,7 @@ test("all Waltr services have exact static environments", () => {
       WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL: "86400",
       WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: "2592000",
       WALTR_MCP_OAUTH_CODE_TTL: "300",
-      WALTR_MCP_OAUTH_ALLOW_DCR: "true",
+      WALTR_MCP_OAUTH_ALLOW_DCR: "false",
       WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true",
       WALTR_MCP_OAUTH_ALLOW_CIMD: "true",
       WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS: "true",
@@ -125,10 +139,16 @@ test("all Waltr services have exact static environments", () => {
     assert.equal(fixture?.read_only, true);
   }
   assert.equal(config.services.waltr.tmpfs, undefined);
-  assert.deepEqual(config.services["waltr-test"].tmpfs, ["/data:mode=0700,uid=65532,gid=65532"]);
+  assert.deepEqual(config.services["waltr-test"].tmpfs, [
+    "/data:mode=0700,uid=65532,gid=65532",
+    "/workspace:mode=0700,uid=65532,gid=65532",
+    "/run/waltr-private:mode=0700,uid=65532,gid=65532",
+  ]);
   assert.deepEqual(config.services["waltr-auth"].tmpfs, [
     "/data:mode=0700,uid=65532,gid=65532",
     "/run/waltr-mcp-oauth:mode=0750,uid=65532,gid=65532",
+    "/workspace:mode=0700,uid=65532,gid=65532",
+    "/run/waltr-private:mode=0700,uid=65532,gid=65532",
   ]);
   const authCommand = config.services["waltr-auth"].command.join(" ");
   assert.equal(config.services["waltr-auth"].user, "0:0");
@@ -138,14 +158,14 @@ test("all Waltr services have exact static environments", () => {
   assert.match(authCommand, /chown 65532:65532 \/run\/waltr-mcp-oauth\/keyring\.json && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-server$/);
   assert.equal(config.services["mcp-auth"].user, "0:0");
   assert.equal(config.services.mcp.user, undefined);
-  assert.match(config.services["mcp-auth"].command.join(" "), /update-ca-certificates >\/dev\/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-agent-test-mcp-server --http 0\.0\.0\.0:14666$/);
+  assert.match(config.services["mcp-auth"].command.join(" "), /update-ca-certificates >\/dev\/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-server-test-mcp-server --http 0\.0\.0\.0:14666$/);
   assert.doesNotMatch(rawCompose, /WALTR_MCP_(?:OIDC|SELF|PROTECTED_OAUTH)/);
   for (const serviceName of ["waltr", "waltr-test", "mcp", "k6", "mcp-auth", "k6-auth"]) {
     assert.equal(config.services[serviceName].environment?.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
   }
 });
 
-test("each profile gives only its worker a workspace and shares only its private socket", () => {
+test("each profile keeps worker storage private and shares only its private socket", () => {
   const pairs = [
     ["waltr", "waltr-worker", "waltr-dev-sandbox-socket"],
     ["waltr-test", "waltr-test-worker", "waltr-test-sandbox-socket"],
@@ -171,7 +191,8 @@ test("each profile gives only its worker a workspace and shares only its private
       assert.notEqual(socketMount.read_only, true);
     }
     assert.equal(server.volumes.some((volume) => volume.target === "/workspace"), false);
-    assert.equal(server.tmpfs?.some((mount) => mount.startsWith("/workspace")) ?? false, false);
+    const localWorkspace = server.tmpfs?.filter((mount) => mount.startsWith("/workspace")) ?? [];
+    assert.deepEqual(localWorkspace, serverName === "waltr" ? [] : ["/workspace:mode=0700,uid=65532,gid=65532"]);
     assert.equal(worker.volumes.some((volume) => volume.target === "/data"), false);
     assert.equal(worker.tmpfs?.some((mount) => mount.startsWith("/data")) ?? false, false);
   }
@@ -192,13 +213,13 @@ test("hosted MCP OAuth resource tree uses the OIDC/TLS Waltr contract", () => {
   assert.match(hostedOauthMcpFixture, /^  url: https:\/\/waltr\.test\/mcp$/m);
   assert.match(hostedOauthCodingFixture, /^kind: FeatureSet$/m);
   assert.match(hostedOauthCodingFixture, /^  name: coding$/m);
-  assert.match(hostedOauthCodingFixture, /^      include: \[protected\]$/m);
+  assert.match(hostedOauthCodingFixture, /^      include: \[waltr\]$/m);
   assert.match(hostedOauthDefaultsFixture, /^kind: Defaults$/m);
   assert.match(hostedOauthDefaultsFixture, /^    provider: k6-openai$/m);
   assert.match(hostedOauthDefaultsFixture, /^    model: gpt-5-nano$/m);
   assert.match(hostedOauthScript, /\.well-known\/oauth-client\/waltr/);
   assert.match(hostedOauthScript, /outbound-oauth\/callback/);
-  assert.match(hostedOauthScript, /mcp_protected_exec/);
+  assert.match(hostedOauthScript, /waltr:resource\.source/);
   assert.doesNotMatch(hostedOauthScript, /completeDexLoginViaHttp/);
 });
 
@@ -215,7 +236,12 @@ test("test services use profile-local internal networks", () => {
   assert.equal(config.networks.test.internal, true);
   assert.equal(config.networks["test-auth"].internal, true);
   for (const serviceName of expectedServicesByProfile.test) {
-    assert.deepEqual(Object.keys(config.services[serviceName].networks), ["test"], serviceName);
+    if (serviceName === "test-ca") {
+      assert.equal(config.services[serviceName].networks, undefined);
+      assert.equal(config.services[serviceName].network_mode, "none");
+    } else {
+      assert.deepEqual(Object.keys(config.services[serviceName].networks), ["test"], serviceName);
+    }
   }
   for (const serviceName of expectedServicesByProfile["test-auth"]) {
     if (serviceName === "test-ca") {
@@ -241,7 +267,7 @@ test("test containers are unprivileged and source mounts are read-only", () => {
 });
 
 test("every required health dependency edge is explicit", () => {
-  const longRunning = ["waltr", "waltr-test", "dex", "mcp", "auth-proxy", "dex-auth", "waltr-auth", "mcp-auth"];
+  const longRunning = ["waltr", "waltr-test", "dex", "mcp", "test-proxy", "auth-proxy", "dex-auth", "waltr-auth", "mcp-auth"];
   for (const serviceName of longRunning) {
     assert.ok(config.services[serviceName].healthcheck?.test, `${serviceName} needs a health check`);
   }
@@ -256,7 +282,8 @@ test("every required health dependency edge is explicit", () => {
     waltr: { "waltr-worker": "service_started" },
     "waltr-test": { dex: "service_healthy", mcp: "service_healthy", "waltr-test-worker": "service_started" },
     mcp: { dex: "service_healthy" },
-    k6: { dex: "service_healthy", "waltr-test": "service_healthy", mcp: "service_healthy" },
+    k6: { "test-proxy": "service_healthy", dex: "service_healthy", "waltr-test": "service_healthy", mcp: "service_healthy" },
+    "test-proxy": { "test-ca": "service_completed_successfully", "waltr-test": "service_healthy" },
     "auth-proxy": { "test-ca": "service_completed_successfully" },
     "waltr-auth": {
       "auth-proxy": "service_healthy",
@@ -307,14 +334,33 @@ test("TLS trust wiring is strict and private material is isolated", () => {
 
   assert.deepEqual(volumeTargets(config.services["test-ca"]), ["/test-ca-caddy", "/test-ca-public"]);
   assert.deepEqual(volumeTargets(config.services["auth-proxy"]), ["/etc/caddy/Caddyfile", "/test-ca-caddy"]);
-  for (const serviceName of ["waltr-auth", "mcp-auth", "k6-auth"]) {
+  for (const serviceName of ["waltr-auth", "mcp-auth", "k6-auth", "k6"]) {
     assert.ok(volumeTargets(config.services[serviceName]).includes("/test-ca-public"));
     assert.ok(!volumeTargets(config.services[serviceName]).includes("/test-ca-caddy"));
     const caVolume = config.services[serviceName].volumes.find((volume) => volume.target === "/test-ca-public");
     assert.equal(caVolume.read_only, true);
   }
-  assert.deepEqual(servicesMounting("test-ca-public"), ["k6-auth", "waltr-auth", "mcp-auth", "test-ca"]);
-  assert.deepEqual(servicesMounting("test-ca-caddy"), ["auth-proxy", "test-ca"]);
+  assert.deepEqual(servicesMounting("test-ca-public"), ["k6", "k6-auth", "waltr-auth", "mcp-auth", "test-ca"].sort());
+  assert.deepEqual(servicesMounting("test-ca-caddy"), ["auth-proxy", "test-ca", "test-proxy"]);
+});
+
+test("access-disabled browsers use verified TLS without enabling Waltr authentication", () => {
+  const proxy = readFileSync(`${repoRoot}/tests/web/k6/support/Caddyfile.test`, "utf8");
+  assert.match(proxy, /https:\/\/waltr\.test/);
+  assert.match(proxy, /reverse_proxy waltr-test:14333/);
+  assert.match(proxy, /tls \/test-ca-caddy\/tls\.crt \/test-ca-caddy\/tls\.key/);
+  assert.doesNotMatch(proxy, /tls\s+internal|insecure/);
+  assert.equal(config.services["waltr-test"].environment.WALTR_AUTH_MODE, "disabled");
+  assert.equal(config.services.k6.environment.WALTR_WEB_ACCESS_AUTH, "disabled");
+  assert.equal(config.services.k6.environment.WALTR_WEB_BASE_URL, "https://waltr.test");
+  assert.equal(config.services.k6.environment.SSL_CERT_FILE, "/test-ca-public/ca.crt");
+  assert.equal(config.services.k6.environment.K6_INSECURE_SKIP_TLS_VERIFY, undefined);
+  assert.equal(config.services.k6.environment.K6_BROWSER_ARGS, undefined);
+  assert.deepEqual(config.services["test-ca"].profiles, ["test", "test-auth"]);
+  assert.deepEqual(volumeTargets(config.services["test-proxy"]), ["/etc/caddy/Caddyfile", "/test-ca-caddy"]);
+  assert.match(trustScript, /response\.proto === "HTTP\/2\.0"/);
+  assert.match(trustScript, /nextHopProtocol/);
+  assert.match(trustScript, /value === "h2"/);
 });
 
 test("TLS generator produces a verifiable two-SAN fixture with exact permissions", (context) => {
@@ -432,11 +478,11 @@ test("production and test services use isolated runtime targets", () => {
   const testRuntime = dockerStage("test-runtime");
   const workerRuntime = dockerStage("worker-runtime");
   assert.match(runtime, /COPY --from=server-build \/usr\/local\/bin\/waltr-server \/usr\/local\/bin\/waltr-server/);
-  assert.doesNotMatch(runtime, /waltr-agent-test-mcp-server/);
+  assert.doesNotMatch(runtime, /waltr-server-test-mcp-server/);
   assert.match(runtime, /USER 65532:65532/);
   assert.match(runtime, /ENTRYPOINT \["\/usr\/local\/bin\/waltr-server"\]/);
   assert.doesNotMatch(runtime, /^CMD /m);
-  assert.match(testRuntime, /waltr-agent-test-mcp-server/);
+  assert.match(testRuntime, /waltr-server-test-mcp-server/);
   assert.match(testRuntime, /apt-get install -y --no-install-recommends [^\n]*util-linux/);
   assert.match(testRuntime, /^USER 65532:65532$/m);
   assert.match(workerRuntime, /^USER 65532:65532$/m);
@@ -452,7 +498,7 @@ test("runtime and build context contain required hardening", () => {
   const testBuild = dockerStage("test-build");
   assert.match(dockerStage("runtime-base"), /apt-get install -y --no-install-recommends ca-certificates curl/);
   assert.match(dockerStage("test-runtime"), /apt-get install -y --no-install-recommends bash coreutils findutils procps/);
-  assert.match(dockerfile, /ENV PNPM_HOME=\/pnpm/);
+  assert.match(dockerfile, /^FROM cr\.holdenitdown\.net\/rfhold\/rust-web-ci@sha256:[a-f0-9]{64} AS build-base$/m);
   assert.equal((dockerfile.match(/pnpm install --frozen-lockfile/g) ?? []).length, 1);
   assert.equal((dockerfile.match(/pnpm --filter @rfhold\/waltr-web build/g) ?? []).length, 0);
   assert.doesNotMatch(dockerfile, /^(?:COPY|ADD)\s+(?:\.|\.\/)\s+(?:\.|\.\/|\/workspace)\/?$/m);
@@ -484,7 +530,7 @@ test("runtime and build context contain required hardening", () => {
   assert.match(dockerfile, /WALTR_BUILD_REVISION="\$\{REVISION\}" cargo build/);
   assert.match(dockerfile, /org\.opencontainers\.image\.source="https:\/\/git\.holdenitdown\.net\/rfhold\/waltr"/);
   assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{REVISION\}"/);
-  for (const cache of ["cargo-registry", "cargo-git", "pnpm-store"]) {
+  for (const cache of ["pnpm-store"]) {
     assert.match(buildBase, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache}`));
   }
   for (const cache of ["cargo-registry", "cargo-git", "cargo-target", "pnpm-store"]) {
@@ -492,6 +538,9 @@ test("runtime and build context contain required hardening", () => {
   }
   for (const cache of ["cargo-registry", "cargo-git", "cargo-target"]) {
     assert.match(testBuild, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache}`));
+    for (const stage of [serverBuild, testBuild, dockerStage("worker-build")]) {
+      assert.match(stage, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache},target=[^\\s,]+,sharing=locked`));
+    }
   }
   assert.doesNotMatch(dockerfile, /FROM --platform=/);
   const entries = new Set(dockerignore.split("\n").map(normalizeIgnoreEntry).filter(Boolean));

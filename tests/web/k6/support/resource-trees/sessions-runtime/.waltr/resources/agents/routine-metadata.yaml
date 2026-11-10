@@ -1,0 +1,9 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: routine-metadata
+spec:
+  description: Session metadata source for the Routine browser fixture.
+  systemPrompt: Use this session as the source for the metadata Routine.
+  features: []
+  permissions: []

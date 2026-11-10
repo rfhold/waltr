@@ -405,7 +405,7 @@ export function profileForPhase(phase) {
       profile: "test",
       waltrService: "waltr-test",
       k6Service: "k6",
-      upServices: ["waltr-test"],
+      upServices: ["test-proxy"],
     };
   }
   if (phase === "oidc") {
@@ -558,9 +558,11 @@ function browserScriptsForPhase(mode, live, selectedScript, phase) {
   }
   if (!live && phase === "oidc") {
     scripts.unshift(
-      "tests/web/k6/access/trust.browser.js",
       "tests/web/k6/access/login.browser.js",
     );
+  }
+  if (!live && mode === "compose") {
+    scripts.unshift("tests/web/k6/access/trust.browser.js");
   }
   if (!selectedScript) {
     return scripts;

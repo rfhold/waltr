@@ -7,6 +7,9 @@ FROM cr.holdenitdown.net/rfhold/rust-web-ci@sha256:472959b480ef0f974ba75be2ee5ae
 
 ARG TARGETARCH
 
+# Application builds must not inherit the CI image's private Cargo mirror.
+RUN printf '[source.crates-io]\nregistry = "sparse+https://index.crates.io/"\n' > /usr/local/cargo/config.toml
+
 WORKDIR /workspace
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -32,9 +35,9 @@ RUN apt-get update && \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
 
-RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target \
+RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target,sharing=locked \
     cargo build -p waltr-agent-sandbox --features shell --bin waltr-agent-sandbox --locked --release && \
     cp /workspace/target/release/waltr-agent-sandbox /usr/local/bin/waltr-agent-sandbox
 
@@ -42,9 +45,9 @@ FROM build-base AS server-build
 
 ARG REVISION
 
-RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target \
+RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target,sharing=locked \
     --mount=type=cache,id=waltr-${TARGETARCH}-pnpm-store,target=/pnpm/store \
     touch crates/waltr-server/build.rs && \
     WALTR_BUILD_REVISION="${REVISION}" cargo build -p waltr-server --features web --locked --release && \
@@ -52,11 +55,11 @@ RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/c
 
 FROM build-base AS test-build
 
-RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target \
-    cargo build -p waltr-agent --bin waltr-agent-test-mcp-server --locked --release && \
-    cp /workspace/target/release/waltr-agent-test-mcp-server /usr/local/bin/waltr-agent-test-mcp-server
+RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=waltr-${TARGETARCH}-cargo-target,target=/workspace/target,sharing=locked \
+    cargo build -p waltr-server --no-default-features --bin waltr-server-test-mcp-server --locked --release && \
+    cp /workspace/target/release/waltr-server-test-mcp-server /usr/local/bin/waltr-server-test-mcp-server
 
 FROM debian:bookworm-slim AS runtime-base
 
@@ -115,7 +118,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=server-build /usr/local/bin/waltr-server /usr/local/bin/waltr-server
-COPY --from=test-build /usr/local/bin/waltr-agent-test-mcp-server /usr/local/bin/waltr-agent-test-mcp-server
+COPY --from=test-build /usr/local/bin/waltr-server-test-mcp-server /usr/local/bin/waltr-server-test-mcp-server
 
 USER 65532:65532
 CMD ["/usr/local/bin/waltr-server"]
