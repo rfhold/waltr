@@ -1,7 +1,7 @@
 import { createMemo, createSignal, type ParentProps } from "solid-js";
 
 import { AppStateContextProvider, type AppPhase, type AppState } from "./context";
-import type { AuthSnapshot, ClientCommand, ClientSnapshot, OperationSnapshot, SessionTimelineView, SessionView, TimelineEventView } from "../generated/waltr-client";
+import type { AuthSnapshot, ClientCommand, ClientSnapshot, OperationSnapshot, SessionTimelineView, SessionView } from "../generated/waltr-client";
 
 export function fixtureSnapshotForPath(pathname: string) {
   if (!import.meta.env.DEV && import.meta.env.MODE !== "test") {
@@ -67,7 +67,6 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     dispatchUpdateSessionInferenceSettings: async (_command) => props.snapshot,
     dispatchUpdateSessionAgent: async (_id, _agentName) => props.snapshot,
     dispatchSubmitUserMessage: async (_sessionId: string, _text: string) => props.snapshot,
-    dispatchRespondExternalRequest: async (_sessionId: string, _requestId: string, _responseJson: string) => props.snapshot,
     dispatchInterruptSession: async (_sessionId: string) => props.snapshot,
     dispatchContinueSession: async (_command) => props.snapshot,
   };
@@ -77,6 +76,10 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
 
 function promptFixtureSnapshot(): ClientSnapshot {
   return {
+    interactions: {
+      permission: { generation: "fixture", revision: 1n, connected: true, error: null, pending: [{ identity: { sessionId: "permission", generation: "fixture", id: "permission-fixture", operationId: "operation-1" }, request: { kind: "permission", message: "Read a file outside the workspace", identity: "read", claims: ['{"filePath":"../outside/project-notes.md"}'], suggestions: ['{"filePath":"../outside/**"}'] }, responding: false, error: null }] },
+      question: { generation: "fixture", revision: 1n, connected: true, error: null, pending: [{ identity: { sessionId: "question", generation: "fixture", id: "question-fixture", operationId: "operation-2" }, request: questionRequest(), responding: false, error: null }] },
+    },
     access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
     apps: { current: {}, requests: {} },
@@ -95,8 +98,9 @@ function promptFixtureSnapshot(): ClientSnapshot {
     },
     status: { ready: true, watch: operationSnapshot("ready") },
     routines: {
-      definitions: { watch: operationSnapshot("idle"), digest: "", definitions: [] },
-      history: { watch: operationSnapshot("idle"), recent: [], throughSequence: null, olderPageToken: null, pagination: operationSnapshot("idle") },
+      requests: {},
+      definitions: { watch: operationSnapshot("idle"), digest: "", definitions: [], supportedCapabilities: [], limits: null },
+      history: { snapshotHighWater: null, snapshotComplete: false, operations: [], watch: operationSnapshot("idle"), recent: [], throughSequence: null, olderPageToken: null, pagination: operationSnapshot("idle") },
       sessionHistories: {},
       details: {},
       starts: {},
@@ -111,14 +115,13 @@ function promptFixtureSnapshot(): ClientSnapshot {
       inferenceSettingsUpdate: operationSnapshot("idle"),
       agentUpdate: operationSnapshot("idle"),
       submitUserMessage: operationSnapshot("idle"),
-      respondExternalRequest: operationSnapshot("idle"),
       interrupt: operationSnapshot("idle"),
       rollback: operationSnapshot("idle"),
       continueSession: operationSnapshot("idle"),
       watch: operationSnapshot("received"),
       timelines: {
-        permission: timeline(permissionRequestEvent()),
-        question: timeline(questionRequestEvent()),
+        permission: timeline(),
+        question: timeline(),
       },
       templateSearches: {},
     },
@@ -143,10 +146,10 @@ function sessionView(id: string): SessionView {
     id,
     agentName: "default",
     revision: 0n,
-    status: { phase: "suspended", suspensionKind: "awaitingExternalInput", failedMessage: "", authenticationFailure: null },
-    coordination: { phase: "ready", reason: null, queuedCount: 0, continuationArmed: false },
-    progress: { phase: "awaitingExternalInput", runStage: null, reason: null, queuedCount: 0n, continuationArmed: false, running: false },
-    capabilities: { promptDisposition: "supersedeSuspension", canRespondExternalRequest: true, canInterrupt: false },
+    status: { phase: "runningTool", suspensionKind: null, failedMessage: "", authenticationFailure: null },
+    coordination: { phase: "running", reason: null, queuedCount: 0, continuationArmed: false },
+    progress: { phase: "running", runStage: "runningTool", reason: null, queuedCount: 0n, continuationArmed: false, running: true },
+    capabilities: { promptDisposition: "queued", canInterrupt: true },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),
@@ -170,18 +173,9 @@ function sessionView(id: string): SessionView {
   };
 }
 
-function permissionRequestEvent(): TimelineEventView {
-  return timelineEvent("permission", "permission-fixture", 1, {
-    tool_call: {
-      name: "read",
-      arguments: { filePath: "../outside/project-notes.md" },
-    },
-    patterns: [{ tool: "read", arguments: { filePath: "../outside/**" } }],
-  });
-}
-
-function questionRequestEvent(): TimelineEventView {
-  return timelineEvent("question", "question-fixture", 2, {
+function questionRequest(): Extract<import("../generated/waltr-client").InteractionRequestView, { kind: "question" }> {
+  return {
+    kind: "question",
     questions: [
       {
         header: "Direction",
@@ -204,34 +198,12 @@ function questionRequestEvent(): TimelineEventView {
         ],
       },
     ],
-  });
-}
-
-function timelineEvent(sessionId: string, requestId: string, kind: 1 | 2, payload: unknown): TimelineEventView {
-  return {
-    cursor: 1n,
-    sessionId,
-    turn: 1n,
-    itemId: "i1",
-    parentId: null,
-    kind: "externalRequestOpened",
-    channel: "external_request",
-    content: {
-      kind: "externalRequest",
-      request: {
-        id: requestId,
-        kind,
-        payloadJson: JSON.stringify(payload),
-      },
-    },
-    status: "awaitingExternalInput",
-    metadataJson: "{}",
   };
 }
 
-function timeline(event: TimelineEventView): SessionTimelineView {
+function timeline(): SessionTimelineView {
   return {
-    events: [{ entryKind: "durable", identity: event.itemId, presentation: "durable", event }],
+    events: [],
     projectionRevision: null,
     rawPageBoundary: null,
     hasMore: false,

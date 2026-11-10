@@ -7,6 +7,7 @@ Waltr web owns browser routing, forms, transitions, and UI-specific state.
 | Path | Info |
 | --- | --- |
 | [../waltr-client/](../waltr-client/) | Web should defer server data state to the shared client state machine. |
+| [README.md](README.md) | Routine v2 web media boundaries, browser proof, and optional native IPC handoff. |
 
 # Contracts
 

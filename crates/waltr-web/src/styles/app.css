@@ -1670,6 +1670,29 @@
   visibility: hidden;
 }
 
+.sessions__interactions {
+  display: grid;
+  gap: var(--space-3);
+  max-height: 45vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.sessions__interactions:empty {
+  display: none;
+}
+
+.sessions__interaction-fields {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.sessions__interaction-url,
+.sessions__interactions pre {
+  overflow-wrap: anywhere;
+}
+
 .sessions__prompt {
   display: grid;
   gap: var(--space-4);

@@ -33,7 +33,6 @@ import type {
   ClientRoutineInvocationSummary,
   ClientSnapshot,
   ConfigView,
-  ExternalRequestView,
   ProviderView,
   SelectableAgentView,
   SessionTemplateOptionView,
@@ -43,7 +42,9 @@ import type {
 } from "../../generated/waltr-client";
 import { SessionCommandPalette } from "./SessionCommandPalette";
 import { DictationControl } from "../../components/DictationControl";
+import { validSelection } from "../../platform/dictation";
 import { dictationDraft, type DictationDraft } from "../../components/dictation-draft";
+import { SessionInteractions } from "./SessionInteractions";
 
 const TIMELINE_CHANNELS = [
   "user_text",
@@ -53,7 +54,6 @@ const TIMELINE_CHANNELS = [
   "tool_progress_info",
   "tool_progress_error",
   "tool_result",
-  "external_request",
   "metrics",
 ];
 const TIMELINE_PAGE_SIZE = 64;
@@ -62,8 +62,6 @@ const SHELL_OUTPUT_RECENT_LINE_COUNT = 15;
 const RESOURCE_SEARCH_DEBOUNCE_MS = 120;
 const RESOURCE_SEARCH_LIMIT = 12;
 
-const EXTERNAL_REQUEST_PERMISSION = 1;
-const EXTERNAL_REQUEST_QUESTION = 2;
 
 type SessionsContextValue = {
   sessions: Accessor<SessionView[]>;
@@ -507,7 +505,6 @@ function SessionDetail(props: { session: SessionView }) {
   let registeredTimelineSession: string | undefined;
   let registeredRoutineInvocationSession: string | undefined;
   let templateSearchDebounce: number | undefined;
-  let previousTimelineItemKeys: string[] = [];
   let initialScrollSession: string | undefined;
   let pendingHistoryCursor: bigint | undefined;
   let exhaustedHistoryCursor: bigint | undefined;
@@ -571,6 +568,13 @@ function SessionDetail(props: { session: SessionView }) {
     return status === "opened" || status === "received";
   });
   const dictationReady = createMemo(() => app.systemReady() && timelineReady());
+  const needsDictationDefinitions = createMemo(() => Boolean(app.dictation?.())
+    && dictationReady() && validSelection(app.snapshot()?.config.current?.sessionDictation));
+  createEffect(on(needsDictationDefinitions, (needed) => {
+    if (!needed) return;
+    untrack(() => dispatchSessionWatchCommand(app.dispatch, { type: "registerRoutineDefinitionWatchInterest" }));
+    onCleanup(() => dispatchSessionWatchCommand(app.dispatch, { type: "releaseRoutineDefinitionWatchInterest" }));
+  }));
 
   createEffect(() => {
     const sessionId = props.session.id;
@@ -595,7 +599,6 @@ function SessionDetail(props: { session: SessionView }) {
     cancelScheduledTimelineViewportUpdate();
     cancelScheduledHistoryShiftClear();
     setHistoryShift(false);
-    previousTimelineItemKeys = [];
     void (async () => {
       try {
         await app.dispatch({
@@ -670,12 +673,6 @@ function SessionDetail(props: { session: SessionView }) {
     const scroller = timelineScroll;
     const sessionId = props.session.id;
     reconcilePendingHistory(currentTimeline);
-    const itemKeys = currentItems.map(timelineItemKey);
-    const hasNewExternalPrompt = currentItems.some((item) => isExternalPromptItem(item) && !previousTimelineItemKeys.includes(timelineItemKey(item)));
-    previousTimelineItemKeys = itemKeys;
-    if (hasNewExternalPrompt) {
-      followTail = true;
-    }
     const shouldInitialScroll = currentItems.length > 0 && initialScrollSession !== sessionId;
 
     if (!scroller) {
@@ -989,38 +986,12 @@ function SessionDetail(props: { session: SessionView }) {
     }
   };
 
-  const respond = async (requestId: string, response: unknown) => {
-    if (!props.session.capabilities.canRespondExternalRequest) {
-      return;
-    }
-
-    setCommandError(undefined);
-    try {
-      await app.dispatchRespondExternalRequest(props.session.id, requestId, JSON.stringify(response));
-    } catch (error) {
-      const current = app.snapshot();
-      setCommandError({
-        message: error instanceof Error ? error.message : "Unable to answer prompt.",
-        authenticationFailure: sessionOperationAuthenticationFailure(current, current?.sessions.respondExternalRequest.key, "sessionRespondExternalRequest", props.session.id),
-      });
-    }
-  };
-
   const rollbackTurn = async (turn: bigint) => {
     setCommandError(undefined);
     try {
       await app.dispatch({ type: "rollbackSessionToTurn", sessionId: props.session.id, turn });
     } catch (error) {
       setCommandError({ message: error instanceof Error ? error.message : "Unable to roll back session." });
-    }
-  };
-
-  const rollbackCursor = async (cursor: bigint) => {
-    setCommandError(undefined);
-    try {
-      await app.dispatch({ type: "rollbackSessionToCursor", sessionId: props.session.id, cursor });
-    } catch (error) {
-      setCommandError({ message: error instanceof Error ? error.message : "Unable to roll back response." });
     }
   };
 
@@ -1127,15 +1098,11 @@ function SessionDetail(props: { session: SessionView }) {
                   onOpenApp={(callId) => setOpenedApp({ sessionId: props.session.id, callId })}
                   expandedShellOutputs={expandedShellOutputs()}
                   onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
-                  onRespond={respond}
-                  onInterrupt={interrupt}
-                  canRespondExternalRequest={props.session.capabilities.canRespondExternalRequest}
                   showTurnActions={turnFooterItemIds().has(item.id)}
                   canRollbackTurn={lastTurn() !== undefined && item.turn < lastTurn()!}
                   onRollbackTurn={rollbackTurn}
                   onContinueTurn={continueTurn}
                   onContinueCursor={continueCursor}
-                  onRollbackCursor={rollbackCursor}
                   onEditUserMessage={editUserMessage}
                 />
               </div>
@@ -1156,6 +1123,7 @@ function SessionDetail(props: { session: SessionView }) {
           )}
         </Show>
       </div>
+      <SessionInteractions sessionId={props.session.id} />
       <form
         class="sessions__composer"
         aria-label="Send session message"
@@ -1296,8 +1264,7 @@ function SessionDetail(props: { session: SessionView }) {
 type TimelineItemModel =
   | TextTimelineItem
   | ToolTimelineItem
-  | TurnMetricsTimelineItem
-  | ExternalPromptTimelineItem;
+  | TurnMetricsTimelineItem;
 
 type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string; maskReplacement?: boolean };
 type TemplateTextPart = TemplatePlainTextPart | TemplateResultPart | TemplateErrorPart;
@@ -1314,15 +1281,6 @@ type TemplateResultPart = {
 };
 type TemplateErrorPart = { kind: "error"; raw: string; message: string };
 type ActiveTemplateToken = { start: number; end: number; query: string; cursor: number; target: "resources" | "prompts"; kinds: Array<"file" | "tool" | "prompt" | "resource"> };
-type ExternalPromptTimelineItem = {
-  id: string;
-  turn: bigint;
-  cursor: bigint;
-  openCursor: bigint;
-  kind: "permission" | "question" | "prompt";
-  request: ExternalRequestView;
-  resolved: boolean;
-};
 
 type ToolInputEntry = { key: string; value: string };
 type ToolState = "loading" | "complete" | "error";
@@ -1699,15 +1657,11 @@ function TimelineItem(props: {
   onOpenApp: (callId: string) => void;
   expandedShellOutputs: Record<string, boolean>;
   onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
-  onRespond: (requestId: string, response: unknown) => Promise<void>;
-  onInterrupt: () => Promise<void>;
-  canRespondExternalRequest: boolean;
   showTurnActions: boolean;
   canRollbackTurn: boolean;
   onRollbackTurn: (turn: bigint) => Promise<void>;
   onContinueTurn: (turn: bigint) => Promise<void>;
   onContinueCursor: (cursor: bigint) => Promise<void>;
-  onRollbackCursor: (cursor: bigint) => Promise<void>;
   onEditUserMessage: (item: TextTimelineItem) => Promise<void>;
 }) {
   const item = () => props.item;
@@ -1731,15 +1685,6 @@ function TimelineItem(props: {
         <Match when={metricsTimelineItem(item())}>
           {(metricsItem) => <TurnMetricsTimelineItemView item={metricsItem()} />}
         </Match>
-        <Match when={permissionTimelineItem(item())}>
-          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespondExternalRequest} />}
-        </Match>
-        <Match when={questionTimelineItem(item())}>
-          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespondExternalRequest} />}
-        </Match>
-        <Match when={externalTimelineItem(item())}>
-          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespondExternalRequest} />}
-        </Match>
       </Switch>
       <TimelineItemActions
         item={item()}
@@ -1748,7 +1693,6 @@ function TimelineItem(props: {
         onRollbackTurn={props.onRollbackTurn}
         onContinueTurn={props.onContinueTurn}
         onContinueCursor={props.onContinueCursor}
-        onRollbackCursor={props.onRollbackCursor}
         onEditUserMessage={props.onEditUserMessage}
       />
     </>
@@ -1762,14 +1706,12 @@ function TimelineItemActions(props: {
   onRollbackTurn: (turn: bigint) => Promise<void>;
   onContinueTurn: (turn: bigint) => Promise<void>;
   onContinueCursor: (cursor: bigint) => Promise<void>;
-  onRollbackCursor: (cursor: bigint) => Promise<void>;
   onEditUserMessage: (item: TextTimelineItem) => Promise<void>;
 }) {
-  const canReAnswer = () => isExternalPromptItem(props.item) && props.item.resolved && (props.item.kind === "permission" || props.item.kind === "question");
   const userItem = () => (props.item.kind === "user" && !isMaskReplacement(props.item) ? props.item : undefined);
 
   return (
-    <Show when={props.showTurnActions || canReAnswer() || userItem()}>
+    <Show when={props.showTurnActions || userItem()}>
       <footer class="sessions__timeline-actions">
         <Show when={userItem()}>
           {(item) => (
@@ -1782,11 +1724,6 @@ function TimelineItemActions(props: {
               </button>
             </>
           )}
-        </Show>
-        <Show when={canReAnswer()}>
-          <button type="button" onClick={() => void props.onRollbackCursor((props.item as ExternalPromptTimelineItem).openCursor)}>
-            Re-answer
-          </button>
         </Show>
         <Show when={props.showTurnActions && props.canRollbackTurn}>
           <button type="button" onClick={() => void props.onRollbackTurn(props.item.turn)}>
@@ -2045,18 +1982,6 @@ function toolTimelineItem(item: TimelineItemModel) {
   return item.kind === "tool" ? item : undefined;
 }
 
-function permissionTimelineItem(item: TimelineItemModel) {
-  return item.kind === "permission" ? item : undefined;
-}
-
-function questionTimelineItem(item: TimelineItemModel) {
-  return item.kind === "question" ? item : undefined;
-}
-
-function externalTimelineItem(item: TimelineItemModel) {
-  return item.kind === "prompt" ? item : undefined;
-}
-
 function metricsTimelineItem(item: TimelineItemModel) {
   return item.kind === "metrics" ? item : undefined;
 }
@@ -2076,242 +2001,11 @@ function latestContextTokens(item: TurnMetricsTimelineItem | undefined) {
   return item ? item.contextTokens : 0n;
 }
 
-function ExternalRequestTimelineItem(props: {
-  item: Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>;
-  onRespond: (requestId: string, response: unknown) => Promise<void>;
-  onInterrupt: () => Promise<void>;
-  canRespond: boolean;
-}) {
-  return (
-    <Show when={!props.item.resolved} fallback={<ExternalRequestResult item={props.item} />}>
-      <Switch>
-        <Match when={props.item.kind === "permission"}>
-          <PermissionPrompt request={props.item.request} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespond} />
-        </Match>
-        <Match when={props.item.kind === "question"}>
-          <QuestionPrompt request={props.item.request} onRespond={props.onRespond} canRespond={props.canRespond} />
-        </Match>
-        <Match when={props.item.kind === "prompt"}>
-          <ExternalPrompt request={props.item.request} />
-        </Match>
-      </Switch>
-    </Show>
-  );
-}
-
-function ExternalRequestResult(props: { item: Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }> }) {
-  return (
-    <p class="sessions__timeline-tool sessions__timeline-external-result">
-      {externalRequestLabel(props.item.kind)}: answered
-    </p>
-  );
-}
-
-function PermissionPrompt(props: {
-  request: ExternalRequestView;
-  onRespond: (requestId: string, response: unknown) => Promise<void>;
-  onInterrupt: () => Promise<void>;
-  canRespond: boolean;
-}) {
-  const [message, setMessage] = createSignal("");
-  const [confirmingAlways, setConfirmingAlways] = createSignal(false);
-  const payload = createMemo(() => parseJsonRecord(props.request.payloadJson));
-  const toolCall = createMemo(() => asRecord(payload().tool_call));
-  const toolName = createMemo(() => String(toolCall()?.name ?? "Tool call"));
-  const toolArguments = createMemo(() => JSON.stringify(toolCall()?.arguments ?? {}, null, 2));
-  const patterns = createMemo(() => permissionPatterns(payload()));
-  const patternLabel = createMemo(() => JSON.stringify(patterns(), null, 2));
-
-  const deny = (mode: "return_tool_result" | "cancel_work") => ({
-    decision: "deny",
-    message: message().trim() || null,
-    mode,
-  });
-
-  return (
-    <section class="sessions__prompt sessions__prompt--permission" aria-label="Permission prompt">
-      <header class="sessions__prompt-header">
-        <div>
-          <p class="sessions__prompt-kicker">Permission required</p>
-          <h2>Permission request</h2>
-          <p class="sessions__prompt-subtitle">The session wants to run a tool before it continues.</p>
-        </div>
-        <code class="sessions__prompt-id">{props.request.id}</code>
-      </header>
-
-      <div class="sessions__prompt-detail-card">
-        <div class="sessions__prompt-detail-row">
-          <span>Tool</span>
-          <strong>{toolName()}</strong>
-        </div>
-        <details>
-          <summary>Tool arguments</summary>
-          <pre>{toolArguments()}</pre>
-        </details>
-        <Show when={patterns().length > 0}>
-          <details open={confirmingAlways()}>
-            <summary>Always approval pattern</summary>
-            <pre>{patternLabel()}</pre>
-          </details>
-        </Show>
-      </div>
-
-      <div class="sessions__prompt-actions sessions__prompt-actions--primary">
-        <button class="sessions__prompt-button--primary" type="button" disabled={!props.canRespond} onClick={() => void props.onRespond(props.request.id, { decision: "allow_once" })}>
-          Allow once
-        </button>
-        <Show
-          when={confirmingAlways()}
-          fallback={
-            <button class="sessions__prompt-button--secondary" type="button" disabled={!props.canRespond || patterns().length === 0} onClick={() => setConfirmingAlways(true)}>
-              Allow always
-            </button>
-          }
-        >
-          <button
-            class="sessions__prompt-button--primary"
-            type="button"
-            disabled={!props.canRespond || patterns().length === 0}
-            onClick={() => void props.onRespond(props.request.id, { decision: "allow_always", patterns: patterns() })}
-          >
-            Confirm always
-          </button>
-        </Show>
-      </div>
-
-      <div class="sessions__prompt-deny">
-        <label class="sessions__prompt-field sessions__prompt-field--stacked">
-          <span>Denial message</span>
-          <textarea value={message()} onInput={(event) => setMessage(event.currentTarget.value)} />
-        </label>
-        <div class="sessions__prompt-actions">
-          <button class="sessions__prompt-button--danger" type="button" disabled={!props.canRespond} onClick={() => void props.onRespond(props.request.id, deny("return_tool_result"))}>
-            Deny and resume
-          </button>
-          <button
-            class="sessions__prompt-button--danger"
-            type="button"
-            disabled={!props.canRespond}
-            onClick={() => {
-              void props.onRespond(props.request.id, deny("cancel_work")).then(() => props.onInterrupt());
-            }}
-          >
-            Deny with interrupt
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function QuestionPrompt(props: {
-  request: ExternalRequestView;
-  onRespond: (requestId: string, response: unknown) => Promise<void>;
-  canRespond: boolean;
-}) {
-  const payload = createMemo(() => parseJsonRecord(props.request.payloadJson));
-  const questions = createMemo(() => asArray(payload().questions).map(normalizeQuestion));
-  const [answers, setAnswers] = createSignal<Record<string, { selections: string[]; custom: string }>>({});
-
-  const answerFor = (header: string) => answers()[header] ?? { selections: [], custom: "" };
-  const setSelection = (header: string, label: string, multiple: boolean, selected: boolean) => {
-    setAnswers((current) => {
-      const answer = current[header] ?? { selections: [], custom: "" };
-      const selections = multiple
-        ? selected
-          ? [...answer.selections, label]
-          : answer.selections.filter((selection) => selection !== label)
-        : selected
-          ? [label]
-          : [];
-
-      return { ...current, [header]: { ...answer, selections } };
-    });
-  };
-  const setCustom = (header: string, custom: string) => {
-    setAnswers((current) => ({
-      ...current,
-      [header]: { ...(current[header] ?? { selections: [], custom: "" }), custom },
-    }));
-  };
-  const submit = () => ({
-    answers: questions().map((question) => {
-      const answer = answerFor(question.header);
-      return {
-        header: question.header,
-        selections: answer.selections,
-        ...(answer.custom.trim() ? { custom: answer.custom.trim() } : {}),
-      };
-    }),
-  });
-
-  return (
-    <section class="sessions__prompt sessions__prompt--question" aria-label="Question prompt">
-      <header class="sessions__prompt-header">
-        <div>
-          <p class="sessions__prompt-kicker">Question</p>
-          <h2>Answer required</h2>
-          <p class="sessions__prompt-subtitle">The session is waiting for your input before it resumes.</p>
-        </div>
-        <code class="sessions__prompt-id">{props.request.id}</code>
-      </header>
-      <For each={questions()}>
-        {(question) => (
-          <fieldset class="sessions__question">
-            <legend>{question.header}</legend>
-            <p>{question.question}</p>
-            <div class="sessions__question-options">
-              <For each={question.options}>
-                {(option) => (
-                  <label class="sessions__question-option">
-                    <input
-                      type={question.multiple ? "checkbox" : "radio"}
-                      name={`${props.request.id}-${question.header}`}
-                      checked={answerFor(question.header).selections.includes(option.label)}
-                      onChange={(event) => setSelection(question.header, option.label, question.multiple, event.currentTarget.checked)}
-                    />
-                    <span>{option.label}</span>
-                    <small>{option.description}</small>
-                  </label>
-                )}
-              </For>
-            </div>
-            <Show when={question.custom}>
-              <label class="sessions__prompt-field sessions__prompt-field--stacked">
-                <span>Custom answer</span>
-                <textarea
-                  value={answerFor(question.header).custom}
-                  onInput={(event) => setCustom(question.header, event.currentTarget.value)}
-                />
-              </label>
-            </Show>
-          </fieldset>
-        )}
-      </For>
-      <div class="sessions__prompt-actions sessions__prompt-actions--primary">
-        <button class="sessions__prompt-button--primary" type="button" disabled={!props.canRespond} onClick={() => void props.onRespond(props.request.id, submit())}>
-          Resume session
-        </button>
-      </div>
-    </section>
-  );
-}
-
-function ExternalPrompt(props: { request: ExternalRequestView }) {
-  return (
-    <section class="sessions__prompt" aria-label="External prompt">
-      <p class="sessions__prompt-kicker">External request</p>
-      <pre>{props.request.payloadJson}</pre>
-    </section>
-  );
-}
-
 function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemModel[] {
   const items: TimelineItemModel[] = [];
   const textByItem = new Map<string, Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }>>();
   const toolById = new Map<string, ToolTimelineItem>();
   const toolIdByItemId = new Map<string, string>();
-  const externalById = new Map<string, ExternalPromptTimelineItem>();
   const metricItems: TurnMetricsTimelineItem[] = [];
   const visibleCalls = new Set<string>();
 
@@ -2381,24 +2075,6 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
           if (tool) tool.appLinked = entry.presentation === "durable" && visibleCalls.has(id) && hasLinkedApp(event.metadataJson);
         }
         break;
-      case "externalRequest": {
-        const request = event.content.request;
-        if (!request) {
-          break;
-        }
-
-        upsertExternalRequestItem(
-          items,
-          externalById,
-          event.itemId,
-          event.turn,
-          event.cursor,
-          request,
-          event.kind === "externalRequestOpened",
-          event.kind === "externalRequestResolved" || event.status === "resolved",
-        );
-        break;
-      }
       case "json": {
         if (channel === "metrics") {
           const item = turnMetricsItem(event.itemId, event.turn, event.cursor, event.content.value_json);
@@ -2594,39 +2270,8 @@ function appendToolProgress(
   tool[key] = contentKind === "textSnapshot" ? text : `${tool[key]}${text}`;
 }
 
-function upsertExternalRequestItem(
-  items: TimelineItemModel[],
-  externalById: Map<string, ExternalPromptTimelineItem>,
-  id: string,
-  turn: bigint,
-  cursor: bigint,
-  request: ExternalRequestView,
-  opened: boolean,
-  resolved: boolean,
-) {
-  const existing = externalById.get(id);
-  if (existing) {
-    existing.turn = turn;
-    existing.cursor = cursor;
-    if (opened) {
-      existing.openCursor = cursor;
-    }
-    existing.request = request;
-    existing.resolved = resolved;
-    return;
-  }
-
-  const item = { id, turn, cursor, openCursor: cursor, kind: requestKind(request), request, resolved };
-  externalById.set(id, item);
-  items.push(item);
-}
-
-function isExternalPromptItem(item: TimelineItemModel): item is Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }> {
-  return item.kind === "permission" || item.kind === "question" || item.kind === "prompt";
-}
-
 function timelineItemKey(item: TimelineItemModel) {
-  return isExternalPromptItem(item) ? `${item.id}:${item.resolved ? "resolved" : "open"}` : item.id;
+  return item.id;
 }
 
 function textKind(channel: string): "user" | "assistant" | "thinking" | undefined {
@@ -2641,27 +2286,6 @@ function textKind(channel: string): "user" | "assistant" | "thinking" | undefine
   }
 
   return undefined;
-}
-
-function requestKind(request: ExternalRequestView): "permission" | "question" | "prompt" {
-  if (request.kind === EXTERNAL_REQUEST_PERMISSION) {
-    return "permission";
-  }
-  if (request.kind === EXTERNAL_REQUEST_QUESTION) {
-    return "question";
-  }
-
-  return "prompt";
-}
-
-function externalRequestLabel(kind: "permission" | "question" | "prompt") {
-  if (kind === "permission") {
-    return "permission";
-  }
-  if (kind === "question") {
-    return "question";
-  }
-  return "external request";
 }
 
 function parseTemplateText(text: string): TemplateTextPart[] {
@@ -2976,7 +2600,7 @@ function safeFailureText(value: string) {
 function sessionOperationAuthenticationFailure(
   snapshot: ClientSnapshot | undefined,
   key: string | null | undefined,
-  kind: "sessionSubmitUserMessage" | "sessionRespondExternalRequest" | "sessionContinue",
+  kind: "sessionSubmitUserMessage" | "sessionContinue",
   sessionId: string,
 ) {
   if (!snapshot || !key) return undefined;
@@ -3076,10 +2700,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
 function asBigInt(value: unknown): bigint {
   if (typeof value === "bigint") {
     return value;
@@ -3092,24 +2712,6 @@ function asBigInt(value: unknown): bigint {
   }
   return 0n;
 }
-
-function permissionPatterns(payload: Record<string, unknown>) {
-  const patterns = asArray(payload.patterns);
-  if (patterns.length > 0) {
-    return patterns;
-  }
-
-  const pattern = payload.pattern;
-  return pattern === undefined ? [] : [pattern];
-}
-
-type QuestionModel = {
-  question: string;
-  header: string;
-  options: Array<{ label: string; description: string }>;
-  multiple: boolean;
-  custom: boolean;
-};
 
 function SessionContextSidebar(props: {
   session: SessionView;
@@ -3182,7 +2784,7 @@ function sessionDisplayStatusTone(session: SessionView): "green" | "red" | "grey
   if (session.progress.phase === "failed" || session.progress.phase === "interrupted") {
     return "red";
   }
-  if (["running", "completionBarrier", "paused", "awaitingToolResults", "awaitingExternalInput"].includes(session.progress.phase)) {
+  if (["running", "completionBarrier", "paused", "awaitingToolResults"].includes(session.progress.phase)) {
     return "green";
   }
   return "grey";
@@ -3213,23 +2815,6 @@ function routineStatusTone(status: string): "green" | "red" | "grey" {
 function humanizeStatus(status: string) {
   const words = status.replace(/([a-z])([A-Z])/g, "$1 $2");
   return words.charAt(0).toLocaleUpperCase() + words.slice(1).toLocaleLowerCase();
-}
-
-function normalizeQuestion(value: unknown): QuestionModel {
-  const record = asRecord(value) ?? {};
-  return {
-    question: String(record.question ?? ""),
-    header: String(record.header ?? "Question"),
-    multiple: Boolean(record.multiple),
-    custom: Boolean(record.custom),
-    options: asArray(record.options).map((option) => {
-      const optionRecord = asRecord(option) ?? {};
-      return {
-        label: String(optionRecord.label ?? ""),
-        description: String(optionRecord.description ?? ""),
-      };
-    }),
-  };
 }
 
 function SessionDetailStatusBar(props: {

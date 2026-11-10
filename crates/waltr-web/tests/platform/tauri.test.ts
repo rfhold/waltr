@@ -1,10 +1,40 @@
 import { describe, expect, test, vi } from "vitest";
 
-import type { ClientSnapshot } from "../../src/generated/waltr-client";
+import type { ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
 import { loadTauriClient } from "../../src/platform/tauri";
 import { emptyConfig, snapshotWithConfig } from "../support/snapshots";
 
 describe("Tauri client adapter", () => {
+  test("interaction observation and typed responses use the generation-fenced shared Rust bridge", async () => {
+    let emit!: (event: unknown) => void;
+    const identity = { sessionId: "session", generation: "broker-generation", id: "interaction", operationId: "operation" };
+    const state = namedSnapshot("interactions");
+    state.interactions = { session: { generation: identity.generation, revision: 1n, connected: true, error: null, pending: [{ identity, request: { kind: "urlConsent", message: "Consent required", url: "https://example.test/full?step=1" }, responding: false, error: null }] } };
+    let sequence = 0;
+    const listen = vi.fn(async (_name, handler) => { emit = payload => handler({ payload }); return vi.fn(); });
+    const invoke = vi.fn(async command => {
+      if (command === "start_runtime") { emit(bridgeState(7, sequence++, state)); return { generation: 7 }; }
+      if (command === "client_dispatch") return bridgeState(7, sequence++, state);
+      if (command === "dispose_runtime") return;
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never });
+    await adapter.start();
+    expect(adapter.snapshot()?.interactions).toEqual(state.interactions);
+    const commands: ClientCommand[] = [
+      { type: "retainInteractions", sessionId: "session" },
+      { type: "respondInteraction", identity, response: { kind: "urlConsent", action: "accept" } },
+      { type: "releaseInteractions", sessionId: "session" },
+    ];
+    for (const command of commands) {
+      await adapter.dispatch(command);
+      expect(invoke).toHaveBeenLastCalledWith("client_dispatch", { command, generation: 7 });
+    }
+    expect(adapter.snapshot()?.interactions.session?.pending).toHaveLength(1);
+    expect(invoke.mock.calls.some(([command]) => command === "open_external_url")).toBe(false);
+    await adapter.dispose();
+  });
+
   test("recovers bounded access diagnostics, replays them to subscribers, and clears on generation replacement", async () => {
     let emit!: (event: unknown) => void;
     const listen = vi.fn(async (_name, handler) => {
@@ -311,6 +341,34 @@ describe("Tauri client adapter", () => {
     await adapter.dispose();
     expect(invoke).toHaveBeenCalledWith("dispose_runtime", { generation: 12 });
     await expect(adapter.access!.logout()).rejects.toThrow("not ready");
+  });
+
+  test("advertised native media stays generation-bound and failed logout remains an explicit failure", async () => {
+    let emit!: (event: unknown) => void;
+    let failLogout = true;
+    const listen = vi.fn(async (_name, handler) => { emit = payload => handler({ payload }); return vi.fn(); });
+    const invoke = vi.fn(async (command: string) => {
+      if (command === "start_runtime") {
+        emit(bridgeState(12, 0, namedSnapshot("remote")));
+        return { generation: 12, routineMedia: true };
+      }
+      if (command === "routine_media") return { generation: 12, value: null };
+      if (command === "logout_access" && failLogout) throw new Error("Native cleanup remains unverified");
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
+    expect(adapter.media).toBeUndefined();
+    await adapter.start();
+    const media = adapter.media!;
+    await expect(media.takeMediaOutputJson(3)).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("routine_media", { generation: 12, operation: "outputMetadata", id: 3 });
+    await expect(adapter.access!.logout()).rejects.toThrow("cleanup remains unverified");
+    expect(invoke).not.toHaveBeenCalledWith("dispose_runtime", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("dispatch_command", expect.anything());
+    failLogout = false;
+    await expect(adapter.access!.logout()).resolves.toBe(true);
+    expect(invoke.mock.calls.filter(([command]) => command === "logout_access")).toHaveLength(2);
+    await adapter.dispose();
+    await expect(media.takeMediaOutputJson(3)).rejects.toThrow("Stale");
   });
 
   test("built-in local admission does not expose user access operations", async () => {

@@ -14,8 +14,8 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
   await init();
 
   const client = WaltrClient.forCurrentOrigin();
-  const dictation = browserDictation(client);
   let currentSnapshot: ClientSnapshot | undefined;
+  const dictation = browserDictation(client, () => currentSnapshot);
   let currentSnapshotJson: string | undefined;
   let started = false;
   let disposed = false;
@@ -23,7 +23,7 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
   const disposedError = () => new Error("client adapter disposed");
 
   const publish = (snapshot: ClientSnapshot) => {
-    if (!snapshot.status.ready) dictation.cancel();
+    dictation.reconcile(snapshot);
     currentSnapshot = snapshot;
 
     for (const listener of listeners) {
@@ -102,6 +102,7 @@ export async function loadBrowserClient(): Promise<ClientAdapter> {
   return {
     snapshot: () => currentSnapshot,
     dictation,
+    media: client,
     dictationPreferenceScope: window.location.origin,
     start,
     subscribe: (listener) => {

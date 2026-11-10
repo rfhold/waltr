@@ -25,6 +25,7 @@ export function renderWithAppState(
     explicitAuthTarget?: ClientAuthTarget;
     accessOperations?: AccessOperations | null;
     dictation?: import("../../src/platform/dictation").DictationHost;
+    media?: import("../../src/platform/media").MediaBridge;
     dictationPreferenceScope?: string;
     submitUserMessage?: (sessionId: string, text: string) => Promise<ClientSnapshot>;
     openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
@@ -36,7 +37,6 @@ export function renderWithAppState(
     sessionInferenceSettingsUpdateError?: string;
     sessionAgentUpdateError?: string;
     submitUserMessageError?: string;
-    respondExternalRequestError?: string;
     continueSessionError?: string;
     sessionOperationAuthenticationFailure?: AuthenticationFailureSnapshot;
     interruptSessionError?: string;
@@ -134,7 +134,7 @@ export function renderWithAppState(
         status: { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null },
         coordination: { phase: "ready", reason: null, queuedCount: 0, continuationArmed: false },
         progress: { phase: "idle", runStage: null, reason: null, queuedCount: 0n, continuationArmed: false, running: false },
-        capabilities: { promptDisposition: "immediate", canRespondExternalRequest: false, canInterrupt: false },
+        capabilities: { promptDisposition: "immediate", canInterrupt: false },
         currentPrompt: null,
         createdAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
@@ -353,18 +353,6 @@ export function renderWithAppState(
       });
     };
 
-    const dispatchRespondExternalRequest = async (sessionId: string, requestId: string, responseJson: string) => {
-      return dispatchSessionOperation({
-        command: { type: "respondExternalRequest", sessionId, requestId, responseJson },
-        operationName: "respondExternalRequest",
-        kind: "sessionRespondExternalRequest",
-        error: options.respondExternalRequestError,
-        loadingOperation: { kind: "sessionRespondExternalRequest", status: "loading", error: null, sessionId, requestId, authenticationFailure: null },
-        readyOperation: () => ({ kind: "sessionRespondExternalRequest", status: "ready", error: null, sessionId, requestId, authenticationFailure: null }),
-        failedOperation: (error) => ({ kind: "sessionRespondExternalRequest", status: "failed", error, sessionId, requestId, authenticationFailure: options.sessionOperationAuthenticationFailure ?? null }),
-      });
-    };
-
     const dispatchInterruptSession = async (sessionId: string) => {
       return dispatchSessionOperation({
         command: { type: "interruptSession", sessionId },
@@ -391,7 +379,7 @@ export function renderWithAppState(
 
     const dispatchSessionOperation = async (operation: {
       command: ClientCommand;
-      operationName: "wipe" | "inferenceSettingsUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt" | "continueSession";
+      operationName: "wipe" | "inferenceSettingsUpdate" | "submitUserMessage" | "interrupt" | "continueSession";
       kind: ClientOperationView["kind"];
       error?: string;
       loadingOperation: ClientOperationView;
@@ -504,9 +492,9 @@ export function renderWithAppState(
           dispatchUpdateSessionInferenceSettings,
           dispatchUpdateSessionAgent,
           dictation: () => options.dictation,
+          media: () => options.media,
           dictationPreferenceScope: () => options.dictationPreferenceScope ?? "test-server",
           dispatchSubmitUserMessage: options.submitUserMessage ?? dispatchSubmitUserMessage,
-          dispatchRespondExternalRequest,
           dispatchInterruptSession,
           dispatchContinueSession,
         }}

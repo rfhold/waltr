@@ -187,12 +187,12 @@ export function ConfigRoute(props: ParentProps) {
           </Match>
           <Match when={visibleTab() === "providers"}>
             <ProvidersSection watchedConfig={watchedConfig} resourceBaselines={resourceBaselines}>
-              {props.children}
+              <Show when={routeTab() === "providers"}>{props.children}</Show>
             </ProvidersSection>
           </Match>
           <Match when={visibleTab() === "mcp"}>
             <McpServersSection watchedConfig={watchedConfig} resourceBaselines={resourceBaselines}>
-              {props.children}
+              <Show when={routeTab() === "mcp"}>{props.children}</Show>
             </McpServersSection>
           </Match>
           <Match when={visibleTab() === "defaults"}>

@@ -22,6 +22,7 @@ export type AppState = {
   presentedAuthAttemptId: Accessor<string | undefined>;
   authorizationDraft: Accessor<{ attemptId: string; input: string } | undefined>;
   dictation?: Accessor<import("../platform/dictation").DictationHost | undefined>;
+  media?: Accessor<import("../platform/media").MediaBridge | undefined>;
   dictationPreferenceScope?: Accessor<string | undefined>;
   accessOperations: Accessor<AccessOperations | undefined>;
   accessDiagnostic?: Accessor<import("../platform/client").AccessDiagnostic | undefined>;
@@ -44,7 +45,6 @@ export type AppState = {
   dispatchUpdateSessionInferenceSettings: (command: Extract<ClientCommand, { type: "updateSessionInferenceSettings" }>) => Promise<ClientSnapshot>;
   dispatchUpdateSessionAgent: (id: string, agentName: string) => Promise<ClientSnapshot>;
   dispatchSubmitUserMessage: (sessionId: string, text: string) => Promise<ClientSnapshot>;
-  dispatchRespondExternalRequest: (sessionId: string, requestId: string, responseJson: string) => Promise<ClientSnapshot>;
   dispatchInterruptSession: (sessionId: string) => Promise<ClientSnapshot>;
   dispatchContinueSession: (command: Extract<ClientCommand, { type: "continueSessionFromTurn" | "continueSessionFromCursor" }>) => Promise<ClientSnapshot>;
 };

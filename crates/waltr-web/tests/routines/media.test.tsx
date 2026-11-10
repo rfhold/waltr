@@ -1,0 +1,198 @@
+import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
+import { afterEach, expect, test, vi } from "vitest";
+import { MediaInteractionPanel } from "../../src/routes/routines/MediaInteractionPanel";
+import { mediaBridge, routineDefinition, routineSnapshot } from "../support/routines";
+import { renderWithAppState } from "../support/render";
+import type { NativeFiles } from "../../src/platform/media";
+import { createSignal } from "solid-js";
+import type { ClientSnapshot } from "../../src/generated/waltr-client";
+
+afterEach(() => vi.restoreAllMocks());
+test.each([true, false])("early local ID opening cancellation joins before an explicit new gesture; remote proof %s", async clean => {
+  const bridge = mediaBridge();
+  bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "opening", cleanupVerified: false, preview: "" }));
+  let join!: (clean: boolean) => void;
+  bridge.cancelMediaInteraction.mockImplementationOnce(() => new Promise(resolve => { join = resolve; }));
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  const start = () => screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" });
+  fireEvent.click(start());
+  await waitFor(() => expect(bridge.mediaInteractionStatusJson).toHaveBeenCalledWith(7));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel interaction" }));
+  await waitFor(() => expect(bridge.cancelMediaInteraction).toHaveBeenCalledExactlyOnceWith(7));
+  expect(start().disabled).toBe(true);
+  join(clean);
+  await waitFor(() => expect(start().disabled).toBe(false));
+  expect(screen.getByRole("status").textContent).toBe(clean ? "cancelled" : "error");
+  if (!clean) expect(screen.getByRole("alert").textContent).toContain("remote outcome is uncertain");
+  expect(bridge.openMediaInteraction).toHaveBeenCalledOnce();
+  expect(bridge.finishMediaInput).not.toHaveBeenCalled();
+  fireEvent.click(start());
+  await waitFor(() => expect(bridge.openMediaInteraction).toHaveBeenCalledTimes(2));
+});
+test("download owns its typed reader and revokes its URL on disposal", async () => {
+  const bridge = mediaBridge();
+  const descriptor = { blobId: "public-blob", displayName: "out.pdf", contentType: "application/pdf", bytes: "3", sha256: "digest", image: null, remainingValidityMs: "900000" };
+  bridge.takeMediaOutputJson.mockReturnValueOnce(JSON.stringify({ type: "blob", port: "output", descriptor }));
+  bridge.finishMediaInput.mockImplementation(async () => { bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "succeeded", cleanupVerified: true, preview: "done" })); });
+  bridge.beginMediaDownload.mockResolvedValue(JSON.stringify(descriptor)); bridge.readMediaDownloadChunk.mockResolvedValueOnce(new Uint8Array([1, 2, 3])).mockResolvedValueOnce(undefined);
+  const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:public-result"); const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  const rendered = renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" }));
+  await screen.findByText("succeeded");
+  fireEvent.click(screen.getByRole("button", { name: "Prepare download (up to 64 MiB)" }));
+  const save = await screen.findByRole("link", { name: "Save file" }); expect(save.getAttribute("href")).toBe("blob:public-result");
+  expect(create).toHaveBeenCalledOnce(); expect(bridge.closeMediaDownload).toHaveBeenCalledExactlyOnceWith(7, "output");
+  rendered.unmount(); expect(revoke).toHaveBeenCalledWith("blob:public-result");
+});
+test("defensive delayed bridge reply retains its gate until the late ID is cancelled without uploads", async () => {
+  const bridge = mediaBridge(); let resolve!: (owner: number) => void;
+  bridge.openMediaInteraction.mockImplementation(() => new Promise(yes => { resolve = yes; }));
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" })); fireEvent.click(screen.getByRole("button", { name: "Cancel interaction" }));
+  expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" }).disabled).toBe(true);
+  resolve(7); await waitFor(() => expect(bridge.cancelMediaInteraction).toHaveBeenCalledWith(7));
+  await waitFor(() => expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" }).disabled).toBe(false));
+  expect(bridge.beginMediaUpload).not.toHaveBeenCalled(); expect(bridge.finishMediaInput).not.toHaveBeenCalled();
+});
+test("complete bytes with rejected close never publish a URL and require explicit cleanup verification", async () => {
+  const bridge = mediaBridge();
+  const descriptor = { blobId: "public-blob", displayName: "out.pdf", contentType: "application/pdf", bytes: "1", sha256: "digest", image: null, remainingValidityMs: "900000" };
+  bridge.takeMediaOutputJson.mockReturnValueOnce(JSON.stringify({ type: "blob", port: "output", descriptor }));
+  bridge.finishMediaInput.mockImplementation(async () => { bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "succeeded", cleanupVerified: true, preview: "done" })); });
+  bridge.beginMediaDownload.mockResolvedValue(JSON.stringify(descriptor));
+  bridge.readMediaDownloadChunk.mockResolvedValueOnce(new Uint8Array([1])).mockResolvedValueOnce(undefined);
+  bridge.closeMediaDownload.mockRejectedValueOnce(new Error("private close failure"));
+  const create = vi.spyOn(URL, "createObjectURL");
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" })); await screen.findByText("succeeded");
+  fireEvent.click(screen.getByRole("button", { name: "Prepare download (up to 64 MiB)" }));
+  await screen.findByText(/Download cleanup could not be verified/);
+  expect(screen.getByRole("status").textContent).toBe("error");
+  expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" }).disabled).toBe(true);
+  expect(create).not.toHaveBeenCalled(); expect(screen.queryByRole("link", { name: "Save file" })).toBeNull();
+  expect(bridge.closeMediaDownload).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole("button", { name: "Verify download cleanup" }));
+  await waitFor(() => expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" }).disabled).toBe(false));
+  expect(bridge.closeMediaDownload).toHaveBeenCalledTimes(2); expect(bridge.beginMediaDownload).toHaveBeenCalledOnce(); expect(create).not.toHaveBeenCalled();
+});
+test.each(["cancel", "replacement"])("%s during download holds the original reader through closure and never publishes a late URL", async reason => {
+  const bridge = mediaBridge(), replacement = mediaBridge();
+  const [current, replace] = createSignal(bridge);
+  const descriptor = { blobId: "public-blob", displayName: "out.pdf", contentType: "application/pdf", bytes: "3", sha256: "digest", image: null, remainingValidityMs: "900000" };
+  bridge.takeMediaOutputJson.mockReturnValueOnce(JSON.stringify({ type: "blob", port: "output", descriptor }));
+  bridge.finishMediaInput.mockImplementation(async () => { bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "succeeded", cleanupVerified: true, preview: "done" })); });
+  bridge.beginMediaDownload.mockResolvedValue(JSON.stringify(descriptor));
+  let read!: (value: Uint8Array | undefined) => void, close!: () => void;
+  bridge.readMediaDownloadChunk.mockImplementationOnce(() => new Promise(resolve => { read = resolve; }));
+  bridge.closeMediaDownload.mockImplementationOnce(() => { read(undefined); return new Promise<void>(resolve => { close = resolve; }); });
+  const create = vi.spyOn(URL, "createObjectURL");
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), get media() { return current(); } });
+  const start = () => screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" });
+  fireEvent.click(start()); await screen.findByText("succeeded");
+  fireEvent.click(screen.getByRole("button", { name: "Prepare download (up to 64 MiB)" }));
+  await waitFor(() => expect(bridge.readMediaDownloadChunk).toHaveBeenCalled());
+  if (reason === "cancel") fireEvent.click(screen.getByRole("button", { name: "Cancel interaction" })); else replace(replacement);
+  expect(start().disabled).toBe(true);
+  await waitFor(() => expect(bridge.closeMediaDownload).toHaveBeenCalledWith(7, "output"));
+  expect(start().disabled).toBe(true);
+  close(); await waitFor(() => expect(start().disabled).toBe(false));
+  expect(create).not.toHaveBeenCalled();
+  expect(replacement.closeMediaDownload).not.toHaveBeenCalled(); expect(replacement.cancelMediaInteraction).not.toHaveBeenCalled();
+});
+test("private native failures never enter rendered text", async () => {
+  const bridge = mediaBridge(); bridge.openMediaInteraction.mockRejectedValue(new Error("SECRET_CANARY http://127.0.0.1:9999/private bearer /private/local/path"));
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  const rendered = renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" }));
+  await screen.findByRole("alert"); expect(rendered.container.textContent).not.toMatch(/SECRET_CANARY|127\.0\.0\.1|bearer|private\/local/);
+});
+test.each(["access", "catalog"])("%s invalidation cancels an admitted interaction without waiting for output", async reason => {
+  const bridge = mediaBridge();
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  let publish!: (snapshot: ClientSnapshot) => void;
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge, onSnapshotSetter: setter => { publish = setter; } });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" }));
+  await waitFor(() => expect(bridge.finishMediaInput).toHaveBeenCalledWith(7));
+  const next = routineSnapshot(definition);
+  if (reason === "access") next.status.ready = false;
+  else next.routines.definitions.definitions = [];
+  publish(next);
+  await waitFor(() => expect(bridge.cancelMediaInteraction).toHaveBeenCalledExactlyOnceWith(7));
+  expect(screen.getByRole("status").textContent).toBe("cancelled");
+});
+test("adapter replacement cancels only the captured owner and never reuses its ID on the new generation", async () => {
+  const old = mediaBridge(), replacement = mediaBridge();
+  const [current, replace] = createSignal(old);
+  let resolve!: (owner: number) => void;
+  old.openMediaInteraction.mockImplementation(() => new Promise(yes => { resolve = yes; }));
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }] });
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), get media() { return current(); } });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" }));
+  replace(replacement);
+  expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" }).disabled).toBe(true);
+  resolve(7);
+  await waitFor(() => expect(old.cancelMediaInteraction).toHaveBeenCalledExactlyOnceWith(7));
+  expect(replacement.cancelMediaInteraction).not.toHaveBeenCalled();
+  expect(replacement.finishMediaInput).not.toHaveBeenCalled();
+});
+function nativeFiles(): NativeFiles & { [K in keyof NativeFiles]: ReturnType<typeof vi.fn<NativeFiles[K]>> } {
+  return { pickInput: vi.fn(async () => undefined), releaseInput: vi.fn(async () => {}), pickOutput: vi.fn(async () => undefined), releaseOutput: vi.fn(async () => {}), open: vi.fn(async () => 7) };
+}
+test("native pickers submit known metadata and opaque input/save handles without browser uploads", async () => {
+  const bridge = mediaBridge(), files = nativeFiles(); bridge.nativeFiles = files; bridge.nativePlayback = { drop: vi.fn(async () => {}) };
+  files.pickInput.mockResolvedValue({ handle: "PRIVATE_INPUT_HANDLE", port: "document", name: "source.pdf", contentType: "application/pdf", bytes: 131073, purpose: "file" });
+  files.pickOutput.mockResolvedValue({ handle: "PRIVATE_OUTPUT_HANDLE", port: "result", });
+  bridge.finishMediaInput.mockImplementation(async () => { bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "succeeded", cleanupVerified: true, preview: "done" })); });
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }], ports: [
+    { name: "document", direction: "input", media: "file", required: true, maxBytes: "67108864", formats: ["application/pdf"] },
+    { name: "result", direction: "output", media: "file", required: true, maxBytes: "67108864", formats: ["application/pdf"] },
+    { name: "speech", direction: "output", media: "audio", required: false, maxBytes: "1048576", formats: ["pcm16le"] },
+  ] });
+  const rendered = renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  expect(rendered.container.querySelector('input[type="file"]')).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Choose native file for document" })); await screen.findByText("source.pdf (131073 bytes)");
+  fireEvent.click(screen.getByRole("button", { name: "Choose save destination for result" })); await screen.findByText("Destination selected");
+  expect(screen.getByRole<HTMLInputElement>("checkbox", { name: "Play speech" }).checked).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" })); await screen.findByText("succeeded");
+  expect(files.open).toHaveBeenCalledOnce(); const [metadata, inputs, outputs] = files.open.mock.calls[0];
+  expect(JSON.parse(metadata).inputs).toEqual([{ format: "file", port: "document", displayName: "source.pdf", contentType: "application/pdf", declaredBytes: 131073, expectedSha256: null }]);
+  expect(inputs).toEqual([{ port: "document", handle: "PRIVATE_INPUT_HANDLE" }]); expect(outputs).toEqual([{ port: "result", kind: "file", handle: "PRIVATE_OUTPUT_HANDLE" }]);
+  expect(bridge.openMediaInteraction).not.toHaveBeenCalled(); expect(bridge.beginMediaUpload).not.toHaveBeenCalled();
+  expect(rendered.container.textContent).not.toMatch(/PRIVATE_INPUT_HANDLE|PRIVATE_OUTPUT_HANDLE/);
+  rendered.unmount(); expect(files.releaseInput).not.toHaveBeenCalled(); expect(files.releaseOutput).not.toHaveBeenCalled();
+});
+test("native picker cancellation is neutral; unused replacements and late disposal results release their handles", async () => {
+  const bridge = mediaBridge(), files = nativeFiles(); bridge.nativeFiles = files;
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }], ports: [{ name: "image", direction: "input", media: "image", required: false, maxBytes: "20971520", formats: ["png", "jpeg", "webp"] }] });
+  const rendered = renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  const choose = () => screen.getByRole("button", { name: "Choose native file for image" });
+  fireEvent.click(choose()); await waitFor(() => expect((choose() as HTMLButtonElement).disabled).toBe(false)); expect(screen.queryByRole("alert")).toBeNull();
+  files.pickInput.mockResolvedValueOnce({ handle: "first", port: "image", name: "a.png", contentType: "image/png", bytes: 68, purpose: "image" });
+  fireEvent.click(choose()); await screen.findByText("a.png (68 bytes)");
+  files.pickInput.mockResolvedValueOnce({ handle: "second", port: "image", name: "b.png", contentType: "image/png", bytes: 68, purpose: "image" });
+  fireEvent.click(choose()); await waitFor(() => expect(files.releaseInput).toHaveBeenCalledWith("first"));
+  let resolve!: (value: Awaited<ReturnType<NativeFiles["pickInput"]>>) => void;
+  files.pickInput.mockImplementationOnce(() => new Promise(yes => { resolve = yes; }));
+  await waitFor(() => expect((choose() as HTMLButtonElement).disabled).toBe(false)); fireEvent.click(choose()); rendered.unmount();
+  resolve({ handle: "late", port: "image", name: "c.png", contentType: "image/png", bytes: 68, purpose: "image" });
+  await waitFor(() => expect(files.releaseInput).toHaveBeenCalledWith("late")); expect(files.releaseInput).toHaveBeenCalledWith("second");
+  expect(files.pickInput).toHaveBeenCalledWith({ port: "image", kind: "image", contentTypes: ["image/png", "image/jpeg", "image/webp"], maxBytes: 20971520 });
+});
+test("native playback requires explicit selection and never opens a browser PCM sink", async () => {
+  const bridge = mediaBridge(), files = nativeFiles(); bridge.nativeFiles = files; bridge.nativePlayback = { drop: vi.fn(async () => {}) };
+  bridge.finishMediaInput.mockImplementation(async () => { bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "succeeded", cleanupVerified: true, preview: "done" })); });
+  const definition = routineDefinition({ entrypoints: [{ name: "live", trigger: "interactive", selector: null, startContexts: ["global"] }], ports: [{ name: "speech", direction: "output", media: "audio", required: true, maxBytes: "1048576", formats: ["pcm16le"] }] });
+  renderWithAppState(() => <MediaInteractionPanel definition={definition} parameters="{}" valid={() => true} />, { snapshot: routineSnapshot(definition), media: bridge });
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" })); await screen.findByRole("alert"); expect(files.open).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start interaction" }).disabled).toBe(false));
+  fireEvent.click(screen.getByRole("checkbox", { name: "Play speech (required)" }));
+  fireEvent.click(screen.getByRole("button", { name: "Start interaction" })); await screen.findByText("succeeded");
+  expect(files.open.mock.calls[0].slice(1)).toEqual([[], [{ port: "speech", kind: "playback" }]]);
+  expect(bridge.takeMediaOutputBytes).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Drop audio playback" })); expect(bridge.nativePlayback.drop).toHaveBeenCalledWith(7);
+});

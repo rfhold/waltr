@@ -1,80 +1,39 @@
 import { A } from "@solidjs/router";
-import { For, Show } from "solid-js";
-
-import type { ClientRoutineInvocationDetail, ClientRoutineResult } from "../../generated/waltr-client";
+import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
+import { useAppState } from "../../app/context";
+import { clientRequestId } from "../../app/requestId";
+import type { ClientRoutineInvocationDetail } from "../../generated/waltr-client";
+import { TextResultBudget } from "../../platform/media-transfers";
+import { TextResult } from "./TextResult";
 
 export function RoutineDetail(props: { detail: ClientRoutineInvocationDetail; headingId?: string }) {
-  return (
-    <section class="routine-detail" aria-label="Routine invocation detail" aria-live="polite">
-      <header class="routine-detail__header">
-        <div>
-          <p class="eyebrow">{triggerLabel(props.detail.summary.triggerKind)} invocation</p>
-          <h1 id={props.headingId}>{props.detail.summary.routineName}</h1>
-        </div>
-        <span class={`routine-status routine-status--${props.detail.summary.status}`}>{statusLabel(props.detail.summary.status)}</span>
-      </header>
-
-      <dl class="routine-detail__metadata">
-        <div><dt>Invocation</dt><dd>{props.detail.summary.invocationId}</dd></div>
-        <div><dt>Revision</dt><dd>{props.detail.summary.routineRevision}</dd></div>
-        <Show when={props.detail.summary.metadata["waltr.routine.source_session_id"]}>
-          {(id) => <div><dt>Source session</dt><dd><A href={`/sessions/${encodeURIComponent(id())}`}>{id()}</A></dd></div>}
-        </Show>
-        <Show when={props.detail.summary.sourceCursor}>
-          {(cursor) => <div><dt>Source cursor</dt><dd>{cursor()}</dd></div>}
-        </Show>
-      </dl>
-
-      <Show when={props.detail.summary.terminalError}>
-        {(failure) => <p class="routine-failure" role="alert"><strong>{failure().code}</strong> {failure().message}</p>}
-      </Show>
-
-      <ol class="routine-tasks" aria-label="Routine tasks">
-        <For each={props.detail.tasks}>{(task) => (
-          <li class={`routine-task routine-task--${task.status}`}>
-            <details>
-              <summary>
-                <span class="routine-task__identity"><strong>{task.name}</strong><small>{task.type}</small></span>
-                <span class={`routine-status routine-status--${task.status}`}>{statusLabel(task.status)}</span>
-              </summary>
-              <div class="routine-task__content">
-                <Show when={task.error}>
-                  {(failure) => <p class="routine-failure"><strong>{failure().code}</strong> {failure().message}</p>}
-                </Show>
-                <RoutineResults results={task.results} label={`${task.name} results`} />
-                <Show when={Object.entries(task.sessionReferences).length > 0}>
-                  <dl class="routine-session-references" aria-label={`${task.name} session references`}>
-                    <For each={Object.entries(task.sessionReferences)}>{([name, id]) => (
-                      <div><dt>{name}</dt><dd><A href={`/sessions/${encodeURIComponent(id!)}`}>{id}</A></dd></div>
-                    )}</For>
-                  </dl>
-                </Show>
-              </div>
-            </details>
-          </li>
-        )}</For>
-      </ol>
-      <RoutineResults results={props.detail.results} label="Routine results" />
-    </section>
-  );
+  const app = useAppState();
+  const textBudget = new TextResultBudget();
+  const key = clientRequestId("routine-action");
+  const [requestId, setRequestId] = createSignal("");
+  const receipt = createMemo(() => { const r = app.snapshot()?.routines.requests[key]; return r?.requestId === requestId() ? r : undefined; });
+  function request(command: import("../../generated/waltr-client").RoutineRequest) {
+    if (requestId()) void app.dispatch({ type: "releaseRoutineRequest", operationKey: key, requestId: requestId() }).catch(() => undefined);
+    const id = clientRequestId("routine-action-request"); setRequestId(id);
+    void app.dispatch({ type: "routineRequest", operationKey: key, requestId: id, command }).catch(() => undefined);
+  }
+  onCleanup(() => { if (requestId()) void app.dispatch({ type: "releaseRoutineRequest", operationKey: key, requestId: requestId() }).catch(() => undefined); });
+  return <section class="routine-detail" aria-label="Routine invocation detail">
+    <header><h1 id={props.headingId}>{props.detail.summary.routineName}</h1><p>{statusLabel(props.detail.summary.status)}</p></header>
+    <dl><dt>Invocation</dt><dd>{props.detail.summary.invocationId}</dd><dt>Revision</dt><dd>{props.detail.summary.routineRevision}</dd><dt>Entrypoint</dt><dd>{props.detail.summary.triggerName} ({props.detail.summary.triggerKind})</dd>
+      <Show when={props.detail.summary.sourceSession}>{id => <><dt>Source session</dt><dd><A href={`/sessions/${encodeURIComponent(id())}`}>{id()}</A></dd></>}</Show>
+    </dl>
+    <details><summary>Pinned historical definition</summary><p>{props.detail.pinnedDefinition.description}</p><pre>{props.detail.pinnedDefinition.parameters.schemaJson}</pre></details>
+    <Show when={["admitted", "running"].includes(props.detail.summary.status)}><button disabled={receipt()?.status === "loading"} onClick={() => request({ type: "cancel", invocationId: props.detail.summary.invocationId })}>Request cancellation</button></Show>
+    <Show when={receipt()}>{r => <p role="status">{r().status}{r().cancellationStatus ? `: ${r().cancellationStatus}` : ""} {r().error}</p>}</Show>
+    <Show when={props.detail.summary.status === "uncertain"}><p role="alert">An effect may have occurred. This invocation will not be replayed automatically.</p></Show>
+    <h2>Dynamic operations</h2><ol aria-label="Routine operations"><For each={props.detail.operations}>{operation => <li><details><summary>{operation.name} · {statusLabel(operation.status)}</summary><p>{operation.id}</p><Show when={operation.arguments}><pre>{operation.arguments}</pre></Show><Show when={operation.result}><pre>{operation.result}</pre></Show></details></li>}</For></ol>
+    <Show when={props.detail.nextOperationCursor}>{cursor => <button onClick={() => request({ type: "operations", invocationId: props.detail.summary.invocationId, afterCursor: cursor(), limit: 50 })}>Load more operations</button>}</Show>
+    <h2>Selected business results</h2><Show when={props.detail.summary.result}><pre>{props.detail.summary.result}</pre></Show>
+    <For each={props.detail.summary.helpers}>{helper => <p><A href={`/sessions/${encodeURIComponent(helper.sessionId)}`}>Helper {helper.definitionIdentity}</A> {helper.operationId}</p>}</For>
+    <For each={props.detail.summary.textResults}>{result => <TextResult invocation={props.detail.summary.invocationId} result={result} budget={textBudget} />}</For>
+    <For each={props.detail.summary.binaryResults}>{result => <p>{result.displayName} · {result.bytes} bytes. Historical descriptor only; not a download grant.</p>}</For>
+  </section>;
 }
 
-function RoutineResults(props: { results: ClientRoutineResult[]; label: string }) {
-  return (
-    <Show when={props.results.length > 0}>
-      <dl class="routine-results" aria-label={props.label}>
-        <For each={props.results}>{(result) => (
-          <div><dt>{result.name}</dt><dd>{String(result.value.value)}</dd></div>
-        )}</For>
-      </dl>
-    </Show>
-  );
-}
-
-export function statusLabel(status: string) {
-  return status.charAt(0).toLocaleUpperCase() + status.slice(1);
-}
-
-function triggerLabel(kind: string) {
-  return kind === "event" ? "Event" : "Manual";
-}
+export function statusLabel(status: string) { return status.charAt(0).toUpperCase() + status.slice(1); }

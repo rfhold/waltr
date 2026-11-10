@@ -19,6 +19,7 @@ export type ClientAdapter = {
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispose: () => void | Promise<void>;
   dictation?: import("./dictation").DictationHost;
+  media?: import("./media").MediaBridge;
   dictationPreferenceScope?: string;
   access?: AccessOperations;
   accessDiagnostic?: {

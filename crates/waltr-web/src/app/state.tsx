@@ -329,16 +329,6 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
-  const dispatchRespondExternalRequest = async (sessionId: string, requestId: string, responseJson: string) => {
-    return dispatchAndWaitForOperation({
-      command: { type: "respondExternalRequest", sessionId, requestId, responseJson },
-      key: (snapshot) => snapshot.sessions.respondExternalRequest.key,
-      kind: "sessionRespondExternalRequest",
-      missingKeyMessage: "respond external request command did not produce an operation key",
-      failureMessage: "respond external request failed",
-    });
-  };
-
   const dispatchInterruptSession = async (sessionId: string) => {
     return dispatchAndWaitForOperation({
       command: { type: "interruptSession", sessionId },
@@ -414,6 +404,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
         presentedAuthAttemptId,
         authorizationDraft,
         dictation: () => { snapshot(); return clientAdapter()?.dictation; },
+        media: () => { snapshot(); return clientAdapter()?.media; },
         dictationPreferenceScope: () => clientAdapter()?.dictationPreferenceScope,
         accessOperations: () => clientAdapter()?.access,
         accessDiagnostic,
@@ -439,7 +430,6 @@ export function AppStateProvider(props: AppStateProviderProps) {
           dispatchUpdateSessionInferenceSettings,
           dispatchUpdateSessionAgent,
         dispatchSubmitUserMessage,
-        dispatchRespondExternalRequest,
         dispatchInterruptSession,
         dispatchContinueSession,
       }}

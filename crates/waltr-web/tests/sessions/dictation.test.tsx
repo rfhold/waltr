@@ -5,6 +5,7 @@ import { SessionsRouteWithRouter, testHistory } from "../support/routes";
 import { snapshotWithSessions, sessionView, readySessionTimeline } from "../support/snapshots";
 import { type DictationStatus } from "../../src/platform/dictation";
 import { browserDictation } from "../../src/platform/browser-dictation";
+import { mediaBridge, routineDefinition, routineSnapshot } from "../support/routines";
 function fixture(extra: Parameters<typeof renderWithAppState>[1] = {}) {
   const configuredSelection = { routine: "transcribe", trigger: "audio", input: "audio", output: "text" };
   let state: DictationStatus = { operationId: 1, phase: "recording", preview: "" };
@@ -19,6 +20,25 @@ function fixture(extra: Parameters<typeof renderWithAppState>[1] = {}) {
   const draft = screen.getByRole("textbox", { name: "Session message" }) as HTMLTextAreaElement;
   return { ...rendered, host, operation, draft, commands, updateSnapshot: (update: (value: typeof snapshot) => typeof snapshot) => setSnapshot(update(snapshot)), state: (next: Partial<DictationStatus>) => { state = { ...state, ...next }; } };
 }
+test("configured dictation owns definitions only while ready and releases them on route exit", async () => {
+  const f = fixture();
+  const count = (type: string) => f.commands.filter(command => (command as { type: string }).type === type).length;
+  expect(count("registerRoutineDefinitionWatchInterest")).toBe(1);
+  f.updateSnapshot(current => ({ ...current, config: { ...current.config } }));
+  expect(count("registerRoutineDefinitionWatchInterest")).toBe(1);
+  f.updateSnapshot(current => ({ ...current, status: { ...current.status, ready: false } }));
+  expect(count("releaseRoutineDefinitionWatchInterest")).toBe(1);
+  f.updateSnapshot(current => ({ ...current }));
+  expect(count("registerRoutineDefinitionWatchInterest")).toBe(2);
+  f.updateSnapshot(current => ({ ...current, config: { ...current.config, current: { ...current.config.current!, sessionDictation: null } } }));
+  expect(count("releaseRoutineDefinitionWatchInterest")).toBe(2);
+  f.updateSnapshot(current => ({ ...current }));
+  expect(count("registerRoutineDefinitionWatchInterest")).toBe(3);
+  testHistory().set({ value: "/sessions", replace: false, scroll: false });
+  await waitFor(() => expect(count("releaseRoutineDefinitionWatchInterest")).toBe(3));
+  f.unmount();
+  expect(count("releaseRoutineDefinitionWatchInterest")).toBe(3);
+});
 test("live revisions replace the captured selection and finalize without duplicates or sending", async () => {
   const f = fixture();
   fireEvent.input(f.draft, { target: { value: "hello world", selectionStart: 6, selectionEnd: 11 } });
@@ -145,27 +165,23 @@ test("late edit-message completion preserves a new dictation transaction", async
   complete(undefined as never); await rollback;
   await waitFor(() => expect(f.draft.value).toBe("final speech"));
 });
-test.each([false, true])("actual browser Run keeps hypotheses out of composer; edited=%s", async edited => {
-  let state: DictationStatus = { operationId: 7, phase: "processing", preview: "browser hypothesis" };
-  const bridge = {
-    startAudioRun: vi.fn(() => 7),
-    audioRunStatusJson: vi.fn(() => JSON.stringify(state)),
-    cancelAudioRun: vi.fn(),
-  };
-  const capture = vi.fn(() => ({
-    ready: Promise.resolve(), cancel: vi.fn(),
-    stop: vi.fn(async () => ({ bytes: new Uint8Array([1, 2]), format: { encoding: "PCM_S16LE" as const, sampleRate: 24000 as const, channels: 1 as const } })),
+test.each([false, true])("browser live preview preserves draft guards and final dedup; edited=%s", async edited => {
+  const bridge = mediaBridge();
+  const snapshot = routineSnapshot(routineDefinition({ routineName: "transcribe", entrypoints: [{ name: "audio", trigger: "interactive", selector: null, startContexts: ["session"] }] }));
+  const capture = vi.fn((push: (bytes: Uint8Array) => Promise<void>) => ({
+    ready: Promise.resolve(), cancel: vi.fn(async () => {}),
+    stop: vi.fn(async () => { await push(new Uint8Array([1, 2])); }),
   }));
-  const f = fixture({ dictation: browserDictation(bridge, capture) });
+  const f = fixture({ dictation: browserDictation(bridge, () => snapshot, capture) });
   fireEvent.input(f.draft, { target: { value: "hello world", selectionStart: 6, selectionEnd: 11 } });
   const mic = screen.getByRole("button", { name: "Hold to dictate" });
   fireEvent.keyDown(mic, { key: " " }); fireEvent.keyUp(mic, { key: " " });
-  await waitFor(() => expect(bridge.audioRunStatusJson).toHaveBeenCalled());
+  await waitFor(() => expect(bridge.mediaInteractionStatusJson).toHaveBeenCalled());
   expect(capture).toHaveBeenCalledOnce();
-  expect(bridge.startAudioRun).toHaveBeenCalledOnce();
-  expect(f.draft.value).toBe("hello world");
+  expect(bridge.openMediaInteraction).toHaveBeenCalledOnce();
+  await waitFor(() => expect(f.draft.value).toBe("hello hypothesis"));
   if (edited) fireEvent.input(f.draft, { target: { value: "typed ", selectionStart: 6, selectionEnd: 6 } });
-  state = { ...state, phase: "succeeded", finalText: "final speech" };
+  bridge.mediaInteractionStatusJson.mockReturnValue(JSON.stringify({ phase: "succeeded", preview: "final speech", finalText: "final speech", cleanupVerified: true }));
   if (edited) {
     fireEvent.click(await screen.findByRole("button", { name: "Insert dictation" }));
     expect(f.draft.value).toBe("typed final speech");

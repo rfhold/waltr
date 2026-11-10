@@ -18,6 +18,7 @@ export function snapshotWithConfig(
   options: { ready?: boolean } = {},
 ): ClientSnapshot {
   return {
+    interactions: {},
     apps: { current: {}, requests: {} },
     access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
@@ -40,10 +41,11 @@ export function snapshotWithConfig(
   };
 }
 
-export function emptyRoutineSnapshot() {
+export function emptyRoutineSnapshot(): import("../../src/generated/waltr-client").RoutineSnapshot {
   return {
-    definitions: { watch: operationSnapshot("idle"), digest: "", definitions: [] },
-    history: { watch: operationSnapshot("idle"), recent: [], throughSequence: null, olderPageToken: null, pagination: operationSnapshot("idle") },
+    requests: {},
+    definitions: { watch: operationSnapshot("idle"), digest: "", definitions: [], supportedCapabilities: [], limits: null },
+    history: { snapshotHighWater: null, snapshotComplete: false, operations: [], watch: operationSnapshot("idle"), recent: [], throughSequence: null, olderPageToken: null, pagination: operationSnapshot("idle") },
     sessionHistories: {},
     details: {},
     starts: {},
@@ -122,7 +124,6 @@ export function emptySessionSnapshot(): SessionSnapshot {
     inferenceSettingsUpdate: operationSnapshot("idle"),
     agentUpdate: operationSnapshot("idle"),
     submitUserMessage: operationSnapshot("idle"),
-    respondExternalRequest: operationSnapshot("idle"),
     interrupt: operationSnapshot("idle"),
     rollback: operationSnapshot("idle"),
     continueSession: operationSnapshot("idle"),
@@ -170,7 +171,6 @@ export function snapshotWithSessions(sessions: SessionView[]): ClientSnapshot {
     inferenceSettingsUpdate: operationSnapshot("idle"),
     agentUpdate: operationSnapshot("idle"),
     submitUserMessage: operationSnapshot("idle"),
-    respondExternalRequest: operationSnapshot("idle"),
     interrupt: operationSnapshot("idle"),
     rollback: operationSnapshot("idle"),
     continueSession: operationSnapshot("idle"),
@@ -192,7 +192,7 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
     status: { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null },
     coordination: { phase: "ready", reason: null, queuedCount: 0, continuationArmed: false },
     progress: { phase: "idle", runStage: null, reason: null, queuedCount: 0n, continuationArmed: false, running: false },
-    capabilities: { promptDisposition: "immediate", canRespondExternalRequest: false, canInterrupt: false },
+    capabilities: { promptDisposition: "immediate", canInterrupt: false },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),

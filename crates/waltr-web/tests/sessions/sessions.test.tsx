@@ -114,6 +114,7 @@ describe("sessions route", () => {
       "registerConfigWatchInterest",
       "registerSessionTimelineWatchInterest",
       "registerSessionRoutineInvocationWatchInterest",
+      "retainInteractions",
     ]);
   });
 
@@ -253,7 +254,6 @@ describe("sessions route", () => {
       ["evaluating", progress("running", "evaluatingToolCall"), "Evaluating tool call", "green"],
       ["tool", progress("running", "runningTool"), "Running tool", "green"],
       ["tool-wait", progress("awaitingToolResults"), "Awaiting tool results", "green"],
-      ["input-wait", progress("awaitingExternalInput"), "Awaiting external input", "green"],
       ["failed", progress("failed"), "Failed", "red"],
       ["interrupted", progress("interrupted"), "Interrupted", "red"],
       ["idle", progress("idle"), "Idle", "grey"],
@@ -1103,7 +1103,7 @@ describe("sessions route", () => {
     expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(disabled);
   });
 
-  test("unknown projection does not fall back to legacy status or an open external request", () => {
+  test("unknown projection does not fall back to legacy status", () => {
     const snapshot = snapshotWithSessions([sessionView({
       id: "session-unknown-projection",
       status: sessionStatus("streamingProvider"),
@@ -1111,12 +1111,6 @@ describe("sessions route", () => {
       capabilities: capabilities({ promptDisposition: "unknown" }),
     })]);
     const timeline = readySessionTimeline();
-    timeline.events = [externalRequestOpenEvent({
-      sessionId: "session-unknown-projection",
-      requestId: "permission-unknown",
-      kind: 1,
-      payload: { tool_call: { name: "read", arguments: {} }, patterns: [] },
-    })];
     snapshot.sessions.timelines["session-unknown-projection"] = timeline;
 
     renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-unknown-projection", snapshot });
@@ -1125,7 +1119,6 @@ describe("sessions route", () => {
     expect(screen.getByLabelText("Session activity status").textContent?.trim()).toBe("");
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((within(screen.getByLabelText("Permission prompt")).getByText("Allow once") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "Commands" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
@@ -2062,250 +2055,6 @@ describe("sessions route", () => {
     await waitFor(() => expect(editTool.querySelector(".sessions__highlighted-code")).toBeTruthy());
   });
 
-  test("session detail renders resolved external requests as compact results", () => {
-    const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-permission"),
-    ]);
-    const timeline = readySessionTimeline();
-    timeline.events = [
-      timelineEvent({
-        cursor: 1n,
-        itemId: "i1",
-        kind: "externalRequestOpened",
-        content: {
-          kind: "externalRequest",
-          request: {
-            id: "permission-1",
-            kind: 1,
-            payloadJson: JSON.stringify({ tool_call: { name: "read", arguments: { filePath: "../outside/file.txt" } } }),
-          },
-        },
-      }),
-      timelineEvent({
-        cursor: 2n,
-        itemId: "i1",
-        kind: "externalRequestResolved",
-        status: "resolved",
-        content: {
-          kind: "externalRequest",
-          request: {
-            id: "permission-1",
-            kind: 1,
-            payloadJson: JSON.stringify({ tool_call: { name: "read", arguments: { filePath: "../outside/file.txt" } } }),
-          },
-        },
-      }),
-    ];
-    snapshot.sessions.timelines["session-permission"] = timeline;
-
-    renderWithAppState(() => <SessionsRouteWithRouter />, {
-      routePath: "/sessions/session-permission",
-      snapshot,
-    });
-
-    expect(screen.getByText("permission: answered")).toBeTruthy();
-    expect(screen.queryByLabelText("Permission prompt")).toBeNull();
-  });
-
-  test("session detail re-answer permission rolls back to opened prompt cursor", async () => {
-    const commands: ClientCommand[] = [];
-    const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-permission-reanswer"),
-    ]);
-    const timeline = readySessionTimeline();
-    timeline.events = [
-      timelineEvent({
-        cursor: 3n,
-        sessionId: "session-permission-reanswer",
-        itemId: "i1",
-        kind: "externalRequestOpened",
-        content: {
-          kind: "externalRequest",
-          request: {
-            id: "permission-1",
-            kind: 1,
-            payloadJson: JSON.stringify({ tool_call: { name: "read", arguments: { filePath: "README.md" } } }),
-          },
-        },
-      }),
-      timelineEvent({
-        cursor: 4n,
-        sessionId: "session-permission-reanswer",
-        itemId: "i1",
-        kind: "externalRequestResolved",
-        status: "resolved",
-        content: {
-          kind: "externalRequest",
-          request: {
-            id: "permission-1",
-            kind: 1,
-            payloadJson: JSON.stringify({ tool_call: { name: "read", arguments: { filePath: "README.md" } } }),
-          },
-        },
-      }),
-    ];
-    snapshot.sessions.timelines["session-permission-reanswer"] = timeline;
-
-    renderWithAppState(() => <SessionsRouteWithRouter />, {
-      commands,
-      routePath: "/sessions/session-permission-reanswer",
-      snapshot,
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Re-answer" }));
-
-    await waitFor(() => expect(commands).toContainEqual({
-      type: "rollbackSessionToCursor",
-      sessionId: "session-permission-reanswer",
-      cursor: 3n,
-    }));
-    expect(commands).not.toContainEqual({
-      type: "rollbackSessionToCursor",
-      sessionId: "session-permission-reanswer",
-      cursor: 4n,
-    });
-  });
-
-  test("session detail re-answer question rolls back to opened prompt cursor", async () => {
-    const commands: ClientCommand[] = [];
-    const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-question-reanswer"),
-    ]);
-    const timeline = readySessionTimeline();
-    const payload = {
-      questions: [{
-        header: "Direction",
-        question: "Which path?",
-        multiple: false,
-        custom: false,
-        options: [{ label: "A", description: "Path A" }],
-      }],
-    };
-    timeline.events = [
-      timelineEvent({
-        cursor: 5n,
-        sessionId: "session-question-reanswer",
-        itemId: "i1",
-        kind: "externalRequestOpened",
-        content: {
-          kind: "externalRequest",
-          request: { id: "question-1", kind: 2, payloadJson: JSON.stringify(payload) },
-        },
-      }),
-      timelineEvent({
-        cursor: 6n,
-        sessionId: "session-question-reanswer",
-        itemId: "i1",
-        kind: "externalRequestResolved",
-        status: "resolved",
-        content: {
-          kind: "externalRequest",
-          request: { id: "question-1", kind: 2, payloadJson: JSON.stringify(payload) },
-        },
-      }),
-    ];
-    snapshot.sessions.timelines["session-question-reanswer"] = timeline;
-
-    renderWithAppState(() => <SessionsRouteWithRouter />, {
-      commands,
-      routePath: "/sessions/session-question-reanswer",
-      snapshot,
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Re-answer" }));
-
-    await waitFor(() => expect(commands).toContainEqual({
-      type: "rollbackSessionToCursor",
-      sessionId: "session-question-reanswer",
-      cursor: 5n,
-    }));
-    expect(commands).not.toContainEqual({
-      type: "rollbackSessionToCursor",
-      sessionId: "session-question-reanswer",
-      cursor: 6n,
-    });
-  });
-
-  test("session detail renders unresolved permission prompts and submits decisions", async () => {
-    const commands: ClientCommand[] = [];
-    const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-permission"),
-    ]);
-    const timeline = readySessionTimeline();
-    snapshot.sessions.current[0]!.progress = progress("awaitingExternalInput");
-    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "supersedeSuspension", canRespondExternalRequest: true });
-    timeline.events = [externalRequestOpenEvent({
-      sessionId: "session-permission",
-      requestId: "permission-1",
-      kind: 1,
-      payload: {
-        tool_call: { name: "read", arguments: { filePath: "../outside/file.txt" } },
-        patterns: [{ tool: "read", arguments: { filePath: "../outside/**" } }],
-      },
-    })];
-    snapshot.sessions.timelines["session-permission"] = timeline;
-
-    renderWithAppState(() => <SessionsRouteWithRouter />, {
-      commands,
-      routePath: "/sessions/session-permission",
-      snapshot,
-    });
-
-    const prompt = screen.getByLabelText("Permission prompt");
-    expect(within(prompt).getByText("Permission required")).toBeTruthy();
-    expect(within(prompt).getByText("permission-1")).toBeTruthy();
-    expect(within(prompt).getByText("read")).toBeTruthy();
-    expect(prompt.textContent).toContain("../outside/file.txt");
-    expect(within(prompt).getByText("Always approval pattern")).toBeTruthy();
-    expect(within(prompt).getByText("Allow once")).toBeTruthy();
-    expect(within(prompt).getByText("Allow always")).toBeTruthy();
-    expect(within(prompt).getByText("Deny and resume")).toBeTruthy();
-    expect(within(prompt).getByText("Deny with interrupt")).toBeTruthy();
-
-    fireEvent.click(within(prompt).getByText("Allow once"));
-
-    await waitFor(() => expect(commands).toContainEqual({
-      type: "respondExternalRequest",
-      sessionId: "session-permission",
-      requestId: "permission-1",
-      responseJson: JSON.stringify({ decision: "allow_once" }),
-    }));
-  });
-
-  test("session detail shows external response operation failures", async () => {
-    const commands: ClientCommand[] = [];
-    const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-permission-fail"),
-    ]);
-    const timeline = readySessionTimeline();
-    snapshot.sessions.current[0]!.progress = progress("awaitingExternalInput");
-    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "supersedeSuspension", canRespondExternalRequest: true });
-    timeline.events = [externalRequestOpenEvent({
-      sessionId: "session-permission-fail",
-      requestId: "permission-1",
-      kind: 1,
-      payload: {
-        tool_call: { name: "read", arguments: { filePath: "README.md" } },
-        patterns: [],
-      },
-    })];
-    snapshot.sessions.timelines["session-permission-fail"] = timeline;
-
-    renderWithAppState(() => <SessionsRouteWithRouter />, {
-      routePath: "/sessions/session-permission-fail",
-      snapshot,
-      respondExternalRequestError: "response rejected",
-      sessionOperationAuthenticationFailure: authenticationFailure("mcpServer", "remote", "credentialRequired"),
-      commands,
-    });
-
-    fireEvent.click(within(screen.getByLabelText("Permission prompt")).getByText("Allow once"));
-
-    await waitFor(() => expect(screen.getByText("response rejected")).toBeTruthy());
-    expect(screen.getByRole("link", { name: "Open MCP server Config" }).getAttribute("href")).toBe("/config/mcp/edit/remote");
-    expect(commands.some(isOAuthCommand)).toBe(false);
-  });
-
   test("session detail shows interrupt operation failures", async () => {
     const snapshot = snapshotWithSessions([
       sessionWithInferenceSettings("session-interrupt-fail", { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null }),
@@ -2323,79 +2072,6 @@ describe("sessions route", () => {
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
 
     await waitFor(() => expect(screen.getByText("interrupt rejected")).toBeTruthy());
-  });
-
-  test("session detail renders unresolved question prompts and submits answers", async () => {
-    const commands: ClientCommand[] = [];
-    const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-question"),
-    ]);
-    const timeline = readySessionTimeline();
-    snapshot.sessions.current[0]!.progress = progress("awaitingExternalInput");
-    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "supersedeSuspension", canRespondExternalRequest: true });
-    timeline.events = [externalRequestOpenEvent({
-      sessionId: "session-question",
-      requestId: "question-1",
-      kind: 2,
-      payload: {
-        questions: [
-          {
-            header: "Direction",
-            question: "Which visual direction should the prompt take?",
-            multiple: false,
-            custom: true,
-            options: [
-              { label: "Compact", description: "Keep the prompt dense and fast." },
-              { label: "Guided", description: "Use more explanatory copy." },
-            ],
-          },
-          {
-            header: "Details",
-            question: "What should stay visible while answering?",
-            multiple: true,
-            custom: false,
-            options: [
-              { label: "Tool name", description: "Show the requested action." },
-              { label: "Payload", description: "Show the full request payload." },
-            ],
-          },
-        ],
-      },
-    })];
-    snapshot.sessions.timelines["session-question"] = timeline;
-
-    renderWithAppState(() => <SessionsRouteWithRouter />, {
-      commands,
-      routePath: "/sessions/session-question",
-      snapshot,
-    });
-
-    const prompt = screen.getByLabelText("Question prompt");
-    expect(within(prompt).getByText("Question")).toBeTruthy();
-    expect(within(prompt).getByText("Direction")).toBeTruthy();
-    expect(within(prompt).getByText("Which visual direction should the prompt take?")).toBeTruthy();
-    expect(within(prompt).getByText("Compact")).toBeTruthy();
-    expect(within(prompt).getByText("Keep the prompt dense and fast.")).toBeTruthy();
-    expect(within(prompt).getByText("Details")).toBeTruthy();
-    expect(within(prompt).getByText("Payload")).toBeTruthy();
-    expect(within(prompt).getByText("Custom answer")).toBeTruthy();
-
-    fireEvent.click(inputForOption(prompt, "Compact"));
-    fireEvent.click(inputForOption(prompt, "Payload"));
-    fireEvent.input(within(prompt).getByLabelText("Custom answer"), { target: { value: "Make it calmer." } });
-    fireEvent.click(within(prompt).getByText("Resume session"));
-
-    await waitFor(() => expect(commands).toContainEqual({
-      type: "respondExternalRequest",
-      sessionId: "session-question",
-      requestId: "question-1",
-      responseJson: JSON.stringify({
-        answers: [
-          { header: "Direction", selections: ["Compact"], custom: "Make it calmer." },
-          { header: "Details", selections: ["Payload"] },
-        ],
-      }),
-    }));
   });
 
   test("delete failure keeps the session visible and shows the error", async () => {
@@ -2697,22 +2373,17 @@ function routineSummary(
   sourceSessionId: string | null,
 ): ClientRoutineInvocationSummary {
   return {
-    admissionSequence: 1n,
+    version: 2, admissionSequence: "1", ownership: "detached", snapshot: null, result: null, textResults: [], binaryResults: [], helpers: [], observationRevision: "1",
     invocationId,
     routineName,
     routineRevision: "revision-1",
     triggerName: "manual",
     triggerKind: "manual",
     correlationId: invocationId,
-    metadata: sourceSessionId ? { "waltr.routine.source_session_id": sourceSessionId } : {},
-    sourceCursor: null,
+    sourceSession: sourceSessionId,
     status,
     admittedAtMs: 1_700_000_000_000n,
-    startedAtMs: null,
-    completedAtMs: null,
     updatedAtMs: 1_700_000_000_000n,
-    terminalError: null,
-    latestSequence: 1n,
   };
 }
 
@@ -2787,41 +2458,7 @@ function progress(
 function capabilities(overrides: Partial<SessionCapabilitiesView> = {}): SessionCapabilitiesView {
   return {
     promptDisposition: "immediate",
-    canRespondExternalRequest: false,
     canInterrupt: false,
     ...overrides,
   };
-}
-
-function externalRequestOpenEvent(options: {
-  sessionId: string;
-  requestId: string;
-  kind: 1 | 2;
-  payload: unknown;
-}): ProjectedTimelineEntryView {
-  return timelineEvent({
-    sessionId: options.sessionId,
-    itemId: "i1",
-    kind: "externalRequestOpened",
-    channel: "external_request",
-    content: {
-      kind: "externalRequest",
-      request: {
-        id: options.requestId,
-        kind: options.kind,
-        payloadJson: JSON.stringify(options.payload),
-      },
-    },
-    status: "awaitingExternalInput",
-  });
-}
-
-function inputForOption(root: HTMLElement, text: string) {
-  const label = within(root).getByText(text).closest("label");
-  const input = label?.querySelector("input");
-  if (!input) {
-    throw new Error(`missing input for option ${text}`);
-  }
-
-  return input;
 }

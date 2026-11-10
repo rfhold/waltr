@@ -11,6 +11,8 @@ import type {
 
 import { nativeDictation } from "./native-dictation";
 import type { DictationHost } from "./dictation";
+import { nativeMedia } from "./native-media";
+import type { MediaBridge } from "./media";
 
 const BRIDGE_EVENT = "waltr://bridge";
 
@@ -56,6 +58,9 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   let currentSnapshot: ClientSnapshot | undefined;
   let dictation: DictationHost | undefined;
   let dictationSupported = false;
+  let media: MediaBridge | undefined;
+  let mediaSupported = false;
+  const mediaFor = (id: number) => mediaSupported ? nativeMedia(api.invoke, id, () => !disposed && generation === id && announcedGeneration === id) : undefined;
   let generation: number | undefined;
   let announcedGeneration: number | undefined;
   let sequence = -1;
@@ -121,6 +126,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
       dictation?.dispose();
       publishDiagnostic(undefined);
       generation = event.generation;
+      media = mediaFor(generation);
       dictation = dictationSupported ? nativeDictation(api.invoke, generation) : undefined;
       announcedGeneration = event.generation;
       sequence = -1;
@@ -159,12 +165,14 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         return;
       }
 
-      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown; dictation?: boolean }>("start_runtime", { serverId });
+      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown; dictation?: boolean; routineMedia?: boolean }>("start_runtime", { serverId });
       if (disposed) {
         await api.invoke("dispose_runtime", { generation: runtime.generation });
         return;
       }
       generation = runtime.generation;
+      mediaSupported = runtime.routineMedia === true;
+      media = mediaFor(generation);
       dictationSupported = runtime.dictation === true;
       dictation = dictationSupported ? nativeDictation(api.invoke, generation) : undefined;
       acceptNativeAppsBootstrap(runtime.nativeApps);
@@ -207,6 +215,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   return {
     snapshot: () => currentSnapshot,
     get dictation() { return dictation; },
+    get media() { return media; },
     dictationPreferenceScope: `native:${serverId ?? "local"}`,
     start,
     subscribe: (listener) => {
