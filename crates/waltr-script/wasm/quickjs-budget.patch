@@ -1,0 +1,58 @@
+--- build/quickjs/quickjs-amalgam.c
++++ build/quickjs/quickjs-amalgam.c
+@@ -12830,5 +12830,7 @@
+     s = &rt->malloc_state;
+     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
+-    if (unlikely(s->malloc_size + (count * size) > s->malloc_limit - 1))
++    if (unlikely(s->malloc_size + (count * size) > s->malloc_limit - 1)) {
++        waltr_budget_event(WALTR_BUDGET_HEAP);
+         return NULL;
++    }
+ 
+@@ -12853,5 +12855,7 @@
+     s = &rt->malloc_state;
+     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
+-    if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
++    if (unlikely(s->malloc_size + size > s->malloc_limit - 1)) {
++        waltr_budget_event(WALTR_BUDGET_HEAP);
+         return NULL;
++    }
+ 
+@@ -12900,5 +12904,7 @@
+     s = &rt->malloc_state;
+     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
+-    if (s->malloc_size + size - old_size > s->malloc_limit - 1)
++    if (s->malloc_size + size - old_size > s->malloc_limit - 1) {
++        waltr_budget_event(WALTR_BUDGET_HEAP);
+         return NULL;
++    }
+ 
+@@ -13144,6 +13150,8 @@
+ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
+ {
+     uintptr_t sp;
+     sp = js_get_stack_pointer() - alloca_size;
+-    return unlikely(sp < rt->stack_limit);
++    bool overflow = unlikely(sp < rt->stack_limit);
++    if (overflow) waltr_budget_event(WALTR_BUDGET_STACK);
++    return overflow;
+ }
+@@ -13960,12 +13968,8 @@
+ static void update_stack_limit(JSRuntime *rt)
+ {
+-#if defined(__wasi__)
+-    rt->stack_limit = 0; /* no limit */
+-#else
+     if (rt->stack_size == 0) {
+         rt->stack_limit = 0; /* no limit */
+     } else {
+         rt->stack_limit = rt->stack_top - rt->stack_size;
+     }
+-#endif
+ }
+@@ -19387,4 +19391,5 @@
+ JSValue JS_ThrowOutOfMemory(JSContext *ctx)
+ {
+     JSRuntime *rt = ctx->rt;
++    waltr_budget_event(WALTR_BUDGET_ALLOCATION);
+     if (!rt->in_out_of_memory) {
