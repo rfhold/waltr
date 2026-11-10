@@ -243,6 +243,11 @@ impl McpConnection {
             .await
     }
 
+    /// Wait for explicit shutdown or terminal transport closure.
+    pub(crate) async fn closed(&self) {
+        self.dispatch_cancellation.cancelled().await;
+    }
+
     /// Shutdown the underlying transport.
     pub async fn shutdown(&self) -> Result<()> {
         let result = self.transport.shutdown().await;
@@ -342,9 +347,11 @@ async fn dispatch_loop(
             TransportInbound::Disconnected(error) => {
                 fail_pending(&pending, &error).await;
                 handler.disconnected(error);
+                cancellation.cancel();
             }
         }
     }
+    cancellation.cancel();
 }
 
 async fn fail_pending_with_bearer_provider(

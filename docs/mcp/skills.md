@@ -1,7 +1,7 @@
 # MCP Skills
 
 The generic `mcp` crate implements the official `io.modelcontextprotocol/skills` extension.
-Waltr's session activation and permissions belong in [agent MCP integration](../agent/mcp.md#mcp-skills).
+Waltr's session activation and permissions belong in [server MCP integration](../agent-host/mcp.md#mcp-skills).
 
 ## Protocol Surface
 

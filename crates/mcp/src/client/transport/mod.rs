@@ -55,6 +55,7 @@ pub struct McpTransportOptions {
     limits: McpTransportLimits,
     bearer_provider: Option<Arc<dyn McpBearerProvider>>,
     streamable_http_client: Option<reqwest::Client>,
+    redact_endpoint: bool,
 }
 
 impl fmt::Debug for McpTransportOptions {
@@ -62,6 +63,7 @@ impl fmt::Debug for McpTransportOptions {
         formatter
             .debug_struct("McpTransportOptions")
             .field("limits", &self.limits)
+            .field("redact_endpoint", &self.redact_endpoint)
             .field("has_bearer_provider", &self.bearer_provider.is_some())
             .field(
                 "has_streamable_http_client",
@@ -92,6 +94,14 @@ impl McpTransportOptions {
         self.streamable_http_client = Some(client);
         self
     }
+
+    /// Hide the HTTP endpoint in transport spans, runtime Debug, and reqwest errors.
+    /// Defaults to false. This does not filter server payloads or third-party tracing.
+    #[must_use]
+    pub const fn with_endpoint_redaction(mut self, enabled: bool) -> Self {
+        self.redact_endpoint = enabled;
+        self
+    }
 }
 
 impl Default for McpTransportOptions {
@@ -100,6 +110,7 @@ impl Default for McpTransportOptions {
             limits: McpTransportLimits::default(),
             bearer_provider: None,
             streamable_http_client: None,
+            redact_endpoint: false,
         }
     }
 }
@@ -347,16 +358,19 @@ impl McpTransport {
             McpTransportConfig::StreamableHttp {
                 endpoint,
                 bearer_token,
-            } => Ok(Self::StreamableHttp(StreamableHttpTransport::new(
-                endpoint,
-                bearer_token,
-                options.bearer_provider,
-                options
-                    .streamable_http_client
-                    .unwrap_or_else(reqwest::Client::new),
-                inbound,
-                options.limits,
-            ))),
+            } => Ok(Self::StreamableHttp(
+                StreamableHttpTransport::new(
+                    endpoint,
+                    bearer_token,
+                    options.bearer_provider,
+                    options
+                        .streamable_http_client
+                        .unwrap_or_else(reqwest::Client::new),
+                    inbound,
+                    options.limits,
+                )
+                .with_endpoint_redaction(options.redact_endpoint),
+            )),
         }
     }
 

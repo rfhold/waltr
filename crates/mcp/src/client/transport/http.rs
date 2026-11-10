@@ -36,13 +36,14 @@ pub struct StreamableHttpTransport {
     readers: Mutex<JoinSet<()>>,
     shutting_down: AtomicBool,
     limits: McpTransportLimits,
+    redact_endpoint: bool,
 }
 
 impl std::fmt::Debug for StreamableHttpTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StreamableHttpTransport")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &self.diagnostic_endpoint())
             .finish_non_exhaustive()
     }
 }
@@ -68,6 +69,20 @@ impl StreamableHttpTransport {
             readers: Mutex::new(JoinSet::new()),
             shutting_down: AtomicBool::new(false),
             limits,
+            redact_endpoint: false,
+        }
+    }
+
+    pub(super) fn with_endpoint_redaction(mut self, enabled: bool) -> Self {
+        self.redact_endpoint = enabled;
+        self
+    }
+
+    fn diagnostic_endpoint(&self) -> &str {
+        if self.redact_endpoint {
+            "<redacted>"
+        } else {
+            &self.endpoint
         }
     }
 
@@ -140,7 +155,7 @@ impl StreamableHttpTransport {
         let span = tracing::info_span!(
             "http.client.request",
             http_request_method = "POST",
-            server_address = %self.endpoint,
+            server_address = %self.diagnostic_endpoint(),
             client = "mcp",
             http_response_status_code = tracing::field::Empty,
             rpc.system = "jsonrpc",
@@ -154,7 +169,7 @@ impl StreamableHttpTransport {
         let response = tokio::select! {
             () = request_cancelled(request_cancellation) => return Err(Error::protocol("MCP request canceled")),
             () = self.cancellation.cancelled() => return Err(Error::protocol("MCP HTTP transport is shutting down")),
-            response = builder.send().instrument(span.clone()) => response?,
+            response = builder.send().instrument(span.clone()) => response.map_err(|error| transport_http_error(error, self.redact_endpoint))?,
         };
         span.record("http_response_status_code", response.status().as_u16());
         if matches!(
@@ -189,6 +204,7 @@ impl StreamableHttpTransport {
             let shutdown = self.cancellation.clone();
             let request_cancel = request_cancellation.cloned();
             let limits = self.limits;
+            let redact_endpoint = self.redact_endpoint;
             {
                 let mut readers = self.readers.lock().await;
                 while readers.try_join_next().is_some() {}
@@ -203,13 +219,19 @@ impl StreamableHttpTransport {
                         request_cancel,
                         request_json_rpc_id,
                         limits,
+                        redact_endpoint,
                     )
                     .await;
                 });
             }
             return Ok(());
         }
-        let body = collect_body_bounded(response, self.limits.max_message_bytes).await?;
+        let body = collect_body_bounded(
+            response,
+            self.limits.max_message_bytes,
+            self.redact_endpoint,
+        )
+        .await?;
         let inbound = parse_json_rpc_message(serde_json::from_slice(&body)?)?;
         self.inbound
             .send(TransportInbound::Message(inbound))
@@ -254,6 +276,7 @@ async fn read_sse(
     request_cancel: Option<CancellationToken>,
     request_id: Option<JsonRpcId>,
     limits: McpTransportLimits,
+    redact_endpoint: bool,
 ) {
     let mut body = response.bytes_stream();
     let mut decoder = SseDecoder::with_limits(limits.max_sse_line_bytes, limits.max_message_bytes);
@@ -266,7 +289,7 @@ async fn read_sse(
         };
         let Some(chunk) = chunk else { break };
         let frames = match chunk
-            .map_err(Error::from)
+            .map_err(|error| transport_http_error(error, redact_endpoint))
             .and_then(|chunk| decoder.push(&chunk))
         {
             Ok(frames) => frames,
@@ -345,11 +368,12 @@ fn report_stream_error(inbound: &InboundSender, error: &Error) {
 async fn collect_body_bounded(
     response: reqwest::Response,
     max_message_bytes: usize,
+    redact_endpoint: bool,
 ) -> Result<Vec<u8>> {
     let mut body = response.bytes_stream();
     let mut collected = Vec::new();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|error| transport_http_error(error, redact_endpoint))?;
         let next = collected
             .len()
             .checked_add(chunk.len())
@@ -359,6 +383,15 @@ async fn collect_body_bounded(
         collected.extend_from_slice(&chunk);
     }
     Ok(collected)
+}
+
+fn transport_http_error(error: reqwest::Error, redact_endpoint: bool) -> Error {
+    if redact_endpoint {
+        // Reqwest's source Debug can retain a socket address even after without_url().
+        Error::protocol(error.without_url().to_string())
+    } else {
+        error.into()
+    }
 }
 
 fn authorization_error(response: &reqwest::Response) -> McpAuthorizationError {
@@ -379,5 +412,217 @@ async fn request_cancelled(cancellation: Option<&CancellationToken>) {
     match cancellation {
         Some(cancellation) => cancellation.cancelled().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Write, sync::Mutex as StdMutex, time::Duration};
+    use tokio::sync::mpsc;
+
+    static TRACE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Clone, Default)]
+    struct Output(Arc<StdMutex<Vec<u8>>>);
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Output {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+    fn message() -> Value {
+        serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"ping", "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":MCP_PROTOCOL_VERSION}}})
+    }
+
+    #[tokio::test]
+    async fn endpoint_redaction_preserves_default_spans_and_removes_reqwest_urls() {
+        let _serial = TRACE_SERIAL.lock().await;
+        for redacted in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/private-endpoint", listener.local_addr().unwrap());
+            drop(listener);
+            let (tx, _) = mpsc::unbounded_channel();
+            let mut options = super::super::McpTransportOptions::default()
+                .with_streamable_http_client(
+                    reqwest::Client::builder().no_proxy().build().unwrap(),
+                );
+            if redacted {
+                options = options.with_endpoint_redaction(true);
+            }
+            let super::super::McpTransport::StreamableHttp(transport) =
+                super::super::McpTransport::start_with_options(
+                    "privacy-test".into(),
+                    super::super::McpTransportConfig::StreamableHttp {
+                        endpoint: endpoint.clone(),
+                        bearer_token: Some("private-bearer".into()),
+                    },
+                    tx,
+                    options,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected HTTP transport");
+            };
+            let output = Output::default();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_span_events(
+                    tracing_subscriber::fmt::format::FmtSpan::NEW
+                        | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                )
+                .with_writer(output.clone())
+                .finish();
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            let error =
+                tokio::time::timeout(Duration::from_secs(2), transport.send(message(), None, &[]))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+            let diagnostics = format!("{transport:?} {error} {error:?}");
+            let spans = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(diagnostics.contains(&endpoint), !redacted);
+            if redacted {
+                let address = url::Url::parse(&endpoint).unwrap().authority().to_owned();
+                assert!(
+                    !diagnostics.contains(&address),
+                    "redacted errors must not retain socket authority"
+                );
+            }
+            assert_eq!(
+                spans.contains(&endpoint),
+                !redacted,
+                "captured spans: {spans}; error: {error}"
+            );
+            assert!(spans.contains("http.client.request"));
+            assert!(spans.contains("rpc.method=ping"));
+            assert!(spans.contains("mcp.request_id=\"1\""));
+            assert!(!format!("{diagnostics} {spans}").contains("private-bearer"));
+            if redacted {
+                assert!(spans.contains("<redacted>"));
+            }
+            transport.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_redaction_removes_body_and_sse_error_urls() {
+        let _serial = TRACE_SERIAL.lock().await;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for sse in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/private-endpoint", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                socket.read(&mut bytes).await.unwrap();
+                let content_type = if sse {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nx").as_bytes()).await.unwrap();
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let transport = StreamableHttpTransport::new(
+                endpoint.clone(),
+                None,
+                None,
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                tx,
+                McpTransportLimits::default(),
+            )
+            .with_endpoint_redaction(true);
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), transport.send(message(), None, &[]))
+                    .await
+                    .unwrap();
+            let diagnostic = if sse {
+                result.unwrap();
+                format!(
+                    "{:?}",
+                    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+            } else {
+                let error = result.unwrap_err();
+                format!("{error} {error:?}")
+            };
+            assert!(!diagnostic.contains(&endpoint));
+            assert!(diagnostic.contains("body") || diagnostic.contains("decode"));
+            transport.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_redaction_retains_success_status_method_and_request_id() {
+        let _serial = TRACE_SERIAL.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let cancel = CancellationToken::new();
+        let stopping = cancel.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/mcp",
+                    axum::routing::post(|| async { axum::http::StatusCode::ACCEPTED }),
+                ),
+            )
+            .with_graceful_shutdown(stopping.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        let (tx, _) = mpsc::unbounded_channel();
+        let transport = StreamableHttpTransport::new(
+            endpoint.clone(),
+            None,
+            None,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            tx,
+            McpTransportLimits::default(),
+        )
+        .with_endpoint_redaction(true);
+        let output = Output::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(output.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message(), None, &[]))
+            .await
+            .unwrap()
+            .unwrap();
+        let spans = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(spans.contains("http_response_status_code=202"));
+        assert!(spans.contains("rpc.method=ping"));
+        assert!(spans.contains("mcp.request_id=\"1\""));
+        assert!(spans.contains("server_address=<redacted>"));
+        assert!(!spans.contains(&endpoint));
+        transport.shutdown().await.unwrap();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

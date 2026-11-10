@@ -12,4 +12,4 @@ The Apps authoring guide is an explicit Waltr-specific repository workflow, not 
 | [protocol.md](protocol.md) | Generic `mcp` crate boundaries, typed client/server APIs, transports, protected resources, hosted OAuth/DCR/CIMD, optional one-shot resource-owner OIDC, persistence, revocation leases, shutdown, and tests. |
 | [tracing.md](tracing.md) | MCP request spans, server metrics and lifecycle outcomes, trace context propagation, and telemetry fields. |
 
-For Waltr agent session integration on top of the generic crate, see [../agent/mcp.md](../agent/mcp.md).
+For server-owned session integration, see [Server MCP integration](../agent-host/mcp.md).

@@ -6,6 +6,8 @@ mod capabilities;
 /// MCP client connection and transport helpers.
 pub mod client;
 mod error;
+/// Typed MRTR form and URL elicitation contracts.
+pub mod elicitation;
 mod http_headers;
 mod log;
 /// MCP OAuth protected-resource discovery and bearer-token validation helpers.
@@ -34,6 +36,10 @@ pub use capabilities::{
     McpPromptsCapability, McpResourcesCapability, McpServerCapabilities, McpToolsCapability,
 };
 pub use error::{Error, Result};
+pub use elicitation::{
+    McpElicitationAction, McpElicitationCapabilities, McpElicitationFuture,
+    McpElicitationRequest, McpElicitationResponse, McpElicitationSchema, McpElicitationValue,
+};
 pub use log::McpLogLevel;
 #[cfg(feature = "macros")]
 pub use mcp_macros::mcp_server;

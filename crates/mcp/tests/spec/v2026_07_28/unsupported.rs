@@ -84,7 +84,7 @@ async fn unsupported_methods_return_method_not_found() -> mcp::Result<()> {
 }
 
 #[tokio::test]
-async fn client_rejects_non_roots_mrtr_input_requests() -> mcp::Result<()> {
+async fn client_rejects_sampling_and_unadvertised_elicitation_inputs() -> mcp::Result<()> {
     for method in ["sampling/createMessage", "elicitation/create"] {
         let app = Router::new()
             .route("/mcp", post(non_roots_mrtr_server))
@@ -112,7 +112,7 @@ async fn client_rejects_non_roots_mrtr_input_requests() -> mcp::Result<()> {
                 cancellation,
             )
             .await
-            .expect_err("non-roots MRTR must fail");
+            .expect_err("unsupported or unadvertised MRTR must fail");
         assert!(
             error.to_string().contains("unsupported MCP input request"),
             "unexpected error for {method}: {error}"

@@ -33,7 +33,7 @@ event IDs, ping, global logging levels, or task-core shapes removed by `2026-07-
 | Global `logging/setLevel` | `transport.rs` | Removed and explicitly returns method-not-found. |
 | Logging notification fields and filtering | `server_utilities/logging.rs` | Adapted to request-scoped log-level metadata. |
 | Roots client capability and server-initiated request | `client.rs` | Replaced by roots-only MRTR input/retry state. |
-| Sampling and elicitation placeholders | `unsupported.rs` | Still unsupported; capabilities/methods and non-roots MRTR are executable failures. |
+| Sampling and elicitation placeholders | `unsupported.rs`, `elicitation.rs` | Sampling and unadvertised elicitation fail explicitly; opt-in form/URL elicitation uses keyed MRTR input requests. |
 | Task capability and execution shapes | `unsupported.rs` | Removed; capability omission and task methods are executable failures. |
 | List-change delivery | `subscriptions.rs` | Expanded with acknowledgment ordering, filter negotiation, correlation IDs, and completion. |
 | Content block variants | `common/content.rs` | Preserved for text, image, audio, links, and embedded text/blob resources. |

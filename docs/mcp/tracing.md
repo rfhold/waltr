@@ -33,6 +33,21 @@ Each typed client request runs inside an `mcp.client.request` span from [../../c
 
 Stdio cancellation and timeout paths send `notifications/cancelled`. Streamable HTTP cancellation closes only the affected request response stream.
 
+## HTTP Endpoint Privacy
+
+`McpTransportOptions::with_endpoint_redaction(true)` opts into endpoint privacy for one Streamable HTTP transport.
+The default is `false`; ordinary transports retain their current endpoint spans and HTTP errors.
+
+With redaction, `http.client.request.server_address` and transport runtime Debug use `<redacted>`.
+Method, request ID, response status, trace propagation, cancellation, and transport event shapes retain their current behavior.
+Reqwest failures first discard their URL through `without_url()`.
+The transport then retains only the URL-free display message as `Error::Protocol`, not reqwest's source chain.
+That source chain can retain a socket address even after URL removal.
+The same rule covers request, response-body, and SSE-body failures.
+
+This option does not filter remote response payloads, caller-owned configuration values, or arbitrary third-party tracing subscribers.
+It does not install a subscriber or disable tracing globally.
+
 ## Server Span
 
 Each inbound server request or notification runs inside an `mcp.server.request` span from [../../crates/mcp/src/server/mod.rs](../../crates/mcp/src/server/mod.rs).

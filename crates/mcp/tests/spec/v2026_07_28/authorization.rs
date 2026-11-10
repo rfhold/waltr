@@ -66,6 +66,260 @@ impl ServerHandler for AuthorizationServer {
 
 struct AuthorizationClient;
 
+#[derive(Clone)]
+struct HostMarker(&'static str);
+struct HostExtensionServer;
+impl ServerHandler for HostExtensionServer {
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo::new("host-extension", "1")
+    }
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities::new().tools()
+    }
+    fn list_tools(
+        &self,
+        _: Option<String>,
+        context: ServerContext,
+    ) -> BoxFuture<ServerResult<McpToolList>> {
+        assert_eq!(
+            context.host_extension::<HostMarker>().unwrap().0,
+            "trusted-host-value"
+        );
+        assert!(
+            context.authorization().is_none(),
+            "host context is not hosted OAuth authority"
+        );
+        Box::pin(async {
+            Ok(McpToolList {
+                tools: vec![],
+                next_cursor: None,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn trusted_http_host_extension_cannot_be_supplied_by_metadata() -> mcp::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    let router = streamable_http_router_with_options(
+        Arc::new(HostExtensionServer),
+        StreamableHttpOptions::default(),
+    )
+    .layer(axum::Extension(HostMarker("trusted-host-value")));
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await
+            .unwrap()
+    });
+    let mut params = modern_params(json!({}));
+    params["_meta"]["hostMarker"] = json!("forged-value");
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "tools/list")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params}))
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+    drop(response.text().await?);
+    stop.cancel();
+    task.await.unwrap();
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_metadata_does_not_create_origin_authority() -> mcp::Result<()> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (client, server) = tokio::io::duplex(65536);
+    let (read, write) = tokio::io::split(server);
+    let task = tokio::spawn(mcp::server::serve_stream(
+        Arc::new(OriginCapture {
+            captured: std::sync::Mutex::new(Some(sender)),
+        }),
+        read,
+        write,
+    ));
+    let (read, mut write) = tokio::io::split(client);
+    let mut responses = tokio::io::BufReader::new(read).lines();
+    let mut params = modern_params(json!({}));
+    params["_meta"]["principal_id"] = json!("forged-origin");
+    write
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let response: Value = serde_json::from_str(&responses.next_line().await?.unwrap())?;
+    assert!(response.get("result").is_some());
+    assert!(receiver.await.unwrap().is_none());
+    drop(write);
+    drop(responses);
+    task.await.unwrap()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unprotected_http_metadata_does_not_create_origin_authority() -> mcp::Result<()> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    let router = streamable_http_router_with_options(
+        Arc::new(OriginCapture {
+            captured: std::sync::Mutex::new(Some(sender)),
+        }),
+        StreamableHttpOptions::default(),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut params = modern_params(json!({}));
+    params["_meta"]["principal_id"] = json!("forged-origin");
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "tools/list")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params}))
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+    drop(response.text().await?);
+    assert!(receiver.await.unwrap().is_none());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    Ok(())
+}
+
+struct OriginCapture {
+    captured: std::sync::Mutex<
+        Option<tokio::sync::oneshot::Sender<Option<mcp::server::McpTokenAuthorization>>>,
+    >,
+}
+
+impl ServerHandler for OriginCapture {
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo::new("origin-capture", "1")
+    }
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities::new().tools()
+    }
+    fn list_tools(
+        &self,
+        _: Option<String>,
+        context: ServerContext,
+    ) -> BoxFuture<ServerResult<McpToolList>> {
+        let proof = context.authorization().cloned();
+        assert!(context.host_extension::<HostMarker>().is_none());
+        assert!(!format!("{context:?}").contains("SECRET_ORIGIN_BEARER"));
+        if let Some(sender) = self.captured.lock().unwrap().take() {
+            sender.send(proof).unwrap();
+        }
+        Box::pin(async {
+            Ok(McpToolList {
+                tools: vec![],
+                next_cursor: None,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn validated_origin_cannot_be_spoofed_and_outlives_the_response() -> mcp::Result<()> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let server = AuthorizedSpecServer::start_with_handler(
+        Arc::new(OriginCapture {
+            captured: std::sync::Mutex::new(Some(sender)),
+        }),
+        |token, _| {
+            Box::pin(async move {
+                assert_eq!(token.0, "SECRET_ORIGIN_BEARER");
+                McpTokenValidation::Authorized {
+                    principal_id: McpPrincipalId::new("validated-origin").unwrap(),
+                    expires_at: Some(SystemTime::now() + Duration::from_millis(500)),
+                }
+            })
+        },
+    )
+    .await?;
+    let mut params = modern_params(json!({}));
+    params["_meta"]["principal_id"] = json!("forged-origin");
+    params["_meta"]["authorization"] = json!({"principal_id":"forged-origin", "expires_at":null});
+    let response = reqwest::Client::new()
+        .post(&server.endpoint)
+        .header("authorization", "Bearer SECRET_ORIGIN_BEARER")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "tools/list")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params}))
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+    let body = response.text().await?;
+    assert!(body.contains("result"));
+    let proof = receiver.await.unwrap().unwrap();
+    assert_eq!(proof.principal_id.as_str(), "validated-origin");
+    assert!(!format!("{proof:?}").contains("SECRET_ORIGIN_BEARER"));
+    tokio::time::timeout(Duration::from_secs(2), proof.ended())
+        .await
+        .expect("original expiry retained after response");
+    server._task.abort();
+    assert!(server._task.await.unwrap_err().is_cancelled());
+    Ok(())
+}
+
+#[cfg(feature = "oauth-authorization-server")]
+#[tokio::test]
+async fn owned_origin_retains_original_revocation_after_waiter_drop() -> mcp::Result<()> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (revoked, notifications) = tokio::sync::watch::channel(0_u64);
+    let server = AuthorizedSpecServer::start_hosted_with_handler(
+        Arc::new(OriginCapture {
+            captured: std::sync::Mutex::new(Some(sender)),
+        }),
+        move |_, _| {
+            let notifications = notifications.clone();
+            Box::pin(async move {
+                McpHostedTokenValidation::Authorized(McpTokenAuthorization {
+                    principal_id: McpPrincipalId::new("original-revocable-origin").unwrap(),
+                    expires_at: None,
+                    revocation: Some(McpRevocationLease::new(
+                        || Box::pin(async { Ok(false) }),
+                        Duration::from_secs(60),
+                        notifications,
+                    )),
+                })
+            })
+        },
+    )
+    .await?;
+    let response = reqwest::Client::new().post(&server.endpoint)
+        .header("authorization", "Bearer SECRET_ORIGIN_BEARER")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "tools/list")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":modern_params(json!({}))}))
+        .send().await?;
+    assert!(response.status().is_success());
+    drop(response);
+    let proof = receiver.await.unwrap().unwrap();
+    let abandoned = proof.ended();
+    drop(abandoned);
+    revoked.send(1).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), proof.ended())
+        .await
+        .expect("same original revocation retained");
+    server._task.abort();
+    assert!(server._task.await.unwrap_err().is_cancelled());
+    Ok(())
+}
+
 impl McpClientHandler for AuthorizationClient {}
 
 #[tokio::test]

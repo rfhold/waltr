@@ -18,7 +18,7 @@ Tests here serve generic MCP protocol consumers and ecosystem compatibility, not
 - Keep spec tests grouped under the single supported protocol revision, currently `spec/v2026_07_28/`.
 - Keep shared spec helpers minimal and protocol-focused.
 - Use ecosystem tests for compatibility with crates such as `rmcp`; do not use ecosystem dependencies in runtime code.
-- Cover list-change subscriptions and preserve explicit assertions that resource URI subscriptions, sampling, elicitation, and task runtime extensions are unsupported.
+- Cover list-change subscriptions and opt-in form/URL elicitation through MRTR. Preserve explicit assertions that resource URI subscriptions, sampling, unadvertised elicitation modes, and task runtime extensions are unsupported.
 
 # Hints
 

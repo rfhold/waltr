@@ -3,6 +3,7 @@ mod authorization;
 mod basic;
 mod client;
 mod common;
+mod elicitation;
 mod oauth_protocol;
 mod protocol;
 mod request_sse;

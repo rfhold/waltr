@@ -250,6 +250,8 @@ pub type ServerResult<T> = std::result::Result<T, ServerError>;
 /// Per-request server context.
 #[derive(Clone)]
 pub struct ServerContext {
+    host_extensions: axum::http::Extensions,
+    authorization: Option<McpTokenAuthorization>,
     sender: NotificationSender,
     request_id: Option<JsonRpcId>,
     request_meta: Option<serde_json::Map<String, Value>>,
@@ -280,6 +282,21 @@ impl std::fmt::Debug for ServerContext {
 }
 
 impl ServerContext {
+    /// Return a typed extension installed by trusted HTTP host middleware, never request metadata.
+    /// Stdio contexts contain no host extensions. This does not establish OAuth identity.
+    #[must_use]
+    pub fn host_extension<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.host_extensions.get::<T>()
+    }
+    /// Return authority validated by this request's HTTP token authorizer.
+    ///
+    /// Absent on unauthenticated HTTP and stdio. Request metadata cannot set this proof.
+    /// Clone the proof to retain the original credential lifetime after the response ends.
+    #[must_use]
+    pub const fn authorization(&self) -> Option<&McpTokenAuthorization> {
+        self.authorization.as_ref()
+    }
+
     /// Return the current request id, if this context belongs to a request.
     #[must_use]
     pub const fn request_id(&self) -> Option<&JsonRpcId> {
@@ -327,6 +344,55 @@ impl ServerContext {
     #[must_use]
     pub fn request_state(&self) -> Option<&str> {
         self.request_state.as_deref()
+    }
+
+    /// Decode elicitation modes advertised on this request, never from prior requests.
+    pub fn elicitation_capabilities(&self) -> ServerResult<crate::McpElicitationCapabilities> {
+        crate::McpElicitationCapabilities::parse(
+            self.client_capabilities.as_ref().unwrap_or(&Value::Null),
+        )
+        .map_err(|error| ServerError::invalid_params(error.to_string()))
+    }
+
+    /// Build an MRTR result before performing the operation's side effects.
+    /// The handler must bind/verify state and resume its continuation on the next request;
+    /// this helper does not persist state, deduplicate execution, or authorize user data.
+    pub fn elicitation_required(
+        &self,
+        key: &str,
+        request: &crate::McpElicitationRequest,
+        request_state: Option<&str>,
+    ) -> ServerResult<Value> {
+        if !self.elicitation_capabilities()?.supports(request) {
+            return Err(ServerError::invalid_params("MCP elicitation mode was not advertised"));
+        }
+        let input = request.to_input_request()
+            .map_err(|error| ServerError::invalid_params(error.to_string()))?;
+        let mut requests = serde_json::Map::new();
+        requests.insert(key.to_owned(), input);
+        let mut result = json!({ "resultType": "input_required", "inputRequests": requests });
+        if let Some(state) = request_state {
+            result["requestState"] = json!(state);
+        }
+        Ok(result)
+    }
+
+    /// Decode and validate one response against the original requested form or URL mode.
+    /// The caller must first authenticate and validate its continuation state.
+    pub fn elicitation_response(
+        &self,
+        key: &str,
+        request: &crate::McpElicitationRequest,
+    ) -> ServerResult<Option<crate::McpElicitationResponse>> {
+        let Some(value) = self.input_responses.as_ref().and_then(|responses| responses.get(key)) else {
+            return Ok(None);
+        };
+        request.validate().map_err(|error| ServerError::invalid_params(error.to_string()))?;
+        let response = serde_json::from_value(value.clone())
+            .map_err(|error| ServerError::invalid_params(format!("invalid elicitation response: {error}")))?;
+        request.validate_response(&response)
+            .map_err(|error| ServerError::invalid_params(error.to_string()))?;
+        Ok(Some(response))
     }
 
     /// Wait until the transport cancels this request.
@@ -615,6 +681,8 @@ where
     let telemetry = ServerTelemetry::new();
     let stdout: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
     let context = ServerContext {
+        host_extensions: axum::http::Extensions::new(),
+        authorization: None,
         sender: NotificationSender::Stdio(Arc::clone(&stdout)),
         request_id: None,
         request_meta: None,
@@ -798,6 +866,21 @@ impl std::fmt::Debug for McpTokenAuthorization {
             .field("expires_at", &self.expires_at)
             .field("revocation", &self.revocation.is_some())
             .finish()
+    }
+}
+
+impl McpTokenAuthorization {
+    /// Wait for this original credential's expiry or authoritative revocation.
+    ///
+    /// Independent clones retain the same validator and notification source. This
+    /// future owns no spawned task and remains usable after the HTTP response ends.
+    pub async fn ended(&self) {
+        authorized_request_ended(AuthorizedHttpRequest {
+            expires_at: self.expires_at,
+            revocation: self.revocation.clone(),
+            authorization: None,
+        })
+        .await;
     }
 }
 
@@ -1186,6 +1269,8 @@ async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Re
                 span.clone(),
             );
             let context = ServerContext {
+                host_extensions: parts.extensions.clone(),
+                authorization: authorization.authorization.clone(),
                 sender: NotificationSender::Channel(mpsc::channel(1).0),
                 request_id: None,
                 request_meta: Some(meta.raw),
@@ -1213,6 +1298,8 @@ async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Re
             let (sender, receiver) = mpsc::channel(32);
             let cancellation = CancellationToken::new();
             let context = ServerContext {
+                host_extensions: parts.extensions.clone(),
+                authorization: authorization.authorization.clone(),
                 sender: NotificationSender::Channel(sender.clone()),
                 request_id: Some(request.id.clone()),
                 request_meta: Some(meta.raw),
@@ -1625,6 +1712,7 @@ async fn authorize_http_request(
 ) -> std::result::Result<AuthorizedHttpRequest, Response> {
     let Some(authorization) = &state.authorization else {
         return Ok(AuthorizedHttpRequest {
+            authorization: None,
             expires_at: None,
             revocation: None,
         });
@@ -1667,10 +1755,15 @@ async fn authorize_http_request(
     };
     match validation {
         McpHostedTokenValidation::Authorized(McpTokenAuthorization {
-            principal_id: _,
+            principal_id,
             expires_at,
             revocation,
         }) => Ok(AuthorizedHttpRequest {
+            authorization: Some(McpTokenAuthorization {
+                principal_id,
+                expires_at,
+                revocation: revocation.clone(),
+            }),
             expires_at,
             revocation,
         }),
@@ -1697,6 +1790,7 @@ async fn authorize_http_request(
 }
 
 struct AuthorizedHttpRequest {
+    authorization: Option<McpTokenAuthorization>,
     expires_at: Option<SystemTime>,
     revocation: Option<McpRevocationLease>,
 }

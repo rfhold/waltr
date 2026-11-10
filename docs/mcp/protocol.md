@@ -73,6 +73,58 @@ Roots are retained as a deprecated client feature. A server requests roots throu
 or `resources/read` request with a new JSON-RPC ID, exact `requestState`, and keyed
 `inputResponses`.
 
+### Elicitation
+
+Clients opt in through `McpClientOptions::with_elicitation(McpElicitationCapabilities { form, url })`.
+Both modes default to false. Each request advertises exactly the selected modes.
+The capability parser also accepts `elicitation: {}` as implicit form-only support.
+
+`McpClientHandler::elicit(key, request, cancellation_token)` returns `McpElicitationFuture`.
+The callback receives a typed `McpElicitationRequest::Form` or `::Url`.
+It returns `McpElicitationResponse` with `Accept`, `Decline`, or `Cancel` intent.
+Accepted forms include flat typed content; URL responses never include content.
+The client validates required properties, primitive types, enum choices, numeric bounds, and lengths.
+The host owns string-format validation, server identity display, user review, and trust policy.
+Property schema values preserve titles, defaults, and enum labels.
+
+The host must display the full URL before consent.
+The crate never fetches or opens elicitation URLs.
+The host must keep sensitive URL interactions outside the client and model context.
+URL acceptance means consent, not external completion; the callback can await a manual resume action.
+The server determines external completion from its own state when the client submits the continuation.
+
+Elicitation uses keyed `inputRequests` inside `input_required` results, not server-originated JSON-RPC requests.
+The client preserves the original operation parameters and echoes the exact opaque `requestState`.
+Each continuation uses a new JSON-RPC ID and only the current round's keyed `inputResponses`.
+The client never retries complete results, protocol errors, callback errors, or ambiguous transport failures.
+Each operation permits at most 32 network rounds and 32 input requests per round.
+One timeout covers all rounds and user interaction.
+The client validates the entire input batch before it invokes any callback.
+
+Operation cancellation, timeout, connection closure, or explicit shutdown drops the callback future and cancels its token.
+A `Cancel` response instead reports user dismissal and resumes the server continuation.
+The crate starts no detached task for an elicitation callback.
+The host must tie any work it starts to the callback token.
+
+Server handlers use these `ServerContext` methods:
+
+- `elicitation_capabilities()` decodes the current request's advertised modes.
+- `elicitation_required(key, request, request_state)` builds an `input_required` result after mode validation.
+- `elicitation_response(key, request)` decodes and validates a keyed response against the original request.
+
+Handlers wrap the result with `McpToolResult::new`, `McpPromptResult::new`, or `McpResourceResult::new`.
+The helper does not persist state or deduplicate side effects.
+Handlers must verify state integrity, principal, expiry, and operation identity before they resume side effects.
+One-shot operations also need server-side single-use enforcement.
+
+Revision `2026-07-28` defines no `elicitationId`, `notifications/elicitation/complete`, or URL-required error `-32042`.
+The client does not emulate these older mechanisms.
+No server notification cancels an elicitation input request; operation cancellation owns that lifetime.
+See the official [elicitation specification](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation)
+and [MRTR specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr).
+
+### Notifications
+
 List-change notifications use a long-lived `subscriptions/listen` request. The first
 message acknowledges only requested filters that the server actually advertises.
 Every acknowledgment, notification, and graceful final result carries the originating
@@ -111,6 +163,23 @@ compare recognized headers against the request body before executing the tool.
 Origin validation is default-deny when an `Origin` header is present. Bearer tokens are
 resolved independently for every POST. Token expiry or revocation terminates the active
 response stream.
+
+`ServerContext::authorization()` exposes the token authorizer's validated
+`McpTokenAuthorization`, independently of untrusted request `_meta`. It is absent on
+stdio and unprotected HTTP. The proof contains the validated principal identifier,
+original expiry, and optional authoritative revocation lease; it contains no bearer
+bytes. Its `Debug` output does not expose credentials or validator internals.
+
+Handlers may clone this owned proof when admitted host work outlives a response.
+`ServerContext::host_extension<T>()` separately exposes typed extensions installed
+by trusted HTTP host middleware. These are absent on stdio, cannot be populated
+from JSON metadata, and do not create hosted OAuth identity. The embedding host
+owns their validation, authority semantics, and lifetime.
+`McpTokenAuthorization::ended()` waits for that original expiry or revocation,
+including bounded authoritative revalidation. It creates no background task or new
+identity registry. Dropping one waiter does not invalidate another clone. Hosts
+remain responsible for canceling and joining their owned work when access ends;
+the proof grants no application role, tool policy, or session access by itself.
 
 Clients bound JSON responses, SSE lines and events, and stdio messages. Default connections accept
 at most 64 KiB in one SSE line and 1 MiB in one complete message, SSE event, JSON response body, or
@@ -204,10 +273,9 @@ The crate explicitly does not implement:
 
 - resource URI subscriptions and `notifications/resources/updated`
 - sampling input requests
-- elicitation input requests
 - task runtime or task extension methods
 - `resources/directory/read` and the Skills `directoryRead` capability
-- non-roots MRTR input requests
+- MRTR input requests other than roots and explicitly enabled elicitation modes
 - initialize-era lifecycle, ping, or session transport behavior
 
 Unsupported areas are omitted from capabilities and fail explicitly rather than
