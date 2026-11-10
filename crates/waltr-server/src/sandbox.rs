@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 
+use crate::agent_host::sandbox_gateway::{SandboxGateway, SandboxHandle};
 use hyper_util::rt::TokioIo;
-use waltr_agent::sandbox_gateway::{SandboxGateway, SandboxHandle};
 use tokio::{io::DuplexStream, net::UnixListener, sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;
@@ -215,6 +215,18 @@ impl Drop for HealthGuard {
     }
 }
 
+struct LocalWorkerGuard {
+    gateway: SandboxGateway,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for LocalWorkerGuard {
+    fn drop(&mut self) {
+        self.gateway.shutdown();
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 /// One private Tonic service and its local worker.
 pub(crate) struct LocalSandbox {
     gateway: SandboxGateway,
@@ -290,11 +302,15 @@ impl LocalSandbox {
         };
         let worker_alive = alive.clone();
         let worker_stop = stop.clone();
+        let worker_gateway = gateway.clone();
         let mut sandbox = Self {
             gateway,
             server,
             worker: tokio::spawn(async move {
-                let _health = HealthGuard(worker_alive.clone());
+                let _health = LocalWorkerGuard {
+                    gateway: worker_gateway,
+                    alive: worker_alive.clone(),
+                };
                 let result = waltr_agent_sandbox::run_worker_with_shutdown(
                     channel,
                     root,
@@ -388,16 +404,16 @@ mod tests {
     #[cfg(feature = "shell")]
     mod in_flight_reconnect {
         use super::*;
+        use std::{pin::Pin, sync::atomic::AtomicUsize};
+        use tokio::sync::Notify;
+        use tokio_stream::Stream;
+        use tonic::{Request, Response, Status};
         use waltr::grpc::waltr::sandbox::v1::{
             self as proto,
             connect_request::Body as WorkerBody,
             connect_response::Body as HostBody,
             sandbox_service_server::{SandboxService, SandboxServiceServer},
         };
-        use std::{pin::Pin, sync::atomic::AtomicUsize};
-        use tokio::sync::Notify;
-        use tokio_stream::Stream;
-        use tonic::{Request, Response, Status};
 
         struct Session {
             incoming: tonic::Streaming<proto::ConnectRequest>,

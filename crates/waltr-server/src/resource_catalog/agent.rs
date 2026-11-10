@@ -1,6 +1,6 @@
 //! Agent registry compilation.
 
-use waltr_agent::{
+use crate::agent_host::{
     AgentDefinitionCatalog, AgentDefinitionError, AgentDefinitionRegistry,
     AgentDefinitionResourceKind,
 };

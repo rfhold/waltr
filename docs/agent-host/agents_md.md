@@ -1,6 +1,7 @@
 # AGENTS.md
 
-`AGENTS.md` support lets a host add repository instructions to agent prompts without baking those instructions into provider or UI code. Agent prompt middleware owns durable state and optional filesystem-read context; instruction file I/O goes through the private workspace worker. See [agent architecture](../architecture/agent.md#private-workspace-boundary).
+The server adds repository instructions through concrete host middleware. The private workspace worker performs instruction file I/O.
+See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
 
@@ -9,10 +10,10 @@
 | `AGENTS_INSTRUCTION_FILE` | Default instruction filename, `AGENTS.md`. |
 | `AgentsPromptConfig` | Host-provided static instruction roots and optional filename override. |
 | `AgentsInstruction` | Loaded instruction content and source path. |
-| `AgentBuilder::with_agents_system_prompt` | Enables static instruction prompt contribution. |
+| `HostRuntimeBuilder::with_agents_system_prompt` | Enables static instruction prompt contribution. |
 | `FilesystemConfig::with_agents_read_context` | Enables dynamic reminders after filesystem reads. |
 
-The agent crate exposes these APIs through `waltr_agent`, but does not automatically discover repository instructions unless a host opts in.
+The server exposes these APIs through `waltr_server::agent_host`; instruction discovery requires explicit host configuration.
 
 ## Static Prompt Contribution
 
@@ -60,16 +61,16 @@ Focused coverage:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/waltr-agent/src/prompt.rs](../../crates/waltr-agent/src/prompt.rs) | Prompt and instruction configuration types. |
-| [../../crates/waltr-agent/tests/agent/loop.rs](../../crates/waltr-agent/tests/agent/loop.rs) | Deterministic prompt and read-context behavior. |
-| [../../crates/waltr-agent/tests/agent/session.rs](../../crates/waltr-agent/tests/agent/session.rs) | Durable middleware state and resume behavior. |
-| [../../crates/waltr-agent/tests/live/agent/context.rs](../../crates/waltr-agent/tests/live/agent/context.rs) | Ignored live-provider context coverage. |
+| [../../crates/waltr-server/src/agent_host/prompt.rs](../../crates/waltr-server/src/agent_host/prompt.rs) | Prompt and instruction configuration types. |
+| [../../crates/waltr-server/tests/agent_host/loop.rs](../../crates/waltr-server/tests/agent_host/loop.rs) | Prompt and read-context cases. |
+| [../../crates/waltr-server/tests/agent_host/session.rs](../../crates/waltr-server/tests/agent_host/session.rs) | Durable host context cases. |
+| [../../crates/waltr-server/tests/agent_host/live/context.rs](../../crates/waltr-server/tests/agent_host/live/context.rs) | Live-provider context cases. |
 
 ## References
 
 | Path | Purpose |
 | --- | --- |
 | [../../crates/waltr-agent-sandbox/src/tools.rs](../../crates/waltr-agent-sandbox/src/tools.rs) | Worker workspace instruction reads and path resolution. |
-| [../../crates/waltr-agent/src/middleware/agents.rs](../../crates/waltr-agent/src/middleware/agents.rs) | Static instruction middleware and filesystem read-context reminders. |
-| [../../crates/waltr-agent/src/agent/builder.rs](../../crates/waltr-agent/src/agent/builder.rs) | Builder wiring and middleware ordering. |
-| [../../crates/waltr-agent/src/tools/filesystem/config.rs](../../crates/waltr-agent/src/tools/filesystem/config.rs) | Filesystem read-context configuration. |
+| [../../crates/waltr-server/src/agent_host/middleware/agents.rs](../../crates/waltr-server/src/agent_host/middleware/agents.rs) | Instruction context and reminders. |
+| [../../crates/waltr-server/src/agent_host/builder.rs](../../crates/waltr-server/src/agent_host/builder.rs) | Host assembly order. |
+| [../../crates/waltr-server/src/agent_host/tools/filesystem/config.rs](../../crates/waltr-server/src/agent_host/tools/filesystem/config.rs) | Read-context configuration. |

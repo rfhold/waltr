@@ -3,8 +3,6 @@ use crate::support::{
     server::{temp_root, wait_for_health},
 };
 use axum::{Json, Router, extract::State, routing::get};
-use waltr::grpc::waltr::resource::v1::{InspectResourceRequest, ReplaceResourceRequest};
-use waltr_server::persistence::{DatabaseConfig, Persistence};
 use serde_json::{Value, json};
 use sqlx::Connection as _;
 use std::{
@@ -18,6 +16,8 @@ use std::{
     },
     time::Duration,
 };
+use waltr::grpc::waltr::resource::v1::{InspectResourceRequest, ReplaceResourceRequest};
+use waltr_server::persistence::{DatabaseConfig, Persistence};
 
 const OIDC_ENVIRONMENT: &[&str] = &[
     "WALTR_AUTH_MODE",
@@ -508,14 +508,20 @@ async fn assert_process_database_isolation(
         waltr_tables,
         [
             "_sqlx_migrations",
+            "outbound_oauth_attempts",
+            "outbound_oauth_credentials",
+            "script_code_dispatch",
+            "script_invocation_publications",
+            "script_invocations",
+            "script_observation_head",
+            "script_observations",
+            "script_operations",
+            "script_program_revisions",
+            "script_text_result_usage",
+            "script_text_results",
             "waltr_browser_sessions",
             "waltr_mcp_oauth_login_continuations",
             "waltr_oidc_login_attempts",
-            "outbound_oauth_attempts",
-            "outbound_oauth_credentials",
-            "routine_invocation_events",
-            "routine_invocation_metadata",
-            "routine_invocations"
         ]
     );
     assert_eq!(

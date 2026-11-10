@@ -8,9 +8,13 @@ use super::{
     lease::{LeaseMonitor, PrincipalLease, RevocationSignal},
 };
 
-/// The mechanism that established a Waltr access identity.
+/// The mechanism that admitted Waltr access, including explicit anonymous mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationMethod {
+    /// The standalone host explicitly disabled authentication; no identity was validated.
+    AnonymousDisabled,
+    /// A trusted embedding host validated its current process-generation bearer.
+    LocalProcessBearer,
     /// An OIDC ID token established a browser login.
     OidcIdToken,
     /// A JWT bearer access token authenticated an API request.
@@ -19,10 +23,10 @@ pub enum AuthenticationMethod {
     BrowserSession,
 }
 
-/// Authentication evidence attached to an authorized Waltr request.
+/// Access evidence attached to an admitted Waltr request.
 ///
-/// Every instance grants the same effective Waltr access. The evidence is not
-/// an ownership or data-partitioning key.
+/// The legacy type name includes explicit `AnonymousDisabled` admission, which
+/// authenticates nobody. Evidence is not an ownership or data-partitioning key.
 #[derive(Clone)]
 pub struct AuthenticatedPrincipal {
     issuer: String,
@@ -30,6 +34,8 @@ pub struct AuthenticatedPrincipal {
     scopes: BTreeSet<String>,
     method: AuthenticationMethod,
     lease: PrincipalLease,
+    hosted_mcp: Option<std::sync::Arc<mcp::server::McpTokenAuthorization>>,
+    local_generation: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
 }
 
 impl fmt::Debug for AuthenticatedPrincipal {
@@ -41,6 +47,7 @@ impl fmt::Debug for AuthenticatedPrincipal {
             .field("scopes", &self.scopes)
             .field("method", &self.method)
             .field("lease", &self.lease)
+            .field("hosted_mcp", &self.hosted_mcp.is_some())
             .finish()
     }
 }
@@ -57,6 +64,57 @@ impl PartialEq for AuthenticatedPrincipal {
 impl Eq for AuthenticatedPrincipal {}
 
 impl AuthenticatedPrincipal {
+    pub(crate) fn anonymous_disabled() -> Self {
+        Self::new(
+            "waltr:anonymous-disabled",
+            "shared-dev-domain",
+            [],
+            AuthenticationMethod::AnonymousDisabled,
+        )
+    }
+
+    pub(crate) fn same_access_lease(&self, other: &Self) -> bool {
+        if self != other {
+            return false;
+        }
+        match (&self.local_generation, &other.local_generation) {
+            (Some(left), Some(right)) => return std::sync::Arc::ptr_eq(left, right),
+            (None, None) => {}
+            _ => return false,
+        }
+        match (&self.hosted_mcp, &other.hosted_mcp) {
+            (Some(left), Some(right)) => return std::sync::Arc::ptr_eq(left, right),
+            (None, None) => {}
+            _ => return false,
+        }
+        match (&self.lease, &other.lease) {
+            (PrincipalLease::Unbounded, PrincipalLease::Unbounded) => true,
+            (
+                PrincipalLease::Bearer { expires_at: left },
+                PrincipalLease::Bearer { expires_at: right },
+            ) => left == right,
+            (
+                PrincipalLease::Browser {
+                    token_digest: left,
+                    expires_at: left_expiry,
+                    revocation_signal: left_signal,
+                    ..
+                },
+                PrincipalLease::Browser {
+                    token_digest: right,
+                    expires_at: right_expiry,
+                    revocation_signal: right_signal,
+                    ..
+                },
+            ) => {
+                left == right
+                    && left_expiry == right_expiry
+                    && std::sync::Arc::ptr_eq(left_signal, right_signal)
+            }
+            _ => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn apps_test_principal(subject: &str) -> Self {
         Self::new(
@@ -80,6 +138,8 @@ impl AuthenticatedPrincipal {
             scopes: scopes.into_iter().collect(),
             method,
             lease: PrincipalLease::Unbounded,
+            hosted_mcp: None,
+            local_generation: None,
         }
     }
 
@@ -95,6 +155,8 @@ impl AuthenticatedPrincipal {
             scopes: scopes.into_iter().collect(),
             method: AuthenticationMethod::BearerAccessToken,
             lease: PrincipalLease::Bearer { expires_at },
+            hosted_mcp: None,
+            local_generation: None,
         }
     }
 
@@ -124,6 +186,8 @@ impl AuthenticatedPrincipal {
                 store,
                 revocation_signal,
             },
+            hosted_mcp: None,
+            local_generation: None,
         }
     }
 
@@ -131,13 +195,61 @@ impl AuthenticatedPrincipal {
         self.lease.monitor()
     }
 
-    /// Return the exact issuer that authenticated this identity.
+    /// Observe access loss independently of the request or response body.
+    pub(crate) fn access_ended(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        if let Some(generation) = self.local_generation.clone() {
+            return Box::pin(async move { generation.cancelled().await });
+        }
+        if let Some(proof) = self.hosted_mcp.clone() {
+            return Box::pin(async move { proof.ended().await });
+        }
+        let monitor = self.lease_monitor();
+        Box::pin(async move {
+            if let Some(mut monitor) = monitor {
+                futures_util::future::poll_fn(|context| monitor.poll(context)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+
+    /// Bind the exact hosted OAuth subject and its original validated credential.
+    pub(crate) fn hosted_mcp(issuer: &str, proof: mcp::server::McpTokenAuthorization) -> Self {
+        Self {
+            issuer: issuer.to_owned(),
+            subject: proof.principal_id.as_str().to_owned(),
+            scopes: BTreeSet::new(),
+            method: AuthenticationMethod::BearerAccessToken,
+            lease: proof
+                .expires_at
+                .map_or(PrincipalLease::Unbounded, |expires_at| {
+                    PrincipalLease::Bearer { expires_at }
+                }),
+            hosted_mcp: Some(std::sync::Arc::new(proof)),
+            local_generation: None,
+        }
+    }
+
+    pub(crate) fn local_process(origin: &crate::local_admission::ValidatedLocalOrigin) -> Self {
+        let mut principal = Self::new(
+            "waltr:disabled",
+            "local",
+            [],
+            AuthenticationMethod::LocalProcessBearer,
+        );
+        principal.local_generation = Some(origin.0.clone());
+        principal
+    }
+
+    /// Return the validating issuer, or the fixed anonymous access namespace.
     #[must_use]
     pub fn issuer(&self) -> &str {
         &self.issuer
     }
 
-    /// Return the issuer-local subject identifier.
+    /// Return the issuer-local subject, or the shared anonymous domain identifier.
     #[must_use]
     pub fn subject(&self) -> &str {
         &self.subject
@@ -148,7 +260,7 @@ impl AuthenticatedPrincipal {
         self.scopes.iter().map(String::as_str)
     }
 
-    /// Return how this request was authenticated.
+    /// Return how this request was admitted; anonymous mode validates no identity.
     #[must_use]
     pub const fn method(&self) -> AuthenticationMethod {
         self.method
@@ -199,6 +311,98 @@ fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
 )]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn anonymous_disabled_is_shared_unbounded_and_not_authenticated() {
+        use futures_util::FutureExt as _;
+        let principal = AuthenticatedPrincipal::anonymous_disabled();
+        assert_eq!(principal.method(), AuthenticationMethod::AnonymousDisabled);
+        assert_eq!(principal.scopes().count(), 0);
+        assert!(principal.bearer_expires_at().is_none());
+        assert!(principal.hosted_mcp.is_none());
+        assert!(principal.local_generation.is_none());
+        assert!(principal.access_ended().now_or_never().is_none());
+        assert!(principal.same_access_lease(&AuthenticatedPrincipal::anonymous_disabled()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn access_ended_bearer_expiry_and_unbounded_drop_are_independent() {
+        use futures_util::FutureExt as _;
+        let principal = AuthenticatedPrincipal::bearer(
+            "issuer",
+            "subject",
+            [],
+            SystemTime::now() + std::time::Duration::from_secs(2),
+        );
+        let abandoned = principal.access_ended();
+        drop(abandoned);
+        let remaining = principal.access_ended();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        remaining.await;
+        let unbounded = AuthenticatedPrincipal::new(
+            "issuer",
+            "subject",
+            [],
+            AuthenticationMethod::BrowserSession,
+        );
+        assert!(unbounded.access_ended().now_or_never().is_none());
+        assert!(unbounded.access_ended().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn access_ended_browser_logout_and_store_revalidation_survive_waiter_drop() {
+        use super::super::{BrowserSession, lease::RevocationRegistry};
+        use std::{sync::Arc, time::Duration};
+        for immediate in [true, false] {
+            let persistence = crate::persistence::Persistence::initialize(
+                crate::persistence::DatabaseConfig::for_tests().unwrap(),
+            )
+            .await
+            .unwrap();
+            let store = AccessAuthStore::new(&persistence);
+            let digest = BrowserSessionTokenDigest::from_token("owned-monitor");
+            let now = SystemTime::now();
+            let expires_at = now + Duration::from_secs(60);
+            store
+                .insert_browser_session(&BrowserSession {
+                    token_digest: digest.clone(),
+                    issuer: "issuer".into(),
+                    client_id: "client".into(),
+                    subject: "subject".into(),
+                    created_at: now,
+                    expires_at,
+                    last_seen_at: now,
+                })
+                .await
+                .unwrap();
+            let registry = RevocationRegistry::default();
+            let signal = registry.signal(&digest);
+            let principal = AuthenticatedPrincipal::browser(
+                "issuer".into(),
+                "client".into(),
+                "subject".into(),
+                digest.clone(),
+                expires_at,
+                store.clone(),
+                Arc::clone(&signal),
+            );
+            drop(principal.access_ended());
+            assert!(!signal.is_cancelled());
+            let waiting = principal.access_ended();
+            if immediate {
+                registry.cancel(&digest);
+            } else {
+                store
+                    .revoke_browser_session(&digest, SystemTime::now())
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap();
+            assert_eq!(signal.is_cancelled(), immediate);
+        }
+    }
 
     #[test]
     fn principal_retains_evidence_without_an_authorization_variant() {

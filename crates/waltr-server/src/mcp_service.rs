@@ -6,19 +6,18 @@ use crate::{
 };
 use futures_util::StreamExt as _;
 use jaq_interpret::{Ctx, FilterT as _, ParseCtx, RcIter, Val};
-use waltr_agent::{
-    AgentSessionRunDisposition, AuthTarget, ExternalRequest, ExternalRequestKind,
-    ExternalRequestStatus, InferenceSettings, PendingWork, PendingWorkStatus, SessionCapabilities,
-    SessionCoordinationPhase, SessionCoordinationState, SessionId, SessionProgress,
-    SessionProgressPhase, SessionPromptDisposition, SessionRunStage, SessionStatus, SessionSummary,
-    Suspension,
-};
 use mcp::server::{ServerError, ServerResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tonic::{Code, Status};
+use waltr_agent::{
+    AgentSessionRunDisposition, AuthTarget, InferenceSettings, PendingWork, PendingWorkStatus,
+    SessionCapabilities, SessionCoordinationPhase, SessionCoordinationState, SessionId,
+    SessionProgress, SessionProgressPhase, SessionPromptDisposition, SessionRunStage,
+    SessionStatus, SessionSummary, Suspension,
+};
 
 #[path = "mcp_service/apps/mod.rs"]
 mod served_apps;
@@ -279,10 +278,15 @@ fn resource_revision(detail: &Value) -> String {
 /// MCP server backed by Waltr's registered configuration and session services.
 #[derive(Clone)]
 pub struct WaltrMcpServer {
+    anonymous_disabled: bool,
+    hosted_issuer: Option<String>,
+    hosted_routines: Option<Arc<crate::routine::production::ProductionRuntime>>,
     sessions: Arc<dyn SessionHost>,
     resources: AgentDefinitionState,
     catalog: Arc<mcp::SkillCatalog>,
     readiness: Option<crate::readiness::Readiness>,
+    code: Option<Arc<dyn crate::routine::code_mode::PublicCodePort>>,
+    self_resource: Option<String>,
 }
 
 impl std::fmt::Debug for WaltrMcpServer {
@@ -383,16 +387,85 @@ impl WaltrMcpServer {
                     ),
                 ],
             )?;
+        // Self tools are already served here; never recursively wrap the bound self transport.
+        let self_resource = resources
+            .resource_catalog()
+            .effective_configuration
+            .and_then(|configuration| {
+                configuration
+                    .mcp_servers
+                    .get("waltr")
+                    .map(|server| server.url.clone())
+            });
         Ok(Self {
+            anonymous_disabled: false,
+            hosted_issuer: None,
+            hosted_routines: None,
             sessions,
             resources,
             catalog: Arc::new(catalog),
             readiness: None,
+            code: None,
+            self_resource,
         })
     }
 
     pub(crate) fn with_readiness(mut self, readiness: crate::readiness::Readiness) -> Self {
         self.readiness = Some(readiness);
+        self
+    }
+
+    /// Only trusted standalone composition may enable the shared anonymous domain.
+    pub(crate) fn with_anonymous_disabled(mut self) -> Self {
+        self.anonymous_disabled = true;
+        self
+    }
+
+    pub(crate) fn with_hosted_origin(
+        mut self,
+        issuer: &str,
+        routines: Arc<crate::routine::production::ProductionRuntime>,
+    ) -> Self {
+        self.hosted_routines = Some(routines);
+        self.hosted_issuer = Some(issuer.to_owned());
+        self
+    }
+
+    fn origin(
+        &self,
+        context: &mcp::server::ServerContext,
+    ) -> ServerResult<crate::access_auth::AuthenticatedPrincipal> {
+        if let Some(origin) =
+            context.host_extension::<crate::local_admission::ValidatedLocalOrigin>()
+        {
+            return Ok(crate::access_auth::AuthenticatedPrincipal::local_process(
+                origin,
+            ));
+        }
+        if self.anonymous_disabled {
+            return Ok(crate::access_auth::AuthenticatedPrincipal::anonymous_disabled());
+        }
+        let issuer = self
+            .hosted_issuer
+            .as_deref()
+            .ok_or_else(|| ServerError::invalid_params("authenticated hosted origin required"))?;
+        let proof = context
+            .authorization()
+            .ok_or_else(|| ServerError::invalid_params("authenticated hosted origin required"))?;
+        Ok(crate::access_auth::AuthenticatedPrincipal::hosted_mcp(
+            issuer,
+            proof.clone(),
+        ))
+    }
+
+    /// Install an explicitly authenticated, principal-scoped code port. Default servers expose none.
+    /// This server instance must not be reused across different principals.
+    #[must_use]
+    pub fn with_code_port(
+        mut self,
+        code: Arc<dyn crate::routine::code_mode::PublicCodePort>,
+    ) -> Self {
+        self.code = Some(code);
         self
     }
 
@@ -439,7 +512,11 @@ impl WaltrMcpServer {
     }
 
     /// Create a hosted session and immediately start its required prompt.
-    async fn create_session(&self, input: CreateInput) -> ServerResult<Value> {
+    async fn create_session(
+        &self,
+        input: CreateInput,
+        principal: crate::access_auth::AuthenticatedPrincipal,
+    ) -> ServerResult<Value> {
         if input.prompt.trim().is_empty() {
             return Err(ServerError::invalid_params("prompt must not be empty"));
         }
@@ -449,10 +526,19 @@ impl WaltrMcpServer {
             .await
             .map_err(|status| session_creation_error(&status))?;
         let session_id = session.record.id.clone();
-        let agent_name = session.record.summary().agent_name;
+        let agent_name = session
+            .record
+            .agent_definition
+            .as_ref()
+            .map(|value| {
+                serde_json::from_value::<crate::agent_host::AgentDefinitionBundle>(value.clone())
+            })
+            .transpose()
+            .map_err(|_| ServerError::internal("invalid stored agent configuration"))?
+            .map(|bundle| bundle.agent_name);
         let submission = self
             .sessions
-            .submit_prompt(session_id.clone(), input.prompt)
+            .submit_prompt_authorized(session_id.clone(), input.prompt, principal)
             .await
             .map_err(|error| {
                 ServerError::internal(format!(
@@ -498,7 +584,11 @@ impl WaltrMcpServer {
     }
 
     /// Submit a prompt, queueing it when the session already has an active run.
-    async fn send_session(&self, input: SendInput) -> ServerResult<Value> {
+    async fn send_session(
+        &self,
+        input: SendInput,
+        principal: crate::access_auth::AuthenticatedPrincipal,
+    ) -> ServerResult<Value> {
         let id = required_session_id(input.id)?;
         if input.prompt.trim().is_empty() {
             return Err(ServerError::invalid_params("prompt must not be empty"));
@@ -506,7 +596,7 @@ impl WaltrMcpServer {
         self.sessions.load(&id).await.map_err(session_error)?;
         let submission = self
             .sessions
-            .submit_prompt(id, input.prompt)
+            .submit_prompt_authorized(id, input.prompt, principal)
             .await
             .map_err(run_error)?;
         let (disposition, queue_position) = match submission.disposition {
@@ -642,27 +732,41 @@ impl WaltrMcpServer {
         self.resource_detail(&input.uri)
     }
 
-    async fn edit_resource(&self, input: TextEditInput) -> ServerResult<Value> {
-        let detail = self.resource_detail(&input.uri)?;
+    async fn edit_resource(&self, input: TextEditInput) -> Result<Value, (ServerError, bool)> {
+        let detail = self
+            .resource_detail(&input.uri)
+            .map_err(|error| (error, true))?;
         if resource_revision(&detail) != input.expected_revision {
-            return Err(ServerError::invalid_params(
-                "failed precondition: revision changed; read and retry",
+            return Err((
+                ServerError::invalid_params(
+                    "failed precondition: revision changed; read and retry",
+                ),
+                true,
             ));
         }
-        let source = detail["source"]
-            .as_str()
-            .ok_or_else(|| ServerError::invalid_params("resource has no source; use create"))?;
-        let output = apply_text_edits(source, &input.edits)?;
+        let source = detail["source"].as_str().ok_or_else(|| {
+            (
+                ServerError::invalid_params("resource has no source; use create"),
+                true,
+            )
+        })?;
+        let output = apply_text_edits(source, &input.edits).map_err(|error| (error, true))?;
         self.resources
             .replace_guarded(
-                &resource_path(&input.uri)?,
+                &resource_path(&input.uri).map_err(|error| (error, true))?,
                 output,
                 detail["persisted_etag"].as_str().unwrap_or_default(),
                 Some(source),
             )
             .await
-            .map_err(|error| agent_definition_error(&error))?;
+            .map_err(|error| {
+                (
+                    agent_definition_error(&error),
+                    error.is_validation() || error.is_failed_precondition(),
+                )
+            })?;
         self.resource_detail(&input.uri)
+            .map_err(|error| (error, false))
     }
 
     async fn destroy_resource(&self, input: ResourceDestroyInput) -> ServerResult<Value> {
@@ -709,8 +813,17 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                 tool_definition($name, $description, input_schema(&[$($action),+], vec![$(ActionInputSchema { action: $action, schema: Some(json_schema_for::<$ty>()) }),+]))
             };
         }
+        let code = self.code.is_some()
+            || self.origin(&context).ok().is_some_and(|principal| {
+                self.hosted_routines
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.code.public_enabled(&principal))
+            });
+        let external = self.sessions.external_tools();
+        let self_resource = self.self_resource.clone();
+        let admitted = self.origin(&context);
         Box::pin(async move {
-            Ok(mcp::McpToolList {
+            let mut list = mcp::McpToolList {
                 tools: vec![
                     status_app::tool(&context),
                     tool!("create", "Create a session or an absent persisted resource slot (including a bundled override).", "session.create" => CreateInput, "resource.create" => ResourceCreateInput),
@@ -724,17 +837,71 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                     tool!("query", "Wait for a bounded jq condition on a hosted session.", "session.wait" => WaitInput),
                 ],
                 next_cursor: None,
-            })
+            };
+            if code {
+                list.tools.push(tool_definition("code", "Optional bounded JavaScript over the same Routine service and caller policy. Discover exact permitted names/descriptions without schemas; fetch selected schemas only. No ambient imports, shell, filesystem or network. Interrupted calls are never automatically replayed.", crate::routine::code_mode::CodeInput::schema()));
+            }
+            if let Some(external) = external {
+                admitted?;
+                list.tools
+                    .extend(external.list(self_resource.as_deref()).await?);
+            }
+            Ok(list)
         })
     }
 
     fn call_tool(
         &self,
         call: mcp::McpToolCall,
-        _context: mcp::server::ServerContext,
+        context: mcp::server::ServerContext,
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolResult>> {
         let server = self.clone();
         Box::pin(async move {
+            if call.name.starts_with("capability__") {
+                let principal = server.origin(&context)?;
+                return server
+                    .sessions
+                    .external_tools()
+                    .ok_or_else(|| {
+                        ServerError::invalid_params(
+                            "external workspace capabilities are not configured",
+                        )
+                    })?
+                    .call(call, context, principal, server.self_resource.as_deref())
+                    .await;
+            }
+            if call.name == "code" {
+                let port = if let Some(port) = &server.code {
+                    port.clone()
+                } else {
+                    let principal = server.origin(&context)?;
+                    server
+                        .hosted_routines
+                        .as_ref()
+                        .ok_or_else(|| {
+                            ServerError::invalid_params("code capability is not configured")
+                        })?
+                        .code
+                        .public_port(principal)
+                        .await
+                        .map_err(|_| {
+                            ServerError::invalid_params("code capability is not configured")
+                        })?
+                };
+                // Normal MCP input responses are not a source-replay or approval mechanism.
+                if context.input_responses().is_some() || context.request_state().is_some() {
+                    return Err(ServerError::invalid_params(
+                        "code calls do not accept retry state or permission responses",
+                    ));
+                }
+                let input = serde_json::from_value(call.arguments)
+                    .map_err(|_| ServerError::invalid_params("invalid code arguments"))?;
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let call = port.call(input, cancellation.clone());
+                tokio::pin!(call);
+                let output = tokio::select! { biased; () = context.cancelled() => { cancellation.cancel(); let _joined = call.await; return Err(ServerError::internal("code waiter cancelled; effects require reconciliation")); }, output = &mut call => output.map_err(|error|ServerError::internal(format!("code host category: {error:?}; do not replay an interrupted call")))? };
+                return mcp::progressive::tool_result(output, None);
+            }
             if call.name == "status" {
                 if !call.arguments.is_object()
                     || call
@@ -762,7 +929,27 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                     serde_json::from_value::<TextEditInput>(call.arguments).map_err(|error| {
                         ServerError::invalid_params(format!("invalid edit arguments: {error}"))
                     })?;
-                let output = server.edit_resource(input).await?;
+                for edit in &input.edits {
+                    if let TextEdit::Insert {
+                        placement: Placement::Before | Placement::After,
+                        anchor: None,
+                        ..
+                    } = edit
+                    {
+                        return Err(ServerError::invalid_params(
+                            "before/after require an anchor",
+                        ));
+                    }
+                }
+                let output = match server.edit_resource(input).await {
+                    Ok(output) => output,
+                    Err((error, true)) => {
+                        return Ok(mcp::McpToolResult::new(json!({
+                            "isError": true, "content": [{"type":"text", "text": format!("{error:?}")}],
+                        })));
+                    }
+                    Err((error, false)) => return Err(error),
+                };
                 return mcp::progressive::tool_result(output, None);
             }
             let request = mcp::progressive::parse_arguments(&call.name, call.arguments)?;
@@ -772,11 +959,19 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                 };
             }
             let output = match (call.name.as_str(), request.action.as_str()) {
-                ("create", "session.create") => server.create_session(input!()).await?,
+                ("create", "session.create") => {
+                    server
+                        .create_session(input!(), server.origin(&context)?)
+                        .await?
+                }
                 ("create", "resource.create") => server.create_resource(input!()).await?,
                 ("destroy", "resource.destroy") => server.destroy_resource(input!()).await?,
                 ("destroy", "session.wipe") => server.wipe_sessions(input!()).await?,
-                ("execute", "session.send") => server.send_session(input!()).await?,
+                ("execute", "session.send") => {
+                    server
+                        .send_session(input!(), server.origin(&context)?)
+                        .await?
+                }
                 ("execute", "session.interrupt") => server.interrupt_session(input!()).await?,
                 ("query", "session.wait") => server.wait_session(input!()).await?,
                 _ => return Err(mcp::progressive::unknown_action(&request.action)),
@@ -920,17 +1115,6 @@ fn project_session(
         "pending_work".to_owned(),
         Value::Array(snapshot.pending_work.iter().map(project_work).collect()),
     );
-    object.insert(
-        "active_external_requests".to_owned(),
-        Value::Array(
-            snapshot
-                .external_requests
-                .iter()
-                .filter(|request| matches!(request.status, ExternalRequestStatus::Pending))
-                .map(project_external_request)
-                .collect(),
-        ),
-    );
     value
 }
 
@@ -994,7 +1178,6 @@ fn project_progress(progress: &SessionProgress) -> Value {
         SessionProgressPhase::CompletionBarrier => "completion_barrier",
         SessionProgressPhase::Paused => "paused",
         SessionProgressPhase::AwaitingToolResults => "awaiting_tool_results",
-        SessionProgressPhase::AwaitingExternalInput => "awaiting_external_input",
         SessionProgressPhase::Interrupted => "interrupted",
         SessionProgressPhase::Finished => "finished",
         SessionProgressPhase::Failed => "failed",
@@ -1028,7 +1211,6 @@ fn project_capabilities(capabilities: &SessionCapabilities) -> Value {
     };
     json!({
         "prompt_disposition": prompt_disposition,
-        "can_respond_external_request": capabilities.can_respond_external_request,
         "can_interrupt": capabilities.can_interrupt,
     })
 }
@@ -1083,7 +1265,7 @@ fn project_status(status: &SessionStatus) -> (&'static str, Value, Value, Value)
                 "authentication": authentication_failure.as_ref().map(|failure| {
                     let (target_kind, target_key) = match &failure.target {
                         AuthTarget::Provider { key } => ("provider", key.as_str()),
-                        AuthTarget::McpServer { key } => ("mcp_server", key.as_str()),
+                        AuthTarget::Host { namespace, key } => (namespace.as_str(), key.as_str()),
                     };
                     json!({
                         "target_kind": target_kind,
@@ -1103,10 +1285,6 @@ fn project_suspension(suspension: &Suspension) -> Value {
             "kind": "awaiting_tool_results",
             "work": work.iter().map(project_work).collect::<Vec<_>>()
         }),
-        Suspension::AwaitingExternalInput { request } => json!({
-            "kind": "awaiting_external_input",
-            "request": project_external_request(request)
-        }),
         Suspension::Interrupted { work } => json!({
             "kind": "interrupted",
             "work": work.iter().map(project_work).collect::<Vec<_>>()
@@ -1122,23 +1300,6 @@ fn project_work(work: &PendingWork) -> Value {
         PendingWorkStatus::Failed { message } => ("failed", json!(message)),
     };
     json!({ "id": work.id, "turn": work.turn, "status": status, "detail": detail })
-}
-
-fn project_external_request(request: &ExternalRequest) -> Value {
-    let (kind, custom_kind) = match &request.kind {
-        ExternalRequestKind::Permission => ("permission", None),
-        ExternalRequestKind::Question => ("question", None),
-        ExternalRequestKind::ToolInput => ("tool_input", None),
-        ExternalRequestKind::Custom(kind) => ("custom", Some(kind.as_str())),
-    };
-    json!({
-        "id": request.id.as_str(),
-        "kind": kind,
-        "custom_kind": custom_kind,
-        "tool_call_id": request.tool_call_id,
-        "prompt": request.prompt,
-        "payload": request.payload
-    })
 }
 
 fn project_inference(settings: &InferenceSettings) -> Value {
@@ -1230,18 +1391,15 @@ fn session_error(error: waltr_agent::LlmError) -> ServerError {
     clippy::needless_pass_by_value,
     reason = "the signature is used directly as a Result::map_err conversion"
 )]
-fn run_error(error: waltr_agent::AgentSessionRunError) -> ServerError {
-    let message = error.to_string();
-    match error {
-        waltr_agent::AgentSessionRunError::AlreadyRunning { .. }
-        | waltr_agent::AgentSessionRunError::Canceled { .. }
-        | waltr_agent::AgentSessionRunError::Runtime(
-            waltr_agent::AgentSessionRuntimeError::FailedPrecondition(_),
-        ) => ServerError::invalid_params(message),
-        _ => session_error(waltr_agent::LlmError::Protocol {
-            provider: "session-run",
-            message,
-        }),
+fn run_error(error: Status) -> ServerError {
+    match error.code() {
+        Code::FailedPrecondition
+        | Code::Aborted
+        | Code::Cancelled
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::InvalidArgument => ServerError::invalid_params(error.message()),
+        _ => ServerError::internal("session run unavailable"),
     }
 }
 
@@ -1278,12 +1436,12 @@ mod tests {
         http::Request as HttpRequest,
     };
     use futures_util::Stream;
+    use std::{io, path::PathBuf, pin::Pin};
+    use tower::ServiceExt as _;
     use waltr_agent::{
         AgentSession, AgentSessionActiveRunState, AgentSessionRunError, AgentSessionRunSubmission,
         LlmError, SessionListUpdate,
     };
-    use std::{io, path::PathBuf, pin::Pin};
-    use tower::ServiceExt as _;
 
     struct UnusedSessionHost;
 
@@ -1314,7 +1472,8 @@ mod tests {
         async fn capture_latest_completed(
             &self,
             _: &SessionId,
-        ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionCaptureError> {
+        ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionCaptureError>
+        {
             Err(waltr_agent::SessionCaptureError::FailedPrecondition(
                 "session capture is unsupported".to_owned(),
             ))
@@ -1343,7 +1502,8 @@ mod tests {
             &self,
             lease: &waltr_agent::SessionPauseLease,
             _: waltr_agent::SessionMaskMutation,
-        ) -> Result<waltr_agent::SessionMaskMutationOutcome, waltr_agent::SessionPauseError> {
+        ) -> Result<waltr_agent::SessionMaskMutationOutcome, waltr_agent::SessionPauseError>
+        {
             Err(waltr_agent::SessionPauseError::Unavailable {
                 session_id: lease.session_id().clone(),
             })
@@ -1479,6 +1639,51 @@ mod tests {
             })
             .collect();
         assert!(apply_text_edits("aaa", &excessive).is_err());
+    }
+
+    #[cfg(feature = "test")]
+    #[tokio::test]
+    async fn optional_code_mcp_http_uses_explicit_caller_port_and_schema_on_demand() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let default = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state.clone()).unwrap();
+        let router = mcp::server::streamable_http_router(Arc::new(default.clone()));
+        let listed = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        assert!(
+            !listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "code")
+        );
+        let disabled=mcp_request(&router,json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"return true;"}}})).await;
+        assert!(disabled.get("error").is_some());
+        let fixture =
+            crate::routine::code_mode::tests::Fixture::new(true, "allow", "return null;").await;
+        let adapter = fixture.adapter().await;
+        let enabled = default.with_code_port(Arc::new(adapter));
+        let router = mcp::server::streamable_http_router(Arc::new(enabled));
+        let listed = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+        )
+        .await;
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "code"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "effect"));
+        let discover=mcp_request(&router,json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"code","arguments":{"action":"discover"}}})).await;
+        assert!(!discover.to_string().contains("input_schema"));
+        let execute=mcp_request(&router,json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"const effect=await host.call('tools.execute',{target:{server:'upstream',tool:'effect'},callId:'public-effect',arguments:{}}); return {selected:effect.status};"}}})).await;
+        let output = &execute["result"]["structuredContent"];
+        assert_eq!(output["status"], "succeeded", "{execute}");
+        assert_eq!(output["result"]["selected"], "completed");
+        let invalid=mcp_request(&router,json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"return true;","capabilities":["all"]}}})).await;
+        assert!(invalid.get("error").is_some());
+        fixture.finish().await;
     }
 
     #[tokio::test]
@@ -1633,7 +1838,8 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_server_error(&stale, -32602, "revision changed", &[]);
+        assert!(stale.1);
+        assert_server_error(&stale.0, -32602, "revision changed", &[]);
         assert_eq!(server.resource_detail(uri).unwrap(), edited);
         let guarded = server
             .resources
@@ -1712,7 +1918,12 @@ mod tests {
     async fn resource_reads_and_uniform_tools_remain_behind_local_admission() {
         let router = mcp::server::streamable_http_router(test_server()).layer(
             axum::middleware::from_fn_with_state(
-                crate::local_admission::LocalBearer::new("test-generation").unwrap(),
+                (
+                    crate::local_admission::LocalBearer::new("test-generation").unwrap(),
+                    crate::local_admission::ValidatedLocalOrigin(Arc::new(
+                        tokio_util::sync::CancellationToken::new(),
+                    )),
+                ),
                 crate::local_admission::require_local_protocol_bearer,
             ),
         );
@@ -1757,7 +1968,6 @@ mod tests {
             (SessionProgressPhase::CompletionBarrier, true),
             (SessionProgressPhase::Paused, true),
             (SessionProgressPhase::AwaitingToolResults, false),
-            (SessionProgressPhase::AwaitingExternalInput, false),
             (SessionProgressPhase::Interrupted, false),
             (SessionProgressPhase::Failed, false),
         ] {
@@ -1816,7 +2026,6 @@ mod tests {
         };
         summary.capabilities = SessionCapabilities {
             prompt_disposition: SessionPromptDisposition::Queued,
-            can_respond_external_request: false,
             can_interrupt: false,
         };
 
@@ -1938,6 +2147,33 @@ mod tests {
 
         assert!(!schema.contains("help"));
         assert!(!schema.contains("runbooks"));
+
+        for (name, action, input) in [
+            (
+                "create",
+                "session.create",
+                json!({"prompt":"untrusted origin"}),
+            ),
+            (
+                "execute",
+                "session.send",
+                json!({"id":"untrusted", "prompt":"untrusted origin"}),
+            ),
+        ] {
+            let denied = mcp_request(&router, json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":name,"arguments":{"action":action,"input":input},
+                    "_meta":{"principal_id":"forged-operator", "issuer":"https://forged.example",
+                        "io.modelcontextprotocol/protocolVersion":mcp::protocol::MCP_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities":{},
+                        "io.modelcontextprotocol/clientInfo":{"name":"origin-test", "version":"1"}}}})).await;
+            assert_eq!(denied["error"]["code"], -32602, "{denied}");
+            assert!(
+                denied["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("authenticated hosted origin required")
+            );
+        }
 
         let definitions = mcp_request(
             &router,
@@ -2119,9 +2355,10 @@ mod tests {
         let (_definitions, definitions) =
             tokio::sync::watch::channel(crate::DefinitionWatcherHealth::Running);
         let (_routines, routines) =
-            tokio::sync::watch::channel(crate::routine::EngineHealth::Running);
+            tokio::sync::watch::channel(crate::routine::production::RuntimeHealth::Running);
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let readiness = crate::readiness::Readiness {
+            invocations: None,
             persistence,
             oauth: None,
             definitions,
@@ -2229,7 +2466,10 @@ mod tests {
             );
             let refresh = mcp_request(&router, json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"status","arguments":{},"_meta":meta}})).await;
             assert_eq!(refresh["result"]["structuredContent"]["ready"], false);
-            assert_eq!(refresh["result"]["content"][0]["text"], "Waltr is not ready");
+            assert_eq!(
+                refresh["result"]["content"][0]["text"],
+                "Waltr is not ready"
+            );
         } else {
             assert!(status.get("_meta").is_none());
             assert!(resource.get("error").is_some());

@@ -1,5 +1,9 @@
 //! Reusable Waltr server components.
 
+pub mod agent_host;
+pub mod interaction;
+pub mod permission;
+
 pub mod access_auth;
 pub mod agent_definition;
 pub mod app;
@@ -23,9 +27,10 @@ mod readiness;
 pub mod resource_catalog;
 pub mod resource_error;
 pub mod routine;
-pub mod routine_interaction_service;
+pub mod routine_objects;
 pub mod routine_service;
 mod sandbox;
+pub mod self_mcp;
 pub mod session;
 pub mod status_service;
 #[cfg(any(debug_assertions, feature = "test"))]
@@ -45,7 +50,9 @@ pub use app::{
     build_app_with_catalog_loader, build_app_with_services,
 };
 pub use local_admission::{LocalBearer, LocalBearerError};
-pub use resource_catalog::routine::InteractionLimits;
 pub use resource_error::ResourceError;
 /// Default address the server listens on when `WALTR_SERVER_ADDR` is unset.
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:14333";
+#[cfg(test)]
+#[path = "../tests/agent_host/mod.rs"]
+mod host_tests;

@@ -9,7 +9,6 @@ mod state;
 mod store;
 mod watcher;
 
-pub use routine::{InteractionLimits, MaterializedRoutine, RoutineDefinition};
 pub use state::{
     AgentDefinitionInspection, AgentDefinitionLoadError, AgentDefinitionSnapshot,
     AgentDefinitionState, DefinitionResourceDetail, DefinitionResourceSummary,

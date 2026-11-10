@@ -218,7 +218,7 @@ fn validate_envelope(
     expected_kind: &str,
     path: &str,
 ) -> Result<(), AgentDefinitionLoadError> {
-    if api_version != waltr_agent::AGENT_DEFINITION_API_VERSION || kind != expected_kind {
+    if api_version != crate::agent_host::AGENT_DEFINITION_API_VERSION || kind != expected_kind {
         return Err(AgentDefinitionLoadError::InvalidResourceValue {
             path: path.to_owned(),
             message: format!("expected apiVersion `waltr.dev/v1alpha1` and kind `{expected_kind}`"),

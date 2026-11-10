@@ -11,6 +11,7 @@ use waltr_server::test_support::setup_server;
 
 #[tokio::test]
 async fn create_session_persists_resource_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
     let session = client
@@ -45,6 +46,7 @@ async fn create_session_persists_resource_defaults() -> Result<(), Box<dyn std::
 #[tokio::test]
 async fn explicit_settings_update_persists_and_publishes() -> Result<(), Box<dyn std::error::Error>>
 {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut mutation_client = session_client(server).await?;
     let mut watch_client = session_client(server).await?;
@@ -95,6 +97,7 @@ async fn explicit_settings_update_persists_and_publishes() -> Result<(), Box<dyn
 
 #[tokio::test]
 async fn resource_change_reports_provider_drift() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut sessions = session_client(server).await?;
     let created = sessions

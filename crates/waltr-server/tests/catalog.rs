@@ -42,6 +42,7 @@ const FIXTURE: &str = r#"{
 
 #[tokio::test]
 async fn catalog_search_returns_fixture_model() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_catalog_server()?;
     let mut client = catalog_client(server).await?;
     let response = client
@@ -66,6 +67,7 @@ async fn catalog_search_returns_fixture_model() -> Result<(), Box<dyn std::error
 
 #[tokio::test]
 async fn catalog_suggests_exact_provider_model_match() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_catalog_server()?;
     let mut client = catalog_client(server).await?;
     let response = client
@@ -86,6 +88,7 @@ async fn catalog_suggests_exact_provider_model_match() -> Result<(), Box<dyn std
 #[tokio::test]
 async fn catalog_suggest_derives_gateway_upstream_model() -> Result<(), Box<dyn std::error::Error>>
 {
+    waltr_server::isolate_application_test!();
     let server = setup_catalog_server()?;
     let mut client = catalog_client(server).await?;
     let response = client

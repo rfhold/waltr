@@ -1,5 +1,10 @@
+use crate::agent_host::runtime_factory::{McpConnectionKind, McpResolvedConnection};
+use crate::auth::refresh::{CredentialRefreshCoordinator, CredentialRefreshError, RefreshMode};
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
+use crate::auth::{
+    CredentialStore, McpOAuthRegistration, McpOAuthRegistrationMethod, OAuthCredential,
+};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -27,14 +32,10 @@ use waltr::grpc::waltr::auth::v1::{
     RefreshAuthRequest, RefreshAuthResponse,
     auth_service_server::AuthService as GeneratedAuthService, auth_target,
 };
-use waltr_agent::{
-    AuthenticationFailureReason as AgentAuthenticationFailureReason, CredentialRefreshCoordinator,
-    CredentialRefreshError, CredentialStore, McpConnectionKind, McpOAuthRegistration,
-    McpOAuthRegistrationMethod, McpResolvedConnection, OAuthCredential, RefreshMode,
-};
+use waltr_agent::AuthenticationFailureReason as AgentAuthenticationFailureReason;
 
 #[cfg(test)]
-use waltr_agent::{
+use crate::auth::{
     McpOAuthContext, McpOAuthEndpoints, OAuthCredentialStore, OAuthRefreshClaim, OAuthTokenSet,
 };
 
@@ -2422,12 +2423,12 @@ mod tests {
             McpOAuthContext {
                 resource: "https://mcp.example/resource".to_owned(),
                 issuer: "https://auth.example".to_owned(),
-                registration: waltr_agent::McpOAuthRegistration {
+                registration: crate::auth::McpOAuthRegistration {
                     method: McpOAuthRegistrationMethod::Dynamic,
                     client_id: "public-client".to_owned(),
-                    ..waltr_agent::McpOAuthRegistration::default()
+                    ..crate::auth::McpOAuthRegistration::default()
                 },
-                endpoints: waltr_agent::McpOAuthEndpoints {
+                endpoints: crate::auth::McpOAuthEndpoints {
                     authorization: "https://auth.example/authorize".to_owned(),
                     token: "https://auth.example/token".to_owned(),
                     revocation: Some("https://auth.example/revoke".to_owned()),

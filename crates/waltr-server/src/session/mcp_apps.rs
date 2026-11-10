@@ -1,5 +1,5 @@
+use crate::agent_host::mcp::session_apps::{McpAppError, McpAppHandle};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use waltr_agent::{McpAppError, McpAppHandle, SessionId};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -7,6 +7,7 @@ use std::{
 };
 use tokio::time::Instant;
 use tonic::{Request, Status};
+use waltr_agent::SessionId;
 
 pub(super) const TIMEOUT: Duration = Duration::from_secs(30);
 const TTL: Duration = Duration::from_secs(900);
@@ -109,10 +110,26 @@ impl Registry {
     }
 
     pub fn remove(&self, id: &str) {
-        self.0.lock().unwrap().remove(id);
+        if let Some(entry) = self.0.lock().unwrap().remove(id) {
+            entry.entry.handle.revoke();
+        }
+    }
+    pub fn remove_session(&self, session: &SessionId) {
+        self.0.lock().unwrap().retain(|_, entry| {
+            if &entry.entry.session == session {
+                entry.entry.handle.revoke();
+                false
+            } else {
+                true
+            }
+        });
     }
     pub fn clear(&self) {
-        self.0.lock().unwrap().clear();
+        let mut entries = self.0.lock().unwrap();
+        for entry in entries.values() {
+            entry.entry.handle.revoke();
+        }
+        entries.clear();
     }
 }
 
@@ -121,7 +138,6 @@ pub(super) fn status(error: McpAppError) -> Status {
         McpAppError::Busy => Status::failed_precondition("MCP app busy"),
         McpAppError::Stale => Status::failed_precondition("MCP app stale"),
         McpAppError::Canceled => Status::cancelled("MCP app canceled"),
-        McpAppError::ApprovalRequired => Status::permission_denied("MCP app approval required"),
         McpAppError::Denied => Status::permission_denied("MCP app denied"),
         McpAppError::Limit => Status::resource_exhausted("MCP app limit"),
         McpAppError::Failure(_) => Status::unavailable("MCP app unavailable"),
@@ -138,7 +154,7 @@ mod tests {
             "MCP app unavailable"
         );
         assert_eq!(
-            status(McpAppError::ApprovalRequired).code(),
+            status(McpAppError::Denied).code(),
             tonic::Code::PermissionDenied
         );
         assert_eq!(

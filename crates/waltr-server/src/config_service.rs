@@ -2,14 +2,14 @@
 
 use std::{path::PathBuf, pin::Pin, sync::Arc};
 
+use tokio_stream::{Stream, StreamExt as _, wrappers::BroadcastStream};
+use tonic::{Request, Response, Status};
 use waltr::grpc::waltr::resource::v1::{
     GetResourceCatalogRequest, GetResourceCatalogResponse, InspectResourceRequest,
     InspectResourceResponse, ReplaceResourceRequest, ReplaceResourceResponse, ResetResourceRequest,
     ResetResourceResponse, WatchResourceCatalogRequest, WatchResourceCatalogResponse,
     resource_service_server::ResourceService as GeneratedResourceService,
 };
-use tokio_stream::{Stream, StreamExt as _, wrappers::BroadcastStream};
-use tonic::{Request, Response, Status};
 
 use crate::{
     agent_definition::{AgentDefinitionLoadError, AgentDefinitionState},
@@ -216,7 +216,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response.catalog.unwrap().resources.len(), 6);
+        assert_eq!(response.catalog.unwrap().resources.len(), 16);
 
         let mut watch = service
             .watch_resource_catalog(Request::new(WatchResourceCatalogRequest {}))
@@ -249,7 +249,7 @@ mod tests {
             .unwrap();
         let changed = watch.next().await.unwrap().unwrap().catalog.unwrap();
         assert_ne!(changed.etag, initial.etag);
-        assert_eq!(changed.resources.len(), 6);
+        assert_eq!(changed.resources.len(), 16);
     }
 
     #[tokio::test]

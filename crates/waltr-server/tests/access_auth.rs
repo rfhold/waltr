@@ -7,24 +7,24 @@ use std::{pin::Pin, sync::OnceLock, time::Duration};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt as _};
 
-use waltr::grpc::waltr::{
-    auth::v1::{
-        AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
-        ListAuthStatusesRequest, auth_service_client::AuthServiceClient,
-    },
-    routine::v1::{WatchManualRoutinesRequest, routine_service_client::RoutineServiceClient},
-    status::v1::{WatchStatusRequest, status_service_client::StatusServiceClient},
-};
-use waltr_server::test_support::{
-    AccessAuthTestServer, RestartableAccessAuthServer, setup_access_auth_browser_fixture,
-    setup_access_auth_server, setup_server,
-};
 use prost::Message as _;
 use reqwest::{StatusCode, header};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tonic::{Code, Request, transport::Endpoint};
 use url::Url;
+use waltr::grpc::waltr::{
+    auth::v1::{
+        AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
+        ListAuthStatusesRequest, auth_service_client::AuthServiceClient,
+    },
+    routine::v2::{WatchDefinitionsRequest, routine_service_client::RoutineServiceClient},
+    status::v1::{WatchStatusRequest, status_service_client::StatusServiceClient},
+};
+use waltr_server::test_support::{
+    AccessAuthTestServer, RestartableAccessAuthServer, setup_access_auth_browser_fixture,
+    setup_access_auth_server, setup_server,
+};
 
 fn fixture() -> &'static AccessAuthTestServer {
     static SERVER: OnceLock<AccessAuthTestServer> = OnceLock::new();
@@ -34,6 +34,7 @@ fn fixture() -> &'static AccessAuthTestServer {
 #[tokio::test]
 async fn session_apps_rpcs_revalidate_access_before_handle_lookup()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     use waltr::grpc::waltr::session::v1::{
         CallSessionMcpAppToolRequest, CloseSessionMcpAppRequest, OpenSessionMcpAppRequest,
         session_service_client::SessionServiceClient,
@@ -126,6 +127,7 @@ async fn session_apps_rpcs_revalidate_access_before_handle_lookup()
 
 #[tokio::test]
 async fn health_and_oidc_routes_are_public() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = fixture();
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -169,6 +171,7 @@ async fn health_and_oidc_routes_are_public() -> Result<(), Box<dyn std::error::E
 #[tokio::test]
 async fn web_navigation_redirects_with_encoded_local_return_path()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -193,6 +196,7 @@ async fn web_navigation_redirects_with_encoded_local_return_path()
 #[tokio::test]
 async fn browser_login_survives_reconstruction_and_logout_revokes_it()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let first_server = fixture.start_server(std::time::Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -257,6 +261,7 @@ async fn browser_login_survives_reconstruction_and_logout_revokes_it()
 #[tokio::test]
 async fn browser_session_survives_same_configuration_reconstruction()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let first_server = fixture.start_server(std::time::Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -273,6 +278,7 @@ async fn browser_session_survives_same_configuration_reconstruction()
 #[tokio::test]
 async fn changed_browser_client_rejects_and_revokes_old_session()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let first_server = fixture.start_server(std::time::Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -291,6 +297,7 @@ async fn changed_browser_client_rejects_and_revokes_old_session()
 #[tokio::test]
 async fn changed_issuer_rejects_and_revokes_old_session() -> Result<(), Box<dyn std::error::Error>>
 {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let first_server = fixture.start_server(std::time::Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -306,6 +313,7 @@ async fn changed_issuer_rejects_and_revokes_old_session() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn browser_client_secret_rotation_preserves_session() -> Result<(), Box<dyn std::error::Error>>
 {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let first_server =
         fixture.start_server_with_client_secret(std::time::Duration::from_hours(1), "first-secret");
@@ -324,6 +332,7 @@ async fn browser_client_secret_rotation_preserves_session() -> Result<(), Box<dy
 #[tokio::test]
 async fn expired_browser_session_cannot_access_protected_routes()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server(std::time::Duration::from_secs(1));
     let client = no_redirect_client()?;
@@ -344,6 +353,7 @@ async fn expired_browser_session_cannot_access_protected_routes()
 #[tokio::test]
 async fn callback_cleanup_failure_preserves_redirect_cookie_and_authenticated_session()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server =
         fixture.start_server_with_callback_cleanup_failure(std::time::Duration::from_hours(1));
@@ -358,6 +368,7 @@ async fn callback_cleanup_failure_preserves_redirect_cookie_and_authenticated_se
 #[tokio::test]
 async fn native_grpc_requires_a_valid_bearer_with_typed_access_details()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = fixture();
     let channel = Endpoint::from_shared(fixture.server.base_url())?
         .connect()
@@ -404,17 +415,16 @@ async fn native_grpc_requires_a_valid_bearer_with_typed_access_details()
 #[tokio::test]
 async fn native_routine_rpc_uses_the_common_access_auth_layer()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = fixture();
     let channel = Endpoint::from_shared(fixture.server.base_url())?
         .connect()
         .await?;
     let mut client = RoutineServiceClient::new(channel);
-    let request = || WatchManualRoutinesRequest {
-        request_id: "routine-auth".to_owned(),
-    };
+    let request = || WatchDefinitionsRequest {};
 
     let missing = client
-        .watch_manual_routines(request())
+        .watch_definitions(request())
         .await
         .expect_err("missing bearer should fail");
     assert_eq!(missing.code(), Code::Unauthenticated);
@@ -426,24 +436,25 @@ async fn native_routine_rpc_uses_the_common_access_auth_layer()
         format!("Bearer {}", fixture.access_token).parse()?,
     );
     let response = client
-        .watch_manual_routines(authorized)
+        .watch_definitions(authorized)
         .await?
         .into_inner()
         .message()
         .await?
         .expect("definition watch should emit an initial snapshot");
-    assert_eq!(response.request_id, "routine-auth");
+    assert!(!response.catalog_revision.is_empty());
     assert!(
         response
-            .routines
+            .definitions
             .iter()
-            .any(|routine| routine.routine_name == "fork")
+            .any(|routine| routine.name == "fork")
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn grpc_web_requires_a_valid_browser_cookie() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = fixture();
     let client = reqwest::Client::new();
     let endpoint = fixture
@@ -490,6 +501,7 @@ async fn grpc_web_requires_a_valid_browser_cookie() -> Result<(), Box<dyn std::e
 
 #[tokio::test]
 async fn native_status_stream_ends_at_bearer_expiry() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server(Duration::from_hours(1));
     let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
@@ -529,6 +541,7 @@ async fn native_status_stream_ends_at_bearer_expiry() -> Result<(), Box<dyn std:
 #[tokio::test]
 async fn grpc_web_status_stream_ends_at_browser_session_expiry()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server(Duration::from_secs(2));
     let client = no_redirect_client()?;
@@ -564,6 +577,7 @@ async fn grpc_web_status_stream_ends_at_browser_session_expiry()
 #[tokio::test]
 async fn same_instance_logout_immediately_ends_only_its_browser_stream()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server(Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -596,8 +610,9 @@ async fn same_instance_logout_immediately_ends_only_its_browser_stream()
 #[tokio::test]
 async fn cross_instance_logout_ends_browser_stream_within_revalidation_bound()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
-    let server_a = fixture.start_server(Duration::from_hours(1));
+    let server_a = fixture.start_auth_replica(Duration::from_hours(1), "waltr-test-client");
     let server_b = fixture.start_server(Duration::from_hours(1));
     let client = no_redirect_client()?;
     let cookie = complete_browser_login(&client, &server_a, false).await?;
@@ -621,6 +636,7 @@ async fn cross_instance_logout_ends_browser_stream_within_revalidation_bound()
 #[tokio::test]
 async fn configuration_revocation_ends_existing_browser_stream()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let original = fixture.start_server(Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -629,8 +645,7 @@ async fn configuration_revocation_ends_existing_browser_stream()
     assert_grpc_web_initial_data(&mut stream).await?;
 
     let changed_at = std::time::Instant::now();
-    let reconfigured =
-        fixture.start_server_with_client_id(Duration::from_hours(1), "replacement-client");
+    let reconfigured = fixture.start_auth_replica(Duration::from_hours(1), "replacement-client");
     tokio::time::timeout(
         Duration::from_millis(1_100),
         assert_grpc_web_terminal_status(&mut stream, 16, "Waltr access authentication required"),
@@ -646,6 +661,7 @@ async fn configuration_revocation_ends_existing_browser_stream()
 #[tokio::test]
 async fn browser_revalidation_store_failure_ends_stream_as_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server(Duration::from_hours(1));
     let client = no_redirect_client()?;
@@ -667,6 +683,7 @@ async fn browser_revalidation_store_failure_ends_stream_as_unavailable()
 #[tokio::test]
 async fn disabled_mode_stream_remains_open_across_revalidation_intervals()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let channel = Endpoint::from_shared(setup_server().base_url())?
         .connect()
         .await?;
@@ -687,6 +704,7 @@ async fn disabled_mode_stream_remains_open_across_revalidation_intervals()
 #[tokio::test]
 async fn provider_auth_service_is_behind_the_waltr_access_gate()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let channel = Endpoint::from_shared(fixture().server.base_url())?
         .connect()
         .await?;
@@ -774,6 +792,19 @@ async fn hosted_mcp_metadata_and_access_fail_closed_at_the_http_boundary()
 
     let missing = mcp_post_raw(&client, &endpoint, None, None, b"not json").await?;
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    for bearer in [None, Some("forged-local-generation")] {
+        let mut request = client.post(&endpoint)
+            .header("x-waltr-local-origin", "true")
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
+                "validatedLocalOrigin":true,"origin":"local_process","principal_id":"shared-dev-domain",
+                "io.modelcontextprotocol/protocolVersion":mcp::protocol::MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities":{}}}}));
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        assert_eq!(request.send().await?.status(), StatusCode::UNAUTHORIZED);
+    }
     assert!(
         missing.headers()[header::WWW_AUTHENTICATE]
             .to_str()?

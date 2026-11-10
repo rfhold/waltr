@@ -6,7 +6,6 @@ use super::{
 use waltr::grpc::waltr::{
     config::v1::Configuration,
     session::v1::{
-        ExternalRequest as ProtoExternalRequest, ExternalRequestKind as ProtoExternalRequestKind,
         PendingWork as ProtoPendingWork, PendingWorkStatus as ProtoPendingWorkStatus,
         SessionCapabilities as ProtoSessionCapabilities,
         SessionCoordinationPhase as ProtoSessionCoordinationPhase,
@@ -21,10 +20,9 @@ use waltr::grpc::waltr::{
     },
 };
 use waltr_agent::{
-    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, SessionCapabilities,
-    SessionCoordinationPhase, SessionCoordinationReason, SessionCoordinationState, SessionProgress,
-    SessionProgressPhase, SessionPromptDisposition, SessionRunStage, SessionStatus, SessionSummary,
-    Suspension,
+    PendingWork, PendingWorkStatus, SessionCapabilities, SessionCoordinationPhase,
+    SessionCoordinationReason, SessionCoordinationState, SessionProgress, SessionProgressPhase,
+    SessionPromptDisposition, SessionRunStage, SessionStatus, SessionSummary, Suspension,
 };
 
 pub(super) fn session_summary_to_proto(
@@ -47,8 +45,11 @@ pub(super) fn session_summary_to_proto(
         inference_settings,
         metrics: Some(session_metrics_to_proto(summary.metrics)),
         agent_name: summary
-            .agent_name
-            .unwrap_or_else(|| default_agent_name.to_owned()),
+            .host_configuration
+            .map(serde_json::from_value::<crate::agent_host::AgentDefinitionBundle>)
+            .transpose()
+            .map_err(|_| tonic::Status::failed_precondition("invalid stored agent configuration"))?
+            .map_or_else(|| default_agent_name.to_owned(), |bundle| bundle.agent_name),
         metadata: Some(metadata),
         coordination: Some(session_coordination_to_proto(summary.coordination)),
         progress: Some(session_progress_to_proto(summary.progress)),
@@ -66,9 +67,6 @@ fn session_progress_to_proto(progress: SessionProgress) -> ProtoSessionProgress 
             SessionProgressPhase::Paused => ProtoSessionProgressPhase::Paused,
             SessionProgressPhase::AwaitingToolResults => {
                 ProtoSessionProgressPhase::AwaitingToolResults
-            }
-            SessionProgressPhase::AwaitingExternalInput => {
-                ProtoSessionProgressPhase::AwaitingExternalInput
             }
             SessionProgressPhase::Interrupted => ProtoSessionProgressPhase::Interrupted,
             SessionProgressPhase::Finished => ProtoSessionProgressPhase::Finished,
@@ -97,7 +95,6 @@ fn session_capabilities_to_proto(capabilities: SessionCapabilities) -> ProtoSess
                 ProtoSessionPromptDisposition::SupersedeSuspension
             }
         } as i32,
-        can_respond_external_request: capabilities.can_respond_external_request,
         can_interrupt: capabilities.can_interrupt,
     }
 }
@@ -260,17 +257,10 @@ fn suspension_to_proto(suspension: Suspension) -> ProtoSuspension {
         Suspension::AwaitingToolResults { work } => ProtoSuspension {
             kind: ProtoSuspensionKind::AwaitingToolResults as i32,
             work: work.into_iter().map(pending_work_to_proto).collect(),
-            request: None,
-        },
-        Suspension::AwaitingExternalInput { request } => ProtoSuspension {
-            kind: ProtoSuspensionKind::AwaitingExternalInput as i32,
-            work: Vec::new(),
-            request: Some(external_request_to_proto(*request)),
         },
         Suspension::Interrupted { work } => ProtoSuspension {
             kind: ProtoSuspensionKind::Interrupted as i32,
             work: work.into_iter().map(pending_work_to_proto).collect(),
-            request: None,
         },
     }
 }
@@ -292,25 +282,6 @@ const fn pending_work_status_to_proto(status: &PendingWorkStatus) -> ProtoPendin
     }
 }
 
-pub(super) fn external_request_to_proto(request: ExternalRequest) -> ProtoExternalRequest {
-    ProtoExternalRequest {
-        id: request.id.as_str().to_owned(),
-        kind: external_request_kind_to_proto(&request.kind) as i32,
-        tool_call_id: request.tool_call_id,
-        prompt: request.prompt,
-        payload_json: serde_json::to_string(&request.payload).unwrap_or_else(|_| "null".to_owned()),
-    }
-}
-
-const fn external_request_kind_to_proto(kind: &ExternalRequestKind) -> ProtoExternalRequestKind {
-    match kind {
-        ExternalRequestKind::Permission => ProtoExternalRequestKind::Permission,
-        ExternalRequestKind::Question => ProtoExternalRequestKind::Question,
-        ExternalRequestKind::ToolInput => ProtoExternalRequestKind::ToolInput,
-        ExternalRequestKind::Custom(_) => ProtoExternalRequestKind::Custom,
-    }
-}
-
 fn timestamp_to_proto(time: SystemTime) -> prost_types::Timestamp {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -324,10 +295,10 @@ fn timestamp_to_proto(time: SystemTime) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use waltr::grpc::waltr::auth::v1::{
         AuthenticationDomain, AuthenticationFailureReason, auth_target,
     };
-    use serde_json::json;
 
     #[test]
     fn progress_and_capabilities_preserve_every_agent_value() {
@@ -352,10 +323,6 @@ mod tests {
             (
                 SessionProgressPhase::AwaitingToolResults,
                 ProtoSessionProgressPhase::AwaitingToolResults,
-            ),
-            (
-                SessionProgressPhase::AwaitingExternalInput,
-                ProtoSessionProgressPhase::AwaitingExternalInput,
             ),
             (
                 SessionProgressPhase::Interrupted,
@@ -429,11 +396,9 @@ mod tests {
         ] {
             let projected = session_capabilities_to_proto(SessionCapabilities {
                 prompt_disposition: disposition,
-                can_respond_external_request: true,
                 can_interrupt: true,
             });
             assert_eq!(projected.prompt_disposition, expected as i32);
-            assert!(projected.can_respond_external_request);
             assert!(projected.can_interrupt);
         }
     }
@@ -443,20 +408,23 @@ mod tests {
         let status = session_status_to_proto(SessionStatus::Failed {
             message: "MCP credential rejected".to_owned(),
             authentication_failure: Some(waltr_agent::AuthenticationFailure {
-                target: waltr_agent::AuthTarget::mcp_server("configured-mcp"),
+                target: crate::auth::AuthTarget::mcp_server("configured-mcp").into(),
                 reason: waltr_agent::AuthenticationFailureReason::CredentialRejected,
-                mcp_authorization: Some(Box::new(waltr_agent::McpAuthorizationContext {
-                    endpoint: "https://mcp.example/rpc".to_owned(),
-                    http_status: 401,
-                    resource_metadata_url: Some(
-                        "https://mcp.example/.well-known/oauth-protected-resource".to_owned(),
-                    ),
-                    scope: Some("tools.read".to_owned()),
-                    error: Some("invalid_token".to_owned()),
-                    error_description: None,
-                    error_uri: None,
-                    realm: None,
-                })),
+                host_context: Some(
+                    serde_json::to_value(crate::auth::McpAuthorizationContext {
+                        endpoint: "https://mcp.example/rpc".to_owned(),
+                        http_status: 401,
+                        resource_metadata_url: Some(
+                            "https://mcp.example/.well-known/oauth-protected-resource".to_owned(),
+                        ),
+                        scope: Some("tools.read".to_owned()),
+                        error: Some("invalid_token".to_owned()),
+                        error_description: None,
+                        error_uri: None,
+                        realm: None,
+                    })
+                    .unwrap(),
+                ),
             }),
         });
 

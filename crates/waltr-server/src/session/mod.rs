@@ -1,6 +1,8 @@
 //! Session service coordination.
 
 use futures_util::Stream;
+use std::{pin::Pin, sync::Arc};
+use tonic::service::RoutesBuilder;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
 use waltr_agent::{
     AgentRunLimits, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
@@ -11,8 +13,6 @@ use waltr_agent::{
     SessionMaskMutationOutcome, SessionPauseError, SessionPauseLease, SessionStore, SessionSummary,
     TimelineCursor,
 };
-use std::{pin::Pin, sync::Arc};
-use tonic::service::RoutesBuilder;
 
 pub mod service;
 pub mod storage;
@@ -20,10 +20,12 @@ pub mod storage;
 mod convert;
 mod error;
 mod inference_settings;
+pub mod interactions;
 mod mcp_apps;
 mod timeline_convert;
 
 pub use service::{SessionCatalogSource, SessionRegistrationInput, SessionService};
+pub(crate) use service::resolve_mcp_connections;
 pub use storage::SessionStorageConfigError;
 
 pub(crate) use storage::SessionStorageConfig;
@@ -47,6 +49,20 @@ pub(crate) fn pinned_inference_settings(
 /// Object-safe access to the coordinator owned by the registered gRPC session service.
 #[tonic::async_trait]
 pub trait SessionHost: Send + Sync {
+    /// Install an opaque private self binding composed by the owning application.
+    fn install_self_mcp(&self, _binding: crate::self_mcp::SelfMcpBinding) {}
+    /// Explicit server workspace and broker binding for authenticated sessionless callers.
+    fn external_tools(&self) -> Option<Arc<crate::agent_host::external::ExternalToolHost>> {
+        None
+    }
+    /// Compose the application's single Routine runtime with this concrete normal coordinator.
+    async fn compose_routines(
+        &self,
+        _input: crate::routine::production::ProductionInput,
+    ) -> Result<Arc<crate::routine::production::ProductionRuntime>, crate::routine::ports::PortError>
+    {
+        Err(crate::routine::ports::PortError::UnsupportedCapability)
+    }
     /// Install or remove synchronous terminal-run admission.
     fn set_completion_admission_handler(
         &self,
@@ -112,6 +128,17 @@ pub trait SessionHost: Send + Sync {
         id: SessionId,
         prompt: String,
     ) -> Result<AgentSessionRunSubmission, AgentSessionRunError>;
+    /// Admit durable work with current authentication; later credential expiry does not cancel it.
+    async fn submit_prompt_authorized(
+        &self,
+        _id: SessionId,
+        _prompt: String,
+        _principal: crate::access_auth::AuthenticatedPrincipal,
+    ) -> Result<OriginSubmission, tonic::Status> {
+        Err(tonic::Status::permission_denied(
+            "origin binding unavailable",
+        ))
+    }
     /// Atomically set one metadata value.
     async fn set_metadata_value_conditionally(
         &self,
@@ -131,6 +158,17 @@ pub trait SessionHost: Send + Sync {
     }
     /// Permanently stop run admission and cancel process-local session work.
     async fn shutdown(&self);
+}
+
+/// Admission receipt for a run retained by its origin-lifetime owner.
+#[derive(Debug)]
+pub struct OriginSubmission {
+    /// Durable target session.
+    pub session_id: SessionId,
+    /// Exact coordinator submission identifier.
+    pub run_id: u64,
+    /// Ordinary admission disposition.
+    pub disposition: waltr_agent::AgentSessionRunDisposition,
 }
 
 /// Load storage from the environment and register a session host with a live worker.
@@ -203,6 +241,11 @@ where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     let service = SessionService::from_sessions(sessions, input);
+    routes.add_service(
+        waltr::grpc::waltr::session::v1::interaction_service_server::InteractionServiceServer::new(
+            interactions::InteractionService::new(service.clone(), service.interactions.clone()),
+        ),
+    );
     routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
     service
 }
@@ -248,5 +291,13 @@ mod sandbox_root_tests {
             )
             .is_err()
         );
+    }
+}
+#[derive(Debug)]
+pub(crate) struct UnboundSessionEvents;
+
+impl waltr_agent::SessionEventSink for UnboundSessionEvents {
+    fn send(&self, _: waltr_agent::SessionEvent) -> waltr_agent::SessionEventSinkFuture {
+        Box::pin(async { Ok(()) })
     }
 }

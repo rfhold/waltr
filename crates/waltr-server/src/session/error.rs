@@ -1,10 +1,10 @@
 use tonic::Status;
 
+use prost::Message;
 use waltr::grpc::waltr::auth::v1::{
     AuthTarget, AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
     McpAuthorizationContext, auth_target,
 };
-use prost::Message;
 
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn agent_error_to_status(error: waltr_agent::LlmError) -> Status {
@@ -38,12 +38,12 @@ pub(super) fn session_run_error_to_status(error: waltr_agent::AgentSessionRunErr
                 target,
                 message,
                 reason,
-                mcp_authorization,
+                host_context,
             } => {
                 let details = authentication_failure_to_proto(waltr_agent::AuthenticationFailure {
                     target,
                     reason,
-                    mcp_authorization,
+                    host_context,
                 });
                 Status::with_details(status_code(reason), message, details.encode_to_vec().into())
             }
@@ -61,12 +61,21 @@ pub(super) fn authentication_failure_to_proto(
                 target: Some(auth_target::Target::ProviderKey(key)),
             },
         ),
-        waltr_agent::AuthTarget::McpServer { key } => (
+        waltr_agent::AuthTarget::Host { namespace, key } if namespace == "mcp" => (
             AuthenticationDomain::OutboundMcp,
             AuthTarget {
                 target: Some(auth_target::Target::McpServerKey(key)),
             },
         ),
+        _ => {
+            return AuthenticationFailure {
+                version: 1,
+                domain: 0,
+                reason: proto_reason(failure.reason) as i32,
+                target: None,
+                mcp_authorization: None,
+            };
+        }
     };
     AuthenticationFailure {
         version: 1,
@@ -74,7 +83,10 @@ pub(super) fn authentication_failure_to_proto(
         reason: proto_reason(failure.reason) as i32,
         target: Some(target),
         mcp_authorization: failure
-            .mcp_authorization
+            .host_context
+            .and_then(|value| {
+                serde_json::from_value::<crate::auth::McpAuthorizationContext>(value).ok()
+            })
             .map(|context| McpAuthorizationContext {
                 endpoint: context.endpoint,
                 http_status: u32::from(context.http_status),
@@ -136,22 +148,25 @@ mod tests {
     fn mcp_requirement_encodes_domain_reason_target_and_challenge() {
         let status = session_run_error_to_status(waltr_agent::AgentSessionRunError::Runtime(
             waltr_agent::AgentSessionRuntimeError::Authentication {
-                target: waltr_agent::AuthTarget::mcp_server("self"),
+                target: crate::auth::AuthTarget::mcp_server("self").into(),
                 message: "MCP authentication failed".to_owned(),
                 reason: waltr_agent::AuthenticationFailureReason::CredentialRequired,
-                mcp_authorization: Some(Box::new(waltr_agent::McpAuthorizationContext {
-                    endpoint: "https://waltr.example.test/mcp".to_owned(),
-                    http_status: 401,
-                    resource_metadata_url: Some(
-                        "https://waltr.example.test/.well-known/oauth-protected-resource/mcp"
-                            .to_owned(),
-                    ),
-                    scope: Some("tools.read".to_owned()),
-                    error: None,
-                    error_description: None,
-                    error_uri: None,
-                    realm: None,
-                })),
+                host_context: Some(
+                    serde_json::to_value(crate::auth::McpAuthorizationContext {
+                        endpoint: "https://waltr.example.test/mcp".to_owned(),
+                        http_status: 401,
+                        resource_metadata_url: Some(
+                            "https://waltr.example.test/.well-known/oauth-protected-resource/mcp"
+                                .to_owned(),
+                        ),
+                        scope: Some("tools.read".to_owned()),
+                        error: None,
+                        error_description: None,
+                        error_uri: None,
+                        realm: None,
+                    })
+                    .unwrap(),
+                ),
             },
         ));
 
@@ -182,7 +197,7 @@ mod tests {
                 target: waltr_agent::AuthTarget::provider("openai"),
                 message: "token service unavailable".to_owned(),
                 reason: waltr_agent::AuthenticationFailureReason::NetworkFailed,
-                mcp_authorization: None,
+                host_context: None,
             },
         ));
 

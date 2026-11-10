@@ -1,6 +1,7 @@
+use tonic::Status;
 use waltr::grpc::waltr::session::v1::{
-    ContentRefTimelineContent, EmptyTimelineContent, ExternalRequestTimelineContent,
-    JsonTimelineContent, ProjectedTimelineEvent as ProtoProjectedTimelineEvent,
+    ContentRefTimelineContent, EmptyTimelineContent, JsonTimelineContent,
+    ProjectedTimelineEvent as ProtoProjectedTimelineEvent,
     SyntheticTimelineEvent as ProtoSyntheticTimelineEvent, TextDeltaTimelineContent,
     TextSnapshotTimelineContent, TimelineContent as ProtoTimelineContent,
     TimelineDirection as ProtoTimelineDirection, TimelineEvent as ProtoTimelineEvent,
@@ -15,9 +16,6 @@ use waltr_agent::{
     TimelineChannel, TimelineContent, TimelineCursor, TimelineDirection as AgentTimelineDirection,
     TimelineEventKind, TimelineQuery, TimelineStatus,
 };
-use tonic::Status;
-
-use super::convert::external_request_to_proto;
 
 const DEFAULT_TIMELINE_LIMIT: usize = 100;
 const MAX_TIMELINE_LIMIT: usize = 1000;
@@ -178,11 +176,6 @@ fn timeline_content_to_proto(content: TimelineContent) -> Result<ProtoTimelineCo
                 error: result.is_error,
             })
         }
-        TimelineContent::ExternalRequest { request } => {
-            timeline_content::Content::ExternalRequest(ExternalRequestTimelineContent {
-                request: Some(external_request_to_proto(request)),
-            })
-        }
         TimelineContent::ContentRef { content_id, bytes } => {
             timeline_content::Content::ContentRef(ContentRefTimelineContent {
                 content_id: content_id.as_str().to_owned(),
@@ -206,10 +199,6 @@ const fn timeline_kind_to_proto(kind: TimelineEventKind) -> ProtoTimelineEventKi
         TimelineEventKind::ContentDelta => ProtoTimelineEventKind::ContentDelta,
         TimelineEventKind::ItemUpdated => ProtoTimelineEventKind::ItemUpdated,
         TimelineEventKind::ItemFinished => ProtoTimelineEventKind::ItemFinished,
-        TimelineEventKind::ExternalRequestOpened => ProtoTimelineEventKind::ExternalRequestOpened,
-        TimelineEventKind::ExternalRequestResolved => {
-            ProtoTimelineEventKind::ExternalRequestResolved
-        }
         TimelineEventKind::SessionStatusChanged => ProtoTimelineEventKind::SessionStatusChanged,
     }
 }
@@ -224,7 +213,6 @@ const fn timeline_status_to_proto(status: TimelineStatus) -> ProtoTimelineStatus
         TimelineStatus::RunningTool => ProtoTimelineStatus::RunningTool,
         TimelineStatus::Pending => ProtoTimelineStatus::Pending,
         TimelineStatus::AwaitingToolResults => ProtoTimelineStatus::AwaitingToolResults,
-        TimelineStatus::AwaitingExternalInput => ProtoTimelineStatus::AwaitingExternalInput,
         TimelineStatus::Interrupted => ProtoTimelineStatus::Interrupted,
         TimelineStatus::Resolved => ProtoTimelineStatus::Resolved,
         TimelineStatus::Finished => ProtoTimelineStatus::Finished,

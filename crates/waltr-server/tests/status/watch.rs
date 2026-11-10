@@ -4,6 +4,7 @@ use waltr_server::test_support::setup_server;
 
 #[tokio::test]
 async fn status_service_watch_reports_ready() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = status_client(server).await?;
 

@@ -8,6 +8,7 @@ use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 
 #[tokio::test]
 async fn list_agents_is_sorted_and_reports_default() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let response = session_client(server)
         .await?
@@ -21,7 +22,23 @@ async fn list_agents_is_sorted_and_reports_default() -> Result<(), Box<dyn std::
         .iter()
         .map(|agent| agent.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, ["coding", "configuration", "default"]);
+    assert_eq!(
+        names,
+        [
+            "coding",
+            "configuration",
+            "default",
+            "routine-categorization",
+            "routine-category-context",
+            "routine-cleanup",
+            "routine-compaction",
+            "routine-context-strategy",
+            "routine-conversation-filter",
+            "routine-conversation-notes",
+            "routine-fork",
+            "routine-title"
+        ]
+    );
     assert!(
         response
             .agents
@@ -34,6 +51,7 @@ async fn list_agents_is_sorted_and_reports_default() -> Result<(), Box<dyn std::
 #[tokio::test]
 async fn create_selects_alternate_and_rejects_invalid_names()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut client = session_client(server).await?;
     let created = client
@@ -50,7 +68,10 @@ async fn create_selects_alternate_and_rejects_invalid_names()
     assert_eq!(created.agent_name, "default");
     let stored = sessions.load(&SessionId::new(&created.id)).await?;
     assert_eq!(
-        stored.record.agent_definition.unwrap().agent_name,
+        serde_json::from_value::<waltr_server::agent_host::AgentDefinitionBundle>(
+            stored.record.agent_definition.unwrap()
+        )?
+        .agent_name,
         "default"
     );
 
@@ -72,6 +93,7 @@ async fn create_selects_alternate_and_rejects_invalid_names()
 #[tokio::test]
 async fn switch_updates_response_watch_list_and_durable_bundle()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut client = session_client(server).await?;
     let created = client
@@ -113,7 +135,10 @@ async fn switch_updates_response_watch_list_and_durable_bundle()
     assert_eq!(listed[0].agent_name, "default");
     let stored = sessions.load(&SessionId::new(&created.id)).await?;
     assert_eq!(
-        stored.record.agent_definition.unwrap().agent_name,
+        serde_json::from_value::<waltr_server::agent_host::AgentDefinitionBundle>(
+            stored.record.agent_definition.unwrap()
+        )?
+        .agent_name,
         "default"
     );
     Ok(())
@@ -122,6 +147,7 @@ async fn switch_updates_response_watch_list_and_durable_bundle()
 #[tokio::test]
 async fn switch_validation_and_missing_session_have_precise_statuses()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
     let created = client
@@ -159,6 +185,7 @@ async fn switch_validation_and_missing_session_have_precise_statuses()
 #[tokio::test]
 async fn legacy_bundleless_summary_uses_effective_default() -> Result<(), Box<dyn std::error::Error>>
 {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let legacy = sessions
         .create(SessionCreateRequest::new(SessionId::generate()))

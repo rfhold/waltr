@@ -1,18 +1,19 @@
 const TEST_APP_HTML: &str = "<!doctype html><html><body><p>Generic fixture app</p></body></html>";
 use super::super::mcp_apps as apps;
 use super::*;
-use waltr::grpc::waltr::session::v1::{session_service_server::SessionService as _, *};
-use waltr_agent::{
-    AgentRuntimeProvider, AgentSessionRuntimeFactory, BoxCompletionStream, BoxStreamFuture,
-    CompletionEvent, CompletionRequest, LlmStream, MemorySessionStore, SessionCoordinator,
-    SessionCreateRequest, SessionId,
-};
+use crate::agent_host::mcp::session_apps::ServerMcpApps;
+use crate::agent_host::runtime_factory::ServerAgentRuntimeFactory as AgentSessionRuntimeFactory;
 use serde_json::json;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use tonic::{Code, Request};
+use waltr::grpc::waltr::session::v1::{session_service_server::SessionService as _, *};
+use waltr_agent::{
+    AgentRuntimeProvider, BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
+    LlmStream, MemorySessionStore, SessionCoordinator, SessionCreateRequest, SessionId,
+};
 
 struct Provider(AtomicUsize);
 
@@ -30,14 +31,14 @@ impl LlmStream for SelfStatusProvider {
             request
                 .tools
                 .iter()
-                .any(|tool| tool.name == "mcp_waltr_status")
+                .any(|tool| tool.name == "waltr__status")
         );
         let turn = self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let events = if turn == 0 {
                 vec![CompletionEvent::ToolCall(waltr_agent::ToolCall::new(
                     "self-status",
-                    "mcp_waltr_status",
+                    "waltr__status",
                     json!({}),
                 ))]
             } else {
@@ -54,14 +55,15 @@ impl LlmStream for SelfStatusProvider {
 #[cfg(feature = "apps-served-assets")]
 #[tokio::test]
 async fn embedded_self_status_records_app_association_from_local_credential_snapshot() {
+    use crate::auth::{AuthTarget, CredentialStore, FileCredentialStore};
     use crate::embedded::{
         EmbeddedCatalogSource, EmbeddedOutboundPolicy, EmbeddedServerConfig, build_embedded_server,
     };
-    use waltr_agent::{AuthTarget, CredentialStore, FileCredentialStore};
 
     let root = crate::test_support::temp_root();
     let bearer = crate::LocalBearer::new("embedded-status-fixture-secret").unwrap();
     let server = build_embedded_server(EmbeddedServerConfig {
+        routine_authority: Default::default(),
         resources_root: root.join("resources"),
         waltr_database_path: root.join("data/waltr.sqlite3"),
         mcp_database_path: root.join("data/mcp.sqlite3"),
@@ -76,7 +78,6 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
         default_agent: "coding".into(),
         local_bearer: bearer.clone(),
         outbound_policy: EmbeddedOutboundPolicy::default(),
-        interaction_limits: Default::default(),
     })
     .await
     .unwrap();
@@ -113,6 +114,7 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
     let (definition, _) = crate::test_support::default_agent_definition();
     let provider = Arc::new(SelfStatusProvider(AtomicUsize::new(0)));
     let provider_factory = provider.clone();
+    let interactions = crate::interaction::InteractionBroker::new();
     let factory = AgentSessionRuntimeFactory::new(
         sandbox.handle(),
         root.join("fixture-workspace"),
@@ -129,19 +131,28 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
             provider_factory.clone(),
         ))
     })
+    .with_capability_policy(crate::permission::ServerPermissionPolicy::sessions(
+        interactions.clone(),
+    ))
     .with_trusted_mcp_oauth_origins(vec![origin.parse().unwrap()])
     .with_mcp_connection_resolver(move |_| {
         let endpoint = endpoint.clone();
         Box::pin(async move {
-            Ok(vec![waltr_agent::McpResolvedConnection {
-                key: "waltr".into(),
-                kind: waltr_agent::McpConnectionKind::StreamableHttp,
-                url: endpoint,
-                command: String::new(),
-            }])
+            Ok(vec![
+                crate::agent_host::runtime_factory::McpResolvedConnection {
+                    key: "waltr".into(),
+                    kind: crate::agent_host::runtime_factory::McpConnectionKind::StreamableHttp,
+                    url: endpoint,
+                    command: String::new(),
+                },
+            ])
         })
     });
-    let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
+    let sessions = sessions
+        .clone()
+        .with_runtime_factory(factory.session_factory(sessions.clone()));
+    let app_runtime = ServerMcpApps::new(sessions.clone(), factory.clone());
     let id = SessionId::generate();
     sessions
         .create(SessionCreateRequest::new(id.clone()))
@@ -208,7 +219,7 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
         super::super::timeline_convert::timeline_event_to_proto(result.clone()).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&projected.metadata_json).unwrap();
     assert_eq!(metadata["mcp_app"], *association);
-    let app = sessions
+    let app = app_runtime
         .open_session_mcp_app(
             &id,
             "self-status",
@@ -218,7 +229,7 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
         .unwrap();
     assert!(app.resource.html.contains("Waltr Status"));
     assert_eq!(app.association.result, association["result"]);
-    sessions.close_session_mcp_app(&app.handle);
+    app_runtime.close_session_mcp_app(&app.handle);
     sessions.shutdown().await;
     sandbox.shutdown().await;
     stop.cancel();
@@ -233,10 +244,10 @@ impl LlmStream for Provider {
     fn stream_request<'a>(&'a self, _: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
         let turn = self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
-            let events = if turn == 0 {
+            let events = if turn % 2 == 0 {
                 vec![CompletionEvent::ToolCall(waltr_agent::ToolCall::new(
                     "original",
-                    "mcp_fixture_observe_fixture",
+                    "fixture__observe_fixture",
                     json!({}),
                 ))]
             } else {
@@ -326,7 +337,7 @@ impl mcp::server::ServerHandler for Fixture {
 
 fn definition(level: &str) -> String {
     format!(
-        "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: apps }}\nspec:\n  features: [{{ featureSetRef: {{ name: apps }} }}]\n  permissions: [{{ permissionSetRef: {{ name: apps }} }}]\n---\napiVersion: waltr.dev/v1alpha1\nkind: FeatureSet\nmetadata: {{ name: apps }}\nspec:\n  mcp: {{ exposeTools: true, defaultPermissions: false }}\n---\napiVersion: waltr.dev/v1alpha1\nkind: PermissionSet\nmetadata: {{ name: apps }}\nspec:\n  tools: [{{ name: mcp_fixture_observe_fixture, permission: {level} }}]\n"
+        "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: apps }}\nspec:\n  features: [{{ featureSetRef: {{ name: apps }} }}]\n  permissions: [{{ permissionSetRef: {{ name: apps }} }}]\n---\napiVersion: waltr.dev/v1alpha1\nkind: FeatureSet\nmetadata: {{ name: apps }}\nspec:\n  mcp: {{ exposeTools: true, defaultPermissions: false }}\n---\napiVersion: waltr.dev/v1alpha1\nkind: PermissionSet\nmetadata: {{ name: apps }}\nspec:\n  tools: [{{ name: fixture__observe_fixture, permission: {level} }}]\n"
     )
 }
 
@@ -340,6 +351,11 @@ fn request<T>(value: T, subject: &str) -> Request<T> {
 
 #[tokio::test]
 async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed() {
+    if !crate::test_support::isolated_process_test(
+        "session::service::apps_tests::apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed",
+    ) {
+        return;
+    }
     let root = crate::test_support::temp_root();
     let sandbox = crate::sandbox::LocalSandbox::start(root.clone())
         .await
@@ -361,15 +377,16 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
         .unwrap();
     });
     let source = definition("allow");
-    let mut registry = waltr_agent::AgentDefinitionRegistry::new();
+    let mut registry = crate::agent_host::definition::AgentDefinitionRegistry::new();
     registry.load_yaml(&source).unwrap();
     let resolved = registry.resolve_agent("apps").unwrap();
     let provider = Arc::new(Provider(AtomicUsize::new(0)));
     let provider_factory = provider.clone();
+    let interactions = crate::interaction::InteractionBroker::new();
     let factory = AgentSessionRuntimeFactory::new(
         sandbox.handle(),
         root.clone(),
-        waltr_agent::FileCredentialStore::new(root.join("credentials.json")),
+        crate::auth::FileCredentialStore::new(root.join("credentials.json")),
         resolved,
     )
     .with_runtime_provider(move |_| {
@@ -382,19 +399,28 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
             provider_factory.clone(),
         ))
     })
+    .with_capability_policy(crate::permission::ServerPermissionPolicy::sessions(
+        interactions.clone(),
+    ))
     .with_trusted_mcp_oauth_origins(vec![origin.parse().unwrap()])
     .with_mcp_connection_resolver(move |_| {
         let endpoint = endpoint.clone();
         Box::pin(async move {
-            Ok(vec![waltr_agent::McpResolvedConnection {
-                key: "fixture".into(),
-                kind: waltr_agent::McpConnectionKind::StreamableHttp,
-                url: endpoint,
-                command: String::new(),
-            }])
+            Ok(vec![
+                crate::agent_host::runtime_factory::McpResolvedConnection {
+                    key: "fixture".into(),
+                    kind: crate::agent_host::runtime_factory::McpConnectionKind::StreamableHttp,
+                    url: endpoint,
+                    command: String::new(),
+                },
+            ])
         })
     });
-    let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
+    let sessions = sessions
+        .clone()
+        .with_runtime_factory(factory.session_factory(sessions.clone()));
+    let app_runtime = ServerMcpApps::new(sessions.clone(), factory.clone());
     let id = SessionId::generate();
     sessions
         .create(SessionCreateRequest::new(id.clone()))
@@ -429,6 +455,15 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
     run.handle.wait().await.unwrap();
     let state = crate::test_support::resource_state_with_overrides(&[]);
     let service = Arc::new(SessionService {
+        app_runtime,
+        external_tools: crate::agent_host::external::ExternalToolHost::new(
+            factory.clone(),
+            interactions.clone(),
+        ),
+        interactions: interactions.clone(),
+        runtime_factory: Arc::new(factory),
+        routines: tokio::sync::Mutex::new(None),
+        origin_runs: super::OriginRuns::default(),
         sessions: sessions.clone(),
         config: crate::config::ConfigHandle::from_resources(state),
         agent_catalog: SessionCatalogSource::Static(crate::test_support::default_agent_catalog()),
@@ -464,6 +499,39 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
     );
     assert_eq!(provider.0.load(Ordering::SeqCst), 2);
     let mut waiting = call();
+    let inference = sessions.load(&id).await.unwrap().record.inference_settings;
+    macro_rules! fresh_app {
+        () => {{
+            let id = SessionId::generate();
+            let mut create = SessionCreateRequest::new(id.clone());
+            create.inference_settings = inference.clone();
+            sessions.create(create).await.unwrap();
+            sessions
+                .submit_prompt(
+                    id.clone(),
+                    "observe",
+                    waltr_agent::RunConflictPolicy::RejectIfActive,
+                )
+                .await
+                .unwrap()
+                .handle
+                .wait()
+                .await
+                .unwrap();
+            let app = service
+                .open_session_mcp_app(request(
+                    OpenSessionMcpAppRequest {
+                        session_id: id.as_str().to_owned(),
+                        call_id: "original".into(),
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("fresh app {id:?}: {error:?}"))
+                .into_inner();
+            (id, app)
+        }};
+    }
     waiting.arguments_json = "{\"wait\":true}".into();
     let running_service = service.clone();
     let running = tokio::spawn(async move {
@@ -479,7 +547,21 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
     service
         .call_session_mcp_app_tool(request(call(), "alice"))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        sessions
+            .load(&id)
+            .await
+            .unwrap()
+            .record
+            .has_unsettled_host_dispatch()
+    );
+    let (id, app) = fresh_app!();
+    let call = || CallSessionMcpAppToolRequest {
+        app_id: app.app_id.clone(),
+        name: "observe_fixture".into(),
+        arguments_json: "{}".into(),
+    };
     let mut waiting = call();
     waiting.arguments_json = "{\"wait\":true}".into();
     let running_service = service.clone();
@@ -502,7 +584,21 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
     service
         .call_session_mcp_app_tool(request(call(), "alice"))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        sessions
+            .load(&id)
+            .await
+            .unwrap()
+            .record
+            .has_unsettled_host_dispatch()
+    );
+    let (id, app) = fresh_app!();
+    let call = || CallSessionMcpAppToolRequest {
+        app_id: app.app_id.clone(),
+        name: "observe_fixture".into(),
+        arguments_json: "{}".into(),
+    };
     let record = sessions.load(&id).await.unwrap();
     let original = record.record.timeline_events().find(|event| matches!(&event.content, waltr_agent::TimelineContent::ToolResult { result } if result.call_id == "original")).unwrap();
     assert_eq!(
@@ -525,33 +621,56 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
             .code(),
         Code::FailedPrecondition
     );
-    for (level, message) in [
-        ("ask", "MCP app approval required"),
-        ("deny", "MCP app denied"),
-    ] {
+    for level in ["ask", "deny"] {
         sessions
             .set_agent_definition(
                 &id,
-                Some(waltr_agent::AgentDefinitionBundle::new(
-                    "apps",
-                    vec![definition(level)],
-                )),
+                Some(
+                    serde_json::to_value(
+                        crate::agent_host::definition::AgentDefinitionBundle::new(
+                            "apps",
+                            vec![definition(level)],
+                        ),
+                    )
+                    .unwrap(),
+                ),
             )
             .await
             .unwrap();
-        assert_eq!(
-            service
-                .call_session_mcp_app_tool(request(call(), "alice"))
+        let pending_service = service.clone();
+        let pending_call = call();
+        let owner = tokio::spawn(async move {
+            pending_service
+                .call_session_mcp_app_tool(request(pending_call, "alice"))
                 .await
-                .unwrap_err()
-                .message(),
-            message
-        );
+        });
+        if level == "ask" {
+            let snapshot = crate::host_tests::pending(&interactions, &id).await;
+            assert!(!owner.is_finished());
+            crate::host_tests::respond(
+                &interactions,
+                &snapshot,
+                crate::interaction::InteractionResponse::Permission(
+                    crate::permission::PermissionResponse::Deny {
+                        message: None,
+                        mode: crate::permission::PermissionDenyMode::ReturnToolResult,
+                    },
+                ),
+            )
+            .unwrap();
+        }
+        assert!(owner.await.unwrap().is_err());
     }
     sessions
         .set_agent_definition(
             &id,
-            Some(waltr_agent::AgentDefinitionBundle::new("apps", vec![source])),
+            Some(
+                serde_json::to_value(crate::agent_host::definition::AgentDefinitionBundle::new(
+                    "apps",
+                    vec![source],
+                ))
+                .unwrap(),
+            ),
         )
         .await
         .unwrap();
@@ -562,6 +681,10 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
         )
         .await
         .unwrap();
+    let open = || OpenSessionMcpAppRequest {
+        session_id: id.as_str().to_owned(),
+        call_id: "original".into(),
+    };
     assert_eq!(
         service
             .open_session_mcp_app(request(open(), "alice"))
@@ -719,6 +842,32 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
             .await
             .unwrap();
     }
+    let owners = service.origin_runs.tasks.lock().await;
+    let principal = request((), "alice")
+        .extensions()
+        .get::<crate::access_auth::AuthenticatedPrincipal>()
+        .unwrap()
+        .clone();
+    let admission = crate::session::SessionHost::submit_prompt_authorized(
+        service.as_ref(),
+        id.clone(),
+        "closed admission".into(),
+        principal,
+    );
+    tokio::pin!(admission);
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(admission.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(service.origin_runs.slots.available_permits(), 127);
+    service.origin_runs.slots.close();
+    drop(owners);
+    assert_eq!(
+        admission.await.unwrap_err().message(),
+        "origin admission closed"
+    );
+    assert!(service.origin_runs.tasks.lock().await.is_empty());
     service.apps.clear();
     sessions.shutdown().await;
     sandbox.shutdown().await;

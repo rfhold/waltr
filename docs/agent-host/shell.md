@@ -1,8 +1,10 @@
 # Shell Tool
 
-The shell tool gives an agent policy-controlled access to local shell command execution. The agent owns the schema and permissions; `waltr-agent-sandbox` executes commands through the private worker. Both crates require the `shell` feature and the host must enable the tool through `AgentBuilder`. See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
+The server owns shell schemas and policy; `waltr-agent-sandbox` executes commands through the private worker.
+Both crates require `shell`; `waltr-agent` has no shell feature. `HostRuntimeBuilder` installs the tool.
+See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
 
-The standalone server and embedded desktop app retain this feature. Their worker runs in the server process without operating-system isolation. Android is compiled without it.
+Standalone containers use a separate worker. Embedded desktop uses a process-local worker without OS isolation. Android has no shell feature.
 
 Every host loads the same ordinary catalog. A no-shell build accepts, exposes, and resolves shell-bearing definitions, but runtime construction does not install the shell tool or feature-derived shell tool permissions.
 
@@ -10,12 +12,12 @@ Every host loads the same ordinary catalog. A no-shell build accepts, exposes, a
 
 | API | Purpose |
 | --- | --- |
-| Cargo feature `shell` | Enables agent shell schemas and worker-side tree-sitter bash scanning/execution. |
-| `AgentBuilder::with_shell_tool` | Adds the provider-facing `shell` tool. |
-| `AgentBuilder::with_shell_system_prompt` | Adds shell usage guidance to the system prompt. |
+| Server Cargo feature `shell` | Enables server schemas and the worker shell feature. |
+| `HostRuntimeBuilder::with_shell_tool` | Adds the `shell` capability. |
+| `HostRuntimeBuilder::with_shell_system_prompt` | Adds shell prompt guidance. |
 | `ShellConfig` | Configures root, default workdir, timeout, and output limits; overrides are sent to the worker. |
 | `ShellInput` | Provider-facing command input. |
-| `ShellScan` and `ParsedShellCommand` | Agent-side parser types for command hints; worker supplies claims for runtime decisions. |
+| `ShellScan` and `ParsedShellCommand` | Server parser types for command hints; worker supplies claims for runtime decisions. |
 
 ## Execution Behavior
 
@@ -65,21 +67,21 @@ Hosts should configure explicit `PermissionPolicy` rules for shell use. The pars
 
 ## Tests
 
-See [../testing.md](../testing.md) for canonical test commands. Agent shell tests require `--features shell`; server shell builds enable both agent and worker features.
+See [../testing.md](../testing.md). Server host shell tests require the server `shell` feature, which also enables worker shell support.
 
 Focused coverage:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/waltr-agent/src/tools/shell/mod.rs](../../crates/waltr-agent/src/tools/shell/mod.rs) | Agent-side shell schema and parser unit coverage. |
+| [../../crates/waltr-server/src/agent_host/tools/shell/mod.rs](../../crates/waltr-server/src/agent_host/tools/shell/mod.rs) | Server shell schema and parser. |
 | [../../crates/waltr-agent-sandbox/src/shell.rs](../../crates/waltr-agent-sandbox/src/shell.rs) | Worker-side shell parsing, claims, and execution. |
-| [../../crates/waltr-agent/tests/agent/permissions.rs](../../crates/waltr-agent/tests/agent/permissions.rs) | Deterministic permission behavior with shell claims when the feature is enabled. |
-| [../../crates/waltr-agent/tests/live/agent/shell.rs](../../crates/waltr-agent/tests/live/agent/shell.rs) | Ignored live-provider shell coverage. |
+| [../../crates/waltr-server/tests/agent_host/permissions.rs](../../crates/waltr-server/tests/agent_host/permissions.rs) | Shell policy cases. |
+| [../../crates/waltr-server/tests/agent_host/live/shell.rs](../../crates/waltr-server/tests/agent_host/live/shell.rs) | Live-provider shell cases. |
 
 ## References
 
 | Path | Purpose |
 | --- | --- |
-| [../../crates/waltr-agent/Cargo.toml](../../crates/waltr-agent/Cargo.toml) | `shell` feature declaration. |
-| [../../crates/waltr-agent/src/tools/shell/config.rs](../../crates/waltr-agent/src/tools/shell/config.rs) | Shell configuration and input types. |
+| [../../crates/waltr-server/Cargo.toml](../../crates/waltr-server/Cargo.toml) | Server `shell` feature. |
+| [../../crates/waltr-server/src/agent_host/tools/shell/config.rs](../../crates/waltr-server/src/agent_host/tools/shell/config.rs) | Shell configuration and input types. |
 | [../../crates/waltr-agent-sandbox/src/wire.rs](../../crates/waltr-agent-sandbox/src/wire.rs) | Worker RPC defaults including configured shell overrides. |

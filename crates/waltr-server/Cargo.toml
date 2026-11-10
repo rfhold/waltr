@@ -1,5 +1,6 @@
 [package]
 name = "waltr-server"
+default-run = "waltr-server"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -7,7 +8,7 @@ version.workspace = true
 [features]
 default = ["profiling", "shell", "apps-assets"]
 profiling = ["dep:pyroscope"]
-shell = ["waltr-agent/shell", "waltr-agent-sandbox/shell"]
+shell = ["dep:tree-sitter", "dep:tree-sitter-bash", "waltr-agent-sandbox/shell"]
 test = []
 web = ["apps-assets"]
 apps-assets = ["apps-host-assets", "apps-served-assets"]
@@ -22,9 +23,11 @@ cookie.workspace = true
 waltr = { path = "../waltr", version = "0.3.0", default-features = false, features = ["grpc"] }
 waltr-agent = { path = "../waltr-agent", version = "0.3.0", default-features = false }
 waltr-audio = { path = "../waltr-audio", version = "0.3.0" }
+waltr-script = { path = "../waltr-script", version = "0.3.0" }
 waltr-agent-sandbox = { path = "../waltr-agent-sandbox", version = "0.3.0", default-features = false, features = ["rpc"] }
 futures-util.workspace = true
 http-body.workspace = true
+http.workspace = true
 hyper-util = { workspace = true, features = ["server-auto", "service"] }
 hyper = { version = "1.10.0", features = ["http2", "server"] }
 jsonwebtoken.workspace = true
@@ -36,7 +39,7 @@ mcp = { workspace = true, features = ["oauth-authorization-server-postgres", "oa
 oauth2.workspace = true
 notify.workspace = true
 p256.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
@@ -63,8 +66,13 @@ tonic-web.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
 url.workspace = true
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 rustls.workspace = true
@@ -74,6 +82,7 @@ webpki-roots.workspace = true
 workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 reqwest = { workspace = true, features = ["json", "http2"] }
 testcontainers.workspace = true

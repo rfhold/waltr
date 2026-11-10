@@ -1,6 +1,6 @@
 //! Shared resource catalog failures and service-boundary classification.
 
-use waltr_agent::AgentDefinitionError;
+use crate::agent_host::AgentDefinitionError;
 use std::{error::Error, fmt, io, path::PathBuf};
 
 use super::state::ResourceKind;

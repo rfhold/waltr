@@ -1,4 +1,5 @@
 use crate::support::grpc::session_client;
+use std::collections::BTreeMap;
 use waltr::grpc::waltr::session::v1::{
     SearchSessionTemplatesRequest, SessionTemplateKind, SessionTemplateSearchTarget,
     search_session_templates_response,
@@ -7,11 +8,11 @@ use waltr_agent::{
     InferenceProviderSettings, InferenceSettings, ModelApi, SessionCreateRequest, SessionId,
 };
 use waltr_server::test_support::setup_server_with_sessions;
-use std::collections::BTreeMap;
 
 #[tokio::test]
 async fn search_session_templates_returns_tagged_tool_results()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut request = SessionCreateRequest::new(SessionId::generate());
     request.inference_settings = Some(test_inference_settings());

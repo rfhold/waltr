@@ -1,5 +1,6 @@
 //! Shared integration test server setup.
 
+use crate::agent_host::{AgentDefinitionBundle, AgentDefinitionCatalog, ResolvedAgent};
 use crate::{
     ServerApplication,
     access_auth::{
@@ -26,8 +27,6 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use waltr_agent::definition::AgentDefinitionBundle;
-use waltr_agent::{AgentDefinitionCatalog, MemorySessionStore, ResolvedAgent, SessionCoordinator};
 use mcp::oauth::{
     McpJwtAccessTokenHeader, OAuthEncryptedPrivateKey, OAuthKeyEncryption,
     VersionedOAuthWrappingKeyring,
@@ -55,6 +54,7 @@ use std::{
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use waltr_agent::{MemorySessionStore, SessionCoordinator};
 
 static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -336,6 +336,44 @@ impl AccessAuthBrowserFixture {
             false,
             false,
             false,
+        )
+    }
+
+    /// Start the real authentication router as an independent SQL-sharing replica.
+    #[must_use]
+    pub fn start_auth_replica(
+        &self,
+        session_ttl: Duration,
+        client_id: &str,
+    ) -> RestartableAccessAuthServer {
+        start_restartable_auth_server_mode(
+            &self.issuer,
+            client_id,
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+    }
+
+    /// Start the real OAuth and MCP authorization layers without a second Routine host.
+    #[must_use]
+    pub fn start_mcp_auth_replica(&self, session_ttl: Duration) -> RestartableAccessAuthServer {
+        start_restartable_auth_server_mode(
+            &self.issuer,
+            "waltr-test-client",
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+            true,
+            false,
+            false,
+            true,
         )
     }
 
@@ -852,6 +890,20 @@ pub fn setup_server_with_catalog_loader(catalog_loader: CatalogLoader) -> &'stat
     setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader, true)
 }
 
+/// Isolate a result-returning application test from other process-global resource owners.
+#[macro_export]
+macro_rules! isolate_application_test {
+    () => {
+        if !$crate::test_support::isolated_process_test(
+            std::thread::current()
+                .name()
+                .expect("named Cargo test thread"),
+        ) {
+            return Ok(());
+        }
+    };
+}
+
 /// Start an isolated integration test server with an explicit session coordinator.
 #[must_use]
 pub fn setup_server_with_sessions() -> (&'static TestServer, SessionCoordinator<MemorySessionStore>)
@@ -942,6 +994,7 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
         .local_addr()
         .expect("test server local address should be available");
 
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let server_thread = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -956,40 +1009,98 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
             .expect("test persistence should initialize");
             let listener = tokio::net::TcpListener::from_std(listener)
                 .expect("test server listener should become async");
-            build_app_with_catalog_loader(
+            let app = build_app_with_catalog_loader(
                 config_service,
                 persistence,
                 catalog_loader,
                 |routes, input| Ok(session::add_sessions_service(routes, sessions, input)),
             )
             .await
-            .expect("test server config should load")
-            .serve_with_shutdown(listener, std::future::pending())
-            .await
-            .expect("test server should run");
+            .expect("test server config should load");
+            if ready_tx.send(()).is_err() {
+                return;
+            }
+            app.serve_with_shutdown(listener, std::future::pending())
+                .await
+                .expect("test server should run");
         });
     });
 
+    // Bound fixture startup, not client progress; this cannot forcibly join blocked OS bootstrap.
+    wait_for_test_server_ready(ready_rx, Duration::from_secs(30))
+        .expect("test server assembly should finish before returning the fixture");
     Box::leak(Box::new(TestServer {
         addr,
         _thread: server_thread,
     }))
 }
 
+fn wait_for_test_server_ready(
+    ready: mpsc::Receiver<()>,
+    timeout: Duration,
+) -> Result<(), &'static str> {
+    ready.recv_timeout(timeout).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Disconnected => "test server bootstrap failed before assembly",
+        mpsc::RecvTimeoutError::Timeout => "test server assembly readiness timed out",
+    })
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn test_support_startup_ready_waits_for_assembly_and_reports_failure() {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let started = barrier.clone();
+        let waiter = thread::spawn(move || {
+            started.wait();
+            returned_tx
+                .send(wait_for_test_server_ready(ready_rx, Duration::from_secs(2)))
+                .unwrap();
+        });
+        barrier.wait();
+        assert!(matches!(
+            returned_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        ready_tx.send(()).unwrap();
+        assert_eq!(
+            returned_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        waiter.join().unwrap();
+
+        let (failed_tx, failed_rx) = mpsc::sync_channel(1);
+        drop(failed_tx);
+        assert_eq!(
+            wait_for_test_server_ready(failed_rx, Duration::from_secs(2)),
+            Err("test server bootstrap failed before assembly")
+        );
+        let (_blocked_tx, blocked_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            wait_for_test_server_ready(blocked_rx, Duration::ZERO),
+            Err("test server assembly readiness timed out")
+        );
+    }
+}
+
 async fn test_persistence() -> Persistence {
+    let root = temp_root();
     Persistence::initialize(
-        DatabaseConfig::for_tests().expect("test persistence config should be valid"),
+        DatabaseConfig::from_urls(
+            &format!("sqlite:{}", root.join("waltr.sqlite3").display()),
+            &format!("sqlite:{}", root.join("mcp.sqlite3").display()),
+        )
+        .expect("test persistence config should be valid"),
     )
     .await
     .expect("test persistence should initialize")
 }
 
-#[allow(
-    clippy::fn_params_excessive_bools,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the fixture exposes independent authentication server settings"
-)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn start_restartable_auth_server(
     issuer: &str,
     client_id: &str,
@@ -1000,6 +1111,37 @@ fn start_restartable_auth_server(
     enable_mcp_oauth: bool,
     allow_mcp_oauth_dcr: bool,
     allow_mcp_oauth_loopback_redirects: bool,
+) -> RestartableAccessAuthServer {
+    start_restartable_auth_server_mode(
+        issuer,
+        client_id,
+        client_secret,
+        database_url,
+        session_ttl,
+        fail_callback_cleanup,
+        enable_mcp_oauth,
+        allow_mcp_oauth_dcr,
+        allow_mcp_oauth_loopback_redirects,
+        false,
+    )
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn start_restartable_auth_server_mode(
+    issuer: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    database_url: &str,
+    session_ttl: Duration,
+    fail_callback_cleanup: bool,
+    enable_mcp_oauth: bool,
+    allow_mcp_oauth_dcr: bool,
+    allow_mcp_oauth_loopback_redirects: bool,
+    authentication_only: bool,
 ) -> RestartableAccessAuthServer {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1045,6 +1187,14 @@ fn start_restartable_auth_server(
             )
             .await
             .expect("browser flow authenticator should initialize");
+            if authentication_only && !enable_mcp_oauth {
+                ready_tx.send(addr).expect("auth replica should report ready");
+                axum::serve(listener, authenticator.router())
+                    .with_graceful_shutdown(async move { drop(shutdown_rx.await); })
+                    .await
+                    .expect("auth replica should run");
+                return;
+            }
             if fail_callback_cleanup {
                 sqlx::query(
                     r"
@@ -1129,6 +1279,47 @@ END
             let trusted_mcp_oauth_origin = mcp_oauth.as_ref().map(|oauth| {
                 reqwest::Url::parse(oauth.resource()).expect("test hosted MCP resource URL")
             });
+            if authentication_only {
+                let oauth = mcp_oauth.expect("MCP auth replica requires hosted OAuth");
+                let workspace = temp_root();
+                let sandbox = crate::sandbox::SandboxHost::start(workspace.clone(), None)
+                    .await.expect("replica sandbox should start");
+                let state = config_service.state().clone();
+                let mut routes = tonic::service::Routes::builder();
+                let sessions = session::add_sessions_service(
+                    &mut routes,
+                    SessionCoordinator::new(MemorySessionStore::new()),
+                    session::SessionRegistrationInput {
+                        workspace_root: workspace,
+                        config: crate::config::ConfigHandle::from_resources(state.clone()),
+                        credential_store: crate::auth::CredentialStore::shared(persistence.outbound_oauth_store()),
+                        trusted_mcp_oauth_origins: trusted_mcp_oauth_origin.into_iter().collect(),
+                        catalog: session::SessionCatalogSource::Dynamic(state.clone()),
+                        event_sink: Arc::new(crate::session::UnboundSessionEvents),
+                        sandbox: sandbox.handle(),
+                    },
+                );
+                let server = Arc::new(crate::mcp_service::WaltrMcpServer::new(sessions.clone(), state)
+                    .expect("replica MCP catalog should initialize"));
+                let hosted = oauth.authorization().clone();
+                let scopes = oauth.required_scopes().to_vec();
+                let metadata = mcp::McpProtectedResourceMetadata::new(oauth.resource(), [oauth.issuer()])
+                    .with_scopes(scopes.clone()).with_resource_name("Waltr MCP");
+                let authorization = mcp::server::StreamableHttpAuthorization::hosted(metadata, move |token, context| {
+                    hosted.authorize_token(token, context)
+                }).expect("replica authorization should initialize").with_required_scopes(scopes);
+                let options = mcp::server::StreamableHttpOptions::default()
+                    .without_root_protected_resource_metadata().with_authorization(authorization);
+                let router = authenticator.router().merge(oauth.router()).merge(
+                    mcp::server::streamable_http_router_with_options(server, options),
+                );
+                ready_tx.send(addr).expect("MCP auth replica should report ready");
+                axum::serve(listener, router).with_graceful_shutdown(async move { drop(shutdown_rx.await); })
+                    .await.expect("MCP auth replica should run");
+                sessions.shutdown().await;
+                sandbox.shutdown().await;
+                return;
+            }
             let app = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
                 config_service,
                 persistence,
@@ -1216,6 +1407,77 @@ fn start_fake_issuer() -> FakeIssuerHandle {
         url: ready_rx.recv().expect("fake issuer should initialize"),
         thread,
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn composition_auth(
+    persistence: &Persistence,
+    address: SocketAddr,
+) -> (
+    AccessAuthenticator,
+    String,
+    String,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let state = Arc::new(FakeIssuerState {
+        issuer: issuer.clone(),
+        pending: Mutex::new(HashMap::new()),
+    });
+    let router = Router::new()
+        .route("/.well-known/openid-configuration", get(discovery))
+        .route("/jwks", get(jwks))
+        .with_state(state);
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await
+            .unwrap();
+    });
+    let config = OidcConfig::new(
+        &issuer,
+        "waltr-test-client",
+        None,
+        format!("http://{address}/oidc/callback"),
+        "waltr-api",
+        vec!["openid".into()],
+        Duration::from_hours(1),
+        true,
+        true,
+    )
+    .unwrap();
+    let authenticator = AccessAuthenticator::initialize(
+        AccessAuthConfig::oidc(config),
+        persistence,
+        AccessAuthHttpClient::build(reqwest::Client::builder().timeout(Duration::from_secs(5)))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let now = SystemTime::now();
+    AccessAuthStore::new(persistence)
+        .insert_browser_session(&BrowserSession {
+            token_digest: BrowserSessionTokenDigest::from_token("composition-browser"),
+            issuer: issuer.clone(),
+            client_id: "waltr-test-client".into(),
+            subject: "browser-subject".into(),
+            created_at: now,
+            expires_at: now + Duration::from_hours(1),
+            last_seen_at: now,
+        })
+        .await
+        .unwrap();
+    (
+        authenticator,
+        sign_access_token(&issuer, "waltr:read"),
+        issuer,
+        stop,
+        task,
+    )
 }
 
 async fn discovery(State(state): State<Arc<FakeIssuerState>>) -> Json<Value> {
@@ -1335,7 +1597,7 @@ fn sign_access_token(issuer: &str, scope: &str) -> String {
     sign_access_token_with_ttl(issuer, scope, Duration::from_hours(1))
 }
 
-fn sign_access_token_with_ttl(issuer: &str, scope: &str, ttl: Duration) -> String {
+pub(crate) fn sign_access_token_with_ttl(issuer: &str, scope: &str, ttl: Duration) -> String {
     sign_access_token_for_subject_with_ttl(issuer, "api-subject", scope, ttl)
 }
 
@@ -1398,14 +1660,66 @@ fn sign_token(header: Header, claims: Value) -> String {
 
 #[must_use]
 pub fn temp_root() -> PathBuf {
-    let counter = TEMP_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "waltr-config-test-{}-{counter}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("temp root should be created");
+    let root = std::env::temp_dir().join(format!("waltr-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&root).expect("unique temp root should be created");
     root
+}
+/// Run one verified Cargo test in a bounded child process with isolated process globals.
+pub fn isolated_process_test(name: &str) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const MARKER: &str = "WALTR_PROCESS_TEST_CHILD";
+    if let Some(child) = std::env::var_os(MARKER) {
+        assert_eq!(child, name, "isolated child must run its exact test");
+        return true;
+    }
+    fn drain(mut pipe: impl std::io::Read) -> Vec<u8> {
+        let mut retained = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let count = pipe.read(&mut buffer).expect("read isolated test output");
+            if count == 0 {
+                return retained;
+            }
+            let keep = count.min((64 * 1024_usize).saturating_sub(retained.len()));
+            retained.extend_from_slice(&buffer[..keep]);
+        }
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(MARKER, name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start isolated test");
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout = std::thread::spawn(move || drain(stdout));
+    let stderr = std::thread::spawn(move || drain(stderr));
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("poll isolated test") {
+            break (status, false);
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            let _killed = child.kill();
+            break (child.wait().expect("reap isolated test"), true);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout.join().expect("join isolated stdout");
+    let stderr = stderr.join().expect("join isolated stderr");
+    assert!(
+        !timed_out && status.success(),
+        "{name}: timed_out={timed_out}\n{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stdout)
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+        "isolated child must execute exactly one successful test: {name}"
+    );
+    false
 }

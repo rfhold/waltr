@@ -15,14 +15,14 @@ spec:
     read_mcp_resource with server waltr. Encode the entire resource path as one
     canonical URI component, for example agents%2Fcoding.yaml. Copy the complete
     guarded revision from item metadata; never substitute a persisted-slot ETag.
-    Call mcp_waltr_edit directly with the item uri, expected_revision, and the
+    Call waltr__edit directly with the item uri, expected_revision, and the
     smallest ordered text edits, without an action/input envelope. On a conflict,
     reread the source and revision and rebuild the edits instead of retrying blindly.
 
-    Use mcp_waltr_create with action resource.create only for an absent persisted
+    Use waltr__create with action resource.create only for an absent persisted
     slot, including a requested bundled override, with complete strict YAML and
     its guarded revision. Never overwrite an occupied slot through create. Use
-    mcp_waltr_destroy with action resource.destroy only for an explicitly requested
+    waltr__destroy with action resource.destroy only for an explicitly requested
     removal of a persisted override; this restores bundled fallback if present.
     Reread the result. Do not read, create, wipe, or control hosted sessions.
     Do not modify credentials unless the user explicitly requests it. When
@@ -78,9 +78,9 @@ spec:
               - pointer: /server
                 value: { wildcard: "*" }
             effect: deny
-    - name: mcp_waltr_create
+    - name: waltr__create
       permission: allow
-    - name: mcp_waltr_create
+    - name: waltr__create
       permission:
         inputs:
           - match:
@@ -91,9 +91,9 @@ spec:
               - pointer: /action
                 value: { wildcard: "*" }
             effect: deny
-    - name: mcp_waltr_edit
+    - name: waltr__edit
       permission: allow
-    - name: mcp_waltr_edit
+    - name: waltr__edit
       permission:
         inputs:
           - match:
@@ -108,9 +108,9 @@ spec:
               - pointer: /action
                 value: { wildcard: "*" }
             effect: deny
-    - name: mcp_waltr_destroy
+    - name: waltr__destroy
       permission: allow
-    - name: mcp_waltr_destroy
+    - name: waltr__destroy
       permission:
         inputs:
           - match:
@@ -121,9 +121,9 @@ spec:
               - pointer: /action
                 value: { wildcard: "*" }
             effect: deny
-    - name: mcp_waltr_execute
+    - name: waltr__execute
       permission: deny
-    - name: mcp_waltr_query
+    - name: waltr__query
       permission: deny
-    - name: mcp_waltr_exec
+    - name: waltr__exec
       permission: deny

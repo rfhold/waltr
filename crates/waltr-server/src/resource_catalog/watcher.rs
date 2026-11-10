@@ -120,6 +120,19 @@ impl AgentDefinitionState {
             .and_then(Path::parent)
             .expect("resources root always has .waltr and server-root parents")
             .to_owned();
+        // Native backends report canonical paths, including macOS /private/var aliases.
+        let canonical_watch_root = std::fs::canonicalize(&watch_root).map_err(|source| {
+            AgentDefinitionLoadError::Inspect {
+                path: watch_root.clone(),
+                source,
+            }
+        })?;
+        let event_resources_root = canonical_watch_root.join(
+            self.inner
+                .resources_root
+                .strip_prefix(&watch_root)
+                .expect("resources root belongs to the watched server root"),
+        );
         let (events_tx, mut events_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
         let overflowed = Arc::new(AtomicBool::new(false));
         let overflowed_tx = overflowed.clone();
@@ -133,7 +146,7 @@ impl AgentDefinitionState {
         )
         .map_err(AgentDefinitionLoadError::Watch)?;
         watcher
-            .watch(&watch_root, RecursiveMode::Recursive)
+            .watch(&canonical_watch_root, RecursiveMode::Recursive)
             .map_err(AgentDefinitionLoadError::Watch)?;
 
         let state = self.clone();
@@ -157,7 +170,7 @@ impl AgentDefinitionState {
                 };
                 let mut should_reload = overflowed.swap(false, Ordering::Relaxed);
                 match event {
-                    Ok(event) if event_targets_resources(&event, &state.inner.resources_root) => {
+                    Ok(event) if event_targets_resources(&event, &event_resources_root) => {
                         should_reload = true;
                     }
                     Ok(_) if !should_reload => continue,
@@ -173,8 +186,7 @@ impl AgentDefinitionState {
                 while let Ok(event) = events_rx.try_recv() {
                     match event {
                         Ok(event) => {
-                            should_reload |=
-                                event_targets_resources(&event, &state.inner.resources_root);
+                            should_reload |= event_targets_resources(&event, &event_resources_root);
                         }
                         Err(error) => {
                             let message =

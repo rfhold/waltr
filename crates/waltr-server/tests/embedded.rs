@@ -13,6 +13,7 @@ use waltr_server::{
 
 fn config(root: &std::path::Path, bearer: &str) -> EmbeddedServerConfig {
     EmbeddedServerConfig {
+        routine_authority: Default::default(),
         resources_root: root.join("resources"),
         waltr_database_path: root.join("data/waltr.sqlite3"),
         mcp_database_path: root.join("data/mcp.sqlite3"),
@@ -27,34 +28,7 @@ fn config(root: &std::path::Path, bearer: &str) -> EmbeddedServerConfig {
         default_agent: "coding".to_owned(),
         local_bearer: LocalBearer::new(bearer).unwrap(),
         outbound_policy: EmbeddedOutboundPolicy::default(),
-        interaction_limits: Default::default(),
     }
-}
-
-#[test]
-fn embedded_config_uses_shared_default_interaction_limits() {
-    let root = waltr_server::test_support::temp_root();
-    let config = config(&root, "one-generation-secret");
-    assert_eq!(
-        serde_json::to_value(config.interaction_limits).unwrap(),
-        serde_json::to_value(waltr_server::InteractionLimits::default()).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn embedded_rejects_invalid_limits_before_paths_or_runtime_effects() {
-    let root = waltr_server::test_support::temp_root();
-    let mut config = config(&root, "one-generation-secret");
-    config.interaction_limits.active_interactions = 0;
-    config.workspace_root = "relative-workspace".into();
-    let resources = config.resources_root.clone();
-    let database = config.waltr_database_path.clone();
-    assert!(matches!(
-        build_embedded_server(config).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Application)
-    ));
-    assert!(!resources.exists());
-    assert!(!database.exists());
 }
 
 #[tokio::test]
@@ -163,6 +137,11 @@ async fn embedded_rejects_configured_path_aliases_of_workspace_and_host_files() 
 #[cfg(unix)]
 #[tokio::test]
 async fn embedded_startup_does_not_crawl_workspace_symlinks() {
+    if !waltr_server::test_support::isolated_process_test(
+        "embedded_startup_does_not_crawl_workspace_symlinks",
+    ) {
+        return;
+    }
     use std::os::unix::fs::symlink;
 
     let root = waltr_server::test_support::temp_root();
@@ -182,6 +161,11 @@ async fn embedded_startup_does_not_crawl_workspace_symlinks() {
 
 #[tokio::test]
 async fn embedded_server_materializes_bundled_resources_from_explicit_builtin_catalog() {
+    if !waltr_server::test_support::isolated_process_test(
+        "embedded_server_materializes_bundled_resources_from_explicit_builtin_catalog",
+    ) {
+        return;
+    }
     let seed: serde_json::Value =
         serde_json::from_str(include_str!("../resources/models-dev-defaults.json"))
             .expect("production seed must remain valid models.dev JSON");
@@ -266,6 +250,11 @@ async fn embedded_server_materializes_bundled_resources_from_explicit_builtin_ca
 
 #[tokio::test]
 async fn embedded_server_prebinds_and_admits_only_exact_local_bearer() {
+    if !waltr_server::test_support::isolated_process_test(
+        "embedded_server_prebinds_and_admits_only_exact_local_bearer",
+    ) {
+        return;
+    }
     let root = waltr_server::test_support::temp_root();
     let config = config(&root, "one-generation-secret");
     let persisted_path = config
@@ -408,6 +397,18 @@ async fn embedded_server_prebinds_and_admits_only_exact_local_bearer() {
         .await
         .unwrap();
     assert_eq!(mcp_rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let forged = client
+        .post(format!("http://{address}/mcp"))
+        .bearer_auth("wrong-generation-secret")
+        .header("x-waltr-local-origin", "true")
+        .json(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
+            "validatedLocalOrigin":true,"origin":"local_process"}}}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED);
     let mcp_admitted = client
         .post(format!("http://{address}/mcp"))
         .header(
@@ -425,6 +426,11 @@ async fn embedded_server_prebinds_and_admits_only_exact_local_bearer() {
 
 #[tokio::test]
 async fn sequential_embedded_generations_overwrite_the_persisted_endpoint() {
+    if !waltr_server::test_support::isolated_process_test(
+        "sequential_embedded_generations_overwrite_the_persisted_endpoint",
+    ) {
+        return;
+    }
     let root = waltr_server::test_support::temp_root();
     let first = build_embedded_server(config(&root, "first-generation"))
         .await

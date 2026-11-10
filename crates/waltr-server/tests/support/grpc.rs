@@ -1,13 +1,12 @@
+use tonic::transport::{Channel, Endpoint};
 use waltr::grpc::waltr::catalog::v1::catalog_service_client::CatalogServiceClient;
 use waltr::grpc::waltr::config::v1::Configuration;
 use waltr::grpc::waltr::resource::v1::{
     GetResourceCatalogRequest, ResourceCatalog, resource_service_client::ResourceServiceClient,
 };
-use waltr::grpc::waltr::routine::v1::routine_service_client::RoutineServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use waltr_server::test_support::TestServer;
-use tonic::transport::{Channel, Endpoint};
 
 pub async fn resource_client(
     server: &TestServer,
@@ -42,11 +41,28 @@ pub async fn session_client(
     Ok(SessionServiceClient::new(channel))
 }
 
+pub async fn interaction_client(
+    server: &TestServer,
+) -> Result<
+    waltr::grpc::waltr::session::v1::interaction_service_client::InteractionServiceClient<Channel>,
+    Box<dyn std::error::Error>,
+> {
+    let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
+    Ok(
+        waltr::grpc::waltr::session::v1::interaction_service_client::InteractionServiceClient::new(
+            channel,
+        ),
+    )
+}
+
 pub async fn routine_client(
     server: &TestServer,
-) -> Result<RoutineServiceClient<Channel>, Box<dyn std::error::Error>> {
+) -> Result<
+    waltr::grpc::waltr::routine::v2::routine_service_client::RoutineServiceClient<Channel>,
+    Box<dyn std::error::Error>,
+> {
     let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
-    Ok(RoutineServiceClient::new(channel))
+    Ok(waltr::grpc::waltr::routine::v2::routine_service_client::RoutineServiceClient::new(channel))
 }
 
 pub async fn get_catalog(

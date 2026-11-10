@@ -14,6 +14,7 @@ use waltr_server::test_support::{setup_server_with_seeded_sessions, setup_server
 
 #[tokio::test]
 async fn get_timeline_returns_persisted_events() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut client = session_client(server).await?;
     let session = client
@@ -72,6 +73,7 @@ async fn get_timeline_returns_persisted_events() -> Result<(), Box<dyn std::erro
 #[tokio::test]
 async fn watch_timeline_replays_history_then_live_events() -> Result<(), Box<dyn std::error::Error>>
 {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut create_client = session_client(server).await?;
     let mut watch_client = session_client(server).await?;
@@ -140,6 +142,7 @@ async fn watch_timeline_replays_history_then_live_events() -> Result<(), Box<dyn
 #[tokio::test]
 async fn watch_timeline_replays_after_cursor_before_initial_limit()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut create_client = session_client(server).await?;
     let mut watch_client = session_client(server).await?;
@@ -211,6 +214,7 @@ async fn watch_timeline_replays_after_cursor_before_initial_limit()
 #[tokio::test]
 async fn watch_timeline_pages_large_after_cursor_catchup_without_initial_gap()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut create_client = session_client(server).await?;
     let mut watch_client = session_client(server).await?;
@@ -283,6 +287,7 @@ async fn watch_timeline_pages_large_after_cursor_catchup_without_initial_gap()
 #[tokio::test]
 async fn effective_timeline_projects_synthetic_identity_and_explicit_pagination()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (sessions, session_id) = seeded_completed_session().await?;
     apply_replacement(&sessions, &session_id, "compact summary").await?;
     let server = setup_server_with_seeded_sessions(sessions);
@@ -347,6 +352,7 @@ async fn effective_timeline_projects_synthetic_identity_and_explicit_pagination(
 #[tokio::test]
 async fn effective_watch_requeries_after_projection_invalidation()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (sessions, session_id) = seeded_completed_session().await?;
     let server = setup_server_with_seeded_sessions(sessions.clone());
     let mut client = session_client(server).await?;
@@ -395,6 +401,7 @@ async fn effective_watch_requeries_after_projection_invalidation()
 #[tokio::test]
 async fn effective_watch_emits_projected_durable_live_events()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (sessions, session_id) = seeded_completed_session().await?;
     let server = setup_server_with_seeded_sessions(sessions.clone());
     let mut client = session_client(server).await?;
@@ -458,21 +465,23 @@ pub(super) async fn seeded_completed_session()
             reasoning_effort: None,
         },
     });
-    create.agent_definition = Some(waltr_server::test_support::default_agent_definition().1);
+    create.agent_definition = Some(serde_json::to_value(
+        waltr_server::test_support::default_agent_definition().1,
+    )?);
     let created = store.create(create).await?;
-    let revision = store
+    let commit = store
         .append_journal(
             &session_id,
-            created.revision,
+            created.execution_token()?,
             vec![SessionJournalEvent::PromptAppended {
                 prompt: "source prompt".to_owned(),
             }],
         )
         .await?;
-    store
+    let timeline = store
         .append_timeline(
             &session_id,
-            revision,
+            commit.execution_token,
             vec![
                 PendingTimelineEvent::user_text_snapshot(
                     session_id.clone(),
@@ -489,11 +498,10 @@ pub(super) async fn seeded_completed_session()
             ],
         )
         .await?;
-    let revision = store.load(&session_id).await?.revision;
     store
         .append_journal(
             &session_id,
-            revision,
+            timeline.commit.execution_token,
             vec![SessionJournalEvent::TurnFinished { turn: 0 }],
         )
         .await?;

@@ -1,6 +1,6 @@
 //! Server-owned unified resource catalog lifecycle and materialization.
 
-use waltr_agent::{AgentDefinitionBundle, AgentDefinitionCatalog, ResolvedAgent};
+use crate::agent_host::{AgentDefinitionBundle, AgentDefinitionCatalog, ResolvedAgent};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,7 +22,7 @@ use super::{
         invalid_value, materialize_defaults, materialize_mcp_server, materialize_provider,
         materialized_snapshot_etag, proto_kind, proto_resource, yaml_json,
     },
-    routine::{MAX_ROUTINE_COUNT, MaterializedRoutine, materialize_routine},
+    routine::MAX_ROUTINE_COUNT,
     store::{
         PersistedSlotPostcondition, atomic_write, check_expected_etag, discover_persisted,
         discover_persisted_for, load_external_sources, resource_disk_path, slot_etag, source_etag,
@@ -34,7 +34,7 @@ const DEFAULT_AGENT: &str = "coding";
 const ENV_DEFINITION_PATHS: &str = "WALTR_AGENT_DEFINITION_PATHS";
 const ENV_DEFAULT_AGENT: &str = "WALTR_DEFAULT_AGENT";
 
-const BUNDLED_RESOURCES: [(&str, &str); 6] = [
+const BUNDLED_RESOURCES: [(&str, &str); 16] = [
     (
         "agents/coding.yaml",
         include_str!("../../resources/agents/coding.yaml"),
@@ -59,15 +59,65 @@ const BUNDLED_RESOURCES: [(&str, &str); 6] = [
         "permissions/default.yaml",
         include_str!("../../resources/permissions/default.yaml"),
     ),
+    (
+        "agents/routine-title.yaml",
+        include_str!("../../resources/agents/routine-title.yaml"),
+    ),
+    (
+        "agents/routine-fork.yaml",
+        include_str!("../../resources/agents/routine-fork.yaml"),
+    ),
+    (
+        "agents/routine-compaction.yaml",
+        include_str!("../../resources/agents/routine-compaction.yaml"),
+    ),
+    (
+        "agents/routine-cleanup.yaml",
+        include_str!("../../resources/agents/routine-cleanup.yaml"),
+    ),
+    (
+        "agents/routine-conversation-filter.yaml",
+        include_str!("../../resources/agents/routine-conversation-filter.yaml"),
+    ),
+    (
+        "agents/routine-conversation-notes.yaml",
+        include_str!("../../resources/agents/routine-conversation-notes.yaml"),
+    ),
+    (
+        "agents/routine-categorization.yaml",
+        include_str!("../../resources/agents/routine-categorization.yaml"),
+    ),
+    (
+        "agents/routine-context-strategy.yaml",
+        include_str!("../../resources/agents/routine-context-strategy.yaml"),
+    ),
+    (
+        "agents/routine-category-context.yaml",
+        include_str!("../../resources/agents/routine-category-context.yaml"),
+    ),
+    (
+        "permissions/routine-helper-capture.yaml",
+        include_str!("../../resources/permissions/routine-helper-capture.yaml"),
+    ),
 ];
 
-const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 15] = [
+const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 33] = [
     BUNDLED_RESOURCES[0],
     BUNDLED_RESOURCES[1],
     BUNDLED_RESOURCES[2],
     BUNDLED_RESOURCES[3],
     BUNDLED_RESOURCES[4],
     BUNDLED_RESOURCES[5],
+    BUNDLED_RESOURCES[6],
+    BUNDLED_RESOURCES[7],
+    BUNDLED_RESOURCES[8],
+    BUNDLED_RESOURCES[9],
+    BUNDLED_RESOURCES[10],
+    BUNDLED_RESOURCES[11],
+    BUNDLED_RESOURCES[12],
+    BUNDLED_RESOURCES[13],
+    BUNDLED_RESOURCES[14],
+    BUNDLED_RESOURCES[15],
     (
         "providers/anthropic.yaml",
         include_str!("../../resources/providers/anthropic.yaml"),
@@ -103,6 +153,38 @@ const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 15] = [
     (
         "routines/fork.yaml",
         include_str!("../../resources/routines/fork.yaml"),
+    ),
+    (
+        "routines/configuration.yaml",
+        include_str!("../../resources/routines/configuration.yaml"),
+    ),
+    (
+        "routines/audio-transcribe.yaml",
+        include_str!("../../resources/routines/audio-transcribe.yaml"),
+    ),
+    (
+        "routines/audio-transcribe-cleanup.yaml",
+        include_str!("../../resources/routines/audio-transcribe-cleanup.yaml"),
+    ),
+    (
+        "routines/audio-conversation-notes.yaml",
+        include_str!("../../resources/routines/audio-conversation-notes.yaml"),
+    ),
+    (
+        "routines/audio-synthesize.yaml",
+        include_str!("../../resources/routines/audio-synthesize.yaml"),
+    ),
+    (
+        "routines/context-categorization.yaml",
+        include_str!("../../resources/routines/context-categorization.yaml"),
+    ),
+    (
+        "routines/context-management.yaml",
+        include_str!("../../resources/routines/context-management.yaml"),
+    ),
+    (
+        "routines/manage-category-context.yaml",
+        include_str!("../../resources/routines/manage-category-context.yaml"),
     ),
 ];
 
@@ -213,7 +295,7 @@ pub struct AgentDefinitionSnapshot {
     entries: BTreeMap<String, ActiveResource>,
     persisted_fingerprint: String,
     configuration: config_proto::Configuration,
-    routines: BTreeMap<String, MaterializedRoutine>,
+    scripts: BTreeMap<String, Arc<crate::routine::definition::Definition>>,
     etag: String,
 }
 
@@ -248,16 +330,9 @@ impl AgentDefinitionSnapshot {
         &self.configuration
     }
 
-    /// Look up one materialized routine by canonical name.
-    #[must_use]
-    pub fn routine(&self, name: &str) -> Option<&MaterializedRoutine> {
-        self.routines.get(name)
-    }
-
-    /// Iterate over materialized routines in canonical name order.
-    #[must_use]
-    pub fn routines(&self) -> impl ExactSizeIterator<Item = &MaterializedRoutine> {
-        self.routines.values()
+    /// Validated JavaScript definitions pinned to this resource snapshot.
+    pub fn scripts(&self) -> &BTreeMap<String, Arc<crate::routine::definition::Definition>> {
+        &self.scripts
     }
 
     /// Return the materialized aggregate snapshot `ETag`.
@@ -1071,7 +1146,9 @@ fn build_snapshot(
     let mut entries = BTreeMap::new();
     let mut sources = Vec::new();
     let mut configuration = config_proto::Configuration::default();
-    let mut routines = BTreeMap::new();
+    let mut scripts = BTreeMap::new();
+    let script_engine = waltr_script::Engine::new(1)
+        .map_err(|_| invalid_value("routines", "script validation engine unavailable".into()))?;
     for (path, source) in effective {
         let key = validate_resource_source(&path, &source)?;
         if !identities.insert((key.kind, key.name.clone())) {
@@ -1117,25 +1194,19 @@ fn build_snapshot(
                 value
             }
             ResourceKind::Routine => {
-                if routines.len() >= MAX_ROUTINE_COUNT {
+                if scripts.len() >= MAX_ROUTINE_COUNT {
                     return Err(invalid_value(
                         &path,
                         format!("routine catalog exceeds {MAX_ROUTINE_COUNT} entries"),
                     ));
                 }
-                let definition = materialize_routine(&source, &path)?;
-                let value = serde_json::to_value(&definition)
-                    .expect("validated routine definition serializes");
-                routines.insert(
-                    key.name.clone(),
-                    MaterializedRoutine::new(
-                        key.name.clone(),
-                        path.clone(),
-                        source_etag(source.as_bytes()),
-                        definition,
-                    ),
-                );
-                value
+                let definition =
+                    crate::routine::definition::Definition::parse(&source, &script_engine)
+                        .map_err(|error| {
+                            invalid_value(&path, format!("invalid JavaScript Routine: {error}"))
+                        })?;
+                scripts.insert(key.name.clone(), definition);
+                yaml_json(&source, &path)?
             }
         };
         entries.insert(
@@ -1153,57 +1224,41 @@ fn build_snapshot(
     sources.extend_from_slice(external_sources);
 
     if let Some(selection) = &configuration.session_dictation {
-        use super::routine::{RoutineAudioEncoding, RoutineStreamFormat};
-        let path = "defaults/default.yaml";
-        let interaction = routines
-            .get(&selection.routine)
-            .and_then(|routine| {
-                routine
-                    .definition()
-                    .spec
-                    .triggers
-                    .iter()
-                    .find(|trigger| trigger.name == selection.trigger)
-            })
-            .and_then(|trigger| trigger.interaction.as_ref())
-            .ok_or_else(|| {
-                invalid_value(
-                    path,
-                    "sessionDictation must select an existing interaction trigger".into(),
-                )
-            })?;
-        let audio = RoutineStreamFormat::Audio {
-            encoding: RoutineAudioEncoding::PcmS16Le,
-            sample_rate_hz: 24_000,
-            channels: 1,
-        };
-        if !interaction
-            .input_ports
-            .iter()
-            .any(|port| port.name == selection.input && port.format == audio)
-            || !interaction.output_ports.iter().any(|port| {
-                port.name == selection.output && port.format == RoutineStreamFormat::Text
-            })
-            || interaction
-                .input_ports
-                .iter()
-                .any(|port| port.required && port.name != selection.input)
-            || routines[&selection.routine]
-                .definition()
-                .spec
-                .params
-                .iter()
-                .any(|param| param.required && param.default.is_none())
-        {
-            return Err(invalid_value(path, "sessionDictation requires PCM s16le 24000 Hz mono input, text output, and no other required inputs".into()));
+        if let Some(definition) = scripts.get(&selection.routine) {
+            use crate::routine::definition::{Direction, Media, Trigger};
+            let spec = &definition.envelope().spec;
+            let valid = spec
+                .entrypoints
+                .get(&selection.trigger)
+                .is_some_and(|entry| matches!(entry.trigger, Trigger::Interactive))
+                && spec.ports.get(&selection.input).is_some_and(|port| {
+                    matches!(port.direction, Direction::Input)
+                        && matches!(port.media, Media::Audio)
+                        && port
+                            .formats
+                            .iter()
+                            .any(|format| format == "pcm16le-24000-mono")
+                })
+                && spec.ports.get(&selection.output).is_some_and(|port| {
+                    matches!(port.direction, Direction::Output)
+                        && matches!(port.media, Media::Text)
+                        && port.formats.iter().any(|format| format == "utf8")
+                })
+                && !spec.ports.iter().any(|(name, port)| {
+                    port.required
+                        && matches!(port.direction, Direction::Input)
+                        && name != &selection.input
+                })
+                && spec.parameters.accepts_host(&serde_json::json!({}), 65536);
+            if !valid {
+                return Err(invalid_value("defaults/default.yaml", "sessionDictation requires an interactive entrypoint, PCM s16le 24000 Hz mono input, UTF-8 text output, and no other required inputs or parameters".into()));
+            }
+        } else {
+            return Err(invalid_value(
+                "defaults/default.yaml",
+                "sessionDictation must select an existing JavaScript Routine".into(),
+            ));
         }
-    }
-    for routine in routines.values() {
-        super::routine::validate_routine_models(
-            routine.definition(),
-            &configuration,
-            routine.source_path(),
-        )?;
     }
     let catalog = compile_catalog(&sources, default_agent)?;
     let etag = materialized_snapshot_etag(&entries, &configuration);
@@ -1244,7 +1299,7 @@ fn build_snapshot(
         entries,
         persisted_fingerprint,
         configuration,
-        routines,
+        scripts,
         etag,
     })
 }

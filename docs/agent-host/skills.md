@@ -2,7 +2,9 @@
 
 This document covers workspace skills and the shared `load_skill` interface. Remote MCP Skills use separate opt-in, origin labels, and manifest-bound consent; see [MCP Skills](mcp.md#mcp-skills).
 
-Agent skills are reusable prompt/resource packages discovered from `.agents/skills/` directories and exposed to the provider through a visible catalog plus a synthetic `load_skill` tool. Agent middleware owns catalog state and rendering; the private worker owns workspace discovery, reads, and resource listing. Skills are not enabled by default. See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
+Skills supply prompt/resource packages from `.agents/skills/` through a visible catalog and `load_skill`.
+Server middleware owns catalog state and presentation; the private worker owns workspace discovery and reads. Skills require opt-in.
+See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
 
@@ -10,7 +12,7 @@ Agent skills are reusable prompt/resource packages discovered from `.agents/skil
 | --- | --- |
 | `SkillsConfig` | Configures visible skill catalogs. |
 | `SkillDefinition` | Parsed skill metadata and file locations. |
-| `AgentBuilder::with_skills` | Enables skills middleware and the `load_skill` tool. |
+| `HostRuntimeBuilder::with_skills` | Enables Skills and `load_skill`. |
 | `FilesystemConfig::with_skills_context` | Enables dynamic skill reveal from filesystem reads/searches. |
 | `SandboxHandle` | Worker-backed catalog, skill reads, and path discovery used by skills middleware. |
 
@@ -78,7 +80,7 @@ Dynamic reveal depends on filesystem tools and is separate from static skills co
 
 ## Boundaries
 
-- Skills are opt-in through `AgentBuilder::with_skills`.
+- Skills require `HostRuntimeBuilder::with_skills` or a normal server definition.
 - Dynamic reveal is separately opt-in through filesystem configuration.
 - `load_skill` with `source: "local"` cannot load arbitrary paths; it can only load visible discovered skills.
 - Skill resource paths are listed, not read automatically.
@@ -94,17 +96,17 @@ Focused coverage:
 | Path | Covers |
 | --- | --- |
 | [../../crates/waltr-agent-sandbox/src/tools.rs](../../crates/waltr-agent-sandbox/src/tools.rs) | Worker skill discovery and file I/O implementation and coverage. |
-| [../../crates/waltr-agent/tests/agent/loop.rs](../../crates/waltr-agent/tests/agent/loop.rs) | Deterministic skills middleware and dynamic reveal behavior. |
-| [../../crates/waltr-agent/tests/agent/session.rs](../../crates/waltr-agent/tests/agent/session.rs) | Durable loaded-skill and middleware state behavior. |
-| [../../crates/waltr-agent/tests/live/agent/context.rs](../../crates/waltr-agent/tests/live/agent/context.rs) | Ignored live-provider context coverage. |
-| [../../crates/waltr-agent/tests/live/agent/coding_agent.rs](../../crates/waltr-agent/tests/live/agent/coding_agent.rs) | Ignored live-provider coding-agent skill coverage. |
+| [../../crates/waltr-server/tests/agent_host/loop.rs](../../crates/waltr-server/tests/agent_host/loop.rs) | Skills and dynamic reveal cases. |
+| [../../crates/waltr-server/tests/agent_host/session.rs](../../crates/waltr-server/tests/agent_host/session.rs) | Durable host context cases. |
+| [../../crates/waltr-server/tests/agent_host/live/context.rs](../../crates/waltr-server/tests/agent_host/live/context.rs) | Live-provider context cases. |
+| [../../crates/waltr-server/tests/agent_host/live/coding_agent.rs](../../crates/waltr-server/tests/agent_host/live/coding_agent.rs) | Live-provider Skills cases. |
 
 ## References
 
 | Path | Purpose |
 | --- | --- |
-| [../../crates/waltr-agent/src/tools/skills/config.rs](../../crates/waltr-agent/src/tools/skills/config.rs) | Skills configuration. |
-| [../../crates/waltr-agent/src/tools/skills/definition.rs](../../crates/waltr-agent/src/tools/skills/definition.rs) | Skill frontmatter and name validation. |
-| [../../crates/waltr-agent/src/tools/skills/render.rs](../../crates/waltr-agent/src/tools/skills/render.rs) | Visible skill catalog and reminder rendering. |
-| [../../crates/waltr-agent/src/middleware/skills.rs](../../crates/waltr-agent/src/middleware/skills.rs) | Shared `load_skill` schema and source routing. |
-| [../../crates/waltr-agent/src/middleware/sandbox_skills.rs](../../crates/waltr-agent/src/middleware/sandbox_skills.rs) | Worker-backed local skill catalog, loading, and dynamic reveal. |
+| [../../crates/waltr-server/src/agent_host/tools/skills/config.rs](../../crates/waltr-server/src/agent_host/tools/skills/config.rs) | Skills configuration. |
+| [../../crates/waltr-server/src/agent_host/tools/skills/definition.rs](../../crates/waltr-server/src/agent_host/tools/skills/definition.rs) | Frontmatter and name validation. |
+| [../../crates/waltr-server/src/agent_host/tools/skills/render.rs](../../crates/waltr-server/src/agent_host/tools/skills/render.rs) | Catalog and reminders. |
+| [../../crates/waltr-server/src/agent_host/middleware/skills.rs](../../crates/waltr-server/src/agent_host/middleware/skills.rs) | Shared loader and source routes. |
+| [../../crates/waltr-server/src/agent_host/middleware/sandbox_skills.rs](../../crates/waltr-server/src/agent_host/middleware/sandbox_skills.rs) | Local discovery and reveal. |

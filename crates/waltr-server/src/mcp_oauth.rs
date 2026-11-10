@@ -382,7 +382,8 @@ impl McpOAuthServer {
         server_config.signing_verification_overlap = config
             .access_token_ttl
             .checked_add(server_config.clock_skew)
-            .ok_or(McpOAuthError::Configuration)?;
+            .ok_or(McpOAuthError::Configuration)?
+            .max(server_config.signing_private_key_overlap);
         server_config.refresh_token_lifetime = config.refresh_token_ttl;
         server_config.refresh_family_lifetime = config.refresh_family_ttl;
         if config.allow_dcr {
@@ -1431,7 +1432,10 @@ mod tests {
                     "/run/secrets/mcp-keys".to_owned(),
                 ),
                 ("WALTR_MCP_OAUTH_ALLOW_CIMD", "true".to_owned()),
-                ("WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS", allow.to_string()),
+                (
+                    "WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS",
+                    allow.to_string(),
+                ),
             ]);
             let McpOAuthConfig::Enabled(config) =
                 McpOAuthConfig::from_values(&access_config(), &values).expect("hosted config")

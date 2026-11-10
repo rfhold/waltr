@@ -18,11 +18,11 @@ use crate::{
     mcp_oauth::{McpOAuthConfig, McpOAuthConfigError, McpOAuthError, McpOAuthServer},
     mcp_service::WaltrMcpServer,
     persistence::{Persistence, PersistenceError},
-    resource_catalog::routine::InteractionLimits,
     resource_error::ResourceError,
-    routine::{EngineHealth, EventBus, RoutineEngine},
-    routine_interaction_service::RoutineInteractionService,
-    routine_service::RoutineService,
+    routine::{
+        production::RuntimeHealth,
+        production::{ProductionInput, ProductionRuntime, RoutineAuthority},
+    },
     sandbox::SandboxHost,
     session,
     status_service::StatusService,
@@ -34,14 +34,6 @@ use axum::{
     response::IntoResponse as _,
     routing::{any, get},
 };
-use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
-use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
-use waltr::grpc::waltr::resource::v1::resource_service_server::ResourceServiceServer;
-use waltr::grpc::waltr::routine::v1::{
-    routine_interaction_service_server::RoutineInteractionServiceServer,
-    routine_service_server::RoutineServiceServer,
-};
-use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
 use serde::Serialize;
 use std::{error::Error, fmt, future::Future, io, path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -51,6 +43,10 @@ use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 use tonic_web::GrpcWebLayer;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
+use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
+use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
+use waltr::grpc::waltr::resource::v1::resource_service_server::ResourceServiceServer;
+use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
 
 #[cfg(test)]
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -74,14 +70,18 @@ pub(crate) struct AppServices {
     pub(crate) local_admission: Option<LocalAdmission>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) sandbox_socket: Option<PathBuf>,
-    pub(crate) interaction_limits: InteractionLimits,
+    pub(crate) routine_authority: RoutineAuthority,
+    pub(crate) routine_private_parent: PathBuf,
 }
 
 /// Host-owned options for standalone application construction.
 #[derive(Clone, Debug, Default)]
 pub struct BuildAppOptions {
     /// Finite interaction admission and transport bounds.
-    pub interaction_limits: InteractionLimits,
+    /// Explicit operator roles and profiles; defaults grant none.
+    pub routine_authority: RoutineAuthority,
+    /// Parent for fresh private ephemeral media storage, outside the workspace.
+    pub routine_private_parent: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,8 +107,8 @@ pub(crate) fn definition_watcher_ready(
     health.has_changed().is_ok() && matches!(&*health.borrow(), DefinitionWatcherHealth::Running)
 }
 
-pub(crate) fn routine_engine_ready(health: &tokio::sync::watch::Receiver<EngineHealth>) -> bool {
-    health.has_changed().is_ok() && matches!(&*health.borrow(), EngineHealth::Running)
+pub(crate) fn routine_engine_ready(health: &tokio::sync::watch::Receiver<RuntimeHealth>) -> bool {
+    health.has_changed().is_ok() && matches!(&*health.borrow(), RuntimeHealth::Running)
 }
 
 /// Waltr router and server-owned background work.
@@ -116,12 +116,13 @@ pub struct ServerApplication {
     router: Router,
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
-    routine_engine: Option<RoutineEngine>,
+    routine_engine: Option<Arc<ProductionRuntime>>,
     session_host: Option<Arc<dyn session::SessionHost>>,
     readiness: Option<Readiness>,
     test_background: Option<TestBackgroundTask>,
     sandbox: Option<SandboxHost>,
     app_container: Option<crate::app_container::SpawnedAppsContainer>,
+    self_mcp: Option<crate::self_mcp::PrivateSelfMcp>,
 }
 
 impl fmt::Debug for ServerApplication {
@@ -137,7 +138,7 @@ impl ServerApplication {
         router: Router,
         definition_watcher: AgentDefinitionWatcher,
         oauth: Option<McpOAuthServer>,
-        routine_engine: RoutineEngine,
+        routine_engine: Arc<ProductionRuntime>,
         session_host: Arc<dyn session::SessionHost>,
         readiness: Readiness,
         sandbox: SandboxHost,
@@ -152,12 +153,22 @@ impl ServerApplication {
             test_background: None,
             sandbox: Some(sandbox),
             app_container: None,
+            self_mcp: None,
         }
     }
 
     /// Clone the router for in-process request testing.
     pub fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn routine_test_service(&self) -> crate::routine_service::RoutineRpcService {
+        self.routine_engine
+            .as_ref()
+            .expect("production routines")
+            .rpc
+            .clone()
     }
 
     /// Check all server-owned readiness dependencies directly.
@@ -190,8 +201,12 @@ impl ServerApplication {
             test_background,
             sandbox,
             app_container,
+            self_mcp,
         } = self;
         drop(router);
+        if let Some(private) = self_mcp {
+            private.shutdown().await;
+        }
         if let Some(apps) = app_container
             && let Err(error) = apps.shutdown().await
         {
@@ -232,6 +247,7 @@ impl ServerApplication {
             test_background: Some(TestBackgroundTask { cancellation, task }),
             sandbox: None,
             app_container: None,
+            self_mcp: None,
         }
     }
 
@@ -371,6 +387,7 @@ impl ServerApplication {
             test_background,
             sandbox,
             app_container,
+            self_mcp,
         } = self;
         let apps_stopped = app_container.as_ref().map(|apps| apps.stopped());
         let child_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -390,6 +407,9 @@ impl ServerApplication {
         };
         let result =
             crate::http_lifecycle::serve_owned_connections(listener, router, owned_shutdown).await;
+        if let Some(private) = self_mcp {
+            private.shutdown().await;
+        }
         let apps_result = match app_container {
             Some(apps) => apps.shutdown().await,
             None => Ok(()),
@@ -428,13 +448,15 @@ fn loopback_parent_origins(addr: std::net::SocketAddr) -> [String; 2] {
 async fn shutdown_background_tasks(
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
-    routine_engine: Option<RoutineEngine>,
+    routine_engine: Option<Arc<ProductionRuntime>>,
     session_host: Option<Arc<dyn session::SessionHost>>,
     test_background: Option<TestBackgroundTask>,
     sandbox: Option<SandboxHost>,
 ) {
     if let Some(routine_engine) = routine_engine {
-        routine_engine.shutdown().await;
+        if let Err(error) = routine_engine.shutdown().await {
+            tracing::error!(?error, "Routine shutdown could not verify cleanup");
+        }
     }
     if let Some(session_host) = session_host {
         session_host.shutdown().await;
@@ -666,12 +688,6 @@ impl From<session::SessionStorageConfigError> for AppAssemblyError {
 /// Returns an error when persistence, config, authentication, or agent session storage cannot initialize.
 ///
 pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, BuildAppError> {
-    let interaction_limits = options.interaction_limits;
-    RoutineInteractionService::validate_limits(&interaction_limits).map_err(|_| {
-        BuildAppError::Config(ResourceError::unavailable(
-            "invalid interaction host limits",
-        ))
-    })?;
     tracing::debug!("building app with config service from current directory");
     let config_root = std::env::current_dir()
         .map_err(|error| BuildAppError::Config(ResourceError::current_dir(error)))?;
@@ -695,7 +711,12 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
     ) {
         return Err(BuildAppError::WorkspacePaths);
     }
-    let persistence = Persistence::initialize(database)
+    let objects = crate::routine_objects::from_env(&workspace_root).map_err(|_| {
+        BuildAppError::Persistence(crate::persistence::PersistenceError::Configuration(
+            "invalid Routine object storage configuration",
+        ))
+    })?;
+    let persistence = Persistence::initialize_with_objects(database, objects)
         .await
         .map_err(BuildAppError::Persistence)?;
     let config_service = ConfigService::from_current_dir(catalog_loader.clone())
@@ -725,7 +746,7 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
         outbound_private_origins.clone(),
         automatic_self_mcp_resource.as_ref(),
     );
-    let router = assemble_app(
+    let router = assemble_app_with_self_mcp(
         AppServices {
             config_service,
             persistence,
@@ -739,12 +760,16 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
             local_admission: None,
             workspace_root,
             sandbox_socket,
-            interaction_limits,
+            routine_authority: options.routine_authority,
+            routine_private_parent: options
+                .routine_private_parent
+                .unwrap_or_else(std::env::temp_dir),
         },
         |grpc_routes, mut input| {
             input.trusted_mcp_oauth_origins = session_private_origins;
             session::add_storage_service(grpc_routes, storage, input)
         },
+        crate::self_mcp::public_resource_from_env(),
     )
     .await
     .map_err(|error| match error {
@@ -1082,7 +1107,7 @@ where
     let automatic_self_mcp_resource = mcp_oauth
         .as_ref()
         .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
-    assemble_app(
+    assemble_app_with_self_mcp(
         AppServices {
             config_service,
             persistence,
@@ -1096,9 +1121,11 @@ where
             local_admission: None,
             workspace_root: std::env::current_dir().map_err(ResourceError::current_dir)?,
             sandbox_socket: None,
-            interaction_limits: InteractionLimits::default(),
+            routine_authority: RoutineAuthority::default(),
+            routine_private_parent: std::env::temp_dir(),
         },
         add_session_service,
+        crate::self_mcp::public_resource_from_env(),
     )
     .await
 }
@@ -1117,8 +1144,20 @@ where
         session::SessionRegistrationInput,
     ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
 {
-    RoutineInteractionService::validate_limits(&services.interaction_limits)
-        .map_err(|_| ResourceError::unavailable("invalid interaction host limits"))?;
+    assemble_app_with_self_mcp(services, add_session_service, None).await
+}
+
+async fn assemble_app_with_self_mcp<F>(
+    services: AppServices,
+    add_session_service: F,
+    standalone_self_resource: Option<url::Url>,
+) -> Result<ServerApplication, AppAssemblyError>
+where
+    F: FnOnce(
+        &mut RoutesBuilder,
+        session::SessionRegistrationInput,
+    ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
+{
     tracing::debug!("building app router");
     let AppServices {
         config_service,
@@ -1133,13 +1172,49 @@ where
         local_admission,
         workspace_root,
         sandbox_socket,
-        interaction_limits,
+        routine_authority,
+        routine_private_parent,
     } = services;
+    let agent_state = agent_state.unwrap_or_else(|| config_service.state().clone());
+    let config = ConfigHandle::from_resources(agent_state.clone());
+    let anonymous_mcp =
+        local_admission.is_none() && !access_authenticator.enabled() && mcp_oauth.is_none();
+    let mut private_self_mcp = if anonymous_mcp {
+        if let Some(resource) = standalone_self_resource {
+            let connections = session::resolve_mcp_connections(
+                &config.load().await,
+                crate::agent_host::runtime_factory::McpConnectionResolveRequest {
+                    servers: crate::agent_host::McpServerSelection::Include(
+                        std::collections::BTreeSet::from(["waltr".to_owned()]),
+                    ),
+                },
+            );
+            match connections.ok().and_then(|connections| {
+                connections.into_iter().find(|connection| {
+                    connection.kind
+                        == crate::agent_host::runtime_factory::McpConnectionKind::StreamableHttp
+                        && connection.key == "waltr"
+                        && connection.url == resource.as_str()
+                })
+            }) {
+                Some(connection) => Some(
+                    crate::self_mcp::PrivateSelfMcp::bind(connection)
+                        .await
+                        .map_err(|_| {
+                            ResourceError::unavailable("private self-MCP could not bind")
+                        })?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let sandbox = SandboxHost::start(workspace_root.clone(), sandbox_socket)
         .await
         .map_err(|_| ResourceError::unavailable("sandbox worker could not start"))?;
-    let agent_state = agent_state.unwrap_or_else(|| config_service.state().clone());
-    let config = ConfigHandle::from_resources(agent_state.clone());
     let outbound_oauth_store = persistence.outbound_oauth_store();
     let credential_store = match &local_admission {
         Some(local) => CredentialStore::new(LocalCredentialStore::new(
@@ -1180,16 +1255,15 @@ where
         mcp_options = mcp_options.with_authorization(authorization);
     }
     let mut grpc_routes = Routes::builder();
-    let event_bus = EventBus::default();
     let session_host = match add_session_service(
         &mut grpc_routes,
         session::SessionRegistrationInput {
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config,
             credential_store,
             trusted_mcp_oauth_origins: Vec::new(),
             catalog: session::SessionCatalogSource::Dynamic(agent_state.clone()),
-            event_sink: Arc::new(event_bus.clone()),
+            event_sink: Arc::new(session::UnboundSessionEvents),
             sandbox: sandbox.handle(),
         },
     ) {
@@ -1199,6 +1273,22 @@ where
             return Err(AppAssemblyError::SessionStorage(error));
         }
     };
+    if let Some(private) = &private_self_mcp {
+        session_host.install_self_mcp(private.binding());
+    }
+    if let Some(external) = session_host.external_tools() {
+        if external
+            .install_journal(persistence.external_dispatch_store())
+            .is_err()
+        {
+            session_host.shutdown().await;
+            sandbox.shutdown().await;
+            return Err(ResourceError::unavailable(
+                "external capability journal could not initialize",
+            )
+            .into());
+        }
+    }
     let waltr_mcp = match WaltrMcpServer::new(session_host.clone(), agent_state.clone()) {
         Ok(server) => server,
         Err(_) => {
@@ -1217,35 +1307,48 @@ where
             return Err(ResourceError::unavailable("resource watcher could not start").into());
         }
     };
-    let routine_store = persistence.routine_invocation_store();
-    let routine_engine = RoutineEngine::start(
-        &event_bus,
-        agent_state.clone(),
-        session_host.clone(),
-        routine_store.clone(),
-    );
-    let interaction_service = RoutineInteractionService::new(
-        agent_state.clone(),
-        routine_engine.manual_handle(),
-        session_host.clone(),
-        interaction_limits.clone(),
-    )
-    .expect("interaction limits validated before assembly");
-    let routine_service = RoutineService::new(
-        agent_state,
-        routine_engine.manual_handle(),
-        routine_store,
-        routine_engine.lifecycle_wakeups(),
-    );
+    let routine_engine = match session_host
+        .compose_routines(ProductionInput {
+            state: agent_state,
+            persistence: persistence.clone(),
+            workspace: workspace_root,
+            private_parent: routine_private_parent,
+            authority: routine_authority,
+        })
+        .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            drop(definition_watcher.shutdown().await);
+            session_host.shutdown().await;
+            sandbox.shutdown().await;
+            return Err(ResourceError::unavailable(format!("JavaScript Routine configuration preflight failed ({error:?}); verify configured Routine resources and host capabilities")).into());
+        }
+    };
+    let waltr_mcp = if let Some(oauth) = &mcp_oauth {
+        waltr_mcp.with_hosted_origin(oauth.issuer(), routine_engine.clone())
+    } else if anonymous_mcp {
+        waltr_mcp.with_anonymous_disabled()
+    } else {
+        waltr_mcp
+    };
     let readiness = Readiness {
         persistence,
         oauth: mcp_oauth.clone(),
         definitions: definition_watcher.health(),
         routines: routine_engine.health(),
+        invocations: Some(routine_engine.invocations.clone()),
         sandbox_alive: sandbox.health(),
     };
     let readiness_route = readiness.clone();
     let waltr_mcp = Arc::new(waltr_mcp.with_readiness(readiness.clone()));
+    if let Some(private) = &mut private_self_mcp {
+        private.start(
+            waltr_mcp.clone(),
+            session_host.clone(),
+            routine_engine.clone(),
+        );
+    }
     let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
         Router::new()
             .route("/mcp", any(service_unavailable))
@@ -1256,12 +1359,7 @@ where
     grpc_routes.add_service(ResourceServiceServer::from_arc(config_service));
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
-    grpc_routes.add_service(RoutineServiceServer::new(routine_service));
-    grpc_routes.add_service(
-        RoutineInteractionServiceServer::new(interaction_service)
-            .max_decoding_message_size(interaction_limits.complete_request_bytes)
-            .max_encoding_message_size(interaction_limits.complete_request_bytes),
-    );
+    grpc_routes.add_service(routine_engine.rpc.clone().into_server());
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()
@@ -1323,12 +1421,17 @@ where
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
     let router = match local_admission {
         Some(local) => router.layer(middleware::from_fn_with_state(
-            local.bearer,
+            (
+                local.bearer,
+                crate::local_admission::ValidatedLocalOrigin(Arc::new(
+                    routine_engine.local_generation_lifetime(),
+                )),
+            ),
             require_local_protocol_bearer,
         )),
         None => router,
     };
-    Ok(ServerApplication::new(
+    let mut app = ServerApplication::new(
         router,
         definition_watcher,
         mcp_oauth,
@@ -1336,13 +1439,19 @@ where
         session_host,
         readiness,
         sandbox,
-    ))
+    );
+    app.self_mcp = private_self_mcp;
+    Ok(app)
 }
 
 fn request_span<B>(request: &Request<B>) -> tracing::Span {
     let (method, path) = request_trace_fields(request);
     tracing::debug_span!("request", method = %method, path = %path)
 }
+
+#[cfg(test)]
+#[path = "app/tests/self_mcp.rs"]
+mod self_mcp_tests;
 
 fn request_trace_fields<B>(request: &Request<B>) -> (&axum::http::Method, &str) {
     (request.method(), request.uri().path())
@@ -1498,10 +1607,20 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn apps_startup_failure_joins_real_worker_watcher_and_engine() {
+        if !crate::test_support::isolated_process_test(
+            "app::tests::apps_startup_failure_joins_real_worker_watcher_and_engine",
+        ) {
+            return;
+        }
         let root = crate::test_support::temp_root();
-        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let self_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::create_dir_all(root.join(".waltr/resources/mcp-servers")).unwrap();
+        std::fs::write(root.join(".waltr/resources/mcp-servers/waltr.yaml"), format!("apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {{name: waltr}}\nspec: {{transport: streamableHttp, url: 'http://{}/mcp'}}\n", self_listener.local_addr().unwrap())).unwrap();
         let config_service =
-            ConfigService::from_state(state.clone(), crate::test_support::default_catalog_loader());
+            ConfigService::new(root.clone(), crate::test_support::default_catalog_loader())
+                .await
+                .unwrap();
+        let state = config_service.state().clone();
         let persistence =
             Persistence::initialize(crate::persistence::DatabaseConfig::for_tests().unwrap())
                 .await
@@ -1519,9 +1638,10 @@ mod tests {
                 automatic_self_mcp_resource: None,
                 agent_state: Some(state),
                 local_admission: None,
+                routine_authority: RoutineAuthority::default(),
+                routine_private_parent: crate::test_support::temp_root(),
                 workspace_root: root,
                 sandbox_socket: None,
-                interaction_limits: InteractionLimits::default(),
             },
             move |routes, input| {
                 worker_tx.send(input.sandbox.clone()).unwrap();
@@ -1627,12 +1747,22 @@ mod tests {
 
     #[tokio::test]
     async fn policy_builder_supplies_the_shared_agent_definition_state_to_sessions() {
+        if !crate::routine::telemetry::isolated_exporter_test(
+            "app::tests::policy_builder_supplies_the_shared_agent_definition_state_to_sessions",
+        ) {
+            return;
+        }
         let root = crate::test_support::temp_root();
+        std::fs::create_dir_all(root.join(".waltr/resources/mcp-servers")).unwrap();
+        let self_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(root.join(".waltr/resources/mcp-servers/waltr.yaml"), format!("apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {{name: waltr}}\nspec: {{transport: streamableHttp, url: 'http://{}/mcp'}}\n", self_listener.local_addr().unwrap())).unwrap();
         let canonical_root = root.canonicalize().unwrap();
-        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let expected_snapshot = state.snapshot();
         let config_service =
-            ConfigService::from_state(state.clone(), crate::test_support::default_catalog_loader());
+            ConfigService::new(root.clone(), crate::test_support::default_catalog_loader())
+                .await
+                .unwrap();
+        let state = config_service.state().clone();
+        let expected_snapshot = state.snapshot();
         let persistence =
             Persistence::initialize(crate::persistence::DatabaseConfig::for_tests().unwrap())
                 .await
@@ -1651,9 +1781,10 @@ mod tests {
                 automatic_self_mcp_resource: None,
                 agent_state: Some(state),
                 local_admission: None,
+                routine_authority: RoutineAuthority::default(),
+                routine_private_parent: crate::test_support::temp_root(),
                 workspace_root: root,
                 sandbox_socket: None,
-                interaction_limits: InteractionLimits::default(),
             },
             move |routes, input| {
                 let session::SessionCatalogSource::Dynamic(ref callback_state) = input.catalog
@@ -1750,9 +1881,10 @@ mod tests {
                 automatic_self_mcp_resource: None,
                 agent_state: Some(state),
                 local_admission: None,
+                routine_authority: RoutineAuthority::default(),
+                routine_private_parent: root.clone(),
                 workspace_root: root,
                 sandbox_socket: None,
-                interaction_limits: InteractionLimits::default(),
             },
             |routes, input| {
                 assert!(matches!(
@@ -1770,93 +1902,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, AppAssemblyError::SessionStorage(_)));
-    }
-
-    #[tokio::test]
-    async fn primary_assembly_propagates_custom_interaction_transport_limits() {
-        let root = crate::test_support::temp_root();
-        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let catalog_loader = crate::test_support::default_catalog_loader();
-        let config_service = ConfigService::from_state(state.clone(), catalog_loader.clone());
-        let persistence =
-            Persistence::initialize(crate::persistence::DatabaseConfig::for_tests().unwrap())
-                .await
-                .unwrap();
-        let app = assemble_app(
-            AppServices {
-                config_service,
-                persistence,
-                catalog_loader,
-                access_authenticator: AccessAuthenticator::disabled(),
-                mcp_oauth: None,
-                outbound_private_origins: Vec::new(),
-                outbound_oauth: OutboundOAuthConfig::default(),
-                automatic_self_mcp_resource: None,
-                agent_state: Some(state),
-                local_admission: None,
-                workspace_root: root,
-                sandbox_socket: None,
-                interaction_limits: InteractionLimits {
-                    complete_request_bytes: 1024,
-                    chunk_bytes: 512,
-                    ..InteractionLimits::default()
-                },
-            },
-            |routes, input| {
-                Ok(session::add_store_service(
-                    routes,
-                    waltr_agent::MemorySessionStore::new(),
-                    input,
-                ))
-            },
-        )
-        .await
-        .unwrap();
-        let mut oversized_frame = vec![0];
-        oversized_frame.extend_from_slice(&2048_u32.to_be_bytes());
-        oversized_frame.resize(2053, 0);
-        let response = tower::ServiceExt::oneshot(
-            app.router(),
-            Request::builder()
-                .method("POST")
-                .uri("/waltr.routine.v1.RoutineInteractionService/Run")
-                .version(axum::http::Version::HTTP_2)
-                .header("content-type", "application/grpc")
-                .body(axum::body::Body::from(oversized_frame))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        let status = tonic::Status::from_header_map(response.headers()).unwrap();
-        assert_eq!(status.code(), tonic::Code::OutOfRange);
-        assert!(status.message().contains("1024"), "{status}");
-        app.shutdown().await;
-    }
-
-    #[test]
-    fn standalone_options_default_to_the_shared_limits() {
-        let options = BuildAppOptions::default();
-        assert_eq!(
-            serde_json::to_value(options.interaction_limits).unwrap(),
-            serde_json::to_value(InteractionLimits::default()).unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn standalone_rejects_invalid_limits_before_loading_environment() {
-        let options = BuildAppOptions {
-            interaction_limits: InteractionLimits {
-                active_interactions: 0,
-                ..InteractionLimits::default()
-            },
-        };
-        let error = build_app(options).await.unwrap_err();
-        assert!(matches!(error, BuildAppError::Config(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("invalid interaction host limits")
-        );
     }
 
     #[test]
@@ -1888,14 +1933,14 @@ mod tests {
         drop(definition_tx);
         assert!(!definition_watcher_ready(&definition_rx));
 
-        let (routine_tx, routine_rx) = tokio::sync::watch::channel(EngineHealth::Running);
+        let (routine_tx, routine_rx) = tokio::sync::watch::channel(RuntimeHealth::Running);
         assert!(routine_engine_ready(&routine_rx));
         routine_tx
-            .send(EngineHealth::Failed("worker exited".to_owned()))
+            .send(RuntimeHealth::Failed("worker exited".to_owned()))
             .unwrap();
         assert!(!routine_engine_ready(&routine_rx));
 
-        let (routine_tx, routine_rx) = tokio::sync::watch::channel(EngineHealth::Running);
+        let (routine_tx, routine_rx) = tokio::sync::watch::channel(RuntimeHealth::Running);
         drop(routine_tx);
         assert!(!routine_engine_ready(&routine_rx));
     }

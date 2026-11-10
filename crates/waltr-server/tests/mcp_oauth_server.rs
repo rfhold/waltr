@@ -3,11 +3,11 @@
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use waltr_server::test_support::{setup_access_auth_browser_fixture, setup_server};
 use reqwest::{StatusCode, header, redirect::Policy};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use url::Url;
+use waltr_server::test_support::{setup_access_auth_browser_fixture, setup_server};
 
 const CLIENT_ID: &str = "test-mcp-client";
 const CLIENT_REDIRECT: &str = "https://client.example/callback";
@@ -17,6 +17,7 @@ const VERIFIER: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 #[tokio::test]
 async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let denied_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), false);
     let client = reqwest::Client::new();
@@ -36,6 +37,7 @@ async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy(
         .send()
         .await?;
     assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+    denied_server.stop();
 
     let enabled_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), true);
     let registration = client
@@ -62,9 +64,10 @@ async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy(
 #[allow(clippy::too_many_lines)]
 async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server_with_mcp_oauth(Duration::from_hours(1));
-    let replica = fixture.start_server_with_mcp_oauth(Duration::from_hours(1));
+    let replica = fixture.start_mcp_auth_replica(Duration::from_hours(1));
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
         .build()?;
@@ -369,6 +372,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
 #[tokio::test]
 async fn disabled_auth_exposes_neither_oauth_routes_nor_mcp_challenges()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let client = reqwest::Client::new();
     assert_eq!(
@@ -396,6 +400,7 @@ async fn disabled_auth_exposes_neither_oauth_routes_nor_mcp_challenges()
 #[tokio::test]
 async fn enabled_access_without_hosted_oauth_fails_closed_for_mcp()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server(Duration::from_hours(1));
     let client = reqwest::Client::new();
@@ -427,6 +432,7 @@ async fn enabled_access_without_hosted_oauth_fails_closed_for_mcp()
 #[tokio::test]
 async fn restart_preserves_the_active_signing_key_and_registered_client()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let client = reqwest::Client::new();
     let first = fixture.start_server_with_mcp_oauth(Duration::from_hours(1));
@@ -485,6 +491,7 @@ async fn restart_preserves_the_active_signing_key_and_registered_client()
 #[tokio::test]
 async fn readiness_fails_closed_when_active_signing_public_key_mismatches_private_key()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
     let server = fixture.start_server_with_mcp_oauth(Duration::from_hours(1));
     let client = reqwest::Client::new();

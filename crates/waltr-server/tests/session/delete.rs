@@ -1,12 +1,13 @@
 use crate::support::grpc::session_client;
+use tonic::Code;
 use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, DeleteSessionRequest, ListSessionsRequest, WipeSessionsRequest,
 };
 use waltr_server::test_support::setup_server;
-use tonic::Code;
 
 #[tokio::test]
 async fn removes_session_from_list() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
 
@@ -36,6 +37,7 @@ async fn removes_session_from_list() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn missing_session_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
 
@@ -50,6 +52,7 @@ async fn missing_session_succeeds() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn empty_id_returns_invalid_argument() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
 
@@ -67,6 +70,7 @@ async fn empty_id_returns_invalid_argument() -> Result<(), Box<dyn std::error::E
 
 #[tokio::test]
 async fn wipe_requires_confirmation() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
     client
@@ -94,6 +98,7 @@ async fn wipe_requires_confirmation() -> Result<(), Box<dyn std::error::Error>> 
 #[tokio::test]
 async fn wipe_is_empty_idempotent_and_removes_all_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
 

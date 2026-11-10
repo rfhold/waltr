@@ -1,14 +1,14 @@
-# MCP Integration
+# Server MCP Integration
 
-Waltr agent MCP integration lets a session expose tools, prompt templates, resource data reads, resource templates, and opt-in Skills from configured MCP servers. Generic protocol behavior lives in [../mcp/protocol.md](../mcp/protocol.md); this document covers how the agent layer adapts that protocol surface into Waltr session behavior.
+The server host exposes tools, prompt templates, resource reads, resource templates, and opt-in Skills from configured MCP servers. Generic protocol behavior lives in [MCP protocol](../mcp/protocol.md); this guide covers server-owned adaptation, policy, and live interactions.
 
-MCP servers are owned by the durable session coordinator so they can remain initialized alongside a session. MCP is not attached directly to `AgentRuntimeBuilder`; runtime construction receives tools and template middleware from the coordinator-owned MCP runtime for that session.
+`ServerAgentRuntimeFactory` owns the session MCP registry and concrete runtime construction. The generic agent receives neutral tools and hooks, not MCP clients. Host retirement cancels and joins runtime shutdown.
 
 ## Entry Points
 
 | API | Purpose |
 | --- | --- |
-| `McpConfig` | Agent-side collection of MCP servers, request timeout, log level, and trace propagation mode. |
+| `McpConfig` | Server-host collection of MCP servers, request timeout, log level, and trace propagation mode. |
 | `McpServerConfig` | One named server and its generic `mcp::client::McpTransportConfig`. |
 | `McpClientRuntime` | Session-scoped runtime that starts configured servers and adapts their registries. |
 | `McpServerRuntime` | Per-server runtime that owns the typed generic `McpClient`, registries, progress routing, and refresh behavior. |
@@ -18,9 +18,9 @@ MCP servers are owned by the durable session coordinator so they can remain init
 | `McpFeatureConfig::resources` | Enables ordinary provider resource reads and user-inserted resource templates. |
 | `McpFeatureConfig::skills` | Explicit opt-in for remote MCP Skills through `load_skill` and verified supporting-file reads; default false. |
 | `McpConfig::with_skills` | Enables the same remote Skills contract for library callers. |
-| `SessionCoordinator` | Resolves current MCP configuration and caches a session-scoped MCP runtime. |
+| `ServerAgentRuntimeFactory` | Resolves current MCP configuration and owns a session-scoped runtime registry. |
 
-The agent integration depends on the generic `mcp` crate. The generic crate must not depend back on `waltr-agent`.
+The server integration depends on generic `mcp` and `waltr-agent` primitives. Neither generic crate depends on the concrete server host.
 
 ## Definition Selection
 
@@ -67,13 +67,33 @@ Template search uses the same current resolution. It treats MCP preparation fail
 
 ## Cache Lifecycle
 
-The coordinator caches one MCP runtime per durable session. Its structural fingerprint contains selected keys, transport kinds, targets, and trace propagation.
+### Standalone Self Connection
+
+The public standalone `/mcp` route is anonymous only when trusted composition selects disabled access authentication with neither hosted OAuth nor embedded local admission. Clients need no bearer or sign-in. Anonymous callers share the configured dev domain and ordinary enabled capabilities. They gain no optional code profiles, helper grants, or speech/model authority. Normal dispatch journaling, sandbox policy, consent/elicitation and cancellation ownership still apply. Missing interaction routes fail explicitly and never broadcast to another session. Bare MCP server construction does not enable anonymous capability or prompt admission. Do not expose a no-auth server to untrusted networks.
+
+Access-disabled, non-hosted standalone composition binds the initial self resource to a private MCP-only loopback listener.
+The initial `waltr` key and logical URL must match the trusted public resource destination.
+A name alone grants no authority; later destination edits use ordinary upstream transport and credentials.
+
+`McpServerConfig` retains the logical endpoint for source identity and declaration checks.
+Only its private transport destination changes, with a memory-only generation bearer and a distinct authority identifier.
+Every private bearer lookup checks the current logical connection and generation lifetime.
+The external capability catalog excludes the logical self resource, so self discovery cannot recurse.
+
+The private client bypasses proxies, refuses all redirects, and enables generic endpoint redaction.
+The application never persists the private endpoint or bearer in resource YAML, OAuth credentials, or session metadata.
+Standalone upstream OAuth callbacks and durable credentials retain their ordinary lifecycle; embedded callback markers do not apply.
+See [private admission and shutdown](../architecture/access-authentication.md#standalone-private-self-mcp-admission).
+
+### Session Registry
+
+The server host registry caches one MCP runtime per durable session. Its structural fingerprint contains selected keys, transport kinds, targets, and trace propagation.
 With Skills enabled, it also incorporates a digest of each selected server's current bearer token.
 This binds Skills runtime identity to credential changes and opt-in state. Provider settings and unselected MCP entries do not affect the fingerprint.
 
-An equal fingerprint reuses the cached runtime after credential preflight. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. After a successful swap, current `Arc` users finish with the old runtime. Waltr shuts it down after those users release it.
+An equal fingerprint reuses the cached runtime after credential preflight and exact incarnation, credentialed-server, and Apps-authority checks. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. A successful swap enqueues shutdown of the replaced runtime immediately; outstanding users do not keep its authority alive. Host retirement joins those shutdown tasks.
 
-Coordinator shutdown rejects new work, cancels active and queued work, waits for run ownership to drain, and atomically takes MCP preparation guards and cached runtimes under the MCP lifecycle write gate. It then awaits every `McpClientRuntime::shutdown`; each runtime awaits each server's generic client shutdown, including the explicit stdio shutdown and child-reap path. No additional bounded termination guarantee exists beyond that MCP shutdown contract.
+Session shutdown drains generic run ownership; server host retirement drains the MCP registry and private policy state. It awaits each `McpClientRuntime::shutdown`, including generic client stdio shutdown and child reaping. No additional bounded termination guarantee exists beyond that contract.
 
 ## Tool Discovery
 
@@ -88,23 +108,25 @@ For each configured server, the session MCP runtime:
 MCP tools are exposed directly. Tool names are generated as:
 
 ```text
-mcp_<server>_<tool>
+<server>__<tool>
 ```
 
-Non-alphanumeric characters are sanitized so the name is provider-safe.
+Names are sanitized for provider visibility. Visible aliases are not authority: dispatch retains exact source-server/tool identities and declaration revisions. The bundled self server therefore exposes `waltr__*`. Old aliases in persisted resource overrides require deliberate replacement; there is no compatibility alias.
 
 ## Tool Calls
 
-When a provider calls an MCP-backed tool, the agent uses the normal tool execution path:
+Provider calls, templates, Apps, reviewed JavaScript, and authenticated external tools all use the same server capability dispatcher:
 
-- The tool call and result are recorded as generic timeline events and journal-backed session projection data.
+- Session-bound tool calls and results are recorded as generic timeline events and journal-backed session projection data. Sessionless external calls use the SQL journal described below instead.
 - Permission behavior can target the generated tool name through normal tool selectors.
-- The MCP runtime sends `tools/call` to the server.
+- The dispatcher validates exact target and policy before the MCP runtime sends `tools/call`.
 - The MCP request includes a progress token.
 - If the Waltr tool call is canceled or times out, the MCP runtime sends `notifications/cancelled` for the in-flight JSON-RPC request.
 - The response is converted into ordered provider-neutral `ToolResult` text and image blocks.
 
 MCP result conversion preserves text order, represents unknown content with explicit unsupported-content markers, appends `structuredContent` as text, and preserves MCP `isError` as structured tool-result state. Image blocks must use canonical standard Base64, declare `image/png`, `image/jpeg`, or `image/webp`, and match that type's file signature. Waltr accepts at most four images and 4 MiB of decoded image data in one result. Invalid encoding, unsupported media, signature mismatches, and excess data become bounded MCP protocol errors; image data is never included in the error.
+
+Authenticated sessionless `capability__*` calls require a server-owned `ExternalDispatchStore`; production standalone and embedded composition install the Waltr SQL store. The exact principal, operation, target, declaration, and original input are durably associated as uncertain before dispatcher entry. A known result permits an exact completion CAS. Dispatch/settlement failure or crash never authorizes reconstruction or replay, and missing persistence fails closed. No synthetic session is created. Arguments and complete text/image results are sensitive retained SQL data, not merely transient interaction state; see [persistence and retention boundaries](../architecture/persistence.md#sessionless-external-dispatch). The journal supplies neither restart continuation nor automatic cleanup.
 
 Without Skills, Waltr opts into an 8 MiB MCP message and event-stream line limit.
 This limit fits one bounded 4 MiB decoded image plus Base64 and JSON framing.
@@ -172,13 +194,13 @@ The user fills the URI path in-place before submitting, for example:
 
 The renderer requires an absolute URI that either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Before `resources/read`, it evaluates the same `read_mcp_resource` tool permission and input rules using `{server, uri}` as a direct reader call. Discovery does not grant read permission. Denied reads render a template error without resource I/O. Resource template search can call the MCP completion API for URI template arguments when the server advertises completion support.
 
-Resource references do not create tool-call identities or permission suspensions. An unresolved whole-tool or input `Ask` renders a template error without reading; invoke `read_mcp_resource` directly to request approval. Existing reusable input approval patterns apply to resource references, but one-shot tool-call approvals do not. Allowed reads retain the resource result wrapper and nested template expansion; every nested resource reference passes the same checks.
+Resource references use the same exact capability and policy boundary as direct reads. An Ask awaits the original live rendering operation through the broker; an unavailable route fails before reading. Allowed reads retain the result wrapper and nested expansion; every nested reference passes the same checks.
 
-The native reader also checks the final selector against those input rules before fetching data, including when middleware changes arguments. A direct call, or a registered `@tool(read_mcp_resource, ...)` reference, suspends on unresolved input `Ask` without resource I/O. The prefetch check recognizes reusable patterns and the caller's exact contextual one-shot approval without consuming it; normal permission continuation owns consumption or call-completion cleanup. Approving the whole tool does not override input denial or manifest-bound Skill consent.
+The reader checks the final selector before fetching, including middleware changes. Direct and `@tool(read_mcp_resource, ...)` calls await input consent without resource I/O. Approving the whole tool does not override input denial or manifest-bound Skill consent.
 
-Template permission request identities bind the complete tool name and arguments as well as the policy, approval stage, and claims. A selector change requires a new approval even when an input Ask rule claims only the server. Prior request identities receive no compatibility grant.
+Operation receipts bind exact capability, policy, arguments, and claims. A changed selector requires fresh approval. Private receipts are not durable history or compatibility grants.
 
-Reader completion caches bind the session, turn, call identity, complete selector, tool name, and policy identity. An exact authorized completion survives a render retry after its one-shot approval expires, without another fetch. Changed selectors or policies follow normal permission checks; input denial returns no cached private data. Reader calls never reuse legacy completion entries without this authorization binding. Other tool caches retain their current behavior.
+A live reader approval resumes that exact original operation. It is not a persistent authorization cache or permission to rerender an effect after restart. Changed selectors and policies require their own authorization; input denial returns no private resource data.
 
 ### Provider Resource Reads
 
@@ -234,8 +256,8 @@ The generic reader does not accept a skill URI selector. Before resource I/O, th
 
 Activation approval binds the server origin, runtime incarnation, exact complete manifest, and current request.
 Generic policy allows and remembered approvals cannot satisfy this consent request. The host rejects dynamic manifests before any file read.
-Request-bound approvals survive additional pre-dispatch permission or middleware suspensions for the same call.
-The agent clears them at final execution or result, denial, cancellation, or prompt supersession.
+Request-bound consent belongs to the original live call and can cover its additional pre-dispatch gates.
+The host clears private consent on completion, cancellation, or retirement; restart never restores an approval waiter.
 Skill output retains origin labels; the host never evaluates its text as templates.
 Ordinary `resources/read` and resource templates do not activate a skill or establish approval.
 
@@ -247,7 +269,7 @@ The additional gate covers every other tool, including shell execution, custom t
 Nested remote activation requires its own manifest-bound approval. Cross-origin supporting-file reads require per-call consent that identifies all active origins.
 The host disables delegation and template expansion while remote instructions remain in durable history.
 
-The acting window lasts for that durable history, not one turn. Held manifests and consent provenance survive session replay. Replay distinguishes local loader calls and ordinary data results from remote activation calls and resource results carrying verified skill origins; ordinary data does not establish activation provenance.
+The acting window lasts for that durable history, not one turn. Held manifests and origin provenance survive replay, but approval grants and live consent waiters do not. Replay distinguishes local loader calls and ordinary data from remote activation and verified skill origins; ordinary data does not establish activation provenance.
 Missing provenance, disabled Skills, or a retired runtime fail closed.
 A replacement runtime requires explicit reapproval of the unchanged held manifest before further action.
 Manifest changes and integrity failures revoke approval; the host never substitutes a new manifest automatically.
@@ -275,7 +297,9 @@ The instructions middleware is registered with the other MCP session middleware,
 
 ## Notifications and MRTR
 
-The generic MCP client opens `subscriptions/listen` for the list-change filters advertised by the server and reconnects after an unexpected closure. The agent-side handler converts subscription messages and request-scoped notifications into registry refreshes, progress updates, or logs. Roots are supplied through multi-round-trip request (MRTR) input rather than a server-initiated JSON-RPC request.
+The generic client is pinned to MCP `2026-07-28`. It opens `subscriptions/listen` for advertised list-change filters and reconnects after unexpected closure. The host converts notifications into refreshes, progress, or logs. MRTR uses `input_required`, keyed inputs, and opaque `requestState`, not server-originated elicitation RPC or a completion notification.
+
+`McpClient::for_operation` binds an immutable handler and advertised capabilities to one actual operation while sharing the transport. Form and URL inputs route to that operation's broker binding; an upstream key is correlation, not authority. Missing routes fail closed before dependent effects, without broadcasting to unrelated sessions. Live Skills and Apps use the same route. Unsupported modes are not advertised; unsupported forms cannot be accepted. URL acceptance records consent only and never fetches, opens, or infers completion.
 
 | MCP message | Current behavior |
 | --- | --- |
@@ -284,7 +308,7 @@ The generic MCP client opens `subscriptions/listen` for the list-change filters 
 | `notifications/resources/list_changed` | Refreshes that server's concrete resource and resource URI template registries in the background. Template searches see the refreshed resources. |
 | `notifications/message` | Publishes an internal MCP log event and writes a tracing event when the originating request opted into a log level. |
 | `notifications/progress` | Publishes an internal MCP progress event. |
-| MRTR `roots/list` input request | Retries the originating tool, prompt, or resource request with the host-injected coordinator runtime root as a single `file://` root response. Production code does not introspect a workspace root from process state. |
+| MRTR `roots/list` input request | Continues the originating tool, prompt, or resource request with the host-injected runtime root as a single `file://` root response. Production code does not introspect a workspace root from process state. |
 
 The internal MCP event stream is not yet exposed as a public client or UI contract.
 
@@ -294,7 +318,7 @@ The internal MCP event stream is not yet exposed as a public client or UI contra
 
 Trace context is propagated through MCP request `_meta.traceparent` and `_meta.tracestate`, not only through HTTP headers. See [../mcp/tracing.md](../mcp/tracing.md) for generic client/server span and propagation details.
 
-The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.operation` spans:
+The server host also wraps Waltr-facing MCP operations in `mcp.agent.operation` spans:
 
 | Operation | Fields |
 | --- | --- |
@@ -347,14 +371,14 @@ Hosted web and TUI receive the generic authorization URL and sanitized lifecycle
 
 Standalone target-scoped durable credentials preserve the exact resource, issuer, selected registration, authorization/token/revocation endpoints, redirect, tokens, scopes, expiry, and refresh generation. Embedded credentials replace the redirect with their generation marker. Expiry distinguishes a known deadline, a true non-expiring token, and a token whose successful response omitted `expires_in`; omitted expiry does not retain the replaced token's deadline. The Waltr SQL backend uses a 30-second identity-bound compare-and-swap refresh lease across sessions/replicas. A claimant commits only against its generation and claim identity. An indeterminate exchange or an expired refresh lease requires reauthorization rather than risking reuse of a rotated token family. Code-exchange and refresh responses must be JSON and fit within 64 KiB. Authorization, token, refresh, and revocation requests preserve the discovered resource. Debug output for attempts, claims, durable OAuth state, and token values is redacted.
 
-Agent transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each stateless POST, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. The same refresh coordinator supports an explicit target-scoped forced refresh while preserving generation/claim coordination and resource binding. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Config clients expose sanitized MCP credential status and authorize, force-refresh, and reset actions, while registration remains discovery- and environment-owned. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes ordinary local state unconditionally. Embedded self-MCP logout instead returns failed precondition and preserves its host-owned generation credential. External MCP expiration or rejection is an ordinary outbound-MCP failure carrying the exact server key and sanitized challenge context; it never starts OAuth, replays work, or clears Waltr access credentials.
+Server upstream transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each stateless POST, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. The same refresh coordinator supports an explicit target-scoped forced refresh while preserving generation/claim coordination and resource binding. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Config clients expose sanitized MCP credential status and authorize, force-refresh, and reset actions, while registration remains discovery- and environment-owned. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes ordinary local state unconditionally. Embedded self-MCP logout instead returns failed precondition and preserves its host-owned generation credential. External MCP expiration or rejection is an ordinary outbound-MCP failure carrying the exact server key and sanitized challenge context; it never starts OAuth, replays work, or clears Waltr access credentials.
 
 ## Boundaries
 
 - MCP support is opt-in through the current resolved agent definition.
-- Generic MCP protocol implementation belongs in `crates/mcp`; Waltr conversion into tools, templates, permissions, and session runtime belongs in `crates/waltr-agent/src/mcp/`.
+- Generic MCP protocol implementation belongs in `crates/mcp`; concrete integration belongs in `crates/waltr-server/src/agent_host/mcp/`.
 - MCP server instructions are injected into the provider system prompt by default for factory-built session runtimes; this is a factory policy, not generic MCP protocol behavior.
-- Resource URI subscriptions, sampling, elicitation, non-roots MRTR input, and task runtime extensions are not implemented. List-change subscriptions are implemented through `subscriptions/listen`.
+- Resource URI subscriptions, sampling, and task runtime extensions are not implemented. List-change subscriptions and operation-bound roots/form/URL MRTR inputs are supported.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - Session RPC and UI timeline results expose the safe text projection rather than inline image data; direct model delivery and durable agent replay retain validated image blocks.
@@ -372,12 +396,12 @@ Focused coverage:
 | --- | --- |
 | [../../crates/mcp/tests/spec.rs](../../crates/mcp/tests/spec.rs) and [../../crates/mcp/tests/spec/](../../crates/mcp/tests/spec/) | Generic MCP protocol conformance. |
 | [../../crates/mcp/tests/ecosystem.rs](../../crates/mcp/tests/ecosystem.rs) and [../../crates/mcp/tests/ecosystem/](../../crates/mcp/tests/ecosystem/) | Generic MCP ecosystem interoperability. |
-| [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows, server instructions, plus stdio MCP prompt/resource template discovery and rendering. |
-| [../../crates/waltr-agent/tests/live/agent/mcp.rs](../../crates/waltr-agent/tests/live/agent/mcp.rs) | Ignored live-provider MCP coverage. |
-| [../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs](../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs) | Test MCP server binary. |
+| [../../crates/waltr-server/tests/agent_host/mcp.rs](../../crates/waltr-server/tests/agent_host/mcp.rs) | Deterministic MCP tools, instructions, prompts, and resources. |
+| [../../crates/waltr-server/tests/agent_host/live/mcp.rs](../../crates/waltr-server/tests/agent_host/live/mcp.rs) | Ignored live-provider MCP coverage. |
+| [../../crates/waltr-server/src/bin/waltr-server-test-mcp-server.rs](../../crates/waltr-server/src/bin/waltr-server-test-mcp-server.rs) | Test MCP server binary. |
 | [../../crates/waltr-server/tests/mcp_oauth_server.rs](../../crates/waltr-server/tests/mcp_oauth_server.rs) | Waltr-hosted issuer, browser bridge/consent, token lifecycle, direct-upstream rejection, and restart behavior. |
 
-Current deterministic coverage exercises stdio behavior but does not provide a real child-process integration assertion for coordinator shutdown and child reaping. Do not cite such an integration test until one exists.
+Stdio shutdown and child reaping belong to the server host retirement path and the generic transport contract, not the generic agent coordinator.
 
 ## References
 
@@ -385,16 +409,16 @@ Current deterministic coverage exercises stdio behavior but does not provide a r
 | --- | --- |
 | [../mcp/protocol.md](../mcp/protocol.md) | Generic MCP protocol crate behavior and boundaries. |
 | [../mcp/skills.md](../mcp/skills.md) | Official Skills extension, explicit embedded manifests, and byte verification. |
-| [../../crates/waltr-agent/src/middleware/mcp_skills.rs](../../crates/waltr-agent/src/middleware/mcp_skills.rs) | Manifest-bound activation, origin labels, per-call consent, and durable replay gates. |
-| [../../crates/waltr-agent/src/middleware/skills.rs](../../crates/waltr-agent/src/middleware/skills.rs) | Shared skill loader schema and local/MCP source routing. |
-| [../../crates/waltr-agent/src/middleware/mcp_resources.rs](../../crates/waltr-agent/src/middleware/mcp_resources.rs) | Generic raw resource reader, held-manifest verification, and user-inserted resource templates. |
+| [../../crates/waltr-server/src/agent_host/middleware/mcp_skills.rs](../../crates/waltr-server/src/agent_host/middleware/mcp_skills.rs) | Manifest-bound activation, origin labels, per-call consent, and replay gates. |
+| [../../crates/waltr-server/src/agent_host/middleware/skills.rs](../../crates/waltr-server/src/agent_host/middleware/skills.rs) | Shared skill loader and source routing. |
+| [../../crates/waltr-server/src/agent_host/middleware/mcp_resources.rs](../../crates/waltr-server/src/agent_host/middleware/mcp_resources.rs) | Raw reader, held-manifest verification, and templates. |
 | [../mcp/tracing.md](../mcp/tracing.md) | Generic MCP spans and trace propagation. |
 | [../../crates/mcp/src/client/](../../crates/mcp/src/client/) | Typed generic MCP client, connection loop, and transports. |
 | [../../crates/mcp/src/server/mod.rs](../../crates/mcp/src/server/mod.rs) | Typed generic MCP server. |
 | [../../crates/mcp/src/protocol.rs](../../crates/mcp/src/protocol.rs) | JSON-RPC helpers and MCP protocol version. |
 | [../../crates/mcp/src/trace.rs](../../crates/mcp/src/trace.rs) | Generic request `_meta` trace propagation helpers. |
-| [../../crates/waltr-agent/src/mcp/config.rs](../../crates/waltr-agent/src/mcp/config.rs) | MCP configuration types. |
-| [../../crates/waltr-agent/src/mcp/runtime.rs](../../crates/waltr-agent/src/mcp/runtime.rs) | Session MCP runtime, `AgentTool` conversion, prompt access, and resource access. |
-| [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs) | Waltr-side MCP server runtime, registries, notifications, progress, roots, and request behavior. |
-| [../../crates/waltr-agent/src/middleware/mcp_instructions.rs](../../crates/waltr-agent/src/middleware/mcp_instructions.rs) | System-prompt middleware for initialized MCP server instructions. |
-| [../../crates/waltr-agent/src/mcp/name.rs](../../crates/waltr-agent/src/mcp/name.rs) | Generated tool-name sanitization. |
+| [../../crates/waltr-server/src/agent_host/mcp/config.rs](../../crates/waltr-server/src/agent_host/mcp/config.rs) | MCP configuration. |
+| [../../crates/waltr-server/src/agent_host/mcp/runtime.rs](../../crates/waltr-server/src/agent_host/mcp/runtime.rs) | Session tools, prompts, and resources. |
+| [../../crates/waltr-server/src/agent_host/mcp/server.rs](../../crates/waltr-server/src/agent_host/mcp/server.rs) | Registries, notifications, progress, and request behavior. |
+| [../../crates/waltr-server/src/agent_host/middleware/mcp_instructions.rs](../../crates/waltr-server/src/agent_host/middleware/mcp_instructions.rs) | Server instruction middleware. |
+| [../../crates/waltr-server/src/agent_host/mcp/name.rs](../../crates/waltr-server/src/agent_host/mcp/name.rs) | Visible alias generation. |

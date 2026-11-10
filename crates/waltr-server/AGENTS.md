@@ -1,12 +1,16 @@
-# Boundaries
-
-Waltr server is a coordination layer so multiple clients can stay on the same page about state.
-
 # Index
 
 | Path | Info |
 | --- | --- |
+| [src/agent_host/](src/agent_host/) | Concrete definitions, shared capability dispatch, tools/templates/middleware/Skills, worker gateway, and MCP runtime. |
+| [src/permission/](src/permission/) | Codified policy and private process-local approval state. |
+| [src/interaction.rs](src/interaction.rs) | Typed live broker, exact identity, snapshot/watch, and owner cancellation. |
+| [src/auth/](src/auth/) | Upstream MCP OAuth and provider-only inference credential adapter. |
+| [../../docs/agent-host/README.md](../../docs/agent-host/README.md) | Concrete host guides moved from generic agent docs. |
+| [../../docs/runbooks/server-capability-cutover.md](../../docs/runbooks/server-capability-cutover.md) | Coordinated upgrade and separately authorized exact reset boundaries. |
 | [src/persistence/](src/persistence/) | SQLite/PostgreSQL selection, Waltr migrations, and MCP store composition. |
+| [src/routine_objects.rs](src/routine_objects.rs) | Immutable filesystem/S3 program and text payloads; SQL publication references and retained orphan objects. |
+| [src/agent_host/session_roles.rs](src/agent_host/session_roles.rs) | Trusted process-local helper/task provenance, keyed by actual session and incarnation. |
 | [../waltr-web/src/mcp-apps/container/](../waltr-web/src/mcp-apps/container/) | Web-owned trusted container source; web also owns the bridge contract and browser fixtures. |
 | [assets/status/](assets/status/) | Server-owned MCP status app source with a Vite module entry. |
 | [package.json](package.json) | `@rfhold/waltr-server` workspace build and served-app contracts. |
@@ -22,10 +26,16 @@ Waltr server is a coordination layer so multiple clients can stay on the same pa
 | [src/standalone_apps.rs](src/standalone_apps.rs) | All-or-none standalone Apps opt-in and exact origin validation. |
 | [src/embedded.rs](src/embedded.rs) | Ambient-free embedded composition with explicit paths, prebound loopback, host policy, and cache source. |
 | [src/local_admission.rs](src/local_admission.rs) | Process-generation bearer admission and host-owned self-MCP credentials. |
+| [src/self_mcp.rs](src/self_mcp.rs) | Standalone private MCP-only listener, exact logical binding, and joined generation cleanup. |
 | [src/access_auth/](src/access_auth/) | Waltr access OIDC config, discovery, principals, browser sessions, bearer validation, and SQL domain store. |
 | [src/mcp_oauth.rs](src/mcp_oauth.rs) | Hosted MCP OAuth configuration, Authentik-session bridge, consent adapter, keyring loading, and lifecycle composition. |
 | [src/persistence/outbound_oauth.rs](src/persistence/outbound_oauth.rs) | Durable outbound MCP callback, credential, and refresh-claim state. |
-| [src/routine/](src/routine/) | Server-owned event adapters, host boundary, Routine engine lifecycle, invocation execution, and expressions. |
+| [src/routine/](src/routine/) | Shared JavaScript invocation service, typed host adapters and transport ownership; no task DSL or v1 executor. |
+| [src/routine/production.rs](src/routine/production.rs) | Standalone/embedded composition, explicit default-deny roles and code profiles, normal helpers, lifecycle callbacks, and joined shutdown. |
+| [src/routine/README.md](src/routine/README.md) | Versioned script API, bounded contracts, joined cancellation, and SQL history. |
+| [src/routine/code_mode/README.md](src/routine/code_mode/README.md) | Optional principal-scoped agent/MCP code API, exact policy, durable outer association, and non-replay rules. |
+| [src/routine/rpc/](src/routine/rpc/) | Production Routine RPC adapter, principal-scoped observations, transport owners, and opaque blob grants. |
+| [src/routine_service.rs](src/routine_service.rs) | Production Routine RPC service export. |
 | [src/sandbox.rs](src/sandbox.rs) | Private gateway, standalone UDS worker connection, embedded duplex worker, readiness and shutdown; never mount it on public routes. |
 | [src/workspace_paths.rs](src/workspace_paths.rs) | Startup checks keeping host-owned storage and config paths out of the workspace worker root. |
 | [../../docs/architecture/agent.md](../../docs/architecture/agent.md) | Canonical agent/worker private RPC and dispatch-fence contract. |
@@ -42,7 +52,13 @@ Waltr server is a coordination layer so multiple clients can stay on the same pa
 
 # Contracts
 
+Server owns concrete capabilities; `waltr-agent` remains the generic provider/model runner, neutral hooks, history/coordinator, and durable fences. All entry points share exact-identity `CapabilityDispatcher`, final middleware arguments/claims, worker Prepare/authorize/Execute, and live operation routes. Never detour through a model or fabricate a session for external `capability__*` calls. Those authenticated sessionless calls have full access over enabled capabilities, not a code grant or sandbox/upstream-auth bypass.
+
+Private pending interactions and grants belong to `InteractionBroker`/`ServerPermissionPolicy`, not metadata, journal, or timeline. Responses bind session/generation/request/operation and resume the original live future. Cancel/drop removes pending state; observer release does not decide work. Restart discards requests/grants without replay. URL consent is not navigation or completion. Ordinary admitted MCP create/send prompts survive later token expiry; explicit Routine/helper/code leases remain separate.
+
 Server code should coordinate shared state without taking ownership of client-side UI state or reducer behavior.
+
+Keep public session revision CAS and strict Routine/context metadata/mask predicates separate from execution-token append checks. Adopt coherent append receipts before publication; preserve concurrent titles and current idle Apps admission checks. Actual settings/definition changes invalidate execution, never hot-swap live policy. Each session store requires one coordinated writer version; no automatic retained-state reset applies. See [session storage](../../docs/agent/storage.md#revision-domains-and-append-receipts) and [cutover](../../docs/runbooks/server-capability-cutover.md#session-revision-cutover).
 
 Keep container assets separate from MCP-served app assets. `apps-assets` selects `apps-host-assets` and `apps-served-assets`; defaults and `web` retain that umbrella.
 For served assets, run `pnpm --filter @rfhold/waltr-server build` for the explicit `scripts/apps.entries` list.
@@ -111,20 +127,34 @@ Embedded desktop and Android always start the process-local duplex worker using 
 
 Bind the host-owned self-MCP credential to the exact initialized resource URL. If the persisted resource is edited to another endpoint, never send the generation bearer there.
 
+For access-disabled non-hosted standalone self-MCP, keep the private transport separate from the public router and embedded callback credentials. Require the initialized logical self target, a generation bearer, proxy bypass, no redirects, and opt-in generic endpoint redaction. Keep resource YAML and durable OAuth credentials unchanged.
+
+Trusted standalone composition enables shared anonymous public MCP admission only with access auth disabled, no hosted OAuth, and no embedded local admission. Bare MCP construction remains fail-closed for capabilities and prompt admission. Represent anonymous access as `AnonymousDisabled`, never validated process identity. Preserve normal enabled-capability policy and operation ownership; no-auth grants no optional code/helper/media authority. Private self-MCP still requires its exact generation bearer.
+
 Keep Pyroscope behind the optional `profiling` feature, which remains enabled by default. The standalone binary must also compile and run without `profiling`; embedded consumers use `default-features = false`.
 
-Server shutdown must call the session host shutdown path. `SessionCoordinator::shutdown` rejects new work, cancels active and queued work, waits for run ownership to drain, atomically drains MCP preparation/cache state under its lifecycle gate, and awaits every cached `McpClientRuntime::shutdown`. Do not add a stronger termination bound than the MCP shutdown contract provides.
+Server shutdown must drain generic session run ownership and retire the server host runtime registry/private policy, awaiting cached MCP client shutdown and stdio child reaping. Do not put MCP lifecycle ownership back in the generic coordinator or promise a stronger termination bound than the MCP shutdown contract.
 
 Waltr and MCP use independent pools and standard embedded SQLx migrators. SQLite requires separate ownership files; PostgreSQL migration histories live under the `waltr` and `mcp` schemas. Waltr owns outbound OAuth attempts/credentials; MCP owns hosted clients, grants, tokens, authorization leases, and encrypted signing keys.
 
-`spec.sourceSession.snapshot` supports manual raw capture. `spec.sourceSession.pause` supports manual admission and `sessionLifecycle.runCompleted` admission through an exclusive agent-owned pause; it captures mask-effective completed context at a pinned cursor. Manual admission rejects busy sources before durable admission. Lifecycle admission atomically claims the completion barrier and transfers pause ownership only after durable admission. Other event-triggered Routines cannot request source capture. Request IDs provide correlation only; do not add retry or deduplication semantics implicitly. Durable admission and lifecycle state belong to Waltr SQL.
+Reviewed JS capture APIs distinguish raw completed history from mask-effective paused capture. Manual pause rejects busy sources before admission; lifecycle admission claims the generic completion barrier and transfers owned pause authority after durable admission. Request IDs are correlation, not implicit retry/deduplication. Durable JS admission and lifecycle belong to Waltr SQL; no task DSL remains.
 
-Every source-backed `sessionTemplate` atomically creates a durable helper with completed rollback-aware source history followed by its task prompt. Inference-only templates start with only their task prompt. Provider requests derive only from durable helper state, and ordinary session retention, delete, and wipe rules apply.
+Source-backed helpers use normal named agent bundles and durable rollback-aware completed history followed by the task prompt. Inference-only helpers start with the task prompt. Ordinary session retention/delete/wipe applies; JS supplies no replacement system prompt.
 
-The fork compact helper stores `<fork-direction>\n<exact direction>\n</fork-direction>` after copied history. Its replacement system prompt treats the entire user message as untrusted emphasis text. The ordinary destination stores only compaction plus the original direction, not source history.
+The fork helper stores `<fork-direction>\n<exact direction>\n</fork-direction>` after copied history. Its named agent's prompt treats that message as untrusted emphasis text. The destination stores compaction plus direction, not source history.
+
+Routine JavaScript owns category schemas, checkpoint keys, background excerpts, title/fork/compaction policy and media helper arguments. Keep context operations generic. Original history requires declared capability plus independent source authorization, never a Routine name or public metadata. Private approved manage-context evidence binds only its exact normal dispatch.
+
+Resources declare exact capture selections/contracts; declarations grant no helper tool permission. Preflight rejects definite capture denial before speech effects. Normal live Ask consent remains separate. Host authority supplies exact inference attachment capabilities and allowed synthesis choices, not hidden helper profiles.
+
+Persist and verify immutable payloads before SQL references. Keep owner/quota/state publication atomic and uncertainty non-replayable. Migration 0016 refuses populated incompatible Routine state; no converter, body fallback, automatic wipe or orphan collector exists. Embedded object roots remain explicit and outside the workspace. Preserve current namespaces unless exact deletion receives separate authorization.
 
 `SessionCreateRequest` atomically persists a Routine destination and its exact validated first prompt. Successful creation is the prompt-durability boundary. After cancellation or start failure, retain the destination and its ID.
 
 # Hints
 
 Use the server-modification skill when modifying this crate.
+Keep production JS composition on the shared Routine RPC service; do not restore the removed v1/task executor.
+Reuse one invocation service and shared attachment/blob registries across native and browser transports.
+Keep attachment credentials, binary grants, and reader credentials out of logs, `Debug`, and durable history.
+Authorize observation reads inside SQL before page limits or payload allocation.

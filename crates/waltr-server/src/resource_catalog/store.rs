@@ -1,6 +1,6 @@
 //! Canonical resource identity, persisted trees, and conflict-safe slot operations.
 
-use waltr_agent::{AgentDefinitionResourceKind, inspect_agent_definition_source};
+use crate::agent_host::{AgentDefinitionResourceKind, inspect_agent_definition_source};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -61,6 +61,47 @@ pub(super) fn validate_resource_source(
             message: format!("source exceeds {MAX_ROUTINE_SOURCE_BYTES} bytes"),
         });
     }
+    if expected_kind == ResourceKind::Routine {
+        let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).map_err(|source| {
+            AgentDefinitionLoadError::ResourceYaml {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+        if value
+            .get("apiVersion")
+            .and_then(serde_yaml_ng::Value::as_str)
+            != Some(crate::routine::definition::API_VERSION)
+        {
+            return Err(AgentDefinitionLoadError::InvalidResourceValue {
+                path: path.to_owned(),
+                message: "legacy Routine DSL requires offline conversion to waltr.routine/v1"
+                    .into(),
+            });
+        }
+        {
+            let envelope: crate::routine::definition::Envelope = serde_yaml_ng::from_value(value)
+                .map_err(|source| {
+                AgentDefinitionLoadError::ResourceYaml {
+                    path: path.to_owned(),
+                    source,
+                }
+            })?;
+            if envelope.kind != "Routine" || envelope.name != expected_name {
+                return Err(AgentDefinitionLoadError::ResourceIdentity {
+                    path: path.to_owned(),
+                    expected_kind,
+                    expected_name,
+                    actual_kind: ResourceKind::Routine,
+                    actual_name: envelope.name,
+                });
+            }
+            return Ok(ResourceKey {
+                kind: ResourceKind::Routine,
+                name: envelope.name,
+            });
+        }
+    }
     if matches!(
         expected_kind,
         ResourceKind::Provider
@@ -75,7 +116,7 @@ pub(super) fn validate_resource_source(
             }
         })?;
         let expected_kind_name = expected_kind.to_string();
-        if header.api_version != waltr_agent::AGENT_DEFINITION_API_VERSION
+        if header.api_version != crate::agent_host::AGENT_DEFINITION_API_VERSION
             || header.kind != expected_kind_name
         {
             return Err(AgentDefinitionLoadError::InvalidResourceValue {

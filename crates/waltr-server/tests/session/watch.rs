@@ -11,6 +11,7 @@ use waltr_server::test_support::{
 
 #[tokio::test]
 async fn session_service_watch_emits_created_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut watch_client = session_client(server).await?;
     let mut create_client = session_client(server).await?;
@@ -59,6 +60,7 @@ async fn session_service_watch_emits_created_sessions() -> Result<(), Box<dyn st
 
 #[tokio::test]
 async fn receives_deleted_session_event() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut watch_client = session_client(server).await?;
     let mut mutation_client = session_client(server).await?;
@@ -132,6 +134,7 @@ async fn receives_deleted_session_event() -> Result<(), Box<dyn std::error::Erro
 #[tokio::test]
 async fn multiple_watchers_receive_created_and_deleted_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut first_watch_client = session_client(server).await?;
     let mut second_watch_client = session_client(server).await?;
@@ -182,6 +185,7 @@ async fn multiple_watchers_receive_created_and_deleted_sessions()
 #[tokio::test]
 async fn session_service_watch_initial_snapshot_includes_existing_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut mutation_client = session_client(server).await?;
     let mut watch_client = session_client(server).await?;
@@ -206,6 +210,7 @@ async fn session_service_watch_initial_snapshot_includes_existing_sessions()
 #[tokio::test]
 async fn session_service_watch_emits_runtime_status_updates()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut watch_client = session_client(server).await?;
     let created = sessions
@@ -244,6 +249,7 @@ async fn session_service_watch_emits_runtime_status_updates()
 #[tokio::test]
 async fn session_service_watch_emits_one_cleared_event_for_wipe()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut watch_client = session_client(server).await?;
     let mut mutation_client = session_client(server).await?;
@@ -282,6 +288,7 @@ async fn session_service_watch_emits_one_cleared_event_for_wipe()
 #[tokio::test]
 async fn list_and_watch_sessions_project_pause_queue_and_release_coordination()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (sessions, session_id) = super::timeline::seeded_completed_session().await?;
     let server = setup_server_with_seeded_sessions(sessions.clone());
     let mut client = session_client(server).await?;

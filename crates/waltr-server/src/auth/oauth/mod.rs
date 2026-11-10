@@ -1,6 +1,15 @@
 use std::collections::BTreeMap;
 
+use crate::auth::{
+    McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod,
+    OAuthTokenSet,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use oauth2::Scope;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use tonic::Status;
+use uuid::Uuid;
 use waltr::grpc::waltr::{
     auth::v1::{AuthMethod, BeginAuthResponse},
     config::v1::{
@@ -8,15 +17,9 @@ use waltr::grpc::waltr::{
     },
 };
 use waltr_agent::{
-    McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod,
-    OAuthTokenSet, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
     SessionOAuthTokenRequestStyle,
 };
-use oauth2::Scope;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use tonic::Status;
-use uuid::Uuid;
 
 use super::{
     AuthTarget, OAuthCredential,

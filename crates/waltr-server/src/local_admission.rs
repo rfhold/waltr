@@ -1,15 +1,15 @@
 //! Process-generation local bearer admission and self-MCP credentials.
 
+use crate::auth::{
+    AuthTarget, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, OAuthCredential,
+    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
+    OAuthRefreshClaimResult, OAuthTokenSet,
+};
 use axum::{
     body::Body,
     extract::{Request, State},
     middleware::Next,
     response::{IntoResponse as _, Response},
-};
-use waltr_agent::{
-    AuthTarget, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, OAuthCredential,
-    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
-    OAuthRefreshClaimResult, OAuthTokenSet,
 };
 use std::{fmt, sync::Arc};
 
@@ -54,6 +54,10 @@ impl LocalBearer {
         self.0.as_bytes() == candidate
     }
 
+    pub(crate) fn secret(&self) -> &str {
+        &self.0
+    }
+
     pub(crate) fn credential(&self, resource: &str) -> OAuthCredential {
         OAuthCredential::mcp(
             OAuthTokenSet::bearer(self.0.to_string(), None, None),
@@ -95,8 +99,8 @@ impl fmt::Display for LocalBearerError {
 impl std::error::Error for LocalBearerError {}
 
 pub(crate) async fn require_local_protocol_bearer(
-    State(expected): State<LocalBearer>,
-    request: Request<Body>,
+    State((expected, origin)): State<(LocalBearer, ValidatedLocalOrigin)>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let protected = request.uri().path() == "/mcp" || request.uri().path().starts_with("/waltr.");
@@ -108,12 +112,17 @@ pub(crate) async fn require_local_protocol_bearer(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
         .is_some_and(|candidate| expected.matches(candidate));
-    if admitted {
+    if admitted && !origin.0.is_cancelled() {
+        request.extensions_mut().insert(origin);
         next.run(request).await
     } else {
         axum::http::StatusCode::UNAUTHORIZED.into_response()
     }
 }
+
+/// Installed only after exact process-generation bearer validation.
+#[derive(Clone)]
+pub(crate) struct ValidatedLocalOrigin(pub(crate) Arc<tokio_util::sync::CancellationToken>);
 
 pub(crate) struct LocalCredentialStore<S> {
     durable: Arc<S>,

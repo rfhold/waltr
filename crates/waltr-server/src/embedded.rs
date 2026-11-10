@@ -8,11 +8,10 @@ use crate::{
     catalog::{CatalogLoader, CatalogMaterializer},
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
-    resource_catalog::routine::InteractionLimits,
     resource_catalog::{AgentDefinitionState, provision_persisted_resource},
     session,
 };
-use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf};
+use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf, sync::Arc};
 
 const BUILT_IN_CATALOG: &str = include_str!("../resources/models-dev-defaults.json");
 
@@ -85,8 +84,8 @@ pub struct EmbeddedServerConfig {
     pub local_bearer: LocalBearer,
     /// Explicit provider/upstream-MCP outbound OAuth policy.
     pub outbound_policy: EmbeddedOutboundPolicy,
-    /// Finite interaction admission and transport bounds; use `InteractionLimits::default()` for defaults.
-    pub interaction_limits: InteractionLimits,
+    /// Explicit operator-selected Routine roles and profiles; defaults grant none.
+    pub routine_authority: crate::routine::production::RoutineAuthority,
 }
 
 impl fmt::Debug for EmbeddedServerConfig {
@@ -154,10 +153,27 @@ impl EmbeddedServer {
 pub async fn build_embedded_server(
     config: EmbeddedServerConfig,
 ) -> Result<EmbeddedServer, EmbeddedBuildError> {
-    crate::routine_interaction_service::RoutineInteractionService::validate_limits(
-        &config.interaction_limits,
-    )
-    .map_err(|_| EmbeddedBuildError::Application)?;
+    build_embedded_server_with_registration(config, |routes, input, root| {
+        session::add_storage_service(
+            routes,
+            session::SessionStorageConfig::Filesystem { root },
+            input,
+        )
+    })
+    .await
+}
+
+pub(crate) async fn build_embedded_server_with_registration<F>(
+    config: EmbeddedServerConfig,
+    register: F,
+) -> Result<EmbeddedServer, EmbeddedBuildError>
+where
+    F: FnOnce(
+        &mut tonic::service::RoutesBuilder,
+        session::SessionRegistrationInput,
+        PathBuf,
+    ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
+{
     validate_paths(&config)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -181,10 +197,18 @@ pub async fn build_embedded_server(
         &self_mcp_source,
     )
     .map_err(|_| EmbeddedBuildError::Resources)?;
-    let database =
-        DatabaseConfig::from_sqlite_paths(config.waltr_database_path, config.mcp_database_path)
-            .map_err(|_| EmbeddedBuildError::Persistence)?;
-    let persistence = Persistence::initialize(database)
+    let database = DatabaseConfig::from_sqlite_paths(
+        config.waltr_database_path.clone(),
+        config.mcp_database_path,
+    )
+    .map_err(|_| EmbeddedBuildError::Persistence)?;
+    let object_root = config.waltr_database_path.parent().ok_or(EmbeddedBuildError::Paths)?.join("routine-objects");
+    if crate::workspace_paths::overlaps(&config.workspace_root, &object_root).map_err(|_| EmbeddedBuildError::Paths)? {
+        return Err(EmbeddedBuildError::Paths);
+    }
+    let objects = Arc::new(crate::routine_objects::FilesystemObjects::new(object_root)
+        .map_err(|_| EmbeddedBuildError::Paths)?);
+    let persistence = Persistence::initialize_with_objects(database, objects)
         .await
         .map_err(|_| EmbeddedBuildError::Persistence)?;
     let mut catalog_loader = match config.catalog_source {
@@ -233,15 +257,16 @@ pub async fn build_embedded_server(
             }),
             workspace_root,
             sandbox_socket: None,
-            interaction_limits: config.interaction_limits,
+            routine_authority: config.routine_authority,
+            routine_private_parent: config
+                .waltr_database_path
+                .parent()
+                .ok_or(EmbeddedBuildError::Paths)?
+                .to_owned(),
         },
         move |routes, mut input| {
             input.trusted_mcp_oauth_origins = session_origins;
-            session::add_storage_service(
-                routes,
-                session::SessionStorageConfig::Filesystem { root: session_root },
-                input,
-            )
+            register(routes, input, session_root)
         },
     )
     .await

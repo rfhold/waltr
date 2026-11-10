@@ -3,6 +3,7 @@ use waltr_server::test_support::setup_server;
 
 #[tokio::test]
 async fn health_returns_ok() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
 
     let response = reqwest::get(server.url("/health")).await?;
@@ -16,6 +17,7 @@ async fn health_returns_ok() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn ready_checks_initialized_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
 
     let response = reqwest::get(server.url("/ready")).await?;

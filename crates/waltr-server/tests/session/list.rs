@@ -7,6 +7,7 @@ use waltr_server::test_support::setup_server;
 
 #[tokio::test]
 async fn session_service_list_returns_created_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let server = setup_server();
     let mut client = session_client(server).await?;
 
@@ -59,7 +60,6 @@ async fn session_service_list_returns_created_sessions() -> Result<(), Box<dyn s
             capabilities.prompt_disposition,
             SessionPromptDisposition::Immediate as i32
         );
-        assert!(!capabilities.can_respond_external_request);
         assert!(!capabilities.can_interrupt);
     }
 

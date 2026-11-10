@@ -70,27 +70,21 @@ impl fmt::Debug for S3SessionStorageConfig {
 
 impl S3SessionStorageConfig {
     pub(super) fn into_store(self) -> S3SessionStore {
-        let credentials = Credentials::new(
-            self.access_key_id,
-            self.secret_access_key,
-            None,
-            None,
-            "waltr-session-s3",
-        );
-        let sdk_config = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .endpoint_url(self.endpoint.to_string())
-            .region(Region::new(self.region))
-            .credentials_provider(credentials)
-            .force_path_style(self.force_path_style)
-            .build();
         S3SessionStore::new_with_write_mode(
-            Client::from_conf(sdk_config),
+            s3_client(self.endpoint.to_string(), self.region, self.access_key_id, self.secret_access_key, self.force_path_style),
             self.bucket,
             self.prefix,
             self.write_mode,
         )
     }
+}
+
+pub(crate) fn s3_client(endpoint: String, region: String, access_key: String, secret_key: String, force_path_style: bool) -> Client {
+    let credentials = Credentials::new(access_key, secret_key, None, None, "waltr-s3");
+    let config = aws_sdk_s3::Config::builder().behavior_version_latest()
+        .endpoint_url(endpoint).region(Region::new(region)).credentials_provider(credentials)
+        .force_path_style(force_path_style).build();
+    Client::from_conf(config)
 }
 
 impl SessionStorageConfig {

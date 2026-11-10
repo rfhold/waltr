@@ -13,9 +13,10 @@ const PROVIDER_OVERRIDE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Provider\
 
 #[tokio::test]
 async fn read_returns_complete_seven_kind_catalog() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let mut client = resource_client(setup_server()).await?;
     let catalog = get_catalog(&mut client).await?;
-    assert_eq!(catalog.resources.len(), 15);
+    assert_eq!(catalog.resources.len(), 34);
     assert_eq!(
         catalog
             .resources
@@ -34,6 +35,7 @@ async fn read_returns_complete_seven_kind_catalog() -> Result<(), Box<dyn std::e
 
 #[tokio::test]
 async fn replace_watch_and_reset_are_resource_native() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let mut client = resource_client(setup_server()).await?;
     let mut watch = client
         .watch_resource_catalog(WatchResourceCatalogRequest {})
@@ -107,6 +109,7 @@ async fn replace_watch_and_reset_are_resource_native() -> Result<(), Box<dyn std
 #[tokio::test]
 async fn routine_inspect_replace_watch_and_reset_restore_bundle()
 -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let mut client = resource_client(setup_server()).await?;
     let mut watch = client
         .watch_resource_catalog(WatchResourceCatalogRequest {})
@@ -170,6 +173,7 @@ async fn routine_inspect_replace_watch_and_reset_restore_bundle()
 
 #[tokio::test]
 async fn stale_etag_and_invalid_yaml_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let mut client = resource_client(setup_server()).await?;
     let stale = client
         .replace_resource(ReplaceResourceRequest {

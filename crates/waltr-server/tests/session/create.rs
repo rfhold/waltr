@@ -5,6 +5,7 @@ use waltr_server::test_support::setup_server_with_sessions;
 
 #[tokio::test]
 async fn session_service_create_returns_idle_session() -> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
     let (server, sessions) = setup_server_with_sessions();
     let mut client = session_client(server).await?;
 
@@ -31,6 +32,7 @@ async fn session_service_create_returns_idle_session() -> Result<(), Box<dyn std
         .record
         .agent_definition
         .expect("created session should preserve its agent definitions");
+    let bundle: waltr_server::agent_host::AgentDefinitionBundle = serde_json::from_value(bundle)?;
     assert_eq!(bundle.agent_name, "coding");
     assert_eq!(bundle.resolve()?.name, "coding");
 
