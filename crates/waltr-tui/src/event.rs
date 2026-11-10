@@ -19,6 +19,8 @@ pub enum AppEvent {
     Client(Box<ClientSnapshot>),
     /// Secret-free progress from the native Waltr login runtime.
     NativeLogin(NativeLoginEvent),
+    /// Bounded presentation from the private media owner.
+    Media(crate::media::MediaEvent),
 }
 
 impl AppEvent {
@@ -27,7 +29,11 @@ impl AppEvent {
     pub const fn timestamp(&self, fallback: Instant) -> Instant {
         match self {
             Self::Tick(now) => *now,
-            Self::Input(_) | Self::Stream(_) | Self::Client(_) | Self::NativeLogin(_) => fallback,
+            Self::Input(_)
+            | Self::Stream(_)
+            | Self::Client(_)
+            | Self::NativeLogin(_)
+            | Self::Media(_) => fallback,
         }
     }
 }

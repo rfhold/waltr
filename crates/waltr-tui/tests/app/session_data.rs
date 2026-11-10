@@ -165,6 +165,7 @@ fn opening_session_data_from_detail_releases_timeline_and_keeps_delete_binding_s
     assert_eq!(
         app.handle_event(&char_press('w'), now),
         AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseInteractions { session_id: "one".to_owned() },
             ClientCommand::ReleaseSessionTimelineWatchInterest {
                 session_id: "one".to_owned(),
             },
@@ -192,6 +193,7 @@ fn remote_clear_reconciles_open_detail_from_shared_snapshot() {
             now,
         ),
         AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseInteractions { session_id: "one".to_owned() },
             ClientCommand::ReleaseSessionTimelineWatchInterest {
                 session_id: "one".to_owned(),
             },

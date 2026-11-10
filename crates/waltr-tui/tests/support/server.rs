@@ -298,6 +298,7 @@ async fn apply_snapshot(stream: &mut ClientStateStream, app: &mut App, snapshot:
         AppAction::CopyAuthUrl(url) => panic!("unexpected auth URL copy: {url}"),
         AppAction::Continue => Vec::new(),
         AppAction::Exit => panic!("unexpected exit while applying snapshot"),
+        AppAction::Media(_) => panic!("media actions require the dedicated private broker fixture"),
     };
 
     for command in commands {
@@ -340,3 +341,7 @@ pub fn provider_view(name: &str) -> ProviderView {
 }
 
 pub async fn no_sleep(_: u64) {}
+pub fn isolated_application_test() -> bool {
+    let thread = std::thread::current();
+    waltr_server::test_support::isolated_process_test(thread.name().expect("named Cargo test"))
+}

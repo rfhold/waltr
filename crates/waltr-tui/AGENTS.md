@@ -22,6 +22,10 @@ Provider/upstream-MCP authorization uses shared attempt state. Keep its copyable
 
 # Hints
 
+Routine catalog and forms consume exact v2 definitions and entrypoints. JSON parameter drafts preserve input bytes; schemas own admission rules. Global and source-session history use keyed selected-page requests, not the recent watch window as pagination. Release receipts with both their operation key and request identity.
+
+The private [media broker](src/media.rs) owns finite trusted local inputs, live output grants, SHA-256/length checks, separate durable text readers, and no-overwrite staged saves. Keep grants, credentials, local selections, and text out of Debug output. Route ownership and credential generations fence local effects; never retry ambiguous uploads or renew a binary read deadline. Do not claim capture, playback, or bitmap decoding. See [README.md](README.md) for controls and generated-v2 native TCP fixtures.
+
 Use the tui-modification skill when modifying this crate.
 
 Compare [../waltr-web/](../waltr-web/) behavior when changing shared user-facing flows.

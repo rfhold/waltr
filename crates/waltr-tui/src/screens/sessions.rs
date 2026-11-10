@@ -1,7 +1,7 @@
 //! Session list/detail surface: state, input, and rendering.
 
 mod agent_selector;
-mod command_palette;
+pub(crate) mod command_palette;
 mod composer;
 mod context;
 mod inference_editor;
@@ -11,12 +11,6 @@ mod timeline;
 
 use std::collections::BTreeSet;
 
-use waltr_client::{
-    AuthenticationFailureSnapshot, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
-    ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection,
-    InferenceSettingsMatchView, SessionProgressPhaseView, SessionPromptDispositionView,
-    SessionRunStageView, SessionTemplateSearchSnapshot, SessionTimelineView, SessionView,
-};
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -25,7 +19,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Padding, Paragraph, Wrap},
 };
-use serde_json::{Value, json};
+use waltr_client::{
+    AuthenticationFailureSnapshot, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
+    ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection,
+    InferenceSettingsMatchView, SessionProgressPhaseView, SessionPromptDispositionView,
+    SessionRunStageView, SessionTemplateSearchSnapshot, SessionTimelineView, SessionView,
+};
 
 use crate::{
     screens::{OperationResult, OperationTracker, SectionAction},
@@ -43,7 +42,7 @@ use self::{
     context::render_session_context,
     inference_editor::{InferenceEditor, render_inference_editor},
     prompts::{
-        ExternalPromptModel, PromptDraft, current_external_prompt, prompt_height, render_prompt,
+        InteractionPromptModel, PromptDraft, current_interaction_prompt, prompt_height, render_prompt,
     },
     timeline::{
         TimelineClickTarget, latest_context_tokens, shell_tool_at_row, timeline_channels,
@@ -70,9 +69,7 @@ const DETAIL_CONTEXT_NARROW_MAX_HEIGHT: u16 = 6;
 const DETAIL_SCROLL_WHEEL_LINES: usize = 3;
 const DETAIL_SCROLL_PAGE_LINES: usize = 12;
 const RESOURCE_SEARCH_LIMIT: u32 = 12;
-const PERMISSION_REQUEST_KIND: i32 = 1;
-const QUESTION_REQUEST_KIND: i32 = 2;
-const TIMELINE_CHANNELS: [&str; 9] = [
+const TIMELINE_CHANNELS: [&str; 8] = [
     "user_text",
     "assistant_text",
     "thinking",
@@ -80,7 +77,6 @@ const TIMELINE_CHANNELS: [&str; 9] = [
     "tool_progress_info",
     "tool_progress_error",
     "tool_result",
-    "external_request",
     "metrics",
 ];
 
@@ -104,7 +100,6 @@ pub struct SessionsSection {
     inference_settings_update: OperationTracker,
     agent_update: OperationTracker,
     submit: OperationTracker,
-    respond: OperationTracker,
     interrupt: OperationTracker,
     rollback: OperationTracker,
     continue_session: OperationTracker,
@@ -146,7 +141,6 @@ struct RollbackModal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RollbackModalTarget {
     UserMessage { cursor: u64, text: String },
-    ExternalRequest { cursor: u64, label: String },
     Turn { turn: u64 },
 }
 
@@ -154,7 +148,6 @@ enum RollbackModalTarget {
 enum RollbackModalAction {
     Rerun,
     Edit,
-    ReAnswer,
     RollBack,
     Continue,
     Cancel,
@@ -165,9 +158,6 @@ impl RollbackModal {
         let target = match target {
             TimelineClickTarget::UserMessage { cursor, text } => {
                 RollbackModalTarget::UserMessage { cursor, text }
-            }
-            TimelineClickTarget::ExternalRequest { cursor, label } => {
-                RollbackModalTarget::ExternalRequest { cursor, label }
             }
             TimelineClickTarget::Turn { turn } => RollbackModalTarget::Turn { turn },
         };
@@ -185,9 +175,6 @@ fn rollback_modal_actions(target: &RollbackModalTarget) -> Vec<RollbackModalActi
             RollbackModalAction::Edit,
             RollbackModalAction::Cancel,
         ],
-        RollbackModalTarget::ExternalRequest { .. } => {
-            vec![RollbackModalAction::ReAnswer, RollbackModalAction::Cancel]
-        }
         RollbackModalTarget::Turn { .. } => vec![
             RollbackModalAction::RollBack,
             RollbackModalAction::Continue,
@@ -240,7 +227,6 @@ impl SessionsSection {
             inference_settings_update: OperationTracker::new(),
             agent_update: OperationTracker::new(),
             submit: OperationTracker::new(),
-            respond: OperationTracker::new(),
             interrupt: OperationTracker::new(),
             rollback: OperationTracker::new(),
             continue_session: OperationTracker::new(),
@@ -290,7 +276,17 @@ impl SessionsSection {
     ) -> Option<SessionDetailFooterStatus> {
         let session = self.current_detail_session(snapshot)?;
         let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(&session.id));
-        let prompt = current_respondable_external_prompt(snapshot, Some(session.id.as_str()));
+        let prompt = current_interaction_prompt(snapshot, Some(session.id.as_str()), &self.prompt_draft);
+
+        if let Some(interactions) = snapshot.and_then(|s| s.interactions.get(&session.id))
+            && (!interactions.connected || interactions.error.is_some())
+        {
+            return Some(SessionDetailFooterStatus {
+                text: interactions.error.clone().unwrap_or_else(|| "Connecting to server interactions; work continues.".into()),
+                error: interactions.error.is_some(),
+                interruptible: session.capabilities.can_interrupt,
+            });
+        }
 
         if let Some(status) = session_important_status(&session, timeline, prompt.as_ref()) {
             let error = timeline
@@ -306,6 +302,14 @@ impl SessionsSection {
             return Some(SessionDetailFooterStatus {
                 text: status,
                 error,
+                interruptible: session.capabilities.can_interrupt,
+            });
+        }
+
+        if prompt.is_some() {
+            return Some(SessionDetailFooterStatus {
+                text: if self.prompt_draft.composer_focused() { "Conversation focused; F6 returns to pending server interaction." } else { "Server interaction pending; F6 focuses conversation. Navigation does not cancel work." }.into(),
+                error: false,
                 interruptible: session.capabilities.can_interrupt,
             });
         }
@@ -454,31 +458,7 @@ impl SessionsSection {
             self.composer_cursor = 0;
         }
 
-        if let Some(Ok(_request_id)) = self.respond.reconcile(
-            &snapshot.sessions.respond_external_request,
-            snapshot,
-            |operation| match operation {
-                ClientOperationView::SessionRespondExternalRequest {
-                    status,
-                    error,
-                    request_id,
-                    authentication_failure,
-                    ..
-                } => Some(match *status {
-                    "ready" => OperationResult::Ready(request_id.clone()),
-                    "failed" => OperationResult::Failed(operation_failure_message(
-                        error.as_deref(),
-                        authentication_failure.as_ref(),
-                        "respond again",
-                        "external request response failed",
-                    )),
-                    _ => OperationResult::Pending,
-                }),
-                _ => None,
-            },
-        ) {
-            self.prompt_draft.clear();
-        }
+        self.prompt_draft.reconcile(snapshot, self.detail_session_id.as_deref());
 
         drop(
             self.interrupt
@@ -788,7 +768,11 @@ impl SessionsSection {
                     }
 
                     self.detail_session_id = Some(session.id.clone());
+                    if let Some(snapshot) = snapshot {
+                        self.prompt_draft.reconcile(snapshot, Some(&session.id));
+                    }
                     return SectionAction::ClientCommands(vec![
+                        ClientCommand::RetainInteractions { session_id: session.id.clone() },
                         register_timeline_watch_command(session.id.clone()),
                         ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
                             session_id: session.id.clone(),
@@ -867,7 +851,7 @@ impl SessionsSection {
             return self.handle_rollback_modal_key(key);
         }
 
-        if current_respondable_external_prompt(snapshot, self.detail_session_id()).is_some() {
+        if current_interaction_prompt(snapshot, self.detail_session_id(), &self.prompt_draft).is_some() {
             return self.handle_prompt_key(key, snapshot);
         }
 
@@ -1222,53 +1206,6 @@ impl SessionsSection {
         })
     }
 
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "callers construct response values for immediate command serialization"
-    )]
-    fn respond_external_request(
-        &mut self,
-        session_id: &str,
-        request_id: &str,
-        response: Value,
-    ) -> SectionAction {
-        self.respond.begin();
-        SectionAction::ClientCommand(ClientCommand::RespondExternalRequest {
-            session_id: session_id.to_owned(),
-            request_id: request_id.to_owned(),
-            response_json: response.to_string(),
-        })
-    }
-
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "callers construct denial values for immediate command serialization"
-    )]
-    fn deny_permission_and_interrupt(
-        &mut self,
-        session_id: &str,
-        request_id: &str,
-        message: Value,
-    ) -> SectionAction {
-        self.respond.begin();
-        self.interrupt.begin();
-        SectionAction::ClientCommands(vec![
-            ClientCommand::RespondExternalRequest {
-                session_id: session_id.to_owned(),
-                request_id: request_id.to_owned(),
-                response_json: json!({
-                    "decision": "deny",
-                    "message": message,
-                    "mode": "cancel_work"
-                })
-                .to_string(),
-            },
-            ClientCommand::InterruptSession {
-                session_id: session_id.to_owned(),
-            },
-        ])
-    }
-
     fn handle_rollback_modal_key(&mut self, key: KeyEvent) -> SectionAction {
         let Some(modal) = &mut self.rollback_modal else {
             return SectionAction::Continue;
@@ -1332,17 +1269,6 @@ impl SessionsSection {
                 self.clear_resource_autocomplete();
                 self.rollback_modal = None;
                 SectionAction::ClientCommand(ClientCommand::RollbackSessionBeforeCursor {
-                    session_id,
-                    cursor: *cursor,
-                })
-            }
-            (
-                RollbackModalTarget::ExternalRequest { cursor, .. },
-                RollbackModalAction::ReAnswer,
-            ) => {
-                self.rollback.begin();
-                self.rollback_modal = None;
-                SectionAction::ClientCommand(ClientCommand::RollbackSessionToCursor {
                     session_id,
                     cursor: *cursor,
                 })
@@ -1538,7 +1464,6 @@ impl SessionsSection {
             || self.inference_settings_update.is_pending()
             || self.agent_update.is_pending()
             || self.submit.is_pending()
-            || self.respond.is_pending()
             || self.interrupt.is_pending()
             || self.rollback.is_pending()
             || self.continue_session.is_pending()
@@ -1556,7 +1481,6 @@ impl SessionsSection {
         self.expanded_shell_tools.clear();
         self.prompt_draft.clear();
         self.submit.clear();
-        self.respond.clear();
         self.interrupt.clear();
         self.rollback.clear();
         self.continue_session.clear();
@@ -1579,7 +1503,7 @@ impl SessionsSection {
                 Constraint::Length(status_height(snapshot, self)),
             ])
             .areas(area);
-        let prompt = current_respondable_external_prompt(snapshot, Some(id));
+        let prompt = current_interaction_prompt(snapshot, Some(id), &self.prompt_draft);
         Some(self.detail_areas(main_area, prompt.as_ref()).timeline)
     }
 
@@ -1765,7 +1689,7 @@ impl SessionsSection {
         };
 
         let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
-        let prompt = current_respondable_external_prompt(snapshot, Some(id));
+        let prompt = current_interaction_prompt(snapshot, Some(id), &self.prompt_draft);
         let detail_areas = self.detail_areas(main_area, prompt.as_ref());
         let timeline_area = detail_areas.timeline;
         let response_area = detail_areas.response;
@@ -1780,8 +1704,8 @@ impl SessionsSection {
             timeline_area,
         );
 
-        if let Some(prompt) = &prompt {
-            render_prompt(frame, response_area, prompt, &self.prompt_draft);
+        if let Some(prompt) = &prompt && !self.prompt_draft.composer_focused() {
+            render_prompt(frame, response_area, prompt, &self.prompt_draft, snapshot);
         } else {
             render_composer(frame, response_area, self, snapshot, &session);
         }
@@ -1824,9 +1748,10 @@ impl SessionsSection {
 
     fn detail_response_height(
         &self,
-        prompt: Option<&ExternalPromptModel>,
+        prompt: Option<&InteractionPromptModel>,
         main_height: u16,
     ) -> u16 {
+        let prompt = prompt.filter(|_| !self.prompt_draft.composer_focused());
         let desired_height = prompt.map_or_else(
             || self.detail_composer_height(),
             |prompt| prompt_height(prompt, &self.prompt_draft),
@@ -1837,7 +1762,7 @@ impl SessionsSection {
         desired_height.min(max_height)
     }
 
-    fn detail_areas(&self, main_area: Rect, prompt: Option<&ExternalPromptModel>) -> DetailAreas {
+    fn detail_areas(&self, main_area: Rect, prompt: Option<&InteractionPromptModel>) -> DetailAreas {
         if main_area.width >= DETAIL_CONTEXT_WIDE_BREAKPOINT {
             let [left, _gap, context] = Layout::horizontal([
                 Constraint::Percentage(80),
@@ -2028,7 +1953,6 @@ fn rollback_modal_height(modal: &RollbackModal) -> u16 {
 const fn rollback_modal_title(target: &RollbackModalTarget) -> &'static str {
     match target {
         RollbackModalTarget::UserMessage { .. } => " Message actions ",
-        RollbackModalTarget::ExternalRequest { .. } => " Prompt actions ",
         RollbackModalTarget::Turn { .. } => " Turn actions ",
     }
 }
@@ -2055,10 +1979,6 @@ fn rollback_modal_summary_line(target: &RollbackModalTarget) -> Line<'static> {
             Span::styled("User message: ", THEME.panel_muted_style()),
             Span::styled(shorten_modal_text(text), THEME.text_style()),
         ]),
-        RollbackModalTarget::ExternalRequest { label, .. } => Line::from(vec![
-            Span::styled("Answered prompt: ", THEME.panel_muted_style()),
-            Span::styled(label.clone(), THEME.text_style()),
-        ]),
         RollbackModalTarget::Turn { turn } => Line::from(vec![
             Span::styled("Turn ", THEME.panel_muted_style()),
             Span::styled(turn.to_string(), THEME.text_style()),
@@ -2083,7 +2003,6 @@ const fn rollback_modal_action_label(action: RollbackModalAction) -> &'static st
     match action {
         RollbackModalAction::Rerun => "Rerun",
         RollbackModalAction::Edit => "Edit",
-        RollbackModalAction::ReAnswer => "Re-answer",
         RollbackModalAction::RollBack => "Roll back",
         RollbackModalAction::Continue => "Continue",
         RollbackModalAction::Cancel => "Cancel",
@@ -2452,7 +2371,6 @@ fn status_messages(snapshot: Option<&ClientSnapshot>, section: &SessionsSection)
         .or_else(|| section.inference_settings_update.error())
         .or_else(|| section.agent_update.error())
         .or_else(|| section.submit.error())
-        .or_else(|| section.respond.error())
         .or_else(|| section.interrupt.error())
         .or_else(|| section.rollback.error())
         .or_else(|| section.continue_session.error())
@@ -2580,7 +2498,7 @@ fn format_optional_timestamp(timestamp: Option<&waltr_client::TimestampView>) ->
 fn session_important_status(
     session: &SessionView,
     timeline: Option<&SessionTimelineView>,
-    prompt: Option<&ExternalPromptModel>,
+    prompt: Option<&InteractionPromptModel>,
 ) -> Option<String> {
     if let Some(error) = timeline.and_then(|timeline| {
         timeline
@@ -2669,9 +2587,6 @@ pub(super) fn progress_status(session: &SessionView) -> (String, StatusRole) {
         SessionProgressPhaseView::AwaitingToolResults => {
             ("awaiting tool results", StatusRole::Ready)
         }
-        SessionProgressPhaseView::AwaitingExternalInput => {
-            ("awaiting external input", StatusRole::Ready)
-        }
         SessionProgressPhaseView::Interrupted => ("interrupted", StatusRole::Error),
         SessionProgressPhaseView::Finished => ("finished", StatusRole::Ready),
         SessionProgressPhaseView::Failed => ("failed", StatusRole::Error),
@@ -2680,23 +2595,6 @@ pub(super) fn progress_status(session: &SessionView) -> (String, StatusRole) {
         }
     };
     (text.to_owned(), role)
-}
-
-fn current_respondable_external_prompt(
-    snapshot: Option<&ClientSnapshot>,
-    session_id: Option<&str>,
-) -> Option<ExternalPromptModel> {
-    let session_id = session_id?;
-    let snapshot = snapshot?;
-    let session = snapshot
-        .sessions
-        .current
-        .iter()
-        .find(|session| session.id == session_id)?;
-    if !session.capabilities.can_respond_external_request {
-        return None;
-    }
-    current_external_prompt(Some(snapshot), Some(session_id))
 }
 
 fn timeline_ready(snapshot: Option<&ClientSnapshot>, session_id: &str) -> bool {

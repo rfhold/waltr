@@ -1,12 +1,7 @@
-//! Read-only global Routine definitions, history, and invocation detail.
+//! Routine catalog, launch forms, selected history, and durable operation detail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use waltr_client::{
-    ClientCommand, ClientManualRoutineDefinition, ClientRoutineInvocationDetail,
-    ClientRoutineInvocationSummary, ClientRoutineTriggerKind, ClientRoutineValue, ClientSnapshot,
-    ROUTINE_SOURCE_SESSION_ID_METADATA_KEY,
-};
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent},
@@ -15,7 +10,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
+use waltr_client::{
+    ClientCommand, ClientManualRoutineDefinition, ClientRoutineInvocationDetail,
+    ClientRoutineInvocationSummary, ClientSnapshot, RoutineRequest, RoutineRequestState,
+    RoutineRequestStatus, RoutineRevision,
+};
 
+use crate::screens::sessions::command_palette::{PaletteAction, SessionCommandPalette};
 use crate::{screens::SectionAction, theme::THEME, ui};
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
@@ -44,9 +45,35 @@ pub struct RoutinesSection {
     history_index: usize,
     invocation_id: Option<String>,
     detail_line: usize,
+    page: Option<(String, String)>,
+    operations: Option<(String, String)>,
+    cancel: Option<(String, String)>,
+    palette: Option<SessionCommandPalette>,
+    source_session: Option<String>,
+    pub(crate) media: Option<crate::media::MediaEditor>,
 }
 
 impl RoutinesSection {
+    pub(crate) fn open_media(&mut self, text: bool, snapshot: Option<&ClientSnapshot>) {
+        self.media = if text {
+            self.invocation_id.as_ref().and_then(|id| {
+                snapshot?
+                    .routines
+                    .details
+                    .get(id)?
+                    .detail
+                    .as_ref()
+                    .map(|detail| {
+                        crate::media::MediaEditor::text(
+                            id.clone(),
+                            detail.summary.text_results.clone(),
+                        )
+                    })
+            })
+        } else {
+            Some(crate::media::MediaEditor::new(self.source_session.clone()))
+        };
+    }
     /// Create empty global Routine screen state.
     #[must_use]
     pub const fn new() -> Self {
@@ -58,18 +85,45 @@ impl RoutinesSection {
             history_index: 0,
             invocation_id: None,
             detail_line: 0,
+            page: None,
+            operations: None,
+            cancel: None,
+            palette: None,
+            source_session: None,
+            media: None,
         }
+    }
+
+    /// Initialize a global or source-session route without retaining old receipts.
+    pub fn begin_route(&mut self, source_session: Option<String>) -> Vec<ClientCommand> {
+        let mut commands = self.release_requests();
+        *self = Self::new();
+        self.source_session = source_session;
+        if let Some(session_id) = &self.source_session {
+            commands.push(
+                ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+                    session_id: session_id.clone(),
+                },
+            );
+            if let SectionAction::ClientCommands(page) = self.request_page(RoutineRevision(0)) {
+                commands.extend(page);
+            }
+        }
+        commands
     }
 
     /// Preserve identity selection across complete shared snapshot replacement.
     pub fn reconcile(&mut self, snapshot: &ClientSnapshot) {
+        if let Some(palette) = &mut self.palette {
+            palette.reconcile(snapshot);
+        }
         let definitions = &snapshot.routines.definitions.definitions;
         self.definition_index = self
             .definition_key
             .as_ref()
             .and_then(|(routine, trigger)| {
                 definitions.iter().position(|definition| {
-                    definition.routine_name == *routine && definition.trigger_name == *trigger
+                    definition.routine_name == *routine && definition.routine_revision == *trigger
                 })
             })
             .unwrap_or_else(|| {
@@ -79,11 +133,11 @@ impl RoutinesSection {
         self.definition_key = definitions.get(self.definition_index).map(|definition| {
             (
                 definition.routine_name.clone(),
-                definition.trigger_name.clone(),
+                definition.routine_revision.clone(),
             )
         });
 
-        let history = &snapshot.routines.history.recent;
+        let history = self.history(snapshot);
         let selected_history_index = self
             .invocation_id
             .as_ref()
@@ -103,9 +157,11 @@ impl RoutinesSection {
                 .map(|summary| summary.invocation_id.clone());
         }
         if self.view == RoutineView::Detail {
-            self.detail_line = self
-                .detail_line
-                .min(detail_line_count(snapshot, self.invocation_id.as_deref()).saturating_sub(1));
+            self.detail_line = self.detail_line.min(
+                detail_presentation(self, Some(snapshot))
+                    .len()
+                    .saturating_sub(1),
+            );
         }
     }
 
@@ -122,6 +178,9 @@ impl RoutinesSection {
 
     /// Return from invocation detail to the history list without changing watch ownership.
     pub fn dismiss_detail(&mut self, snapshot: Option<&ClientSnapshot>) -> bool {
+        if self.palette.is_some() {
+            return false;
+        }
         if self.view != RoutineView::Detail {
             return false;
         }
@@ -129,19 +188,45 @@ impl RoutinesSection {
         self.focus = RoutineFocus::History;
         self.detail_line = 0;
         self.invocation_id = snapshot
-            .and_then(|snapshot| snapshot.routines.history.recent.get(self.history_index))
+            .and_then(|snapshot| self.history(snapshot).get(self.history_index))
             .map(|summary| summary.invocation_id.clone());
         true
     }
 
-    /// Route input without adding any global launch action.
+    /// Route terminal navigation and exact manual launch input.
     pub fn handle_key(
         &mut self,
         key: KeyEvent,
         snapshot: Option<&ClientSnapshot>,
     ) -> SectionAction {
+        if let Some(snapshot) = snapshot {
+            self.reconcile(snapshot);
+        }
+        if let Some(palette) = &mut self.palette {
+            return match palette.handle_key(key, snapshot) {
+                PaletteAction::Handled(action) => action,
+                PaletteAction::Close(action) => {
+                    self.palette = None;
+                    action
+                }
+                PaletteAction::Navigate(id, action) => {
+                    self.palette = None;
+                    let mut commands = match action {
+                        SectionAction::ClientCommand(c) => vec![c],
+                        SectionAction::ClientCommands(c) => c,
+                        _ => vec![],
+                    };
+                    commands.extend(self.release_detail_requests());
+                    let detail = self.focus_invocation(id);
+                    commands.push(detail);
+                    SectionAction::ClientCommands(commands)
+                }
+            };
+        }
         if self.view == RoutineView::Detail {
             return match key.code {
+                KeyCode::Char('c') => self.request_cancel(),
+                KeyCode::Char('o') => self.load_operations(snapshot),
                 KeyCode::Enter => self.load_selected_detail(snapshot),
                 KeyCode::Up => {
                     self.detail_line = self.detail_line.saturating_sub(1);
@@ -165,7 +250,9 @@ impl RoutinesSection {
                 }
                 KeyCode::End => {
                     self.detail_line = snapshot.map_or(0, |snapshot| {
-                        detail_line_count(snapshot, self.invocation_id.as_deref()).saturating_sub(1)
+                        detail_presentation(self, Some(snapshot))
+                            .len()
+                            .saturating_sub(1)
                     });
                     SectionAction::Continue
                 }
@@ -173,14 +260,14 @@ impl RoutinesSection {
             };
         }
         match key.code {
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    RoutineFocus::Definitions => RoutineFocus::History,
-                    RoutineFocus::History => RoutineFocus::Definitions,
-                };
-                SectionAction::Continue
+            KeyCode::Char('n') => {
+                let (palette, action) =
+                    SessionCommandPalette::open_context(self.source_session.clone());
+                self.palette = Some(palette);
+                action
             }
-            KeyCode::BackTab => {
+            KeyCode::Char('r') => self.request_page(RoutineRevision(0)),
+            KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     RoutineFocus::Definitions => RoutineFocus::History,
                     RoutineFocus::History => RoutineFocus::Definitions,
@@ -215,13 +302,13 @@ impl RoutinesSection {
                 self.definition_key = definitions.get(self.definition_index).map(|definition| {
                     (
                         definition.routine_name.clone(),
-                        definition.trigger_name.clone(),
+                        definition.routine_revision.clone(),
                     )
                 });
                 SectionAction::Continue
             }
             RoutineFocus::History => {
-                let history = &snapshot.routines.history.recent;
+                let history = self.history(snapshot);
                 let previous = self.history_index;
                 self.history_index = move_index(self.history_index, history.len(), forward);
                 self.invocation_id = history
@@ -249,9 +336,7 @@ impl RoutinesSection {
     }
 
     fn move_detail(&mut self, snapshot: Option<&ClientSnapshot>, amount: usize) {
-        let last = snapshot.map_or(0, |snapshot| {
-            detail_line_count(snapshot, self.invocation_id.as_deref()).saturating_sub(1)
-        });
+        let last = detail_presentation(self, snapshot).len().saturating_sub(1);
         self.detail_line = self.detail_line.saturating_add(amount).min(last);
     }
 
@@ -274,29 +359,175 @@ impl RoutinesSection {
         })
     }
 
-    fn load_older(&self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
-        let Some(history) = snapshot.map(|snapshot| &snapshot.routines.history) else {
+    fn load_older(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        if self.page.is_none() {
+            return self.request_page(RoutineRevision(0));
+        }
+        let Some(receipt) = snapshot.and_then(|s| self.page_receipt(s)) else {
             return SectionAction::Continue;
         };
-        if history.older_page_token.is_none() || history.pagination.status == "loading" {
+        if receipt.status == RoutineRequestStatus::Expired
+            || receipt.status == RoutineRequestStatus::Failed
+        {
+            return self.request_page(RoutineRevision(0));
+        }
+        if receipt.status != RoutineRequestStatus::Ready {
             return SectionAction::Continue;
         }
-        SectionAction::ClientCommand(ClientCommand::LoadOlderRoutineInvocations {
-            request_id: next_request("routine-history"),
-            page_size: 50,
-        })
+        let Some(cursor) = receipt.next_cursor else {
+            return SectionAction::Continue;
+        };
+        self.request_page(cursor)
+    }
+
+    fn page_receipt<'a>(&self, snapshot: &'a ClientSnapshot) -> Option<&'a RoutineRequestState> {
+        let (key, id) = self.page.as_ref()?;
+        snapshot
+            .routines
+            .requests
+            .get(key)
+            .filter(|r| &r.request_id == id)
+    }
+
+    fn history<'a>(&self, snapshot: &'a ClientSnapshot) -> &'a [ClientRoutineInvocationSummary] {
+        if self.page.is_some() {
+            self.page_receipt(snapshot)
+                .map_or(&[], |r| r.selected_invocations.as_slice())
+        } else if let Some(session_id) = &self.source_session {
+            snapshot
+                .routines
+                .session_histories
+                .get(session_id)
+                .map_or(&[], |h| h.recent.as_slice())
+        } else {
+            &snapshot.routines.history.recent
+        }
+    }
+
+    fn request_page(&mut self, after_cursor: RoutineRevision) -> SectionAction {
+        let mut commands = Vec::new();
+        release(&mut self.page, &mut commands);
+        let key = next_request("history");
+        let id = next_request("page");
+        self.page = Some((key.clone(), id.clone()));
+        commands.push(ClientCommand::RoutineRequest {
+            operation_key: key,
+            request_id: id,
+            command: RoutineRequest::Invocations {
+                after_cursor,
+                limit: 50,
+                source_session: self.source_session.clone(),
+            },
+        });
+        SectionAction::ClientCommands(commands)
+    }
+
+    fn request_cancel(&mut self) -> SectionAction {
+        let Some(invocation_id) = self.invocation_id.clone() else {
+            return SectionAction::Continue;
+        };
+        let mut commands = vec![];
+        release(&mut self.cancel, &mut commands);
+        let key = next_request("cancel");
+        let id = next_request("cancel-request");
+        self.cancel = Some((key.clone(), id.clone()));
+        commands.push(ClientCommand::RoutineRequest {
+            operation_key: key,
+            request_id: id,
+            command: RoutineRequest::Cancel { invocation_id },
+        });
+        SectionAction::ClientCommands(commands)
+    }
+
+    fn load_operations(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let Some(detail) = snapshot
+            .and_then(|s| s.routines.details.get(self.invocation_id.as_ref()?))
+            .and_then(|d| d.detail.as_ref())
+        else {
+            return SectionAction::Continue;
+        };
+        let Some(after_cursor) = detail.next_operation_cursor else {
+            return SectionAction::Continue;
+        };
+        let mut commands = vec![];
+        release(&mut self.operations, &mut commands);
+        let key = next_request("operations");
+        let id = next_request("operations-request");
+        self.operations = Some((key.clone(), id.clone()));
+        commands.push(ClientCommand::RoutineRequest {
+            operation_key: key,
+            request_id: id,
+            command: RoutineRequest::Operations {
+                invocation_id: detail.summary.invocation_id.clone(),
+                after_cursor,
+                limit: 100,
+            },
+        });
+        SectionAction::ClientCommands(commands)
+    }
+
+    /// Release exact receipt identities when leaving this route.
+    pub fn release_requests(&mut self) -> Vec<ClientCommand> {
+        self.media = None;
+        let mut commands = vec![];
+        release(&mut self.page, &mut commands);
+        release(&mut self.operations, &mut commands);
+        release(&mut self.cancel, &mut commands);
+        if self.palette.take().is_some() {
+            commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
+        }
+        if let Some(session_id) = self.source_session.take() {
+            commands
+                .push(ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { session_id });
+        }
+        commands
+    }
+
+    /// Dispose invocation-specific receipts without releasing the history page.
+    pub fn release_detail_requests(&mut self) -> Vec<ClientCommand> {
+        let mut commands = vec![];
+        release(&mut self.operations, &mut commands);
+        release(&mut self.cancel, &mut commands);
+        commands
+    }
+
+    /// Whether the global parameter editor owns keyboard input.
+    #[must_use]
+    pub const fn editor_open(&self) -> bool {
+        self.palette.is_some() || self.media.is_some()
+    }
+
+    /// Clear the protected parameter draft without changing route watch ownership.
+    pub fn clear_editor(&mut self) -> bool {
+        self.palette.take().is_some()
     }
 }
 
-/// Draw the complete read-only global Routine screen.
+fn release(owner: &mut Option<(String, String)>, commands: &mut Vec<ClientCommand>) {
+    if let Some((operation_key, request_id)) = owner.take() {
+        commands.push(ClientCommand::ReleaseRoutineRequest {
+            operation_key,
+            request_id,
+        });
+    }
+}
+
+/// Draw the Routine catalog, selected history, and exact-revision launch form.
 pub fn draw_routines(
     frame: &mut Frame<'_>,
     area: Rect,
     section: &RoutinesSection,
     snapshot: Option<&ClientSnapshot>,
 ) {
+    if let Some(editor) = &section.media {
+        editor.draw(frame, area, snapshot);
+        return;
+    }
     if section.view == RoutineView::Detail {
         render_detail(frame, area, section, snapshot);
+        if let Some(palette) = &section.palette {
+            palette.render(frame, area, snapshot);
+        }
         return;
     }
 
@@ -305,7 +536,11 @@ pub fn draw_routines(
         Paragraph::new(Line::from(vec![
             Span::styled("Routines", THEME.accent_bold()),
             Span::styled(
-                "  read-only definitions and durable history",
+                if section.source_session.is_some() {
+                    "  session history · n new  m media  r first page  o next page"
+                } else {
+                    "  n manual  m media  r first page  o next page"
+                },
                 THEME.muted_text_style(),
             ),
         ])),
@@ -332,6 +567,9 @@ pub fn draw_routines(
 
     render_definitions(frame, definitions_area, section, snapshot);
     render_history(frame, history_area, section, snapshot);
+    if let Some(palette) = &section.palette {
+        palette.render(frame, area, snapshot);
+    }
 }
 
 fn render_definitions(
@@ -344,7 +582,7 @@ fn render_definitions(
     render_heading(
         frame,
         heading,
-        "Manual definitions",
+        "Routine catalog",
         section.focus == RoutineFocus::Definitions,
     );
     let mut lines = watch_lines(
@@ -355,7 +593,7 @@ fn render_definitions(
         if snapshot.routines.definitions.watch.status == "received"
             && snapshot.routines.definitions.definitions.is_empty()
         {
-            lines.push(ui::loading_line("No manual Routines."));
+            lines.push(ui::loading_line("No Routines."));
         }
         let prefix_lines = lines.len();
         for (index, definition) in snapshot.routines.definitions.definitions.iter().enumerate() {
@@ -387,7 +625,11 @@ fn render_history(
     render_heading(
         frame,
         heading,
-        "Recent invocations",
+        if section.page.is_some() {
+            "Selected invocations"
+        } else {
+            "Recent invocations"
+        },
         section.focus == RoutineFocus::History,
     );
     let mut lines = watch_lines(
@@ -396,21 +638,30 @@ fn render_history(
     );
     if let Some(snapshot) = snapshot {
         if snapshot.routines.history.watch.status == "received"
-            && snapshot.routines.history.recent.is_empty()
+            && section.page.is_none()
+            && section.history(snapshot).is_empty()
         {
             lines.push(ui::loading_line("No Routine invocations."));
         }
         let prefix_lines = lines.len();
-        for (index, invocation) in snapshot.routines.history.recent.iter().enumerate() {
+        for (index, invocation) in section.history(snapshot).iter().enumerate() {
             lines.extend(invocation_lines(invocation, index == section.history_index));
         }
-        if snapshot.routines.history.pagination.status == "loading" {
-            lines.push(ui::loading_line("Loading older invocations..."));
-        } else if let Some(error) = snapshot.routines.history.pagination.error.as_deref() {
-            lines.push(ui::error_line(&display_text(error)));
-            lines.push(ui::loading_line("o retry older history"));
-        } else if snapshot.routines.history.older_page_token.is_some() {
-            lines.push(ui::loading_line("o / End  load older"));
+        if let Some(receipt) = section.page_receipt(snapshot) {
+            lines.push(Line::raw(format!("Selected page: {:?}", receipt.status)));
+            if let Some(error) = &receipt.error {
+                lines.push(ui::error_line(error));
+            }
+            if receipt.status == RoutineRequestStatus::Expired {
+                lines.push(Line::raw("Page expired; r reloads from the first cursor."));
+            }
+            if receipt.next_cursor.is_some() {
+                lines.push(Line::raw("o / End next page"));
+            }
+        } else if section.page.is_some() {
+            lines.push(Line::raw("Selected page: awaiting matching receipt"));
+        } else {
+            lines.push(Line::raw("r / o browse authoritative pages"));
         }
         let selected_line = prefix_lines.saturating_add(section.history_index.saturating_mul(2));
         let scroll = selected_wrapped_scroll(&lines, selected_line, 2, inner);
@@ -436,23 +687,41 @@ fn render_detail(
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("Routine invocation", THEME.accent_bold()),
-                Span::styled("  read-only durable detail", THEME.muted_text_style()),
+                Span::styled("  durable operation detail", THEME.muted_text_style()),
             ]),
             Line::from(Span::styled(
-                "Esc back  Up/Down scroll  PgUp/PgDn page  Home/End",
+                "Esc back  c request cancellation  o more operations  Up/Down scroll",
                 THEME.muted_text_style(),
             )),
         ]),
         title,
     );
+    let lines = detail_presentation(section, snapshot);
+    let cursor = section.detail_line.min(lines.len().saturating_sub(1));
+    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+    let rendered_to_cursor = Paragraph::new(lines[..=cursor].to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width);
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(usize::from(inner.height));
+    let scroll = rendered_to_cursor
+        .saturating_sub(usize::from(inner.height))
+        .min(max_scroll)
+        .try_into()
+        .unwrap_or(u16::MAX);
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+}
+
+fn detail_presentation(
+    section: &RoutinesSection,
+    snapshot: Option<&ClientSnapshot>,
+) -> Vec<Line<'static>> {
     let Some(invocation_id) = section.invocation_id.as_deref() else {
-        frame.render_widget(
-            Paragraph::new(ui::loading_line("Select an invocation.")),
-            inner,
-        );
-        return;
+        return vec![ui::loading_line("Select an invocation.")];
     };
-    let lines = match snapshot.and_then(|snapshot| snapshot.routines.details.get(invocation_id)) {
+    let mut lines = match snapshot.and_then(|snapshot| snapshot.routines.details.get(invocation_id))
+    {
         Some(detail) if detail.status == "ready" => detail.detail.as_ref().map_or_else(
             || vec![ui::loading_line("Detail unavailable.")],
             detail_lines,
@@ -469,23 +738,37 @@ fn render_detail(
                 format!("id {}", display_text(invocation_id)),
                 THEME.muted_text_style(),
             )),
-            ui::loading_line("Enter load task detail"),
+            ui::loading_line("Enter load operation detail"),
         ],
     };
-    let cursor = section.detail_line.min(lines.len().saturating_sub(1));
-    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-    let rendered_to_cursor = Paragraph::new(lines[..=cursor].to_vec())
-        .wrap(Wrap { trim: false })
-        .line_count(inner.width);
-    let max_scroll = paragraph
-        .line_count(inner.width)
-        .saturating_sub(usize::from(inner.height));
-    let scroll = rendered_to_cursor
-        .saturating_sub(usize::from(inner.height))
-        .min(max_scroll)
-        .try_into()
-        .unwrap_or(u16::MAX);
-    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+    if let Some(receipt) = section.cancel.as_ref().and_then(|(key, id)| {
+        snapshot?
+            .routines
+            .requests
+            .get(key)
+            .filter(|r| &r.request_id == id)
+    }) {
+        lines.push(Line::raw(format!(
+            "Cancellation receipt: {:?}; reported status {:?} (history remains authoritative)",
+            receipt.status, receipt.cancellation_status
+        )));
+        if let Some(error) = &receipt.error {
+            lines.push(ui::error_line(error));
+        }
+    }
+    if let Some(receipt) = section.operations.as_ref().and_then(|(key, id)| {
+        snapshot?
+            .routines
+            .requests
+            .get(key)
+            .filter(|r| &r.request_id == id)
+    }) {
+        lines.push(Line::raw(format!("Operations page: {:?}", receipt.status)));
+        if let Some(error) = &receipt.error {
+            lines.push(ui::error_line(error));
+        }
+    }
+    lines
 }
 
 fn selected_wrapped_scroll(
@@ -509,13 +792,6 @@ fn selected_wrapped_scroll(
         .min(rendered_before)
         .try_into()
         .unwrap_or(u16::MAX)
-}
-
-fn detail_line_count(snapshot: &ClientSnapshot, invocation_id: Option<&str>) -> usize {
-    invocation_id
-        .and_then(|invocation_id| snapshot.routines.details.get(invocation_id))
-        .and_then(|detail| detail.detail.as_ref())
-        .map_or(1, |detail| detail_lines(detail).len())
 }
 
 fn section_areas(area: Rect) -> [Rect; 2] {
@@ -573,10 +849,20 @@ fn definition_lines(
         Line::from(vec![
             ui::selection_marker(selected),
             Span::raw(" "),
-            Span::styled(display_text(&definition.display_name), style),
+            Span::styled(display_text(&definition.routine_name), style),
         ]),
         Line::from(Span::styled(
-            format!("  {}", display_text(&definition.description)),
+            format!(
+                "  {} @ {}: {}",
+                display_text(&definition.description),
+                definition.routine_revision,
+                definition
+                    .entrypoints
+                    .iter()
+                    .map(|e| format!("{} {:?} {:?}", e.name, e.trigger, e.start_contexts))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             THEME.muted_text_style(),
         )),
     ]
@@ -586,10 +872,7 @@ fn invocation_lines(
     invocation: &ClientRoutineInvocationSummary,
     selected: bool,
 ) -> Vec<Line<'static>> {
-    let trigger = match invocation.trigger_kind {
-        ClientRoutineTriggerKind::Manual => "manual",
-        ClientRoutineTriggerKind::Event => "event",
-    };
+    let trigger = format!("{:?}", invocation.trigger_kind);
     let style = if selected {
         THEME.focus_style().add_modifier(Modifier::BOLD)
     } else {
@@ -603,7 +886,7 @@ fn invocation_lines(
             Span::styled(
                 format!(
                     "  {trigger}  {:?}  #{}",
-                    invocation.status, invocation.admission_sequence
+                    invocation.status, invocation.admission_sequence.0
                 ),
                 THEME.muted_text_style(),
             ),
@@ -617,10 +900,7 @@ fn invocation_lines(
 
 fn detail_lines(detail: &ClientRoutineInvocationDetail) -> Vec<Line<'static>> {
     let summary = &detail.summary;
-    let trigger = match summary.trigger_kind {
-        ClientRoutineTriggerKind::Manual => "manual",
-        ClientRoutineTriggerKind::Event => "event",
-    };
+    let trigger = format!("{:?}", summary.trigger_kind);
     let mut lines = vec![
         Line::from(vec![
             Span::styled(display_text(&summary.routine_name), THEME.accent_bold()),
@@ -634,70 +914,68 @@ fn detail_lines(detail: &ClientRoutineInvocationDetail) -> Vec<Line<'static>> {
             THEME.muted_text_style(),
         )),
         Line::from(Span::styled(
-            format!("admission sequence {}", summary.admission_sequence),
+            format!("admission sequence {}", summary.admission_sequence.0),
             THEME.muted_text_style(),
         )),
     ];
-    if let Some(session_id) = summary.metadata.get(ROUTINE_SOURCE_SESSION_ID_METADATA_KEY) {
+    if let Some(session_id) = &summary.source_session {
         lines.push(Line::from(Span::styled(
             format!("source session {}", display_text(session_id)),
             THEME.muted_text_style(),
         )));
     }
-    if let Some(cursor) = summary.source_cursor.as_deref() {
-        lines.push(Line::from(Span::styled(
-            format!("source cursor {}", display_text(cursor)),
-            THEME.muted_text_style(),
+    lines.push(Line::raw(format!(
+        "Pinned definition {} @ {} ({}, {})",
+        detail.pinned_definition.routine_name,
+        detail.pinned_definition.routine_revision,
+        detail.pinned_definition.api_version,
+        detail.pinned_definition.engine
+    )));
+    lines.push(Line::raw(format!(
+        "Parameters {}: {}",
+        detail.pinned_definition.parameters.schema_version,
+        detail.pinned_definition.parameters.schema_json.as_str()
+    )));
+    lines.push(Line::raw(format!(
+        "Result {}: {}",
+        detail.pinned_definition.result.schema_version,
+        detail.pinned_definition.result.schema_json.as_str()
+    )));
+    lines.push(Line::raw(""));
+    for operation in &detail.operations {
+        lines.push(Line::raw(format!(
+            "[{:?}] {} ({})",
+            operation.status, operation.name, operation.id
+        )));
+        if let Some(result) = &operation.result {
+            lines.push(Line::raw(format!("  result: {}", result.as_str())));
+        }
+    }
+    if detail.next_operation_cursor.is_some() {
+        lines.push(Line::raw("o loads more operations"));
+    }
+    if let Some(result) = &summary.result {
+        lines.push(Line::raw(format!("Business result: {}", result.as_str())));
+    }
+    for helper in &summary.helpers {
+        lines.push(Line::raw(format!(
+            "Helper {} / {} / {:?}",
+            helper.session_id, helper.definition_identity, helper.operation_id
         )));
     }
-    if let Some(error) = &summary.terminal_error {
-        lines.push(ui::error_line(&display_text(&error.message)));
+    for result in &summary.text_results {
+        lines.push(Line::raw(format!(
+            "Durable text {} ({}) {} UTF-8 bytes; not included in history",
+            result.name, result.id, result.utf8_bytes.0
+        )));
     }
-    lines.push(Line::raw(""));
-    for task in &detail.tasks {
-        lines.push(Line::from(vec![
-            Span::styled(format!("[{:?}] ", task.status), THEME.muted_text_style()),
-            Span::styled(display_text(&task.name), THEME.text_style()),
-            Span::styled(
-                format!("  {}", display_text(&task.r#type)),
-                THEME.muted_text_style(),
-            ),
-        ]));
-        if let Some(error) = &task.error {
-            lines.push(ui::error_line(&display_text(&error.message)));
-        }
-        for result in &task.results {
-            lines.push(result_line("  ", result));
-        }
-        for (name, session_id) in &task.session_references {
-            lines.push(Line::from(Span::styled(
-                format!("  {}: {}", display_text(name), display_text(session_id)),
-                THEME.muted_text_style(),
-            )));
-        }
-    }
-    if !detail.results.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("Results", THEME.accent_bold())));
-        for result in &detail.results {
-            lines.push(result_line("", result));
-        }
+    for result in &summary.binary_results {
+        lines.push(Line::raw(format!(
+            "Binary {} ({}, {} bytes, image {:?}); descriptor is not download authority",
+            result.display_name, result.content_type, result.bytes.0, result.image
+        )));
     }
     lines
-}
-
-fn result_line(prefix: &str, result: &waltr_client::ClientRoutineResult) -> Line<'static> {
-    let value = match &result.value {
-        ClientRoutineValue::String(value) => display_text(value),
-        ClientRoutineValue::Boolean(value) => value.to_string(),
-    };
-    Line::from(vec![
-        Span::styled(
-            format!("{prefix}{}: ", display_text(&result.name)),
-            THEME.muted_text_style(),
-        ),
-        Span::styled(value, THEME.text_style()),
-    ])
 }
 
 fn move_index(current: usize, len: usize, forward: bool) -> usize {

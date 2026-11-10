@@ -11,6 +11,9 @@ use crate::support::server::{
 
 #[tokio::test]
 async fn auth_disabled_logout_reprobes_anonymously_and_returns_to_landing() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();

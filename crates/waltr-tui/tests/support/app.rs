@@ -8,11 +8,13 @@
 
 use std::{collections::BTreeMap, time::Instant};
 
+use ratatui::{Terminal, backend::TestBackend};
+use serde_json::json;
 use waltr_client::{
     AccessSnapshot, AccessStatus, AuthSnapshot, AuthStatusSnapshot, AuthenticationFailureSnapshot,
     CatalogMatchSourceView, CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot,
     CatalogSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
-    ConfigSnapshot, ConfigView, ExternalRequestView, McpAuthorizationContextSnapshot,
+    ConfigSnapshot, ConfigView, McpAuthorizationContextSnapshot,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
     OperationSnapshot, ProjectedTimelineEntryView, ProviderKindView, ProviderView,
@@ -27,8 +29,6 @@ use waltr_tui::{
     app::{App, AppAction},
     event::AppEvent,
 };
-use ratatui::{Terminal, backend::TestBackend};
-use serde_json::json;
 
 #[allow(unused_imports)]
 pub(crate) use super::input::{
@@ -319,6 +319,7 @@ pub(crate) fn mask_replacement_entry(
 
 pub(crate) fn expected_register_timeline_command(session_id: &str) -> AppAction {
     AppAction::ClientCommands(vec![
+        ClientCommand::RetainInteractions { session_id: session_id.to_owned() },
         ClientCommand::RegisterSessionTimelineWatchInterest {
             session_id: session_id.to_owned(),
             after_cursor: None,
@@ -340,7 +341,6 @@ pub(crate) fn timeline_channels() -> Vec<String> {
         "tool_progress_info",
         "tool_progress_error",
         "tool_result",
-        "external_request",
         "metrics",
     ]
     .iter()
@@ -523,34 +523,6 @@ pub(crate) fn timeline_tool_result_event(
             error,
         },
         status: None,
-        metadata_json: "{}".to_owned(),
-    }
-}
-
-pub(crate) fn external_request_event(
-    cursor: u64,
-    session_id: &str,
-    item_id: &str,
-    request_id: &str,
-    kind: i32,
-    payload_json: &str,
-) -> TimelineEventView {
-    TimelineEventView {
-        cursor,
-        session_id: session_id.to_owned(),
-        turn: 1,
-        item_id: item_id.to_owned(),
-        parent_id: None,
-        kind: TimelineEventKindView::ExternalRequestOpened,
-        channel: Some("external_request".to_owned()),
-        content: TimelineContentView::ExternalRequest {
-            request: Some(ExternalRequestView {
-                id: request_id.to_owned(),
-                kind,
-                payload_json: payload_json.to_owned(),
-            }),
-        },
-        status: Some(TimelineStatusView::AwaitingExternalInput),
         metadata_json: "{}".to_owned(),
     }
 }
@@ -808,7 +780,6 @@ pub(crate) fn session_with_phase(
         },
         capabilities: SessionCapabilitiesView {
             prompt_disposition: SessionPromptDispositionView::Immediate,
-            can_respond_external_request: false,
             can_interrupt,
         },
         current_prompt: None,
@@ -822,7 +793,7 @@ pub(crate) fn session_with_phase(
     }
 }
 
-pub(crate) const fn ready_snapshot() -> ClientSnapshot {
+pub(crate) fn ready_snapshot() -> ClientSnapshot {
     ClientSnapshot {
         access: AccessSnapshot {
             status: AccessStatus::Authenticated,
@@ -961,11 +932,6 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 error: None,
                 key: None,
             },
-            respond_external_request: OperationSnapshot {
-                status: "idle",
-                error: None,
-                key: None,
-            },
             interrupt: OperationSnapshot {
                 status: "idle",
                 error: None,
@@ -989,8 +955,12 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
             timelines: BTreeMap::new(),
             template_searches: BTreeMap::new(),
         },
+        interactions: BTreeMap::new(),
         routines: RoutineSnapshot {
+            requests: BTreeMap::new(),
             definitions: RoutineDefinitionSnapshot {
+                limits: None,
+                supported_capabilities: Vec::new(),
                 watch: OperationSnapshot {
                     status: "idle",
                     error: None,
@@ -1000,6 +970,9 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 definitions: Vec::new(),
             },
             history: RoutineHistorySnapshot {
+                snapshot_high_water: None,
+                snapshot_complete: false,
+                operations: Vec::new(),
                 watch: OperationSnapshot {
                     status: "idle",
                     error: None,
@@ -1018,6 +991,7 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
             details: BTreeMap::new(),
             starts: BTreeMap::new(),
         },
+        apps: Default::default(),
     }
 }
 
@@ -1033,6 +1007,7 @@ pub(crate) fn login_required_snapshot(reason: &str) -> ClientSnapshot {
 pub(crate) fn loaded_config_snapshot() -> ClientSnapshot {
     let mut snapshot = ready_snapshot();
     snapshot.config.current = Some(ConfigView {
+        session_dictation: None,
         etag: "etag-1".to_owned(),
         providers: BTreeMap::from([(
             "anthropic".to_owned(),

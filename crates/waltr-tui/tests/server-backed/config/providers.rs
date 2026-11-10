@@ -19,6 +19,9 @@ use crate::support::{
     reason = "the test covers one complete provider lifecycle against a real server"
 )]
 async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();

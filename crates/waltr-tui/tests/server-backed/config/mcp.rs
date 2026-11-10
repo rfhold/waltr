@@ -1,17 +1,17 @@
 use std::time::Instant;
 
-use waltr_client::{ClientRuntime, McpServerTypeView, ModelTypeView};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use waltr_client::{ClientCommand, ClientRuntime, McpServerTypeView, ModelTypeView};
 use waltr_server::test_support::setup_server;
 use waltr_tui::{
     app::{App, AppAction},
     event::AppEvent,
     input::InputEvent,
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::support::{
     input::{
-        char_press, ctrl_x_press, delete_press, down_press, enter_press, right_press, tab_press,
+        char_press, ctrl_x_press, delete_press, enter_press, right_press, tab_press, up_press,
     },
     render::render_app,
     server::{
@@ -22,16 +22,21 @@ use crate::support::{
 
 #[tokio::test]
 async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
     drive_app_to_landing(&mut stream, &mut app).await;
     open_config_screen(&mut stream, &mut app).await;
-    next_snapshot_until(&mut stream, &mut app, |snapshot| {
+    let initial = next_snapshot_until(&mut stream, &mut app, |snapshot| {
         snapshot.config.watch.status == "received" && snapshot.config.current.is_some()
     })
     .await;
+    let original_servers = initial.config.current.as_ref().unwrap().mcp_servers.clone();
+    assert!(original_servers.contains_key("waltr"));
 
     let now = Instant::now();
 
@@ -76,34 +81,85 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
     insta::assert_snapshot!("config_mcp_saved_real_server", render_app(&app));
 
     // Select and edit the added server (still on the MCP tab).
-    assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&up_press(), now), AppAction::Continue);
+    assert_eq!(
+        created
+            .config
+            .current
+            .as_ref()
+            .unwrap()
+            .mcp_servers
+            .keys()
+            .nth(app.mcp_section().selected_server())
+            .map(String::as_str),
+        Some("remote")
+    );
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.mcp_section()
+            .config_form()
+            .unwrap()
+            .original_name
+            .as_deref(),
+        Some("remote")
+    );
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    for character in "edited".chars() {
+        assert_eq!(
+            app.handle_event(&char_press(character), now),
+            AppAction::Continue
+        );
+    }
     let action = app.handle_event(&enter_press(), now);
-    let edited = dispatch_app_command(&mut stream, &mut app, action).await;
     assert!(
+        matches!(&action, AppAction::ClientCommand(ClientCommand::UpdateMcpServer {
+        original_name, server, ..
+    }) if original_name == "remote" && server.url == "https://mcp.example/edited")
+    );
+    let edited = dispatch_app_command(&mut stream, &mut app, action).await;
+    let mut expected_servers = original_servers.clone();
+    let mut edited_remote = server_view.clone();
+    edited_remote.url = "https://mcp.example/edited".into();
+    expected_servers.insert("remote".into(), edited_remote);
+    assert_eq!(
+        edited.config.current.as_ref().unwrap().mcp_servers,
+        expected_servers
+    );
+
+    // Delete the selected server.
+    assert_eq!(app.handle_event(&up_press(), now), AppAction::Continue);
+    assert_eq!(
         edited
             .config
             .current
             .as_ref()
-            .is_some_and(|config| config.mcp_servers.contains_key("remote")),
-        "edited MCP server should remain persisted"
+            .unwrap()
+            .mcp_servers
+            .keys()
+            .nth(app.mcp_section().selected_server())
+            .map(String::as_str),
+        Some("remote")
     );
-
-    // Delete the selected server.
     assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
+    assert_eq!(app.mcp_section().delete_server(), Some("remote"));
     let action = app.handle_event(&enter_press(), now);
-    let deleted = dispatch_app_command(&mut stream, &mut app, action).await;
     assert!(
-        deleted.config.current.as_ref().is_some_and(|config| {
-            config.mcp_servers.contains_key("waltr") && !config.mcp_servers.contains_key("remote")
-        }),
-        "deleted MCP server should be removed from persisted config"
+        matches!(&action, AppAction::ClientCommand(ClientCommand::DeleteMcpServer { name }) if name == "remote")
+    );
+    let deleted = dispatch_app_command(&mut stream, &mut app, action).await;
+    assert_eq!(
+        deleted.config.current.as_ref().unwrap().mcp_servers,
+        original_servers
     );
 }
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn client_stream_manages_provider_models_via_update_provider_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();

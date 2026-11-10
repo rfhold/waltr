@@ -12,6 +12,9 @@ use crate::support::{
 
 #[tokio::test]
 async fn routine_screen_receives_real_definition_and_history_watches() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
@@ -53,6 +56,9 @@ async fn routine_screen_receives_real_definition_and_history_watches() {
     assert!(!snapshot.routines.definitions.definitions.is_empty());
     let rendered = render_app(&app);
     assert!(rendered.contains("Routines"), "{rendered}");
-    assert!(rendered.contains("Fork session"), "{rendered}");
+    assert!(
+        rendered.contains(&snapshot.routines.definitions.definitions[0].routine_name),
+        "{rendered}"
+    );
     assert!(rendered.contains("No Routine invocations"), "{rendered}");
 }

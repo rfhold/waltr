@@ -7,7 +7,7 @@ mod landing;
 mod operation;
 mod routines;
 mod session_data;
-mod sessions;
+pub(crate) mod sessions;
 mod splash;
 
 pub use access::draw_access;

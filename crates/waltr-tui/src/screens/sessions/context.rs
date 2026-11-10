@@ -1,15 +1,15 @@
 //! Read-only session associations and aggregate context rendering.
 
-use waltr_client::{
-    ClientRoutineInvocationStatus, ClientRoutineInvocationSummary, ClientSnapshot,
-    SessionProgressPhaseView, SessionRunStageView, SessionView,
-};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
+};
+use waltr_client::{
+    ClientRoutineInvocationStatus, ClientRoutineInvocationSummary, ClientSnapshot,
+    SessionProgressPhaseView, SessionRunStageView, SessionView,
 };
 
 use crate::theme::{StatusRole, THEME};
@@ -247,7 +247,6 @@ fn subtask_status(session: &SessionView) -> (String, Style) {
             Some(SessionRunStageView::Unknown) | None => "running",
         },
         SessionProgressPhaseView::AwaitingToolResults => "awaiting tool results",
-        SessionProgressPhaseView::AwaitingExternalInput => "awaiting external input",
         SessionProgressPhaseView::Interrupted => "interrupted",
         SessionProgressPhaseView::Finished => "finished",
         SessionProgressPhaseView::Failed => "failed",
@@ -257,8 +256,7 @@ fn subtask_status(session: &SessionView) -> (String, Style) {
     };
     let style = match session.progress.phase {
         SessionProgressPhaseView::Running
-        | SessionProgressPhaseView::AwaitingToolResults
-        | SessionProgressPhaseView::AwaitingExternalInput => THEME.status_style(StatusRole::Ready),
+        | SessionProgressPhaseView::AwaitingToolResults => THEME.status_style(StatusRole::Ready),
         SessionProgressPhaseView::Failed | SessionProgressPhaseView::Interrupted => {
             THEME.status_style(StatusRole::Error)
         }
@@ -295,6 +293,9 @@ fn routine_line(summary: &ClientRoutineInvocationSummary) -> Line<'static> {
         ClientRoutineInvocationStatus::Interrupted => {
             ("interrupted", THEME.status_style(StatusRole::Error))
         }
+        ClientRoutineInvocationStatus::Uncertain => {
+            ("uncertain", THEME.status_style(StatusRole::Error))
+        }
     };
     Line::from(vec![
         Span::styled("  •", style),
@@ -320,16 +321,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subtask_status_projects_exact_suspension_labels_and_semantic_colors() {
+    fn subtask_status_projects_exact_progress_labels_and_semantic_colors() {
         for (phase, label, color) in [
             (
                 SessionProgressPhaseView::AwaitingToolResults,
                 "awaiting tool results",
-                THEME.success(),
-            ),
-            (
-                SessionProgressPhaseView::AwaitingExternalInput,
-                "awaiting external input",
                 THEME.success(),
             ),
             (
@@ -343,7 +339,7 @@ mod tests {
                 THEME.muted_text(),
             ),
         ] {
-            let mut session = session(SessionPhaseView::Suspended);
+            let mut session = session(SessionPhaseView::RunningTool);
             session.progress.phase = phase;
             let (actual_label, style) = subtask_status(&session);
             assert_eq!(actual_label, label);
@@ -440,22 +436,25 @@ mod tests {
 
     fn summary(status: ClientRoutineInvocationStatus) -> ClientRoutineInvocationSummary {
         ClientRoutineInvocationSummary {
-            admission_sequence: 1,
+            version: 2,
+            admission_sequence: waltr_client::RoutineRevision(1),
             invocation_id: "invocation".to_owned(),
             routine_name: "routine".to_owned(),
             routine_revision: "revision".to_owned(),
             trigger_name: "manual".to_owned(),
             trigger_kind: waltr_client::ClientRoutineTriggerKind::Manual,
             correlation_id: "correlation".to_owned(),
-            metadata: Default::default(),
-            source_cursor: None,
+            ownership: waltr_client::RoutineOwnership::Detached,
+            snapshot: None,
+            source_session: None,
             status,
             admitted_at_ms: 1,
-            started_at_ms: None,
-            completed_at_ms: None,
             updated_at_ms: 1,
-            terminal_error: None,
-            latest_sequence: 1,
+            result: None,
+            text_results: Vec::new(),
+            binary_results: Vec::new(),
+            helpers: Vec::new(),
+            observation_revision: waltr_client::RoutineRevision(1),
         }
     }
 }

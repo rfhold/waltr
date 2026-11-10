@@ -8,6 +8,9 @@ use crate::support::server::{drive_app_to_landing, no_sleep, unused_addr};
 
 #[tokio::test]
 async fn client_stream_retries_until_delayed_real_server_is_ready() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let addr = unused_addr();
     let mut stream =
         ClientRuntime::for_endpoint(format!("http://{addr}")).into_state_stream(no_sleep);

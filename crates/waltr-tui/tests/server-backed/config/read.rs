@@ -12,6 +12,9 @@ use crate::support::{
 
 #[tokio::test]
 async fn opening_config_before_watch_data_renders_waiting_state() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();

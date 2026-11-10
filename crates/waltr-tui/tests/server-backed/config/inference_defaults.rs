@@ -25,6 +25,9 @@ use crate::support::{
 
 #[tokio::test]
 async fn inference_defaults_snapshot_and_save_use_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_inference_defaults_server().await;
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
@@ -64,6 +67,7 @@ async fn setup_inference_defaults_server() -> &'static TestServer {
     seed_configuration(
         server,
         Configuration {
+            session_dictation: None,
             etag: String::new(),
             providers: HashMap::from([(
                 "anthropic".to_owned(),

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use waltr_client::{
-    ClientCommand, ExternalRequestView, ProjectedTimelineEntryView, SessionTimelineView,
+    ClientCommand, ProjectedTimelineEntryView, SessionTimelineView,
     TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
     TimelineStatusView,
 };
@@ -23,7 +23,6 @@ use crate::{
 use super::{
     SHELL_OUTPUT_RECENT_LINE_COUNT, TIMELINE_CHANNELS, TIMELINE_PAGE_SIZE, TIMELINE_TEXT_PREFIX,
     format_compact_cost, format_count, panel_style,
-    prompts::external_request_kind_label,
     template_style::{has_template_markers, template_inline_spans},
 };
 
@@ -56,14 +55,6 @@ enum TimelineItemModel {
         task_progress: Option<TaskProgressModel>,
         state: ToolState,
     },
-    External {
-        item_id: String,
-        cursor: u64,
-        open_cursor: u64,
-        turn: u64,
-        request: Option<ExternalRequestView>,
-        resolved: bool,
-    },
     Metrics {
         text: String,
         turn: u64,
@@ -80,7 +71,6 @@ enum TimelineItemModel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TimelineClickTarget {
     UserMessage { cursor: u64, text: String },
-    ExternalRequest { cursor: u64, label: String },
     Turn { turn: u64 },
 }
 
@@ -223,25 +213,12 @@ pub(super) fn timeline_click_target_at_row(
             durable_actions: true,
             ..
         } => Some(TimelineClickTarget::UserMessage { cursor, text }),
-        TimelineItemModel::External {
-            open_cursor,
-            request,
-            resolved: true,
-            ..
-        } => Some(TimelineClickTarget::ExternalRequest {
-            cursor: open_cursor,
-            label: request.as_ref().map_or_else(
-                || "external request".to_owned(),
-                |request| external_request_kind_label(request.kind).to_owned(),
-            ),
-        }),
         TimelineItemModel::Text {
             durable_actions: false,
             ..
         } => None,
         TimelineItemModel::Text { turn, .. }
         | TimelineItemModel::Tool { turn, .. }
-        | TimelineItemModel::External { turn, .. }
         | TimelineItemModel::Metrics { turn, .. }
         | TimelineItemModel::Event { turn, .. } => Some(TimelineClickTarget::Turn { turn }),
     })
@@ -363,9 +340,7 @@ fn timeline_items(events: &[ProjectedTimelineEntryView]) -> Vec<TimelineItemMode
             Some("tool_progress_error") => {
                 append_tool_progress(&mut items, &tool_id_by_item_id, event, true);
             }
-            Some("external_request") => {
-                upsert_external_item(&mut items, event);
-            }
+
             Some("metrics") => {
                 if let Some(metrics) = metrics_line(event) {
                     items.push(TimelineItemModel::Metrics {
@@ -396,11 +371,8 @@ fn event_label(event: &TimelineEventView) -> &'static str {
         Some("tool_progress_info") => "tool info",
         Some("tool_progress_error") => "tool error",
         Some("tool_result") => "tool result",
-        Some("external_request") => "external",
         Some("metrics") => "metrics",
         _ => match event.kind {
-            TimelineEventKindView::ExternalRequestOpened => "external opened",
-            TimelineEventKindView::ExternalRequestResolved => "external resolved",
             TimelineEventKindView::SessionStatusChanged => "status",
             TimelineEventKindView::ContentDelta => "delta",
             TimelineEventKindView::ItemStarted => "started",
@@ -655,49 +627,6 @@ fn append_task_progress(
     true
 }
 
-fn upsert_external_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventView) {
-    let request = match &event.content {
-        TimelineContentView::ExternalRequest { request } => request.clone(),
-        _ => None,
-    };
-    let resolved = event.kind == TimelineEventKindView::ExternalRequestResolved
-        || event.status == Some(TimelineStatusView::Resolved);
-
-    if let Some(TimelineItemModel::External {
-        cursor,
-        open_cursor,
-        turn,
-        request: item_request,
-        resolved: item_resolved,
-        ..
-    }) = items.iter_mut().find(|item| {
-        matches!(
-            item,
-            TimelineItemModel::External { item_id, .. } if item_id == &event.item_id
-        )
-    }) {
-        *cursor = event.cursor;
-        *turn = event.turn;
-        if event.kind == TimelineEventKindView::ExternalRequestOpened {
-            *open_cursor = event.cursor;
-        }
-        if request.is_some() {
-            *item_request = request;
-        }
-        *item_resolved = *item_resolved || resolved;
-        return;
-    }
-
-    items.push(TimelineItemModel::External {
-        item_id: event.item_id.clone(),
-        cursor: event.cursor,
-        open_cursor: event.cursor,
-        turn: event.turn,
-        request,
-        resolved,
-    });
-}
-
 fn find_tool_item_mut<'a>(
     items: &'a mut [TimelineItemModel],
     id: &str,
@@ -750,20 +679,6 @@ fn append_timeline_item_lines(
             width,
             expanded_shell_tools,
         ),
-        TimelineItemModel::External {
-            request, resolved, ..
-        } => {
-            let label = request.as_ref().map_or("external request", |request| {
-                external_request_kind_label(request.kind)
-            });
-            let status = if resolved { "answered" } else { "pending" };
-            lines.push(Line::from(vec![
-                Span::styled("~ ", THEME.focus_style()),
-                Span::styled(label.to_owned(), THEME.text_style()),
-                Span::raw("  "),
-                Span::styled(status, THEME.muted_text_style()),
-            ]));
-        }
         TimelineItemModel::Metrics { text, .. } => lines.push(metrics_item_line(&text, width)),
         TimelineItemModel::Event {
             cursor: _,
@@ -1669,10 +1584,6 @@ fn event_text_content(content: &TimelineContentView) -> String {
             let prefix = if *error { "error" } else { "ok" };
             format!("{name} {id} {prefix}: {content}")
         }
-        TimelineContentView::ExternalRequest { request } => request.as_ref().map_or_else(
-            || "request pending".to_owned(),
-            |request| format!("request {} kind {}", request.id, request.kind),
-        ),
         TimelineContentView::ContentRef { content_id, bytes } => {
             format!("content {content_id} ({bytes} bytes)")
         }
@@ -1692,7 +1603,6 @@ const fn status_name(status: TimelineStatusView) -> &'static str {
         TimelineStatusView::RunningTool => "running tool",
         TimelineStatusView::Pending => "pending",
         TimelineStatusView::AwaitingToolResults => "awaiting tool results",
-        TimelineStatusView::AwaitingExternalInput => "awaiting external input",
         TimelineStatusView::Interrupted => "interrupted",
         TimelineStatusView::Resolved => "resolved",
         TimelineStatusView::Finished => "finished",

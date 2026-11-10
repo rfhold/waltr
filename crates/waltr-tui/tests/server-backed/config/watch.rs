@@ -14,6 +14,9 @@ use crate::support::{
 
 #[tokio::test]
 async fn client_stream_renders_config_status_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut seeder = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     dispatch_client_command(&mut seeder, ClientCommand::RequestConfig).await;

@@ -2,12 +2,12 @@
 
 use std::{env, io, process::Stdio, time::Duration};
 
+use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
 use waltr_client::{
     AccessAttemptId, NativeAccessAction, NativeAccessConfig, NativeAccessCoordinator,
     NativeAccessOutput, NativeAccessProgress, NativeCallbackPolicy, NativeCredentialProvider,
     NativeLoopbackPolicy,
 };
-use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
 
 use crate::{
     event::{AppEvent, NativeLoginEvent},
@@ -222,7 +222,7 @@ fn open_browser(url: &str) -> Option<tokio::process::Child> {
     process.spawn().ok()
 }
 
-async fn copy_to_clipboard(value: &str) -> bool {
+pub(crate) async fn copy_to_clipboard(value: &str) -> bool {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else if cfg!(target_os = "windows") {
@@ -236,6 +236,7 @@ async fn copy_to_clipboard(value: &str) -> bool {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
         else {
             continue;

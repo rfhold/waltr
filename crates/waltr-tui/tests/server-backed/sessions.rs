@@ -31,6 +31,9 @@ use crate::support::{
     reason = "the test covers one complete session lifecycle against a real server"
 )]
 async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
@@ -52,16 +55,46 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     let load_agents = app.handle_event(&char_press('s'), now);
     if !matches!(load_agents, AppAction::Continue) {
         drop(dispatch_app_command(&mut stream, &mut app, load_agents).await);
-        next_snapshot_until(&mut stream, &mut app, |snapshot| {
-            (snapshot.sessions.agents.load.status == "ready"
-                && !snapshot.sessions.agents.entries.is_empty())
-                || snapshot.sessions.agents.load.status == "failed"
-        })
-        .await;
+    }
+    let catalog = next_snapshot_until(&mut stream, &mut app, |snapshot| {
+        (snapshot.sessions.agents.load.status == "ready"
+            && !snapshot.sessions.agents.entries.is_empty())
+            || snapshot.sessions.agents.load.status == "failed"
+    })
+    .await;
+    assert_eq!(
+        catalog.sessions.agents.load.status, "ready",
+        "agent catalog should load: {:?}",
+        catalog.sessions.agents.load
+    );
+    let coding_index = catalog
+        .sessions
+        .agents
+        .entries
+        .iter()
+        .position(|agent| agent.name == "coding")
+        .expect("coding agent should be available");
+    for _ in &catalog.sessions.agents.entries {
+        assert_eq!(
+            app.handle_event(&crate::support::input::up_press(), now),
+            AppAction::Continue
+        );
+    }
+    for _ in 0..coding_index {
+        assert_eq!(
+            app.handle_event(&crate::support::input::down_press(), now),
+            AppAction::Continue
+        );
     }
     let selector = render_app(&app);
     assert!(selector.contains("Create session"));
     let create_action = app.handle_event(&enter_press(), now);
+    assert_eq!(
+        create_action,
+        AppAction::ClientCommand(waltr_client::ClientCommand::CreateSession {
+            agent_name: "coding".to_owned()
+        })
+    );
     let created = dispatch_app_command(&mut stream, &mut app, create_action).await;
     let create_key = created
         .sessions
@@ -88,6 +121,11 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
             .current
             .iter()
             .any(|session| session.id == session_id)
+            && snapshot
+                .sessions
+                .timelines
+                .get(&session_id)
+                .is_some_and(|timeline| timeline.watch.status == "received")
     })
     .await;
     let rendered = render_app(&app);
@@ -133,6 +171,9 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
 
 #[tokio::test]
 async fn session_data_screen_wipes_all_sessions_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
@@ -145,23 +186,91 @@ async fn session_data_screen_wipes_all_sessions_with_real_server() {
     .await;
 
     let now = Instant::now();
+    let mut created_ids = Vec::new();
     for _ in 0..2 {
         assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
         let load_agents = app.handle_event(&char_press('s'), now);
         if !matches!(load_agents, AppAction::Continue) {
             drop(dispatch_app_command(&mut stream, &mut app, load_agents).await);
         }
+        let catalog = next_snapshot_until(&mut stream, &mut app, |snapshot| {
+            (snapshot.sessions.agents.load.status == "ready"
+                && !snapshot.sessions.agents.entries.is_empty())
+                || snapshot.sessions.agents.load.status == "failed"
+        })
+        .await;
+        assert_eq!(
+            catalog.sessions.agents.load.status, "ready",
+            "agent catalog should load: {:?}",
+            catalog.sessions.agents.load
+        );
+        let coding_index = catalog
+            .sessions
+            .agents
+            .entries
+            .iter()
+            .position(|agent| agent.name == "coding")
+            .expect("coding agent should be available");
+        for _ in &catalog.sessions.agents.entries {
+            assert_eq!(
+                app.handle_event(&crate::support::input::up_press(), now),
+                AppAction::Continue
+            );
+        }
+        for _ in 0..coding_index {
+            assert_eq!(
+                app.handle_event(&crate::support::input::down_press(), now),
+                AppAction::Continue
+            );
+        }
         let create = app.handle_event(&enter_press(), now);
-        drop(dispatch_app_command(&mut stream, &mut app, create).await);
+        assert_eq!(
+            create,
+            AppAction::ClientCommand(waltr_client::ClientCommand::CreateSession {
+                agent_name: "coding".to_owned()
+            })
+        );
+        let created = dispatch_app_command(&mut stream, &mut app, create).await;
         let session_id = app
             .sessions_section()
             .detail_session_id()
             .expect("created session detail should be open")
             .to_owned();
+        assert!(!created_ids.contains(&session_id));
+        created_ids.push(session_id.clone());
+        let observed = if created_ids.iter().all(|id| {
+            created
+                .sessions
+                .current
+                .iter()
+                .any(|session| &session.id == id)
+        }) {
+            created
+        } else {
+            next_snapshot_until(&mut stream, &mut app, |snapshot| {
+                created_ids.iter().all(|id| {
+                    snapshot
+                        .sessions
+                        .current
+                        .iter()
+                        .any(|session| &session.id == id)
+                })
+            })
+            .await
+        };
+        assert_eq!(observed.sessions.watch.status, "received");
+        assert!(created_ids.iter().all(|id| {
+            observed
+                .sessions
+                .current
+                .iter()
+                .any(|session| &session.id == id)
+        }));
         let leave_detail = app.handle_event(&crate::support::input::escape_press(), now);
         assert_eq!(
             leave_detail,
             AppAction::ClientCommands(vec![
+                waltr_client::ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
                 waltr_client::ClientCommand::ReleaseSessionTimelineWatchInterest {
                     session_id: session_id.clone(),
                 },
@@ -190,6 +299,15 @@ async fn session_data_screen_wipes_all_sessions_with_real_server() {
             error: None,
         })
     ));
+    let wiped = if wiped.sessions.current.is_empty() {
+        wiped
+    } else {
+        next_snapshot_until(&mut stream, &mut app, |snapshot| {
+            snapshot.sessions.watch.status == "received" && snapshot.sessions.current.is_empty()
+        })
+        .await
+    };
+    assert_eq!(wiped.sessions.watch.status, "received");
     assert!(wiped.sessions.current.is_empty());
     assert_eq!(app.screen(), waltr_tui::app::AppScreen::SessionData);
     let rendered = render_app(&app);
@@ -218,6 +336,9 @@ fn normalize_session_render(rendered: &str, session_id: &str) -> String {
 
 #[tokio::test]
 async fn session_detail_updates_inference_settings_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_inference_configured_server().await;
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
@@ -260,15 +381,85 @@ async fn session_detail_updates_inference_settings_with_real_server() {
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     let open_provider = app.handle_event(&char_press('p'), now);
-    dispatch_app_command(&mut stream, &mut app, open_provider).await;
+    if !matches!(open_provider, AppAction::Continue) {
+        drop(dispatch_app_command(&mut stream, &mut app, open_provider).await);
+    }
+    if app
+        .client_snapshot()
+        .is_none_or(|snapshot| snapshot.config.load.status != "ready")
+    {
+        next_snapshot_until(&mut stream, &mut app, |snapshot| {
+            matches!(snapshot.config.load.status, "ready" | "failed")
+        })
+        .await;
+    }
+    let catalog = app
+        .client_snapshot()
+        .expect("config snapshot should be available");
+    assert_eq!(
+        catalog.config.load.status, "ready",
+        "model catalog should load: {:?}",
+        catalog.config.load
+    );
+    assert!(
+        catalog
+            .config
+            .current
+            .as_ref()
+            .expect("ready config should be available")
+            .providers
+            .get("openai")
+            .is_some_and(|provider| provider.models.contains_key("gpt4o"))
+    );
     let provider_editor = render_app(&app);
     assert!(provider_editor.contains("Inference settings"));
     assert!(provider_editor.contains("Search"));
     assert!(!provider_editor.contains("Ctrl-T"));
     assert!(!provider_editor.contains("Thinking"));
 
+    for character in "gpt4o".chars() {
+        assert_eq!(
+            app.handle_event(&char_press(character), now),
+            AppAction::Continue
+        );
+    }
     let provider_update = app.handle_event(&enter_press(), now);
+    assert_eq!(
+        provider_update,
+        AppAction::ClientCommand(
+            waltr_client::ClientCommand::UpdateSessionInferenceSettings {
+                id: session_id.clone(),
+                provider_key: "openai".to_owned(),
+                model_id: "gpt4o".to_owned(),
+                reasoning_effort: None,
+            }
+        )
+    );
     let updated_provider = dispatch_app_command(&mut stream, &mut app, provider_update).await;
+    let update_key = updated_provider
+        .sessions
+        .inference_settings_update
+        .key
+        .as_ref()
+        .expect("inference update should expose operation key");
+    assert!(
+        matches!(updated_provider.operations.current.get(update_key), Some(ClientOperationView::SessionInferenceSettingsUpdate { status: "ready", error: None, session: Some(session) }) if session.id == session_id)
+    );
+    let updated_provider = next_snapshot_until(&mut stream, &mut app, |snapshot| {
+        snapshot
+            .sessions
+            .current
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.inference_settings.as_ref())
+            .and_then(|settings| settings.provider.as_ref())
+            .is_some_and(|provider| {
+                provider.key == "openai"
+                    && provider.model_id == "gpt4o"
+                    && provider.reasoning_effort.is_none()
+            })
+    })
+    .await;
     assert_inference_provider(&updated_provider, &session_id, "openai", "gpt4o", None);
 
     for expected_effort in ["low", "medium", "high"] {
@@ -310,6 +501,7 @@ async fn setup_inference_configured_server() -> &'static TestServer {
     seed_configuration(
         server,
         Configuration {
+            session_dictation: None,
             etag: String::new(),
             providers: HashMap::from([
                 ("openai".to_owned(), provider("openai", "gpt4o").into()),

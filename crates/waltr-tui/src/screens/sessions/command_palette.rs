@@ -1,722 +1,460 @@
-//! Dynamic terminal UI for session-scoped manual Routines.
+//! Exact-revision manual entrypoint selection and bounded JSON parameter editing.
 
-use std::{
-    collections::BTreeMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
-
-use waltr_client::{
-    ClientCommand, ClientManualRoutineDefinition, ClientRoutineInputDefinition, ClientRoutineValue,
-    ClientRoutineValueType, ClientSnapshot,
-};
+use crate::{screens::SectionAction, theme::THEME, ui};
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::Rect,
-    style::Modifier,
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use waltr_client::{
+    ClientCommand, ClientManualRoutineDefinition, ClientSnapshot, RoutineJson, RoutineSchema,
+};
 
-use crate::{screens::SectionAction, theme::THEME, ui};
+static NEXT: AtomicU64 = AtomicU64::new(1);
 
-const TITLE: &str = "Session commands";
-const GENERIC_FAILURE: &str = "Unable to run session command.";
-static NEXT_ROUTINE_OPERATION: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum PaletteMode {
-    #[default]
-    List,
-    Form,
-    Success,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Selection {
+    definition: ClientManualRoutineDefinition,
+    entrypoint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum InputValueDraft {
-    String { value: String, cursor: usize },
-    Boolean(bool),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InputDraft {
-    name: String,
-    value: InputValueDraft,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InvocationTracker {
-    operation_key: String,
-    request_id: String,
-    invocation_id: Option<String>,
+struct Tracker {
+    key: String,
+    request: String,
     pending: bool,
+    invocation: Option<String>,
 }
 
-/// Terminal-local interaction state for one open command palette.
+/// Terminal-only draft; authoritative admission remains in the shared client.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SessionCommandPalette {
-    source_session_id: String,
-    mode: PaletteMode,
+pub(crate) struct SessionCommandPalette {
+    source: Option<String>,
+    row: usize,
     search: String,
-    search_cursor: usize,
-    selected_row: usize,
-    selected_definition: Option<ClientManualRoutineDefinition>,
-    drafts: Vec<InputDraft>,
-    focused_control: usize,
-    field_errors: BTreeMap<String, String>,
-    general_error: Option<String>,
-    invocation: Option<InvocationTracker>,
+    selection: Option<Selection>,
+    json: String,
+    cursor: usize,
+    error: Option<String>,
+    tracker: Option<Tracker>,
 }
 
 impl SessionCommandPalette {
-    pub(super) fn open(source_session_id: String) -> (Self, SectionAction) {
+    pub(crate) fn open(source: String) -> (Self, SectionAction) {
+        Self::open_context(Some(source))
+    }
+
+    pub(crate) fn open_context(source: Option<String>) -> (Self, SectionAction) {
         (
             Self {
-                source_session_id,
-                mode: PaletteMode::List,
+                source,
+                row: 0,
                 search: String::new(),
-                search_cursor: 0,
-                selected_row: 0,
-                selected_definition: None,
-                drafts: Vec::new(),
-                focused_control: 0,
-                field_errors: BTreeMap::new(),
-                general_error: None,
-                invocation: None,
+                selection: None,
+                json: String::new(),
+                cursor: 0,
+                error: None,
+                tracker: None,
             },
-            SectionAction::ClientCommands(vec![
-                ClientCommand::RegisterRoutineDefinitionWatchInterest,
-            ]),
+            SectionAction::ClientCommand(ClientCommand::RegisterRoutineDefinitionWatchInterest),
         )
     }
 
-    pub(super) fn pending(&self) -> bool {
-        self.invocation
-            .as_ref()
-            .is_some_and(|tracker| tracker.pending)
+    pub(crate) fn pending(&self) -> bool {
+        self.tracker.as_ref().is_some_and(|t| t.pending)
     }
 
-    pub(super) fn release_action() -> SectionAction {
+    pub(crate) fn release_action() -> SectionAction {
         SectionAction::ClientCommand(ClientCommand::ReleaseRoutineDefinitionWatchInterest)
     }
 
-    pub(super) fn handle_key(
+    fn choices(&self, snapshot: Option<&ClientSnapshot>) -> Vec<Selection> {
+        let Some(snapshot) = snapshot else {
+            return vec![];
+        };
+        // A stale session selection is not authority to start a session entrypoint.
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|id| !snapshot.sessions.current.iter().any(|s| &s.id == id))
+        {
+            return vec![];
+        }
+        snapshot
+            .routines
+            .definitions
+            .definitions
+            .iter()
+            .flat_map(|definition| {
+                definition
+                    .entrypoints
+                    .iter()
+                    .filter(|e| definition.permits(&e.name, false, self.source.as_deref()))
+                    .map(|e| Selection {
+                        definition: definition.clone(),
+                        entrypoint: e.name.clone(),
+                    })
+            })
+            .filter(|s| {
+                format!(
+                    "{} {} {}",
+                    s.definition.routine_name, s.entrypoint, s.definition.description
+                )
+                .to_lowercase()
+                .contains(&self.search.to_lowercase())
+            })
+            .collect()
+    }
+
+    pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
         snapshot: Option<&ClientSnapshot>,
     ) -> PaletteAction {
         if self.pending() {
-            return PaletteAction::Handled(SectionAction::Continue);
+            return if key.code == KeyCode::Esc {
+                PaletteAction::Close(Self::release_action())
+            } else {
+                PaletteAction::Handled(SectionAction::Continue)
+            };
         }
-
-        match self.mode {
-            PaletteMode::List => self.handle_list_key(key, snapshot),
-            PaletteMode::Form => self.handle_form_key(key),
-            PaletteMode::Success => match key.code {
-                KeyCode::Enter => PaletteAction::Navigate(
-                    self.invocation
-                        .as_ref()
-                        .and_then(|tracker| tracker.invocation_id.clone())
-                        .expect("success mode has an accepted invocation"),
-                    Self::release_action(),
-                ),
+        if let Some(id) = self.tracker.as_ref().and_then(|t| t.invocation.clone()) {
+            return match key.code {
+                KeyCode::Enter => PaletteAction::Navigate(id, Self::release_action()),
                 KeyCode::Esc => PaletteAction::Close(Self::release_action()),
                 _ => PaletteAction::Handled(SectionAction::Continue),
-            },
+            };
         }
-    }
-
-    pub(super) fn reconcile(&mut self, snapshot: &ClientSnapshot) {
-        let Some(tracker) = self.invocation.as_mut().filter(|tracker| tracker.pending) else {
-            return;
-        };
-        let Some(start) = snapshot.routines.starts.get(&tracker.operation_key) else {
-            return;
-        };
-        if start.request_id != tracker.request_id
-            || start.source_session_id != self.source_session_id
-        {
-            return;
-        }
-
-        if start.status == "failed" {
-            tracker.pending = false;
-            self.mode = PaletteMode::Form;
-            self.field_errors.clear();
-            if let Some(failure) = &start.validation_failure {
-                let mut unmatched = Vec::new();
-                for violation in &failure.violations {
-                    if let Some(draft) = self.drafts.iter().find(|draft| {
-                        violation.field_path == draft.name
-                            || violation
-                                .field_path
-                                .strip_prefix("inputs.")
-                                .is_some_and(|name| name == draft.name)
-                    }) {
-                        self.field_errors
-                            .insert(draft.name.clone(), violation.message.clone());
-                    } else {
-                        unmatched.push(violation.message.clone());
+        if self.selection.is_none() {
+            let choices = self.choices(snapshot);
+            match key.code {
+                KeyCode::Esc => return PaletteAction::Close(Self::release_action()),
+                KeyCode::Up => self.row = self.row.saturating_sub(1),
+                KeyCode::Down => self.row = (self.row + 1).min(choices.len().saturating_sub(1)),
+                KeyCode::Enter => {
+                    if let Some(selection) = choices.get(self.row) {
+                        self.json =
+                            initial_json(&selection.definition.parameters.schema).to_string();
+                        self.cursor = self.json.len();
+                        self.selection = Some(selection.clone());
                     }
                 }
-                let general = std::iter::once(failure.message.clone())
-                    .chain(unmatched)
-                    .filter(|message| !message.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                self.general_error = (!general.is_empty()).then_some(general);
-            } else {
-                self.general_error = Some(start.error.as_deref().map_or_else(
-                    || GENERIC_FAILURE.to_owned(),
-                    |error| format!("{GENERIC_FAILURE} {}", display_text(error)),
-                ));
+                KeyCode::Backspace => {
+                    self.search.pop();
+                    self.row = 0;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.search.push(c);
+                    self.row = 0;
+                }
+                _ => {}
             }
-            return;
+        } else {
+            match key.code {
+                KeyCode::Esc => {
+                    self.selection = None;
+                    self.error = None;
+                    self.tracker = None;
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return PaletteAction::Handled(self.submit(snapshot));
+                }
+                KeyCode::Tab => return PaletteAction::Handled(self.submit(snapshot)),
+                KeyCode::Left => {
+                    if let Some((i, _)) = self.json[..self.cursor].char_indices().last() {
+                        self.cursor = i;
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(c) = self.json[self.cursor..].chars().next() {
+                        self.cursor += c.len_utf8();
+                    }
+                }
+                KeyCode::Home => self.cursor = 0,
+                KeyCode::End => self.cursor = self.json.len(),
+                KeyCode::Backspace => {
+                    if let Some((i, _)) = self.json[..self.cursor].char_indices().last() {
+                        self.json.drain(i..self.cursor);
+                        self.cursor = i;
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(c) = self.json[self.cursor..].chars().next() {
+                        self.json.drain(self.cursor..self.cursor + c.len_utf8());
+                    }
+                }
+                KeyCode::Enter => self.insert('\n'),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.insert(c)
+                }
+                _ => {}
+            }
         }
+        PaletteAction::Handled(SectionAction::Continue)
+    }
 
-        if start.status == "ready"
-            && let Some(invocation_id) = &start.invocation_id
-        {
-            tracker.invocation_id = Some(invocation_id.clone());
-            tracker.pending = false;
-            self.mode = PaletteMode::Success;
+    fn insert(&mut self, c: char) {
+        if self.json.len() + c.len_utf8() <= 65536 {
+            self.json.insert(self.cursor, c);
+            self.cursor += c.len_utf8();
+            self.error = None;
         }
     }
 
-    pub(super) fn render(
+    fn submit(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let Some(selection) = self.selection.clone() else {
+            return SectionAction::Continue;
+        };
+        if !self.choices(snapshot).contains(&selection) {
+            self.error = Some(
+                "Definition, entrypoint, revision, or session authorization changed. Select again."
+                    .into(),
+            );
+            return SectionAction::Continue;
+        }
+        let Ok(parameters) = RoutineJson::parse(self.json.clone()) else {
+            self.invalid_parameters();
+            return SectionAction::Continue;
+        };
+        if selection
+            .definition
+            .parameters
+            .validate(&parameters)
+            .is_err()
+        {
+            self.invalid_parameters();
+            return SectionAction::Continue;
+        }
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let key = format!("tui-start-{n}");
+        let request = format!("tui-start-request-{n}");
+        self.tracker = Some(Tracker {
+            key: key.clone(),
+            request: request.clone(),
+            pending: true,
+            invocation: None,
+        });
+        self.error = None;
+        SectionAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key: key,
+            request_id: request,
+            routine_name: selection.definition.routine_name,
+            routine_revision: selection.definition.routine_revision,
+            trigger_name: selection.entrypoint,
+            source_session_id: self.source.clone(),
+            inputs: parameters,
+        })
+    }
+
+    fn invalid_parameters(&mut self) {
+        self.error = Some("Parameters must match the displayed versioned schema (bounded JSON, no duplicate keys or unsafe numbers).".into());
+    }
+
+    pub(crate) fn reconcile(&mut self, snapshot: &ClientSnapshot) {
+        let Some(t) = self.tracker.as_mut().filter(|t| t.pending) else {
+            return;
+        };
+        let Some(start) = snapshot.routines.starts.get(&t.key) else {
+            return;
+        };
+        if start.request_id != t.request || start.source_session_id != self.source {
+            return;
+        }
+        if start.status == "failed" {
+            t.pending = false;
+            self.error = Some(start.validation_failure.as_ref().map_or_else(
+                || {
+                    start
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Admission failed.".into())
+                },
+                |f| {
+                    std::iter::once(f.message.clone())
+                        .chain(
+                            f.violations
+                                .iter()
+                                .map(|v| format!("{}: {}", v.field_path, v.message)),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+            ));
+        } else if start.status == "ready" && start.invocation_id.is_some() {
+            t.pending = false;
+            t.invocation.clone_from(&start.invocation_id);
+        }
+    }
+
+    pub(crate) fn render(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         snapshot: Option<&ClientSnapshot>,
     ) {
-        let modal_area = ui::centered_rect(area, area.width.min(76), area.height.min(22));
-        frame.render_widget(Clear, modal_area);
-        let body = ui::render_modal_frame(frame, modal_area, TITLE, self.footer());
-        let lines = match self.mode {
-            PaletteMode::List => self.list_lines(snapshot),
-            PaletteMode::Form => self.form_lines(),
-            PaletteMode::Success => self.success_lines(),
+        let modal = ui::centered_rect(area, area.width.min(100), area.height.min(30));
+        frame.render_widget(Clear, modal);
+        let body = ui::render_modal_frame(
+            frame,
+            modal,
+            if self.source.is_some() {
+                "Session commands"
+            } else {
+                "Global commands"
+            },
+            "JSON editor: Tab/Ctrl-Enter submit  Esc back",
+        );
+        let mut lines = vec![];
+        let mut cursor_line = None;
+        if let Some(id) = self.tracker.as_ref().and_then(|t| t.invocation.as_ref()) {
+            lines.push(Line::raw(format!("Command accepted: {id}")));
+            lines.push(Line::raw(
+                "Enter inspect; acceptance is not business success.",
+            ));
+        } else if let Some(s) = &self.selection {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} / {} @ {}",
+                    s.definition.routine_name, s.entrypoint, s.definition.routine_revision
+                ),
+                THEME.accent_bold(),
+            )));
+            lines.push(Line::raw(format!(
+                "{} schema: {}",
+                s.definition.parameters.schema_version,
+                s.definition.parameters.schema_json.as_str()
+            )));
+            lines.push(Line::raw(
+                "Parameters (exact JSON; file declarations are separate):",
+            ));
+            let prefix = &self.json[..self.cursor];
+            let suffix = &self.json[self.cursor..];
+            let mut edited = prefix
+                .split('\n')
+                .map(|s| Line::raw(s.to_owned()))
+                .collect::<Vec<_>>();
+            let mut rest = suffix.split('\n');
+            let tail = rest.next().unwrap_or_default();
+            let current = edited.last_mut().expect("split always yields one line");
+            let mut chars = tail.chars();
+            current.spans.push(Span::styled(
+                chars.next().map_or_else(|| " ".into(), |c| c.to_string()),
+                THEME.focus_style(),
+            ));
+            current.spans.push(Span::raw(chars.as_str().to_owned()));
+            cursor_line = Some(lines.len() + edited.len());
+            edited.extend(rest.map(|s| Line::raw(s.to_owned())));
+            lines.extend(edited);
+        } else {
+            lines.push(Line::raw(format!("Search: {}", self.search)));
+            for (i, s) in self.choices(snapshot).iter().enumerate() {
+                lines.push(Line::raw(format!(
+                    "{} {} / {} @ {}",
+                    if i == self.row { ">" } else { " " },
+                    s.definition.routine_name,
+                    s.entrypoint,
+                    s.definition.routine_revision
+                )));
+            }
+            if self.choices(snapshot).is_empty() {
+                lines.push(ui::loading_line(
+                    "No authorized manual entrypoints available.",
+                ));
+            }
+        }
+        if self.pending() {
+            lines.push(ui::loading_line("Awaiting admission..."));
+        }
+        if let Some(error) = &self.error {
+            lines.push(ui::error_line(error));
+        }
+        let visible_through = if self.error.is_some() || self.pending() {
+            lines.len()
+        } else {
+            cursor_line
+                .unwrap_or(self.row.saturating_add(2))
+                .min(lines.len())
         };
+        let scroll = Paragraph::new(lines[..visible_through].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(body.width)
+            .saturating_sub(usize::from(body.height))
+            .try_into()
+            .unwrap_or(u16::MAX);
         frame.render_widget(
             Paragraph::new(lines)
-                .style(THEME.panel_style())
-                .wrap(Wrap { trim: false }),
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
             body,
         );
     }
+}
 
-    fn handle_list_key(
-        &mut self,
-        key: KeyEvent,
-        snapshot: Option<&ClientSnapshot>,
-    ) -> PaletteAction {
-        let visible = self.filtered_definition_indices(snapshot);
-        match key.code {
-            KeyCode::Esc => PaletteAction::Close(Self::release_action()),
-            KeyCode::Up => {
-                self.selected_row = self.selected_row.saturating_sub(1);
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Down => {
-                self.selected_row = (self.selected_row + 1).min(visible.len().saturating_sub(1));
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Enter => {
-                if let Some(definition) = visible
-                    .get(self.selected_row)
-                    .and_then(|index| {
-                        self.available_definitions(snapshot)
-                            .and_then(|items| items.get(*index))
-                    })
-                    .cloned()
-                {
-                    self.select_definition(&definition);
-                }
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Left => {
-                move_cursor_left(&self.search, &mut self.search_cursor);
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Right => {
-                move_cursor_right(&self.search, &mut self.search_cursor);
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Home => {
-                self.search_cursor = 0;
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::End => {
-                self.search_cursor = self.search.len();
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Backspace => {
-                delete_before_cursor(&mut self.search, &mut self.search_cursor);
-                self.selected_row = 0;
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Delete => {
-                delete_at_cursor(&mut self.search, self.search_cursor);
-                self.selected_row = 0;
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                insert_at_cursor(&mut self.search, &mut self.search_cursor, character);
-                self.selected_row = 0;
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            _ => PaletteAction::Handled(SectionAction::Continue),
-        }
-    }
-
-    fn handle_form_key(&mut self, key: KeyEvent) -> PaletteAction {
-        let control_count = self.drafts.len() + 1;
-        match key.code {
-            KeyCode::Esc => {
-                self.return_to_list();
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Tab => {
-                self.focused_control = (self.focused_control + 1) % control_count;
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::BackTab => {
-                self.focused_control = self
-                    .focused_control
-                    .checked_sub(1)
-                    .unwrap_or(control_count - 1);
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Enter if self.focused_control == self.drafts.len() => {
-                PaletteAction::Handled(self.submit())
-            }
-            KeyCode::Enter => {
-                self.edit_focused_string('\n');
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Char(' ') => {
-                if let Some(InputDraft {
-                    name,
-                    value: InputValueDraft::Boolean(value),
-                }) = self.drafts.get_mut(self.focused_control)
-                {
-                    *value = !*value;
-                    self.field_errors.remove(name);
-                    self.general_error = None;
-                } else {
-                    self.edit_focused_string(' ');
-                }
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Left => {
-                if let Some(InputValueDraft::String { value, cursor }) = self
-                    .drafts
-                    .get_mut(self.focused_control)
-                    .map(|draft| &mut draft.value)
-                {
-                    move_cursor_left(value, cursor);
-                }
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Right => {
-                if let Some(InputValueDraft::String { value, cursor }) = self
-                    .drafts
-                    .get_mut(self.focused_control)
-                    .map(|draft| &mut draft.value)
-                {
-                    move_cursor_right(value, cursor);
-                }
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Home => {
-                if let Some(InputValueDraft::String { cursor, .. }) = self
-                    .drafts
-                    .get_mut(self.focused_control)
-                    .map(|draft| &mut draft.value)
-                {
-                    *cursor = 0;
-                }
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::End => {
-                if let Some(InputValueDraft::String { value, cursor }) = self
-                    .drafts
-                    .get_mut(self.focused_control)
-                    .map(|draft| &mut draft.value)
-                {
-                    *cursor = value.len();
-                }
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Backspace => {
-                self.edit_focused(delete_before_cursor);
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Delete => {
-                self.edit_focused(|value, cursor| delete_at_cursor(value, *cursor));
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.edit_focused_string(character);
-                PaletteAction::Handled(SectionAction::Continue)
-            }
-            _ => PaletteAction::Handled(SectionAction::Continue),
-        }
-    }
-
-    fn edit_focused_string(&mut self, character: char) {
-        self.edit_focused(|value, cursor| insert_at_cursor(value, cursor, character));
-    }
-
-    fn edit_focused(&mut self, edit: impl FnOnce(&mut String, &mut usize)) {
-        let Some(draft) = self.drafts.get_mut(self.focused_control) else {
-            return;
-        };
-        if let InputValueDraft::String { value, cursor } = &mut draft.value {
-            edit(value, cursor);
-            self.field_errors.remove(&draft.name);
-            self.general_error = None;
-        }
-    }
-
-    fn submit(&mut self) -> SectionAction {
-        let Some(definition) = self.selected_definition.clone() else {
-            self.general_error = Some(GENERIC_FAILURE.to_owned());
-            return SectionAction::Continue;
-        };
-        self.field_errors.clear();
-        self.general_error = None;
-        for input in &definition.inputs {
-            let Some(InputValueDraft::String { value, .. }) = self
-                .drafts
+pub(crate) fn initial_json(schema: &RoutineSchema) -> serde_json::Value {
+    use serde_json::Value;
+    match schema {
+        RoutineSchema::Null | RoutineSchema::Nullable { .. } => Value::Null,
+        RoutineSchema::Boolean => false.into(),
+        RoutineSchema::Number { min, .. } => Value::Number(min.clone()),
+        RoutineSchema::String { .. } => "".into(),
+        RoutineSchema::Array { .. } => Value::Array(vec![]),
+        RoutineSchema::Object {
+            properties,
+            required,
+        } => Value::Object(
+            required
                 .iter()
-                .find(|draft| draft.name == input.name)
-                .map(|draft| &draft.value)
-            else {
-                continue;
-            };
-            if input.required && value.trim().is_empty() {
-                self.field_errors
-                    .insert(input.name.clone(), "Required.".to_owned());
-            } else if let Some(minimum) = input.minimum_string_length
-                && u64::try_from(value.chars().count()).unwrap_or(u64::MAX) < minimum
-            {
-                self.field_errors.insert(
-                    input.name.clone(),
-                    format!("Must contain at least {minimum} characters."),
-                );
-            }
-        }
-        if !self.field_errors.is_empty() {
-            return SectionAction::Continue;
-        }
-
-        let inputs = self
-            .drafts
-            .iter()
-            .map(|draft| {
-                let value = match &draft.value {
-                    InputValueDraft::String { value, .. } => {
-                        ClientRoutineValue::String(value.clone())
-                    }
-                    InputValueDraft::Boolean(value) => ClientRoutineValue::Boolean(*value),
-                };
-                (draft.name.clone(), value)
-            })
-            .collect();
-        let sequence = NEXT_ROUTINE_OPERATION.fetch_add(1, Ordering::Relaxed);
-        let operation_key = format!("tui-routine-start-{sequence}");
-        let request_id = format!("tui-routine-request-{sequence}");
-        self.invocation = Some(InvocationTracker {
-            operation_key: operation_key.clone(),
-            request_id: request_id.clone(),
-            invocation_id: None,
-            pending: true,
-        });
-        SectionAction::ClientCommand(ClientCommand::StartManualRoutine {
-            operation_key,
-            request_id,
-            routine_name: definition.routine_name,
-            trigger_name: definition.trigger_name,
-            source_session_id: self.source_session_id.clone(),
-            inputs,
-        })
-    }
-
-    fn select_definition(&mut self, definition: &ClientManualRoutineDefinition) {
-        self.selected_definition = Some(definition.clone());
-        self.drafts = definition
-            .inputs
-            .iter()
-            .map(|input| InputDraft {
-                name: input.name.clone(),
-                value: match (&input.r#type, &input.default_value) {
-                    (ClientRoutineValueType::String, Some(ClientRoutineValue::String(value))) => {
-                        InputValueDraft::String {
-                            value: value.clone(),
-                            cursor: value.len(),
-                        }
-                    }
-                    (ClientRoutineValueType::String, _) => InputValueDraft::String {
-                        value: String::new(),
-                        cursor: 0,
-                    },
-                    (ClientRoutineValueType::Boolean, Some(ClientRoutineValue::Boolean(value))) => {
-                        InputValueDraft::Boolean(*value)
-                    }
-                    (ClientRoutineValueType::Boolean, _) => InputValueDraft::Boolean(false),
-                },
-            })
-            .collect();
-        self.focused_control = 0;
-        self.field_errors.clear();
-        self.general_error = None;
-        self.invocation = None;
-        self.mode = PaletteMode::Form;
-    }
-
-    fn return_to_list(&mut self) {
-        self.mode = PaletteMode::List;
-        self.selected_definition = None;
-        self.drafts.clear();
-        self.focused_control = 0;
-        self.field_errors.clear();
-        self.general_error = None;
-        self.invocation = None;
-    }
-
-    fn available_definitions<'a>(
-        &self,
-        snapshot: Option<&'a ClientSnapshot>,
-    ) -> Option<&'a [ClientManualRoutineDefinition]> {
-        let definitions = &snapshot?.routines.definitions;
-        (!definitions.definitions.is_empty() || definitions.watch.status == "received")
-            .then_some(definitions.definitions.as_slice())
-    }
-
-    fn filtered_definition_indices(&self, snapshot: Option<&ClientSnapshot>) -> Vec<usize> {
-        let query = self.search.to_lowercase();
-        self.available_definitions(snapshot)
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, definition)| {
-                (query.is_empty()
-                    || definition.display_name.to_lowercase().contains(&query)
-                    || definition.description.to_lowercase().contains(&query))
-                .then_some(index)
-            })
-            .collect()
-    }
-
-    fn footer(&self) -> &'static str {
-        if self.pending() {
-            "Running command..."
-        } else {
-            match self.mode {
-                PaletteMode::List => "Enter select  Esc close",
-                PaletteMode::Form => "Tab next  Enter run  Esc back",
-                PaletteMode::Success => "Enter navigate  Esc close",
-            }
-        }
-    }
-
-    fn list_lines(&self, snapshot: Option<&ClientSnapshot>) -> Vec<Line<'static>> {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("Search commands: ", THEME.muted_text_style()),
-                Span::styled(self.search.clone(), THEME.text_style()),
-            ]),
-            Line::raw(""),
-        ];
-        let watch = snapshot.map(|snapshot| &snapshot.routines.definitions.watch);
-        if watch.is_none_or(|watch| watch.status != "received") {
-            if let Some(error) = watch.and_then(|watch| watch.error.as_deref()) {
-                lines.push(ui::error_line(&display_text(error)));
-            }
-            if watch.is_some_and(|watch| matches!(watch.status, "failed" | "waiting")) {
-                lines.push(ui::loading_line("Reconnecting to session commands..."));
-            } else {
-                lines.push(ui::loading_line("Loading session commands..."));
-            }
-        }
-        let Some(definitions) = self.available_definitions(snapshot) else {
-            return lines;
-        };
-        let visible = self.filtered_definition_indices(snapshot);
-        if visible.is_empty() {
-            lines.push(ui::loading_line("No session commands available."));
-            return lines;
-        }
-        for (row, index) in visible.into_iter().enumerate() {
-            let definition = &definitions[index];
-            let selected = row == self.selected_row;
-            let style = if selected {
-                THEME.focus_style().add_modifier(Modifier::BOLD)
-            } else {
-                THEME.text_style()
-            };
-            lines.push(Line::from(vec![
-                ui::selection_marker(selected),
-                Span::raw(" "),
-                Span::styled(definition.display_name.clone(), style),
-                Span::styled(
-                    required_input_summary(&definition.inputs),
-                    THEME.muted_text_style(),
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(
-                format!("  {}", display_text(&definition.description)),
-                THEME.muted_text_style(),
-            )));
-        }
-        lines
-    }
-
-    fn form_lines(&self) -> Vec<Line<'static>> {
-        let heading = self
-            .selected_definition
-            .as_ref()
-            .map_or("Session command", |definition| {
-                definition.display_name.as_str()
-            });
-        let mut lines = vec![
-            Line::from(Span::styled(heading.to_owned(), THEME.accent_bold())),
-            Line::raw(""),
-        ];
-        for (index, draft) in self.drafts.iter().enumerate() {
-            let value = match &draft.value {
-                InputValueDraft::String { value, .. } if value.is_empty() => "<empty>".to_owned(),
-                InputValueDraft::String { value, .. } => display_text(&value.replace('\n', "\\n")),
-                InputValueDraft::Boolean(true) => "[x] true".to_owned(),
-                InputValueDraft::Boolean(false) => "[ ] false".to_owned(),
-            };
-            lines.push(ui::form_field_row(
-                index,
-                self.focused_control,
-                draft.name.clone(),
-                value,
-            ));
-            if let Some(error) = self.field_errors.get(&draft.name) {
-                lines.push(ui::error_line(&display_text(error)));
-            }
-        }
-        lines.push(Line::raw(""));
-        lines.push(ui::form_field_row(
-            self.drafts.len(),
-            self.focused_control,
-            "Submit",
-            format!("Run {heading}"),
-        ));
-        if let Some(error) = &self.general_error {
-            lines.push(ui::error_line(&display_text(error)));
-        }
-        lines
-    }
-
-    fn success_lines(&self) -> Vec<Line<'static>> {
-        let Some(tracker) = &self.invocation else {
-            return vec![ui::error_line(GENERIC_FAILURE)];
-        };
-        let Some(invocation_id) = tracker.invocation_id.as_deref() else {
-            return vec![ui::error_line(GENERIC_FAILURE)];
-        };
-        vec![
-            Line::from(Span::styled("Command accepted", THEME.accent_bold())),
-            Line::raw(""),
-            Line::from(Span::styled(
-                format!("Invocation {}", display_text(invocation_id)),
-                THEME.muted_text_style(),
-            )),
-        ]
+                .filter_map(|k| properties.get(k).map(|s| (k.clone(), initial_json(s))))
+                .collect(),
+        ),
     }
 }
 
 #[allow(
     clippy::large_enum_variant,
-    reason = "palette input returns the selected shared client command"
+    reason = "palette returns the selected shared command"
 )]
-pub(super) enum PaletteAction {
+pub(crate) enum PaletteAction {
     Handled(SectionAction),
     Close(SectionAction),
     Navigate(String, SectionAction),
 }
 
-fn display_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(500)
-        .collect::<String>()
-        .trim()
-        .to_owned()
-}
+#[cfg(test)]
+mod tests {
+    use super::initial_json;
+    use waltr_client::RoutineSchema;
 
-fn required_input_summary(inputs: &[ClientRoutineInputDefinition]) -> String {
-    let required = inputs
-        .iter()
-        .filter(|input| input.required)
-        .map(|input| input.name.as_str())
-        .collect::<Vec<_>>();
-    if required.is_empty() {
-        String::new()
-    } else {
-        format!("  required: {}", required.join(", "))
+    #[test]
+    fn json_scaffolds_follow_every_supported_schema_type_without_fake_defaults() {
+        for (schema, expected) in [
+            (r#"{"type":"null"}"#, "null"),
+            (r#"{"type":"nullable","schema":{"type":"boolean"}}"#, "null"),
+            (r#"{"type":"boolean"}"#, "false"),
+            (r#"{"type":"number","min":-2,"max":4}"#, "-2"),
+            (r#"{"type":"string","maxLength":10}"#, r#""""#),
+            (
+                r#"{"type":"array","maxItems":2,"items":{"type":"boolean"}}"#,
+                "[]",
+            ),
+            (
+                r#"{"type":"object","properties":{"required":{"type":"boolean"},"optional":{"type":"null"}},"required":["required"]}"#,
+                r#"{"required":false}"#,
+            ),
+        ] {
+            let schema: RoutineSchema = serde_json::from_str(schema).unwrap();
+            assert_eq!(initial_json(&schema).to_string(), expected);
+        }
     }
-}
-
-fn insert_at_cursor(value: &mut String, cursor: &mut usize, character: char) {
-    *cursor = (*cursor).min(value.len());
-    value.insert(*cursor, character);
-    *cursor += character.len_utf8();
-}
-
-fn move_cursor_left(value: &str, cursor: &mut usize) {
-    if *cursor > 0
-        && let Some((previous, _)) = value[..*cursor].char_indices().last()
-    {
-        *cursor = previous;
-    }
-}
-
-fn move_cursor_right(value: &str, cursor: &mut usize) {
-    if let Some(character) = value[*cursor..].chars().next() {
-        *cursor += character.len_utf8();
-    }
-}
-
-fn delete_before_cursor(value: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let Some((previous, _)) = value[..*cursor].char_indices().last() else {
-        return;
-    };
-    value.drain(previous..*cursor);
-    *cursor = previous;
-}
-
-fn delete_at_cursor(value: &mut String, cursor: usize) {
-    if cursor >= value.len() {
-        return;
-    }
-    let end = value[cursor..]
-        .chars()
-        .next()
-        .map_or(cursor, |character| cursor + character.len_utf8());
-    value.drain(cursor..end);
 }

@@ -2,13 +2,13 @@
 
 use std::time::{Duration, Instant};
 
-use waltr_client::{AccessStatus, ClientAuthTarget, ClientCommand, ClientSnapshot};
 use ratatui::Frame;
 use ratatui::crossterm::{
     event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind},
     terminal,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
+use waltr_client::{AccessStatus, ClientAuthTarget, ClientCommand, ClientSnapshot};
 
 use crate::{
     event::{AppEvent, NativeLoginEvent},
@@ -50,6 +50,8 @@ pub enum AppAction {
     NativeAuth(NativeAuthAction),
     /// Copy a provider or upstream MCP authorization URL.
     CopyAuthUrl(String),
+    /// Start one explicitly selected private terminal media operation.
+    Media(crate::media::MediaRequest),
 }
 
 /// The currently armed close confirmation, if any.
@@ -116,6 +118,21 @@ pub struct App {
 }
 
 impl App {
+    pub(crate) fn media_owner(&self) -> Option<u64> {
+        if self.screen != AppScreen::Routines
+            || !self
+                .client_snapshot
+                .as_ref()
+                .is_some_and(|s| s.access.status == AccessStatus::Authenticated)
+        {
+            return None;
+        }
+        let editor = self.routines_section.media.as_ref()?;
+        if !editor.current_selection(self.client_snapshot.as_ref()?) {
+            return None;
+        }
+        editor.owner()
+    }
     /// Create a fresh app instance.
     #[must_use]
     pub const fn new() -> Self {
@@ -159,6 +176,12 @@ impl App {
         self.update(now);
 
         match event {
+            AppEvent::Media(event) => {
+                if let Some(editor) = &mut self.routines_section.media {
+                    editor.receive(event);
+                }
+                AppAction::Continue
+            }
             AppEvent::Tick(_) | AppEvent::Stream(_) => AppAction::Continue,
             AppEvent::Client(snapshot) => {
                 AppAction::from_commands(self.handle_client_snapshot(snapshot.as_ref().clone()))
@@ -332,7 +355,9 @@ impl App {
         match self.native_login {
             NativeLoginState::AwaitingBrowser { .. } => "c copy URL    Esc cancel",
             NativeLoginState::Discovering | NativeLoginState::Exchanging => "Esc cancel",
-            NativeLoginState::Succeeded | NativeLoginState::Refreshing => "Reconnecting to Waltr...",
+            NativeLoginState::Succeeded | NativeLoginState::Refreshing => {
+                "Reconnecting to Waltr..."
+            }
             NativeLoginState::Idle
             | NativeLoginState::Canceled
             | NativeLoginState::Failed { .. } => "Enter sign in    r retry    Ctrl-C Ctrl-C quit",
@@ -696,6 +721,7 @@ impl App {
                         && self.sessions_section.detail_session_id().is_none()
                     {
                         return AppAction::ClientCommands(vec![
+                            ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
                             ClientCommand::ReleaseSessionTimelineWatchInterest {
                                 session_id: session_id.clone(),
                             },
@@ -717,10 +743,12 @@ impl App {
                 self.screen = AppScreen::Landing;
                 self.leader_armed = false;
                 self.armed_close = None;
-                AppAction::ClientCommands(vec![
+                let mut commands = self.routines_section.release_requests();
+                commands.extend([
                     ClientCommand::ReleaseRoutineDefinitionWatchInterest,
                     ClientCommand::ReleaseRoutineInvocationWatchInterest,
-                ])
+                ]);
+                AppAction::ClientCommands(commands)
             }
             KeyCommand::Escape => self.handle_close_intent(CloseIntent::Escape, now),
             KeyCommand::SessionCommands => {
@@ -770,6 +798,7 @@ impl App {
                     self.screen = AppScreen::Config;
                     let mut commands = Vec::new();
                     if let Some(session_id) = detail_session_id {
+                        commands.push(ClientCommand::ReleaseInteractions { session_id: session_id.clone() });
                         commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         });
@@ -783,6 +812,7 @@ impl App {
                         commands.push(ClientCommand::ReleaseSessionWatchInterest);
                     }
                     if leaving_routines {
+                        commands.extend(self.routines_section.release_requests());
                         commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
                         commands.push(ClientCommand::ReleaseRoutineInvocationWatchInterest);
                     }
@@ -844,6 +874,7 @@ impl App {
                         commands.push(ClientCommand::ReleaseConfigWatchInterest);
                     }
                     if leaving_routines {
+                        commands.extend(self.routines_section.release_requests());
                         commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
                         commands.push(ClientCommand::ReleaseRoutineInvocationWatchInterest);
                     }
@@ -865,6 +896,7 @@ impl App {
 
                 detail_session_id.map_or(AppAction::Continue, |session_id| {
                     AppAction::ClientCommands(vec![
+                        ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
                         ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         },
@@ -917,12 +949,18 @@ impl App {
                     return AppAction::Continue;
                 }
 
+                let source_session = if self.screen == AppScreen::Sessions {
+                    self.sessions_section.detail_session_id().map(str::to_owned)
+                } else {
+                    None
+                };
                 let mut commands = Vec::new();
                 if self.screen == AppScreen::Config {
                     commands.push(ClientCommand::ReleaseConfigWatchInterest);
                 }
                 if matches!(self.screen, AppScreen::Sessions | AppScreen::SessionData) {
                     if let Some(session_id) = self.sessions_section.clear_detail_route() {
+                        commands.push(ClientCommand::ReleaseInteractions { session_id: session_id.clone() });
                         commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         });
@@ -937,6 +975,7 @@ impl App {
                 self.screen = AppScreen::Routines;
                 commands.push(ClientCommand::RegisterRoutineDefinitionWatchInterest);
                 commands.push(ClientCommand::RegisterRoutineInvocationWatchInterest);
+                commands.extend(self.routines_section.begin_route(source_session));
                 AppAction::from_commands(commands)
             }
             KeyCommand::LeaderCommand(LeaderCommand::Quit) => {
@@ -1051,6 +1090,10 @@ impl App {
             if self.sessions_section.clear_session_commands() {
                 commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
             }
+            if self.routines_section.clear_editor() {
+                commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
+            }
+            self.routines_section.media = None;
             if snapshot.access.status == AccessStatus::LoginRequired && self.has_native_credential {
                 self.has_native_credential = false;
                 commands.push(ClientCommand::ReprobeWaltrAccess);
@@ -1139,11 +1182,13 @@ impl App {
 
         commands.extend(match (detail_before, detail_after) {
             (None, Some(session_id)) => vec![
+                ClientCommand::RetainInteractions { session_id: session_id.clone() },
                 register_timeline_watch_command(session_id.clone()),
                 ClientCommand::RegisterSessionRoutineInvocationWatchInterest { session_id },
             ],
             (Some(session_id), None) => {
                 vec![
+                    ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
                     ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: session_id.clone(),
                     },
@@ -1152,12 +1197,14 @@ impl App {
             }
             (Some(old_session_id), Some(new_session_id)) if old_session_id != new_session_id => {
                 vec![
+                    ClientCommand::ReleaseInteractions { session_id: old_session_id.clone() },
                     ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: old_session_id.clone(),
                     },
                     ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
                         session_id: old_session_id,
                     },
+                    ClientCommand::RetainInteractions { session_id: new_session_id.clone() },
                     register_timeline_watch_command(new_session_id.clone()),
                     ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
                         session_id: new_session_id,
@@ -1297,13 +1344,39 @@ impl App {
     }
 
     fn handle_routines_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        if let Some(editor) = &mut self.routines_section.media {
+            if key.code == KeyCode::Esc {
+                self.routines_section.media = None;
+                return AppAction::Continue;
+            }
+            return editor
+                .key(key, self.client_snapshot.as_ref())
+                .map_or(AppAction::Continue, AppAction::Media);
+        }
+        if matches!(key.code, KeyCode::Char('m' | 't')) && !self.routines_section.editor_open() {
+            self.routines_section.open_media(
+                key.code == KeyCode::Char('t'),
+                self.client_snapshot.as_ref(),
+            );
+            return AppAction::Continue;
+        }
+        if self.routines_section.editor_open() {
+            return match self
+                .routines_section
+                .handle_key(key, self.client_snapshot.as_ref())
+            {
+                SectionAction::ClientCommand(c) => AppAction::ClientCommand(c),
+                SectionAction::ClientCommands(c) => AppAction::ClientCommands(c),
+                _ => AppAction::Continue,
+            };
+        }
         if key.code == KeyCode::Esc
             && self
                 .routines_section
                 .dismiss_detail(self.client_snapshot.as_ref())
         {
             self.leader_armed = false;
-            return AppAction::Continue;
+            return AppAction::from_commands(self.routines_section.release_detail_requests());
         }
         let command = key_command(key, self.leader_armed);
         if !matches!(command, KeyCommand::None) {
@@ -1334,7 +1407,9 @@ impl App {
                     SectionAction::ClientCommands(commands) => commands,
                     SectionAction::Continue | SectionAction::Unhandled => Vec::new(),
                 };
+                let source_session = detail_session_id.clone();
                 if let Some(session_id) = detail_session_id {
+                    commands.push(ClientCommand::ReleaseInteractions { session_id: session_id.clone() });
                     commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: session_id.clone(),
                     });
@@ -1345,6 +1420,7 @@ impl App {
                 commands.push(ClientCommand::ReleaseSessionWatchInterest);
                 commands.push(ClientCommand::RegisterRoutineDefinitionWatchInterest);
                 commands.push(ClientCommand::RegisterRoutineInvocationWatchInterest);
+                commands.extend(self.routines_section.begin_route(source_session));
                 commands.push(self.routines_section.focus_invocation(invocation_id));
                 return AppAction::from_commands(commands);
             }
@@ -1372,6 +1448,7 @@ impl App {
                         if old_session_id != new_session_id =>
                     {
                         AppAction::ClientCommands(vec![
+                            ClientCommand::ReleaseInteractions { session_id: old_session_id.clone() },
                             ClientCommand::ReleaseSessionTimelineWatchInterest {
                                 session_id: old_session_id.clone(),
                             },

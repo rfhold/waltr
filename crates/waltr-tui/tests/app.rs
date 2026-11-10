@@ -1,27 +1,28 @@
 //! App-level rendering and input tests.
 
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
+use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    layout::Rect,
+    style::{Color, Modifier, Style},
+};
 use waltr_client::{
     AuthAttemptSnapshot, AuthenticationFailureSnapshot, CatalogMatchSourceView, ClientAuthTarget,
-    ClientCommand, ClientManualRoutineDefinition, ClientOperationView, ClientRoutineFailure,
-    ClientRoutineFieldViolation, ClientRoutineInputDefinition, ClientRoutineInvocationDetail,
-    ClientRoutineInvocationStatus, ClientRoutineInvocationSummary, ClientRoutineResult,
-    ClientRoutineResultDefinition, ClientRoutineScope, ClientRoutineTask, ClientRoutineTaskStatus,
-    ClientRoutineTriggerKind, ClientRoutineValidationFailure, ClientRoutineValue,
-    ClientRoutineValueType, ClientSnapshot, ClientTimelineDirection, ConfigView,
+    ClientCommand, ClientManualRoutineDefinition, ClientOperationView,
+    ClientRoutineInvocationDetail, ClientRoutineInvocationStatus, ClientRoutineInvocationSummary,
+    ClientRoutineTriggerKind, ClientSnapshot, ClientTimelineDirection, ConfigView,
     InferenceProviderSettingsView, InferenceSettingsMatchView, InferenceSettingsView,
     McpAuthorizationContextSnapshot, McpServerTypeView, McpServerView, ModelCapabilitiesView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OAuthJwtMetadataView,
     OAuthProviderView, OAuthTokenFieldView, OAuthTokenRequestStyleView, OAuthUrlParamView,
-    OperationSnapshot, ProviderKindView, ProviderView, RollbackTargetView, RoutineDetailSnapshot,
-    RoutineStartOperationView, SessionCoordinationReasonView, SessionPhaseView,
-    SessionProgressPhaseView, SessionPromptDispositionView, SessionRunStageView,
-    SessionSuspensionKindView, SessionTimelineView, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelineStatusView,
+    OperationSnapshot, ProviderKindView, ProviderView, RollbackTargetView, RoutineBudgets,
+    RoutineContract, RoutineDetailSnapshot, RoutineEntrypoint, RoutineJson, RoutineOperation,
+    RoutineOperationStatus, RoutineOwnership, RoutineRequest, RoutineRequestState,
+    RoutineRequestStatus, RoutineRevision, RoutineStartContext, RoutineTextResult,
+    SessionCoordinationReasonView, SessionPhaseView, SessionProgressPhaseView,
+    SessionPromptDispositionView, SessionRunStageView,
+    SessionTimelineView, TimelineEventView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -30,11 +31,6 @@ use waltr_tui::{
     screens::{ConfigTab, SectionAction, SessionsSection, draw_sessions},
     theme::{StatusRole, THEME},
     ui,
-};
-use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::Rect,
-    style::{Color, Modifier, Style},
 };
 
 mod support;

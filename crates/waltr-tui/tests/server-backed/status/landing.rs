@@ -6,6 +6,9 @@ use crate::support::server::{drive_app_to_landing, no_sleep};
 
 #[tokio::test]
 async fn client_stream_reaches_landing_with_real_server() {
+    if !crate::support::server::isolated_application_test() {
+        return;
+    }
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();

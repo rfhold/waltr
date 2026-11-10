@@ -2,12 +2,12 @@
 
 use std::{cell::Cell, env, io, rc::Rc, time::Duration};
 
+use ratatui::DefaultTerminal;
+use tokio::{sync::mpsc, time};
 use waltr_client::{
     AccessStatus, ClientCommand, ClientCommandRequest, ClientRuntime, ClientStateStreamEvent,
     NativeCredentialProvider, NativeGrpcTransport,
 };
-use ratatui::DefaultTerminal;
-use tokio::{sync::mpsc, time};
 
 use crate::{
     app::{App, AppAction},
@@ -78,19 +78,34 @@ pub async fn run_with_options(
     Box::pin(tokio::task::LocalSet::new().run_until(async {
         let (events, commands, native_auth, runtime) =
             RuntimeEvents::start(options.client_endpoint);
-        let result = run_with_events(terminal, App::new(), events, commands, native_auth).await;
+        let mut runtime = runtime;
+        let result = Box::pin(run_with_events(
+            terminal,
+            App::new(),
+            events,
+            commands,
+            native_auth,
+            &mut runtime.media,
+        ))
+        .await;
+        runtime.media.shutdown().await;
         runtime.abort();
         result
     }))
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "terminal event loop owns distinct command, authentication, and media lanes"
+)]
 async fn run_with_events(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut events: mpsc::Receiver<io::Result<AppEvent>>,
     commands: mpsc::Sender<RuntimeClientCommand>,
     native_auth: mpsc::Sender<NativeAuthAction>,
+    media: &mut crate::media::Broker,
 ) -> io::Result<()> {
     let _ = terminal.draw(|frame| app.draw(frame))?;
 
@@ -99,6 +114,7 @@ async fn run_with_events(
         let now = event.timestamp(std::time::Instant::now());
 
         match app.handle_event(&event, now) {
+            AppAction::Media(request) => media.start(request).await,
             AppAction::Exit => return Ok(()),
             AppAction::Continue => {}
             AppAction::ClientCommand(command) => {
@@ -137,15 +153,17 @@ async fn run_with_events(
             }
         }
 
+        media.sync_owner(app.media_owner());
+
         let _ = terminal.draw(|frame| app.draw(frame))?;
     }
 
     Ok(())
 }
 
-#[derive(Debug)]
 struct RuntimeEvents {
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    media: crate::media::Broker,
 }
 
 impl RuntimeEvents {
@@ -155,6 +173,8 @@ impl RuntimeEvents {
         let (native_actions, native_action_receiver) = mpsc::channel(8);
         let endpoint = client_endpoint_or_default(client_endpoint);
         let credentials = NativeCredentialProvider::new();
+        let media =
+            crate::media::Broker::new(endpoint.clone(), credentials.clone(), events.clone());
         let tasks = vec![
             spawn_tick_events(events.clone()),
             spawn_input_events(events.clone()),
@@ -175,7 +195,7 @@ impl RuntimeEvents {
             ),
         ];
 
-        (receiver, commands, native_actions, Self { tasks })
+        (receiver, commands, native_actions, Self { tasks, media })
     }
 
     fn abort(self) {
