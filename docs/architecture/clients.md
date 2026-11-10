@@ -61,15 +61,19 @@ Resource traffic uses `waltr.resource.v1.ResourceService`:
 
 Embedded startup provisions its generation URL into the ordinary persisted `mcp-servers/waltr.yaml` slot before the client loads the catalog. Clients inspect, replace, watch, and reset it through the same ETag contract as any other persisted resource. A reset can fail ordinary candidate validation when the bundled fallback requires an unavailable `WALTR_PUBLIC_URL`.
 
-Manual Routine traffic uses `waltr.routine.v1.RoutineService`:
+Routine traffic uses `waltr.routine.v2.RoutineService` in standalone and embedded production composition:
 
 | RPC | Client Use |
 | --- | --- |
-| `WatchManualRoutines` | Watch complete global typed definition snapshots and their stable digest. |
-| `StartManualRoutine` | Validate and durably admit one detached manual invocation. |
-| `ListRoutineInvocations` | Page durable invocation aggregates by admission sequence, optionally filtered by exact-AND metadata equality. |
-| `GetRoutineInvocation` | Load one durable invocation, its tasks, results, and event history. |
-| `WatchRoutineInvocations` | Load a bounded server-filtered snapshot or replay matching SQL events after a durable global cursor. |
+| `WatchDefinitions` | Watch complete source-free definitions, typed contracts and exact revisions. |
+| `StartInvocation` | Validate and durably admit one detached manual invocation. |
+| `ListInvocations` / `GetInvocation` | Read bounded history or one selected invocation, with explicit source filtering. |
+| `WatchInvocations` | Read bounded snapshots and durable observations with opaque cursors. |
+| `ListOperations` / `CancelInvocation` | Read bounded operation history or request authorized cancellation. |
+| `Interact` | Native duplex using the shared invocation/media host. |
+| Attachment, blob and text-result RPCs | Browser split lanes and independent bounded resource ownership. |
+
+Absent code-mode opt-in adds no agent tool; a configured code tool remains bound to the originating real lease and durable session incarnation. See [Routines](routines.md).
 
 Status traffic uses the status service to watch system readiness. Catalog watch maintenance waits until the server reports ready.
 
@@ -87,9 +91,11 @@ Session RPCs and shared views use `InferenceSettings`, `InferenceSettingsRequest
 
 `SessionView` preserves the complete durable metadata map from each `SessionSummary`. Metadata is public session state and must contain no credentials or secrets. Numbers must convert exactly to protobuf `double`; the server rejects a lossy projection.
 
+Public session and projection revisions retain complete-record semantics and the same wire shape. Metadata-only commits therefore advance the public revision even though the internal execution sequence remains unchanged. Clients retain public stale-page and summary guards; execution tokens are not client freshness or authority substitutes. List sequences, interaction revisions and timeline cursors remain independent namespaces. Append receipts let the engine publish coherent titles and lifecycle summaries through current ordered publication guards. See [session revision domains](../agent/storage.md#revision-domains-and-append-receipts).
+
 `SessionAssociationsView` also projects string values for `waltr.task.parent_session_id`, `waltr.task.description`, and `waltr.routine.invocation_id`. `SessionStatusView` projects an optional typed suspension kind. Shells use these typed fields for shared behavior and retain complete metadata for other consumers.
 
-`SessionView.coordination` retains the server-projected, process-local coordination state for diagnostics and compatibility. `SessionView.progress` is the agent-owned unified lifecycle projection, including phase, optional run stage, reason, queue count, armed continuation, and activity. `SessionView.capabilities` carries prompt disposition plus external-response and interrupt availability. Missing or unspecified progress and prompt disposition map to `Unknown`, with absent booleans false. List snapshots and full-summary upserts replace all three structures directly. The client does not infer progress or capabilities from durable status, coordination, pending commands, or timeline activity. Shells own final labels and presentation.
+`SessionView.coordination` retains server-projected process-local coordination. `SessionView.progress` is the generic lifecycle projection, including phase, optional run stage, reason, queue count, armed continuation, and activity. `SessionView.capabilities` carries prompt disposition and interrupt availability, not private response authority. Missing progress and prompt disposition map to `Unknown`, with absent booleans false. Full summaries replace these structures; clients do not infer them from commands or timeline activity. Shells own presentation.
 
 Session detail timeline commands explicitly request the Effective projection. The transport retains an explicit projection mode so direct Rust callers can continue to request Raw for administration and debugging. Effective responses are already projected by the server: the client stores their entries, projection revision, raw page boundary, and `has_more` without receiving or applying mask selectors. Backward detail requests use the stored raw page boundary rather than a visible or synthetic entry cursor.
 
@@ -97,6 +103,14 @@ Session detail timeline commands explicitly request the Effective projection. Th
 
 Hosted MCP resources `waltr://sessions` and `waltr://sessions/{id}`, plus tool `query` action `session.wait`, expose the same complete metadata map.
 This feature requires no generic MCP behavior; `crates/mcp` remains unchanged.
+
+## Live Interactions
+
+Shared retain/release/respond operations observe the server's `InteractionService`, separately from Routine audio/stream interactions. `snapshot.interactions` contains typed permission, question, form, and URL-consent requests. Get/watch snapshots fully replace pending state with a process generation and revision. Exact response identity and watch epochs reject stale sessions, requests, operations, reconnects, and client generations.
+
+Web and Tauri use the same shared state, UI, and bridge contract. TUI supplies typed keyboard responses, forms, and explicit URL consent. Unsupported schema cannot be accepted; unsupported modes are not advertised. URL acceptance never automatically opens, fetches, or infers completion.
+
+Releasing observation is not operation cancellation. Observer disconnect neither approves nor denies. Owner cancellation/drop removes pending state; one authorized valid response resumes the original live future without rerunning model or JavaScript work. Restart discards pending requests and grants without replay. The old timeline external-request and `RespondExternalRequest`/suspension-resume contract is removed. See [server interactions](agent.md#live-interactions) and [upgrade guidance](../runbooks/server-capability-cutover.md).
 
 ## Routine Interaction Clients
 
@@ -539,7 +553,7 @@ The literal target remains `waltr_app_lib::dictation_telemetry` for telemetry co
 Each admitted operation owns a `native.audio.operation` async span through permission, RPC, external actions, and complete cleanup.
 The span parents the native transport spans; app events record bounded admission outcomes, permission results, milestones, and one terminal summary.
 Synchronous event scopes restore the saved dispatcher and operation context, so worker milestones and post-await terminal logs export the operation's exact trace and span IDs.
-The literal interaction RPC catalog names `routine_interaction.Interact` and `routine_interaction.Run`; unknown paths remain private.
+The literal v2 RPC catalog uses `routine.Interact` and the finite attachment operations, including `routine.OpenAttachment`. Unknown paths remain private.
 Validated remote failure, interruption, and rejection remain distinct from invalid selected output; opaque stream errors retain their observed RPC boundary without parsing messages.
 Primary and cleanup categories remain separate, including when the same capture worker error supplies both. Cleanup-only failures do not become primary failures.
 Process-local numeric diagnostic identifiers never copy IPC or configuration identifiers.
@@ -855,7 +869,7 @@ The TUI opens create selection with `C-x s` and switches the open session with `
 | [../../crates/waltr-web/src/platform/tauri.ts](../../crates/waltr-web/src/platform/tauri.ts) | Tauri frontend adapter and stale-output recovery. |
 | [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |
 | [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC contract. |
-| [../../proto/waltr/routine/v1/routine_service.proto](../../proto/waltr/routine/v1/routine_service.proto) | Manual Routine RPC contract. |
+| [../../proto/waltr/routine/v2/routine.proto](../../proto/waltr/routine/v2/routine.proto) | Routine and transport RPC contract. |
 | [config.md](config.md) | Unified catalog, per-slot ETag, and watch behavior. |
 | [routines.md](routines.md) | Canonical Routine lifecycle, replay, restart, and UI contract. |
 | [access-authentication.md](access-authentication.md) | Access boundaries and browser, native, and MCP authentication flows. |

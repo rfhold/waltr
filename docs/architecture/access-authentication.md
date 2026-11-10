@@ -1,5 +1,9 @@
 # Access Authentication
 
+Server `auth/` owns upstream MCP credentials and orchestration. Its `provider_store` adapter exposes only provider targets and compare-and-swap to agent inference auth. API access, hosted MCP OAuth, upstream OAuth, and provider inference auth remain separate domains.
+
+Private interaction responses require exact authorized session/generation/request/operation identity, not metadata or an upstream key. Authenticated public MCP `capability__*` calls use explicit sessionless full-access host policy over enabled capabilities and an operation route. They do not fabricate a session or invoke a model; full access does not bypass sandbox checks, upstream auth, or optional code grants. MRTR continuations bind the principal and exact original call. See [server interactions](agent.md#live-interactions) and [upgrade guidance](../runbooks/server-capability-cutover.md).
+
 ## Purpose
 
 Waltr access authentication decides whether a caller may use a Waltr server. It is separate from credential authorization, where an already admitted Waltr caller authorizes Waltr to call a model provider or an upstream MCP server.
@@ -17,7 +21,7 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 
 `WALTR_AUTH_MODE` is exactly `disabled` or `oidc` and defaults to `disabled`.
 
-- For environment-owned servers, `disabled` admits a synthetic local principal. `WALTR_PUBLIC_URL` remains required so the bundled self-MCP resource can materialize. Any partial OIDC configuration still fails startup.
+- For environment-owned servers, `disabled` admits anonymous access. `WALTR_PUBLIC_URL` remains required so the bundled self-MCP resource can materialize. Any partial OIDC configuration still fails startup.
 - `oidc` requires valid configuration, successful provider discovery, an initial JWKS load, and initialized SQL persistence before the application is constructed. It never falls back to disabled mode.
 
 | Variable | Required | Contract |
@@ -62,6 +66,34 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 | API-root RFC 9728 metadata, path-specific MCP metadata, local RFC 8414 metadata/JWKS, OAuth authorization/token/revocation/registration routes, and outbound callback/CIMD routes | |
 
 API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before each stateless MCP request dispatch.
+
+## Standalone Private Self-MCP Admission
+
+Access-disabled, non-hosted standalone composition supplies a private self-MCP connection when the initial `waltr` resource exactly matches `WALTR_PUBLIC_URL` plus `/mcp`.
+The application prebinds a separate MCP-only listener on ephemeral IPv4 loopback and creates a random 256-bit bearer in memory.
+This private connection does not use hosted OAuth or the embedded credential-store adapter.
+
+Only an exact, current generation bearer establishes `ValidatedLocalOrigin` on the private listener.
+Loopback addresses, Host, Origin, headers, `_meta`, resource names, and disabled access authentication grant no process identity.
+Trusted standalone composition explicitly enables anonymous public `/mcp` admission only with disabled access authentication, no hosted OAuth, and no embedded local admission. Clients need no bearer or OAuth flow. Bare `WaltrMcpServer::new` instances remain fail-closed for capability and session-prompt admission unless the host enables this mode.
+The legacy `AuthenticatedPrincipal` type represents this admission as `AnonymousDisabled`, not validated process or hosted identity. Anonymous calls share one configured dev access domain, without user/client isolation or credential expiry. Public headers, metadata, IP addresses, and client session IDs grant no additional authority. A private self-MCP bearer on this public route adds no privileges.
+Enabled capabilities and normal administration/session tools use ordinary server dispatch policy, durable dispatch association, sandbox, consent, and operation ownership. Disabled authentication grants no optional code, speech/model, or helper authority. Admitted durable session prompts outlive their HTTP request; external operation cancellation and non-replay rules remain unchanged. Keep no-auth development bound to loopback. Any reachable client can use the enabled tools. Do not expose this mode to untrusted networks.
+Hosted OAuth and embedded composition retain their separate admission contracts.
+
+The private transport preserves the logical public resource identity, declarations, source checks, and Apps authority checks.
+A resource edit to another destination receives no generation bearer or self authority.
+Self discovery excludes the bound logical resource to prevent recursion.
+The private HTTP client bypasses environment proxies and refuses every redirect, even same-origin path redirects.
+
+The application retains the bearer and private endpoint only in memory.
+Resource YAML, public catalogs, and durable OAuth credentials retain no private transport data.
+The private client enables [transport endpoint redaction](../mcp/tracing.md#http-endpoint-privacy).
+Normal capability policy, sandbox checks, upstream credentials, and durable effect fences still apply; this connection grants no optional code capability.
+
+Startup failure closes the prebound listener and revokes its generation.
+Explicit shutdown revokes admission, joins private HTTP connections, and drains the application runtime and session MCP registry.
+Application drop revokes admission immediately and schedules the same private-listener and host cleanup on the live Tokio runtime.
+Explicit async shutdown remains the completion boundary for callers that require joined cleanup before return.
 
 ## Embedded Local Admission
 
@@ -223,7 +255,7 @@ Waltr configures the generic MCP Streamable HTTP authorization hooks as follows:
 3. The public client uses a preregistered client, a validated HTTPS CIMD client ID, or public DCR, then completes Authorization Code with PKCE S256 and Waltr consent.
 4. Waltr verifies the ES256 `at+jwt`, exact issuer/resource audience, lifetime, subject, client, scopes, and durable token/grant/family/client authorization state before dispatching every MCP POST. Direct Authentik access tokens are rejected.
 
-Missing, invalid, expired, or revoked credentials return `401`; insufficient scopes return `403` with `insufficient_scope`; authorization-store failures fail closed. Expiry and same-process revocation terminate active request-scoped response streams immediately at their observed boundary. Other replicas authoritatively recheck durable revocation at most every five seconds, plus scheduling and database latency. Waltr has no browser MCP client, so its Origin allowlist is empty: absent Origin is accepted and every present Origin is denied.
+Missing, invalid, expired, or revoked credentials return `401`; insufficient scopes return `403` with `insufficient_scope`; store failures fail closed. Expiry and same-process revocation terminate request-scoped response streams at their observed boundary. Ordinary admitted session create/send prompts are durable and are not canceled by later token expiry; explicit Routine/helper/code leases retain their cancellation contract. Other replicas recheck durable revocation at most every five seconds, plus scheduling and database latency. Waltr has no browser MCP client: absent Origin is accepted and every present Origin is denied.
 
 Configuration and agent-definition actions are both published through public `/mcp` and use this same hosted-resource scope policy. Waltr does not assign separate action-level scopes.
 

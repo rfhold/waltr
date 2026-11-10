@@ -1,5 +1,7 @@
 # Sandbox Reconnect Implementation Plan
 
+Historical design record. Its work packages, ownership paths, suspension model, and command recipes describe the earlier implementation, not current authority. Use [Agent and server host architecture](agent.md), [host guides](../agent-host/README.md), and [Testing](../testing.md) for the current contract and commands. The capability cutover supersedes the old permission-suspension flow; Ask now awaits the original live server interaction.
+
 ## Purpose
 
 Make the process-local sandbox usable from every agent entry point, including

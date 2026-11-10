@@ -15,6 +15,8 @@ It is designed around shared workspace state, so configuration and status stay c
 | Provider support | Run against supported model providers directly or through a shared gateway. |
 | Safety boundaries | Keep permissions, tool access, and workspace behavior explicit and testable. |
 
+The server owns concrete capabilities, MCP, policy, and live user interactions; the agent library owns generic inference and durable sessions. See [architecture](docs/architecture/agent.md), [host guides](docs/agent-host/README.md), and [coordinated upgrades](docs/runbooks/server-capability-cutover.md).
+
 # Everyday Use
 
 Run the full local development loop:

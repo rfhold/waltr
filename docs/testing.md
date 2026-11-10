@@ -12,15 +12,22 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/mcp/tests/oauth_authorization_server.rs` and `crates/mcp/tests/oauth_store.rs` | Hosted OAuth HTTP flow, DCR/CIMD security, token/revocation/key lifecycle, leases, and memory-store behavior. |
 | `crates/mcp/tests/oauth_*_store.rs` | Feature-gated SQLite and container-backed PostgreSQL OAuth store parity, migrations, reopen, and concurrency. |
 | `crates/waltr-agent/tests/agent.rs` and `crates/waltr-agent/tests/agent/` | Deterministic agent library tests using scripted/shared providers. |
+| `crates/waltr-script/tests/` and unit tests | Isolated engine, fake-host callbacks/resources, value and memory limits, teardown, disposable watchdogs, and trait substitution; no server or provider integration. |
 | `crates/waltr-agent-sandbox/src/` tests | Worker file/patch/shell operations, tickets, workspace context, and snapshots. |
-| `crates/waltr-agent/src/sandbox_gateway.rs` tests | Private RPC request correlation, cancellation, disconnect, and capacity. |
+| `crates/waltr-server/src/agent_host/sandbox_gateway.rs` tests | Private RPC correlation, cancellation, disconnect, and capacity. |
+| `crates/waltr-server/tests/agent_host/` | Concrete host library tests, compiled by `src/lib.rs` as `host_tests`; tools, policy, MCP, templates, Skills, and ignored live coverage. |
+| `crates/waltr-server/src/interaction.rs` and `src/permission/live_tests.rs` | Private broker lifetime/identity and live approval contracts, separate from Routine stream interactions. |
 | `crates/waltr-server/src/sandbox.rs` tests | Private gateway startup, embedded duplex and standalone UDS worker readiness, reconnect, and shutdown. |
 | `crates/waltr-agent/tests/live.rs` and `crates/waltr-agent/tests/live/` | Ignored live-provider and external-service agent tests. |
 | `crates/waltr-server/tests/` | Server contract, coordination, watch, validation, health, persistence, access-auth, and system flows. |
 | `crates/waltr-audio/tests/adapter.rs` and `tests/tls.rs` | Loopback speech method, container, cancellation, deadline, capacity, TLS rejection, and no-plaintext-fallback contracts. |
-| `crates/waltr-server/src/resource_catalog/routine/interaction_tests.rs` | Strict audio examples, explicit model resolution, PCM compatibility, and live-component validation. |
-| `crates/waltr-server/src/routine/interaction/tests.rs` and `tests/` | Internal live-component execution, text revisions, collectors, groups, cancellation, bounds, and lifecycle records. |
-| `crates/waltr-server/src/routine_interaction_service/` | Interaction admission, protocol, quota, capability preflight, transport cancellation, and loopback service contracts. |
+| `crates/waltr-server/src/resource_catalog/state/tests.rs` | Strict JS contracts, rejection of old task envelopes, all eleven bundled/example definitions, named helpers, and last-good publication. |
+| `crates/waltr-server/src/routine/service/tests.rs` and `rpc/tests.rs` | Owned JavaScript execution, journal/effect ordering, native/browser streams, cancellation, bounded resources and authentication lifetime. |
+| `crates/waltr-server/src/persistence/cutover_tests.rs` | Populated SQLite 13-to-14 retirement with real new history, session masks, configuration, OAuth and MCP records; the guarded explicit PostgreSQL fixture runs the same preservation checks. |
+| `crates/waltr-server/src/routine/production/runtime/tests.rs` | Actual standalone and embedded constructors, real JWT/browser/local admission, shared JS lifecycle, normal named helpers, opt-in code authority, and native interactive ownership. |
+| `crates/waltr-server/src/routine/rpc/tests.rs` | Native and browser finite-stream RPC, attachment/blob/text ownership, cancellation, and current authentication leases. |
+| `crates/waltr-agent/src/agent/session/metadata.rs` and session storage tests | Opaque session/item metadata, absence versus null, bounded transactions, incarnation/revision predicates and atomic masks. |
+| `crates/waltr-server/src/routine_objects/tests.rs` and `src/persistence/object_cutover_tests.rs` | Immutable payload integrity, failed publication, missing objects and incompatible populated-state refusal. |
 | `crates/waltr-server/tests/embedded.rs` | Embedded composition, local admission, explicit callback metadata, public routes, and workspace isolation. |
 | `crates/waltr-server/src/catalog/mod.rs` tests | Bounded network-first models.dev loading, disk-cache and explicit built-in precedence, stale semantics, and fallback validation. |
 | `crates/waltr-server/src/resource_catalog/state/tests.rs` | Persisted self-MCP provisioning and ordinary resource administration. |
@@ -39,7 +46,7 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
 | `crates/waltr-tui/tests/server_backed.rs` and `crates/waltr-tui/tests/server-backed/` | TUI flows against a real server, kept in parity with web k6 flows. |
 
-Access-auth coverage is intentionally layered. Generic MCP tests own hosted OAuth parsing, DCR/CIMD, atomic token and key state, and authorization leases. Server tests own route partitioning, Authentik-to-Waltr browser resumption, Waltr consent, independent API/MCP issuers, direct-upstream rejection, persistence, and fail-closed startup. Agent/server tests own outbound discovery, registration selection, durable callback/refresh claims, and dynamic bearer replacement. Shared client tests own typed domain classification, native discovery/PKCE/callback/refresh behavior, and sanitized state. Browser, TUI, and Tauri tests own their host adapters and presentation without token access.
+Access-auth coverage is intentionally layered. Generic MCP tests own hosted OAuth parsing, DCR/CIMD, atomic token and key state, and authorization leases. Server tests own route partitioning, Authentik-to-Waltr browser resumption, Waltr consent, independent API/MCP issuers, direct-upstream rejection, persistence, and fail-closed startup. Server host/auth tests own outbound MCP discovery, registration selection, durable callback/refresh claims, and dynamic bearer replacement; generic agent tests retain provider inference auth. Shared client tests own typed domain classification, native discovery/PKCE/callback/refresh behavior, and sanitized state. Browser, TUI, and Tauri tests own their host adapters and presentation without token access.
 
 # Layering
 
@@ -48,6 +55,19 @@ Do not remove higher-layer coverage just because lower-layer coverage exists.
 Generic protocol/library tests validate reusable crates such as `mcp`. Agent tests validate the agent library as a normal library boundary on top of generic dependencies. Server tests validate the server-facing contract. Client tests validate the shared state machine and native access protocol on top of that contract. Browser, TUI, and Tauri tests validate user-facing behavior and lifecycle through their platform-specific adapters.
 
 # Commands
+
+## Script engine
+
+Run the isolated engine contracts without server or provider credentials:
+
+```sh
+cargo test -p waltr-script --locked
+cargo test -p waltr-script --locked --release
+cargo clippy -p waltr-script --all-targets --locked -- -D warnings
+cargo fmt -p waltr-script -- --check
+```
+
+The ordinary suite launches its ignored adversarial fixtures through watched subprocesses. Do not run those fixtures directly. See the [crate boundary](../crates/waltr-script/README.md) and [artifact provenance](../crates/waltr-script/PROVENANCE.md).
 
 ## Protobuf Toolchain
 
@@ -318,7 +338,7 @@ Inspect the Android feature graph without compiling Android Rust code:
 
 `cargo tree -p waltr-app --target aarch64-linux-android -e features`
 
-The tree must omit `waltr-server/shell`, `waltr-agent/shell`, `waltr-agent-sandbox/shell`, and `waltr-server/profiling`. It must contain no Pyroscope dependency.
+The tree must omit `waltr-server/shell`, `waltr-agent-sandbox/shell`, and `waltr-server/profiling`. The generic agent has no shell feature. The tree must contain no Pyroscope dependency.
 
 Check the standalone binary without profiling:
 
@@ -328,7 +348,7 @@ This check proves profiling is optional for the executable; default builds still
 
 No-shell runtime-factory coverage must keep shell-bearing definitions loadable while omitting the shell tool and feature-derived shell permissions. Unified catalog coverage must materialize ordinary shell-bearing and stdio resources for embedded composition; stdio uses the normal session runtime rather than a host-specific rejection path. Server coverage must keep the worker off public routes and fail readiness if it stops; agent/session coverage must keep unknown dispatched workspace calls suspended rather than executing them twice. Standalone tests must check UDS startup failure, canonical-root agreement, loss and reconnection of the same worker, worker process replacement, and failure without host-side tool execution. Embedded tests must verify that ambient socket and workspace overrides cannot switch it out of duplex mode.
 
-Coordinator tests must prove shutdown rejects new work, cancels active and queued work, waits for active run ownership to drain, atomically empties MCP preparation/cache state, and awaits each cached runtime's explicit shutdown. Existing deterministic stdio coverage does not constitute a real child-process shutdown/reap integration test; do not claim that test exists.
+Generic coordinator tests must prove admission closes and active/queued ownership drains. Server host tests own MCP registry retirement, private grant cleanup, and awaited client shutdown. Deterministic stdio coverage alone does not prove real child-process shutdown/reaping.
 
 Run only native observability tests:
 
@@ -419,7 +439,9 @@ Run web server-backed k6 tests:
 
 This builds the repository server+web image through the static local Compose test infrastructure and runs every browser scenario in both access modes. The host runner supports Linux and macOS with Python 3 and Docker Compose; it uses platform-specific process identity and descriptor-bound cleanup rather than assuming Linux `/proc` is available on macOS. Windows is not supported. The `test` profile exercises access-disabled Waltr. The `test-auth` profile uses an HTTPS proxy with Waltr access OIDC enabled and an ephemeral hosted-MCP wrapping ring, then adds a real browser login, protected-route return, session-cookie checks, a real Sign out button click, and signed-out stream/state verification against Dex. Dex is the authentication-only fixture. The hosted MCP scenario exercises Waltr-to-Waltr CIMD registration, Waltr consent, durable callback completion, persisted credential reuse in a fresh session, dynamic bearer delivery, and protected resource discovery. Deterministic refresh, replay, revocation, and key-rotation behavior remains covered at the Rust protocol, store, agent, and server layers.
 
-Run only the unauthenticated Compose phase:
+Both Compose phases use a verified HTTPS gateway and check HTTP/2 negotiation in k6 HTTP and Chromium. Access-disabled means Waltr authentication is disabled, not that the browser uses plaintext HTTP. Each run generates its own CA and leaf certificate in project-local volumes; only the gateway receives the leaf private key. Browser UI and API requests use the same TLS origin. Plain HTTP remains subject to the browser's per-origin connection limit when several streaming watches are open; this test topology does not change that application transport behavior or verify a production gateway.
+
+Run only the access-disabled Compose phase:
 
 `pnpm test:web:integration:no-auth`
 
@@ -449,7 +471,18 @@ Update the local screenshot snapshots after an intentional visual change:
 
 Run agent unit tests:
 
-`cargo test -p waltr-agent --features shell --lib`
+`cargo test -p waltr-agent --lib`
+
+Run concrete host contracts (a library module, not a standalone `host_tests` integration target):
+
+```sh
+cargo build -p waltr-server --bin waltr-server-test-mcp-server
+cargo test -p waltr-server --lib host_tests
+cargo test -p waltr-server --lib interaction::
+cargo test -p waltr-server --lib permission::
+```
+
+Host MCP tests locate the fixture at the current build profile root, or the exact `WALTR_TEST_MCP_SERVER` override. The fixture now belongs to `waltr-server`; building library tests alone does not build that binary. Server default features include shell and Apps assets; asset builds need Node/pnpm dependencies. For the host no-shell split use `cargo test -p waltr-server --no-default-features --lib host_tests`.
 
 Run worker unit tests, including shell execution:
 
@@ -477,11 +510,15 @@ The static contract checks profile and mount topology. The worker Compose smoke 
 
 Run deterministic agent integration tests:
 
-`cargo test -p waltr-agent --features shell --test agent`
+`cargo test -p waltr-agent --test agent`
 
 Run ignored live agent tests:
 
-`cargo test -p waltr-agent --features shell --test live -- --ignored`
+`cargo test -p waltr-agent --test live -- --ignored`
+
+Run ignored concrete host live tests, with explicit live credentials:
+
+`cargo test -p waltr-server --lib host_tests::live -- --ignored`
 
 Run ignored live server session tests:
 
@@ -623,8 +660,9 @@ Run these focused commands from the repository root:
 
 ```sh
 cargo test -p mcp --test spec apps
-cargo test -p waltr-agent --features shell --lib mcp_apps
-cargo test -p waltr-agent --features shell --test agent mcp
+cargo build -p waltr-server --bin waltr-server-test-mcp-server
+cargo test -p waltr-server --lib agent_host::mcp::session_apps
+cargo test -p waltr-server --lib host_tests::mcp
 cargo test -p waltr-client --test apps
 cargo test -p waltr-client --lib apps_cancellation
 cargo test -p waltr-server --lib apps
@@ -643,7 +681,7 @@ node --test crates/waltr-app/scripts/confined-ipc.test.mjs
 | --- | --- |
 | Generic MCP | Default-off capability, typed declarations/read errors, exact metadata/visibility, raw fields, bounded resource decode, and independent lifecycle payloads. |
 | Asset builds | Actual self-contained status output, independent second-fixture Vite output/Rust embedding, and separate mocked Cargo feature/override orchestration. |
-| Agent | App-only exclusion, exact provenance, refresh-stable credential authority, account-replacement rejection, middleware mutation denial, and raw snapshots outside model context. |
+| Server host | App-only exclusion, exact provenance, refresh-stable authority, account-replacement rejection, middleware mutation denial, and raw snapshots outside model context. |
 | Server session | Owner-bound handles, complete Effective pairs, stale/busy rejection, no inference, expiry/cancellation, audit results, and Close without session load. |
 | Shared client | Keyed state, original snapshot preservation, matching-call close preemption, unrelated-effect retention, stale completions, access invalidation, and late canceled-open cleanup. |
 | Web host | SDK handshake, original input/result exactly once, response-only refresh, message validation, unsupported methods, persisted pagehide retention, and final-unload cleanup. |
@@ -833,13 +871,13 @@ Live agent tests are ignored by default. Running them explicitly without provide
 
 Use the shared gateway:
 
-`WALTR_AGENT_LIVE_GATEWAY=1 cargo test -p waltr-agent --features shell --test live -- --ignored`
+`WALTR_AGENT_LIVE_GATEWAY=1 cargo test -p waltr-agent --test live -- --ignored`
 
 Use direct provider credentials:
 
-`OPENAI_API_KEY=<key> cargo test -p waltr-agent --features shell --test live -- --ignored`
+`OPENAI_API_KEY=<key> cargo test -p waltr-agent --test live -- --ignored`
 
-`ANTHROPIC_API_KEY=<key> cargo test -p waltr-agent --features shell --test live -- --ignored`
+`ANTHROPIC_API_KEY=<key> cargo test -p waltr-agent --test live -- --ignored`
 
 Select the live provider for selected-provider tests with `WALTR_AGENT_LIVE_PROVIDER`.
 

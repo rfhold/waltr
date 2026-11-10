@@ -23,6 +23,8 @@ Streams are the server's shared-state contract; drift causes clients to render s
 - Update events omit ETag or changed-section metadata.
 - Cancellation leaves watcher, pubsub, or task resources alive.
 - Domain errors map to generic gRPC status codes.
+- Session summaries discard concurrent metadata because append callers ignore coherent commit receipts.
+- Public session/projection revision guards use internal execution sequences or accept obsolete lifecycle publications.
 
 ## Suggested Tests
 

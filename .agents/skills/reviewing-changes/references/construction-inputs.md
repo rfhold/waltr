@@ -10,12 +10,18 @@ Positional forwarding through multiple wrappers makes it hard to see which host 
 
 ## Source Files To Inspect
 
+The generic factory accepts neutral host contracts. The server host factory owns concrete capabilities, policy, broker, and worker dependencies.
+
 - [Server session service constructors](../../../../crates/waltr-server/src/session/service.rs)
 - [Server session registration and forwarding](../../../../crates/waltr-server/src/session/mod.rs)
 - [App builders and session-service callback](../../../../crates/waltr-server/src/app.rs)
 - [Agent session runtime factory](../../../../crates/waltr-agent/src/agent/session/runtime_factory.rs)
-- [Agent workspace request gateway](../../../../crates/waltr-agent/src/sandbox_gateway.rs)
-- [Agent prompt template runtime](../../../../crates/waltr-agent/src/template.rs)
+- [Server host runtime builder](../../../../crates/waltr-server/src/agent_host/builder.rs)
+- [Server host runtime factory](../../../../crates/waltr-server/src/agent_host/runtime_factory.rs)
+- [Server workspace request gateway](../../../../crates/waltr-server/src/agent_host/sandbox_gateway.rs)
+- [Server prompt template runtime](../../../../crates/waltr-server/src/agent_host/template.rs)
+- [Server provider-only credential adapter](../../../../crates/waltr-server/src/auth/credentials.rs)
+- [Server live interaction broker](../../../../crates/waltr-server/src/interaction.rs)
 - [SessionCreateRequest](../../../../crates/waltr-agent/src/agent/session/create.rs)
 - [SessionRunContext](../../../../crates/waltr-agent/src/agent/session/control.rs)
 
@@ -26,6 +32,12 @@ Positional forwarding through multiple wrappers makes it hard to see which host 
 - A workspace request uses operation strings, placeholder arguments, or positional bounds instead of operation-specific fields at the gateway boundary.
 - An older constructor reaches the same runtime by supplying a disconnected sandbox handle instead of requiring the caller to provide the capability or making a truly separate lifecycle explicit.
 - A one-field context only forwards another context, a request groups unrelated values only to shorten a signature, or separate constructors for genuinely different ownership are collapsed into one bag of optional fields.
+- A generic agent constructor acquires concrete MCP, permission, worker, or upstream credential dependencies instead of neutral host contracts.
+- A host constructs a second broker or policy instance, so RPC observers cannot reach the original live operation.
+- A Routine adapter interprets category metadata, hides helper tasks/budgets, or selects workflow policy by bundled Routine name.
+- A host treats public metadata as helper/task provenance, original-history access or private approval evidence.
+- SQL publishes a program/text reference before immutable payload verification, or a missing object silently falls back to catalog bytes.
+- Embedded storage reads standalone environment defaults, or a schema upgrade converts or deletes retained Routine state without separate authority.
 
 ## Suggested Tests
 

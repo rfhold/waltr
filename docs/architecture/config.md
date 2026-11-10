@@ -44,7 +44,7 @@ Waltr does not merge resource fields. Waltr does not support aggregate patches, 
 
 ## Resource Schemas
 
-All resources use `apiVersion: waltr.dev/v1alpha1`. The catalog rejects unknown fields and invalid path, kind, or name identities.
+Agent, feature, permission, provider, MCP server and defaults resources use `apiVersion: waltr.dev/v1alpha1`. Production Routine resources use `apiVersion: waltr.routine/v1` with top-level `name` and `description`. The catalog rejects unknown fields and invalid path, kind, or name identities. Production rejects legacy Routine DSL overrides. Replace unsupported resources with reviewed current-schema definitions; no converter or fallback exists.
 
 Agent, feature, and permission syntax is documented in [Agent Architecture](agent.md#agent-definitions).
 
@@ -79,31 +79,19 @@ Routine changes that break this default also reject the candidate catalog.
 `Configuration.session_dictation` and shared `ConfigView.sessionDictation` expose the selection through the ordinary catalog snapshot and watch path.
 Explicit interaction APIs and desktop keybind selections remain independent.
 
-`Routine` defines a server-owned event, manual, `sessionLifecycle.runCompleted`, or interaction workflow. Each trigger declares exactly one form. The interaction runtime and RPC service support audio/text execution. See [Routines](routines.md#interaction-catalog-and-runtime). Conditions support `In`, `NotIn`, numeric `GreaterThanOrEqual`, nested `any` OR groups, and top-level AND semantics.
+`Routine` defines a bounded JavaScript program with typed entrypoints and host capabilities. JavaScript owns workflow decisions; production does not interpret task graphs, expression substitutions or legacy trigger conditions. See [Routines](routines.md#interaction-catalog-and-runtime).
 
-Parameters use closed string or boolean scalars. String parameters support required use, `validation.minLength`, and bounded Rust regex patterns. Manual triggers expose declared parameters with session scope.
+Routine entrypoints declare bounded scalar/stream contracts; JavaScript expresses workflow ordering and uses reviewed host APIs. The removed task DAG, `sessionTemplate`, replacement-system-prompt, and `spec.sourceSession` DSL is not accepted. Helpers use normal named agent bundles and durable provider-neutral copied history where authorized. Raw versus mask-effective source capture and owned pauses are explicit server contracts, not implicit DSL behavior. See [Routines](routines.md) and the [script API](../../crates/waltr-server/src/routine/README.md) for exact current fields, limits, capture, masks, and retention.
 
-Event/manual tasks form a validated `runAfter` DAG that the sequential executor processes. Each task contains a generic agent template or one supported action; speech and collector tasks require the interaction runtime and are rejected before sequential admission. Both executors interpret `runAfter` as requiring completion: succeeded and skipped prerequisites permit successors, while failed or interrupted prerequisites block them. Interaction definitions also validate live stream dependencies. The separate interaction runtime schedules live components concurrently; it does not extend action support. Standalone `sessionTemplate.model` helpers resolve inference against the admission-pinned configuration in either executor; interaction helpers retain their one-turn, no-tools restrictions.
+All eleven bundled Routine resources have matching [documentation examples](../examples/routines/README.md). Media, capture, and code capabilities require explicit host grants; loading an example grants no authority.
 
-Agent tasks require replacement prompts, explicit feature, tool, and permission lists, `maxTurns`, and text output. They inherit provider settings from a source session, with reasoning disabled.
-
-Every source-backed `sessionTemplate` atomically creates a durable helper with rollback-aware provider-neutral inference history through the latest completed turn. The helper stores that history followed by its task prompt. The history preserves provider-replay prompts, assistant text, tool calls and results, and inline images. It excludes lifecycle, middleware, status, usage and cost, request audit, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work.
-
-Provider requests derive only from durable helper state. The history persists across restart and storage backends under ordinary session retention rules. The history is not a byte-for-byte HTTP wire archive. Provider adapters apply their normal encoding rules. An inherited-inference or standalone-model `sessionTemplate` starts with only its task prompt.
-
-The metadata action supports one scalar `set` mutation with `ifAbsent: true`. The implemented `sessionCreate` subset requires exact inference and agent-definition inheritance, metadata, one first prompt, and immediate start.
-
-Top-level `spec.sourceSession` supports manual triggers and `runCompleted` lifecycle triggers. A paused source queues submissions; manual acquisition requires `onBusy: reject`, while lifecycle admission claims the source completion barrier. Inference-only event Routines remain supported.
-
-`sourceSession.snapshot` admits a manual raw latest-completed capture. `sourceSession.pause` admits a mask-effective completed-turn capture pinned to an exclusive process-local boundary. Implemented compaction actions atomically subtract overlapping prefix replacement masks, add one keyed prefix replacement, and optionally continue from the committed mask cursor.
-
-The implemented mask subset is persistent replacement masks with completed-prefix selectors, opaque IDs, stable keys, overlap subtraction and rejection, explicit removal, and effective replay. Filter, truncation, annotation, exact item-set, and category-oriented masks remain unsupported. Other unsupported fields, operators, actions, task types, and substitutions fail strict validation.
-
-The server bundles [`title`](../../crates/waltr-server/resources/routines/title.yaml), [`compact-and-continue`](../../crates/waltr-server/resources/routines/compact-and-continue.yaml), and [`fork`](../../crates/waltr-server/resources/routines/fork.yaml). Their matching [documentation examples](../examples/routines/README.md) use identical source. The examples index separates the implemented subset from proposed fixture syntax.
+Concrete agent/feature/permission parsing and resolution belong to server `agent_host/`, not the generic agent. Visible upstream tool aliases are `<server>__<tool>` (self server `waltr__*`), distinct from exact capability identities. Persisted overrides with old aliases need deliberate full-resource replacement. Follow the [coordinated upgrade runbook](../runbooks/server-capability-cutover.md); no resource edit implicitly resets sessions, credentials, or current SQL history.
 
 The catalog materializes providers, MCP servers, and defaults into `waltr.config.v1.Configuration`. Runtime, auth, catalog search, and clients use this projection. The server retains routines separately, so routine resources never enter agent-definition bundles.
 
 ## Speech Provider Contract
+
+Catalog membership does not select or authorize Routine speech. The standalone binary uses explicit [Routine speech environment pairs and optional TTS choices](../deployment.md#standalone-routine-speech); embedding hosts supply `BuildAppOptions.routine_authority` or their embedded configuration directly. Unset selections remain disabled. Each invocation resolves the exact selected provider/model and streaming kind from its catalog snapshot, without ambient first-model selection or helper/code grants.
 
 The catalog accepts `googleSpeechV2` and `googleTextToSpeechV1` transports. These additive `ProviderType` values are 5 and 6; current inference values and model fields retain their meanings. `waltr-audio` implements unary and duplex speech adapters. The internal interaction runtime connects those adapters through explicit model resolution. The application registers interaction RPCs under common authentication and shared admission. Local implementation does not establish deployment availability or real upstream compatibility.
 
@@ -148,6 +136,7 @@ models:
       streaming: true
     synthesis:
       voice: en-US-Chirp3-HD-Aoede
+      # model_name: upstream-model-id # optional; endpoint-specific
       language_code: en-US
       sample_rate_hz: 24000
       channels: 1
@@ -157,9 +146,25 @@ models:
 
 Model keys, recognition model IDs, recognizers, languages, and voices are explicit operator configuration, not discovery or a guarantee that an upstream endpoint supports them. At least one capability must be true. Recognition accepts 1–3 nonempty language codes, 8–48 kHz PCM, and 1–8 channels. Synthesis accepts 8–48 kHz mono PCM. Capability declarations are checked locally; they do not probe upstream support. The interaction adapter maps speaking rate, requires streaming capability, and rejects nonzero pitch. It never substitutes unary speech calls.
 
+Optional `synthesis.model_name` must be nonempty when set. The adapter copies it unchanged to Google `VoiceSelectionParams.model_name`. Absence preserves the upstream default (an empty wire value). This selector is independent of the Provider's model map key. Each call retains that catalog selector when it chooses a voice, language, or rate.
+
 Recognition supports the optional boolean `recognition.diarization`, which defaults to `false` when absent. For an endpoint with cumulative diarization support, `true` sends an empty Google `RecognitionFeatures.diarization_config`; no speaker-count constraints accompany it. The Routine adapter expects provisional cumulative text followed by one final cumulative response with attributed words. This opt-in does not probe backend support or enable diarization on current models. See the [Routine transcript contract](routines.md#speech-and-text) for text output and limits.
 
-The [conversation-notes example](../examples/routines/audio-conversation-notes.yaml) selects a separate `speech/diarized-dictation` model with `recognition.diarization: true`. Keep the ordinary `speech/dictation` model disabled for diarization to preserve plain transcription and cleanup behavior.
+Typed transcript snapshots require `recognition.diarization: true` on the host-selected STT model and an endpoint that implements the cumulative, attributed-word contract.
+The conversation-notes Routine requests these snapshots; a non-diarized selection cannot satisfy it.
+Plain transcription and cleanup collect ordinary transcripts without snapshots or a diarization requirement.
+The host supplies independent exact `RoutineAuthority.recognition` and optional `recognition_snapshot` provider/model pairs.
+Ordinary transcription uses only `recognition`; an explicit `recognition_snapshot` supplies only typed snapshots.
+Both selections resolve from one invocation catalog snapshot and retain their own endpoints and model options.
+The explicit snapshot selection requires STT kind, streaming support and `recognition.diarization: true` at startup and invocation admission.
+Invalid or unavailable explicit snapshot selections fail closed, without fallback to ordinary recognition.
+Without `recognition_snapshot`, an explicitly diarized `recognition` selection retains its prior ordinary and snapshot support.
+Snapshot-only hosts need no ordinary recognition selection.
+Media admission accepts input PCM when either available STT path supports it; admission does not predict dynamic JavaScript operations.
+Ordinary and snapshot operations enforce their own exact PCM settings before provider effects, without conversion or cross-selection fallback.
+Standalone hosts supply the separate pair through `WALTR_ROUTINE_STT_SNAPSHOT_PROVIDER` and `WALTR_ROUTINE_STT_SNAPSHOT_MODEL`.
+Standalone helper attachments and capture tools require independent, exact [host ceilings](../deployment.md#standalone-routine-speech).
+Catalog membership and normal agent permissions cannot raise those ceilings.
 
 Speech models reject inference options, token limits, LLM capabilities, cost/catalog matching fields, wrong transport/model kinds, and mismatched option families. Inference providers cannot contain STT/TTS models or speech options. Inference defaults cannot select a speech provider. Existing LLM resources need no new fields.
 
@@ -233,7 +238,7 @@ Persisted revisions equal persisted-slot ETags; absent-slot revisions also guard
 Destroy removes only a persisted override and restores bundled fallback when present.
 See the embedded [resource contract](../../crates/waltr-server/resources/skills/resource-administration/references/resources.md) for URI encoding and edit inputs.
 
-`waltr.routine.v1.RoutineService` provides global definition snapshots, durable manual admission, history, detail, and lifecycle replay.
+`waltr.routine.v2.RoutineService` provides complete source-free definitions, durable admission, observations, operations, cancellation, text results and native/browser interaction lanes. Production registers no v1 Routine service.
 
 See [Routines](routines.md) for revision pinning, validation, detached starts, persistence, replay, and restart behavior.
 
@@ -364,7 +369,7 @@ See [Deployment](../deployment.md#client-audio-host-prerequisites) for platform 
 | Path | Purpose |
 | --- | --- |
 | [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC messages and service contract. |
-| [../../proto/waltr/routine/v1/routine_service.proto](../../proto/waltr/routine/v1/routine_service.proto) | Generic manual Routine discovery and invocation contract. |
+| [../../proto/waltr/routine/v2/routine.proto](../../proto/waltr/routine/v2/routine.proto) | Routine discovery, invocation, transport and review contract. |
 | [../../proto/waltr/config/v1/config_service.proto](../../proto/waltr/config/v1/config_service.proto) | Effective configuration projection types. |
 | [../../crates/waltr-server/src/resource_catalog/](../../crates/waltr-server/src/resource_catalog/) | Catalog state, materialization, persistence, ETags, and watcher lifecycle. |
 | [../../crates/waltr-server/src/resource_catalog/routine.rs](../../crates/waltr-server/src/resource_catalog/routine.rs) | Strict Routine schema and validation. |

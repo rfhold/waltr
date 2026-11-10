@@ -106,7 +106,7 @@ If that mapping exists, use label queries rather than body substring filters:
 If the collector retains attributes as structured metadata, use its actual field names in pipeline filters instead.
 In Tempo, use `{ resource.service.name = "waltr-app-native" && name = "native.audio.operation" }`.
 Compare milestone elapsed times and child gRPC spans within the same trace.
-Audio RPC children are named `routine_interaction.Interact` or `routine_interaction.Run`, with service `waltr.routine.v1.RoutineInteractionService` and the literal method name.
+Audio RPC children use the literal v2 catalog, including `routine.Interact` and `routine.OpenAttachment`, with service `waltr.routine.v2.RoutineService` and the literal method name. The removed v1 `Run` endpoint is not a current telemetry boundary.
 Unknown paths still report `grpc.unknown` without exporting the path. This does not add upstream server status precision.
 Operation permission, milestone, and terminal logs carry the operation trace and span IDs.
 This includes worker `capture_ready` logs and terminal logs after the async operation scope exits.

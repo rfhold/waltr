@@ -223,7 +223,11 @@ Run server access-auth tests:
 
 Run deterministic agent MCP integration tests:
 
-`cargo test -p waltr-agent --features shell --test agent mcp`
+`cargo build -p waltr-server --bin waltr-server-test-mcp-server`
+
+`cargo test -p waltr-server --lib host_tests::mcp`
+
+Concrete host tests are library module `host_tests`, not a `--test host_tests` target. Generic agent tests use no shell feature. See [Testing](docs/testing.md) for the runner/host split and live prerequisites.
 
 Compile the exact shared-client integration targets:
 

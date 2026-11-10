@@ -3,7 +3,10 @@
 | Path | Info |
 | --- | --- |
 | [crates/waltr-server/](crates/waltr-server/) | Server coordination layer. |
+| [crates/waltr-script/](crates/waltr-script/) | Isolated JavaScript engine, host boundary, callbacks, and resources; not server policy. |
 | [crates/waltr-agent/](crates/waltr-agent/) | Isolated agent library. |
+| [docs/agent-host/](docs/agent-host/) | Server-owned tools, templates, middleware, Skills, permissions, and MCP guidance. |
+| [docs/runbooks/server-capability-cutover.md](docs/runbooks/server-capability-cutover.md) | Coordinated server/client/history upgrade; exact separately authorized reset targets. |
 | [crates/waltr-audio/](crates/waltr-audio/) | Bounded Google speech adapters; no auth, devices, or codec conversion. |
 | [crates/waltr-audio-io/](crates/waltr-audio-io/) | Native capture and PCM conversion, independent of UI and network transports. |
 | [crates/waltr-desktop/](crates/waltr-desktop/) | Desktop configuration, hold lifecycle, shortcuts, commands, and live external-text actions. |

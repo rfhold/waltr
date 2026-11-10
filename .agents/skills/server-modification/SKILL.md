@@ -29,6 +29,10 @@ Use this skill for server-owned MCP configuration validation or resolved session
 6. Keep filesystem behavior behind config store, watcher, and pubsub abstractions rather than leaking file details into services.
 7. Convert domain errors to precise gRPC statuses at the service boundary.
 8. Keep router construction centralized in `app.rs` and service-specific behavior in the corresponding service module.
+9. Keep Routine workflow policy in JavaScript/resources; expose authorized generic context/history/metadata/mask/create/start primitives.
+10. Keep helper/task provenance process-local and incarnation-bound. Public metadata never grants source access or private approvals.
+11. Persist and verify immutable Routine program/text objects before SQL publication; commit ownership, quotas and references atomically.
+12. Reject populated incompatible Routine state before destructive migration. Add no converter, fallback, automatic wipe or object collector.
 
 ## Test Selection
 
@@ -51,6 +55,8 @@ Run server integration tests:
 | Path | Info |
 | --- | --- |
 | [../../../docs/architecture/config.md](../../../docs/architecture/config.md) | Config persistence, patch, ETag, and watch architecture. |
+| [../../../docs/architecture/routines.md](../../../docs/architecture/routines.md) | Routine-owned policy, generic primitives, media and lifecycle contracts. |
+| [../../../docs/architecture/persistence.md](../../../docs/architecture/persistence.md) | Immutable payload publication, backend configuration and incompatible-state refusal. |
 | [../../../docs/architecture/clients.md](../../../docs/architecture/clients.md) | Server/client boundary and shared client contract. |
 | [../../../docs/testing.md](../../../docs/testing.md) | Canonical layered test structure and commands. |
 | [../../../crates/waltr-server/AGENTS.md](../../../crates/waltr-server/AGENTS.md) | Server crate boundary and client dependency contract. |
