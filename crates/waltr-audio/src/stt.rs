@@ -8,20 +8,20 @@ use crate::{
 };
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
-pub use waltr::grpc::google::cloud::speech::v2::*;
 use prost::Message;
 pub use speech_client::SpeechClient;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+pub use waltr::grpc::google::cloud::speech::v2::*;
 
-const fn audio_request(bytes: Vec<u8>) -> StreamingRecognizeRequest {
+pub(crate) const fn audio_request(bytes: Vec<u8>) -> StreamingRecognizeRequest {
     StreamingRecognizeRequest {
         recognizer: String::new(),
         streaming_request: Some(streaming_recognize_request::StreamingRequest::Audio(bytes)),
     }
 }
 
-const fn decoding(config: &mut RecognitionConfig, format: PcmS16Le) {
+pub(crate) const fn decoding(config: &mut RecognitionConfig, format: PcmS16Le) {
     config.decoding_config = Some(recognition_config::DecodingConfig::ExplicitDecodingConfig(
         ExplicitDecodingConfig {
             encoding: explicit_decoding_config::AudioEncoding::Linear16 as i32,

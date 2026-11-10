@@ -48,6 +48,7 @@
 
 pub mod audio;
 pub mod client;
+pub mod compact_stt;
 pub mod config;
 pub mod error;
 pub mod stt;

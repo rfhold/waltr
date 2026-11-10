@@ -1,8 +1,8 @@
 //! Loopback Speech v2 message sizing and byte-preservation regressions.
 use super::support;
 use futures_util::{StreamExt, stream};
-use waltr_audio::{CancellationToken, audio::PcmS16Le, error::Error, stt};
 use std::time::Duration;
+use waltr_audio::{CancellationToken, audio::PcmS16Le, error::Error, stt};
 
 async fn sized_recording(channels: i32, sizes: &[usize], expected_sizes: &[usize]) {
     let (client, _server, capture) = support::start_speech_capture(|config| {
@@ -211,7 +211,7 @@ async fn split_input_is_dropped_on_cancel_deadline_status_and_early_eof() {
             )),
             support::Mode::Fail => super::check_status(response.unwrap().unwrap_err()),
             support::Mode::EarlyEof => assert!(response.is_none()),
-            support::Mode::Ok | support::Mode::TerminalFail => unreachable!(),
+            _ => unreachable!(),
         }
         tokio::time::timeout(Duration::from_secs(3), dropped)
             .await

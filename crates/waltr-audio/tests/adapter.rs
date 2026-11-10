@@ -1,6 +1,13 @@
 //! Loopback-only upstream contract and lifecycle tests.
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Wake, Waker},
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot};
 use waltr_audio::{
     CancellationToken,
     audio::{Container, PcmS16Le},
@@ -9,13 +16,6 @@ use waltr_audio::{
     error::Error,
     stt, tts,
 };
-use std::{
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, Wake, Waker},
-    time::Duration,
-};
-use tokio::sync::{mpsc, oneshot};
 #[path = "support/streaming_pcm.rs"]
 mod streaming_pcm;
 mod support;
@@ -53,6 +53,85 @@ fn text() -> tts::StreamingSynthesisInput {
         )),
         ..Default::default()
     }
+}
+#[tokio::test]
+async fn awaited_finish_and_cancel_reap_owned_workers() {
+    let (client, _server) = start(Mode::Ok, Duration::from_secs(5)).await;
+    let output = client
+        .streaming_synthesize(
+            streaming_config(),
+            stream::iter([Ok(text())]),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    output.finish().await.unwrap();
+
+    for mode in [Mode::EarlyEof, Mode::Fail, Mode::TerminalFail, Mode::Stall] {
+        let (client, _server) = start(mode, Duration::from_secs(5)).await;
+        let output = client
+            .streaming_synthesize(
+                streaming_config(),
+                stream::pending(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), output.cancel_and_join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn awaited_finish_reports_terminal_error_and_joins_early_eof() {
+    for mode in [Mode::EarlyEof, Mode::Fail] {
+        let (client, _server) = start(mode, Duration::from_secs(5)).await;
+        let output = client
+            .streaming_synthesize(
+                streaming_config(),
+                stream::pending(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), output.finish())
+            .await
+            .unwrap();
+        assert_eq!(result.is_ok(), matches!(mode, Mode::EarlyEof));
+    }
+}
+
+#[tokio::test]
+async fn awaited_finish_reports_panicked_producer_without_hanging() {
+    let (client, _server) = start(Mode::EarlyEof, Duration::from_secs(5)).await;
+    let input = stream::poll_fn(
+        |_| -> std::task::Poll<Option<Result<tts::StreamingSynthesisInput, Error>>> {
+            panic!("test producer panic")
+        },
+    );
+    let output = client
+        .streaming_synthesize(streaming_config(), input, CancellationToken::new())
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), output.finish())
+        .await
+        .unwrap();
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn dropping_completion_future_keeps_drop_cancellation_compatibility() {
+    let (client, _server) = start(Mode::Stall, Duration::from_secs(5)).await;
+    let (input, dropped) = tracked(stream::pending());
+    let output = client
+        .streaming_synthesize(streaming_config(), input, CancellationToken::new())
+        .unwrap();
+    let mut completion = Box::pin(output.finish());
+    assert!(futures_util::poll!(&mut completion).is_pending());
+    drop(completion);
+    // This observes eventual Drop cleanup, not awaited completion of an abandoned join.
+    tokio::time::timeout(Duration::from_secs(3), dropped)
+        .await
+        .unwrap()
+        .unwrap();
 }
 async fn next<T>(output: &mut (impl Stream<Item = T> + Unpin)) -> T {
     tokio::time::timeout(Duration::from_secs(3), output.next())

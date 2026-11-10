@@ -1,6 +1,5 @@
 #![allow(clippy::wildcard_imports)]
-use futures_core::Stream;
-use waltr_audio::{client::Client, config::Config, stt, tts};
+use futures_util::Stream;
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
@@ -8,8 +7,10 @@ use std::{
 };
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
+use waltr_audio::{client::Client, config::Config, stt, tts};
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Shared with server media adapter tests.
 pub enum Mode {
     Ok,
     Fail,
@@ -17,11 +18,19 @@ pub enum Mode {
     TerminalFail,
     Stall,
     EarlyEof,
+    Media,
+    Diarized,
+    DiarizedPortions,
+    DiarizedPortionsEarlyEof,
+    DiarizedPortionsFail,
+    OddPcm,
+    IncompletePcm,
 }
 pub struct Fake {
     mode: Mode,
     backpressure: Arc<Mutex<Option<BackpressureService>>>,
     speech_capture: Option<SpeechCapture>,
+    synthesis_capture: SynthesisCapture,
 }
 struct BackpressureService {
     release: oneshot::Receiver<()>,
@@ -62,6 +71,10 @@ pub async fn start_backpressure(timeout: Duration) -> (Client, Server, Backpress
     )
 }
 pub struct Server {
+    #[allow(dead_code)] // Shared with server media adapter tests.
+    pub synthesis_capture: SynthesisCapture,
+    #[allow(dead_code)] // Shared with server media adapter tests.
+    pub endpoint: String,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -80,6 +93,7 @@ pub async fn start_with(
     start_inner(mode, timeout, adjust, None, None).await
 }
 pub type SpeechCapture = Arc<Mutex<Vec<stt::StreamingRecognizeRequest>>>;
+pub type SynthesisCapture = Arc<Mutex<Vec<tts::StreamingSynthesizeConfig>>>;
 pub async fn start_speech_capture(
     adjust: impl FnOnce(&mut Config),
 ) -> (Client, Server, SpeechCapture) {
@@ -101,7 +115,7 @@ async fn start_inner(
     backpressure: Option<BackpressureService>,
     speech_capture: Option<SpeechCapture>,
 ) -> (Client, Server) {
-    start_inner_traced(mode, timeout, adjust, backpressure, speech_capture, None).await
+    start_inner_traced(mode, timeout, adjust, (backpressure, speech_capture, None)).await
 }
 pub type MetadataCapture = Arc<Mutex<Vec<tonic::metadata::MetadataMap>>>;
 #[allow(dead_code)]
@@ -111,9 +125,7 @@ pub async fn start_trace_capture(mode: Mode) -> (Client, Server, MetadataCapture
         mode,
         Duration::from_secs(5),
         |_| {},
-        None,
-        None,
-        Some(metadata.clone()),
+        (None, None, Some(metadata.clone())),
     )
     .await;
     (client, server, metadata)
@@ -122,10 +134,13 @@ async fn start_inner_traced(
     mode: Mode,
     timeout: Duration,
     adjust: impl FnOnce(&mut Config),
-    backpressure: Option<BackpressureService>,
-    speech_capture: Option<SpeechCapture>,
-    metadata: Option<MetadataCapture>,
+    captures: (
+        Option<BackpressureService>,
+        Option<SpeechCapture>,
+        Option<MetadataCapture>,
+    ),
 ) -> (Client, Server) {
+    let (backpressure, speech_capture, metadata) = captures;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::new(format!("http://{}", listener.local_addr().unwrap()));
     config.request_timeout = timeout;
@@ -133,6 +148,8 @@ async fn start_inner_traced(
     config.queue_bytes = 128;
     adjust(&mut config);
     let backpressure = Arc::new(Mutex::new(backpressure));
+    let synthesis_capture = SynthesisCapture::default();
+    let captured_synthesis = synthesis_capture.clone();
     let task = tokio::spawn(async move {
         let intercept = move |request: Request<()>| {
             if let Some(metadata) = &metadata {
@@ -146,6 +163,7 @@ async fn start_inner_traced(
                     mode,
                     backpressure: backpressure.clone(),
                     speech_capture: speech_capture.clone(),
+                    synthesis_capture: captured_synthesis.clone(),
                 },
                 intercept.clone(),
             ))
@@ -155,6 +173,7 @@ async fn start_inner_traced(
                         mode,
                         backpressure,
                         speech_capture,
+                        synthesis_capture: captured_synthesis,
                     },
                     intercept,
                 ),
@@ -163,11 +182,28 @@ async fn start_inner_traced(
             .await
             .unwrap();
     });
-    (Client::connect(config).await.unwrap(), Server { task })
+    let endpoint = config.uri.clone();
+    (
+        Client::connect(config).await.unwrap(),
+        Server {
+            endpoint,
+            task,
+            synthesis_capture,
+        },
+    )
 }
 async fn behavior(mode: Mode) -> Result<(), Status> {
     match mode {
-        Mode::Ok | Mode::EarlyEof | Mode::TerminalFail => Ok(()),
+        Mode::Ok
+        | Mode::EarlyEof
+        | Mode::TerminalFail
+        | Mode::Media
+        | Mode::Diarized
+        | Mode::DiarizedPortions
+        | Mode::DiarizedPortionsEarlyEof
+        | Mode::DiarizedPortionsFail
+        | Mode::OddPcm
+        | Mode::IncompletePcm => Ok(()),
         Mode::Fail => Err(Status::with_details(
             tonic::Code::ResourceExhausted,
             "fake quota",
@@ -177,6 +213,134 @@ async fn behavior(mode: Mode) -> Result<(), Status> {
     }
 }
 type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+fn diarized_portions(
+    input: tonic::Streaming<stt::StreamingRecognizeRequest>,
+    mode: Mode,
+) -> Output<stt::StreamingRecognizeResponse> {
+    Box::pin(futures_util::stream::try_unfold(
+        (input, 0),
+        move |(mut input, step)| async move {
+            if step == 4 || (step == 3 && matches!(mode, Mode::DiarizedPortionsEarlyEof)) {
+                return Ok(None);
+            }
+            if step == 3 {
+                while input.message().await?.is_some() {}
+                if matches!(mode, Mode::DiarizedPortionsFail) {
+                    return Err(Status::unavailable("after portion finals"));
+                }
+            }
+            let (transcript, final_result, words): (&str, bool, Vec<(&str, &str)>) = match step {
+                0 => ("hello", true, vec![("hello", "S1")]),
+                1 => ("wor...", false, vec![("hello", "S2"), ("world", "S2")]),
+                2 => ("world", true, vec![("hello", "S2"), ("world", "S3")]),
+                _ => (
+                    "again",
+                    true,
+                    vec![("hello", "S2"), ("world", "S3"), ("again", "S3")],
+                ),
+            };
+            let response = stt::StreamingRecognizeResponse {
+                results: vec![stt::StreamingRecognitionResult {
+                    is_final: final_result,
+                    channel_tag: 7,
+                    alternatives: vec![stt::SpeechRecognitionAlternative {
+                        transcript: transcript.into(),
+                        words: words
+                            .into_iter()
+                            .map(|(word, speaker)| stt::WordInfo {
+                                word: word.into(),
+                                speaker_label: speaker.into(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            Ok(Some((response, (input, step + 1))))
+        },
+    ))
+}
+fn media_transcripts(
+    input: tonic::Streaming<stt::StreamingRecognizeRequest>,
+    diarized: bool,
+) -> Output<stt::StreamingRecognizeResponse> {
+    Box::pin(futures_util::stream::try_unfold(
+        (input, false),
+        move |(mut input, done)| async move {
+            if done {
+                return Ok(None);
+            }
+            let final_result = input.message().await?.is_none();
+            let response = stt::StreamingRecognizeResponse {
+                results: vec![stt::StreamingRecognitionResult {
+                    is_final: final_result,
+                    channel_tag: 2,
+                    alternatives: vec![stt::SpeechRecognitionAlternative {
+                        transcript: "hello world".into(),
+                        words: if diarized {
+                            vec![
+                                stt::WordInfo {
+                                    word: "hello".into(),
+                                    speaker_label: "S1".into(),
+                                    ..Default::default()
+                                },
+                                stt::WordInfo {
+                                    word: "world".into(),
+                                    speaker_label: "S2".into(),
+                                    ..Default::default()
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            Ok(Some((response, (input, final_result))))
+        },
+    ))
+}
+fn media_synthesis(
+    input: tonic::Streaming<tts::StreamingSynthesizeRequest>,
+    mode: Mode,
+) -> Output<tts::StreamingSynthesizeResponse> {
+    Box::pin(futures_util::stream::try_unfold(
+        (input, false),
+        move |(mut input, done)| async move {
+            if done {
+                return Ok(None);
+            }
+            if input.message().await?.is_some() {
+                let bytes = if matches!(mode, Mode::OddPcm | Mode::IncompletePcm) {
+                    vec![1]
+                } else {
+                    vec![1, 0]
+                };
+                Ok(Some((
+                    tts::StreamingSynthesizeResponse {
+                        audio_content: bytes,
+                    },
+                    (input, false),
+                )))
+            } else if matches!(mode, Mode::OddPcm) {
+                Ok(Some((
+                    tts::StreamingSynthesizeResponse {
+                        audio_content: vec![0],
+                    },
+                    (input, true),
+                )))
+            } else {
+                Ok(None)
+            }
+        },
+    ))
+}
 #[tonic::async_trait]
 impl stt::speech_server::Speech for Fake {
     async fn recognize(
@@ -244,6 +408,18 @@ impl stt::speech_server::Speech for Fake {
         behavior(self.mode).await?;
         if matches!(self.mode, Mode::EarlyEof) {
             return Ok(Response::new(Box::pin(futures_util::stream::empty())));
+        }
+        if matches!(
+            self.mode,
+            Mode::DiarizedPortions | Mode::DiarizedPortionsEarlyEof | Mode::DiarizedPortionsFail
+        ) {
+            return Ok(Response::new(diarized_portions(input, self.mode)));
+        }
+        if matches!(self.mode, Mode::Media | Mode::Diarized) {
+            return Ok(Response::new(media_transcripts(
+                input,
+                matches!(self.mode, Mode::Diarized),
+            )));
         }
         let output = futures_util::stream::unfold((input, 0), |(mut input, step)| async move {
             if step == 2 {
@@ -463,12 +639,20 @@ impl tts::text_to_speech_server::TextToSpeech for Fake {
         request: Request<tonic::Streaming<tts::StreamingSynthesizeRequest>>,
     ) -> Result<Response<Self::StreamingSynthesizeStream>, Status> {
         let mut input = request.into_inner();
-        assert!(matches!(
-            input.message().await?.unwrap().streaming_request,
-            Some(tts::streaming_synthesize_request::StreamingRequest::StreamingConfig(_))
-        ));
+        let Some(tts::streaming_synthesize_request::StreamingRequest::StreamingConfig(config)) =
+            input.message().await?.unwrap().streaming_request
+        else {
+            panic!("synthesis configuration required")
+        };
+        self.synthesis_capture.lock().unwrap().push(config);
         behavior(self.mode).await?;
         let backpressure = self.backpressure.lock().unwrap().take();
+        if matches!(self.mode, Mode::EarlyEof) {
+            return Ok(Response::new(Box::pin(futures_util::stream::empty())));
+        }
+        if matches!(self.mode, Mode::Media | Mode::OddPcm | Mode::IncompletePcm) {
+            return Ok(Response::new(media_synthesis(input, self.mode)));
+        }
         if let Some(service) = backpressure {
             let output = futures_util::stream::unfold(
                 (input, service, 0),

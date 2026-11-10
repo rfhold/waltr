@@ -18,6 +18,7 @@ use tracing::Instrument as _;
 /// Reusable channel and generated clients. Clones share the connection, not requests.
 #[derive(Clone, Debug)]
 pub struct Client {
+    pub(crate) channel: Channel,
     pub(crate) config: Config,
     pub(crate) speech: stt::SpeechClient<Channel>,
     pub(crate) synthesis: tts::TextToSpeechClient<Channel>,
@@ -43,6 +44,7 @@ impl Client {
             .await
             .map_err(Error::Transport)?;
         Ok(Self {
+            channel: channel.clone(),
             speech: stt::SpeechClient::new(channel.clone())
                 .max_encoding_message_size(config.max_encoding_bytes)
                 .max_decoding_message_size(config.max_decoding_bytes),
@@ -69,15 +71,54 @@ impl Client {
 /// Explicit cancellation yields `Error::Cancelled`; normal input EOF allows final responses.
 /// Already queued results are drained before the terminal error. Cancellation and deadlines
 /// stop transport and producer even when the output queue is full. Each operation owns
-/// at most two tasks; neither survives response drop. The supplied token's parent is never
-/// cancelled by this stream.
+/// at most two tasks. Drop requests cancellation and aborts but cannot await teardown;
+/// use `finish` or `cancel_and_join` to prove completion. The supplied token's parent
+/// is never cancelled by this stream.
 #[derive(Debug)]
 pub struct Responses<T> {
     receiver: mpsc::Receiver<Result<T, Error>>,
-    tasks: Vec<tokio::task::AbortHandle>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     cancel: CancellationToken,
     terminal: oneshot::Receiver<Error>,
     terminal_done: bool,
+}
+impl<T: Send + 'static> Responses<T> {
+    /// Drain remaining responses and await both owned tasks. A previously consumed
+    /// stream error is not repeated; this method also verifies task teardown.
+    pub async fn finish(mut self) -> Result<(), Error> {
+        let mut failure = None;
+        while let Some(item) = self.next().await {
+            if let Err(error) = item {
+                failure = Some(error);
+            }
+        }
+        self.join_tasks().await?;
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Request cancellation, release queued responses, and await actual teardown.
+    /// Cancellation is expected here; a worker panic remains an error.
+    pub async fn cancel_and_join(mut self) -> Result<(), Error> {
+        self.cancel.cancel();
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+        self.join_tasks().await
+    }
+
+    async fn join_tasks(&mut self) -> Result<(), Error> {
+        let mut panicked = false;
+        while let Some(task) = self.tasks.last_mut() {
+            if let Err(error) = task.await {
+                panicked |= error.is_panic();
+            }
+            self.tasks.pop();
+        }
+        if panicked {
+            Err(Error::Invalid("audio worker panicked"))
+        } else {
+            Ok(())
+        }
+    }
 }
 impl<T> Stream for Responses<T> {
     type Item = Result<T, Error>;
@@ -114,13 +155,42 @@ pub(crate) fn duplex<I, Q, R, S, F, Fut>(
     cancel: CancellationToken,
     first: Q,
     input: S,
-    mut convert: impl FnMut(I) -> Result<Q, Error> + Send + 'static,
+    convert: impl FnMut(I) -> Result<Q, Error> + Send + 'static,
     call: F,
 ) -> Result<Responses<R>, Error>
 where
     I: Send + 'static,
     Q: Message + Send + Unpin + 'static,
     R: Send + 'static + Message + Default,
+    S: Stream<Item = Result<I, Error>> + Send + 'static,
+    F: FnOnce(tonic::Request<RequestStream<Q>>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<tonic::Response<tonic::Streaming<R>>, tonic::Status>>
+        + Send
+        + 'static,
+{
+    duplex_gated(config, rpc, cancel, first, input, convert, call, None)
+}
+
+pub(crate) struct ResponseGate<R> {
+    pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) attach: fn(R, tokio::sync::OwnedSemaphorePermit) -> R,
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+pub(crate) fn duplex_gated<I, Q, R, S, F, Fut>(
+    config: &Config,
+    rpc: Rpc,
+    cancel: CancellationToken,
+    first: Q,
+    input: S,
+    convert: impl FnMut(I) -> Result<Q, Error> + Send + 'static,
+    call: F,
+    gate: Option<ResponseGate<R>>,
+) -> Result<Responses<R>, Error>
+where
+    I: Send + 'static,
+    Q: Message + Send + Unpin + 'static,
+    R: Send + 'static,
     S: Stream<Item = Result<I, Error>> + Send + 'static,
     F: FnOnce(tonic::Request<RequestStream<Q>>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<tonic::Response<tonic::Streaming<R>>, tonic::Status>>
@@ -141,27 +211,7 @@ where
     let producer_span = operation_span.clone();
     let producer = tokio::spawn(
         async move {
-            let work = async move {
-                let mut input = Box::pin(input);
-                while let Some(item) = input.next().await {
-                    let request = convert(item?)?;
-                    let size = request.encoded_len();
-                    if size > max_bytes {
-                        return Err(Error::Invalid(
-                            "input chunk exceeds queue or encoding limit",
-                        ));
-                    }
-                    let permits = budget
-                        .clone()
-                        .acquire_many_owned(u32::try_from(size).expect("validated byte bound"))
-                        .await
-                        .expect("private semaphore remains open");
-                    if sender.send((request, permits)).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            };
+            let work = produce_requests(input, convert, max_bytes, budget, sender);
             tokio::select! { biased;
                 () = producer_cancel.cancelled() => {},
                 result = work => { if let Err(error) = result { let _sent = errors.send(error); } }
@@ -169,8 +219,7 @@ where
         }
         .instrument(producer_span),
     );
-    let producer_abort = producer.abort_handle();
-    let guard = AbortOnDrop(producer_abort.clone());
+    let guard = AbortOnDrop(producer.abort_handle());
     let mut request = tonic::Request::new(RequestStream {
         first: Some(first),
         receiver,
@@ -186,12 +235,7 @@ where
             let guard = guard;
             let work = async {
                 let mut upstream = call(request).await.map_err(Error::from)?.into_inner();
-                while let Some(response) = upstream.message().await.map_err(Error::from)? {
-                    if out.send(Ok(response)).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                Ok(())
+                forward_responses(&mut upstream, &out, gate.as_ref()).await
             };
             let result = tokio::select! { biased;
                 () = driver_cancel.cancelled() => Err(Error::Cancelled),
@@ -213,11 +257,71 @@ where
     );
     Ok(Responses {
         receiver: responses,
-        tasks: vec![producer_abort, driver.abort_handle()],
+        tasks: vec![producer, driver],
         cancel: operation_cancel,
         terminal,
         terminal_done: false,
     })
+}
+
+async fn produce_requests<I, Q: Message, S: Stream<Item = Result<I, Error>>>(
+    input: S,
+    mut convert: impl FnMut(I) -> Result<Q, Error>,
+    max_bytes: usize,
+    budget: Arc<Semaphore>,
+    sender: mpsc::Sender<(Q, tokio::sync::OwnedSemaphorePermit)>,
+) -> Result<(), Error> {
+    let mut input = Box::pin(input);
+    while let Some(item) = input.next().await {
+        let request = convert(item?)?;
+        let size = request.encoded_len();
+        if size > max_bytes {
+            return Err(Error::Invalid(
+                "input chunk exceeds queue or encoding limit",
+            ));
+        }
+        let permits = budget
+            .clone()
+            .acquire_many_owned(u32::try_from(size).expect("validated byte bound"))
+            .await
+            .expect("private semaphore remains open");
+        if sender.send((request, permits)).await.is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+// The permit must span upstream.message's decode and transfer into the response.
+#[allow(clippy::significant_drop_tightening)]
+async fn forward_responses<R: Send>(
+    upstream: &mut tonic::Streaming<R>,
+    out: &mpsc::Sender<Result<R, Error>>,
+    gate: Option<&ResponseGate<R>>,
+) -> Result<(), Error> {
+    loop {
+        // Checkout retains the gate; it must also cover the next frame's decoding.
+        let permit = if let Some(gate) = gate {
+            Some(
+                gate.semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Invalid("response gate closed"))?,
+            )
+        } else {
+            None
+        };
+        let Some(mut response) = upstream.message().await.map_err(Error::from)? else {
+            return Ok(());
+        };
+        if let (Some(gate), Some(permit)) = (gate, permit) {
+            response = (gate.attach)(response, permit);
+        }
+        if out.send(Ok(response)).await.is_err() {
+            return Ok(());
+        }
+    }
 }
 
 pub(crate) struct RequestStream<Q> {
