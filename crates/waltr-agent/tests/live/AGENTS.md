@@ -11,7 +11,7 @@ Live tests should use the real provider through shared setup instead of local pr
 | Path | Info |
 | --- | --- |
 | [../support/](../support/) | Shared live provider and capture setup. |
-| [agent/](agent/) | Live agent-loop, tool, permission, storage, and MCP coverage. |
+| [agent/](agent/) | Generic live inference and storage coverage. Concrete tool/permission/MCP live coverage lives in `../../../waltr-server/tests/agent_host/live/`. |
 
 # Hints
 

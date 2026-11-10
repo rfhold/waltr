@@ -1,11 +1,11 @@
 use std::sync::Mutex;
 
 use futures_util::stream;
+use serde_json::Value;
 use waltr_agent::{
     BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest, LlmStream,
     ToolDefinition,
 };
-use serde_json::Value;
 
 type RequestHandler = Box<
     dyn for<'a> Fn(&CompletionRequest<'a>) -> Vec<waltr_agent::Result<CompletionEvent>>
@@ -85,6 +85,7 @@ pub struct CapturingProvider<P> {
     system_prompts: Mutex<Vec<Option<String>>>,
 }
 
+#[allow(dead_code)]
 impl<P> CapturingProvider<P> {
     pub const fn new(inner: P) -> Self {
         Self {

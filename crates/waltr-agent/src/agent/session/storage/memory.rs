@@ -7,16 +7,14 @@ use std::{
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    mutate_on_record, sorted_session_summaries, timeline_item_text_from_record,
     timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
-        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
-    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -39,9 +37,9 @@ impl MemorySessionStore {
     fn with_record_mut<T>(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T>,
-    ) -> SessionStoreResult<(Revision, T)> {
+    ) -> SessionStoreResult<(super::super::SessionCommitReceipt, T)> {
         let mut records = self
             .records
             .lock()
@@ -50,22 +48,17 @@ impl MemorySessionStore {
             .get(id)
             .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
 
-        if record.revision != expected_revision {
-            return Err(SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: expected_revision,
-                actual: record.revision,
-            });
-        }
+        record.check_execution_token(&expected_token)?;
 
         let next_revision = record.revision.next();
         let mut updated = record.clone();
-        updated.revision = next_revision;
+        updated.advance_revision(true);
         let value = update(&mut updated, next_revision)?;
+        let receipt = updated.commit_receipt()?;
         records.insert(id.clone(), updated);
         drop(records);
 
-        Ok((next_revision, value))
+        Ok((receipt, value))
     }
 }
 
@@ -77,6 +70,7 @@ impl SessionStore for MemorySessionStore {
         let store = self.clone();
         async move {
             let record = request.materialize();
+            super::super::metadata::validate_record(&record)?;
             let mut records = store
                 .records
                 .lock()
@@ -156,44 +150,46 @@ impl SessionStore for MemorySessionStore {
     fn append_timeline(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<PendingTimelineEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::TimelineAppendReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (_, assigned) = store.with_record_mut(&id, expected_revision, |record, _| {
+            let (commit, events) = store.with_record_mut(&id, expected_token, |record, _| {
                 append_timeline_to_record(record, &id, events)
             })?;
 
-            Ok(assigned)
+            Ok(super::super::TimelineAppendReceipt { commit, events })
         }
     }
 
     fn append_journal(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<SessionJournalEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::SessionCommitReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (revision, ()) = store.with_record_mut(&id, expected_revision, |record, _| {
+            let (receipt, ()) = store.with_record_mut(&id, expected_token, |record, _| {
                 record.append_journal_events(events);
                 record.touch_activity();
                 Ok(())
             })?;
 
-            Ok(revision)
+            Ok(receipt)
         }
     }
 
-    fn mutate_masks(
+    fn mutate(
         &self,
         id: &SessionId,
-        mutation: SessionMaskMutation,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+        mutation: crate::SessionMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<crate::SessionMutationOutcome>> + Send
     {
         let store = self.clone();
         let id = id.clone();
@@ -207,8 +203,7 @@ impl SessionStore for MemorySessionStore {
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
             let revision = current.revision.next();
             let mut updated = current.clone();
-            updated.revision = revision;
-            let outcome = mutate_masks_on_record(&mut updated, revision, &mutation)?;
+            let outcome = mutate_on_record(&mut updated, revision, &mutation)?;
             records.insert(id, updated);
             Ok(outcome)
         }
@@ -224,6 +219,7 @@ impl SessionStore for MemorySessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_set(&key, &value)?;
             let mut records = store
                 .records
                 .lock()
@@ -231,10 +227,10 @@ impl SessionStore for MemorySessionStore {
             let record = records
                 .get_mut(&id)
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
-            let changed = condition == MetadataSetCondition::Unconditional
-                || !record.metadata.values.contains_key(&key);
+            let changed =
+                condition.matches(record, &key) && record.metadata.values.get(&key) != Some(&value);
             if changed {
-                record.set_metadata_value(key, value);
+                super::super::metadata::set_value(record, key, value)?;
             }
             let record = record.clone();
             drop(records);
@@ -250,6 +246,7 @@ impl SessionStore for MemorySessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_key(&key)?;
             let mut records = store
                 .records
                 .lock()
@@ -289,7 +286,7 @@ impl SessionStore for MemorySessionStore {
     fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
@@ -305,6 +302,28 @@ impl SessionStore for MemorySessionStore {
             let record = record.clone();
             drop(records);
             Ok(record)
+        }
+    }
+
+    fn set_agent_definition_if_execution(
+        &self,
+        id: &SessionId,
+        expected: super::super::ExecutionToken,
+        agent_definition: Option<serde_json::Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            let record = records
+                .get_mut(&id)
+                .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
+            record.check_execution_token(&expected)?;
+            record.set_agent_definition(agent_definition);
+            Ok(record.clone())
         }
     }
 
@@ -338,6 +357,7 @@ impl SessionStore for MemorySessionStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixture_token;
     use std::collections::BTreeMap;
 
     use serde_json::json;
@@ -345,21 +365,69 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn legacy_memory_records_seed_stored_revision_and_missing_incarnation_stays_readable() {
+        let store = MemorySessionStore::new();
+        let mut record = SessionRecord::new("legacy-memory");
+        record.revision = Revision::new(23);
+        record.journal.push(SessionJournalEvent::Interrupted);
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("execution_sequence");
+        let decoded = super::super::decode_record(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.execution_sequence.get(), 23);
+        assert_eq!(decoded.journal, record.journal);
+        store
+            .records
+            .lock()
+            .unwrap()
+            .insert(record.id.clone(), decoded);
+        let loaded = store.load(&record.id).await.unwrap();
+        let receipt = store
+            .append_journal(
+                &record.id,
+                loaded.execution_token().unwrap(),
+                vec![SessionJournalEvent::Finished],
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.execution_token.sequence.get(), 24);
+        let persisted = store.load(&record.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap()["execution_sequence"],
+            json!(24)
+        );
+        assert_eq!(persisted.journal[0], record.journal[0]);
+        value["id"] = json!("legacy-memory-no-incarnation");
+        value["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("incarnation");
+        let legacy = super::super::decode_record(&serde_json::to_vec(&value).unwrap()).unwrap();
+        store
+            .records
+            .lock()
+            .unwrap()
+            .insert(legacy.id.clone(), legacy.clone());
+        assert_eq!(store.load(&legacy.id).await.unwrap(), legacy);
+        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert!(matches!(
+            legacy.execution_token(),
+            Err(SessionStoreError::ExecutionCompatibility { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn replacement_masks_follow_store_contract() {
         super::super::assert_mask_store_contract(MemorySessionStore::new(), "memory").await;
     }
 
     use crate::PendingTimelineItemId;
-    use crate::agent::session::{
-        CancelReason, ExternalRequest, ExternalRequestKind, ExternalRequestStatus, RequestId,
-        RequestRecord, SessionStatus,
-    };
+    use crate::agent::session::{RequestId, RequestRecord, SessionStatus};
     use crate::{
         InferenceProviderSettings, ModelApi, ModelRef, ProviderId, ToolCall, ToolResult,
         timeline::{
-            CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
-            TimelineChannel, TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
-            TimelineQuery, TimelineStatus,
+            CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, CHANNEL_TOOL_CALL, TimelineChannel,
+            TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId, TimelineQuery,
+            TimelineStatus,
         },
     };
 
@@ -375,17 +443,6 @@ mod tests {
             canonical_request_hash: format!("canonical-{id}"),
             canonical_request: json!({ "id": id }),
             projected_request: json!({ "projected_id": id }),
-        }
-    }
-
-    fn external_request(id: &str, status: ExternalRequestStatus) -> ExternalRequest {
-        ExternalRequest {
-            id: id.into(),
-            kind: ExternalRequestKind::Permission,
-            tool_call_id: Some(format!("tool-{id}")),
-            prompt: format!("Allow {id}?"),
-            payload: json!({ "id": id }),
-            status,
         }
     }
 
@@ -426,12 +483,15 @@ mod tests {
                 reasoning_effort: None,
             },
         };
-        let bundle = AgentDefinitionBundle::new("selected", vec!["kind: Agent".to_owned()]);
+        let bundle = crate::agent::session::opaque_test_configuration(
+            "selected",
+            vec!["kind: Agent".to_owned()],
+        );
 
         let (append, inference, definition) = tokio::join!(
             store.append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "hello".to_owned(),
                 }],
@@ -440,11 +500,11 @@ mod tests {
             store.set_agent_definition(&id, Some(bundle.clone())),
         );
 
-        assert_eq!(append.unwrap(), Revision::new(1));
+        assert_eq!(append.unwrap().revision, Revision::new(1));
         inference.unwrap();
         definition.unwrap();
         let record = store.load(&id).await.unwrap();
-        assert_eq!(record.revision, Revision::new(1));
+        assert_eq!(record.revision, Revision::new(3));
         assert_eq!(record.inference_settings, Some(settings));
         assert_eq!(record.agent_definition, Some(bundle));
         assert_eq!(record.journal.len(), 1);
@@ -472,20 +532,6 @@ mod tests {
         event
     }
 
-    fn external_request_event(
-        session_id: &SessionId,
-        request: ExternalRequest,
-    ) -> PendingTimelineEvent {
-        PendingTimelineEvent::new(
-            session_id.clone(),
-            1,
-            PendingTimelineItemId::New,
-            TimelineEventKind::ExternalRequestOpened,
-            Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
-            TimelineContent::ExternalRequest { request },
-        )
-    }
-
     #[tokio::test]
     async fn create_and_load_clones_records() {
         let store = MemorySessionStore::new();
@@ -511,7 +557,7 @@ mod tests {
     async fn inference_creation_atomically_stores_settings_and_agent_definition_bundle() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        let bundle = AgentDefinitionBundle::new(
+        let bundle = crate::agent::session::opaque_test_configuration(
             "selected",
             vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: selected\nspec: {}\n".to_owned()],
         );
@@ -545,8 +591,9 @@ mod tests {
     async fn duplicate_inference_creation_does_not_overwrite_existing_record() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        let original = AgentDefinitionBundle::new("original", Vec::new());
-        let replacement = AgentDefinitionBundle::new("replacement", Vec::new());
+        let original = crate::agent::session::opaque_test_configuration("original", Vec::new());
+        let replacement =
+            crate::agent::session::opaque_test_configuration("replacement", Vec::new());
         let mut request = SessionCreateRequest::new(id.clone());
         request.agent_definition = Some(original.clone());
         store.create(request).await.unwrap();
@@ -638,7 +685,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "hello".to_owned(),
                 }],
@@ -671,7 +718,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(updated.revision, Revision::ZERO);
+        assert_eq!(updated.revision, Revision::new(1));
         assert_eq!(
             updated.metadata_value("host.key"),
             Some(&json!({ "value": true }))
@@ -727,7 +774,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "preserved".to_owned(),
                 }],
@@ -746,7 +793,7 @@ mod tests {
             .unwrap();
 
         assert!(outcome.changed);
-        assert_eq!(outcome.record.revision, Revision::new(1));
+        assert_eq!(outcome.record.revision, Revision::new(2));
         assert_eq!(outcome.record.journal.len(), 1);
         assert_eq!(outcome.record.metadata_value("other"), Some(&json!(true)));
         assert_eq!(
@@ -770,13 +817,17 @@ mod tests {
             .unwrap();
 
         let assigned = store
-            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 0).await,
+                vec![pending_delta(&id, 1)],
+            )
             .await
             .unwrap();
 
         let loaded = store.load(&id).await.unwrap();
-        assert_eq!(assigned.len(), 1);
-        assert_eq!(loaded.revision, Revision::new(1));
+        assert_eq!(assigned.events.len(), 1);
+        assert_eq!(loaded.revision, Revision::new(2));
         assert_eq!(
             loaded.metadata_value("runtime.thinking"),
             Some(&json!("high"))
@@ -801,11 +852,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(removed.revision, Revision::ZERO);
+        assert_eq!(removed.revision, Revision::new(2));
         assert_eq!(removed.metadata_value("runtime.thinking"), None);
 
         store
-            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 0).await,
+                vec![pending_delta(&id, 1)],
+            )
             .await
             .unwrap();
     }
@@ -822,7 +877,7 @@ mod tests {
         let revision = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "hello".to_owned(),
                 }],
@@ -831,7 +886,7 @@ mod tests {
             .unwrap();
 
         let loaded = store.load(&id).await.unwrap();
-        assert_eq!(revision, Revision::new(1));
+        assert_eq!(revision.revision, Revision::new(1));
         assert_eq!(loaded.revision, Revision::new(1));
         assert_eq!(loaded.journal.len(), 1);
     }
@@ -847,7 +902,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "first".to_owned(),
                 }],
@@ -858,7 +913,7 @@ mod tests {
         let error = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "stale".to_owned(),
                 }],
@@ -868,10 +923,9 @@ mod tests {
 
         assert_eq!(
             error,
-            SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: Revision::ZERO,
-                actual: Revision::new(1),
+            SessionStoreError::StaleExecution {
+                expected: fixture_token(&store, &id, 0).await,
+                actual: fixture_token(&store, &id, 1).await,
             }
         );
         assert_eq!(store.load(&id).await.unwrap().journal.len(), 1);
@@ -886,23 +940,35 @@ mod tests {
             .await
             .unwrap();
         store
-            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 0).await,
+                vec![pending_delta(&id, 1)],
+            )
             .await
             .unwrap();
 
         let error = store
-            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 2)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 0).await,
+                vec![pending_delta(&id, 2)],
+            )
             .await
             .unwrap_err();
 
-        assert!(matches!(error, SessionStoreError::StaleRevision { .. }));
+        assert!(matches!(error, SessionStoreError::StaleExecution { .. }));
         assert_eq!(store.load(&id).await.unwrap().timeline_events().count(), 1);
         let assigned = store
-            .append_timeline(&id, Revision::new(1), vec![pending_delta(&id, 3)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 1).await,
+                vec![pending_delta(&id, 3)],
+            )
             .await
             .unwrap();
-        assert_eq!(assigned[0].cursor, TimelineCursor::new(2));
-        assert_eq!(assigned[0].item_id.as_str(), "i2");
+        assert_eq!(assigned.events[0].cursor, TimelineCursor::new(2));
+        assert_eq!(assigned.events[0].item_id.as_str(), "i2");
     }
 
     #[tokio::test]
@@ -918,7 +984,7 @@ mod tests {
         let error = store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![PendingTimelineEvent::assistant_text_delta(
                     id.clone(),
                     0,
@@ -955,7 +1021,7 @@ mod tests {
         let append_revision = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "hello".to_owned(),
                 }],
@@ -965,7 +1031,7 @@ mod tests {
         let _assigned = store
             .append_timeline(
                 &id,
-                append_revision,
+                append_revision.execution_token.clone(),
                 vec![
                     PendingTimelineEvent::tool_call(
                         id.clone(),
@@ -987,7 +1053,7 @@ mod tests {
         let turn_revision = store
             .append_journal(
                 &id,
-                Revision::new(2),
+                fixture_token(&store, &id, 2).await,
                 vec![
                     SessionJournalEvent::TurnFinished { turn: 1 },
                     SessionJournalEvent::Finished,
@@ -998,7 +1064,7 @@ mod tests {
 
         let loaded = store.load(&id).await.unwrap();
         let snapshot = loaded.snapshot();
-        assert_eq!(turn_revision, Revision::new(3));
+        assert_eq!(turn_revision.revision, Revision::new(3));
         assert_eq!(loaded.revision, Revision::new(3));
         assert_eq!(snapshot.revision, Revision::new(3));
         assert_eq!(snapshot.status, SessionStatus::Finished);
@@ -1020,7 +1086,7 @@ mod tests {
         let append_revision = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "first".to_owned(),
                 }],
@@ -1030,7 +1096,7 @@ mod tests {
         let stale_append = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "stale".to_owned(),
                 }],
@@ -1039,31 +1105,37 @@ mod tests {
             .unwrap_err();
 
         let timeline_revision = store
-            .append_timeline(&id, append_revision, vec![pending_delta(&id, 1)])
+            .append_timeline(
+                &id,
+                append_revision.execution_token.clone(),
+                vec![pending_delta(&id, 1)],
+            )
             .await
             .unwrap();
         let stale_timeline = store
-            .append_timeline(&id, append_revision, vec![pending_delta(&id, 2)])
+            .append_timeline(
+                &id,
+                append_revision.execution_token.clone(),
+                vec![pending_delta(&id, 2)],
+            )
             .await
             .unwrap_err();
 
-        assert_eq!(append_revision, Revision::new(1));
-        assert_eq!(timeline_revision[0].cursor, TimelineCursor::new(1));
+        assert_eq!(append_revision.revision, Revision::new(1));
+        assert_eq!(timeline_revision.events[0].cursor, TimelineCursor::new(1));
         assert_eq!(store.load(&id).await.unwrap().revision, Revision::new(2));
         assert_eq!(
             stale_append,
-            SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: Revision::ZERO,
-                actual: Revision::new(1),
+            SessionStoreError::StaleExecution {
+                expected: fixture_token(&store, &id, 0).await,
+                actual: fixture_token(&store, &id, 1).await,
             }
         );
         assert_eq!(
             stale_timeline,
-            SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: Revision::new(1),
-                actual: Revision::new(2),
+            SessionStoreError::StaleExecution {
+                expected: fixture_token(&store, &id, 1).await,
+                actual: fixture_token(&store, &id, 2).await,
             }
         );
     }
@@ -1080,7 +1152,7 @@ mod tests {
         let revision = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "hello".to_owned(),
                 }],
@@ -1089,7 +1161,7 @@ mod tests {
             .unwrap();
         let loaded = store.load(&id).await.unwrap();
 
-        assert_eq!(revision, Revision::new(1));
+        assert_eq!(revision.revision, Revision::new(1));
         assert_eq!(loaded.snapshot().revision, loaded.revision);
     }
 
@@ -1105,7 +1177,7 @@ mod tests {
         let revision = store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![SessionJournalEvent::ProviderRequestRecorded {
                     request: request_record("first"),
                 }],
@@ -1115,7 +1187,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                revision,
+                revision.execution_token,
                 vec![SessionJournalEvent::ProviderRequestRecorded {
                     request: request_record("second"),
                 }],
@@ -1132,46 +1204,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_requests_project_insertion_order_and_cancellation_markers() {
-        let store = MemorySessionStore::new();
-        let id = session_id();
-        store
-            .create(SessionCreateRequest::new(id.clone()))
-            .await
-            .unwrap();
-
-        let _assigned = store
-            .append_timeline(
-                &id,
-                Revision::ZERO,
-                vec![
-                    external_request_event(
-                        &id,
-                        external_request("first", ExternalRequestStatus::Pending),
-                    ),
-                    external_request_event(
-                        &id,
-                        external_request(
-                            "second",
-                            ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt),
-                        ),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-        let loaded = store.load(&id).await.unwrap();
-        let requests = loaded.snapshot().external_requests;
-        assert_eq!(requests[0].id.as_str(), "first");
-        assert_eq!(requests[0].status, ExternalRequestStatus::Pending);
-        assert_eq!(requests[1].id.as_str(), "second");
-        assert_eq!(
-            requests[1].status,
-            ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt)
-        );
-    }
-
-    #[tokio::test]
     async fn append_timeline_assigns_stable_monotonic_cursors() {
         let store = MemorySessionStore::new();
         let id = session_id();
@@ -1183,22 +1215,26 @@ mod tests {
         let assigned = store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![pending_delta(&id, 1), pending_delta(&id, 2)],
             )
             .await
             .unwrap();
         let next = store
-            .append_timeline(&id, Revision::new(1), vec![pending_delta(&id, 3)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 1).await,
+                vec![pending_delta(&id, 3)],
+            )
             .await
             .unwrap();
 
-        assert_eq!(assigned[0].cursor, TimelineCursor::new(1));
-        assert_eq!(assigned[1].cursor, TimelineCursor::new(2));
-        assert_eq!(next[0].cursor, TimelineCursor::new(3));
-        assert_eq!(assigned[0].item_id.as_str(), "i1");
-        assert_eq!(assigned[1].item_id.as_str(), "i2");
-        assert_eq!(next[0].item_id.as_str(), "i3");
+        assert_eq!(assigned.events[0].cursor, TimelineCursor::new(1));
+        assert_eq!(assigned.events[1].cursor, TimelineCursor::new(2));
+        assert_eq!(next.events[0].cursor, TimelineCursor::new(3));
+        assert_eq!(assigned.events[0].item_id.as_str(), "i1");
+        assert_eq!(assigned.events[1].item_id.as_str(), "i2");
+        assert_eq!(next.events[0].item_id.as_str(), "i3");
         let loaded = store.load(&id).await.unwrap();
         assert_eq!(loaded.revision, Revision::new(2));
         assert_eq!(loaded.timeline_events().count(), 3);
@@ -1214,14 +1250,18 @@ mod tests {
             .unwrap();
 
         let first = store
-            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .append_timeline(
+                &id,
+                fixture_token(&store, &id, 0).await,
+                vec![pending_delta(&id, 1)],
+            )
             .await
             .unwrap();
-        let first_id = first[0].item_id.clone();
+        let first_id = first.events[0].item_id.clone();
         let assigned = store
             .append_timeline(
                 &id,
-                Revision::new(1),
+                first.commit.execution_token,
                 vec![
                     PendingTimelineEvent::assistant_text_delta(
                         id.clone(),
@@ -1236,8 +1276,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(first_id.as_str(), "i1");
-        assert_eq!(assigned[0].item_id, first_id);
-        assert_eq!(assigned[1].item_id.as_str(), "i3");
+        assert_eq!(assigned.events[0].item_id, first_id);
+        assert_eq!(assigned.events[1].item_id.as_str(), "i3");
     }
 
     #[tokio::test]
@@ -1252,7 +1292,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![
                     pending_delta(&id, 1),
                     pending_thinking_delta(&id, 2),
@@ -1383,7 +1423,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![
                     PendingTimelineEvent::assistant_text_delta(
                         id.clone(),
@@ -1425,7 +1465,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                fixture_token(&store, &id, 0).await,
                 vec![
                     PendingTimelineEvent::tool_call(
                         id.clone(),

@@ -14,12 +14,9 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use crate::{
-    AuthTarget, AuthenticationFailure, AuthenticationFailureReason, LlmError,
-    McpAuthorizationContext, ToolResult,
-};
+use crate::{AuthTarget, AuthenticationFailure, AuthenticationFailureReason, LlmError, ToolResult};
 
-use super::{ExternalRequestId, ExternalResponse, SessionId, SessionStatus};
+use super::{SessionId, SessionStatus};
 use crate::{SessionStoreError, TimelineCursor};
 
 /// Maximum UTF-8 byte length of a coordination reason code.
@@ -243,13 +240,18 @@ pub(crate) type RunOutcomeSender = oneshot::Sender<RunResult>;
 pub(super) struct SessionRunInferenceIdentity {
     pub(super) provider_key: String,
     pub(super) model_id: String,
+    pub(super) execution_token: super::ExecutionToken,
 }
 
 impl SessionRunInferenceIdentity {
-    pub(super) fn from_settings(settings: &super::InferenceSettings) -> Self {
+    pub(super) fn from_settings(
+        settings: &super::InferenceSettings,
+        execution_token: super::ExecutionToken,
+    ) -> Self {
         Self {
             provider_key: settings.provider.key.clone(),
             model_id: settings.provider.model_id.clone(),
+            execution_token,
         }
     }
 }
@@ -475,7 +477,7 @@ pub enum AgentSessionRuntimeError {
         /// Machine-readable reason for the failure.
         reason: AuthenticationFailureReason,
         /// Sanitized MCP challenge context, when the target is an MCP server.
-        mcp_authorization: Option<Box<McpAuthorizationContext>>,
+        host_context: Option<serde_json::Value>,
     },
 }
 
@@ -487,12 +489,12 @@ impl AgentSessionRuntimeError {
             Self::Authentication {
                 target,
                 reason,
-                mcp_authorization,
+                host_context,
                 ..
             } => Some(AuthenticationFailure {
                 target: target.clone(),
                 reason: *reason,
-                mcp_authorization: mcp_authorization.clone(),
+                host_context: host_context.clone(),
             }),
             Self::Agent(error) => error.authentication_failure().cloned(),
             Self::FailedPrecondition(_) | Self::Internal(_) => None,
@@ -527,7 +529,15 @@ impl Error for AgentSessionRuntimeError {
 
 impl From<LlmError> for AgentSessionRuntimeError {
     fn from(error: LlmError) -> Self {
-        Self::Agent(error)
+        match error {
+            LlmError::AuthenticationFailure { failure, message } => Self::Authentication {
+                target: failure.target,
+                message,
+                reason: failure.reason,
+                host_context: failure.host_context,
+            },
+            error => Self::Agent(error),
+        }
     }
 }
 
@@ -561,19 +571,14 @@ pub enum RunConflictPolicy {
 /// Input that can start or resume a durable session run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionRunInput {
+    /// Execute a host-selected tool through the durable lifecycle, without provider inference.
+    HostTool(crate::ToolCall),
     /// Continue from the existing durable checkpoint without adding input.
     Continue,
     /// Start or resume with a new user prompt.
     Prompt(String),
     /// Start or resume with multiple adjacent user prompts.
     Prompts(Vec<String>),
-    /// Resume with an answer to a pending external request.
-    ExternalResponse {
-        /// Pending external request id.
-        request_id: ExternalRequestId,
-        /// Provider-neutral response payload.
-        response: ExternalResponse,
-    },
     /// Resume with externally completed tool results.
     ToolResults(Vec<ToolResult>),
 }
@@ -581,9 +586,9 @@ pub enum AgentSessionRunInput {
 impl AgentSessionRunInput {
     pub(super) const fn kind(&self) -> &'static str {
         match self {
+            Self::HostTool(_) => "host_tool",
             Self::Continue => "continue",
             Self::Prompt(_) | Self::Prompts(_) => "prompt",
-            Self::ExternalResponse { .. } => "external_response",
             Self::ToolResults(_) => "tool_results",
         }
     }
@@ -644,6 +649,38 @@ pub struct AgentSessionRunHandle {
     session_id: SessionId,
     run_id: u64,
     outcome_rx: oneshot::Receiver<RunResult>,
+    cancellation: Option<AgentSessionRunCancellation>,
+}
+
+/// Exact submitted-run cancellation; dropping a clone does not cancel work.
+#[derive(Clone)]
+pub struct AgentSessionRunCancellation {
+    request: Arc<RunCancellationRequest>,
+}
+
+type RunCancellationFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type RunCancellationRequest = dyn Fn() -> RunCancellationFuture + Send + Sync;
+
+impl fmt::Debug for AgentSessionRunCancellation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSessionRunCancellation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentSessionRunCancellation {
+    pub(super) fn new(request: impl Fn() -> RunCancellationFuture + Send + Sync + 'static) -> Self {
+        Self {
+            request: Arc::new(request),
+        }
+    }
+
+    /// Request cancellation of only this submission in its original incarnation.
+    /// Wait on its run handle to receive the owner's cleanup outcome.
+    pub async fn cancel(&self) {
+        (self.request)().await;
+    }
 }
 
 impl AgentSessionRunHandle {
@@ -656,7 +693,33 @@ impl AgentSessionRunHandle {
             session_id,
             run_id,
             outcome_rx,
+            cancellation: None,
         }
+    }
+
+    pub(super) fn with_cancellation(mut self, cancellation: AgentSessionRunCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Return exact cancellation for an explicitly cancellable submission.
+    #[must_use]
+    pub fn cancellation(&self) -> Option<AgentSessionRunCancellation> {
+        self.cancellation.clone()
+    }
+
+    /// Cancel an explicitly cancellable submission, then await its cleanup outcome.
+    /// Handles without cancellation authority only wait for their original outcome.
+    ///
+    /// # Errors
+    /// Returns the original run or cleanup error, including queued cancellation.
+    pub async fn cancel_and_wait(
+        self,
+    ) -> std::result::Result<AgentSessionRunOutcome, AgentSessionRunError> {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel().await;
+        }
+        self.wait().await
     }
 
     /// Return the session id this handle waits on.
@@ -822,6 +885,19 @@ impl From<AgentSessionRunError> for LlmError {
         match error {
             AgentSessionRunError::Agent(error)
             | AgentSessionRunError::Runtime(AgentSessionRuntimeError::Agent(error)) => error,
+            AgentSessionRunError::Runtime(AgentSessionRuntimeError::Authentication {
+                target,
+                message,
+                reason,
+                host_context,
+            }) => Self::AuthenticationFailure {
+                failure: crate::AuthenticationFailure {
+                    target,
+                    reason,
+                    host_context,
+                },
+                message,
+            },
             error => Self::Protocol {
                 provider: "session-run",
                 message: error.to_string(),
@@ -833,6 +909,32 @@ impl From<AgentSessionRunError> for LlmError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_runtime_authentication_round_trip_preserves_structured_context() {
+        let original = crate::AuthenticationFailure {
+            target: AuthTarget::Host {
+                namespace: "test-host".into(),
+                key: "configured".into(),
+            },
+            reason: AuthenticationFailureReason::CredentialRequired,
+            host_context: Some(serde_json::json!({"challenge": "sanitized"})),
+        };
+        let host_error: LlmError =
+            AgentSessionRunError::Runtime(AgentSessionRuntimeError::Authentication {
+                target: original.target.clone(),
+                message: "authenticate".into(),
+                reason: original.reason,
+                host_context: original.host_context.clone(),
+            })
+            .into();
+        assert_eq!(host_error.authentication_failure(), Some(&original));
+        let runtime_error = AgentSessionRuntimeError::from(host_error);
+        assert!(
+            matches!(&runtime_error, AgentSessionRuntimeError::Authentication { message, .. } if message == "authenticate")
+        );
+        assert_eq!(runtime_error.authentication_failure(), Some(original));
+    }
 
     #[test]
     fn coordination_reason_rejects_empty_and_oversized_fields() {

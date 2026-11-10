@@ -16,6 +16,7 @@ pub struct SessionCopy {
     boundary: TimelineCursor,
     completed_turn: u64,
     projected_journal: Vec<SessionJournalEvent>,
+    item_metadata: super::ItemMetadata,
 }
 
 impl SessionCopy {
@@ -29,6 +30,7 @@ impl SessionCopy {
         record: &SessionRecord,
         boundary: TimelineCursor,
     ) -> Result<Self, SessionCopyError> {
+        super::metadata::validate_record(record).map_err(|error| SessionCopyError::InvalidSource(error.to_string()))?;
         let effective = record.effective_journal_events();
         let mut latest_cursor = None;
         let mut boundary_exists = false;
@@ -78,11 +80,18 @@ impl SessionCopy {
 
         let projected_journal =
             project_journal(&record.id, &effective[..=selected_index], completed_turn)?;
+        let ids = projected_journal.iter().filter_map(|event| match event {
+            SessionJournalEvent::Timeline(event) => Some(&event.item_id), _ => None,
+        }).collect::<std::collections::HashSet<_>>();
+        let item_metadata = record.metadata.item_values.iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, values)| (id.clone(), values.clone())).collect();
         Ok(Self {
             source_id: record.id.clone(),
             boundary,
             completed_turn,
             projected_journal,
+            item_metadata,
         })
     }
 
@@ -101,6 +110,14 @@ impl SessionCopy {
             .into_iter()
             .filter(|mask| mask.selector.cursor <= boundary)
         {
+            if let Some(ids) = &mask.item_ids {
+                apply_item_replacement(
+                    &mut copy.projected_journal,
+                    ids,
+                    Some(&mask.replacement.text),
+                );
+                continue;
+            }
             let selected_turn =
                 completed_turn_at(record, mask.selector.cursor).ok_or_else(|| {
                     SessionCopyError::InvalidSource(
@@ -113,6 +130,7 @@ impl SessionCopy {
                 &mask.replacement.text,
             );
         }
+        copy.retain_metadata();
         Ok(copy)
     }
 
@@ -126,6 +144,165 @@ impl SessionCopy {
     #[must_use]
     pub const fn source_id(&self) -> &SessionId {
         &self.source_id
+    }
+
+    /// Select original canonical items, rejecting partial tool pairs and dangling parent links.
+    ///
+    /// # Errors
+    /// Rejects unknown/duplicate IDs, empty selections, and selections exceeding 4096 items.
+    pub fn selected(
+        record: &SessionRecord,
+        boundary: TimelineCursor,
+        ids: &[TimelineItemId],
+    ) -> Result<Self, SessionCopyError> {
+        let selected: std::collections::HashSet<_> = ids.iter().collect();
+        if ids.is_empty()
+            || ids.len() > 4096
+            || selected.len() != ids.len()
+            || record.journal.len() > 100_000
+            || !super::context::json_within_limit(&record.journal, 16 * 1024 * 1024)
+        {
+            return Err(SessionCopyError::InvalidSource(
+                "invalid selected item set".into(),
+            ));
+        }
+        let mut copy = Self::from_record(record, boundary)?;
+        let events = copy.timeline();
+        let known: std::collections::HashSet<_> =
+            events.iter().map(|event| &event.item_id).collect();
+        if !selected.is_subset(&known) {
+            return Err(SessionCopyError::InvalidSource(
+                "unknown selected item".into(),
+            ));
+        }
+        let calls: HashMap<_, _> = events
+            .iter()
+            .filter_map(|event| match &event.content {
+                TimelineContent::ToolCall { call } => Some((&call.id, &event.item_id)),
+                _ => None,
+            })
+            .collect();
+        let results = events
+            .iter()
+            .filter_map(|event| match &event.content {
+                TimelineContent::ToolResult { result } => Some(&result.call_id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut user_turns = HashMap::new();
+        for event in &events {
+            let included = selected.contains(&event.item_id);
+            if let TimelineContent::ToolCall { call } = &event.content
+                && included
+                && !results.contains(&call.id)
+            {
+                return Err(SessionCopyError::InvalidSource(
+                    "selected tool call has no result".into(),
+                ));
+            }
+            if let TimelineContent::ToolResult { result } = &event.content
+                && calls
+                    .get(&result.call_id)
+                    .is_none_or(|id| selected.contains(id) != included)
+            {
+                return Err(SessionCopyError::InvalidSource(
+                    "selection splits a tool call and result".into(),
+                ));
+            }
+            if included
+                && event
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|id| !selected.contains(id))
+            {
+                return Err(SessionCopyError::InvalidSource(
+                    "selection omits a parent item".into(),
+                ));
+            }
+            if !included
+                && event
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|id| selected.contains(id))
+            {
+                return Err(SessionCopyError::InvalidSource(
+                    "selection splits a parent and child".into(),
+                ));
+            }
+            if event
+                .channel
+                .as_ref()
+                .is_some_and(|channel| channel.as_str() == CHANNEL_USER_TEXT)
+                && user_turns
+                    .insert(event.turn, included)
+                    .is_some_and(|previous| previous != included)
+            {
+                return Err(SessionCopyError::InvalidSource(
+                    "selection splits prompts in one turn".into(),
+                ));
+            }
+        }
+        let excluded = known
+            .into_iter()
+            .filter(|id| !selected.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        apply_item_replacement(&mut copy.projected_journal, &excluded, None);
+        copy.retain_metadata();
+        Ok(copy)
+    }
+
+    /// Opaque item values for only the canonical items retained by this projection.
+    #[must_use]
+    pub fn item_metadata(&self) -> super::ItemMetadata {
+        let ids = self.projected_journal.iter().filter_map(|event| match event {
+            SessionJournalEvent::Timeline(event) => Some(&event.item_id), _ => None,
+        }).collect::<std::collections::HashSet<_>>();
+        self.item_metadata.iter().filter(|(id, _)| ids.contains(id))
+            .map(|(id, values)| (id.clone(), values.clone())).collect()
+    }
+
+    fn retain_metadata(&mut self) {
+        let ids = self.projected_journal.iter().filter_map(|event| match event {
+            SessionJournalEvent::Timeline(event) => Some(event.item_id.clone()), _ => None,
+        }).collect::<std::collections::HashSet<_>>();
+        self.item_metadata.retain(|id, _| ids.contains(id));
+    }
+
+    /// Privacy-filtered canonical items, retaining first cursors, IDs and tool linkage.
+    /// Text updates are coalesced; the replay journal remains unchanged.
+    #[must_use]
+    pub fn timeline(&self) -> Vec<AgentTimelineEvent> {
+        let mut items: Vec<AgentTimelineEvent> = Vec::new();
+        let mut positions = HashMap::new();
+        for event in &self.projected_journal {
+            let SessionJournalEvent::Timeline(event) = event else {
+                continue;
+            };
+            let position = *positions.entry(event.item_id.clone()).or_insert_with(|| {
+                items.push(event.clone());
+                items.len() - 1
+            });
+            let item = &mut items[position];
+            if item.cursor == event.cursor {
+                continue;
+            }
+            let content = match (&item.content, &event.content) {
+                (
+                    TimelineContent::TextDelta { delta: text }
+                    | TimelineContent::TextSnapshot { text },
+                    TimelineContent::TextDelta { delta },
+                ) => TimelineContent::TextSnapshot {
+                    text: format!("{text}{delta}"),
+                },
+                (_, content) => content.clone(),
+            };
+            let cursor = item.cursor;
+            *item = event.clone();
+            item.cursor = cursor;
+            item.content = content;
+        }
+        items
     }
 
     pub(crate) const fn next_turn(&self) -> u64 {
@@ -145,7 +322,7 @@ impl SessionCopy {
     }
 
     pub(crate) fn encoded_len(&self) -> Result<usize, serde_json::Error> {
-        serde_json::to_vec(&self.projected_journal).map(|encoded| encoded.len())
+        serde_json::to_vec(&(&self.projected_journal, self.item_metadata())).map(|encoded| encoded.len())
     }
 
     pub(crate) fn context_counts(&self) -> (usize, usize) {
@@ -166,7 +343,7 @@ impl SessionCopy {
     }
 }
 
-fn apply_prefix_replacement(
+pub(super) fn apply_prefix_replacement(
     journal: &mut Vec<SessionJournalEvent>,
     selected_turn: u64,
     replacement: &str,
@@ -178,6 +355,10 @@ fn apply_prefix_replacement(
         let selected = match &event {
             SessionJournalEvent::PromptAppended { .. } => turn <= selected_turn,
             SessionJournalEvent::Timeline(event) => event.turn <= selected_turn,
+            SessionJournalEvent::ProviderThinkingBlockRecorded { turn, .. }
+            | SessionJournalEvent::ProviderTurnMetadataRecorded { turn, .. } => {
+                *turn <= selected_turn
+            }
             _ => false,
         };
         if selected {
@@ -185,6 +366,73 @@ fn apply_prefix_replacement(
                 projected.push(SessionJournalEvent::PromptAppended {
                     prompt: replacement.to_owned(),
                 });
+                inserted = true;
+            }
+        } else {
+            projected.push(event.clone());
+        }
+        if let SessionJournalEvent::TurnFinished { turn: finished } = event {
+            turn = turn.max(finished.saturating_add(1));
+        }
+    }
+    *journal = projected;
+}
+
+pub(super) fn apply_item_replacement(
+    journal: &mut Vec<SessionJournalEvent>,
+    ids: &[TimelineItemId],
+    replacement: Option<&str>,
+) {
+    let selected: std::collections::HashSet<_> = ids.iter().collect();
+    let affected_turns: std::collections::HashSet<_> = journal
+        .iter()
+        .filter_map(|event| match event {
+            SessionJournalEvent::Timeline(event) if selected.contains(&event.item_id) => {
+                Some(event.turn)
+            }
+            _ => None,
+        })
+        .collect();
+    let user_turns: std::collections::HashSet<_> = journal
+        .iter()
+        .filter_map(|event| match event {
+            SessionJournalEvent::Timeline(event)
+                if selected.contains(&event.item_id)
+                    && event
+                        .channel
+                        .as_ref()
+                        .is_some_and(|channel| channel.as_str() == CHANNEL_USER_TEXT) =>
+            {
+                Some(event.turn)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut turn = 0;
+    let mut inserted = false;
+    let mut projected = Vec::with_capacity(journal.len());
+    for event in journal.drain(..) {
+        let remove = match &event {
+            SessionJournalEvent::Timeline(event) => selected.contains(&event.item_id),
+            SessionJournalEvent::PromptAppended { .. } => user_turns.contains(&turn),
+            SessionJournalEvent::ProviderThinkingBlockRecorded { turn, .. }
+            | SessionJournalEvent::ProviderTurnMetadataRecorded { turn, .. } => {
+                affected_turns.contains(turn)
+            }
+            _ => false,
+        };
+        if remove {
+            if !inserted
+                && matches!(
+                    event,
+                    SessionJournalEvent::Timeline(_) | SessionJournalEvent::PromptAppended { .. }
+                )
+            {
+                if let Some(text) = replacement {
+                    projected.push(SessionJournalEvent::PromptAppended {
+                        prompt: text.to_owned(),
+                    });
+                }
                 inserted = true;
             }
         } else {
@@ -349,7 +597,6 @@ fn project_journal(
                     }
                     TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. } => {}
                     TimelineContent::Empty
-                    | TimelineContent::ExternalRequest { .. }
                     | TimelineContent::ContentRef { .. }
                     | TimelineContent::Json { .. } => unreachable!("timeline was allowlisted"),
                 }
@@ -362,8 +609,6 @@ fn project_journal(
             | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
             | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
             | SessionJournalEvent::MiddlewareStateUpdated { .. }
-            | SessionJournalEvent::ExternalRequestResponded { .. }
-            | SessionJournalEvent::ExternalRequestCanceled { .. }
             | SessionJournalEvent::Suspended { .. }
             | SessionJournalEvent::WorkCanceled { .. }
             | SessionJournalEvent::Interrupted
@@ -402,7 +647,6 @@ fn replayable_timeline(event: &AgentTimelineEvent) -> bool {
             .as_ref()
             .is_some_and(|channel| channel.as_str() == CHANNEL_TOOL_RESULT),
         TimelineContent::Empty
-        | TimelineContent::ExternalRequest { .. }
         | TimelineContent::ContentRef { .. }
         | TimelineContent::Json { .. } => false,
     }
@@ -566,6 +810,241 @@ mod tests {
     }
 
     #[test]
+    fn original_selection_ignores_effective_masks_and_retains_tool_pairs() {
+        let mut source = completed_source();
+        source.journal.pop();
+        for event in &mut source.journal {
+            if let SessionJournalEvent::Timeline(event) = event
+                && event.item_id.as_str() == "i4"
+            {
+                event.content = TimelineContent::TextSnapshot {
+                    text: "界".repeat(1000),
+                };
+            }
+        }
+        let ids =
+            [7, 9].map(|cursor| TimelineItemId::from_first_cursor(TimelineCursor::new(cursor)));
+        let mut mutation = crate::SessionMaskMutation::new(Some(TimelineCursor::new(10)));
+        mutation.add.push(crate::SessionMaskAddition::items(
+            "tools",
+            TimelineCursor::new(10),
+            ids.to_vec(),
+            crate::ReplacementUserContent::new("active tool summary"),
+        ));
+        let revision = source.revision.next();
+        super::super::mask::mutate_record_masks(&mut source, revision, &mutation).unwrap();
+        let selected = SessionCopy::selected(
+            &source,
+            TimelineCursor::new(10),
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .timeline()
+                .iter()
+                .map(|event| event.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["i7", "i9"]
+        );
+        let mut request = SessionCreateRequest::new("helper");
+        request.start = SessionStart::Copy {
+            copy: selected,
+            messages: Vec::new(),
+        };
+        let helper = request.materialize();
+        let timeline = helper.timeline_events().collect::<Vec<_>>();
+        assert_eq!(timeline[1].parent_id.as_ref(), Some(&timeline[0].item_id));
+    }
+
+    #[test]
+    fn selected_items_retain_tool_pair_ids_and_reject_split_unknown_or_private_items() {
+        let source = completed_source();
+        let ids =
+            [7, 9].map(|cursor| TimelineItemId::from_first_cursor(TimelineCursor::new(cursor)));
+        let selected = SessionCopy::selected(&source, TimelineCursor::new(10), &ids).unwrap();
+        let events = selected.timeline();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["i7", "i9"]
+        );
+        assert_eq!(events[1].parent_id.as_ref(), Some(&events[0].item_id));
+        for ids in [
+            vec![ids[0].clone()],
+            vec![ids[1].clone()],
+            vec![ids[0].clone(), ids[0].clone()],
+            vec![TimelineItemId::from_first_cursor(TimelineCursor::new(2))],
+            vec![TimelineItemId::from_first_cursor(TimelineCursor::new(99))],
+            Vec::new(),
+        ] {
+            assert!(SessionCopy::selected(&source, TimelineCursor::new(10), &ids).is_err());
+        }
+    }
+
+    #[test]
+    fn item_masks_share_effective_materialization_copy_helper_replay_and_rollback() {
+        use crate::{
+            ReplacementUserContent, SessionContextMode, SessionMaskAddition, SessionMaskMutation,
+        };
+        let mut source = completed_source();
+        source.journal.pop();
+        let journal_len = source.journal.len();
+        let raw = source.materialize_context(SessionContextMode::Raw);
+        let mut mutation = SessionMaskMutation::new(Some(TimelineCursor::new(10)));
+        mutation.add.push(SessionMaskAddition::items(
+            "tools",
+            TimelineCursor::new(10),
+            [7, 9]
+                .map(|cursor| TimelineItemId::from_first_cursor(TimelineCursor::new(cursor)))
+                .to_vec(),
+            ReplacementUserContent::new("tool summary"),
+        ));
+        let next_revision = source.revision.next();
+        super::super::mask::mutate_record_masks(&mut source, next_revision, &mutation).unwrap();
+        let effective = source.materialize_context(SessionContextMode::Effective);
+        assert!(
+            effective
+                .turns
+                .iter()
+                .all(|turn| turn.tool_calls().next().is_none()
+                    && turn.tool_results().next().is_none()
+                    && turn.thinking_blocks().next().is_none())
+        );
+        let copy = SessionCopy::from_record_effective(&source, TimelineCursor::new(10)).unwrap();
+        assert!(copy.timeline().iter().all(|event| !matches!(
+            event.content,
+            TimelineContent::ToolCall { .. } | TimelineContent::ToolResult { .. }
+        )));
+        let mut request = SessionCreateRequest::new("helper");
+        request.start = SessionStart::Copy {
+            copy,
+            messages: Vec::new(),
+        };
+        let helper = request.materialize();
+        let helper_context = helper.materialize_context(SessionContextMode::Raw);
+        assert_eq!(effective, helper_context);
+        assert_eq!(source.materialize_context(SessionContextMode::Raw), raw);
+        let encoded = serde_json::to_string(&helper).unwrap();
+        assert!(!encoded.contains("private reasoning"));
+        assert!(!encoded.contains("image/png"));
+        assert!(encoded.contains("tool summary"));
+        source.append_journal_event(SessionJournalEvent::Rollback {
+            target: SessionRollbackTarget {
+                journal_len: journal_len as u64,
+                remove_prompt_index: None,
+                after_cursor: Some(TimelineCursor::new(10)),
+                next_turn: 1,
+            },
+        });
+        assert_eq!(
+            source.materialize_context(SessionContextMode::Effective),
+            raw
+        );
+    }
+
+    #[test]
+    fn explicit_item_overlap_and_expected_mask_id_fail_atomically() {
+        use crate::{
+            ReplacementUserContent, SessionMaskAddition, SessionMaskError, SessionMaskMutation,
+        };
+        let mut source = completed_source();
+        source.journal.pop();
+        let make = |key, ids: Vec<u64>| {
+            SessionMaskAddition::items(
+                key,
+                TimelineCursor::new(10),
+                ids.into_iter()
+                    .map(|cursor| TimelineItemId::from_first_cursor(TimelineCursor::new(cursor)))
+                    .collect(),
+                ReplacementUserContent::new("summary"),
+            )
+        };
+        let mut mutation = SessionMaskMutation::new(Some(TimelineCursor::new(10)));
+        mutation.add.push(make("tools", vec![7, 9]));
+        let result = super::super::mask::mutate_record_masks(
+            &mut source,
+            crate::Revision::new(1),
+            &mutation,
+        )
+        .unwrap();
+        let before = source.clone();
+        mutation.add = vec![make("overlap", vec![7, 9])];
+        assert!(matches!(
+            super::super::mask::mutate_record_masks(
+                &mut source,
+                crate::Revision::new(2),
+                &mutation
+            ),
+            Err(SessionMaskError::ReplacementOverlap { .. })
+        ));
+        assert_eq!(source, before);
+        mutation.add = vec![make("separate", vec![4])];
+        super::super::mask::mutate_record_masks(&mut source, crate::Revision::new(2), &mutation)
+            .unwrap();
+        let before = source.clone();
+        mutation.expected_masks = vec![("tools".into(), None)];
+        mutation.subtract.keys = vec!["tools".into()];
+        mutation.add = vec![make("tools", vec![7, 9])];
+        assert!(matches!(
+            super::super::mask::mutate_record_masks(
+                &mut source,
+                crate::Revision::new(3),
+                &mutation
+            ),
+            Err(SessionMaskError::MaskIdentityMismatch { .. })
+        ));
+        assert_eq!(source, before);
+        mutation.expected_masks = vec![("tools".into(), Some(result.added_masks[0].id.clone()))];
+        super::super::mask::mutate_record_masks(&mut source, crate::Revision::new(3), &mutation)
+            .unwrap();
+        assert_ne!(
+            source
+                .active_masks()
+                .iter()
+                .find(|mask| mask.key == "tools")
+                .unwrap()
+                .id,
+            result.added_masks[0].id
+        );
+    }
+
+    #[test]
+    fn legacy_prefix_masks_round_trip_without_item_selector_field() {
+        use crate::{
+            ReplacementUserContent, SessionContextMode, SessionMaskAddition, SessionMaskMutation,
+            ThroughCursor,
+        };
+        let mut source = completed_source();
+        source.journal.pop();
+        let mut mutation = SessionMaskMutation::new(Some(TimelineCursor::new(10)));
+        mutation.add.push(SessionMaskAddition::new(
+            "prefix",
+            ThroughCursor::new(TimelineCursor::new(10)),
+            ReplacementUserContent::new("legacy summary"),
+        ));
+        super::super::mask::mutate_record_masks(&mut source, crate::Revision::new(1), &mutation)
+            .unwrap();
+        let mut json = serde_json::to_value(&source).unwrap();
+        json["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("incarnation");
+        assert!(!serde_json::to_string(&json).unwrap().contains("item_ids"));
+        let legacy: SessionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            legacy.materialize_context(SessionContextMode::Effective),
+            source.materialize_context(SessionContextMode::Effective)
+        );
+        assert_eq!(
+            SessionCopy::from_record_effective(&legacy, TimelineCursor::new(10)).unwrap(),
+            SessionCopy::from_record_effective(&source, TimelineCursor::new(10)).unwrap()
+        );
+    }
+
+    #[test]
     fn copy_rejects_inside_and_active_partial_boundaries_without_clamping() {
         let source = completed_source();
         assert!(matches!(
@@ -604,6 +1083,65 @@ mod tests {
                 first_cursor: TimelineCursor(4),
             }) if item_id.as_str() == "i11"
         ));
+    }
+
+    #[test]
+    fn canonical_items_coalesce_streamed_text_and_final_snapshot_without_changing_replay() {
+        let mut source = SessionRecord::new("streamed-copy");
+        let item_id = TimelineItemId::from_first_cursor(TimelineCursor::new(1));
+        for (cursor, kind, content) in [
+            (
+                1,
+                TimelineEventKind::ContentDelta,
+                TimelineContent::TextDelta {
+                    delta: "first ".into(),
+                },
+            ),
+            (
+                2,
+                TimelineEventKind::ContentDelta,
+                TimelineContent::TextDelta {
+                    delta: "second".into(),
+                },
+            ),
+            (
+                3,
+                TimelineEventKind::ItemFinished,
+                TimelineContent::TextSnapshot {
+                    text: "first second".into(),
+                },
+            ),
+        ] {
+            source.journal.push(assigned(
+                cursor,
+                PendingTimelineEvent::new(
+                    source.id.clone(),
+                    0,
+                    if cursor == 1 {
+                        PendingTimelineItemId::New
+                    } else {
+                        PendingTimelineItemId::Existing(item_id.clone())
+                    },
+                    kind,
+                    Some(crate::TimelineChannel::from(CHANNEL_ASSISTANT_TEXT)),
+                    content,
+                ),
+            ));
+        }
+        source
+            .journal
+            .push(SessionJournalEvent::TurnFinished { turn: 0 });
+        let copy = SessionCopy::from_record(&source, TimelineCursor::new(3)).unwrap();
+        assert_eq!(copy.projected_journal, source.journal);
+        let items = copy.timeline();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_id, item_id);
+        assert_eq!(items[0].cursor, TimelineCursor::new(1));
+        assert!(
+            matches!(&items[0].content, TimelineContent::TextSnapshot { text } if text == "first second")
+        );
+        let replay = copy.materialize(&SessionId::new("destination"));
+        assert_eq!(replay.len(), source.journal.len());
     }
 
     #[test]

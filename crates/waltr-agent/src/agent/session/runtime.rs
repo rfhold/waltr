@@ -3,15 +3,10 @@
 #![allow(missing_docs)]
 
 use crate::{
-    AuthenticationFailure, LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
-    definition::AgentDefinitionBundle,
-    permission::{
-        PERMISSION_STATE_NAMESPACE, PermissionApprovalStage, PermissionClaimIdentity,
-        PermissionRuntimeState,
-    },
+    AuthenticationFailure, LlmError, Result, ToolResult,
     timeline::{
-        CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, PendingTimelineItemId, TimelineChannel,
-        TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
+        PendingTimelineEvent, PendingTimelineItemId, TimelineContent, TimelineCursor,
+        TimelineEventKind, TimelineItemId,
     },
 };
 
@@ -20,8 +15,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::{
-    CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, InferenceSettings, MetadataSetCondition, MetadataSetOutcome, PendingWork,
+    CancelReason, InferenceSettings, MetadataSetCondition, MetadataSetOutcome, PendingWork,
     PendingWorkStatus, ResumeInput, SessionCreateRequest, SessionId, SessionIncarnation,
     SessionJournalEvent, SessionRecord, SessionRollbackTarget, SessionRunContext, SessionSnapshot,
     SessionStatus, SessionStore, SessionSummary, Suspension,
@@ -163,17 +157,18 @@ where
     /// Returns an error when the input is stale or invalid, or when the store fails.
     pub async fn resume(&self, id: &SessionId, input: ResumeInput) -> Result<RuntimeResumeOutput> {
         let record = self.load_session(id).await?;
+        self.resume_record(record, input).await
+    }
+
+    pub(crate) async fn resume_record(
+        &self,
+        record: SessionRecord,
+        input: ResumeInput,
+    ) -> Result<RuntimeResumeOutput> {
         match input {
             ResumeInput::Continue => Ok(RuntimeResumeOutput::Resumed { record }),
             ResumeInput::Prompt(prompt) => self.resume_prompt(record, prompt).await,
             ResumeInput::Prompts(prompts) => self.resume_prompts(record, prompts).await,
-            ResumeInput::ExternalResponse {
-                request_id,
-                response,
-            } => {
-                self.resume_external_response(record, request_id, response)
-                    .await
-            }
             ResumeInput::ToolResults(results) => self.resume_tool_results(record, results).await,
         }
     }
@@ -325,7 +320,7 @@ where
     pub async fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> Result<SessionRecord> {
         self.store
             .set_agent_definition(id, agent_definition)
@@ -369,30 +364,8 @@ where
         }
 
         let mut journal = Vec::new();
-        let mut permissions = permission_state(&snapshot)?;
-        if !permissions.one_shot.is_empty() {
-            permissions.one_shot.clear();
-            journal.push(permission_state_event(&permissions));
-        }
         let mut cancellation_timeline = Vec::new();
         let mut status_timeline = Vec::new();
-        for request in pending_external_requests(&snapshot) {
-            let item_id = external_request_item_id(&record, &request.id)?;
-            let reason = CancelReason::SessionInterrupted;
-            journal.push(SessionJournalEvent::ExternalRequestCanceled {
-                request_id: request.id.clone(),
-                reason: reason.clone(),
-            });
-            let mut request = request.clone();
-            request.status = ExternalRequestStatus::Canceled(reason);
-            cancellation_timeline.push(external_request_timeline_event(
-                &record.id,
-                snapshot.turn,
-                request,
-                TimelineEventKind::ExternalRequestResolved,
-                PendingTimelineItemId::Existing(item_id),
-            ));
-        }
         for work in pending_work(&snapshot) {
             if let Some(result) = interrupted_tool_result(work) {
                 let parent_id = tool_call_item_id(&record, &result.call_id)?;
@@ -467,30 +440,8 @@ where
         }
         let snapshot = record.snapshot();
         let mut journal = Vec::new();
-        let mut permissions = permission_state(&snapshot)?;
-        if !permissions.one_shot.is_empty() {
-            permissions.one_shot.clear();
-            journal.push(permission_state_event(&permissions));
-        }
         let mut cancellation_timeline = Vec::new();
         let mut prompt_timeline = Vec::new();
-        for request in pending_external_requests(&snapshot) {
-            let item_id = external_request_item_id(&record, &request.id)?;
-            let reason = CancelReason::SupersededByUserPrompt;
-            journal.push(SessionJournalEvent::ExternalRequestCanceled {
-                request_id: request.id.clone(),
-                reason: reason.clone(),
-            });
-            let mut request = request.clone();
-            request.status = ExternalRequestStatus::Canceled(reason);
-            cancellation_timeline.push(external_request_timeline_event(
-                &record.id,
-                snapshot.turn,
-                request,
-                TimelineEventKind::ExternalRequestResolved,
-                PendingTimelineItemId::Existing(item_id),
-            ));
-        }
         for work in pending_work(&snapshot) {
             if let Some(result) = interrupted_tool_result(work) {
                 let parent_id = tool_call_item_id(&record, &result.call_id)?;
@@ -535,194 +486,13 @@ where
             *journal_index = journal_start.saturating_add(*journal_index);
         }
         record = self.append_journal_and_reload(record, journal).await?;
-        self.publish_user_message_events(&record, snapshot.prompts.len(), created_prompts);
         if !prompt_timeline.is_empty() {
             record = self
                 .append_timeline_and_reload(record, prompt_timeline)
                 .await?;
         }
+        self.publish_user_message_events(&record, snapshot.prompts.len(), created_prompts);
         Ok(RuntimeResumeOutput::Resumed { record })
-    }
-
-    async fn resume_external_response(
-        &self,
-        record: SessionRecord,
-        request_id: ExternalRequestId,
-        response: ExternalResponse,
-    ) -> Result<RuntimeResumeOutput> {
-        let snapshot = record.snapshot();
-        let request = validate_pending_external_response(&snapshot, &request_id)?;
-        if request.kind == ExternalRequestKind::Permission
-            && let PermissionResponse::AllowAlways { patterns } =
-                PermissionResponse::from_value(response.payload.clone())?
-        {
-            validate_permission_patterns(&request, &patterns)?;
-        }
-        let request_item_id = external_request_item_id(&record, &request_id)?;
-        let turn = snapshot.turn;
-        let mut record = self
-            .append_journal_and_reload(
-                record,
-                vec![SessionJournalEvent::ExternalRequestResponded {
-                    request_id: request_id.clone(),
-                    response: response.clone(),
-                }],
-            )
-            .await?;
-
-        let mut resolved_request = request.clone();
-        resolved_request.status = ExternalRequestStatus::Responded(response.clone());
-        let session_id = record.id.clone();
-        record = self
-            .append_timeline_and_reload(
-                record,
-                vec![external_request_timeline_event(
-                    &session_id,
-                    turn,
-                    resolved_request,
-                    TimelineEventKind::ExternalRequestResolved,
-                    PendingTimelineItemId::Existing(request_item_id),
-                )],
-            )
-            .await?;
-
-        match &request.kind {
-            ExternalRequestKind::Permission => {
-                record = self
-                    .apply_permission_response(record, &snapshot, &request, &request_id, response)
-                    .await?;
-            }
-            ExternalRequestKind::Question
-            | ExternalRequestKind::ToolInput
-            | ExternalRequestKind::Custom(_) => {
-                if let Some(tool_call_id) = request.tool_call_id {
-                    let result = ToolResult::new(
-                        tool_call_id,
-                        request_tool_name(&request.kind),
-                        external_response_content(&response),
-                    );
-                    let session_id = record.id.clone();
-                    let parent_id = tool_call_item_id(&record, &result.call_id)?;
-                    record = self
-                        .append_timeline_and_reload(
-                            record,
-                            vec![tool_result_timeline_event(
-                                &session_id,
-                                turn,
-                                parent_id,
-                                result,
-                            )],
-                        )
-                        .await?;
-                    record = self
-                        .append_journal_and_reload(
-                            record,
-                            vec![SessionJournalEvent::TurnFinished { turn }],
-                        )
-                        .await?;
-                }
-            }
-        }
-
-        Ok(RuntimeResumeOutput::Resumed { record })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_permission_response(
-        &self,
-        record: SessionRecord,
-        snapshot: &SessionSnapshot,
-        request: &ExternalRequest,
-        request_id: &ExternalRequestId,
-        response: ExternalResponse,
-    ) -> Result<SessionRecord> {
-        let response = PermissionResponse::from_value(response.payload)?;
-        let Some(tool_call_id) = request.tool_call_id.as_deref() else {
-            return Err(runtime_error("permission request missing tool call id"));
-        };
-        let turn = snapshot.turn;
-        let approval_stage = if request
-            .payload
-            .get("claims")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-        {
-            PermissionApprovalStage::WholeTool
-        } else {
-            PermissionApprovalStage::Contextual
-        };
-        let claims = permission_request_claims(request)?;
-
-        match response {
-            PermissionResponse::AllowOnce => {
-                let mut state = permission_state(snapshot)?;
-                state.allow_once(request_id, tool_call_id, approval_stage, claims);
-                self.append_journal_and_reload(record, vec![permission_state_event(&state)])
-                    .await
-            }
-            PermissionResponse::AllowAlways { patterns } => {
-                validate_permission_patterns(request, &patterns)?;
-                let mut state = permission_state(snapshot)?;
-                state.allow_patterns(patterns);
-                state.allow_once(request_id, tool_call_id, approval_stage, claims);
-                self.append_journal_and_reload(record, vec![permission_state_event(&state)])
-                    .await
-            }
-            PermissionResponse::Deny { message, mode } => {
-                let mut state = permission_state(snapshot)?;
-                let previous_count = state.one_shot.len();
-                state
-                    .one_shot
-                    .retain(|approval| approval.tool_call_id != tool_call_id);
-                let record = if state.one_shot.len() == previous_count {
-                    record
-                } else {
-                    self.append_journal_and_reload(record, vec![permission_state_event(&state)])
-                        .await?
-                };
-                match mode {
-                    PermissionDenyMode::ReturnToolResult => {
-                        if request.payload.get("template") == Some(&Value::Bool(true)) {
-                            return Ok(record);
-                        }
-                        let result = ToolResult::new(
-                            tool_call_id.to_owned(),
-                            "permission",
-                            message.unwrap_or_else(|| "permission denied".to_owned()),
-                        )
-                        .with_error();
-                        let session_id = record.id.clone();
-                        let parent_id = tool_call_item_id(&record, &result.call_id)?;
-                        let record = self
-                            .append_timeline_and_reload(
-                                record,
-                                vec![tool_result_timeline_event(
-                                    &session_id,
-                                    turn,
-                                    parent_id,
-                                    result,
-                                )],
-                            )
-                            .await?;
-                        self.append_journal_and_reload(
-                            record,
-                            vec![SessionJournalEvent::TurnFinished { turn }],
-                        )
-                        .await
-                    }
-                    PermissionDenyMode::CancelWork => {
-                        self.append_journal_and_reload(
-                            record,
-                            vec![SessionJournalEvent::WorkCanceled {
-                                work_id: tool_call_id.to_owned(),
-                                reason: CancelReason::ToolUnavailable,
-                            }],
-                        )
-                        .await
-                    }
-                }
-            }
-        }
     }
 
     async fn resume_tool_results(
@@ -752,34 +522,51 @@ where
 
     async fn append_journal_and_reload(
         &self,
-        record: SessionRecord,
+        mut record: SessionRecord,
         events: Vec<SessionJournalEvent>,
     ) -> Result<SessionRecord> {
         let id = record.id.clone();
-        self.store
-            .append_journal(&id, record.revision, events)
+        let receipt = self
+            .store
+            .append_journal(
+                &id,
+                record.execution_token().map_err(session_store_error)?,
+                events.clone(),
+            )
             .await
             .map_err(session_store_error)?;
-        let record = self.load_session(&id).await?;
+        record.adopt_commit(receipt);
+        record.append_journal_events(events);
         self.publish_session_summary(&record);
         Ok(record)
     }
 
     async fn append_timeline_and_reload(
         &self,
-        record: SessionRecord,
+        mut record: SessionRecord,
         events: Vec<PendingTimelineEvent>,
     ) -> Result<SessionRecord> {
         let id = record.id.clone();
-        let assigned = self
+        let receipt = self
             .store
-            .append_timeline(&id, record.revision, events)
+            .append_timeline(
+                &id,
+                record.execution_token().map_err(session_store_error)?,
+                events,
+            )
             .await
             .map_err(session_store_error)?;
+        record.adopt_commit(receipt.commit);
+        record.append_journal_events(
+            receipt
+                .events
+                .iter()
+                .cloned()
+                .map(SessionJournalEvent::Timeline),
+        );
         if let Some(context) = &self.run_context {
-            context.timeline().publish_all(assigned);
+            context.timeline().publish_all(receipt.events);
         }
-        let record = self.load_session(&id).await?;
         self.publish_session_summary(&record);
         Ok(record)
     }
@@ -812,6 +599,7 @@ where
                 crate::SessionEvent::UserMessageCreated {
                     id: crate::agent::event::user_message_event_id(&record.id, journal_index),
                     session_id: record.id.clone(),
+                    incarnation: record.metadata.incarnation.clone(),
                     prompt_index,
                     user_message_count: prompt_index.saturating_add(1),
                     text,
@@ -821,28 +609,6 @@ where
                 },
             );
         }
-    }
-}
-
-fn validate_permission_patterns(
-    request: &ExternalRequest,
-    patterns: &[crate::PermissionPattern],
-) -> Result<()> {
-    let suggested = request
-        .payload
-        .get("patterns")
-        .cloned()
-        .ok_or_else(|| runtime_error("permission request missing suggested patterns"))?;
-    let suggested: Vec<crate::PermissionPattern> =
-        serde_json::from_value(suggested).map_err(|error| {
-            runtime_error(format!("invalid suggested permission patterns: {error}"))
-        })?;
-    if patterns.iter().all(|pattern| suggested.contains(pattern)) {
-        Ok(())
-    } else {
-        Err(runtime_error(
-            "allow_always patterns must be a subset of the pending suggested patterns",
-        ))
     }
 }
 
@@ -885,43 +651,6 @@ fn rollback_journal_len(
     u64::try_from(index.saturating_add(1)).map_err(session_store_error)
 }
 
-fn validate_pending_external_response(
-    snapshot: &SessionSnapshot,
-    request_id: &ExternalRequestId,
-) -> Result<ExternalRequest> {
-    let request = snapshot
-        .external_requests
-        .iter()
-        .rev()
-        .find(|request| request.id == *request_id)
-        .ok_or_else(|| {
-            runtime_error(format!(
-                "external request not found: {}",
-                request_id.as_str()
-            ))
-        })?;
-
-    match &request.status {
-        ExternalRequestStatus::Pending => Ok(request.clone()),
-        ExternalRequestStatus::Responded(_) => Err(runtime_error(format!(
-            "external request already answered: {}",
-            request_id.as_str()
-        ))),
-        ExternalRequestStatus::Canceled(reason) => Err(runtime_error(format!(
-            "external request canceled: {} ({reason:?})",
-            request_id.as_str()
-        ))),
-    }
-}
-
-fn pending_external_requests(snapshot: &SessionSnapshot) -> Vec<&ExternalRequest> {
-    snapshot
-        .external_requests
-        .iter()
-        .filter(|request| matches!(request.status, ExternalRequestStatus::Pending))
-        .collect()
-}
-
 fn pending_work(snapshot: &SessionSnapshot) -> Vec<&PendingWork> {
     snapshot
         .pending_work
@@ -935,34 +664,6 @@ fn interrupted_tool_result(work: &PendingWork) -> Option<ToolResult> {
     Some(ToolResult::new(call.id.clone(), call.name.clone(), "interrupted").with_error())
 }
 
-fn permission_state(snapshot: &SessionSnapshot) -> Result<PermissionRuntimeState> {
-    snapshot
-        .middleware_state
-        .get(PERMISSION_STATE_NAMESPACE)
-        .map(|state| serde_json::from_value(state.clone()))
-        .transpose()
-        .map_err(|error| runtime_error(error.to_string()))
-        .map(Option::unwrap_or_default)
-}
-
-fn permission_request_claims(request: &ExternalRequest) -> Result<Vec<PermissionClaimIdentity>> {
-    request
-        .payload
-        .get("claim_identities")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| runtime_error(format!("invalid permission claim identities: {error}")))
-        .map(Option::unwrap_or_default)
-}
-
-fn permission_state_event(state: &PermissionRuntimeState) -> SessionJournalEvent {
-    SessionJournalEvent::MiddlewareStateUpdated {
-        namespace: PERMISSION_STATE_NAMESPACE.to_owned(),
-        state: serde_json::to_value(state).expect("permission runtime state serializes"),
-    }
-}
-
 fn tool_call_item_id(record: &SessionRecord, call_id: &str) -> Result<TimelineItemId> {
     record
         .timeline_events()
@@ -972,27 +673,6 @@ fn tool_call_item_id(record: &SessionRecord, call_id: &str) -> Result<TimelineIt
         })
         .last()
         .ok_or_else(|| runtime_error(format!("timeline item missing for tool call: {call_id}")))
-}
-
-fn external_request_item_id(
-    record: &SessionRecord,
-    request_id: &ExternalRequestId,
-) -> Result<TimelineItemId> {
-    record
-        .timeline_events()
-        .filter_map(|event| match &event.content {
-            TimelineContent::ExternalRequest { request } if request.id == *request_id => {
-                Some(event.item_id.clone())
-            }
-            _ => None,
-        })
-        .last()
-        .ok_or_else(|| {
-            runtime_error(format!(
-                "timeline item missing for external request: {}",
-                request_id.as_str()
-            ))
-        })
 }
 
 fn tool_result_timeline_event(
@@ -1029,23 +709,6 @@ fn open_prompt_turn(snapshot: &SessionSnapshot) -> Option<u64> {
     (prompt_turn.turn == snapshot.turn).then_some(prompt_turn.turn)
 }
 
-fn external_request_timeline_event(
-    session_id: &SessionId,
-    turn: u64,
-    request: ExternalRequest,
-    kind: TimelineEventKind,
-    item_id: PendingTimelineItemId,
-) -> PendingTimelineEvent {
-    PendingTimelineEvent::new(
-        session_id.clone(),
-        turn,
-        item_id,
-        kind,
-        Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
-        TimelineContent::ExternalRequest { request },
-    )
-}
-
 fn interrupted_status_timeline_event(session_id: &SessionId, turn: u64) -> PendingTimelineEvent {
     let mut event = PendingTimelineEvent::new(
         session_id.clone(),
@@ -1057,23 +720,6 @@ fn interrupted_status_timeline_event(session_id: &SessionId, turn: u64) -> Pendi
     );
     event.status = Some(crate::timeline::TimelineStatus::Interrupted);
     event
-}
-
-const fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
-    match kind {
-        super::ExternalRequestKind::Question => "question",
-        super::ExternalRequestKind::Permission => "permission",
-        super::ExternalRequestKind::ToolInput | super::ExternalRequestKind::Custom(_) => {
-            "external_request"
-        }
-    }
-}
-
-fn external_response_content(response: &ExternalResponse) -> String {
-    response
-        .payload
-        .as_str()
-        .map_or_else(|| response.payload.to_string(), str::to_owned)
 }
 
 fn session_store_error(error: impl std::fmt::Display) -> LlmError {
@@ -1089,82 +735,12 @@ fn runtime_error(message: impl Into<String>) -> LlmError {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
 
     use super::*;
-    use crate::ToolCall;
-    use crate::agent::session::{ExternalRequestKind, MemorySessionStore, Revision, SessionStore};
+    use crate::agent::session::{MemorySessionStore, Revision};
 
     fn session_id() -> SessionId {
         SessionId::new("runtime-session")
-    }
-
-    fn external_request(id: &str) -> ExternalRequest {
-        ExternalRequest {
-            id: ExternalRequestId::new(id),
-            kind: ExternalRequestKind::Question,
-            tool_call_id: Some("call-question".to_owned()),
-            prompt: "Pick one".to_owned(),
-            payload: json!({ "questions": [] }),
-            status: ExternalRequestStatus::Pending,
-        }
-    }
-
-    async fn suspended_question_session(store: &MemorySessionStore) -> SessionId {
-        let id = session_id();
-        store
-            .create(SessionCreateRequest::new(id.clone()))
-            .await
-            .unwrap();
-        let revision = store
-            .append_journal(
-                &id,
-                Revision::ZERO,
-                vec![SessionJournalEvent::PromptAppended {
-                    prompt: "ask".to_owned(),
-                }],
-            )
-            .await
-            .unwrap();
-        let revision = {
-            store
-                .append_timeline(
-                    &id,
-                    revision,
-                    vec![
-                        PendingTimelineEvent::tool_call(
-                            id.clone(),
-                            0,
-                            PendingTimelineItemId::New,
-                            ToolCall::new("call-question", "question", json!({})),
-                        ),
-                        external_request_timeline_event(
-                            &id,
-                            0,
-                            external_request("question-1"),
-                            TimelineEventKind::ExternalRequestOpened,
-                            PendingTimelineItemId::New,
-                        ),
-                    ],
-                )
-                .await
-                .unwrap();
-            Revision::new(2)
-        };
-        let revision = store
-            .append_journal(
-                &id,
-                revision,
-                vec![SessionJournalEvent::Suspended {
-                    suspension: Suspension::AwaitingExternalInput {
-                        request: Box::new(external_request("question-1")),
-                    },
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(revision, Revision::new(3));
-        id
     }
 
     #[tokio::test]
@@ -1183,154 +759,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_response_records_answer_and_tool_result() {
-        let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
-        let runtime = AgentSessionRuntime::new(&store);
-
-        let output = runtime
-            .resume(
-                &id,
-                ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new("question-1"),
-                    response: ExternalResponse {
-                        payload: json!({ "answers": [{ "header": "Choice" }] }),
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        let RuntimeResumeOutput::Resumed { record } = output else {
-            panic!("external response should resume");
-        };
-        let snapshot = record.snapshot();
-        assert!(matches!(
-            snapshot.external_requests[0].status,
-            ExternalRequestStatus::Responded(_)
-        ));
-        let tool_results: Vec<_> = snapshot.tool_results().collect();
-        assert_eq!(tool_results.len(), 1);
-        assert_eq!(tool_results[0].call_id, "call-question");
-        assert_eq!(tool_results[0].name, "question");
-        assert_eq!(snapshot.turns[0].turn, 0);
-        assert_eq!(
-            snapshot.turn, 1,
-            "answering the suspended call should finish the turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_external_response_is_rejected_deterministically() {
-        let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
-        let runtime = AgentSessionRuntime::new(&store);
-
-        runtime
-            .resume(
-                &id,
-                ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new("question-1"),
-                    response: ExternalResponse {
-                        payload: json!("A"),
-                    },
-                },
-            )
-            .await
-            .unwrap();
-        let error = runtime
-            .resume(
-                &id,
-                ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new("question-1"),
-                    response: ExternalResponse {
-                        payload: json!("B"),
-                    },
-                },
-            )
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("already answered"));
-    }
-
-    #[tokio::test]
-    async fn prompt_resume_cancels_pending_external_request_and_work() {
-        let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
-        let runtime = AgentSessionRuntime::new(&store);
-
-        let output = runtime
-            .resume(&id, ResumeInput::Prompt("new prompt".to_owned()))
-            .await
-            .unwrap();
-
-        let RuntimeResumeOutput::Resumed { record } = output else {
-            panic!("prompt should resume");
-        };
-        let snapshot = record.snapshot();
-        assert_eq!(snapshot.current_prompt.as_deref(), Some("new prompt"));
-        assert_eq!(
-            snapshot.external_requests[0].status,
-            ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt)
-        );
-        assert_eq!(
-            snapshot.pending_work[0].status,
-            PendingWorkStatus::Canceled(CancelReason::SupersededByUserPrompt)
-        );
-        let tool_results: Vec<_> = snapshot.tool_results().collect();
-        assert_eq!(tool_results.len(), 1);
-        assert_eq!(tool_results[0].call_id, "call-question");
-        assert_eq!(tool_results[0].name, "question");
-        assert_eq!(tool_results[0].content, "interrupted");
-    }
-
-    #[tokio::test]
-    async fn interrupt_cancels_pending_external_request_and_work() {
-        let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
-        let runtime = AgentSessionRuntime::new(&store);
-
-        let record = runtime.interrupt(&id).await.unwrap();
-
-        let snapshot = record.snapshot();
-        assert!(matches!(
-            snapshot.status,
-            SessionStatus::Suspended(Suspension::Interrupted { .. })
-        ));
-        assert_eq!(
-            snapshot.external_requests[0].status,
-            ExternalRequestStatus::Canceled(CancelReason::SessionInterrupted)
-        );
-        assert_eq!(
-            snapshot.pending_work[0].status,
-            PendingWorkStatus::Canceled(CancelReason::SessionInterrupted)
-        );
-        assert_eq!(snapshot.turn, 1);
-        let tool_results: Vec<_> = snapshot.tool_results().collect();
-        assert_eq!(tool_results.len(), 1);
-        assert_eq!(tool_results[0].call_id, "call-question");
-        assert_eq!(tool_results[0].name, "question");
-        assert_eq!(tool_results[0].content, "interrupted");
-        assert!(
-            record
-                .journal
-                .iter()
-                .any(|event| matches!(event, SessionJournalEvent::Interrupted))
-        );
-        assert!(
-            record
-                .journal
-                .iter()
-                .any(|event| matches!(event, SessionJournalEvent::TurnInterrupted { turn: 0 }))
-        );
-    }
-
-    #[tokio::test]
     async fn interrupt_is_idempotent() {
         let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
         let runtime = AgentSessionRuntime::new(&store);
+        let id = runtime
+            .create(SessionCreateRequest::new(session_id()))
+            .await
+            .unwrap()
+            .id;
+        runtime
+            .resume(&id, ResumeInput::Prompt("active work".into()))
+            .await
+            .unwrap();
 
         let first = runtime.interrupt(&id).await.unwrap();
         let second = runtime.interrupt(&id).await.unwrap();
@@ -1352,54 +792,5 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn interrupted_external_response_is_rejected_deterministically() {
-        let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
-        let runtime = AgentSessionRuntime::new(&store);
-        runtime.interrupt(&id).await.unwrap();
-
-        let error = runtime
-            .resume(
-                &id,
-                ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new("question-1"),
-                    response: ExternalResponse {
-                        payload: json!("late"),
-                    },
-                },
-            )
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("canceled"));
-    }
-
-    #[tokio::test]
-    async fn canceled_external_response_is_rejected_deterministically() {
-        let store = MemorySessionStore::new();
-        let id = suspended_question_session(&store).await;
-        let runtime = AgentSessionRuntime::new(&store);
-        runtime
-            .resume(&id, ResumeInput::Prompt("replacement".to_owned()))
-            .await
-            .unwrap();
-
-        let error = runtime
-            .resume(
-                &id,
-                ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new("question-1"),
-                    response: ExternalResponse {
-                        payload: json!("late"),
-                    },
-                },
-            )
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("canceled"));
     }
 }

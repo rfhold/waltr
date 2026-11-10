@@ -2,95 +2,84 @@
 
 mod agent;
 mod auth;
-pub mod definition;
 mod error;
-pub mod mcp;
 pub mod middleware;
 mod model;
 mod outbound_http;
-mod permission;
 pub mod prompt;
 pub mod provider;
 mod resource;
-pub mod sandbox_gateway;
 mod stream;
-mod template;
 pub mod timeline;
-pub mod tools;
+mod transient_input;
 
 pub use agent::{
-    ActiveSessionMask, AgentRunBuilder, AgentRunLimits, AgentRuntime, AgentRuntimeBuilder,
-    AgentRuntimeProvider, AgentSession, AgentSessionActiveRunState, AgentSessionRunDisposition,
+    ActiveSessionMask, AgentHostContext, AgentHostRuntimeFactory, AgentRunBuilder, AgentRunLimits,
+    AgentRuntime, AgentRuntimeBuilder, AgentRuntimeProvider, AgentSession,
+    AgentSessionActiveRunState, AgentSessionRunCancellation, AgentSessionRunDisposition,
     AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome,
     AgentSessionRunSubmission, AgentSessionRuntime, AgentSessionRuntimeError,
-    AgentSessionRuntimeFactory, AgentTool, BoxAgentTimelineStream, CancelReason,
-    CompletedSessionCapture, CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore,
-    ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, FileCredentialStore, FilesystemSessionStore, InferenceProviderSettings,
-    InferenceSettings, MAX_ACTIVE_SESSION_MASKS, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
-    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, MAX_SESSION_MASK_KEY_BYTES,
-    MAX_SESSION_MASK_MUTATION_ITEMS, MAX_SESSION_MASK_REPLACEMENT_BYTES, McpAppError, McpAppHandle,
-    McpConnectionKind, McpConnectionResolveFuture, McpConnectionResolveRequest, McpOAuthContext,
-    McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, McpResolvedConnection,
-    MemorySessionStore, MetadataSetCondition, MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION,
-    OAuthCredential, OAuthCredentialContext, OAuthCredentialRecord, OAuthCredentialStore,
-    OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
-    OpenDalSessionStore, PendingWork, PendingWorkStatus, ProviderRetryConfig, RefreshMode,
-    ReplacementUserContent, RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy,
-    RuntimeResumeOutput, S3SessionStore, S3SessionWriteMode, SandboxDispatch, ScyllaSessionStore,
+    AgentSessionRuntimeFactory, AgentTool, BoxAgentTimelineStream,
+    CancelReason, CompletedSessionCapture, ContextIdentity,
+    CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore, FileCredentialStore,
+    FilesystemSessionStore, HostConfigurationUpdate, HostContext, HostContextFuture,
+    HostContextState, HostDispatchBinding, HostEffectExecutor, HostEffectFuture, HostEffectResult,
+    HostPromptFuture, HostPromptRender, HostRequest, HostRuntimeFuture, HostRuntimeRetireFuture,
+    HostSearchFuture, IdleHostEffectError, InferenceProviderSettings, InferenceSettings,
+    MAX_ACTIVE_SESSION_MASKS,
+    MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES, MAX_SESSION_COORDINATION_REASON_CODE_BYTES,
+    MAX_SESSION_MASK_KEY_BYTES, MAX_SESSION_MASK_MUTATION_ITEMS,
+    MAX_SESSION_MASK_REPLACEMENT_BYTES, MemorySessionStore, MetadataSetCondition,
+    MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
+    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
+    OAuthRefreshClaimResult, OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus,
+    ProviderRetryConfig, RefreshMode, ReplacementUserContent, RequestId, RequestRecord,
+    ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
+    ExecutionSequence, ExecutionToken, SessionCommitReceipt, TimelineAppendReceipt,
+    S3SessionWriteMode, SandboxDispatch, ScyllaSessionStore, SemanticSessionEventSink,
     SessionCapabilities, SessionCaptureError, SessionCaptureLimits,
     SessionCompletionAdmissionFinalizer, SessionCompletionAdmissionHandler,
     SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
     SessionCompletionCoordinationPreparation, SessionCompletionFinalizationFuture,
     SessionCompletionPreparation, SessionCompletionPreparationFuture,
-    SessionCompletionWorkerFuture, SessionContextMode, SessionCoordinationPhase,
-    SessionCoordinationReason, SessionCoordinationReasonError, SessionCoordinationState,
-    SessionCoordinator, SessionCopy, SessionCopyError, SessionCreateRequest, SessionEvent,
-    SessionEventSink, SessionEventSinkFuture, SessionId, SessionJournalEvent, SessionListEvent,
-    SessionListSubscription, SessionListUpdate, SessionMask, SessionMaskAddition, SessionMaskError,
-    SessionMaskId, SessionMaskMutation, SessionMaskMutationOutcome, SessionMaskSubtraction,
-    SessionMaterializedContext, SessionMcpApp, SessionMetrics, SessionOAuthJwtMetadata,
-    SessionOAuthJwtToken, SessionOAuthProviderSettings, SessionOAuthTokenField,
-    SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle, SessionPauseError, SessionPauseId,
-    SessionPauseLease, SessionProgress, SessionProgressPhase, SessionPromptDisposition,
-    SessionRecord, SessionRunCompletionSnapshot, SessionRunStage, SessionSnapshot, SessionStart,
-    SessionStartMessage, SessionStartMessageError, SessionStatus, SessionStore, SessionStoreError,
-    SessionStoreResult, SessionSummary, SessionSyntheticTimelineEvent, SessionTimelineEvent,
-    SessionTimelineMode, SessionTimelinePage, SessionTimelinePresentation,
-    SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionCompletionWorkerFuture, SessionContextCapture, SessionContextMode,
+    SessionCoordinationPhase, SessionCoordinationReason, SessionCoordinationReasonError,
+    SessionCoordinationState, SessionCoordinator, SessionCopy, SessionCopyError,
+    SessionCreateRequest, SessionEvent, SessionEventSink, SessionEventSinkFuture, SessionId,
+    SessionJournalEvent, SessionListEvent, SessionListSubscription, SessionListUpdate, SessionMask,
+    SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
+    SessionMaskMutationOutcome, SessionMaskSubtraction, SessionMaterializedContext, SessionMetrics,
+    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    SessionPauseError, SessionPauseId, SessionPauseLease, SessionProgress, SessionProgressPhase,
+    SessionPromptDisposition, SessionRecord, SessionRunCompletionSnapshot, SessionRunStage,
+    SessionSemanticEvent, SessionSemanticHub, SessionSemanticKind, SessionSemanticSubscription,
+    SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError, SessionStatus,
+    SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
+    SessionSyntheticTimelineEvent, SessionTimelineEvent, SessionTimelineMode, SessionTimelinePage,
+    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
     SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
     SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
-    StoredCredential, Suspension, ThroughCursor, ToolExecutionContext, ToolProgressSink,
-    opendal_postgresql_session_store, run_postgresql_migrations,
+    StoredCredential, Suspension, ThroughCursor, ToolExecutionContext,
+    ToolFuture, ToolGuardFuture, ToolProgressSink, ToolResultMetadata,
+    completion::{
+        CompletionDecision, CompletionFeedback, CompletionObserver, CompletionObserverError,
+        CompletionObserverFuture, CompletionProposal, CompletionToolEvidence, CompletionValidation,
+        MAX_COMPLETION_DURATION, MAX_COMPLETION_EVIDENCE_BYTES, MAX_COMPLETION_FEEDBACK_BYTES,
+        MAX_COMPLETION_TURNS,
+    },
+    ItemMetadata, MetadataError, MetadataTarget, MetadataPredicate, MetadataUpdate,
+    SessionMutation, SessionMutationOutcome, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES,
+    MAX_METADATA_KEYS, MAX_METADATA_ITEMS, MAX_METADATA_MUTATION_ENTRIES, MAX_METADATA_BYTES,
+    MAX_SESSION_MUTATION_BYTES,
+    opendal_postgresql_session_store,
+    owned_runs::{OwnedExecutionError, SessionExecutionOwner},
+    run_postgresql_migrations,
 };
-pub use auth::{
-    AuthTarget, AuthenticationFailure, AuthenticationFailureReason, McpAuthorizationContext,
-};
-pub use definition::{
-    AGENT_DEFINITION_API_VERSION, AgentCatalogEntry, AgentDefinitionBundle, AgentDefinitionCatalog,
-    AgentDefinitionError, AgentDefinitionRegistry, AgentDefinitionResourceKey,
-    AgentDefinitionResourceKind, AgentFeature, AgentPermissionSelector, AgentSwitchAudit,
-    AgentsFeatureConfig, FilesystemFeatureConfig, FilesystemFeatureProfile, McpFeatureConfig,
-    ResolvedAgent, ResolvedAgentFeatures, ResolvedPermission, ResolvedPermissionEntry,
-    ResolvedPermissionResources, SESSION_WORKSPACE_ROOT, ShellFeatureConfig, SkillsFeatureConfig,
-    TaskFeatureConfig, inspect_agent_definition_source,
-};
+pub use auth::{AuthTarget, AuthenticationFailure, AuthenticationFailureReason};
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
-pub use permission::{
-    PermissionClaim, PermissionClassRule, PermissionCommandPattern, PermissionCommandRule,
-    PermissionDenyMode, PermissionDirectoryRule, PermissionEffect, PermissionEngine,
-    PermissionInputCondition, PermissionInputRule, PermissionInputScalar,
-    PermissionInputValueMatcher, PermissionJsonPointer, PermissionLevel, PermissionOperation,
-    PermissionPathPattern, PermissionPattern, PermissionPolicy, PermissionResource,
-    PermissionResourcePattern, PermissionResponse, PermissionToolRule, PermissionToolSelector,
-};
-#[cfg(feature = "shell")]
-pub use prompt::ShellPromptConfig;
-pub use prompt::{
-    AGENTS_INSTRUCTION_FILE, AgentsInstruction, AgentsPromptConfig, BASE_SYSTEM_PROMPT,
-    FilesystemPromptConfig, SystemPromptBuilder,
-};
+pub use prompt::SystemPromptBuilder;
 pub use resource::{
     SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
     SessionTemplateSearchTarget,
@@ -103,16 +92,14 @@ pub use stream::{
     ToolResultContent, ToolResultContentBlock, ToolResultContentError, ToolResultImage, TurnItem,
 };
 pub use timeline::{
-    AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS,
-    CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO,
+    AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_METRICS, CHANNEL_THINKING,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO,
     CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, PendingTimelineEvent, PendingTimelineItemId,
     TimelineChannel, TimelineContent, TimelineContentId, TimelineCursor, TimelineDirection,
     TimelineEventKind, TimelineItemId, TimelineItemText, TimelineQuery, TimelineStatus,
 };
-pub use tools::filesystem;
-pub use tools::question;
-pub use tools::skills::{SkillDefinition, SkillsConfig};
-pub use tools::task;
-
-#[cfg(feature = "shell")]
-pub use tools::shell;
+pub use transient_input::{
+    AdmittedTransientInput, MAX_TRANSIENT_ATTACHMENT_BYTES, MAX_TRANSIENT_BODY_BYTES,
+    MAX_TRANSIENT_SOURCE_BYTES, TransientAttachment, TransientInput, TransientInputApi,
+    TransientInputBudget, TransientInputKind, TransientModelCapabilities, TransientPromptTarget,
+};

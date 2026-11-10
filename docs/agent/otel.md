@@ -59,7 +59,7 @@ Tool spans are children of the active `agent.turn` span when a turn span exists.
 
 ## MCP Integration Spans
 
-Waltr MCP integration wraps operations that adapt MCP calls into agent tools and templates in `mcp.agent.operation` spans from [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs).
+The server wraps MCP adaptation operations in `mcp.agent.operation` spans from [the host MCP runtime](../../crates/waltr-server/src/agent_host/mcp/server.rs).
 
 | Operation | Fields |
 | --- | --- |

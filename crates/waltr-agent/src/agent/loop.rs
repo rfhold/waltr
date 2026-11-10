@@ -6,7 +6,6 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt::Write as _,
     hash::{Hash, Hasher},
-    path::PathBuf,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -18,45 +17,38 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-use crate::permission::{
-    PERMISSION_STATE_NAMESPACE, PermissionApprovalStage, PermissionClaimIdentity,
-    PermissionRuntimeState, permission_claim_identities,
-};
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
-    MAX_TOOL_RESULT_IMAGE_BYTES, ModelRef, PendingTimelineEvent, PendingTimelineItemId,
-    PermissionClaim, PermissionLevel, PermissionOperation, PermissionPattern, PermissionPolicy,
-    PermissionResource, PermissionResourcePattern, PermissionResponse, PromptTurn, Result,
-    TimelineChannel, TimelineContent, TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition,
-    ToolExecutionContext, ToolProgressSink, ToolResult, ToolResultContentBlock, TurnItem,
+    MAX_TOOL_RESULT_IMAGE_BYTES, ModelRef, PendingTimelineEvent, PendingTimelineItemId, PromptTurn,
+    Result, TimelineChannel, TimelineContent, TimelineEventKind, TimelineItemId, ToolCall,
+    ToolDefinition, ToolExecutionContext, ToolProgressSink, ToolResult, ToolResultContentBlock,
+    TurnItem,
     middleware::{
         self as middleware, HookOutcome,
         chain::MiddlewareChain,
         context::{
-            MiddlewareStateLog, ModelRequestDraft, RequestContext, RunContext, SystemPromptParts,
-            ToolCallContext, ToolDraft, ToolResultContext,
+            MiddlewareStateLog, ModelRequestDraft, RequestContext, SystemPromptParts, ToolDraft,
+            ToolResultContext,
         },
     },
-    template::{
-        TemplateOrigin, TemplateRender, TemplateRunContext, TemplateRuntime,
-        clear_sandbox_template_results,
-    },
-    timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS, TimelineStatus},
+    timeline::{AgentTimelineEvent, CHANNEL_METRICS, TimelineStatus},
 };
 use tokio::{sync::mpsc, time::Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, Span};
 
+use super::completion::{
+    CompletionDecision, CompletionProposal, CompletionToolEvidence, CompletionValidation,
+    MAX_COMPLETION_FEEDBACK_BYTES, validation_error, wait_deadline,
+};
 use super::{
     AgentTool,
     session::{
-        AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
-        ExternalRequestKind, ExternalRequestStatus, ExternalResponse, PendingWorkStatus, RequestId,
-        RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionContextMode,
-        SessionCreateRequest, SessionId, SessionIncarnation, SessionJournalEvent, SessionOperation,
-        SessionRecord, SessionRollbackTarget, SessionRunContext, SessionSnapshot, SessionStart,
-        SessionStartMessage, SessionStatus, SessionStore, SessionStoreError,
-        Suspension as SessionSuspension,
+        AgentSessionRuntime, EphemeralSessionRun, PendingWorkStatus, RequestId, RequestRecord,
+        ResumeInput, Revision, RuntimeResumeOutput, SessionContextMode, SessionCreateRequest,
+        SessionId, SessionIncarnation, SessionJournalEvent, SessionOperation, SessionRecord,
+        SessionRollbackTarget, SessionRunContext, SessionStart, SessionStartMessage, SessionStatus,
+        SessionStore, SessionStoreError, Suspension as SessionSuspension,
     },
 };
 use super::{ProviderRetryConfig, tool::ToolFuture};
@@ -77,12 +69,12 @@ where
     turn: usize,
     phase: AgentLoopPhase,
     pending: VecDeque<Result<AgentTimelineEvent>>,
-    permission_policy: PermissionPolicy,
     retry_config: ProviderRetryConfig,
     provider_attempt: u32,
     retry_checkpoint: Option<RetryCheckpoint>,
     session_id: SessionId,
     session_revision: Revision,
+    session_execution_token: Option<crate::ExecutionToken>,
     session_journal_len: u64,
     last_timeline_cursor: Option<crate::timeline::TimelineCursor>,
     session_store: S,
@@ -93,17 +85,22 @@ where
     template_submission_journal_len: Option<usize>,
     session_metadata_values: BTreeMap<String, Value>,
     middleware_state: MiddlewareStateLog,
+    host_effects: Option<Arc<super::host_effect::HostEffectJournal<S>>>,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
     cancellation_token: CancellationToken,
-    template_base_dir: Option<PathBuf>,
     max_provider_turns: Option<u64>,
-    sandbox: Option<crate::sandbox_gateway::SandboxHandle>,
+    host_context: Option<Arc<dyn crate::AgentHostContext>>,
     provider_turns_dispatched: u64,
     turn_span: Option<Span>,
     assistant_item_id: Option<(u64, TimelineItemId)>,
     thinking_item_id: Option<(u64, TimelineItemId)>,
     tool_item_ids: HashMap<String, TimelineItemId>,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
+    completion_validation: Option<CompletionValidation>,
+    completion_evidence: Vec<CompletionToolEvidence>,
+    completion_evidence_bytes: usize,
+    completion_effective_calls: std::collections::BTreeMap<String, ToolCall>,
+    direct_tool: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,20 +140,14 @@ struct ToolBatch {
 }
 
 struct RunningTool {
-    app_capture: crate::mcp::apps::AppCapture,
+    result_metadata: super::tool::ToolResultMetadata,
     call: ToolCall,
     result: ToolFuture,
     progress_rx: Option<mpsc::UnboundedReceiver<PendingTimelineEvent>>,
-    sandbox_backed: bool,
+    host_dispatched: bool,
 }
 
 type ResolvedToolCall = (usize, ToolDefinition);
-
-enum PermissionOutcome {
-    Allow,
-    Ask(Vec<PermissionClaim>),
-    Deny(String),
-}
 
 enum ToolExecution {
     Running(RunningTool),
@@ -167,16 +158,73 @@ impl<S> AgentLoopState<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    pub(super) async fn direct_tool_stream(
+        run: EphemeralSessionRun<S>,
+        call: ToolCall,
+    ) -> Result<super::BoxAgentTimelineStream<'static>> {
+        if call.name.is_empty()
+            || call.id.is_empty()
+            || call.id.len() > 256
+            || serde_json::to_vec(&call.arguments)
+                .map_err(|_| validation_error("invalid host tool arguments"))?
+                .len()
+                > 65_536
+        {
+            return Err(validation_error("invalid host tool request"));
+        }
+        let mut state = Self::from_ephemeral_session(run);
+        if !state.initialize_session().await? {
+            return Err(validation_error("host tool session unavailable"));
+        }
+        if state
+            .middleware_state
+            .get("host-tool-execution")
+            .and_then(|value| value.get("active"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            || state
+                .turns
+                .iter()
+                .flat_map(|turn| &turn.items)
+                .any(|item| matches!(item, TurnItem::ToolCall(prior) if prior.id == call.id))
+        {
+            return Err(validation_error(
+                "host tool call already recorded; never replay a dispatch",
+            ));
+        }
+        state.direct_tool = true;
+        state.middleware_state.set(
+            "host-tool-execution",
+            json!({"active": true, "callId": call.id}),
+        );
+        state.flush_middleware_state().await?;
+        CompletionTurn::entry(&mut state.turns, state.turn as u64)
+            .items
+            .push(TurnItem::ToolCall(call.clone()));
+        let event = state
+            .append_timeline_event(tool_call_timeline_event(
+                &state.session_id,
+                state.turn as u64,
+                call.clone(),
+            ))
+            .await?;
+        state
+            .tool_item_ids
+            .insert(call.id.clone(), event.item_id.clone());
+        state.pending.push_back(Ok(event));
+        state.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
+            calls: vec![call].into(),
+        });
+        Ok(Box::pin(futures_util::stream::unfold(state, Self::next)))
+    }
+
     pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<S>) -> Self {
         let prompt = match &run.input {
             ResumeInput::Prompt(prompt) => prompt,
             ResumeInput::Prompts(prompts) => prompts.last().map_or("", String::as_str),
-            ResumeInput::Continue
-            | ResumeInput::ToolResults(_)
-            | ResumeInput::ExternalResponse { .. } => "",
+            ResumeInput::Continue | ResumeInput::ToolResults(_) => "",
         }
         .to_owned();
-        let permission_policy = run.permission_policy;
         Self {
             provider: run.provider,
             model: run.model,
@@ -190,12 +238,12 @@ where
             turn: 0,
             phase: AgentLoopPhase::StartTurn,
             pending: VecDeque::new(),
-            permission_policy,
             retry_config: run.retry_config,
             provider_attempt: 1,
             retry_checkpoint: None,
             session_id: run.session_id,
             session_revision: Revision::ZERO,
+            session_execution_token: None,
             session_journal_len: 0,
             last_timeline_cursor: None,
             session_store: run.session_store,
@@ -206,17 +254,23 @@ where
             template_submission_journal_len: None,
             session_metadata_values: BTreeMap::new(),
             middleware_state: MiddlewareStateLog::default(),
+            host_effects: None,
             system_prompt_override: run.system_prompt_override,
             cancellation_token: run.cancellation_token,
-            template_base_dir: run.template_base_dir,
+
             max_provider_turns: run.max_provider_turns,
-            sandbox: run.sandbox,
+            host_context: run.host_context,
             provider_turns_dispatched: 0,
             turn_span: None,
             assistant_item_id: None,
             thinking_item_id: None,
             tool_item_ids: HashMap::new(),
             event_sink: run.event_sink,
+            completion_validation: run.completion_validation,
+            completion_evidence: Vec::new(),
+            completion_evidence_bytes: 0,
+            completion_effective_calls: std::collections::BTreeMap::new(),
+            direct_tool: false,
         }
     }
 
@@ -236,7 +290,44 @@ where
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::needless_continue, clippy::single_match_else)]
     async fn next_event(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
+        macro_rules! bounded {
+            ($future:expr) => {{
+                let deadline = self
+                    .completion_validation
+                    .as_ref()
+                    .map(|validation| validation.deadline);
+                let cancellation = self.cancellation_token.clone();
+                let result = if deadline.is_some() {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => None,
+                        () = wait_deadline(deadline) => None,
+                        result = $future => Some(result),
+                    }
+                } else {
+                    Some($future.await)
+                };
+                match result {
+                    Some(result) => result,
+                    None => {
+                        return Some((
+                            Err(validation_error(
+                                "helper cancelled or total deadline exceeded",
+                            )),
+                            self,
+                        ));
+                    }
+                }
+            }};
+        }
         loop {
+            if self
+                .completion_validation
+                .as_ref()
+                .is_some_and(|validation| tokio::time::Instant::now() >= validation.deadline)
+            {
+                return Some((Err(validation_error("total deadline exceeded")), self));
+            }
             if self.cancellation_token.is_cancelled() {
                 if let Err(error) = self.record_interrupted().await {
                     return Some((Err(error), self));
@@ -252,7 +343,7 @@ where
             match std::mem::replace(&mut self.phase, AgentLoopPhase::Done) {
                 AgentLoopPhase::StartTurn => {
                     self.ensure_turn_span();
-                    match self.initialize_session().await {
+                    match bounded!(self.initialize_session()) {
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(error) => return Some((Err(error), self)),
@@ -276,7 +367,7 @@ where
                     }
                     // Crash recovery is retry-the-turn: the request is journaled before
                     // dispatch and parser progress is intentionally not persisted.
-                    let draft = match self.build_provider_request().await {
+                    let draft = match bounded!(self.build_provider_request()) {
                         Ok(Some(draft)) => draft,
                         Ok(None) => continue,
                         Err(error) => return Some((Err(error), self)),
@@ -319,6 +410,7 @@ where
                             return None;
                         }
                         result = self.provider.stream_request(request).instrument(provider_span) => result,
+                        () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
                     };
                     match stream_result {
                         Ok(stream) => {
@@ -337,7 +429,8 @@ where
                         }
                     }
                 }
-                AgentLoopPhase::Streaming(mut streaming) => match tokio::select! {
+                AgentLoopPhase::Streaming(mut streaming) => {
+                    let next = tokio::select! {
                     biased;
 
                     () = self.cancellation_token.cancelled() => {
@@ -348,152 +441,153 @@ where
                         return None;
                     }
                     event = streaming.stream.next() => event,
-                } {
-                    Some(Ok(CompletionEvent::Delta(delta))) => {
-                        let event = match self.append_assistant_delta(delta.clone()).await {
-                            Ok(event) => event,
-                            Err(error) => return Some((Err(error), self)),
-                        };
-                        CompletionTurn::entry(&mut self.turns, self.turn as u64)
-                            .append_assistant_text(&delta);
-                        self.phase = AgentLoopPhase::Streaming(streaming);
-                        return Some((Ok(event), self));
-                    }
-                    Some(Ok(CompletionEvent::ThinkingDelta(delta))) => {
-                        let event = match self.append_thinking_delta(delta.text.clone()).await {
-                            Ok(event) => event,
-                            Err(error) => return Some((Err(error), self)),
-                        };
-                        self.phase = AgentLoopPhase::Streaming(streaming);
-                        return Some((Ok(event), self));
-                    }
-                    Some(Ok(CompletionEvent::ThinkingBlock(block))) => {
-                        CompletionTurn::entry(&mut self.turns, self.turn as u64)
-                            .items
-                            .push(TurnItem::Thinking(block.clone()));
-                        if let Err(error) = self
-                            .append_journal_event(
-                                SessionJournalEvent::ProviderThinkingBlockRecorded {
-                                    turn: self.turn as u64,
-                                    block,
-                                },
-                            )
-                            .await
-                        {
-                            return Some((Err(error), self));
+                    () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
+                    };
+                    match next {
+                        Some(Ok(CompletionEvent::Delta(delta))) => {
+                            let event = match self.append_assistant_delta(delta.clone()).await {
+                                Ok(event) => event,
+                                Err(error) => return Some((Err(error), self)),
+                            };
+                            CompletionTurn::entry(&mut self.turns, self.turn as u64)
+                                .append_assistant_text(&delta);
+                            self.phase = AgentLoopPhase::Streaming(streaming);
+                            return Some((Ok(event), self));
                         }
-                        self.phase = AgentLoopPhase::Streaming(streaming);
-                    }
-                    Some(Ok(CompletionEvent::ProviderMetadata(mut metadata))) => {
-                        if metadata.cost.is_none() {
-                            metadata.cost = metadata
-                                .usage
-                                .and_then(|usage| self.model_cost.as_ref()?.cost_for_usage(usage));
+                        Some(Ok(CompletionEvent::ThinkingDelta(delta))) => {
+                            let event = match self.append_thinking_delta(delta.text.clone()).await {
+                                Ok(event) => event,
+                                Err(error) => return Some((Err(error), self)),
+                            };
+                            self.phase = AgentLoopPhase::Streaming(streaming);
+                            return Some((Ok(event), self));
                         }
-                        let event = provider_metrics_timeline_event(
-                            &self.session_id,
-                            self.turn as u64,
-                            &metadata,
-                        );
-                        CompletionTurn::entry(&mut self.turns, self.turn as u64).metadata =
-                            Some(metadata.clone());
-                        if let Err(error) = self
-                            .append_journal_event(
-                                SessionJournalEvent::ProviderTurnMetadataRecorded {
-                                    turn: self.turn as u64,
-                                    metadata,
-                                },
-                            )
-                            .await
-                        {
-                            return Some((Err(error), self));
-                        }
-                        let event = match self.append_timeline_event(event).await {
-                            Ok(event) => event,
-                            Err(error) => return Some((Err(error), self)),
-                        };
-                        self.phase = AgentLoopPhase::Streaming(streaming);
-                        return Some((Ok(event), self));
-                    }
-                    Some(Ok(CompletionEvent::ToolCall(call))) => {
-                        self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call requested"));
-                        CompletionTurn::entry(&mut self.turns, self.turn as u64)
-                            .items
-                            .push(TurnItem::ToolCall(call.clone()));
-                        let event = match self
-                            .append_timeline_event(tool_call_timeline_event(
-                                &self.session_id,
-                                self.turn as u64,
-                                call.clone(),
-                            ))
-                            .await
-                        {
-                            Ok(event) => event,
-                            Err(error) => return Some((Err(error), self)),
-                        };
-                        self.tool_item_ids
-                            .insert(call.id.clone(), event.item_id.clone());
-                        if self.tools.iter().any(|tool| {
-                            tool.is_sandbox_backed() && tool.definition().name == call.name
-                        }) {
+                        Some(Ok(CompletionEvent::ThinkingBlock(block))) => {
+                            CompletionTurn::entry(&mut self.turns, self.turn as u64)
+                                .items
+                                .push(TurnItem::Thinking(block.clone()));
                             if let Err(error) = self
-                                .append_journal_event(SessionJournalEvent::SandboxCallRecorded {
-                                    turn: self.turn as u64,
-                                    tool_call_id: call.id.clone(),
-                                })
+                                .append_journal_event(
+                                    SessionJournalEvent::ProviderThinkingBlockRecorded {
+                                        turn: self.turn as u64,
+                                        block,
+                                    },
+                                )
                                 .await
                             {
                                 return Some((Err(error), self));
                             }
+                            self.phase = AgentLoopPhase::Streaming(streaming);
                         }
-                        streaming.tool_calls.push(call);
-                        self.phase = AgentLoopPhase::Streaming(streaming);
-                        return Some((Ok(event), self));
-                    }
-                    Some(Ok(CompletionEvent::Finished)) | None => {
-                        self.provider_attempt = 1;
-                        self.retry_checkpoint = None;
-                        if !streaming.tool_calls.is_empty() {
-                            self.in_turn_span(|| {
-                                tracing::info!(
-                                    tool_count = streaming.tool_calls.len(),
-                                    "provider turn requested tools"
+                        Some(Ok(CompletionEvent::ProviderMetadata(mut metadata))) => {
+                            if metadata.cost.is_none() {
+                                metadata.cost = metadata.usage.and_then(|usage| {
+                                    self.model_cost.as_ref()?.cost_for_usage(usage)
+                                });
+                            }
+                            let event = provider_metrics_timeline_event(
+                                &self.session_id,
+                                self.turn as u64,
+                                &metadata,
+                            );
+                            CompletionTurn::entry(&mut self.turns, self.turn as u64).metadata =
+                                Some(metadata.clone());
+                            if let Err(error) = self
+                                .append_journal_event(
+                                    SessionJournalEvent::ProviderTurnMetadataRecorded {
+                                        turn: self.turn as u64,
+                                        metadata,
+                                    },
+                                )
+                                .await
+                            {
+                                return Some((Err(error), self));
+                            }
+                            let event = match self.append_timeline_event(event).await {
+                                Ok(event) => event,
+                                Err(error) => return Some((Err(error), self)),
+                            };
+                            self.phase = AgentLoopPhase::Streaming(streaming);
+                            return Some((Ok(event), self));
+                        }
+                        Some(Ok(CompletionEvent::ToolCall(call))) => {
+                            self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call requested"));
+                            CompletionTurn::entry(&mut self.turns, self.turn as u64)
+                                .items
+                                .push(TurnItem::ToolCall(call.clone()));
+                            let event = match self
+                                .append_timeline_event(tool_call_timeline_event(
+                                    &self.session_id,
+                                    self.turn as u64,
+                                    call.clone(),
+                                ))
+                                .await
+                            {
+                                Ok(event) => event,
+                                Err(error) => return Some((Err(error), self)),
+                            };
+                            self.tool_item_ids
+                                .insert(call.id.clone(), event.item_id.clone());
+                            streaming.tool_calls.push(call);
+                            self.phase = AgentLoopPhase::Streaming(streaming);
+                            return Some((Ok(event), self));
+                        }
+                        Some(Ok(CompletionEvent::Finished)) | None => {
+                            self.provider_attempt = 1;
+                            self.retry_checkpoint = None;
+                            if !streaming.tool_calls.is_empty() {
+                                self.in_turn_span(|| {
+                                    tracing::info!(
+                                        tool_count = streaming.tool_calls.len(),
+                                        "provider turn requested tools"
+                                    );
+                                });
+                                self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
+                                    calls: streaming.tool_calls.into(),
+                                });
+                                continue;
+                            }
+                            match bounded!(self.validate_completion()) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => return Some((Err(error), self)),
+                            }
+                            if self.provider.transient_input().is_some() {
+                                self.middleware_state.set(
+                                    "transient-input",
+                                    json!({"active": false, "replayable": false}),
                                 );
+                            }
+                            match self.append_final_assistant_snapshot().await {
+                                Ok(Some(event)) => self.pending.push_back(Ok(event)),
+                                Ok(None) => {}
+                                Err(error) => return Some((Err(error), self)),
+                            }
+                            let mut events = self.middleware_state.drain_pending();
+                            events.push(SessionJournalEvent::TurnFinished {
+                                turn: self.turn as u64,
                             });
-                            self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
-                                calls: streaming.tool_calls.into(),
-                            });
+                            events.push(SessionJournalEvent::Finished);
+                            if let Err(error) = self.append_journal_events(events).await {
+                                return Some((Err(error), self));
+                            }
+                            let status = match self.append_finished_status_event().await {
+                                Ok(event) => event,
+                                Err(error) => return Some((Err(error), self)),
+                            };
+                            self.pending.push_back(Ok(status));
+                            self.close_turn_span("finished");
+                            self.phase = AgentLoopPhase::Done;
+                        }
+                        Some(Err(error)) => {
+                            self.in_turn_span(|| tracing::warn!(%error, "provider stream failed"));
+                            if let Err(error) = self.retry_or_fail_provider_error(error).await {
+                                return Some((Err(error), self));
+                            }
                             continue;
                         }
-                        let mut events = self.middleware_state.drain_pending();
-                        events.push(SessionJournalEvent::TurnFinished {
-                            turn: self.turn as u64,
-                        });
-                        events.push(SessionJournalEvent::Finished);
-                        if let Err(error) = self.append_journal_events(events).await {
-                            return Some((Err(error), self));
-                        }
-                        match self.append_final_assistant_snapshot().await {
-                            Ok(Some(event)) => self.pending.push_back(Ok(event)),
-                            Ok(None) => {}
-                            Err(error) => return Some((Err(error), self)),
-                        }
-                        let status = match self.append_finished_status_event().await {
-                            Ok(event) => event,
-                            Err(error) => return Some((Err(error), self)),
-                        };
-                        self.pending.push_back(Ok(status));
-                        self.close_turn_span("finished");
-                        self.phase = AgentLoopPhase::Done;
                     }
-                    Some(Err(error)) => {
-                        self.in_turn_span(|| tracing::warn!(%error, "provider stream failed"));
-                        if let Err(error) = self.retry_or_fail_provider_error(error).await {
-                            return Some((Err(error), self));
-                        }
-                        continue;
-                    }
-                },
+                }
                 AgentLoopPhase::RetryDelay(mut sleep) => {
                     tokio::select! {
                         biased;
@@ -508,16 +602,17 @@ where
                         () = &mut sleep => {
                             self.phase = AgentLoopPhase::StartTurn;
                         }
+                        () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
                     }
                 }
                 AgentLoopPhase::ExecuteTools(mut batch) => {
                     let Some(call) = batch.calls.pop_front() else {
-                        if let Err(error) = self.finish_tool_batch().await {
+                        if let Err(error) = bounded!(self.finish_tool_batch()) {
                             return Some((Err(error), self));
                         }
                         continue;
                     };
-                    let execution = self.start_tool(call).await;
+                    let execution = bounded!(self.start_tool(call));
                     if self.cancellation_token.is_cancelled() {
                         if let Err(error) = self.record_interrupted().await {
                             return Some((Err(error), self));
@@ -531,7 +626,7 @@ where
                             continue;
                         }
                         Ok(ToolExecution::Finished(Some(result))) => {
-                            if let Err(error) = self.finish_tool_result(result).await {
+                            if let Err(error) = bounded!(self.finish_tool_result(result)) {
                                 return Some((Err(error), self));
                             }
                             self.phase = AgentLoopPhase::ExecuteTools(batch);
@@ -570,6 +665,7 @@ where
                                     }
                                 }
                             }
+                            () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
                             result = &mut running.result => {
                                 if let Some(progress_rx) = running.progress_rx.as_mut() {
                                     match self.append_timeline_events(drain_progress_events(progress_rx)).await {
@@ -577,7 +673,7 @@ where
                                         Err(error) => return Some((Err(error), self)),
                                     }
                                 }
-                                match self.finish_running_tool(running.call, result, running.sandbox_backed, running.app_capture).await {
+                                 match bounded!(self.finish_running_tool(running.call, result, running.host_dispatched, running.result_metadata)) {
                                     Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
                                     Ok(false) => {}
                                     Err(error) => return Some((Err(error), self)),
@@ -597,13 +693,14 @@ where
                                 return None;
                             }
                             result = running.result => result,
+                            () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
                         };
                         match self
                             .finish_running_tool(
                                 running.call,
                                 result,
-                                running.sandbox_backed,
-                                running.app_capture,
+                                running.host_dispatched,
+                                running.result_metadata,
                             )
                             .await
                         {
@@ -620,14 +717,13 @@ where
     }
 
     async fn build_provider_request(&mut self) -> Result<Option<ModelRequestDraft>> {
+        self.prepare_host_effects().await?;
         let prompt_turns = self.prompt_turns();
         let middleware_chain = self.middleware_chain.clone();
         let mut ctx = RequestContext {
             middleware_state: &mut self.middleware_state,
             session_metadata_values: self.session_metadata_values.clone(),
             system_prompt_override: &mut self.system_prompt_override,
-            middleware_chain: middleware_chain.clone(),
-            permission_policy: self.permission_policy.clone(),
             cancellation_token: self.cancellation_token.clone(),
             session_id: self.session_id.as_str(),
             turn: self.turn as u64,
@@ -639,10 +735,7 @@ where
             .await?
         {
             HookOutcome::Continue => {}
-            HookOutcome::Suspend(suspension) => {
-                self.suspend_from_hook(suspension).await?;
-                return Ok(None);
-            }
+            #[cfg(test)]
             outcome @ HookOutcome::ReplaceToolResult(_) => {
                 return Err(unsupported_build_system_prompt_outcome(&outcome));
             }
@@ -670,153 +763,39 @@ where
             .await?
         {
             HookOutcome::Continue => Ok(Some(request)),
+            #[cfg(test)]
             outcome => Err(unsupported_before_provider_request_outcome(&outcome)),
         }
     }
 
     fn resolve_tool_call(&self, call: &ToolCall) -> Option<ResolvedToolCall> {
         let tool_index = self.tools.iter().position(|tool| {
-            crate::middleware::tools::model_visible(tool) && tool.definition().name == call.name
+            (self.direct_tool || tool.model_exposure) && tool.definition().name == call.name
         })?;
         Some((tool_index, self.tools[tool_index].definition().clone()))
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn start_tool(&mut self, mut call: ToolCall) -> Result<ToolExecution> {
-        if self.session_record.as_ref().is_some_and(|record| {
-            record.snapshot().sandbox_dispatches.iter().any(|dispatch| {
-                dispatch.turn == self.turn as u64 && dispatch.tool_call_id == call.id
-            })
-        }) {
-            self.suspend_pending_sandbox_work().await?;
-            return Ok(ToolExecution::Finished(None));
+    async fn start_tool(&mut self, call: ToolCall) -> Result<ToolExecution> {
+        if self.session_record.as_ref().is_some_and(|record| record.journal.iter().any(|event| matches!(event,
+            SessionJournalEvent::MiddlewareStateUpdated { namespace, state }
+            if namespace == "host-dispatch" && state.get("callId").and_then(Value::as_str) == Some(call.id.as_str())))) {
+            return Err(validation_error("host call identity was already dispatched"));
         }
-        let requested_name = call.name.clone();
-        let whole_tool_level = self.permission_policy.evaluate_tool(&call.name);
+        if self.completion_validation.is_some() {
+            self.completion_effective_calls
+                .insert(call.id.clone(), call.clone());
+        }
         let resolved = self.resolve_tool_call(&call);
-        let whole_tool_request = PermissionRequestContext {
-            session_id: self.session_id.as_str(),
-            turn: self.turn as u64,
-            stage: PermissionApprovalStage::WholeTool,
-            policy: &self.permission_policy,
-        };
-        let whole_tool_request_id = permission_request_id(&whole_tool_request, &call, &[]);
-        let whole_tool_approved = match whole_tool_level {
-            PermissionLevel::Allow => false,
-            PermissionLevel::Ask => {
-                let state = self.permission_runtime_state()?;
-                if state.has_one_shot(
-                    &whole_tool_request_id,
-                    &call.id,
-                    PermissionApprovalStage::WholeTool,
-                    &[],
-                ) {
-                    true
-                } else {
-                    let outcome = HookOutcome::Suspend(permission_suspension(
-                        &whole_tool_request,
-                        &call,
-                        &[],
-                    ));
-                    return self
-                        .tool_result_from_hook_outcome(&call, outcome)
-                        .await
-                        .map(ToolExecution::Finished);
-                }
-            }
-            PermissionLevel::Deny => {
-                return Ok(ToolExecution::Finished(Some(error_tool_result(
-                    &call,
-                    &LlmError::Protocol {
-                        provider: "permission",
-                        message: format!("tool is not permitted: {}", call.name),
-                    },
-                ))));
-            }
-        };
-
-        // Claims-producing middleware fills this during before_tool_call; permission
-        // evaluation below runs after the full chain so it observes complete claims.
-        let mut claims = Vec::new();
-        let requested_arguments = call.arguments.clone();
-        let before_outcome = {
-            let mut ctx = ToolCallContext {
-                approved_tool_name: &requested_name,
-                permission_policy: &self.permission_policy,
-                contextual_input_is_approved,
-                contextual_suspension,
-                cancellation_token: self.cancellation_token.clone(),
-                session_id: self.session_id.as_str(),
-                turn: self.turn as u64,
-                call: &mut call,
-                permission_claims: &mut claims,
-                middleware_state: &mut self.middleware_state,
-            };
-            self.middleware_chain.before_tool_call(&mut ctx).await
-        };
+        if let Some((index, _)) = &resolved
+            && let Some(guard) = self.tools[*index].execution_guard.clone()
+        {
+            guard(self.cancellation_token.clone())
+                .await
+                .map_err(|_| validation_error("host execution authority ended"))?;
+        }
         if self.cancellation_token.is_cancelled() {
             return Ok(ToolExecution::Finished(None));
-        }
-        if call.arguments != requested_arguments
-            && self.middleware_state.get("mcp-skills").is_some()
-        {
-            return Ok(ToolExecution::Finished(Some(error_tool_result(
-                &call,
-                &LlmError::Protocol {
-                    provider: "permission",
-                    message: "middleware changed remote-skill-bound tool arguments".into(),
-                },
-            ))));
-        }
-        match before_outcome {
-            Ok(HookOutcome::Continue) => {}
-            Ok(outcome) => {
-                match self.permission_outcome(&call, &claims, whole_tool_approved)? {
-                    PermissionOutcome::Allow => {}
-                    PermissionOutcome::Deny(message) => {
-                        return Ok(ToolExecution::Finished(Some(error_tool_result(
-                            &call,
-                            &LlmError::Protocol {
-                                provider: "permission",
-                                message,
-                            },
-                        ))));
-                    }
-                    PermissionOutcome::Ask(claims) => {
-                        let request = PermissionRequestContext {
-                            session_id: self.session_id.as_str(),
-                            turn: self.turn as u64,
-                            stage: PermissionApprovalStage::Contextual,
-                            policy: &self.permission_policy,
-                        };
-                        let outcome =
-                            HookOutcome::Suspend(permission_suspension(&request, &call, &claims));
-                        return self
-                            .tool_result_from_hook_outcome(&call, outcome)
-                            .await
-                            .map(ToolExecution::Finished);
-                    }
-                }
-                return self
-                    .tool_result_from_hook_outcome(&call, outcome)
-                    .await
-                    .map(ToolExecution::Finished);
-            }
-            Err(error) => {
-                return Ok(ToolExecution::Finished(Some(error_tool_result(
-                    &call, &error,
-                ))));
-            }
-        }
-
-        if call.name != requested_name {
-            return Ok(ToolExecution::Finished(Some(error_tool_result(
-                &call,
-                &LlmError::Protocol {
-                    provider: "permission",
-                    message: "middleware changed the approved tool name".into(),
-                },
-            ))));
         }
 
         let Some((tool_index, _)) = resolved else {
@@ -828,87 +807,6 @@ where
                 },
             ))));
         };
-
-        let prepared = if self.tools[tool_index].is_sandbox_backed() {
-            let sandbox = self.sandbox.as_ref().ok_or_else(|| LlmError::Protocol {
-                provider: "sandbox",
-                message: "workspace tool requires sandbox".into(),
-            })?;
-            match sandbox
-                .prepare_with_shell_defaults(
-                    &call.name,
-                    &call.arguments,
-                    self.tools[tool_index].shell_defaults(),
-                )
-                .await
-            {
-                Ok(prepared) => {
-                    match crate::tools::sandbox::claims(&prepared) {
-                        Ok(extra) => claims.extend(extra),
-                        Err(error) => {
-                            prepared.cancel(sandbox);
-                            return Ok(ToolExecution::Finished(Some(error_tool_result(
-                                &call, &error,
-                            ))));
-                        }
-                    }
-                    Some(prepared)
-                }
-                Err(error) => {
-                    return Ok(ToolExecution::Finished(Some(error_tool_result(
-                        &call, &error,
-                    ))));
-                }
-            }
-        } else {
-            None
-        };
-
-        match self.permission_outcome(&call, &claims, whole_tool_approved) {
-            Ok(PermissionOutcome::Allow) => {
-                self.clear_call_approvals(&call.id)?;
-                self.in_turn_span(|| tracing::debug!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission allowed"));
-                self.flush_middleware_state().await?;
-            }
-            Ok(PermissionOutcome::Deny(message)) => {
-                if let (Some(prepared), Some(sandbox)) = (prepared, &self.sandbox) {
-                    prepared.cancel(sandbox);
-                }
-                self.in_turn_span(|| tracing::warn!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission denied"));
-                return Ok(ToolExecution::Finished(Some(error_tool_result(
-                    &call,
-                    &LlmError::Protocol {
-                        provider: "permission",
-                        message,
-                    },
-                ))));
-            }
-            Ok(PermissionOutcome::Ask(claims)) => {
-                if let (Some(prepared), Some(sandbox)) = (prepared, &self.sandbox) {
-                    prepared.cancel(sandbox);
-                }
-                self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission requested"));
-                let request = PermissionRequestContext {
-                    session_id: self.session_id.as_str(),
-                    turn: self.turn as u64,
-                    stage: PermissionApprovalStage::Contextual,
-                    policy: &self.permission_policy,
-                };
-                let outcome = HookOutcome::Suspend(permission_suspension(&request, &call, &claims));
-                return self
-                    .tool_result_from_hook_outcome(&call, outcome)
-                    .await
-                    .map(ToolExecution::Finished);
-            }
-            Err(error) => {
-                if let (Some(prepared), Some(sandbox)) = (prepared, &self.sandbox) {
-                    prepared.cancel(sandbox);
-                }
-                return Ok(ToolExecution::Finished(Some(error_tool_result(
-                    &call, &error,
-                ))));
-            }
-        }
 
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         let parent_id = self.tool_item_id(&call.id)?;
@@ -927,28 +825,57 @@ where
             self.cancellation_token.clone(),
         )
         .with_session_context(self.session_id.clone(), self.turn as u64);
-        if let Some(prepared) = prepared {
-            context = context.with_prepared_sandbox_call(prepared);
+        context.session_incarnation = self
+            .session_record
+            .as_ref()
+            .and_then(|record| record.metadata.incarnation.clone());
+        if let Some(prepare) = self.tools[tool_index].host_dispatch.clone() {
+            let record = self.session_record.as_ref().ok_or_else(|| {
+                validation_error("host dispatch requires durable session storage")
+            })?;
+            let incarnation =
+                record.metadata.incarnation.clone().ok_or_else(|| {
+                    validation_error("host dispatch requires a durable incarnation")
+                })?;
+            if record.journal.iter().any(|event| matches!(event,
+                SessionJournalEvent::MiddlewareStateUpdated { namespace, state }
+                if namespace == "host-dispatch" && state.get("callId").and_then(Value::as_str) == Some(call.id.as_str()))) {
+                return Err(validation_error("host call identity was already dispatched"));
+            }
+            let binding = prepare(&call)?;
+            if [&binding.invocation_id, &binding.source_revision]
+                .iter()
+                .any(|value| {
+                    value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+                })
+            {
+                return Err(validation_error("invalid host dispatch association"));
+            }
+            if record.journal.iter().any(|event| matches!(event,
+                SessionJournalEvent::MiddlewareStateUpdated { namespace, state }
+                if namespace == "host-dispatch" && state.get("invocationId").and_then(Value::as_str) == Some(binding.invocation_id.as_str()))) {
+                return Err(validation_error("host invocation identity was already dispatched"));
+            }
+            self.middleware_state.set("host-dispatch", json!({"active":true,"callId":call.id,"turn":self.turn,"incarnation":incarnation,"invocationId":binding.invocation_id,"sourceRevision":binding.source_revision}));
+            self.flush_middleware_state().await?;
+            context.host_dispatch = Some(binding);
+            context.session_incarnation = Some(incarnation);
         }
-        let sandbox_backed = self.tools[tool_index].is_sandbox_backed();
-        let app_capture = Arc::new(std::sync::Mutex::new(None));
-        context.app_capture = Some(Arc::clone(&app_capture));
-        if sandbox_backed {
-            // No Execute future may be polled before the dispatch fence is durable.
-            self.append_journal_event(SessionJournalEvent::SandboxDispatchStarted {
-                turn: self.turn as u64,
-                tool_call_id: call.id.clone(),
-            })
-            .await?;
-        }
+        let host_dispatched = context.host_dispatch.is_some();
+        let result_metadata = context.result_metadata.clone();
+        result_metadata.hydrate_state(self.middleware_state.host_snapshot());
         let result = self.tools[tool_index].call(context);
+        if self.completion_validation.is_some() {
+            self.completion_effective_calls
+                .insert(call.id.clone(), call.clone());
+        }
         let result = self.instrument_tool_future(&call, result);
         Ok(ToolExecution::Running(RunningTool {
-            app_capture,
+            result_metadata,
             call,
             result,
             progress_rx: Some(progress_rx),
-            sandbox_backed,
+            host_dispatched,
         }))
     }
 
@@ -956,15 +883,25 @@ where
         &mut self,
         call: ToolCall,
         result: Result<ToolResult>,
-        sandbox_backed: bool,
-        app_capture: crate::mcp::apps::AppCapture,
+        host_dispatched: bool,
+        result_metadata: super::tool::ToolResultMetadata,
     ) -> Result<bool> {
-        if sandbox_backed && result.is_err() {
-            // The worker may have performed the operation even if its reply was lost.
-            // Never turn an uncertain dispatch into a provider-visible tool error.
-            self.suspend_pending_sandbox_work().await?;
-            return Ok(false);
+        let call = result_metadata.take_effective_call().unwrap_or(call);
+        if self.completion_validation.is_some() {
+            self.completion_effective_calls
+                .insert(call.id.clone(), call.clone());
         }
+        for (namespace, value) in result_metadata.take_state() {
+            self.middleware_state.set(namespace, value);
+        }
+        self.synchronize_context_updates().await?;
+        self.flush_middleware_state().await?;
+        if host_dispatched && result.is_err() {
+            return Err(validation_error(
+                "host dispatch outcome uncertain; automatic replay forbidden",
+            ));
+        }
+        let completed = result.is_ok();
         let mut result = match result {
             Ok(result) => {
                 self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call completed"));
@@ -975,19 +912,21 @@ where
                 error_tool_result(&call, &error)
             }
         };
+        if result.call_id != call.id || result.name != call.name {
+            return Err(validation_error("host tool result does not match its call"));
+        }
 
-        let association = app_capture
-            .lock()
-            .expect("app capture lock poisoned")
-            .take();
+        let metadata = if completed {
+            result_metadata.take()
+        } else {
+            Default::default()
+        };
         let original_result = result.clone();
         let after_outcome = {
             let mut ctx = ToolResultContext {
                 call: Some(&call),
                 result: &mut result,
                 middleware_state: &mut self.middleware_state,
-                middleware_chain: self.middleware_chain.clone(),
-                permission_policy: self.permission_policy.clone(),
                 cancellation_token: self.cancellation_token.clone(),
                 session_id: self.session_id.as_str(),
                 turn: self.turn as u64,
@@ -996,62 +935,145 @@ where
         };
         match after_outcome {
             Ok(HookOutcome::Continue) => {
-                let association = crate::mcp::apps::unmodified_association(
-                    association,
-                    &original_result,
-                    &result,
-                );
-                self.finish_tool_result_with_app(result, association)
+                if result.call_id != call.id || result.name != call.name {
+                    return Err(validation_error(
+                        "host result processing changed call association",
+                    ));
+                }
+                let metadata = if original_result == result {
+                    metadata
+                } else {
+                    Default::default()
+                };
+                self.finish_tool_result_with_metadata(result, metadata)
                     .await?;
                 Ok(true)
             }
+            #[cfg(test)]
             Ok(outcome) => {
                 if let Some(result) = self.tool_result_from_hook_outcome(&call, outcome).await? {
-                    self.finish_tool_result_with_app(result, None).await?;
+                    self.finish_tool_result_with_metadata(result, Default::default())
+                        .await?;
                     Ok(true)
                 } else {
                     Ok(false)
                 }
             }
             Err(error) => {
-                self.finish_tool_result_with_app(error_tool_result(&call, &error), None)
-                    .await?;
+                self.finish_tool_result_with_metadata(
+                    error_tool_result(&call, &error),
+                    Default::default(),
+                )
+                .await?;
                 Ok(true)
             }
         }
     }
 
     async fn finish_tool_result(&mut self, result: ToolResult) -> Result<()> {
-        self.finish_tool_result_with_app(result, None).await
+        self.finish_tool_result_with_metadata(result, Default::default())
+            .await
     }
 
-    async fn finish_tool_result_with_app(
+    async fn finish_tool_result_with_metadata(
         &mut self,
         result: ToolResult,
-        association: Option<crate::mcp::apps::McpAppAssociation>,
+        metadata: serde_json::Map<String, Value>,
     ) -> Result<()> {
-        self.clear_call_approvals(&result.call_id)?;
         let parent_id = self.tool_item_id(&result.call_id)?;
+        self.account_completion_result(&result, parent_id.clone(), self.turn as u64)?;
         CompletionTurn::entry(&mut self.turns, self.turn as u64)
             .items
             .push(TurnItem::ToolResult(result.clone()));
         let events = self.middleware_state.drain_pending();
         self.append_journal_events(events).await?;
+        let completed_call = result.call_id.clone();
         let mut pending =
             tool_result_timeline_event(&self.session_id, self.turn as u64, parent_id, result);
-        if let Some(association) = association {
-            pending.metadata[crate::mcp::apps::MCP_APP_ASSOCIATION] =
-                serde_json::to_value(association).map_err(|error| LlmError::Protocol {
-                    provider: "mcp",
-                    message: error.to_string(),
-                })?;
-        }
+        pending.metadata = Value::Object(metadata);
         let event = self.append_timeline_event(pending).await?;
         self.pending.push_back(Ok(event));
+        if let Some(mut dispatch) = self.middleware_state.get("host-dispatch").cloned()
+            && dispatch.get("callId").and_then(Value::as_str) == Some(completed_call.as_str())
+        {
+            let unsettled = dispatch.clone();
+            dispatch["active"] = json!(false);
+            self.middleware_state.set("host-dispatch", dispatch);
+            if let Err(error) = self.flush_middleware_state().await {
+                // A missing acknowledgement is not permission to retry settlement.
+                self.middleware_state.discard_pending("host-dispatch");
+                self.middleware_state
+                    .merge_committed("host-dispatch".into(), unsettled);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn account_completion_result(
+        &mut self,
+        result: &ToolResult,
+        parent_id: TimelineItemId,
+        turn: u64,
+    ) -> Result<()> {
+        if let Some(encoded_byte_limit) = self
+            .completion_validation
+            .as_ref()
+            .map(|validation| validation.encoded_byte_limit)
+        {
+            let call = self
+                .completion_effective_calls
+                .remove(&result.call_id)
+                .or_else(|| {
+                    self.turns
+                        .iter()
+                        .flat_map(|turn| &turn.items)
+                        .find_map(|item| match item {
+                            TurnItem::ToolCall(call) if call.id == result.call_id => {
+                                Some(call.clone())
+                            }
+                            _ => None,
+                        })
+                })
+                .ok_or_else(|| validation_error("missing evidence call"))?;
+            let evidence = CompletionToolEvidence {
+                target: self
+                    .resolve_tool_call(&call)
+                    .and_then(|(index, _)| self.tools[index].identity().map(str::to_owned)),
+                call,
+                result: result.clone(),
+                item_id: parent_id.clone(),
+                turn,
+            };
+            let bytes = serde_json::to_vec(&evidence)
+                .map_err(|_| validation_error("invalid evidence"))?
+                .len();
+            self.completion_evidence_bytes = self.completion_evidence_bytes.saturating_add(bytes);
+            if self.completion_evidence_bytes > encoded_byte_limit
+                || self.completion_evidence.len() >= 256
+            {
+                return Err(validation_error("cumulative evidence limit exceeded"));
+            }
+            self.completion_evidence.push(evidence);
+        }
         Ok(())
     }
 
     async fn finish_tool_batch(&mut self) -> Result<()> {
+        if self.direct_tool {
+            self.middleware_state
+                .set("host-tool-execution", json!({"active": false}));
+            let mut events = self.middleware_state.drain_pending();
+            events.extend([
+                SessionJournalEvent::TurnFinished {
+                    turn: self.turn as u64,
+                },
+                SessionJournalEvent::Finished,
+            ]);
+            self.append_journal_events(events).await?;
+            self.phase = AgentLoopPhase::Done;
+            return Ok(());
+        }
         self.append_journal_event(SessionJournalEvent::TurnFinished {
             turn: self.turn as u64,
         })
@@ -1062,6 +1084,81 @@ where
         Ok(())
     }
 
+    async fn validate_completion(&mut self) -> Result<bool> {
+        let Some(validation) = self.completion_validation.clone() else {
+            return Ok(true);
+        };
+        let response = self
+            .turns
+            .iter()
+            .find(|turn| turn.turn == self.turn as u64)
+            .map(|turn| turn.assistant_texts().collect::<String>())
+            .unwrap_or_default();
+        let proposal = CompletionProposal {
+            session_id: self.session_id.clone(),
+            proposal_id: format!("proposal:{}", self.turn),
+            turn: self.turn as u64,
+            response,
+            evidence: self.completion_evidence.clone(),
+        };
+        if serde_json::to_vec(&proposal)
+            .map_err(|_| validation_error("invalid proposal"))?
+            .len()
+            > validation.encoded_byte_limit
+        {
+            return Err(validation_error("proposal limit exceeded"));
+        }
+        let decision = tokio::select! {
+            biased;
+            () = self.cancellation_token.cancelled() => return Err(validation_error("validation canceled")),
+            () = tokio::time::sleep_until(validation.deadline) => return Err(validation_error("total deadline exceeded")),
+            result = validation.observer.observe(proposal.clone(), self.cancellation_token.clone()) => result.map_err(|_| validation_error("completion observer failed or returned an invalid verdict"))?,
+        };
+        match &decision {
+            CompletionDecision::Accept => {
+                self.middleware_state.set("completion-validation", json!({"active": false, "proposalId": proposal.proposal_id, "decision": "accept"}));
+                Ok(true)
+            }
+            CompletionDecision::Reject { feedback } => {
+                if feedback.proposal_id != proposal.proposal_id
+                    || feedback.message.trim().is_empty()
+                    || feedback.message.len() > MAX_COMPLETION_FEEDBACK_BYTES
+                    || feedback.call_id.as_ref().is_some_and(|id| {
+                        !proposal
+                            .evidence
+                            .iter()
+                            .any(|evidence| &evidence.call.id == id)
+                    })
+                {
+                    return Err(validation_error("invalid completion feedback"));
+                }
+                let prompt = serde_json::to_string(&json!({"completionValidation": decision}))
+                    .map_err(|_| validation_error("invalid completion feedback"))?;
+                self.append_journal_events(vec![
+                    SessionJournalEvent::TurnFinished {
+                        turn: self.turn as u64,
+                    },
+                    SessionJournalEvent::PromptAppended {
+                        prompt: prompt.clone(),
+                    },
+                ])
+                .await?;
+                self.turn += 1;
+                self.prompt_turns.push(PromptTurn {
+                    turn: self.turn as u64,
+                    prompt: prompt.clone(),
+                });
+                self.prompt = prompt;
+                self.assistant_item_id = None;
+                self.thinking_item_id = None;
+                self.phase = AgentLoopPhase::StartTurn;
+                self.close_turn_span("completion_rejected");
+                Ok(false)
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn tool_result_from_hook_outcome(
         &mut self,
         call: &ToolCall,
@@ -1073,134 +1170,9 @@ where
                 call.name.clone(),
                 "",
             ))),
+            #[cfg(test)]
             HookOutcome::ReplaceToolResult(result) => Ok(Some(result)),
-            HookOutcome::Suspend(suspension) => {
-                self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "agent turn suspended"));
-                if let Err(error) = self.suspend_from_hook(suspension).await {
-                    return Ok(Some(error_tool_result(call, &error)));
-                }
-                Ok(None)
-            }
         }
-    }
-
-    async fn suspend_from_hook(&mut self, mut suspension: middleware::Suspension) -> Result<()> {
-        let mut ctx = RunContext {
-            middleware_state: &mut self.middleware_state,
-        };
-        self.middleware_chain
-            .on_suspend(&mut ctx, &mut suspension)
-            .await?;
-        if let Some(request) = suspension.external_request.clone() {
-            let event = self.persist_external_request(&request).await?;
-            let session_request = external_request_from_draft(&request);
-            let mut events = self.middleware_state.drain_pending();
-            events.push(SessionJournalEvent::Suspended {
-                suspension: SessionSuspension::AwaitingExternalInput {
-                    request: Box::new(session_request),
-                },
-            });
-            self.append_journal_events(events).await?;
-            self.pending.push_back(Ok(event));
-        }
-        self.phase = AgentLoopPhase::Done;
-        self.close_turn_span("suspended");
-        Ok(())
-    }
-
-    fn permission_outcome(
-        &mut self,
-        tool_call: &ToolCall,
-        claims: &[PermissionClaim],
-        _whole_tool_approved: bool,
-    ) -> Result<PermissionOutcome> {
-        let denied = claims
-            .iter()
-            .filter(|claim| {
-                self.permission_policy
-                    .evaluate_claim_effect(&tool_call.name, claim)
-                    .level
-                    == PermissionLevel::Deny
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !denied.is_empty() {
-            return Ok(PermissionOutcome::Deny(permission_claim_message(
-                "permission denied",
-                &denied,
-            )));
-        }
-
-        let input = self
-            .permission_policy
-            .evaluate_input(&tool_call.name, &tool_call.arguments);
-        if input
-            .as_ref()
-            .is_some_and(|evaluation| evaluation.effect.level == PermissionLevel::Deny)
-        {
-            return Ok(PermissionOutcome::Deny(
-                "permission denied: tool input does not satisfy policy".to_owned(),
-            ));
-        }
-
-        let state = self.permission_runtime_state()?;
-        let input_claims = input
-            .as_ref()
-            .filter(|input| input.effect.level == PermissionLevel::Ask)
-            .map_or(&[][..], |input| input.claims.as_slice());
-        let mut unmatched = claims
-            .iter()
-            .filter(|claim| {
-                self.permission_policy
-                    .evaluate_claim_refinement_effect(&tool_call.name, claim)
-                    .is_some_and(|effect| effect.level == PermissionLevel::Ask)
-            })
-            .cloned()
-            .chain(input_claims.iter().cloned())
-            .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
-            .collect::<Vec<_>>();
-        let request = PermissionRequestContext {
-            session_id: self.session_id.as_str(),
-            turn: self.turn as u64,
-            stage: PermissionApprovalStage::Contextual,
-            policy: &self.permission_policy,
-        };
-        // Preparation can add claims after middleware has already suspended. Keep
-        // exact-call approvals through those retries, and ask only for new claims.
-        apply_contextual_approvals(&request, tool_call, &state, &mut unmatched);
-        if unmatched.is_empty() {
-            return Ok(PermissionOutcome::Allow);
-        }
-        Ok(PermissionOutcome::Ask(unmatched))
-    }
-
-    fn permission_runtime_state(&self) -> Result<PermissionRuntimeState> {
-        self.middleware_state
-            .get(PERMISSION_STATE_NAMESPACE)
-            .map(|state| serde_json::from_value(state.clone()))
-            .transpose()
-            .map_err(|error| session_store_error(error.to_string()))
-            .map(Option::unwrap_or_default)
-    }
-
-    fn clear_call_approvals(&mut self, call_id: &str) -> Result<()> {
-        let mut state = self.permission_runtime_state()?;
-        let previous_count = state.one_shot.len();
-        state
-            .one_shot
-            .retain(|approval| approval.tool_call_id != call_id);
-        if state.one_shot.len() != previous_count {
-            self.set_permission_runtime_state(&state)?;
-        }
-        Ok(())
-    }
-
-    fn set_permission_runtime_state(&mut self, state: &PermissionRuntimeState) -> Result<()> {
-        self.middleware_state.set(
-            PERMISSION_STATE_NAMESPACE,
-            serde_json::to_value(state).map_err(|error| session_store_error(error.to_string()))?,
-        );
-        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1217,18 +1189,46 @@ where
 
         match self.session_store.load(&self.session_id).await {
             Ok(record) => {
+                if let Some(expected) = self
+                    .session_run_context
+                    .as_ref()
+                    .and_then(SessionRunContext::execution_token)
+                {
+                    let actual = record.execution_token().map_err(session_store_error)?;
+                    if &actual != expected {
+                        return Err(session_store_error(SessionStoreError::StaleExecution {
+                            expected: expected.clone(),
+                            actual,
+                        }));
+                    }
+                }
                 if let Some(operation) = &operation {
                     operation.register_loaded_summary(record.summary());
                 }
                 self.session_incarnation = incarnation;
+                let record = self.prepare_initial_record(record).await?;
                 let continue_start_turn = self.apply_resume_input(record).await?;
                 self.session_initialized = true;
                 return Ok(continue_start_turn);
             }
-            Err(SessionStoreError::NotFound { .. }) => {}
+            Err(error @ SessionStoreError::NotFound { .. }) => {
+                if self
+                    .session_run_context
+                    .as_ref()
+                    .and_then(SessionRunContext::execution_token)
+                    .is_some()
+                {
+                    return Err(session_store_error(error));
+                }
+            }
             Err(error) => return Err(session_store_error(error)),
         }
 
+        if self.provider.transient_input().is_some() {
+            return Err(validation_error(
+                "transient input requires an existing durable helper task",
+            ));
+        }
         if !matches!(
             self.input,
             Some(ResumeInput::Prompt(_) | ResumeInput::Prompts(_))
@@ -1269,9 +1269,10 @@ where
             operation.publish_created(record.summary());
         }
         self.session_incarnation = incarnation;
+        let record = self.prepare_initial_record(record).await?;
         if let Some(prompts) = plain_prompts {
             self.input = None;
-            self.hydrate_from_record(&record);
+            self.hydrate_from_record(&record)?;
             let events = record.timeline_events().cloned().collect::<Vec<_>>();
             if let Some(context) = &self.session_run_context {
                 context.timeline().publish_all(events.clone());
@@ -1286,56 +1287,146 @@ where
         Ok(continue_start_turn)
     }
 
+    async fn check_host_execution_guards(&mut self) -> Result<()> {
+        let mut checked = Vec::new();
+        for guard in self
+            .tools
+            .iter()
+            .filter_map(|tool| tool.execution_guard.clone())
+        {
+            if checked.iter().any(|prior| Arc::ptr_eq(prior, &guard)) {
+                continue;
+            }
+            guard(self.cancellation_token.clone())
+                .await
+                .map_err(|_| validation_error("host execution authority ended"))?;
+            checked.push(guard);
+        }
+        Ok(())
+    }
+
+    async fn prepare_initial_record(&mut self, record: SessionRecord) -> Result<SessionRecord> {
+        self.check_host_execution_guards().await?;
+        // Logical rollback cannot erase an external dispatch fence.
+        if super::tool::host_dispatch_unsettled(&record) {
+            return Err(validation_error(
+                "interrupted host dispatch cannot resume; reconcile the recorded invocation",
+            ));
+        }
+        let snapshot = record.snapshot();
+        if snapshot.middleware_state.contains_key("concrete-execution") {
+            return Err(validation_error(
+                "legacy concrete execution records are unsupported",
+            ));
+        }
+        for namespace in [
+            "live-consent",
+            "completion-validation",
+            "host-tool-execution",
+            "transient-input",
+        ] {
+            if snapshot
+                .middleware_state
+                .get(namespace)
+                .and_then(|value| value.get("active"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Err(validation_error(
+                    "interrupted consumer execution cannot resume; start a new invocation",
+                ));
+            }
+        }
+        if let Some(input) = self.provider.transient_input() {
+            input.preflight()?;
+            if !matches!(self.input, Some(ResumeInput::Continue)) {
+                return Err(validation_error(
+                    "transient input requires a durable initial helper task",
+                ));
+            }
+            let target = input.target();
+            let context = record.materialize_context(SessionContextMode::Effective);
+            let task_event = record
+                .timeline_events()
+                .filter(|event| {
+                    event.channel.as_ref().is_some_and(|channel| {
+                        channel.as_str() == crate::timeline::CHANNEL_USER_TEXT
+                    })
+                })
+                .last();
+            if context.prompt_turns.len().checked_sub(1) != Some(target.prompt_index)
+                || context
+                    .prompt_turns
+                    .last()
+                    .is_none_or(|prompt| prompt.turn != target.turn)
+                || context.next_turn != target.turn
+                || !task_event.is_some_and(|event| {
+                    event.cursor == target.cursor
+                        && event.turn == target.turn
+                        && matches!(&event.content, crate::timeline::TimelineContent::TextSnapshot { text }
+                            if context.prompt_turns.last().is_some_and(|prompt| &prompt.prompt == text))
+                })
+            {
+                return Err(validation_error(
+                    "transient input initial task identity mismatch",
+                ));
+            }
+        }
+        self.hydrate_from_record(&record)?;
+
+        if self.provider.transient_input().is_some() {
+            self.middleware_state.set(
+                "transient-input",
+                json!({"active": true, "replayable": false}),
+            );
+            self.flush_middleware_state().await?;
+        }
+        if self.completion_validation.is_some() {
+            self.middleware_state
+                .set("completion-validation", json!({"active": true}));
+            self.flush_middleware_state().await?;
+        }
+        Ok(self.session_record.clone().expect("loaded session"))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn apply_resume_input(&mut self, record: SessionRecord) -> Result<bool> {
+        self.check_host_execution_guards().await?;
         let Some(input) = self.input.take() else {
-            self.hydrate_from_record(&record);
+            self.hydrate_from_record(&record)?;
             return Ok(true);
         };
 
         // A previous process may have died after sending Execute, or an older
         // record may have no dispatch fence at all. Neither can be retried safely.
         let snapshot = record.snapshot();
-        self.hydrate_from_record(&record);
+        self.hydrate_from_record(&record)?;
         let pending_sandbox = snapshot
             .pending_work
             .iter()
             .filter(|work| {
                 matches!(work.status, PendingWorkStatus::Pending)
                     && work.tool_call.as_ref().is_some_and(|call| {
-                        self.tools.iter().any(|tool| {
-                            tool.is_sandbox_backed() && tool.definition().name == call.name
+                        snapshot.sandbox_calls_recorded.iter().any(|dispatch| {
+                            dispatch.turn == work.turn && dispatch.tool_call_id == call.id
                         })
                     })
             })
             .collect::<Vec<_>>();
-        let permission_retry =
-            matches!(&input, ResumeInput::ExternalResponse { request_id, .. }
-            if snapshot.external_requests.iter().any(|request|
-                request.id == *request_id && request.kind == ExternalRequestKind::Permission
-                && matches!(request.status, ExternalRequestStatus::Pending)))
-                && pending_sandbox.iter().all(|work| {
-                    snapshot.sandbox_calls_recorded.iter().any(|dispatch| {
-                        dispatch.turn == work.turn && dispatch.tool_call_id == work.id
-                    }) && !snapshot.sandbox_dispatches.iter().any(|dispatch| {
-                        dispatch.turn == work.turn && dispatch.tool_call_id == work.id
-                    })
-                });
         let externally_resolved = matches!(&input, ResumeInput::ToolResults(results)
             if snapshot.pending_work.iter()
                 .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
                 .all(|work| results.iter().any(|result| result.call_id == work.id)));
         if !matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_))
             && !pending_sandbox.is_empty()
-            && !permission_retry
             && !externally_resolved
         {
-            self.hydrate_from_record(&record);
+            self.hydrate_from_record(&record)?;
             self.suspend_pending_sandbox_work().await?;
             return Ok(false);
         }
 
-        let mut continue_start_turn = true;
+        let continue_start_turn = true;
         let new_prompts = matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_));
         let record = match input {
             ResumeInput::Continue => record,
@@ -1355,7 +1446,7 @@ where
                 } else {
                     match self
                         .session_runtime()
-                        .resume(&self.session_id, ResumeInput::Prompt(prompt))
+                        .resume_record(record, ResumeInput::Prompt(prompt))
                         .await?
                     {
                         RuntimeResumeOutput::Resumed { record }
@@ -1373,7 +1464,7 @@ where
                 } else {
                     match self
                         .session_runtime()
-                        .resume(&self.session_id, ResumeInput::Prompts(prompts))
+                        .resume_record(record, ResumeInput::Prompts(prompts))
                         .await?
                     {
                         RuntimeResumeOutput::Resumed { record }
@@ -1381,77 +1472,10 @@ where
                     }
                 }
             }
-            ResumeInput::ExternalResponse {
-                request_id,
-                response,
-            } => {
-                let retry = pending_tool_batch_for_permission_retry(
-                    &record.snapshot(),
-                    &request_id,
-                    &response,
-                )?;
-                let cancel = permission_cancel_response(&record.snapshot(), &request_id, &response);
-                let template_denied = record.snapshot().external_requests.iter().any(|request| {
-                    request.id == request_id
-                        && request.payload.get("template") == Some(&json!(true))
-                }) && matches!(
-                    PermissionResponse::from_value(response.payload.clone())?,
-                    PermissionResponse::Deny { .. }
-                );
-                let record = match self
-                    .session_runtime()
-                    .resume(
-                        &self.session_id,
-                        ResumeInput::ExternalResponse {
-                            request_id,
-                            response,
-                        },
-                    )
-                    .await?
-                {
-                    RuntimeResumeOutput::Resumed { record }
-                    | RuntimeResumeOutput::Suspended { record, .. } => record,
-                };
-                if !retry.is_empty() {
-                    self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
-                        calls: retry.into(),
-                    });
-                    continue_start_turn = false;
-                } else if cancel {
-                    self.phase = AgentLoopPhase::Done;
-                    continue_start_turn = false;
-                }
-                if template_denied {
-                    self.hydrate_from_record(&record);
-                    if let Some(mut pending) = self.pending_user_template()? {
-                        pending.denied = true;
-                        self.middleware_state.set(
-                            PENDING_USER_TEMPLATE,
-                            serde_json::to_value(pending).map_err(session_store_error)?,
-                        );
-                    }
-                    self.flush_middleware_state().await?;
-                    self.append_journal_event(SessionJournalEvent::Failed {
-                        message: "template permission denied".to_owned(),
-                        authentication_failure: None,
-                    })
-                    .await?;
-                    self.phase = AgentLoopPhase::Done;
-                    continue_start_turn = false;
-                }
-                if template_denied {
-                    self.session_record
-                        .as_ref()
-                        .expect("loaded session")
-                        .clone()
-                } else {
-                    record
-                }
-            }
             ResumeInput::ToolResults(results) => {
                 match self
                     .session_runtime()
-                    .resume(&self.session_id, ResumeInput::ToolResults(results))
+                    .resume_record(record, ResumeInput::ToolResults(results))
                     .await?
                 {
                     RuntimeResumeOutput::Resumed { record }
@@ -1460,7 +1484,7 @@ where
             }
         };
 
-        self.hydrate_from_record(&record);
+        self.hydrate_from_record(&record)?;
         if continue_start_turn && !self.render_pending_template_prompts(new_prompts).await? {
             return Ok(false);
         }
@@ -1511,30 +1535,28 @@ where
             .expect("loaded session")
             .snapshot();
         if snapshot.prompts.len() == pending.prompt_count {
-            if !superseding_prompt
-                && snapshot.external_requests.iter().any(|request| {
-                    matches!(request.status, ExternalRequestStatus::Pending)
-                        && request.payload.get("template") == Some(&json!(true))
-                })
-            {
-                self.phase = AgentLoopPhase::Done;
-                return Ok(false);
-            }
             let Some((prompts, tool_ids)) = self.render_prompt_templates(pending.prompts).await?
             else {
                 return Ok(false);
             };
+            self.flush_middleware_state().await?;
+            let record = self
+                .session_record
+                .clone()
+                .expect("committed template state");
             let output = self
                 .session_runtime()
-                .resume(&self.session_id, ResumeInput::Prompts(prompts))
+                .resume_record(record, ResumeInput::Prompts(prompts))
                 .await?;
             let record = match output {
                 RuntimeResumeOutput::Resumed { record }
                 | RuntimeResumeOutput::Suspended { record, .. } => record,
             };
-            self.hydrate_from_record(&record);
+            self.hydrate_from_record(&record)?;
             // Earlier prompts in this batch may have completed before a later one suspended.
-            clear_sandbox_template_results(&mut self.middleware_state, &tool_ids)?;
+            if let Some(host) = &self.host_context {
+                host.finish_prompt(&mut self.middleware_state, &tool_ids)?;
+            }
         }
         self.middleware_state
             .set(PENDING_USER_TEMPLATE, Value::Null);
@@ -1572,16 +1594,21 @@ where
         Ok(())
     }
 
-    fn hydrate_from_record(&mut self, record: &SessionRecord) {
+    fn hydrate_from_record(&mut self, record: &SessionRecord) -> Result<()> {
         let snapshot = record.snapshot();
         let context = record.materialize_context(SessionContextMode::Effective);
         self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
+        self.middleware_state.effects = self
+            .host_effects
+            .as_ref()
+            .map(|effects| effects.clone() as Arc<dyn crate::HostEffectExecutor>);
         self.session_metadata_values = record.metadata.values.clone();
         self.prompt = context.current_prompt.unwrap_or_default();
         self.prompt_turns = context.prompt_turns;
         self.turns = context.turns;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
+        self.session_execution_token = Some(record.execution_token().map_err(session_store_error)?);
         self.session_journal_len = record.journal.len() as u64;
         self.last_timeline_cursor = record.timeline_events().last().map(|event| event.cursor);
         self.session_record = Some(record.clone());
@@ -1614,6 +1641,7 @@ where
                 _ => {}
             }
         }
+        Ok(())
     }
 
     fn prompt_turns(&self) -> Vec<PromptTurn> {
@@ -1632,13 +1660,8 @@ where
         &mut self,
         prompts: Vec<String>,
     ) -> Result<Option<(Vec<String>, Vec<String>)>> {
-        let current_dir;
-        let base_dir = if let Some(base_dir) = self.template_base_dir.as_deref() {
-            base_dir
-        } else {
-            current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            current_dir.as_path()
-        };
+        self.prepare_host_effects().await?;
+        let host = self.host_context.clone();
         let mut rendered = Vec::with_capacity(prompts.len());
         let mut tool_ids = Vec::new();
         let prompt_count = self
@@ -1652,31 +1675,26 @@ where
             .and_then(Value::as_u64)
             .unwrap_or(self.session_journal_len);
         for (index, prompt) in prompts.into_iter().enumerate() {
-            let mut runtime = TemplateRuntime::new(
-                base_dir,
-                &mut self.middleware_state,
-                TemplateRunContext {
-                    middleware_chain: &self.middleware_chain,
-                    permission_policy: &self.permission_policy,
-                    cancellation_token: self.cancellation_token.clone(),
-                    session_id: self.session_id.as_str(),
-                    turn: self.turn as u64,
-                    sandbox: self.sandbox.as_ref(),
-                },
-                TemplateOrigin::UserPrompt {
+            let Some(host) = &host else {
+                rendered.push(prompt);
+                continue;
+            };
+            let outcome = host
+                .render_prompt(
+                    crate::HostContext {
+                        session_id: self.session_id.as_str(),
+                        turn: self.turn as u64,
+                        cancellation: self.cancellation_token.clone(),
+                        metadata: None,
+                        state: &mut self.middleware_state,
+                    },
+                    &prompt,
                     submission,
-                    prompt_index: prompt_count + index,
-                },
-            );
-            let outcome = runtime.render_template(&prompt).await?;
-            tool_ids.extend_from_slice(runtime.rendered_tool_ids());
-            match outcome {
-                TemplateRender::Rendered(prompt) => rendered.push(prompt),
-                TemplateRender::Suspend(suspension) => {
-                    self.suspend_from_hook(suspension).await?;
-                    return Ok(None);
-                }
-            }
+                    prompt_count + index,
+                )
+                .await?;
+            tool_ids.extend(outcome.tool_ids);
+            rendered.push(outcome.prompt);
         }
         Ok(Some((rendered, tool_ids)))
     }
@@ -1686,37 +1704,146 @@ where
     }
 
     async fn append_journal_events(&mut self, events: Vec<SessionJournalEvent>) -> Result<()> {
+        self.synchronize_host_effects().await?;
         if events.is_empty() {
             return Ok(());
         }
         let event_count = events.len() as u64;
         let projected_events = events.clone();
-        self.session_revision = self
+        let receipt = self
             .session_store
-            .append_journal(&self.session_id, self.session_revision, events)
+            .append_journal(&self.session_id, self.execution_token()?, events)
             .await
             .map_err(session_store_error)?;
+        self.adopt_commit(receipt);
+        let committed_facts = projected_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                SessionJournalEvent::TurnFinished { turn } => {
+                    Some((self.session_journal_len.saturating_add(index as u64), super::event::SessionSemanticKind::TurnCompleted { turn: *turn }))
+                }
+                SessionJournalEvent::Finished => Some((self.session_journal_len.saturating_add(index as u64), super::event::SessionSemanticKind::RunFinished)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         self.session_journal_len = self.session_journal_len.saturating_add(event_count);
         if let Some(record) = &mut self.session_record {
-            record.revision = self.session_revision;
             record.append_journal_events(projected_events);
-            record.touch_activity();
         }
         self.publish_session_summary();
+        for (index, kind) in committed_facts {
+            self.notify_semantic(
+                kind,
+                format!("j{index}"),
+                self.last_timeline_cursor,
+            );
+        }
         Ok(())
     }
 
     async fn flush_middleware_state(&mut self) -> Result<()> {
         let events = self.middleware_state.drain_pending();
-        self.append_journal_events(events).await
+        if let Err(error) = self.append_journal_events(events.clone()).await {
+            self.middleware_state.restore_pending(events);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn synchronize_context_updates(&mut self) -> Result<()> {
+        let Some(previous) = self.session_record.as_ref() else {
+            return Ok(());
+        };
+        let current = self
+            .session_store
+            .load(&self.session_id)
+            .await
+            .map_err(session_store_error)?;
+        if current.metadata.incarnation != previous.metadata.incarnation
+            || current.agent_definition != previous.agent_definition
+            || current.inference_settings != previous.inference_settings
+            || !current.journal.starts_with(&previous.journal)
+            || current.journal[previous.journal.len()..]
+                .iter()
+                .any(|event| !matches!(event, SessionJournalEvent::MasksMutated { .. }))
+            || current.execution_sequence.get()
+                != previous.execution_sequence.get().saturating_add(
+                    current.journal.len().saturating_sub(previous.journal.len()) as u64,
+                )
+        {
+            return Err(session_store_error(
+                "session changed outside the live context boundary",
+            ));
+        }
+        if current.revision == self.session_revision
+            && current.execution_sequence == previous.execution_sequence
+        {
+            return Ok(());
+        }
+        self.session_revision = current.revision;
+        self.session_execution_token =
+            Some(current.execution_token().map_err(session_store_error)?);
+        self.session_journal_len = current.journal.len() as u64;
+        self.session_record = Some(current);
+        Ok(())
+    }
+
+    async fn prepare_host_effects(&mut self) -> Result<()> {
+        self.flush_middleware_state().await?;
+        self.synchronize_host_effects().await?;
+        if self.host_effects.is_none() {
+            let record = self
+                .session_record
+                .as_ref()
+                .ok_or_else(|| validation_error("host context requires durable storage"))?;
+            self.host_effects = Some(Arc::new(super::host_effect::HostEffectJournal::new(
+                self.session_store.clone(),
+                record,
+                self.cancellation_token.clone(),
+            )?));
+        }
+        self.middleware_state.effects = self
+            .host_effects
+            .as_ref()
+            .map(|effects| effects.clone() as Arc<dyn crate::HostEffectExecutor>);
+        Ok(())
+    }
+
+    async fn synchronize_host_effects(&mut self) -> Result<()> {
+        let Some(effects) = &self.host_effects else {
+            return Ok(());
+        };
+        let record = self
+            .session_record
+            .as_ref()
+            .ok_or_else(|| validation_error("host context requires durable storage"))?;
+        let (receipt, events) = effects
+            .synchronize(record.commit_receipt().map_err(session_store_error)?)
+            .await?;
+        self.adopt_commit(receipt);
+        self.session_journal_len = self.session_journal_len.saturating_add(events.len() as u64);
+        for event in &events {
+            if let SessionJournalEvent::MiddlewareStateUpdated { namespace, state } = event {
+                self.middleware_state
+                    .merge_committed(namespace.clone(), state.clone());
+            }
+        }
+        if let Some(record) = &mut self.session_record {
+            record.append_journal_events(events);
+        }
+        self.publish_session_summary();
+        Ok(())
     }
 
     async fn record_interrupted(&mut self) -> Result<()> {
+        self.cancellation_token.cancel();
+        self.synchronize_host_effects().await?;
         if !self.session_initialized {
             return Ok(());
         }
         let record = self.session_runtime().interrupt(&self.session_id).await?;
-        self.hydrate_from_record(&record);
+        self.hydrate_from_record(&record)?;
         self.close_turn_span("interrupted");
         Ok(())
     }
@@ -1735,18 +1862,17 @@ where
         &mut self,
         events: Vec<PendingTimelineEvent>,
     ) -> Result<Vec<AgentTimelineEvent>> {
+        self.synchronize_host_effects().await?;
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        let assigned = self
+        let receipt = self
             .session_store
-            .append_timeline(&self.session_id, self.session_revision, events)
+            .append_timeline(&self.session_id, self.execution_token()?, events)
             .await
             .map_err(session_store_error)?;
-        if let Some(context) = &self.session_run_context {
-            context.timeline().publish_all(assigned.clone());
-        }
-        self.session_revision = self.session_revision.next();
+        self.adopt_commit(receipt.commit);
+        let assigned = receipt.events;
         self.session_journal_len = self
             .session_journal_len
             .saturating_add(assigned.len() as u64);
@@ -1755,13 +1881,72 @@ where
             .map(|event| event.cursor)
             .or(self.last_timeline_cursor);
         if let Some(record) = &mut self.session_record {
-            record.revision = self.session_revision;
             record
                 .append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
-            record.touch_activity();
+        }
+        if let Some(context) = &self.session_run_context {
+            context.timeline().publish_all(assigned.clone());
         }
         self.publish_session_summary();
+        for event in &assigned {
+            if let TimelineContent::ToolResult { result } = &event.content {
+                self.notify_semantic(
+                    super::event::SessionSemanticKind::ToolResultCommitted {
+                        call_id: result.call_id.clone(),
+                        tool_name: result.name.clone(),
+                        succeeded: !result.is_error,
+                    },
+                    format!("c{}", event.cursor.get()),
+                    Some(event.cursor),
+                );
+            }
+        }
         Ok(assigned)
+    }
+
+    fn execution_token(&self) -> Result<crate::ExecutionToken> {
+        self.session_execution_token
+            .clone()
+            .ok_or_else(|| validation_error("execution requires a durable session token"))
+    }
+
+    fn adopt_commit(&mut self, receipt: crate::SessionCommitReceipt) {
+        self.session_revision = receipt.revision;
+        self.session_execution_token = Some(receipt.execution_token.clone());
+        self.session_metadata_values = receipt.metadata.values.clone();
+        if let Some(record) = &mut self.session_record {
+            record.adopt_commit(receipt);
+        }
+    }
+
+    fn notify_semantic(
+        &self,
+        kind: super::event::SessionSemanticKind,
+        commit: String,
+        cursor: Option<crate::TimelineCursor>,
+    ) {
+        let Some(sink) = self
+            .session_run_context
+            .as_ref()
+            .and_then(|context| context.event_sink())
+            .or(self.event_sink.as_ref())
+        else {
+            return;
+        };
+        let metadata = self.session_record.as_ref().map(|record| &record.metadata);
+        let incarnation = metadata.and_then(|metadata| metadata.incarnation.clone());
+        sink.semantic(super::event::SessionSemanticEvent {
+            id: format!(
+                "semantic:{}:{}:{commit}",
+                self.session_id.as_str(),
+                incarnation.as_deref().unwrap_or("legacy")
+            ),
+            session_id: self.session_id.clone(),
+            incarnation,
+            revision: self.session_revision,
+            cursor,
+            kind,
+        });
     }
 
     fn tool_item_id(&self, call_id: &str) -> Result<TimelineItemId> {
@@ -1879,15 +2064,19 @@ where
     }
 
     async fn record_run_failure(&mut self, error: &LlmError) -> Result<()> {
+        let was_cancelled = self.cancellation_token.is_cancelled();
+        self.cancellation_token.cancel();
+        self.synchronize_host_effects().await?;
+        self.flush_middleware_state().await?;
         self.close_turn_span("error");
-        if self.cancellation_token.is_cancelled() {
+        if was_cancelled {
             return Ok(());
         }
         let operation = match &self.session_run_context {
             Some(context) => Some(context.operation().await),
             None => None,
         };
-        if self.cancellation_token.is_cancelled()
+        if was_cancelled
             || operation
                 .as_ref()
                 .is_some_and(|operation| Some(operation.incarnation()) != self.session_incarnation)
@@ -1901,7 +2090,7 @@ where
                 .load(&self.session_id)
                 .await
                 .map_err(session_store_error)?;
-            self.hydrate_from_record(&record);
+            self.hydrate_from_record(&record)?;
         }
         let Some(record) = &self.session_record else {
             return Ok(());
@@ -1924,7 +2113,6 @@ where
                             Some(
                                 TimelineStatus::Finished
                                     | TimelineStatus::Failed
-                                    | TimelineStatus::AwaitingExternalInput
                                     | TimelineStatus::AwaitingToolResults
                                     | TimelineStatus::Interrupted
                             )
@@ -1997,11 +2185,10 @@ where
                 .publish_truncation(self.session_id.clone(), checkpoint.after_cursor);
         }
         let record = self
-            .session_store
-            .load(&self.session_id)
-            .await
-            .map_err(session_store_error)?;
-        self.hydrate_from_record(&record);
+            .session_record
+            .clone()
+            .ok_or_else(|| validation_error("rollback requires a durable session record"))?;
+        self.hydrate_from_record(&record)?;
         Ok(())
     }
 
@@ -2109,33 +2296,6 @@ where
             .await
     }
 
-    async fn persist_external_request(
-        &mut self,
-        request: &middleware::ExternalRequestDraft,
-    ) -> Result<AgentTimelineEvent> {
-        let request = ExternalRequest {
-            id: ExternalRequestId::new(request.id.clone()),
-            kind: session_external_request_kind(&request.kind),
-            tool_call_id: request.tool_call_id.clone(),
-            prompt: request.prompt.clone(),
-            payload: request.payload.clone(),
-            status: session_external_request_status(&request.status),
-        };
-
-        let events = self.middleware_state.drain_pending();
-        if !events.is_empty() {
-            self.append_journal_events(events).await?;
-        }
-        self.append_timeline_event(external_request_timeline_event(
-            &self.session_id,
-            self.turn as u64,
-            request,
-            TimelineEventKind::ExternalRequestOpened,
-            PendingTimelineItemId::New,
-        ))
-        .await
-    }
-
     fn session_runtime(&self) -> AgentSessionRuntime<'_, S> {
         let mut runtime = AgentSessionRuntime::new(&self.session_store);
         if let (Some(context), Some(incarnation)) =
@@ -2175,6 +2335,7 @@ where
                         first_journal_index.saturating_add(offset.saturating_mul(2)),
                     ),
                     session_id: self.session_id.clone(),
+                    incarnation: self.session_record.as_ref().and_then(|record| record.metadata.incarnation.clone()),
                     prompt_index,
                     user_message_count: prompt_index.saturating_add(1),
                     text: text.clone(),
@@ -2276,34 +2437,6 @@ fn tool_result_timeline_event(
         parent_id,
         result,
     )
-}
-
-fn external_request_timeline_event(
-    session_id: &SessionId,
-    turn: u64,
-    request: ExternalRequest,
-    kind: TimelineEventKind,
-    item_id: PendingTimelineItemId,
-) -> PendingTimelineEvent {
-    PendingTimelineEvent::new(
-        session_id.clone(),
-        turn,
-        item_id,
-        kind,
-        Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
-        TimelineContent::ExternalRequest { request },
-    )
-}
-
-fn external_request_from_draft(request: &middleware::ExternalRequestDraft) -> ExternalRequest {
-    ExternalRequest {
-        id: ExternalRequestId::new(request.id.clone()),
-        kind: session_external_request_kind(&request.kind),
-        tool_call_id: request.tool_call_id.clone(),
-        prompt: request.prompt.clone(),
-        payload: request.payload.clone(),
-        status: session_external_request_status(&request.status),
-    }
 }
 
 fn canonical_request_json(draft: &ModelRequestDraft) -> Value {
@@ -2478,292 +2611,6 @@ fn stable_request_hash(canonical_request: &Value) -> String {
     format!("compat-{:016x}", hasher.finish())
 }
 
-fn session_external_request_kind(kind: &middleware::ExternalRequestKind) -> ExternalRequestKind {
-    match kind {
-        middleware::ExternalRequestKind::Permission => ExternalRequestKind::Permission,
-        middleware::ExternalRequestKind::Question => ExternalRequestKind::Question,
-        middleware::ExternalRequestKind::Custom(value) => {
-            ExternalRequestKind::Custom(value.clone())
-        }
-    }
-}
-
-fn session_external_request_status(
-    status: &middleware::ExternalRequestStatus,
-) -> ExternalRequestStatus {
-    match status {
-        middleware::ExternalRequestStatus::Pending => ExternalRequestStatus::Pending,
-        middleware::ExternalRequestStatus::Answered => {
-            ExternalRequestStatus::Responded(super::session::ExternalResponse {
-                payload: json!({ "answered": true }),
-            })
-        }
-        middleware::ExternalRequestStatus::Canceled => {
-            ExternalRequestStatus::Canceled(super::session::CancelReason::SessionInterrupted)
-        }
-    }
-}
-
-struct PermissionRequestContext<'a> {
-    session_id: &'a str,
-    turn: u64,
-    stage: PermissionApprovalStage,
-    policy: &'a PermissionPolicy,
-}
-
-fn contextual_input_is_approved(
-    ctx: &ToolCallContext<'_>,
-    claims: &[PermissionClaim],
-    state: &PermissionRuntimeState,
-) -> bool {
-    let mut unmatched = claims.to_vec();
-    apply_contextual_approvals(
-        &PermissionRequestContext {
-            session_id: ctx.session_id,
-            turn: ctx.turn,
-            stage: PermissionApprovalStage::Contextual,
-            policy: ctx.permission_policy,
-        },
-        ctx.call,
-        state,
-        &mut unmatched,
-    );
-    unmatched.is_empty()
-}
-
-fn apply_contextual_approvals(
-    request: &PermissionRequestContext<'_>,
-    call: &ToolCall,
-    state: &PermissionRuntimeState,
-    unmatched: &mut Vec<PermissionClaim>,
-) {
-    for approval in &state.one_shot {
-        let Some(identities) = &approval.claims else {
-            continue;
-        };
-        if approval.tool_call_id == call.id
-            && approval.stage == Some(PermissionApprovalStage::Contextual)
-            && approval.request_id == permission_request_id(request, call, identities)
-        {
-            unmatched.retain(|claim| {
-                !identities.contains(&permission_claim_identities(std::slice::from_ref(claim))[0])
-            });
-        }
-    }
-}
-
-pub(crate) fn contextual_suspension(
-    ctx: &ToolCallContext<'_>,
-    claims: &[PermissionClaim],
-) -> middleware::Suspension {
-    permission_suspension(
-        &PermissionRequestContext {
-            session_id: ctx.session_id,
-            turn: ctx.turn,
-            stage: PermissionApprovalStage::Contextual,
-            policy: ctx.permission_policy,
-        },
-        ctx.call,
-        claims,
-    )
-}
-
-fn permission_suspension(
-    request: &PermissionRequestContext<'_>,
-    call: &ToolCall,
-    claims: &[PermissionClaim],
-) -> middleware::Suspension {
-    let summary = permission_claim_message("permission required", claims);
-    let payload = json!({
-        "tool_call": {
-            "id": call.id,
-            "name": call.name,
-            "arguments": call.arguments,
-        },
-        "claims": claims
-            .iter()
-            .map(|claim| {
-                json!({
-                    "operation": format!("{:?}", claim.operation),
-                    "resource": permission_claim_resource(&claim.resource),
-                    "summary": claim.summary,
-                })
-            })
-            .collect::<Vec<_>>(),
-        "patterns": permission_patterns(claims),
-        "claim_identities": permission_claim_identities(claims),
-    });
-    middleware::Suspension::external(
-        "permission",
-        middleware::ExternalRequestDraft {
-            id: permission_request_id(request, call, &permission_claim_identities(claims)),
-            kind: middleware::ExternalRequestKind::Permission,
-            tool_call_id: Some(call.id.clone()),
-            prompt: summary,
-            payload,
-            status: middleware::ExternalRequestStatus::Pending,
-        },
-    )
-}
-
-fn permission_request_id(
-    request: &PermissionRequestContext<'_>,
-    call: &ToolCall,
-    claims: &[PermissionClaimIdentity],
-) -> String {
-    let identity = serde_json::to_string(&(
-        request.stage,
-        request.policy.identity(),
-        &call.name,
-        &call.arguments,
-        claims,
-    ))
-    .expect("permission request identity serializes");
-    let hash = Sha256::digest(identity.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!(
-        "permission:{}:{}:{}:{hash}",
-        request.session_id, request.turn, call.id
-    )
-}
-
-fn permission_patterns(claims: &[PermissionClaim]) -> Vec<PermissionPattern> {
-    let mut patterns = Vec::new();
-    for claim in claims {
-        let pattern = permission_pattern(claim);
-        if !patterns.contains(&pattern) {
-            patterns.push(pattern);
-        }
-    }
-    patterns
-}
-
-fn permission_pattern(claim: &PermissionClaim) -> PermissionPattern {
-    let resource = match &claim.resource {
-        PermissionResource::FilesystemPath(path) => {
-            let parent = path.parent().unwrap_or(path.as_path()).to_path_buf();
-            PermissionResourcePattern::FilesystemPathPrefix(parent)
-        }
-        PermissionResource::FilesystemPathPrefix(path) => {
-            PermissionResourcePattern::FilesystemPathPrefix(path.clone())
-        }
-        PermissionResource::WorkingDirectory(path) => {
-            PermissionResourcePattern::WorkingDirectoryPrefix(path.clone())
-        }
-        PermissionResource::ShellCommand(command) => {
-            return PermissionPattern {
-                operation: Some(PermissionOperation::Execute),
-                resource: PermissionResourcePattern::ShellCommand(command.clone()),
-            };
-        }
-        PermissionResource::ToolInput {
-            tool,
-            pointer,
-            value,
-        } => PermissionResourcePattern::ToolInput {
-            tool: tool.clone(),
-            pointer: pointer.clone(),
-            value: value.clone(),
-        },
-    };
-    PermissionPattern {
-        operation: Some(claim.operation),
-        resource,
-    }
-}
-
-fn pending_tool_batch_for_permission_retry(
-    snapshot: &SessionSnapshot,
-    request_id: &ExternalRequestId,
-    response: &ExternalResponse,
-) -> Result<Vec<ToolCall>> {
-    let Some(request) = snapshot
-        .external_requests
-        .iter()
-        .rev()
-        .find(|request| request.id == *request_id)
-    else {
-        return Ok(Vec::new());
-    };
-    if request.kind != ExternalRequestKind::Permission {
-        return Ok(Vec::new());
-    }
-    let response = PermissionResponse::from_value(response.payload.clone())?;
-    if !matches!(
-        response,
-        PermissionResponse::AllowOnce | PermissionResponse::AllowAlways { .. }
-    ) {
-        return Ok(Vec::new());
-    }
-    if request
-        .payload
-        .get("template")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(Vec::new());
-    }
-    let Some(tool_call_id) = request.tool_call_id.as_deref() else {
-        return Err(session_store_error(
-            "permission request missing tool call id",
-        ));
-    };
-    if !snapshot
-        .pending_work
-        .iter()
-        .any(|work| work.id == tool_call_id && work.tool_call.is_some())
-    {
-        return Err(session_store_error(format!(
-            "pending permission work not found for tool call: {tool_call_id}"
-        )));
-    }
-
-    Ok(snapshot
-        .pending_work
-        .iter()
-        .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
-        .filter_map(|work| work.tool_call.clone())
-        .collect())
-}
-
-fn permission_cancel_response(
-    _snapshot: &SessionSnapshot,
-    _request_id: &ExternalRequestId,
-    response: &ExternalResponse,
-) -> bool {
-    match PermissionResponse::from_value(response.payload.clone()) {
-        Ok(PermissionResponse::Deny {
-            mode: crate::PermissionDenyMode::CancelWork,
-            ..
-        }) => true,
-        Ok(_) | Err(_) => false,
-    }
-}
-
-fn permission_claim_message(prefix: &str, claims: &[PermissionClaim]) -> String {
-    let summaries = claims
-        .iter()
-        .map(|claim| claim.summary.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
-    if summaries.is_empty() {
-        prefix.to_owned()
-    } else {
-        format!("{prefix}: {summaries}")
-    }
-}
-
-fn permission_claim_resource(resource: &PermissionResource) -> String {
-    match resource {
-        PermissionResource::ToolInput { tool, pointer, .. } => {
-            format!("ToolInput {{ tool: {tool:?}, pointer: {pointer:?} }}")
-        }
-        resource => format!("{resource:?}"),
-    }
-}
-
 fn session_store_error(error: impl std::fmt::Display) -> LlmError {
     LlmError::Protocol {
         provider: "session",
@@ -2789,6 +2636,7 @@ fn completion_request_from_draft(draft: &ModelRequestDraft) -> CompletionRequest
     }
 }
 
+#[cfg(test)]
 fn unsupported_before_provider_request_outcome(outcome: &HookOutcome) -> LlmError {
     LlmError::Protocol {
         provider: "middleware",
@@ -2798,6 +2646,7 @@ fn unsupported_before_provider_request_outcome(outcome: &HookOutcome) -> LlmErro
     }
 }
 
+#[cfg(test)]
 fn unsupported_build_system_prompt_outcome(outcome: &HookOutcome) -> LlmError {
     LlmError::Protocol {
         provider: "middleware",
@@ -2823,46 +2672,6 @@ mod tests {
     use crate::{ToolResult, ToolResultContent, ToolResultContentBlock, ToolResultImage};
 
     use super::{redact_provider_images, tool_result_json};
-
-    #[test]
-    fn permission_retry_identity_binds_complete_tool_name_and_arguments() {
-        let policy = crate::PermissionPolicy::default();
-        let request = super::PermissionRequestContext {
-            session_id: "session",
-            turn: 4,
-            stage: super::PermissionApprovalStage::Contextual,
-            policy: &policy,
-        };
-        let call = crate::ToolCall::new(
-            "call",
-            "read",
-            json!({"filePath":"outside", "extra":"original"}),
-        );
-        let id = super::permission_request_id(&request, &call, &[]);
-        let mut approvals = super::PermissionRuntimeState::default();
-        approvals.allow_once(
-            &crate::ExternalRequestId::new(&id),
-            "call",
-            request.stage,
-            vec![],
-        );
-        for changed in [
-            crate::ToolCall::new("call", "write", call.arguments.clone()),
-            crate::ToolCall::new(
-                "call",
-                "read",
-                json!({"filePath":"outside", "extra":"modified"}),
-            ),
-        ] {
-            assert!(!approvals.has_one_shot(
-                &super::permission_request_id(&request, &changed, &[]),
-                "call",
-                request.stage,
-                &[]
-            ));
-        }
-        assert!(approvals.has_one_shot(&id, "call", request.stage, &[]));
-    }
 
     #[test]
     fn provider_request_audit_redacts_native_and_data_url_images() {

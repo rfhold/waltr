@@ -6,15 +6,9 @@ use std::{
 };
 
 use futures_util::StreamExt as _;
-use mcp::{
-    McpOAuthGrantType, McpOAuthSecret, McpRefreshTokenRequest, McpTokenError, McpTokenErrorCode,
-    McpTokenResponse,
-};
-use oauth2::{AccessToken, RefreshToken, Scope};
+use oauth2::{AccessToken, RefreshToken};
 use reqwest::{Client, Response, Url, header::CONTENT_TYPE};
 
-use super::McpResolvedConnection;
-use super::{should_refresh_mcp_token, validate_mcp_access_token, validate_mcp_credential};
 use crate::{
     AuthTarget, AuthenticationFailureReason, CredentialStore, OAuthCredential,
     OAuthCredentialContext, OAuthCredentialRecord, OAuthRefreshClaim, OAuthRefreshClaimResult,
@@ -84,12 +78,11 @@ enum RefreshFailureDisposition {
     Indeterminate,
 }
 
-/// Reusable provider and remote MCP outbound credential refresh coordinator.
+/// Provider inference credential refresh coordinator.
 #[derive(Debug, Clone)]
 pub struct CredentialRefreshCoordinator {
     credential_store: CredentialStore,
     allow_loopback_http: bool,
-    configured_mcp_oauth_origins: Vec<Url>,
 }
 
 impl CredentialRefreshCoordinator {
@@ -99,21 +92,7 @@ impl CredentialRefreshCoordinator {
         Self {
             credential_store: credential_store.into(),
             allow_loopback_http: false,
-            configured_mcp_oauth_origins: Vec::new(),
         }
-    }
-
-    /// Permit private HTTPS peers for host-supplied MCP OAuth origins.
-    #[must_use]
-    pub fn with_trusted_mcp_oauth_origins(mut self, origins: Vec<Url>) -> Self {
-        self.configured_mcp_oauth_origins = origins;
-        self
-    }
-
-    /// Permit private HTTPS peers for one host-supplied MCP OAuth origin.
-    #[must_use]
-    pub fn with_trusted_mcp_oauth_origin(self, origin: Url) -> Self {
-        self.with_trusted_mcp_oauth_origins(vec![origin])
     }
 
     #[cfg(test)]
@@ -192,115 +171,6 @@ impl CredentialRefreshCoordinator {
         self.commit_refresh(&target, &credential_key, claim, refreshed)
             .await
             .map(|record| Some(record.credential))
-    }
-
-    /// Refresh one remote MCP credential and return the committed current state.
-    ///
-    /// `Ok(None)` means no credential exists for normal runtime resolution.
-    ///
-    /// # Errors
-    ///
-    /// Returns a sanitized error while preserving generation, claim, resource-binding,
-    /// and indeterminate token-family protections.
-    #[allow(clippy::too_many_lines)]
-    pub async fn refresh_mcp(
-        &self,
-        server: &McpResolvedConnection,
-        mode: RefreshMode,
-    ) -> Result<Option<OAuthCredential>, CredentialRefreshError> {
-        let target = AuthTarget::mcp_server(&server.key);
-        let credential_key = target.credential_key();
-        let record = self.read_record(&target, &credential_key).await?;
-        let Some(record) = record else {
-            return if mode == RefreshMode::Normal {
-                Ok(None)
-            } else {
-                Err(refresh_error(
-                    target,
-                    AuthenticationFailureReason::CredentialRequired,
-                    "MCP OAuth credential is required",
-                    RefreshFailureDisposition::ReauthorizationRequired,
-                ))
-            };
-        };
-        validate_mcp_state(&target, server, &record)?;
-        if mode == RefreshMode::Normal && !should_refresh_mcp_token(&record.credential) {
-            return Ok(Some(record.credential));
-        }
-        if record.credential.token.refresh_token.is_none() {
-            if mode == RefreshMode::Normal && !record.credential.token.expires_by(now_ms()) {
-                return Ok(Some(record.credential));
-            }
-            return Err(refresh_error(
-                target,
-                AuthenticationFailureReason::CredentialRequired,
-                "MCP OAuth credential does not include a refresh token",
-                RefreshFailureDisposition::ReauthorizationRequired,
-            ));
-        }
-
-        let claim = refresh_claim(record.revision);
-        if let Some(current) = self.claim_refresh(&target, &credential_key, &claim).await? {
-            validate_mcp_state(&target, server, &current)?;
-            if !mcp_refresh_result_is_usable(&current.credential) {
-                return Err(refresh_error(
-                    target,
-                    AuthenticationFailureReason::CredentialRequired,
-                    "MCP OAuth refresh did not produce a usable credential",
-                    RefreshFailureDisposition::ReauthorizationRequired,
-                ));
-            }
-            return Ok(Some(current.credential));
-        }
-
-        let refreshed = match refresh_mcp_oauth(
-            &target,
-            &record.credential,
-            self.allow_loopback_http,
-            &self.configured_mcp_oauth_origins,
-        )
-        .await
-        {
-            Ok(credential) => credential,
-            Err(error) => {
-                self.abort_refresh(&target, &credential_key, &claim, &error)
-                    .await?;
-                if mode == RefreshMode::Normal
-                    && error.disposition == RefreshFailureDisposition::Indeterminate
-                    && !record.credential.token.expires_by(now_ms())
-                {
-                    return Ok(Some(record.credential));
-                }
-                return Err(error);
-            }
-        };
-        if refreshed.token.expires_by(now_ms()) {
-            self.credential_store
-                .abort_refresh(&credential_key, claim.clone(), true)
-                .await
-                .map_err(|_| {
-                    storage_error(target.clone(), "failed to abort MCP credential refresh")
-                })?;
-            return Err(refresh_error(
-                target,
-                AuthenticationFailureReason::ResponseInvalid,
-                "MCP OAuth refresh produced an expired credential",
-                RefreshFailureDisposition::Indeterminate,
-            ));
-        }
-        let current = self
-            .commit_refresh(&target, &credential_key, claim, refreshed)
-            .await?;
-        validate_mcp_state(&target, server, &current)?;
-        if !mcp_refresh_result_is_usable(&current.credential) {
-            return Err(refresh_error(
-                target,
-                AuthenticationFailureReason::CredentialRequired,
-                "MCP OAuth credential changed during refresh",
-                RefreshFailureDisposition::ReauthorizationRequired,
-            ));
-        }
-        Ok(Some(current.credential))
     }
 
     async fn read_record(
@@ -415,32 +285,8 @@ impl CredentialRefreshCoordinator {
 const fn oauth_target_label(target: &AuthTarget) -> &'static str {
     match target {
         AuthTarget::Provider { .. } => "provider",
-        AuthTarget::McpServer { .. } => "MCP",
+        AuthTarget::Host { .. } => "host",
     }
-}
-
-fn validate_mcp_state(
-    target: &AuthTarget,
-    server: &McpResolvedConnection,
-    record: &OAuthCredentialRecord,
-) -> Result<(), CredentialRefreshError> {
-    let credential = &record.credential;
-    validate_mcp_credential(server, credential).map_err(|_| {
-        refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ConfigurationRequired,
-            "MCP OAuth credential binding is invalid",
-            RefreshFailureDisposition::RetrySafe,
-        )
-    })?;
-    validate_mcp_access_token(&server.key, credential).map_err(|_| {
-        refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ResponseInvalid,
-            "MCP OAuth credential does not contain a supported bearer access token",
-            RefreshFailureDisposition::ReauthorizationRequired,
-        )
-    })
 }
 
 fn validate_provider_credential(
@@ -474,10 +320,6 @@ fn should_refresh_provider(credential: &OAuthCredential) -> bool {
     credential
         .token
         .expires_by(now_ms().saturating_add(super::OAUTH_REFRESH_AHEAD_MS))
-}
-
-fn mcp_refresh_result_is_usable(credential: &OAuthCredential) -> bool {
-    !credential.token.expires_by(now_ms())
 }
 
 fn refresh_claim(revision: u64) -> OAuthRefreshClaim {
@@ -553,155 +395,6 @@ async fn refresh_provider_oauth(
         ));
     }
     token_response_to_credential(target, definition, credential, &body)
-}
-
-#[allow(clippy::too_many_lines)]
-pub(super) async fn refresh_mcp_oauth(
-    target: &AuthTarget,
-    credential: &OAuthCredential,
-    allow_loopback_http: bool,
-    trusted_private_origins: &[Url],
-) -> Result<OAuthCredential, CredentialRefreshError> {
-    let context = credential.mcp_context().ok_or_else(|| {
-        refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ConfigurationRequired,
-            "MCP OAuth credential binding is invalid",
-            RefreshFailureDisposition::RetrySafe,
-        )
-    })?;
-    let refresh_token = credential
-        .token
-        .refresh_token
-        .as_ref()
-        .map(RefreshToken::secret)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
-            refresh_error(
-                target.clone(),
-                AuthenticationFailureReason::CredentialRequired,
-                "MCP OAuth credential does not include a refresh token",
-                RefreshFailureDisposition::ReauthorizationRequired,
-            )
-        })?;
-    if context.endpoints.token.is_empty() || context.registration.client_id.is_empty() {
-        return Err(refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ConfigurationRequired,
-            "MCP OAuth refresh configuration is missing",
-            RefreshFailureDisposition::RetrySafe,
-        ));
-    }
-    let request = McpRefreshTokenRequest {
-        grant_type: McpOAuthGrantType::RefreshToken,
-        refresh_token: McpOAuthSecret::new(refresh_token),
-        client_id: context.registration.client_id.clone(),
-        scope: None,
-        resource: Some(context.resource.clone()),
-    };
-    let (token_url, client) = oauth_client_for(
-        target,
-        &context.endpoints.token,
-        allow_loopback_http,
-        trusted_private_origins,
-    )
-    .await?;
-    let response = client
-        .post(token_url)
-        .form(&request)
-        .send()
-        .await
-        .map_err(|_| {
-            refresh_error(
-                target.clone(),
-                AuthenticationFailureReason::NetworkFailed,
-                "MCP OAuth token request failed",
-                RefreshFailureDisposition::Indeterminate,
-            )
-        })?;
-    validate_response_peer(
-        target,
-        &response,
-        allow_loopback_http,
-        trusted_private_origins,
-    )?;
-    let status = response.status();
-    let body = read_json_body(target, response).await?;
-    if !status.is_success() {
-        let token_error = serde_json::from_slice::<McpTokenError>(&body).ok();
-        let invalid_grant = token_error
-            .as_ref()
-            .is_some_and(|error| error.error == McpTokenErrorCode::InvalidGrant);
-        return Err(refresh_error(
-            target.clone(),
-            if invalid_grant {
-                AuthenticationFailureReason::CredentialRejected
-            } else {
-                AuthenticationFailureReason::TokenExchangeFailed
-            },
-            if invalid_grant {
-                "MCP OAuth refresh token was rejected"
-            } else {
-                "MCP OAuth token endpoint rejected the refresh request"
-            },
-            if status.is_server_error() {
-                RefreshFailureDisposition::Indeterminate
-            } else {
-                RefreshFailureDisposition::ReauthorizationRequired
-            },
-        ));
-    }
-    let token: McpTokenResponse = serde_json::from_slice(&body).map_err(|_| {
-        refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ResponseInvalid,
-            "MCP OAuth token response was invalid",
-            RefreshFailureDisposition::Indeterminate,
-        )
-    })?;
-    if token.access_token.expose_secret().is_empty() {
-        return Err(refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ResponseInvalid,
-            "MCP OAuth token response did not include an access token",
-            RefreshFailureDisposition::Indeterminate,
-        ));
-    }
-    let mut next = credential.clone();
-    next.token.access_token = AccessToken::new(token.access_token.expose_secret().to_owned());
-    "Bearer".clone_into(&mut next.token.token_type);
-    if let Some(refresh_token) = token.refresh_token
-        && !refresh_token.expose_secret().is_empty()
-    {
-        next.token.refresh_token =
-            Some(RefreshToken::new(refresh_token.expose_secret().to_owned()));
-    }
-    if let Some(scope) = token.scope {
-        next.token.scopes = scope
-            .split_whitespace()
-            .map(|scope| Scope::new(scope.to_owned()))
-            .collect();
-    }
-    if let Some(seconds) = token.expires_in {
-        next.token.expires_at_ms = Some(
-            now_ms().saturating_add(
-                i64::try_from(seconds)
-                    .unwrap_or(i64::MAX)
-                    .saturating_mul(1000),
-            ),
-        );
-    } else {
-        next.token.expires_at_ms = None;
-    }
-    if next.token.expires_by(now_ms()) {
-        return Err(refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ResponseInvalid,
-            "MCP OAuth refresh produced an expired credential",
-            RefreshFailureDisposition::Indeterminate,
-        ));
-    }
-    Ok(next)
 }
 
 fn pairs_to_json(pairs: &[(&str, &str)]) -> serde_json::Value {
@@ -1144,8 +837,8 @@ mod destination_tests {
     use super::*;
 
     #[test]
-    fn trusted_mcp_origin_accepts_only_rfc1918_and_ula_on_the_exact_origin() {
-        let trusted = Url::parse("https://preview-waltr.example/mcp").expect("trusted URL");
+    fn trusted_host_origin_accepts_only_rfc1918_and_ula_on_the_exact_origin() {
+        let trusted = Url::parse("https://preview-waltr.example/service").expect("trusted URL");
         let token = Url::parse("https://preview-waltr.example/token").expect("token URL");
         let other = Url::parse("https://other.example/token").expect("token URL");
         let other_port = Url::parse("https://preview-waltr.example:444/token").expect("token URL");

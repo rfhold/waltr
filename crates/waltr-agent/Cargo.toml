@@ -4,20 +4,13 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[features]
-default = ["shell"]
-shell = ["dep:tree-sitter", "dep:tree-sitter-bash", "waltr-agent-sandbox/shell"]
-
 [dependencies]
 aws-sdk-s3.workspace = true
-axum.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 http.workspace = true
 httpdate.workspace = true
 jsonwebtoken.workspace = true
-waltr.workspace = true
-mcp.workspace = true
 opendal.workspace = true
 oauth2.workspace = true
 refinery = { workspace = true, features = ["tokio-postgres"] }
@@ -26,17 +19,13 @@ rustls.workspace = true
 scylla.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-postgres.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-tungstenite.workspace = true
 tokio-util.workspace = true
-tonic.workspace = true
 tracing.workspace = true
-tree-sitter = { version = "0.25", optional = true }
-tree-sitter-bash = { version = "0.25", optional = true }
 uuid = { workspace = true, features = ["v7"] }
 webpki-roots.workspace = true
 
@@ -44,9 +33,9 @@ webpki-roots.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+axum.workspace = true
 aws-config.workspace = true
 hyper-util.workspace = true
-waltr-agent-sandbox = { path = "../waltr-agent-sandbox" }
 opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

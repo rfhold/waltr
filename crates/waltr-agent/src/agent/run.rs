@@ -6,17 +6,12 @@ use std::sync::Arc;
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
 
-use crate::PermissionPolicy;
-
 use super::session::{
     AgentRunLimits, EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId,
     SessionRunContext, SessionStore,
 };
 use super::{AgentRuntime, AgentTool, BoxAgentTimelineStream, r#loop::AgentLoopState};
-use crate::middleware::{
-    chain::MiddlewareChain, prompt::SystemPromptOverride,
-    tools::PermissionFilteredToolRegistryMiddleware,
-};
+use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
 
 /// Builder for an agent loop request.
 pub struct AgentRunBuilder<S = MemorySessionStore>
@@ -33,9 +28,30 @@ where
     extra_tools: Vec<AgentTool>,
     cancellation_token: Option<CancellationToken>,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
+    completion_validation: Option<super::completion::CompletionValidation>,
 }
 
 impl AgentRunBuilder {
+    pub(crate) fn resume_with_transient_input<S>(
+        runtime: &AgentRuntime,
+        session_id: SessionId,
+        store: &S,
+        input: crate::TransientInput,
+    ) -> crate::Result<AgentRunBuilder<S>>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        let provider = crate::transient_input::bind_provider(runtime.provider.clone(), input)?;
+        let mut owned = runtime.clone();
+        owned.provider = provider;
+        Ok(AgentRunBuilder::resume(
+            &owned,
+            session_id,
+            store.clone(),
+            ResumeInput::Continue,
+        ))
+    }
+
     pub(super) fn new(runtime: &AgentRuntime, prompt: String) -> Self {
         Self {
             runtime: runtime.clone(),
@@ -48,6 +64,7 @@ impl AgentRunBuilder {
             extra_tools: Vec::new(),
             cancellation_token: None,
             event_sink: None,
+            completion_validation: runtime.completion_validation.clone(),
         }
     }
 
@@ -63,9 +80,7 @@ impl AgentRunBuilder {
         let prompt = match &input {
             ResumeInput::Prompt(prompt) => prompt.clone(),
             ResumeInput::Prompts(prompts) => prompts.last().cloned().unwrap_or_default(),
-            ResumeInput::Continue
-            | ResumeInput::ToolResults(_)
-            | ResumeInput::ExternalResponse { .. } => String::new(),
+            ResumeInput::Continue | ResumeInput::ToolResults(_) => String::new(),
         };
         AgentRunBuilder {
             runtime: runtime.clone(),
@@ -78,6 +93,7 @@ impl AgentRunBuilder {
             extra_tools: Vec::new(),
             cancellation_token: None,
             event_sink: None,
+            completion_validation: runtime.completion_validation.clone(),
         }
     }
 }
@@ -86,6 +102,38 @@ impl<S> AgentRunBuilder<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Bind accounted invocation-local input to an existing durable helper task.
+    /// Empty selections should omit this call to retain ordinary text behavior.
+    ///
+    /// # Errors
+    /// Rejects unsupported providers or an already-bound runtime.
+    pub fn with_transient_input(mut self, input: crate::TransientInput) -> crate::Result<Self> {
+        self.runtime.provider =
+            crate::transient_input::bind_provider(self.runtime.provider, input)?;
+        Ok(self)
+    }
+
+    /// Validate completion proposals before committing output or finishing the session.
+    #[must_use]
+    pub fn with_completion_validation(
+        mut self,
+        validation: super::completion::CompletionValidation,
+    ) -> Self {
+        self.runtime.max_provider_turns = Some(
+            self.runtime
+                .max_provider_turns
+                .map_or(validation.max_turns, |limit| {
+                    limit.min(validation.max_turns)
+                }),
+        );
+        self.completion_validation = Some(validation);
+        self
+    }
+
     /// Add one tool to this run.
     #[must_use]
     pub fn with_tool(mut self, tool: AgentTool) -> Self {
@@ -105,13 +153,6 @@ where
     #[must_use]
     pub fn with_system_prompt_fragment(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt.push_fragment(prompt);
-        self
-    }
-
-    /// Override the permission policy for this run.
-    #[must_use]
-    pub fn with_permission_policy(mut self, policy: PermissionPolicy) -> Self {
-        self.runtime.permission_policy = policy;
         self
     }
 
@@ -165,6 +206,7 @@ where
             extra_tools,
             cancellation_token,
             event_sink,
+            completion_validation,
         } = self;
         AgentRunBuilder {
             runtime,
@@ -177,6 +219,7 @@ where
             extra_tools,
             cancellation_token,
             event_sink,
+            completion_validation,
         }
     }
 
@@ -202,29 +245,25 @@ where
             extra_tools,
             cancellation_token,
             event_sink,
+            completion_validation,
         } = self;
         let AgentRuntime {
+            completion_validation: _,
             provider,
             model,
             model_cost,
             tools,
             middleware_chain: default_chain,
-            permission_policy,
             retry_config,
-            template_base_dir,
             max_provider_turns,
-            sandbox,
+            host_context,
         } = runtime;
 
         let middleware_chain = if extra_tools.is_empty() {
             default_chain
         } else {
             let mut middleware_chain = MiddlewareChain::new();
-            middleware_chain.push(PermissionFilteredToolRegistryMiddleware::new(
-                extra_tools,
-                permission_policy.clone(),
-                true,
-            ));
+            middleware_chain.push(super::host::HostToolRegistry(extra_tools));
             middleware_chain.extend(default_chain);
             middleware_chain
         };
@@ -237,16 +276,15 @@ where
             system_prompt_override: (!system_prompt.is_empty()).then_some(system_prompt),
             tools,
             middleware_chain,
-            permission_policy,
             retry_config,
-            template_base_dir,
             max_provider_turns,
-            sandbox,
+            host_context,
             session_id,
             session_store,
             session_run_context,
             cancellation_token: cancellation_token.unwrap_or_default(),
             event_sink,
+            completion_validation,
         }
     }
 }

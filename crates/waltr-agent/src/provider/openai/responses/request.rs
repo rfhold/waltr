@@ -17,11 +17,33 @@ pub(in crate::provider::openai) fn responses_body(
     prompt_cache_retention: Option<&str>,
     request: &CompletionRequest<'_>,
 ) -> Value {
+    responses_body_with_input(
+        model,
+        reasoning,
+        prompt_cache,
+        prompt_cache_retention,
+        request,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preserves the text-only encoder contract while adding transient input"
+)]
+pub(in crate::provider::openai) fn responses_body_with_input(
+    model: &str,
+    reasoning: Option<&OpenAiReasoningConfig>,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<&str>,
+    request: &CompletionRequest<'_>,
+    input: Option<&crate::TransientInput>,
+) -> Value {
     let mut body = json!({
         "model": model,
         "store": false,
         "stream": true,
-        "input": responses_input(request),
+        "input": responses_input_with_attachments(request, input),
         "tools": responses_tools(&request.tools),
         // With store:false, reasoning items can only be replayed when they
         // carry encrypted content, so always ask for it: reasoning models emit
@@ -43,16 +65,34 @@ pub(in crate::provider::openai) fn responses_body(
     body
 }
 
+#[cfg(test)]
 pub(super) fn responses_input(request: &CompletionRequest<'_>) -> Value {
+    responses_input_with_attachments(request, None)
+}
+
+pub(super) fn responses_input_with_attachments(
+    request: &CompletionRequest<'_>,
+    attachments: Option<&crate::TransientInput>,
+) -> Value {
     let mut input = Vec::new();
+    let mut prompt_index = 0usize;
 
     for item in request.replay_items() {
         match item {
-            CompletionReplayItem::Prompt(prompt) => input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": prompt }]
-            })),
+            CompletionReplayItem::Prompt(prompt) => {
+                let mut content = attachments
+                    .filter(|input| input.matches_prompt(prompt_index))
+                    .map_or_else(Vec::new, |input| {
+                        input.content(crate::TransientInputApi::OpenAiResponses)
+                    });
+                content.push(json!({"type": "input_text", "text": prompt}));
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": content
+                }));
+                prompt_index += 1;
+            }
             CompletionReplayItem::Turn(item) => match item {
                 TurnItem::AssistantText(text) => input.push(responses_assistant_text(text)),
                 TurnItem::Thinking(block)

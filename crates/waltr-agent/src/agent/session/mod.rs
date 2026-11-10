@@ -2,7 +2,7 @@
 
 mod capture;
 mod compat;
-mod compression;
+mod context;
 mod control;
 mod coordinator;
 mod copy;
@@ -10,7 +10,9 @@ mod create;
 mod list;
 mod mask;
 mod materialize;
+mod metadata;
 mod progress;
+mod revision;
 mod projection;
 mod run;
 mod runtime;
@@ -21,10 +23,15 @@ mod types;
 mod watch;
 
 pub use capture::{CompletedSessionCapture, SessionCaptureError, SessionCaptureLimits};
+pub use metadata::{ItemMetadata, MetadataError, MetadataTarget, MetadataPredicate, MetadataUpdate,
+    SessionMutation, SessionMutationOutcome, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES,
+    MAX_METADATA_KEYS, MAX_METADATA_ITEMS, MAX_METADATA_MUTATION_ENTRIES, MAX_METADATA_BYTES,
+    MAX_SESSION_MUTATION_BYTES};
 pub use compat::EphemeralSessionRun;
+pub use context::{ContextIdentity, SessionContextCapture};
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) use control::{SessionControl, SessionOperation, SessionRunContext};
-pub use coordinator::{McpAppError, McpAppHandle, SessionCoordinator, SessionMcpApp};
+pub use coordinator::{IdleHostEffectError, SessionCoordinator};
 pub use copy::{SessionCopy, SessionCopyError};
 pub use create::{
     SessionCreateRequest, SessionStart, SessionStartMessage, SessionStartMessageError,
@@ -44,16 +51,17 @@ pub use progress::{
     SessionCapabilities, SessionProgress, SessionProgressPhase, SessionPromptDisposition,
     SessionRunStage,
 };
+pub use revision::{ExecutionSequence, ExecutionToken, SessionCommitReceipt, TimelineAppendReceipt};
 pub use projection::{
     SessionSyntheticTimelineEvent, SessionTimelineMode, SessionTimelinePage,
     SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
 };
 pub use run::{
-    AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
-    AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
-    AgentSessionRuntimeError, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
-    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, RunConflictPolicy,
-    SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
+    AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunCancellation,
+    AgentSessionRunDisposition, AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput,
+    AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntimeError,
+    MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES, MAX_SESSION_COORDINATION_REASON_CODE_BYTES,
+    RunConflictPolicy, SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
     SessionCompletionCoordinationPreparation, SessionCoordinationPhase, SessionCoordinationReason,
     SessionCoordinationReasonError, SessionCoordinationState, SessionPauseError, SessionPauseId,
     SessionPauseLease,
@@ -62,12 +70,10 @@ pub(super) use run::{RunOutcomeSender, RunResult};
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};
 pub use runtime_factory::{
     AgentRuntimeProvider, AgentSessionRuntimeFactory, CredentialRefreshCoordinator,
-    CredentialRefreshError, McpConnectionKind, McpConnectionResolveFuture,
-    McpConnectionResolveRequest, McpResolvedConnection, RefreshMode,
+    CredentialRefreshError, RefreshMode,
 };
 pub use settings::{
     CredentialStore, FileCredentialStore, InferenceProviderSettings, InferenceSettings,
-    McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod,
     OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext, OAuthCredentialRecord,
     OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
     OAuthTokenSet, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
@@ -80,8 +86,7 @@ pub use storage::{
     opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use types::{
-    AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
-    ExternalRequestStatus, ExternalResponse, MetadataSetCondition, MetadataSetOutcome, PendingWork,
+    AgentSession, CancelReason, MetadataSetCondition, MetadataSetOutcome, PendingWork,
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, SandboxDispatch, SessionId,
     SessionJournalEvent, SessionMetrics, SessionRecord, SessionRollbackTarget, SessionSnapshot,
     SessionStatus, SessionSummary, Suspension,
@@ -91,3 +96,8 @@ pub use watch::{
     SessionTimelineEvent, SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
     SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
 };
+
+#[cfg(test)]
+fn opaque_test_configuration(name: &str, sources: Vec<String>) -> serde_json::Value {
+    serde_json::json!({"name": name, "sources": sources})
+}

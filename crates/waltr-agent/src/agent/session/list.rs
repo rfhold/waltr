@@ -246,19 +246,13 @@ impl SessionListBroadcaster {
         let summary = match entry.summary.as_ref() {
             None => summary,
             Some(current) => {
-                let mut merged = if summary.revision >= current.revision {
-                    summary.clone()
-                } else {
-                    (**current).clone()
-                };
-                merged.metadata_values.clone_from(&summary.metadata_values);
-                merged
-                    .inference_settings
-                    .clone_from(&summary.inference_settings);
-                merged.agent_name.clone_from(&summary.agent_name);
+                if summary.revision < current.revision {
+                    return;
+                }
+                let mut merged = summary;
                 merged.set_coordination(current.coordination.clone());
-                merged.updated_at = merged.updated_at.max(summary.updated_at);
-                merged.last_activity_at = merged.last_activity_at.max(summary.last_activity_at);
+                merged.updated_at = merged.updated_at.max(current.updated_at);
+                merged.last_activity_at = merged.last_activity_at.max(current.last_activity_at);
                 merged
             }
         };
@@ -288,16 +282,18 @@ impl SessionListBroadcaster {
             summary.status = retained.status.clone();
             summary.current_prompt.clone_from(&retained.current_prompt);
             summary.metrics.clone_from(&retained.metrics);
+            summary
+                .metadata_values
+                .clone_from(&retained.metadata_values);
+            summary
+                .host_configuration
+                .clone_from(&retained.host_configuration);
+            summary
+                .inference_settings
+                .clone_from(&retained.inference_settings);
         }
         summary.updated_at = summary.updated_at.max(retained.updated_at);
         summary.last_activity_at = summary.last_activity_at.max(retained.last_activity_at);
-        summary
-            .metadata_values
-            .clone_from(&retained.metadata_values);
-        summary
-            .inference_settings
-            .clone_from(&retained.inference_settings);
-        summary.agent_name.clone_from(&retained.agent_name);
         summary.set_coordination(retained.coordination.clone());
         retained.as_mut().clone_from(&summary);
         self.publish_update(&mut state, SessionListEvent::Upsert(summary));
@@ -446,12 +442,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_and_run_fields_merge_by_owner_revision_and_monotonic_time() {
+    async fn committed_receipts_merge_by_revision_and_monotonic_time() {
         let sessions = SessionListBroadcaster::new();
         let mut watch = sessions.subscribe();
         let mut retained = summary("merge", "host");
         retained.revision = Revision::new(2);
         retained.current_prompt = Some("retained".to_owned());
+        retained.host_configuration = Some(json!({"selected": "host-owned"}));
         retained.inference_settings = Some(crate::InferenceSettings {
             provider: crate::InferenceProviderSettings {
                 key: "provider".to_owned(),
@@ -464,7 +461,6 @@ mod tests {
                 reasoning_effort: None,
             },
         });
-        retained.agent_name = Some("selected".to_owned());
         let incarnation = publish_created(&sessions, retained.clone());
 
         let mut lower = retained.clone();
@@ -474,8 +470,8 @@ mod tests {
         let mut equal = retained.clone();
         equal.current_prompt = Some("regression".to_owned());
         equal.metadata_values.clear();
+        equal.host_configuration = None;
         equal.inference_settings = None;
-        equal.agent_name = None;
         sessions.publish_run_summary(incarnation, equal);
 
         let mut newer = retained.clone();
@@ -485,10 +481,13 @@ mod tests {
         newer.metrics.total_tokens = 42;
         newer.updated_at = SystemTime::UNIX_EPOCH;
         newer.last_activity_at = SystemTime::UNIX_EPOCH;
-        newer.metadata_values.clear();
+        newer
+            .metadata_values
+            .insert("host.key".into(), json!("committed"));
+        newer.host_configuration = None;
         newer.inference_settings = None;
-        newer.agent_name = None;
         sessions.publish_run_summary(incarnation, newer);
+        sessions.publish_host_summary(incarnation, retained.clone());
 
         let created = next_event(&mut watch).await;
         let equal = next_event(&mut watch).await;
@@ -508,9 +507,10 @@ mod tests {
         assert_eq!(newer.metrics.total_tokens, 42);
         assert_eq!(newer.updated_at, equal.updated_at);
         assert_eq!(newer.last_activity_at, equal.last_activity_at);
-        assert_eq!(newer.metadata_values["host.key"], json!("host"));
-        assert!(newer.inference_settings.is_some());
-        assert_eq!(newer.agent_name.as_deref(), Some("selected"));
+        assert_eq!(newer.metadata_values["host.key"], json!("committed"));
+        assert!(newer.inference_settings.is_none());
+        assert_eq!(equal.host_configuration, retained.host_configuration);
+        assert_eq!(newer.host_configuration, None);
         assert!(
             tokio::time::timeout(Duration::from_millis(25), watch.next())
                 .await
@@ -564,7 +564,6 @@ mod tests {
             summary.capabilities.prompt_disposition,
             crate::SessionPromptDisposition::Queued
         );
-        assert!(!summary.capabilities.can_respond_external_request);
         assert!(!summary.capabilities.can_interrupt);
     }
 

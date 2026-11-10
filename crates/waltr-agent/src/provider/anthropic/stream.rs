@@ -4,14 +4,20 @@ use tracing::Instrument as _;
 use crate::{BoxCompletionStream, CompletionEvent, CompletionRequest, LlmError, Result};
 
 use super::{
-    AnthropicMessages, PROVIDER,
-    parser::AnthropicParser,
-    request::{MessagesRequestOptions, messages_request},
+    AnthropicMessages, PROVIDER, parser::AnthropicParser, request::MessagesRequestOptions,
 };
 
 pub(super) async fn send_request(
     provider: &AnthropicMessages,
     request: CompletionRequest<'_>,
+) -> Result<BoxCompletionStream> {
+    send_request_with_input(provider, request, None).await
+}
+
+pub(super) async fn send_request_with_input(
+    provider: &AnthropicMessages,
+    request: CompletionRequest<'_>,
+    input: Option<&crate::TransientInput>,
 ) -> Result<BoxCompletionStream> {
     // Must stay in lockstep with `LlmStream::project_request`: the journaled
     // projection is the exact payload sent here.
@@ -20,20 +26,32 @@ pub(super) async fn send_request(
         &provider.messages_url,
         &provider.model,
     );
-    let mut request_builder = provider
+    let body = super::request::messages_request_with_input(
+        &provider.model,
+        provider.max_tokens,
+        provider.thinking.as_ref(),
+        MessagesRequestOptions::new(
+            provider.prompt_cache,
+            provider.oauth_billing_version.as_deref(),
+        ),
+        &request,
+        input,
+    );
+    if let Some(input) = input {
+        input.check_body(&body)?;
+    }
+    let builder = provider
         .client
         .post(&provider.messages_url)
-        .header("anthropic-version", "2023-06-01")
-        .json(&messages_request(
-            &provider.model,
-            provider.max_tokens,
-            provider.thinking.as_ref(),
-            MessagesRequestOptions::new(
-                provider.prompt_cache,
-                provider.oauth_billing_version.as_deref(),
-            ),
-            &request,
-        ));
+        .header("anthropic-version", "2023-06-01");
+    let mut request_builder = if input.is_some() {
+        builder
+            .header("content-type", "application/json")
+            .body(crate::transient_input::encode_body(&body)?)
+    } else {
+        builder.json(&body)
+    };
+    drop(body);
     for (name, value) in &provider.headers {
         request_builder = request_builder.header(name.as_str(), value);
     }
@@ -75,7 +93,7 @@ pub(super) async fn send_request(
         event_count = tracing::field::Empty,
     );
 
-    Ok(completion_stream(
+    Ok(completion_stream_with_policy(
         response.bytes_stream(),
         AnthropicParser::new(
             super::ANTHROPIC_MESSAGES_NAME,
@@ -83,6 +101,7 @@ pub(super) async fn send_request(
             &provider.model,
         ),
         stream_span,
+        input.is_some(),
     ))
 }
 
@@ -99,17 +118,17 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String
 }
 
 #[allow(clippy::too_many_lines)]
-fn completion_stream<S, B>(
+fn completion_stream_with_policy<S, B>(
     bytes_stream: S,
     parser: AnthropicParser,
     stream_span: tracing::Span,
+    transient: bool,
 ) -> BoxCompletionStream
 where
     S: Stream<Item = std::result::Result<B, reqwest::Error>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
 {
-    // Parser progress is intentionally not persisted: crash recovery retries
-    // the whole turn from the journaled request record.
+    // Transient requests cannot recover payloads from the journal after restart.
     let bytes_stream = Box::pin(bytes_stream);
     Box::pin(futures_stream::unfold(
         (
@@ -121,7 +140,7 @@ where
             0_u64,
             0_u64,
         ),
-        |(
+        move |(
             mut bytes_stream,
             mut buffer,
             mut parser,
@@ -163,6 +182,11 @@ where
                         }
                         Ok(None) => continue,
                         Err(error) => {
+                            let error = if transient {
+                                crate::transient_input::sanitize_error(error)
+                            } else {
+                                error
+                            };
                             record_stream_error(&stream_span, &error, chunk_count, event_count);
                             return Some((
                                 Err(error),
@@ -238,6 +262,11 @@ where
                                 return None;
                             }
                             Err(error) => {
+                                let error = if transient {
+                                    crate::transient_input::sanitize_error(error)
+                                } else {
+                                    error
+                                };
                                 record_stream_error(&stream_span, &error, chunk_count, event_count);
                                 return Some((
                                     Err(error),

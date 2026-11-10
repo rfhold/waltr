@@ -2,11 +2,15 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{LlmStream, ModelCost, ModelRef, PermissionPolicy, middleware::chain::MiddlewareChain};
+use crate::{LlmStream, ModelCost, ModelRef, middleware::chain::MiddlewareChain};
 
 mod builder;
+pub mod completion;
 mod event;
+pub(crate) mod host;
+mod host_effect;
 mod r#loop;
+pub mod owned_runs;
 mod retry;
 mod run;
 pub mod session;
@@ -14,67 +18,84 @@ mod tool;
 
 pub use builder::AgentRuntimeBuilder;
 pub use event::{
-    BoxAgentTimelineStream, SessionCompletionAdmissionFinalizer, SessionCompletionAdmissionHandler,
-    SessionCompletionFinalizationFuture, SessionCompletionPreparation,
-    SessionCompletionPreparationFuture, SessionCompletionWorkerFuture, SessionEvent,
-    SessionEventSink, SessionEventSinkFuture, SessionRunCompletionSnapshot,
+    BoxAgentTimelineStream, SemanticSessionEventSink, SessionCompletionAdmissionFinalizer,
+    SessionCompletionAdmissionHandler, SessionCompletionFinalizationFuture,
+    SessionCompletionPreparation, SessionCompletionPreparationFuture,
+    SessionCompletionWorkerFuture, SessionEvent, SessionEventSink, SessionEventSinkFuture,
+    SessionRunCompletionSnapshot, SessionSemanticEvent, SessionSemanticHub, SessionSemanticKind,
+    SessionSemanticSubscription,
+};
+pub use host::{
+    AgentHostContext, AgentHostRuntimeFactory, HostConfigurationUpdate, HostContext,
+    HostContextFuture, HostContextState, HostEffectExecutor, HostEffectFuture, HostEffectResult,
+    HostPromptFuture, HostPromptRender, HostRequest, HostRuntimeFuture, HostRuntimeRetireFuture,
+    HostSearchFuture,
 };
 pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
     ActiveSessionMask, AgentRunLimits, AgentRuntimeProvider, AgentSession,
-    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
-    AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
-    AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeFactory, CancelReason,
-    CompletedSessionCapture, CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore,
-    ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, FileCredentialStore, FilesystemSessionStore, InferenceProviderSettings,
-    InferenceSettings, MAX_ACTIVE_SESSION_MASKS, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
+    AgentSessionActiveRunState, AgentSessionRunCancellation, AgentSessionRunDisposition,
+    AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome,
+    AgentSessionRunSubmission, AgentSessionRuntime, AgentSessionRuntimeError,
+    AgentSessionRuntimeFactory, CancelReason, CompletedSessionCapture, ContextIdentity,
+    CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore, FileCredentialStore,
+    FilesystemSessionStore, IdleHostEffectError, InferenceProviderSettings, InferenceSettings,
+    MAX_ACTIVE_SESSION_MASKS, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
     MAX_SESSION_COORDINATION_REASON_CODE_BYTES, MAX_SESSION_MASK_KEY_BYTES,
-    MAX_SESSION_MASK_MUTATION_ITEMS, MAX_SESSION_MASK_REPLACEMENT_BYTES, McpAppError, McpAppHandle,
-    McpConnectionKind, McpConnectionResolveFuture, McpConnectionResolveRequest, McpOAuthContext,
-    McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, McpResolvedConnection,
-    MemorySessionStore, MetadataSetCondition, MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION,
-    OAuthCredential, OAuthCredentialContext, OAuthCredentialRecord, OAuthCredentialStore,
+    MAX_SESSION_MASK_MUTATION_ITEMS, MAX_SESSION_MASK_REPLACEMENT_BYTES, MemorySessionStore,
+    MetadataSetCondition, MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION, OAuthCredential,
+    OAuthCredentialContext, OAuthCredentialRecord, OAuthCredentialStore,
     OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
     OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, ReplacementUserContent,
-    RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput,
+    RequestId, RequestRecord, ResumeInput, Revision, ExecutionSequence, ExecutionToken,
+    SessionCommitReceipt, TimelineAppendReceipt, RunConflictPolicy, RuntimeResumeOutput,
     S3SessionStore, S3SessionWriteMode, SandboxDispatch, ScyllaSessionStore, SessionCapabilities,
     SessionCaptureError, SessionCaptureLimits, SessionCompletionCoordinationFuture,
     SessionCompletionCoordinationHandler, SessionCompletionCoordinationPreparation,
-    SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
+    SessionContextCapture, SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
     SessionCoordinationReasonError, SessionCoordinationState, SessionCoordinator, SessionCopy,
     SessionCopyError, SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent,
     SessionListSubscription, SessionListUpdate, SessionMask, SessionMaskAddition, SessionMaskError,
     SessionMaskId, SessionMaskMutation, SessionMaskMutationOutcome, SessionMaskSubtraction,
-    SessionMaterializedContext, SessionMcpApp, SessionMetrics, SessionOAuthJwtMetadata,
-    SessionOAuthJwtToken, SessionOAuthProviderSettings, SessionOAuthTokenField,
-    SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle, SessionPauseError, SessionPauseId,
-    SessionPauseLease, SessionProgress, SessionProgressPhase, SessionPromptDisposition,
-    SessionRecord, SessionRunStage, SessionSnapshot, SessionStart, SessionStartMessage,
-    SessionStartMessageError, SessionStatus, SessionStore, SessionStoreError, SessionStoreResult,
-    SessionSummary, SessionSyntheticTimelineEvent, SessionTimelineEvent, SessionTimelineMode,
-    SessionTimelinePage, SessionTimelinePresentation, SessionTimelineProjectedEvent,
-    SessionTimelineProjectionEvent, SessionTimelineProjectionSubscription,
-    SessionTimelineProjectionUpdate, SessionTimelineProjectionUpdateEvent,
-    SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential, Suspension,
-    ThroughCursor, opendal_postgresql_session_store, run_postgresql_migrations,
+    SessionMaterializedContext, SessionMetrics, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
+    SessionOAuthProviderSettings, SessionOAuthTokenField, SessionOAuthTokenFieldTarget,
+    SessionOAuthTokenRequestStyle, SessionPauseError, SessionPauseId, SessionPauseLease,
+    SessionProgress, SessionProgressPhase, SessionPromptDisposition, SessionRecord,
+    SessionRunStage, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
+    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
+    SessionSyntheticTimelineEvent, SessionTimelineEvent, SessionTimelineMode, SessionTimelinePage,
+    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
+    SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
+    StoredCredential, Suspension, ThroughCursor,
+    opendal_postgresql_session_store, run_postgresql_migrations,
+    ItemMetadata, MetadataError, MetadataTarget, MetadataPredicate, MetadataUpdate,
+    SessionMutation, SessionMutationOutcome, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES,
+    MAX_METADATA_KEYS, MAX_METADATA_ITEMS, MAX_METADATA_MUTATION_ENTRIES, MAX_METADATA_BYTES,
+    MAX_SESSION_MUTATION_BYTES,
 };
-pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
+pub use tool::{
+    AgentTool, HostDispatchBinding, ToolExecutionContext, ToolFuture, ToolGuardFuture,
+    ToolProgressSink, ToolResultMetadata,
+};
+#[cfg(test)]
+mod host_contract_tests;
+#[cfg(test)]
+mod host_dispatch_tests;
 
 /// Executable agent runtime configuration and enabled capabilities.
 #[derive(Clone)]
 pub struct AgentRuntime {
+    pub(super) completion_validation: Option<completion::CompletionValidation>,
     pub(super) provider: Arc<dyn LlmStream>,
     pub(super) model: ModelRef,
     pub(super) model_cost: Option<ModelCost>,
     pub(super) tools: Vec<AgentTool>,
     pub(super) middleware_chain: MiddlewareChain,
-    pub(super) permission_policy: PermissionPolicy,
     pub(super) retry_config: ProviderRetryConfig,
-    pub(super) template_base_dir: Option<std::path::PathBuf>,
     pub(super) max_provider_turns: Option<u64>,
-    pub(super) sandbox: Option<crate::sandbox_gateway::SandboxHandle>,
+    host_context: Option<Arc<dyn crate::AgentHostContext>>,
 }
 
 impl AgentRuntime {
@@ -110,8 +131,54 @@ impl AgentRuntime {
         &self.tools
     }
 
-    pub(crate) const fn middleware_chain(&self) -> &MiddlewareChain {
-        &self.middleware_chain
+    /// Revalidate trusted host authority before initial/resume input, tool middleware and dispatch.
+    /// This only narrows execution; it grants no permission or consent.
+    #[must_use]
+    pub fn with_tool_execution_guard<F>(mut self, guard: F) -> Self
+    where
+        F: Fn(tokio_util::sync::CancellationToken) -> ToolGuardFuture + Send + Sync + 'static,
+    {
+        let guard: Arc<tool::HostExecutionGuard> = Arc::new(guard);
+        for tool in &mut self.tools {
+            let previous = tool.execution_guard.take();
+            let guard = guard.clone();
+            if previous.is_none() {
+                tool.execution_guard = Some(guard);
+                continue;
+            }
+            tool.execution_guard = Some(Arc::new(move |cancellation| {
+                let previous = previous.clone();
+                let guard = guard.clone();
+                Box::pin(async move {
+                    if let Some(previous) = previous {
+                        previous(cancellation.clone()).await?;
+                    }
+                    guard(cancellation).await
+                })
+            }));
+        }
+        self
+    }
+
+    /// Add invocation-local host tools through the ordinary tool lifecycle.
+    /// Duplicate names are rejected; these tools still use the ordinary tool lifecycle.
+    pub fn with_helper_tools(mut self, tools: Vec<AgentTool>) -> Result<Self, &'static str> {
+        let mut names: std::collections::BTreeSet<_> = self
+            .tools
+            .iter()
+            .map(|tool| tool.definition().name.clone())
+            .collect();
+        for tool in &tools {
+            if !names.insert(tool.definition().name.clone()) {
+                return Err("duplicate helper tool name");
+            }
+        }
+        let mut chain = crate::middleware::chain::MiddlewareChain::new();
+        chain.push(host::HostToolRegistry(tools.clone()));
+        chain.extend(self.middleware_chain);
+        self.middleware_chain = chain;
+        self.tools.extend(tools);
+        Ok(self)
     }
 }
 
@@ -125,7 +192,6 @@ impl fmt::Debug for AgentRuntime {
             .field("model_cost", &self.model_cost)
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())
-            .field("permission_policy", &self.permission_policy)
             .finish()
     }
 }
@@ -136,22 +202,19 @@ mod tests {
 
     use crate::{
         AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
-        CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
-        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent, SessionRecord,
-        SessionStatus, SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent,
-        TimelineEventKind, TimelineQuery, ToolCall,
+        CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, MemorySessionStore, ModelApi,
+        ModelRef, ProviderId, ResumeInput, Revision, SessionCreateRequest, SessionId,
+        SessionJournalEvent, SessionListEvent, SessionRecord, SessionStatus, SessionStore,
+        SessionTimelineEvent, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery,
+        ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
             context::{MiddlewareStateAccess, ModelRequestDraft, RequestContext},
         },
-        tools::{
-            filesystem::FilesystemConfig,
-            question::{QUESTION_TOOL_NAME, QuestionConfig},
-        },
     };
     use futures_util::{StreamExt, stream};
+    const QUESTION_TOOL_NAME: &str = "fake_question";
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -245,10 +308,10 @@ mod tests {
         fn append_timeline(
             &self,
             id: &crate::SessionId,
-            expected_revision: crate::Revision,
+            expected_revision: crate::ExecutionToken,
             events: Vec<crate::PendingTimelineEvent>,
         ) -> impl std::future::Future<
-            Output = crate::SessionStoreResult<Vec<crate::AgentTimelineEvent>>,
+            Output = crate::SessionStoreResult<crate::TimelineAppendReceipt>,
         > + Send {
             self.inner.append_timeline(id, expected_revision, events)
         }
@@ -256,10 +319,11 @@ mod tests {
         fn append_journal(
             &self,
             id: &crate::SessionId,
-            expected_revision: crate::Revision,
+            expected_revision: crate::ExecutionToken,
             events: Vec<crate::SessionJournalEvent>,
-        ) -> impl std::future::Future<Output = crate::SessionStoreResult<crate::Revision>> + Send
-        {
+        ) -> impl std::future::Future<
+            Output = crate::SessionStoreResult<crate::SessionCommitReceipt>,
+        > + Send {
             let inner = self.inner.clone();
             let id = id.clone();
             let fail = Arc::clone(&self.fail_next_load);
@@ -275,14 +339,14 @@ mod tests {
             }
         }
 
-        fn mutate_masks(
+        fn mutate(
             &self,
             id: &crate::SessionId,
-            mutation: crate::SessionMaskMutation,
+            mutation: crate::SessionMutation,
         ) -> impl std::future::Future<
-            Output = crate::SessionStoreResult<crate::SessionMaskMutationOutcome>,
+            Output = crate::SessionStoreResult<crate::SessionMutationOutcome>,
         > + Send {
-            self.inner.mutate_masks(id, mutation)
+            self.inner.mutate(id, mutation)
         }
 
         fn set_metadata_value_conditionally(
@@ -318,7 +382,7 @@ mod tests {
         fn set_agent_definition(
             &self,
             id: &crate::SessionId,
-            agent_definition: Option<crate::AgentDefinitionBundle>,
+            agent_definition: Option<serde_json::Value>,
         ) -> impl std::future::Future<Output = crate::SessionStoreResult<SessionRecord>> + Send
         {
             self.inner.set_agent_definition(id, agent_definition)
@@ -385,7 +449,7 @@ mod tests {
 
         let agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider)).build();
 
-        assert_eq!(agent.middleware_chain.len(), 3);
+        assert_eq!(agent.middleware_chain.len(), 2);
     }
 
     #[test]
@@ -401,12 +465,12 @@ mod tests {
             .with_middleware_chain(chain)
             .build();
 
-        assert_eq!(agent.middleware_chain.len(), 4);
-        assert_eq!(chain_agent.middleware_chain.len(), 4);
+        assert_eq!(agent.middleware_chain.len(), 3);
+        assert_eq!(chain_agent.middleware_chain.len(), 3);
     }
 
     #[test]
-    fn filesystem_tools_are_opt_in() {
+    fn host_tools_are_opt_in() {
         let model = ModelRef::new(ProviderId::OpenAi, "gpt-5-nano", ModelApi::OpenAiResponses);
 
         assert!(
@@ -417,12 +481,18 @@ mod tests {
         );
         assert!(
             AgentRuntime::builder(model, Arc::new(TextOnlyProvider))
-                .with_sandbox(crate::sandbox_gateway::SandboxGateway::new("test".into()).handle())
-                .with_filesystem_tools(FilesystemConfig::new("."))
+                .with_tool(crate::AgentTool::new(
+                    crate::ToolDefinition::new(
+                        "host_effect",
+                        "host effect",
+                        serde_json::json!({"type":"object"})
+                    ),
+                    |context| Ok(context.result("host result")),
+                ))
                 .build()
                 .tools()
                 .iter()
-                .any(|tool| tool.definition().name == "apply_patch")
+                .any(|tool| tool.definition().name == "host_effect")
         );
     }
 
@@ -430,6 +500,29 @@ mod tests {
     struct DurableResumeProvider {
         requests: Mutex<usize>,
         saw_resumed_tool_result: Mutex<bool>,
+    }
+
+    #[tokio::test]
+    async fn neutral_tool_result_is_retained_for_the_next_provider_request() {
+        let provider = Arc::new(DurableResumeProvider::default());
+        let runtime = AgentRuntime::builder(
+            ModelRef::new(ProviderId::OpenAi, "test", ModelApi::OpenAiResponses),
+            provider.clone(),
+        )
+        .with_tool(crate::AgentTool::new(
+            crate::ToolDefinition::new(QUESTION_TOOL_NAME, "fake", json!({"type":"object"})),
+            |ctx| Ok(ctx.result("resume-answer-123")),
+        ))
+        .build();
+        runtime
+            .prompt("fake tool")
+            .stream()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert!(*provider.saw_resumed_tool_result.lock().unwrap());
     }
 
     impl crate::LlmStream for DurableResumeProvider {
@@ -600,7 +693,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "original question".to_owned(),
                 }],
@@ -610,7 +703,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::new(1),
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![
                     crate::PendingTimelineEvent::user_text_snapshot(
                         id.clone(),
@@ -631,7 +724,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::new(2),
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![SessionJournalEvent::TurnFinished { turn: 0 }],
             )
             .await
@@ -923,78 +1016,6 @@ mod tests {
             Some(&json!({ "writes": 1 }))
         );
         assert_eq!(*observed.lock().expect("observed state lock"), vec![None]);
-    }
-
-    #[tokio::test]
-    async fn middleware_state_written_before_suspension_is_observable_after_resume() {
-        let store = MemorySessionStore::new();
-        let provider = Arc::new(DurableResumeProvider::default());
-        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
-        let written = json!({ "grants": ["shell"] });
-
-        let writer_observed = Arc::new(Mutex::new(Vec::new()));
-        let writer_agent = AgentRuntime::builder(model.clone(), Arc::clone(&provider))
-            .with_question_tool(QuestionConfig::new())
-            .with_middleware(StateRecordingMiddleware {
-                namespace: "permissions",
-                write: Some(written.clone()),
-                observed: Arc::clone(&writer_observed),
-            })
-            .build();
-        let sessions = SessionCoordinator::new(store.clone());
-        let session_id = sessions
-            .create(SessionCreateRequest::new(SessionId::generate()))
-            .await
-            .expect("created session")
-            .id()
-            .clone();
-
-        let mut events = sessions
-            .prompt(&writer_agent, session_id.clone(), "ask then continue")
-            .stream();
-        let mut request_id = None;
-        while let Some(event) = events.next().await {
-            if let TimelineContent::ExternalRequest { request } =
-                event.expect("agent event").content
-            {
-                request_id = Some(request.id.as_str().to_owned());
-            }
-        }
-        drop(events);
-        let request_id = request_id.expect("question request");
-        assert_eq!(
-            *writer_observed.lock().expect("observed state lock"),
-            vec![None]
-        );
-
-        let reader_observed = Arc::new(Mutex::new(Vec::new()));
-        let reader_agent = AgentRuntime::builder(model, Arc::clone(&provider))
-            .with_question_tool(QuestionConfig::new())
-            .with_middleware(StateRecordingMiddleware {
-                namespace: "permissions",
-                write: None,
-                observed: Arc::clone(&reader_observed),
-            })
-            .build();
-        drain(
-            SessionCoordinator::new(store.clone())
-                .resume(
-                    &reader_agent,
-                    session_id,
-                    ResumeInput::ExternalResponse {
-                        request_id: ExternalRequestId::new(request_id),
-                        response: ExternalResponse::new(json!("resume-answer-123")),
-                    },
-                )
-                .stream(),
-        )
-        .await;
-
-        assert_eq!(
-            *reader_observed.lock().expect("observed state lock"),
-            vec![Some(written)],
-            "resumed run must observe state written before suspension"
-        );
     }
 
     async fn drain<S>(mut stream: S)

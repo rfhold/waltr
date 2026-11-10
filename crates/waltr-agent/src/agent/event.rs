@@ -20,6 +20,8 @@ pub enum SessionEvent {
         id: String,
         /// Session receiving the message.
         session_id: SessionId,
+        /// Durable session incarnation at the append.
+        incarnation: Option<String>,
         /// Zero-based durable prompt index.
         prompt_index: u64,
         /// One-based durable user-message count.
@@ -43,6 +45,157 @@ pub type SessionEventSinkFuture =
 pub trait SessionEventSink: Send + Sync {
     /// Deliver one event. Delivery failure never changes the source session operation.
     fn send(&self, event: SessionEvent) -> SessionEventSinkFuture;
+    /// Best-effort nonblocking post-commit semantic notification. Never replayed on hydration.
+    fn semantic(&self, _event: SessionSemanticEvent) {}
+}
+
+/// Durable live facts, distinct from provider progress and preview text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSemanticKind {
+    /// A live run committed its terminal finished journal entry.
+    RunFinished,
+    /// A live journal transaction committed a completed provider turn.
+    TurnCompleted {
+        /// Completed provider turn ordinal.
+        turn: u64,
+    },
+    /// A tool result committed. This does not assert that an asynchronous task completed.
+    ToolResultCommitted {
+        /// Durable tool-call identity.
+        call_id: String,
+        /// Effective tool name, not provider preview text.
+        tool_name: String,
+        /// Whether the result reports an execution error.
+        succeeded: bool,
+    },
+}
+
+/// Bounded semantic notification with no model output or tool-result payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSemanticEvent {
+    /// Deterministic live-commit identity within this session incarnation.
+    pub id: String,
+    /// Owning source session.
+    pub session_id: SessionId,
+    /// Durable incarnation, absent only in legacy source records.
+    pub incarnation: Option<String>,
+    /// Committed journal revision.
+    pub revision: crate::Revision,
+    /// Last durable timeline boundary at the commit.
+    pub cursor: Option<TimelineCursor>,
+    /// Typed committed fact.
+    pub kind: SessionSemanticKind,
+}
+
+/// Bounded live-only semantic fanout. Lost events are explicit; there is no backfill.
+#[derive(Debug)]
+pub struct SessionSemanticHub {
+    sender: tokio::sync::broadcast::Sender<SessionSemanticEvent>,
+    subscribers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SessionSemanticHub {
+    /// Create a live event ring of 1..=1024 events with at most 32 subscribers.
+    ///
+    /// # Errors
+    /// Rejects zero or unbounded capacities.
+    pub fn new(capacity: usize) -> std::result::Result<Self, &'static str> {
+        if !(1..=1024).contains(&capacity) {
+            return Err("semantic event capacity must be 1..=1024");
+        }
+        let (sender, _) = tokio::sync::broadcast::channel(capacity);
+        Ok(Self {
+            sender,
+            subscribers: std::sync::Arc::default(),
+        })
+    }
+
+    /// Subscribe without historical replay.
+    ///
+    /// # Errors
+    /// Rejects the 33rd concurrent subscriber.
+    pub fn subscribe(&self) -> std::result::Result<SessionSemanticSubscription, &'static str> {
+        use std::sync::atomic::Ordering;
+        self.subscribers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 32).then_some(count + 1)
+            })
+            .map_err(|_| "semantic subscriber capacity reached")?;
+        Ok(SessionSemanticSubscription {
+            receiver: self.sender.subscribe(),
+            subscribers: self.subscribers.clone(),
+        })
+    }
+
+    /// Enqueue one bounded notification without awaiting consumers.
+    ///
+    /// # Errors
+    /// Rejects oversized identities rather than silently dropping an invalid notification.
+    pub fn publish(&self, event: SessionSemanticEvent) -> std::result::Result<(), &'static str> {
+        let bounded = event.id.len() <= 512
+            && event.session_id.as_str().len() <= 256
+            && event.incarnation.as_ref().is_none_or(|id| id.len() <= 128)
+            && match &event.kind {
+                SessionSemanticKind::RunFinished => true,
+                SessionSemanticKind::TurnCompleted { .. } => true,
+                SessionSemanticKind::ToolResultCommitted {
+                    call_id, tool_name, ..
+                } => call_id.len() <= 256 && tool_name.len() <= 256,
+            };
+        if !bounded {
+            return Err("semantic notification exceeds identity bounds");
+        }
+        drop(self.sender.send(event));
+        Ok(())
+    }
+}
+
+/// One bounded semantic subscriber. A lag error must not be interpreted as coverage.
+#[derive(Debug)]
+pub struct SessionSemanticSubscription {
+    receiver: tokio::sync::broadcast::Receiver<SessionSemanticEvent>,
+    subscribers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl SessionSemanticSubscription {
+    /// Receive the next live fact or an explicit `Lagged`/`Closed` error.
+    ///
+    /// # Errors
+    /// Reports loss or shutdown without recovery replay.
+    pub async fn recv(
+        &mut self,
+    ) -> std::result::Result<SessionSemanticEvent, tokio::sync::broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+}
+impl Drop for SessionSemanticSubscription {
+    fn drop(&mut self) {
+        self.subscribers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Compose existing user-message delivery with bounded semantic notifications.
+pub struct SemanticSessionEventSink {
+    /// Existing user-message sink; its lifecycle and delivery contract are unchanged.
+    pub messages: std::sync::Arc<dyn SessionEventSink>,
+    /// Live-only bounded semantic source.
+    pub semantics: std::sync::Arc<SessionSemanticHub>,
+}
+impl std::fmt::Debug for SemanticSessionEventSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SemanticSessionEventSink")
+            .finish_non_exhaustive()
+    }
+}
+impl SessionEventSink for SemanticSessionEventSink {
+    fn send(&self, event: SessionEvent) -> SessionEventSinkFuture {
+        self.messages.send(event)
+    }
+    fn semantic(&self, event: SessionSemanticEvent) {
+        if self.semantics.publish(event).is_err() {
+            tracing::warn!("oversized semantic notification was not delivered");
+        }
+    }
 }
 
 /// Immutable provider-neutral facts for one durably terminal session run.
@@ -50,14 +203,16 @@ pub trait SessionEventSink: Send + Sync {
 pub struct SessionRunCompletionSnapshot {
     /// Completed session.
     pub session_id: SessionId,
+    /// Durable incarnation containing this completion.
+    pub incarnation: Option<String>,
+    /// Journal revision captured with the terminal boundary.
+    pub revision: crate::Revision,
     /// Stable identity for this process-local submitted run.
     pub run_id: String,
     /// Last durable timeline cursor written by the terminal run.
     pub terminal_cursor: TimelineCursor,
     /// Latest completed provider turn's full context usage, when reported.
     pub context_tokens: Option<u64>,
-    /// Host-defined session purpose, when present.
-    pub purpose: Option<String>,
     /// Effective configured provider key used by the completed run.
     pub provider_key: String,
     /// Effective configured model identity used by the completed run.

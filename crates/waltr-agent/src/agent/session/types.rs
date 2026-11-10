@@ -10,7 +10,6 @@ use serde_json::Value;
 use crate::{
     AuthenticationFailure, CompletionTurn, ModelRef, PromptTurn, ProviderTurnMetadata,
     ThinkingBlock, ToolCall, ToolResult, TurnItem,
-    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, TimelineContent,
         TimelineCursor, TimelineEventKind, TimelineStatus,
@@ -23,12 +22,29 @@ use super::{
 };
 
 /// Condition applied by an atomic metadata set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataSetCondition {
     /// Always replace or create the value.
     Unconditional,
     /// Set the value only when the key is absent, including when no JSON null is present.
     Absent,
+    /// Compare the exact context identity and previous value under the storage transaction.
+    ContextValue {
+        context: Box<super::ContextIdentity>,
+        expected: Option<Value>,
+    },
+}
+
+impl MetadataSetCondition {
+    pub(super) fn matches(&self, record: &SessionRecord, key: &str) -> bool {
+        match self {
+            Self::Unconditional => true,
+            Self::Absent => !record.metadata.values.contains_key(key),
+            Self::ContextValue { context, expected } => {
+                context.matches(record) && record.metadata.values.get(key) == expected.as_ref()
+            }
+        }
+    }
 }
 
 /// Result of an atomic conditional metadata set.
@@ -133,35 +149,6 @@ impl From<String> for RequestId {
     }
 }
 
-/// External request identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExternalRequestId(String);
-
-impl ExternalRequestId {
-    /// Create an external request identifier.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the external request identifier string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ExternalRequestId {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for ExternalRequestId {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
 /// In-memory view of a durable agent session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {
@@ -191,20 +178,23 @@ impl AgentSession {
 
 /// Complete stored session record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StoredSessionRecord")]
 pub struct SessionRecord {
     /// Session identity.
     pub id: SessionId,
-    /// Current optimistic revision.
+    /// Public complete-record revision used by strict observation and mutation CAS.
     pub revision: Revision,
+    /// Durable execution sequence, independent of public metadata commits.
+    pub execution_sequence: super::ExecutionSequence,
     /// Durable metadata used by hosts to list and order sessions.
-    #[serde(default = "SessionMetadata::now")]
+    #[serde(default = "SessionMetadata::legacy")]
     pub metadata: SessionMetadata,
     /// Durable settings used for session inference.
     #[serde(default)]
     pub inference_settings: Option<InferenceSettings>,
     /// Self-contained agent definitions selected for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_definition: Option<AgentDefinitionBundle>,
+    pub agent_definition: Option<serde_json::Value>,
     /// Greatest timeline cursor ever allocated for this session.
     #[serde(default)]
     pub timeline_cursor_high_water: TimelineCursor,
@@ -212,9 +202,52 @@ pub struct SessionRecord {
     pub journal: Vec<SessionJournalEvent>,
 }
 
+#[derive(Deserialize)]
+struct StoredSessionRecord {
+    id: SessionId,
+    revision: Revision,
+    #[serde(default, deserialize_with = "deserialize_execution_sequence")]
+    execution_sequence: Option<super::ExecutionSequence>,
+    #[serde(default = "SessionMetadata::legacy")]
+    metadata: SessionMetadata,
+    #[serde(default)]
+    inference_settings: Option<InferenceSettings>,
+    #[serde(default)]
+    agent_definition: Option<Value>,
+    #[serde(default)]
+    timeline_cursor_high_water: TimelineCursor,
+    journal: Vec<SessionJournalEvent>,
+}
+
+fn deserialize_execution_sequence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<super::ExecutionSequence>, D::Error> {
+    super::ExecutionSequence::deserialize(deserializer).map(Some)
+}
+
+impl From<StoredSessionRecord> for SessionRecord {
+    fn from(stored: StoredSessionRecord) -> Self {
+        Self {
+            id: stored.id,
+            revision: stored.revision,
+            execution_sequence: stored
+                .execution_sequence
+                .unwrap_or_else(|| super::ExecutionSequence::new(stored.revision.get())),
+            metadata: stored.metadata,
+            inference_settings: stored.inference_settings,
+            agent_definition: stored.agent_definition,
+            timeline_cursor_high_water: stored.timeline_cursor_high_water,
+            journal: stored.journal,
+        }
+    }
+}
+
 /// Durable session metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetadata {
+    /// Stable record incarnation. Legacy records without it cannot grant context capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
     /// Time the session record was created.
     pub created_at: SystemTime,
     /// Time the session record was last written.
@@ -224,18 +257,29 @@ pub struct SessionMetadata {
     /// Host-defined durable metadata values.
     #[serde(default)]
     pub values: BTreeMap<String, Value>,
+    /// Opaque values keyed by stable canonical item identity, outside replay evidence.
+    #[serde(default)]
+    pub item_values: super::ItemMetadata,
 }
 
 impl SessionMetadata {
+    fn legacy() -> Self {
+        let mut metadata = Self::now();
+        metadata.incarnation = None;
+        metadata
+    }
+
     /// Create metadata with all timestamps set to now.
     #[must_use]
     pub fn now() -> Self {
         let now = SystemTime::now();
         Self {
+            incarnation: Some(uuid::Uuid::now_v7().to_string()),
             created_at: now,
             updated_at: now,
             last_activity_at: now,
             values: BTreeMap::new(),
+            item_values: BTreeMap::new(),
         }
     }
 }
@@ -263,9 +307,9 @@ pub struct SessionSummary {
     /// Durable settings used for session inference.
     #[serde(default)]
     pub inference_settings: Option<InferenceSettings>,
-    /// Currently selected durable agent name, when the session has an explicit bundle.
+    /// Opaque host configuration; only the host derives presentation or capability policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<String>,
+    pub host_configuration: Option<Value>,
     /// Host-defined durable metadata values.
     #[serde(default)]
     pub metadata_values: BTreeMap<String, Value>,
@@ -334,11 +378,16 @@ impl SessionMetrics {
 }
 
 impl SessionRecord {
+    /// Whether an effect has no durable known outcome and must not be replayed.
+    pub fn has_unsettled_host_dispatch(&self) -> bool {
+        crate::agent::tool::host_dispatch_unsettled(self)
+    }
     /// Create a session record with an empty journal.
     pub fn new(id: impl Into<SessionId>) -> Self {
         Self {
             id: id.into(),
             revision: Revision::ZERO,
+            execution_sequence: super::ExecutionSequence::ZERO,
             metadata: SessionMetadata::now(),
             inference_settings: None,
             agent_definition: None,
@@ -349,13 +398,21 @@ impl SessionRecord {
 
     /// Set session inference settings and mark metadata as updated.
     pub fn set_inference_settings(&mut self, inference_settings: Option<InferenceSettings>) {
+        if self.inference_settings == inference_settings {
+            return;
+        }
         self.inference_settings = inference_settings;
+        self.advance_revision(true);
         self.touch_metadata();
     }
 
     /// Set the self-contained agent-definition bundle and mark metadata as updated.
-    pub fn set_agent_definition(&mut self, agent_definition: Option<AgentDefinitionBundle>) {
+    pub fn set_agent_definition(&mut self, agent_definition: Option<serde_json::Value>) {
+        if self.agent_definition == agent_definition {
+            return;
+        }
         self.agent_definition = agent_definition;
+        self.advance_revision(true);
         self.touch_metadata();
     }
 
@@ -367,7 +424,12 @@ impl SessionRecord {
 
     /// Set a host-defined metadata value and mark the record metadata as updated.
     pub fn set_metadata_value(&mut self, key: impl Into<String>, value: Value) {
-        self.metadata.values.insert(key.into(), value);
+        let key = key.into();
+        if self.metadata.values.get(&key) == Some(&value) {
+            return;
+        }
+        self.metadata.values.insert(key, value);
+        self.advance_revision(false);
         self.touch_metadata();
     }
 
@@ -375,6 +437,7 @@ impl SessionRecord {
     pub fn remove_metadata_value(&mut self, key: &str) -> Option<Value> {
         let value = self.metadata.values.remove(key);
         if value.is_some() {
+            self.advance_revision(false);
             self.touch_metadata();
         }
         value
@@ -408,10 +471,7 @@ impl SessionRecord {
             last_activity_at: self.metadata.last_activity_at,
             metrics,
             inference_settings: self.inference_settings.clone(),
-            agent_name: self
-                .agent_definition
-                .as_ref()
-                .map(|bundle| bundle.agent_name.clone()),
+            host_configuration: self.agent_definition.clone(),
             metadata_values: self.metadata.values.clone(),
             coordination: SessionCoordinationState::default(),
             progress: SessionProgress::default(),
@@ -467,8 +527,6 @@ impl SessionRecord {
                 | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
                 | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
                 | SessionJournalEvent::MiddlewareStateUpdated { .. }
-                | SessionJournalEvent::ExternalRequestResponded { .. }
-                | SessionJournalEvent::ExternalRequestCanceled { .. }
                 | SessionJournalEvent::Suspended { .. }
                 | SessionJournalEvent::WorkCanceled { .. }
                 | SessionJournalEvent::Interrupted
@@ -492,8 +550,6 @@ impl SessionRecord {
             | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
             | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
             | SessionJournalEvent::MiddlewareStateUpdated { .. }
-            | SessionJournalEvent::ExternalRequestResponded { .. }
-            | SessionJournalEvent::ExternalRequestCanceled { .. }
             | SessionJournalEvent::Suspended { .. }
             | SessionJournalEvent::WorkCanceled { .. }
             | SessionJournalEvent::Interrupted
@@ -559,8 +615,6 @@ impl SessionRecord {
                 | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
                 | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
                 | SessionJournalEvent::MiddlewareStateUpdated { .. }
-                | SessionJournalEvent::ExternalRequestResponded { .. }
-                | SessionJournalEvent::ExternalRequestCanceled { .. }
                 | SessionJournalEvent::Suspended { .. }
                 | SessionJournalEvent::WorkCanceled { .. }
                 | SessionJournalEvent::Interrupted
@@ -641,8 +695,6 @@ pub struct SessionSnapshot {
     /// Sandbox calls whose Execute may have reached a worker.
     #[serde(default)]
     pub sandbox_dispatches: Vec<SandboxDispatch>,
-    /// External requests created by suspensions.
-    pub external_requests: Vec<ExternalRequest>,
     /// Namespaced durable middleware state blobs.
     #[serde(default)]
     pub middleware_state: BTreeMap<String, Value>,
@@ -664,7 +716,6 @@ impl SessionSnapshot {
             pending_work: Vec::new(),
             sandbox_calls_recorded: Vec::new(),
             sandbox_dispatches: Vec::new(),
-            external_requests: Vec::new(),
             middleware_state: BTreeMap::new(),
         }
     }
@@ -763,13 +814,6 @@ impl SessionSnapshot {
                 self.middleware_state
                     .insert(namespace.clone(), state.clone());
             }
-            SessionJournalEvent::ExternalRequestResponded {
-                request_id,
-                response,
-            } => self.respond_external_request(request_id, response),
-            SessionJournalEvent::ExternalRequestCanceled { request_id, reason } => {
-                self.cancel_external_request(request_id, reason);
-            }
             SessionJournalEvent::Suspended { suspension } => {
                 self.status = SessionStatus::Suspended(suspension.clone());
             }
@@ -819,7 +863,6 @@ impl SessionSnapshot {
         match &event.content {
             TimelineContent::ToolCall { call } => self.record_tool_call(event.turn, call),
             TimelineContent::ToolResult { result } => self.record_tool_result(event.turn, result),
-            TimelineContent::ExternalRequest { request } => self.record_external_request(request),
             TimelineContent::TextDelta { delta } if channel_is(event, CHANNEL_ASSISTANT_TEXT) => {
                 self.record_assistant_text_delta(event.turn, delta);
                 self.status = SessionStatus::StreamingProvider;
@@ -852,19 +895,6 @@ impl SessionSnapshot {
             TimelineStatus::AwaitingToolResults => {
                 SessionStatus::Suspended(Suspension::AwaitingToolResults {
                     work: self.pending_work.clone(),
-                })
-            }
-            TimelineStatus::AwaitingExternalInput => {
-                let request = self
-                    .external_requests
-                    .iter()
-                    .rev()
-                    .find(|request| matches!(request.status, ExternalRequestStatus::Pending))
-                    .cloned();
-                request.map_or(SessionStatus::RunningTool, |request| {
-                    SessionStatus::Suspended(Suspension::AwaitingExternalInput {
-                        request: Box::new(request),
-                    })
                 })
             }
             TimelineStatus::Interrupted => SessionStatus::Suspended(Suspension::Interrupted {
@@ -932,46 +962,6 @@ impl SessionSnapshot {
             });
         }
         self.status = SessionStatus::RunningTool;
-    }
-
-    fn record_external_request(&mut self, request: &ExternalRequest) {
-        upsert_external_request(&mut self.external_requests, request.clone());
-        match &request.status {
-            ExternalRequestStatus::Pending => {
-                self.status = SessionStatus::Suspended(Suspension::AwaitingExternalInput {
-                    request: Box::new(request.clone()),
-                });
-            }
-            ExternalRequestStatus::Responded(_) => self.status = SessionStatus::RunningTool,
-            ExternalRequestStatus::Canceled(_) => {}
-        }
-    }
-
-    fn respond_external_request(
-        &mut self,
-        request_id: &ExternalRequestId,
-        response: &ExternalResponse,
-    ) {
-        if let Some(request) = self
-            .external_requests
-            .iter_mut()
-            .rev()
-            .find(|request| request.id == *request_id)
-        {
-            request.status = ExternalRequestStatus::Responded(response.clone());
-        }
-        self.status = SessionStatus::RunningTool;
-    }
-
-    fn cancel_external_request(&mut self, request_id: &ExternalRequestId, reason: &CancelReason) {
-        if let Some(request) = self
-            .external_requests
-            .iter_mut()
-            .rev()
-            .find(|request| request.id == *request_id)
-        {
-            request.status = ExternalRequestStatus::Canceled(reason.clone());
-        }
     }
 
     fn cancel_work(&mut self, work_id: &str, reason: &CancelReason) {
@@ -1051,16 +1041,6 @@ pub enum SessionJournalEvent {
     },
     /// Middleware namespace state was replaced wholesale.
     MiddlewareStateUpdated { namespace: String, state: Value },
-    /// External request received a durable response.
-    ExternalRequestResponded {
-        request_id: ExternalRequestId,
-        response: ExternalResponse,
-    },
-    /// External request was canceled before a response was applied.
-    ExternalRequestCanceled {
-        request_id: ExternalRequestId,
-        reason: CancelReason,
-    },
     /// Runtime suspended.
     Suspended { suspension: Suspension },
     /// Pending work was canceled.
@@ -1112,11 +1092,6 @@ pub enum ResumeInput {
     Prompts(Vec<String>),
     /// Resume with externally completed tool results.
     ToolResults(Vec<ToolResult>),
-    /// Resume with an answer to a pending external request.
-    ExternalResponse {
-        request_id: ExternalRequestId,
-        response: ExternalResponse,
-    },
 }
 
 /// Durable rollback target stored as an append-only replay barrier.
@@ -1154,66 +1129,8 @@ fn remove_prompt_appended(events: &mut Vec<(usize, &SessionJournalEvent)>, promp
 pub enum Suspension {
     /// Runtime is waiting for tool results.
     AwaitingToolResults { work: Vec<PendingWork> },
-    /// Runtime is waiting for an external response.
-    AwaitingExternalInput { request: Box<ExternalRequest> },
     /// Runtime was interrupted while work was active.
     Interrupted { work: Vec<PendingWork> },
-}
-
-/// External request emitted by middleware or a suspending tool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalRequest {
-    /// External request identity.
-    pub id: ExternalRequestId,
-    /// Request kind used by hosts to route UI/approval behavior.
-    pub kind: ExternalRequestKind,
-    /// Tool call this request belongs to, when applicable.
-    pub tool_call_id: Option<String>,
-    /// Human-readable prompt or description.
-    pub prompt: String,
-    /// Provider-neutral request payload.
-    pub payload: Value,
-    /// Current request status.
-    pub status: ExternalRequestStatus,
-}
-
-/// Kind of external request represented by a suspension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExternalRequestKind {
-    /// Permission decision request.
-    Permission,
-    /// User question request.
-    Question,
-    /// Tool input request.
-    ToolInput,
-    /// Host-defined request kind.
-    Custom(String),
-}
-
-/// External request status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExternalRequestStatus {
-    /// Request is awaiting a response.
-    Pending,
-    /// Request received a response.
-    Responded(ExternalResponse),
-    /// Request was canceled before response.
-    Canceled(CancelReason),
-}
-
-/// Host response to an external request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalResponse {
-    /// Provider-neutral response payload.
-    pub payload: Value,
-}
-
-impl ExternalResponse {
-    /// Create an external response from provider-neutral JSON payload.
-    #[must_use]
-    pub const fn new(payload: Value) -> Self {
-        Self { payload }
-    }
 }
 
 /// Work item tracked across suspensions and cancellation.
@@ -1285,7 +1202,6 @@ fn timeline_failure_message(event: &AgentTimelineEvent) -> String {
         TimelineContent::Empty
         | TimelineContent::ToolCall { .. }
         | TimelineContent::ToolResult { .. }
-        | TimelineContent::ExternalRequest { .. }
         | TimelineContent::ContentRef { .. } => "timeline status failed".to_owned(),
     }
 }
@@ -1322,18 +1238,6 @@ fn retrying_provider_status(event: &AgentTimelineEvent) -> SessionStatus {
     }
 }
 
-fn upsert_external_request(requests: &mut Vec<ExternalRequest>, request: ExternalRequest) {
-    if let Some(existing) = requests
-        .iter_mut()
-        .rev()
-        .find(|existing| existing.id == request.id)
-    {
-        *existing = request;
-    } else {
-        requests.push(request);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1341,10 +1245,7 @@ mod tests {
     use super::*;
     use crate::{
         InferenceProviderSettings, ModelApi, ThinkingBlockKind,
-        timeline::{
-            CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, PendingTimelineItemId, TimelineChannel,
-            TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
-        },
+        timeline::{PendingTimelineEvent, PendingTimelineItemId, TimelineCursor, TimelineItemId},
     };
 
     fn sample_thinking_block() -> ThinkingBlock {
@@ -1459,7 +1360,6 @@ mod tests {
             summary.capabilities.prompt_disposition,
             crate::SessionPromptDisposition::Immediate
         );
-        assert!(!summary.capabilities.can_respond_external_request);
         assert!(!summary.capabilities.can_interrupt);
     }
 
@@ -1522,7 +1422,7 @@ mod tests {
 
     #[test]
     fn session_record_bundle_round_trips_outside_the_journal() {
-        let bundle = AgentDefinitionBundle::new(
+        let bundle = crate::agent::session::opaque_test_configuration(
             "selected",
             vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: selected\nspec: {}\n".to_owned()],
         );
@@ -1563,18 +1463,12 @@ mod tests {
     #[test]
     fn authentication_failure_round_trips_through_failed_journal_status() {
         let failure = AuthenticationFailure {
-            target: crate::AuthTarget::mcp_server("configured-mcp"),
+            target: crate::AuthTarget::Host {
+                namespace: "test-host".into(),
+                key: "configured-target".into(),
+            },
             reason: crate::AuthenticationFailureReason::CredentialRejected,
-            mcp_authorization: Some(Box::new(crate::McpAuthorizationContext {
-                endpoint: "https://mcp.example/rpc".to_owned(),
-                http_status: 401,
-                resource_metadata_url: None,
-                scope: Some("tools.read".to_owned()),
-                error: Some("invalid_token".to_owned()),
-                error_description: None,
-                error_uri: None,
-                realm: None,
-            })),
+            host_context: Some(serde_json::json!({"host":"challenge"})),
         };
         let event = SessionJournalEvent::Failed {
             message: "authentication failed".to_owned(),
@@ -1698,39 +1592,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_external_request_projects_lifecycle_state() {
-        let id = SessionId::new("session-1");
-        let request = ExternalRequest {
-            id: ExternalRequestId::new("request-1"),
-            kind: ExternalRequestKind::Permission,
-            tool_call_id: Some("call-1".to_owned()),
-            prompt: "Allow?".to_owned(),
-            payload: json!({ "allow": true }),
-            status: ExternalRequestStatus::Pending,
-        };
-        let pending = PendingTimelineEvent::new(
-            id.clone(),
-            0,
-            PendingTimelineItemId::New,
-            TimelineEventKind::ExternalRequestOpened,
-            Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
-            TimelineContent::ExternalRequest {
-                request: request.clone(),
-            },
-        );
-
-        let snapshot = SessionSnapshot::from_journal(id, &[assigned(1, pending)]);
-
-        assert_eq!(snapshot.external_requests, std::slice::from_ref(&request));
-        assert_eq!(
-            snapshot.status,
-            SessionStatus::Suspended(Suspension::AwaitingExternalInput {
-                request: Box::new(request),
-            })
-        );
-    }
-
-    #[test]
     fn middleware_state_fold_replaces_namespace_wholesale() {
         let events = vec![
             SessionJournalEvent::MiddlewareStateUpdated {
@@ -1798,8 +1659,8 @@ mod tests {
     fn middleware_state_round_trips_through_serde() {
         let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
         snapshot.apply_event(&SessionJournalEvent::MiddlewareStateUpdated {
-            namespace: "permissions".to_owned(),
-            state: json!({ "grants": ["shell"] }),
+            namespace: "host-state".to_owned(),
+            state: json!({ "cursor": 3 }),
         });
 
         let value = serde_json::to_value(&snapshot).expect("serialize snapshot");

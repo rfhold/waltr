@@ -8,7 +8,6 @@ use super::{
     InferenceSettings, SessionCopy, SessionId, SessionJournalEvent, SessionRecord,
     SessionStoreError,
 };
-use crate::definition::AgentDefinitionBundle;
 
 /// Explicit resource bounds for completed-session capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +45,7 @@ pub struct CompletedSessionCapture {
     /// Exact durable inference settings.
     pub inference_settings: InferenceSettings,
     /// Exact self-contained agent definition.
-    pub agent_definition: AgentDefinitionBundle,
+    pub agent_definition: serde_json::Value,
     /// Validated completed context ready for atomic destination creation.
     pub copy: SessionCopy,
 }
@@ -228,7 +227,7 @@ mod tests {
                 reasoning_effort: None,
             },
         });
-        record.agent_definition = Some(AgentDefinitionBundle::new(
+        record.agent_definition = Some(crate::agent::session::opaque_test_configuration(
             "agent",
             vec![
                 "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: agent }\nspec: {}\n"
@@ -236,6 +235,47 @@ mod tests {
             ],
         ));
         record
+    }
+
+    #[test]
+    fn effective_item_capture_matches_provider_context_and_durable_helper_without_original_content()
+    {
+        use crate::{
+            ReplacementUserContent, SessionCaptureLimits, SessionContextMode, SessionCreateRequest,
+            SessionMaskAddition, SessionMaskMutation, SessionStart,
+        };
+        let mut source = record();
+        source.append_journal_event(assistant(&source.id, 0, 1, "private original answer"));
+        source.append_journal_event(SessionJournalEvent::TurnFinished { turn: 0 });
+        let mut mutation = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+        mutation.add.push(SessionMaskAddition::items(
+            "opaque-selection",
+            TimelineCursor::new(1),
+            vec![TimelineItemId::from_first_cursor(TimelineCursor::new(1))],
+            ReplacementUserContent::new("public summary"),
+        ));
+        let revision = source.revision.next();
+        super::super::mask::mutate_record_masks(&mut source, revision, &mutation).unwrap();
+        let capture = capture_record_effective(&source, SessionCaptureLimits::default()).unwrap();
+        let provider = source.materialize_context(SessionContextMode::Effective);
+        let mut request = SessionCreateRequest::new("durable-helper");
+        request.start = SessionStart::Copy {
+            copy: capture.copy,
+            messages: Vec::new(),
+        };
+        let helper = request.materialize();
+        assert_eq!(
+            provider,
+            helper.materialize_context(SessionContextMode::Raw)
+        );
+        let encoded = serde_json::to_string(&helper).unwrap();
+        assert!(!encoded.contains("private original answer"));
+        assert!(encoded.contains("public summary"));
+        assert!(
+            serde_json::to_string(&source)
+                .unwrap()
+                .contains("private original answer")
+        );
     }
 
     fn assistant(id: &SessionId, turn: u64, cursor: u64, text: &str) -> SessionJournalEvent {

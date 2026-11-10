@@ -3,7 +3,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,38 +13,54 @@ use std::{
 
 use crate::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, LlmError, PendingTimelineEvent, Result,
-    TimelineContent, TimelineItemId, TimelineItemText, TimelineQuery,
-    definition::{AgentDefinitionBundle, AgentSwitchAudit},
-    mcp::McpClientRuntime,
+    SessionRecord, SessionJournalEvent, TimelineContent, TimelineItemId, TimelineItemText,
+    TimelineQuery,
 };
 use futures_util::StreamExt as _;
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify, RwLock, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio_util::sync::CancellationToken;
+
+/// Admission or execution outcome for an exclusive, provider-free host effect.
+#[derive(Debug)]
+pub enum IdleHostEffectError {
+    Busy,
+    Stale,
+    Canceled,
+    Effect(LlmError),
+}
+impl std::fmt::Display for IdleHostEffectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "idle host effect: {self:?}")
+    }
+}
+impl std::error::Error for IdleHostEffectError {}
+impl From<LlmError> for IdleHostEffectError {
+    fn from(error: LlmError) -> Self {
+        Self::Effect(error)
+    }
+}
+
+#[cfg(test)]
+#[path = "idle_host_tests.rs"]
+mod idle_host_tests;
 use tracing::Instrument as _;
 
 use super::run::SessionRunInferenceIdentity;
 use super::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
-    AgentSessionRuntime, AgentSessionRuntimeFactory, CompletedSessionCapture, ExternalResponse,
-    InferenceSettings, MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy,
-    RunOutcomeSender, RunResult, SessionCaptureError, SessionCaptureLimits, SessionControl,
-    SessionCoordinationPhase, SessionCoordinationReason, SessionCoordinationState,
-    SessionCreateRequest, SessionId, SessionListSubscription, SessionMaskMutation,
-    SessionMaskMutationOutcome, SessionPauseError, SessionPauseId, SessionPauseLease,
-    SessionRunContext, SessionStatus, SessionStore, SessionSummary, SessionTimelineBroadcaster,
-    SessionTimelineMode, SessionTimelinePage, SessionTimelineProjectionSubscription,
-    SessionTimelineSubscription,
+    AgentSessionRuntime, AgentSessionRuntimeFactory, CompletedSessionCapture, InferenceSettings,
+    MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy, RunOutcomeSender,
+    RunResult, SessionCaptureError, SessionCaptureLimits, SessionControl, SessionCoordinationPhase,
+    SessionCoordinationReason, SessionCoordinationState, SessionCreateRequest, SessionId,
+    SessionListSubscription, SessionMaskMutation, SessionMaskMutationOutcome, SessionPauseError,
+    SessionPauseId, SessionPauseLease, SessionRunContext, SessionStatus, SessionStore,
+    SessionSummary, SessionTimelineBroadcaster, SessionTimelineMode, SessionTimelinePage,
+    SessionTimelineProjectionSubscription, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
-
-type McpPreparationGuards = Arc<StdMutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>;
-
-#[path = "mcp_apps.rs"]
-mod mcp_apps;
-pub use mcp_apps::{McpAppError, McpAppHandle, SessionMcpApp};
 
 /// Durable session coordinator bound to a store.
 #[derive(Clone)]
@@ -56,12 +72,6 @@ where
     control: SessionControl,
     timeline: SessionTimelineBroadcaster,
     runtime_factory: Option<AgentSessionRuntimeFactory>,
-    mcp_sessions: Arc<StdMutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
-    mcp_preparation_guards: McpPreparationGuards,
-    app_slots: Arc<tokio::sync::Semaphore>,
-    app_handles: Arc<StdMutex<Vec<std::sync::Weak<mcp_apps::AppHandleInner>>>>,
-    mcp_lifecycle: Arc<RwLock<McpLifecycle>>,
-    retired_mcp_runtimes: Arc<StdMutex<Vec<Arc<McpRuntimeRetirement>>>>,
     active_runs: Arc<Mutex<RunCoordination>>,
     run_drain: Arc<RunDrain>,
     next_run_id: Arc<AtomicU64>,
@@ -101,78 +111,6 @@ struct RunCoordination {
     sessions: BTreeMap<SessionId, SessionRunState>,
     wiping: bool,
     shutdown: bool,
-}
-
-#[derive(Debug, Default)]
-struct McpLifecycle {
-    shutdown: bool,
-}
-
-#[derive(Debug)]
-struct McpRuntimeRetirement {
-    session_id: SessionId,
-    runtime: StdMutex<Option<Arc<McpClientRuntime>>>,
-    completion: AsyncCompletion,
-    task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl McpRuntimeRetirement {
-    fn start(session_id: SessionId, runtime: Arc<McpClientRuntime>) -> Arc<Self> {
-        let retirement = Arc::new(Self {
-            session_id,
-            runtime: StdMutex::new(Some(runtime)),
-            completion: AsyncCompletion::default(),
-            task: StdMutex::new(None),
-        });
-        let background = Arc::clone(&retirement);
-        let task = tokio::spawn(async move {
-            background.run().await;
-        });
-        *retirement
-            .task
-            .lock()
-            .expect("MCP retirement task lock poisoned") = Some(task);
-        retirement
-    }
-
-    async fn run(&self) {
-        let runtime = self
-            .runtime
-            .lock()
-            .expect("retired MCP runtime lock poisoned")
-            .take()
-            .expect("retired MCP runtime owned by its task");
-        if let Err(error) = shutdown_when_unused(runtime).await {
-            tracing::warn!(
-                session_id = %self.session_id.as_str(),
-                %error,
-                "failed to shut down retired MCP runtime"
-            );
-        }
-        self.completion.finish();
-    }
-
-    async fn wait(&self) {
-        self.completion.wait().await;
-    }
-
-    async fn wait_and_join(&self) {
-        self.wait().await;
-        let task = self
-            .task
-            .lock()
-            .expect("MCP retirement task lock poisoned")
-            .take();
-        if let Some(task) = task
-            && let Err(error) = task.await
-        {
-            tracing::warn!(
-                session_id = %self.session_id.as_str(),
-                %error,
-                "MCP retirement task failed"
-            );
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -298,28 +236,16 @@ struct QueuedSessionRun {
     outcome_tx: RunOutcomeSender,
     limits: AgentRunLimits,
     runtime: Option<AgentRuntime>,
+    runtime_factory: Option<AgentSessionRuntimeFactory>,
     inference_identity: Option<SessionRunInferenceIdentity>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedMcpRuntime {
-    runtime: Arc<McpClientRuntime>,
-    fingerprint: super::runtime_factory::McpRuntimeFingerprint,
-    credentialed_servers: BTreeSet<String>,
-}
-
-impl CachedMcpRuntime {
-    fn can_reuse(&self, prepared: &super::runtime_factory::PreparedMcpRuntime) -> bool {
-        self.fingerprint == prepared.fingerprint
-            && self.credentialed_servers == prepared.credentialed_servers
-            && self.runtime.app_sources() == prepared.config.app_sources()
-    }
+    cancellation: Option<CancellationToken>,
 }
 
 struct SessionRunStart {
     id: u64,
     token: CancellationToken,
     runtime: Option<AgentRuntime>,
+    runtime_factory: Option<AgentSessionRuntimeFactory>,
     inference_identity: Option<SessionRunInferenceIdentity>,
     input: AgentSessionRunInput,
     outcome_txs: Vec<(u64, RunOutcomeSender)>,
@@ -354,12 +280,6 @@ where
             control: SessionControl::new(),
             timeline: SessionTimelineBroadcaster::new(),
             runtime_factory: None,
-            mcp_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
-            mcp_preparation_guards: Arc::new(StdMutex::new(BTreeMap::new())),
-            app_slots: Arc::new(tokio::sync::Semaphore::new(32)),
-            app_handles: Arc::new(StdMutex::new(Vec::new())),
-            mcp_lifecycle: Arc::new(RwLock::new(McpLifecycle::default())),
-            retired_mcp_runtimes: Arc::new(StdMutex::new(Vec::new())),
             active_runs: Arc::new(Mutex::new(RunCoordination::default())),
             run_drain: Arc::new(RunDrain::default()),
             next_run_id: Arc::new(AtomicU64::new(0)),
@@ -377,8 +297,79 @@ where
     /// Configure the runtime factory used for session run submissions.
     #[must_use]
     pub fn with_runtime_factory(mut self, factory: AgentSessionRuntimeFactory) -> Self {
+        if let Some(events) = &factory.run_events {
+            self.event_sink = Some(events.clone());
+        }
         self.runtime_factory = Some(factory);
         self
+    }
+
+    /// Execute one host effect exclusively in an idle session, without a provider turn.
+    /// A dropped caller cancels but cannot drop dispatched settlement or its audit.
+    pub async fn execute_idle_host_tool(
+        &self,
+        id: &SessionId,
+        expected_revision: crate::Revision,
+        tool: crate::AgentTool,
+        call: crate::ToolCall,
+        audit: impl FnOnce(&crate::ToolResult) -> PendingTimelineEvent + Send + 'static,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<crate::ToolResult, IdleHostEffectError> {
+        let token = cancellation.child_token();
+        let _cancel_on_drop = token.clone().drop_guard();
+        let coordinator = self.clone();
+        let id = id.clone();
+        let driver = self.drive_owned_execution(&tokio::runtime::Handle::current(), async move {
+            use crate::HostEffectExecutor as _;
+            let operation = coordinator.control.session(id.clone()).try_operation()
+                .ok_or(IdleHostEffectError::Busy)?;
+            let record = coordinator.store.load(&id).await.map_err(session_store_error)?;
+            if record.revision != expected_revision { return Err(IdleHostEffectError::Stale); }
+            let snapshot = record.snapshot();
+            if !matches!(snapshot.status, SessionStatus::Idle | SessionStatus::Finished) {
+                return Err(IdleHostEffectError::Busy);
+            }
+            {
+                let mut runs = coordinator.active_runs.lock().await;
+                if runs.shutdown || runs.wiping { return Err(IdleHostEffectError::Canceled); }
+                let state = runs.sessions.entry(id.clone()).or_default();
+                if state.active.is_some() || state.pause.is_some() || state.completion_barrier.is_some()
+                    || state.blocked || !state.queued.is_empty() {
+                    return Err(IdleHostEffectError::Busy);
+                }
+                state.blocked = true;
+            }
+            let execution = async {
+                let journal = crate::agent::host_effect::HostEffectJournal::new(coordinator.store.clone(), &record, token.clone())?;
+                let context = snapshot.middleware_state.iter().filter(|(namespace, _)|
+                    !crate::agent::host::reserved_context_namespace(namespace))
+                    .map(|(key, value)| (key.clone(), value.clone())).collect();
+                let effect = journal.execute(tool, call, snapshot.turn, context).await;
+                let (commit, journal_events) = journal.synchronize(record.commit_receipt().map_err(session_store_error)?).await?;
+                let mut updated = record.clone();
+                updated.adopt_commit(commit);
+                updated.append_journal_events(journal_events);
+                let result = effect?.result?;
+                let receipt = coordinator.store.append_timeline(&id, updated.execution_token().map_err(session_store_error)?, vec![audit(&result)]).await
+                    .map_err(session_store_error)?;
+                updated.adopt_commit(receipt.commit);
+                updated.append_journal_events(receipt.events.iter().cloned().map(SessionJournalEvent::Timeline));
+                coordinator.timeline.publish_all(receipt.events);
+                operation.publish_host_summary(updated.summary());
+                Ok::<_, IdleHostEffectError>(result)
+            };
+            tokio::pin!(execution);
+            let outcome = tokio::select! {
+                biased;
+                _ = coordinator.shutdown_token.cancelled() => { token.cancel(); execution.await },
+                result = &mut execution => result,
+            };
+            coordinator.unblock_session(&id).await;
+            outcome
+        }).await.ok_or(IdleHostEffectError::Canceled)?;
+        driver.await.map_err(|_| {
+            IdleHostEffectError::Effect(coordinator_error("host effect completion unavailable"))
+        })?
     }
 
     /// Configure fire-and-forget semantic session event delivery.
@@ -455,7 +446,6 @@ where
         fields(operation = "delete", db_system = "session_store", session_id = %id.as_str())
     )]
     pub async fn delete(&self, id: &SessionId) -> Result<()> {
-        self.revoke_session_mcp_apps(Some(id));
         let operation = self.control.session(id.clone()).deletion().await;
         self.block_session(id, "session deleted").await;
         if let Err(error) = AgentSessionRuntime::new(&self.store)
@@ -465,32 +455,15 @@ where
             self.unblock_session(id).await;
             return Err(error);
         }
-        let retirement = {
-            let lifecycle = self.mcp_lifecycle.read().await;
-            if lifecycle.shutdown {
-                None
-            } else {
-                let runtime = self
-                    .mcp_sessions
-                    .lock()
-                    .expect("MCP runtime cache lock poisoned")
-                    .remove(id);
-                self.mcp_preparation_guards
-                    .lock()
-                    .expect("MCP preparation guard map lock poisoned")
-                    .remove(id);
-                runtime.map(|runtime| self.retire_mcp_runtime(id.clone(), runtime.runtime))
-            }
-        };
+        if let Some(factory) = &self.runtime_factory {
+            factory.retire(id).await?;
+        }
         operation.publish_deleted();
         drop(operation);
-        if let Some(retirement) = retirement {
-            retirement.wait().await;
-        }
         Ok(())
     }
 
-    /// Delete every durable session and clear cached per-session MCP runtimes.
+    /// Delete every durable session and clear host-owned runtime resources.
     ///
     /// # Errors
     ///
@@ -505,7 +478,6 @@ where
         fields(operation = "wipe", db_system = "session_store")
     )]
     pub async fn wipe_sessions(&self) -> Result<()> {
-        self.revoke_session_mcp_apps(None);
         let lifecycle = self.control.exclusive().await;
         self.begin_wipe().await;
         let wipe = self.store.wipe().await.map_err(session_store_error);
@@ -513,30 +485,11 @@ where
             self.end_wipe().await;
             return wipe;
         }
-        let retirements = {
-            let lifecycle = self.mcp_lifecycle.read().await;
-            if lifecycle.shutdown {
-                Vec::new()
-            } else {
-                let runtimes = std::mem::take(
-                    &mut *self
-                        .mcp_sessions
-                        .lock()
-                        .expect("MCP runtime cache lock poisoned"),
-                );
-                self.mcp_preparation_guards
-                    .lock()
-                    .expect("MCP preparation guard map lock poisoned")
-                    .clear();
-                runtimes
-                    .into_iter()
-                    .map(|(session_id, cached)| self.retire_mcp_runtime(session_id, cached.runtime))
-                    .collect::<Vec<_>>()
-            }
-        };
         lifecycle.publish_cleared();
+        if let Some(factory) = &self.runtime_factory {
+            factory.retire_all().await?;
+        }
         self.end_wipe().await;
-        drop(retirements);
         Ok(())
     }
 
@@ -544,6 +497,25 @@ where
     pub async fn shutdown(&self) {
         self.start_shutdown();
         self.shutdown_completion.wait().await;
+    }
+
+    pub(crate) async fn drive_owned_execution<T: Send + 'static>(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> Option<tokio::task::JoinHandle<T>> {
+        let coordination = self.active_runs.lock().await;
+        if coordination.shutdown || coordination.wiping {
+            return None;
+        }
+        // Track blocked admission even when all join waiters are dropped.
+        let activity = self.run_drain.begin();
+        let driver = runtime.spawn(async move {
+            let _activity = activity;
+            work.await
+        });
+        drop(coordination);
+        Some(driver)
     }
 
     fn start_shutdown(&self) {
@@ -580,34 +552,10 @@ where
                 .publish_coordination(&session_id, SessionCoordinationState::default());
         }
         self.run_drain.wait_until_idle().await;
-        let (runtimes, mut retirements) = {
-            let mut lifecycle = self.mcp_lifecycle.write().await;
-            lifecycle.shutdown = true;
-            self.mcp_preparation_guards
-                .lock()
-                .expect("MCP preparation guard map lock poisoned")
-                .clear();
-            let runtimes = std::mem::take(
-                &mut *self
-                    .mcp_sessions
-                    .lock()
-                    .expect("MCP runtime cache lock poisoned"),
-            );
-            let retirements = std::mem::take(
-                &mut *self
-                    .retired_mcp_runtimes
-                    .lock()
-                    .expect("retired MCP runtime lock poisoned"),
-            );
-            (runtimes, retirements)
-        };
-        retirements.extend(
-            runtimes.into_iter().map(|(session_id, cached)| {
-                McpRuntimeRetirement::start(session_id, cached.runtime)
-            }),
-        );
-        for retirement in retirements {
-            retirement.wait_and_join().await;
+        if let Some(factory) = &self.runtime_factory {
+            if let Err(error) = factory.retire_all().await {
+                tracing::warn!(%error, "host resource retirement failed");
+            }
         }
     }
 
@@ -689,6 +637,35 @@ where
         let record = self.store.load(id).await?;
         operation.register_loaded_summary(record.summary());
         super::capture::capture_record_effective(&record, limits)
+    }
+
+    /// Capture effective completed context and an exact identity under the existing operation gate.
+    /// Legacy records without a durable incarnation fail closed; this operation never writes.
+    ///
+    /// # Errors
+    /// Returns a typed capture, resource, or storage failure without granting guest authority.
+    pub async fn capture_context(
+        &self,
+        id: &SessionId,
+        authority: &str,
+        limits: SessionCaptureLimits,
+    ) -> std::result::Result<super::SessionContextCapture, SessionCaptureError> {
+        if authority.is_empty() || authority.len() > 128 {
+            return Err(SessionCaptureError::FailedPrecondition(
+                "invalid context authority identity".into(),
+            ));
+        }
+        let operation = self.control.session(id.clone()).operation().await;
+        let record = self.store.load(id).await?;
+        operation.register_loaded_summary(record.summary());
+        let completed = super::capture::capture_record_effective(&record, limits)?;
+        let identity =
+            super::ContextIdentity::capture(&record, completed.through_cursor, authority)
+                .map_err(|error| SessionCaptureError::FailedPrecondition(error.to_string()))?;
+        Ok(super::SessionContextCapture {
+            identity,
+            completed,
+        })
     }
 
     /// Acquire an owned process-local pause without waiting for conflicting work.
@@ -853,31 +830,52 @@ where
     pub async fn apply_paused_mask_mutation(
         &self,
         lease: &SessionPauseLease,
-        mut mutation: SessionMaskMutation,
+        mutation: SessionMaskMutation,
     ) -> std::result::Result<SessionMaskMutationOutcome, SessionPauseError> {
+        self.apply_paused_session_mutation(
+            lease,
+            super::SessionMutation {
+                masks: Some(mutation),
+                ..Default::default()
+            },
+        )
+        .await?
+        .masks
+        .ok_or_else(|| SessionPauseError::Store(super::SessionStoreError::Backend {
+            message: "missing mask outcome".into(),
+        }))
+    }
+
+    /// Commit metadata and masks together while retaining exact pause/continuation ownership.
+    pub async fn apply_paused_session_mutation(
+        &self,
+        lease: &SessionPauseLease,
+        mut mutation: super::SessionMutation,
+    ) -> std::result::Result<super::SessionMutationOutcome, SessionPauseError> {
         let operation = self
             .control
             .session(lease.session_id.clone())
             .operation()
             .await;
         self.validate_pause_owner(lease).await?;
-        mutation.expected_timeline_boundary = Some(lease.timeline_boundary);
+        let masks = mutation.masks.as_mut().ok_or_else(|| {
+            SessionPauseError::Store(super::SessionStoreError::Backend {
+                message: "paused history mutation requires masks".into(),
+            })
+        })?;
+        masks.expected_timeline_boundary = Some(lease.timeline_boundary);
         let outcome = self
             .store
-            .mutate_masks(&lease.session_id, mutation)
+            .mutate(&lease.session_id, mutation)
             .await
             .map_err(|error| pause_store_error(lease, error))?;
-        let record = self
-            .store
-            .load(&lease.session_id)
-            .await
-            .map_err(SessionPauseError::Store)?;
+        let record = &outcome.record;
         operation.publish_run_summary(record.summary());
         self.timeline
             .publish_projection_invalidation(lease.session_id.clone(), record.revision);
         let mut coordination = self.active_runs.lock().await;
         let pause = matching_pause_mut(&mut coordination, lease)?;
-        pause.mutation_cursor = Some(outcome.cursor);
+        pause.mutation_cursor = outcome.masks.as_ref().map(|masks| masks.cursor);
         Ok(outcome)
     }
 
@@ -935,10 +933,12 @@ where
         let (outcome_tx, outcome_rx) = oneshot::channel();
         pause.continuation = Some(QueuedSessionRun {
             id,
+            cancellation: None,
             input: AgentSessionRunInput::Continue,
             outcome_tx,
             limits,
             runtime: Some(runtime),
+            runtime_factory: self.runtime_factory.clone(),
             inference_identity: Some(inference_identity),
         });
         let projected = coordination.sessions[&lease.session_id].coordination();
@@ -1000,7 +1000,7 @@ where
         } else if let Some(continuation) = pause.continuation {
             Some(start_queued(state, continuation, &self.run_drain))
         } else {
-            pop_next_start(state, &self.run_drain)
+            pop_next_start(state, &self.run_drain, &lease.session_id)
         };
         if state.active.is_none() && state.queued.is_empty() && !state.blocked {
             coordination.sessions.remove(&lease.session_id);
@@ -1057,6 +1057,18 @@ where
         Ok(summaries)
     }
 
+    /// Read the current admission state for one session without a store traversal.
+    pub async fn coordination_state(&self, id: &SessionId) -> SessionCoordinationState {
+        self.active_runs
+            .lock()
+            .await
+            .sessions
+            .get(id)
+            .map_or_else(SessionCoordinationState::default, |state| {
+                state.coordination()
+            })
+    }
+
     #[cfg(test)]
     async fn wait_at_list_registration_barrier(&self) {
         let barrier = self
@@ -1081,7 +1093,6 @@ where
         fields(operation = "interrupt", db_system = "session_store", session_id = %id.as_str())
     )]
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
-        self.revoke_session_mcp_apps(Some(id));
         let operation = self.control.session(id.clone()).operation().await;
         self.interrupt_active_run(id).await;
         let record = AgentSessionRuntime::new(&self.store)
@@ -1145,17 +1156,31 @@ where
         events: Vec<PendingTimelineEvent>,
     ) -> Result<Vec<AgentTimelineEvent>> {
         let operation = self.control.session(id.clone()).operation().await;
-        let record = self.load(id).await?;
+        let mut record = self.load(id).await?;
         operation.register_loaded_summary(record.record.summary());
-        let assigned = self
+        let receipt = self
             .store
-            .append_timeline(id, record.revision(), events)
+            .append_timeline(
+                id,
+                record
+                    .record
+                    .execution_token()
+                    .map_err(session_store_error)?,
+                events,
+            )
             .await
             .map_err(session_store_error)?;
-        self.timeline.publish_all(assigned.clone());
-        let record = self.load(id).await?;
+        record.record.adopt_commit(receipt.commit);
+        record.record.append_journal_events(
+            receipt
+                .events
+                .iter()
+                .cloned()
+                .map(SessionJournalEvent::Timeline),
+        );
+        self.timeline.publish_all(receipt.events.clone());
         operation.publish_run_summary(record.record.summary());
-        Ok(assigned)
+        Ok(receipt.events)
     }
 
     /// Reconstruct text content for one persisted timeline item.
@@ -1218,6 +1243,50 @@ where
             .await?;
         operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
+    }
+
+    /// Apply host-validated context mask preconditions under the existing session operation gate.
+    pub async fn mutate_context_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> super::SessionStoreResult<SessionMaskMutationOutcome> {
+        self.mutate_session(
+            id,
+            super::SessionMutation {
+                masks: Some(mutation),
+                ..Default::default()
+            },
+        )
+        .await?
+        .masks
+        .ok_or_else(|| super::SessionStoreError::Backend {
+            message: "missing mask outcome".into(),
+        })
+    }
+
+    /// Commit opaque session/item metadata and dependent mask edits under the session gate.
+    pub async fn mutate_session(
+        &self,
+        id: &SessionId,
+        mutation: super::SessionMutation,
+    ) -> super::SessionStoreResult<super::SessionMutationOutcome> {
+        let operation = self.control.session(id.clone()).operation().await;
+        let outcome = self.store.mutate(id, mutation).await?;
+        operation.publish_host_summary(outcome.record.summary());
+        self.timeline
+            .publish_projection_invalidation(id.clone(), outcome.record.revision);
+        Ok(outcome)
+    }
+
+    /// Read bounded opaque metadata under the existing lifecycle/mutation operation gate.
+    pub async fn metadata(
+        &self,
+        id: &SessionId,
+        target: super::MetadataTarget,
+    ) -> super::SessionStoreResult<std::collections::BTreeMap<String, Value>> {
+        let _operation = self.control.session(id.clone()).operation().await;
+        self.store.metadata(id, target).await
     }
 
     /// Atomically set metadata according to `condition` and publish only changed records.
@@ -1293,7 +1362,7 @@ where
     pub async fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> Result<AgentSession> {
         let operation = self.control.session(id.clone()).operation().await;
         let record = AgentSessionRuntime::new(&self.store)
@@ -1303,58 +1372,20 @@ where
         Ok(AgentSession::new(record))
     }
 
-    /// Select a catalog agent immediately for captures beginning after this mutation boundary.
-    ///
-    /// Multiple switches before a run boundary coalesce to the first old name and final new name.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no runtime factory is configured, the agent is absent from the
-    /// current catalog, or the session cannot be loaded or updated.
-    pub async fn switch_agent(
+    /// Transform opaque host configuration under the session mutation boundary.
+    pub async fn update_host_configuration<F>(
         &self,
         id: &SessionId,
-        agent_name: &str,
-    ) -> std::result::Result<AgentSession, AgentSessionRunError> {
-        let factory = self.runtime_factory.as_ref().ok_or_else(|| {
-            super::AgentSessionRuntimeError::Internal(
-                "session runtime factory is not configured".to_owned(),
-            )
-        })?;
-        let mut bundle = factory.bundle_for_agent(agent_name)?;
+        update: F,
+    ) -> Result<AgentSession>
+    where
+        F: FnOnce(&SessionRecord) -> Result<Option<Value>> + Send,
+    {
         let operation = self.control.session(id.clone()).operation().await;
         let current = self.load(id).await?.record;
-        let old_name = current
-            .agent_definition
-            .as_ref()
-            .map_or_else(|| factory.default_agent_name(), |bundle| &bundle.agent_name)
-            .to_owned();
-        let pending = current
-            .agent_definition
-            .as_ref()
-            .and_then(|bundle| bundle.pending_switch_audit.as_ref());
-        let pending_was_emitted = pending.is_some_and(|audit| {
-            current.timeline_events().any(|event| {
-                matches!(
-                    &event.content,
-                    TimelineContent::Json { value }
-                        if value.get("auditId").and_then(Value::as_str)
-                            == Some(audit.id.as_str())
-                )
-            })
-        });
-        let first_old = pending
-            .filter(|_| !pending_was_emitted)
-            .map_or(old_name, |audit| audit.old_name.clone());
-        if first_old != agent_name {
-            bundle.pending_switch_audit = Some(AgentSwitchAudit {
-                id: uuid::Uuid::now_v7().to_string(),
-                old_name: first_old,
-                new_name: agent_name.to_owned(),
-            });
-        }
+        let configuration = update(&current)?;
         let record = AgentSessionRuntime::new(&self.store)
-            .set_agent_definition(id, Some(bundle))
+            .set_agent_definition(id, configuration)
             .await?;
         operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
@@ -1411,29 +1442,6 @@ where
             AgentSessionRunInput::Continue,
             RunConflictPolicy::RejectIfActive,
             limits,
-        )
-        .await
-    }
-
-    /// Submit an external-response resume run.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when runtime resolution or run admission fails.
-    pub async fn resume_external_response(
-        &self,
-        session_id: SessionId,
-        request_id: super::ExternalRequestId,
-        response: Value,
-        policy: RunConflictPolicy,
-    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
-        self.submit(
-            session_id,
-            AgentSessionRunInput::ExternalResponse {
-                request_id,
-                response: ExternalResponse::new(response),
-            },
-            policy,
         )
         .await
     }
@@ -1571,9 +1579,155 @@ where
         policy: RunConflictPolicy,
         limits: AgentRunLimits,
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.submit_configured(session_id, input, policy, limits, None)
+            .await
+    }
+
+    /// Start an isolated helper using a runtime pinned by the trusted consumer.
+    ///
+    /// # Errors
+    /// Rejects an active helper, unavailable session or invalid durable identity.
+    pub async fn start_pinned_helper(
+        &self,
+        session_id: SessionId,
+        runtime: AgentRuntime,
+        validation: Option<crate::agent::completion::CompletionValidation>,
+        limits: AgentRunLimits,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        let mut runtime = runtime;
+        if let Some(validation) = &validation {
+            runtime.max_provider_turns = Some(
+                runtime
+                    .max_provider_turns
+                    .map_or(validation.max_turns, |limit| {
+                        limit.min(validation.max_turns)
+                    }),
+            );
+        }
+        runtime.completion_validation = validation;
+        self.submit_configured(
+            session_id,
+            AgentSessionRunInput::Continue,
+            RunConflictPolicy::RejectIfActive,
+            limits,
+            Some(runtime),
+        )
+        .await
+    }
+
+    /// Execute a host-selected tool in a consumer-owned durable session.
+    ///
+    /// # Errors
+    /// Rejects overlapping ownership or unavailable durable identity.
+    pub async fn start_pinned_host_tool(
+        &self,
+        session_id: SessionId,
+        mut runtime: AgentRuntime,
+        call: crate::ToolCall,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        runtime.completion_validation = None;
+        self.submit_configured(
+            session_id,
+            AgentSessionRunInput::HostTool(call),
+            RunConflictPolicy::RejectIfActive,
+            AgentRunLimits::default(),
+            Some(runtime),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_configured(
+        &self,
+        session_id: SessionId,
+        input: AgentSessionRunInput,
+        policy: RunConflictPolicy,
+        limits: AgentRunLimits,
+        prepared: Option<AgentRuntime>,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.submit_configured_cancellable(session_id, input, policy, limits, prepared, None)
+            .await
+    }
+
+    /// Submit an independently cancellable prompt without merging other submissions.
+    /// The supplied token fences admission and execution; dropping a waiter does not cancel it.
+    ///
+    /// # Errors
+    /// Returns the ordinary admission or runtime-resolution error.
+    pub async fn submit_prompt_cancellable(
+        &self,
+        session_id: SessionId,
+        prompt: String,
+        policy: RunConflictPolicy,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.submit_configured_cancellable(
+            session_id,
+            AgentSessionRunInput::Prompt(prompt),
+            policy,
+            AgentRunLimits::default(),
+            None,
+            Some(cancellation.child_token()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_configured_cancellable(
+        &self,
+        session_id: SessionId,
+        input: AgentSessionRunInput,
+        policy: RunConflictPolicy,
+        limits: AgentRunLimits,
+        prepared: Option<AgentRuntime>,
+        cancellation: Option<CancellationToken>,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         let (outcome_tx, outcome_rx) = oneshot::channel();
-        let handle = AgentSessionRunHandle::new(session_id.clone(), id, outcome_rx);
+        let origin_operation = if cancellation.is_some() {
+            Some(self.control.session(session_id.clone()).operation().await)
+        } else {
+            None
+        };
+        let mut handle = AgentSessionRunHandle::new(session_id.clone(), id, outcome_rx);
+        if let (Some(operation), Some(token)) = (&origin_operation, &cancellation) {
+            let coordinator = self.clone();
+            let session = session_id.clone();
+            let incarnation = operation.incarnation();
+            let token = token.clone();
+            handle =
+                handle.with_cancellation(super::run::AgentSessionRunCancellation::new(move || {
+                    let coordinator = coordinator.clone();
+                    let session = session.clone();
+                    let token = token.clone();
+                    Box::pin(async move {
+                        token.cancel();
+                        let operation = coordinator
+                            .control
+                            .session(session.clone())
+                            .operation()
+                            .await;
+                        if operation.incarnation() != incarnation {
+                            return;
+                        }
+                        let mut coordination = coordinator.active_runs.lock().await;
+                        let Some(state) = coordination.sessions.get_mut(&session) else {
+                            return;
+                        };
+                        if let Some(position) =
+                            state.queued.iter().position(|queued| queued.id == id)
+                        {
+                            let queued = state.queued.remove(position).expect("matched queued run");
+                            cancel_queued(&session, VecDeque::from([queued]), "origin canceled");
+                        }
+                        let projected = state.coordination();
+                        drop(coordination);
+                        coordinator
+                            .control
+                            .publish_coordination(&session, projected);
+                    })
+                }));
+        }
         let mut start = None;
         let disposition;
         let projected;
@@ -1592,10 +1746,12 @@ where
                     RunConflictPolicy::QueueIfActive => {
                         current.queued.push_back(QueuedSessionRun {
                             id,
+                            cancellation: cancellation.clone(),
                             input,
                             outcome_tx,
                             limits,
                             runtime: None,
+                            runtime_factory: self.runtime_factory.clone(),
                             inference_identity: None,
                         });
                         disposition = AgentSessionRunDisposition::Queued {
@@ -1617,10 +1773,12 @@ where
                     RunConflictPolicy::QueueIfActive => {
                         current.queued.push_back(QueuedSessionRun {
                             id,
+                            cancellation: cancellation.clone(),
                             input,
                             outcome_tx,
                             limits,
                             runtime: None,
+                            runtime_factory: self.runtime_factory.clone(),
                             inference_identity: None,
                         });
                         disposition = AgentSessionRunDisposition::Queued {
@@ -1628,7 +1786,7 @@ where
                         };
                     }
                     RunConflictPolicy::ReplaceActive => {
-                        let token = CancellationToken::new();
+                        let token = cancellation.clone().unwrap_or_default();
                         active_run.token.cancel();
                         cancel_queued(
                             &session_id,
@@ -1644,6 +1802,7 @@ where
                             id,
                             token,
                             runtime: None,
+                            runtime_factory: self.runtime_factory.clone(),
                             inference_identity: None,
                             input,
                             outcome_txs: vec![(id, outcome_tx)],
@@ -1654,7 +1813,7 @@ where
                     }
                 }
             } else {
-                let token = CancellationToken::new();
+                let token = cancellation.clone().unwrap_or_default();
                 current.active = Some(ActiveSessionRun {
                     id,
                     token: token.clone(),
@@ -1664,6 +1823,7 @@ where
                     id,
                     token,
                     runtime: None,
+                    runtime_factory: self.runtime_factory.clone(),
                     inference_identity: None,
                     input,
                     outcome_txs: vec![(id, outcome_tx)],
@@ -1675,9 +1835,39 @@ where
             projected = current.coordination();
         }
         self.control.publish_coordination(&session_id, projected);
+        drop(origin_operation);
 
         if let Some(mut start) = start {
-            match self.resolve_runtime_with_identity(&session_id).await {
+            let resolution = if let Some(runtime) = prepared {
+                async {
+                    let captured = if runtime.provider.transient_input().is_some() {
+                        self.capture_runtime_record(&session_id).await?
+                    } else {
+                        self.capture_runtime_record_for_cycle(&session_id).await?
+                    };
+                    let settings =
+                        captured.record.inference_settings.as_ref().ok_or_else(|| {
+                            super::AgentSessionRuntimeError::FailedPrecondition(
+                                "pinned helper requires explicit inference settings".into(),
+                            )
+                        })?;
+                    let identity = SessionRunInferenceIdentity::from_settings(
+                        settings,
+                        captured
+                            .record
+                            .execution_token()
+                            .map_err(session_store_error)?,
+                    );
+                    let _operation = self
+                        .validate_incarnation(&session_id, captured.incarnation)
+                        .await?;
+                    Ok((runtime, identity))
+                }
+                .await
+            } else {
+                self.resolve_runtime_with_identity(&session_id).await
+            };
+            match resolution {
                 Ok((runtime, identity)) => {
                     start.runtime = Some(runtime);
                     start.inference_identity = Some(identity.clone());
@@ -1748,7 +1938,13 @@ where
     }
 
     fn spawn_run(&self, session_id: SessionId, start: SessionRunStart) {
-        let coordinator = self.clone();
+        let mut coordinator = self.clone();
+        coordinator.runtime_factory = start.runtime_factory.clone();
+        if let Some(factory) = &start.runtime_factory {
+            if let Some(events) = &factory.run_events {
+                coordinator.event_sink = Some(events.clone());
+            }
+        }
         let run_id = start.id;
         let run_kind = start.input.kind();
         let span = tracing::info_span!(
@@ -1778,8 +1974,9 @@ where
                 let terminal_state = terminal_state(&outcome);
                 tracing::Span::current().record("terminal_state", terminal_state);
                 tracing::info!(session_id = %session_id.as_str(), run_id, terminal_state, "session run completed");
+                let outcomes = start.outcome_txs;
                 let next = coordinator.complete_active_run(&session_id, run_id, &outcome).await;
-                send_run_outcome(start.outcome_txs, outcome);
+                send_run_outcome(outcomes, outcome);
                 if let Some(next) = next {
                     coordinator.spawn_run(session_id, next);
                 }
@@ -1806,7 +2003,7 @@ where
             self.control.publish_coordination(session_id, projected);
             return None;
         }
-        let next = pop_next_start(current, &self.run_drain);
+        let next = pop_next_start(current, &self.run_drain, session_id);
         if next.is_none() {
             coordination.sessions.remove(session_id);
         }
@@ -1872,10 +2069,15 @@ where
         const COMPLETION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
 
         let handler = self
-            .completion_handler
-            .lock()
-            .expect("completion handler lock poisoned")
-            .clone()?;
+            .runtime_factory
+            .as_ref()
+            .and_then(|factory| factory.run_completion.clone())
+            .or_else(|| {
+                self.completion_handler
+                    .lock()
+                    .expect("completion handler lock poisoned")
+                    .clone()
+            })?;
         let store = self.store.clone();
         let prepared_session_id = session_id.clone();
         let inference_identity = inference_identity.clone();
@@ -1919,15 +2121,11 @@ where
                 });
             let snapshot = crate::SessionRunCompletionSnapshot {
                 session_id: prepared_session_id.clone(),
+                incarnation: record.metadata.incarnation.clone(),
+                revision: record.revision,
                 run_id: format!("session-run:{}:r{run_id}", prepared_session_id.as_str()),
                 terminal_cursor,
                 context_tokens,
-                purpose: record
-                    .metadata
-                    .values
-                    .get("waltr.session.purpose")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
                 provider_key: inference_identity.provider_key,
                 model_id: inference_identity.model_id,
             };
@@ -2074,7 +2272,7 @@ where
             );
             None
         } else {
-            pop_next_start(state, &self.run_drain)
+            pop_next_start(state, &self.run_drain, session_id)
         };
         if state.active.is_none() && state.queued.is_empty() && !state.blocked {
             coordination.sessions.remove(session_id);
@@ -2149,7 +2347,7 @@ where
             return None;
         }
         state.active = None;
-        let next = pop_next_start(state, &self.run_drain);
+        let next = pop_next_start(state, &self.run_drain, session_id);
         if next.is_none() && state.pause.is_none() && !state.blocked {
             coordination.sessions.remove(session_id);
         }
@@ -2188,6 +2386,23 @@ where
             .with_session_run_context(context)
     }
 
+    /// Resume an existing helper task with invocation-local attachments.
+    /// Uses the supplied runtime and the normal session store and middleware.
+    ///
+    /// # Errors
+    /// Rejects unsupported provider APIs or invalid model/input capabilities.
+    pub fn resume_with_transient_input(
+        &self,
+        runtime: &AgentRuntime,
+        session_id: SessionId,
+        input: crate::TransientInput,
+    ) -> crate::Result<AgentRunBuilder<S>> {
+        let builder =
+            AgentRunBuilder::resume_with_transient_input(runtime, session_id, &self.store, input)?;
+        let context = self.run_context(builder.session_id());
+        Ok(builder.with_session_run_context(context))
+    }
+
     /// Return the session store used by this coordinator.
     pub const fn store(&self) -> &S {
         &self.store
@@ -2205,16 +2420,23 @@ where
     ) -> std::result::Result<Vec<SessionTemplateOption>, AgentSessionRunError> {
         let (runtime, middleware_state, incarnation) =
             self.resolve_runtime_for_template_search(session_id).await?;
-        let root = runtime.template_base_dir.as_deref().ok_or_else(|| {
-            super::AgentSessionRuntimeError::Internal("runtime template root is missing".to_owned())
-        })?;
-        let templates = crate::resource::search_session_templates_with_state(
-            root,
-            &runtime,
-            &request,
-            Some(&middleware_state),
-        )
-        .await;
+        let mut middleware_state = middleware_state;
+        let templates = match runtime.host_context.as_ref() {
+            Some(host) => {
+                host.search_templates(
+                    crate::HostContext {
+                        session_id: session_id.as_str(),
+                        turn: 0,
+                        cancellation: tokio_util::sync::CancellationToken::new(),
+                        metadata: None,
+                        state: &mut middleware_state,
+                    },
+                    &request,
+                )
+                .await
+            }
+            None => Ok(Vec::new()),
+        };
         let _operation = self.validate_incarnation(session_id, incarnation).await?;
         Ok(templates?)
     }
@@ -2244,14 +2466,10 @@ where
                 "session runtime factory is not configured".to_owned(),
             )
         })?;
-        let mcp_runtime = self
-            .ensure_mcp_runtime(session_id, record, captured.incarnation, factory)
-            .await
-            .ok()
-            .flatten();
         let runtime = factory
-            .runtime_for_session(record, self.clone(), mcp_runtime)
-            .await;
+            .build_for_discovery(record)
+            .await
+            .map_err(super::AgentSessionRuntimeError::from);
         let _operation = self
             .validate_incarnation(session_id, captured.incarnation)
             .await?;
@@ -2259,7 +2477,10 @@ where
         Ok((runtime, middleware_state, captured.incarnation))
     }
 
-    pub(crate) async fn resolve_runtime(
+    /// Resolve the immutable definition and inference captured in a durable session.
+    /// Hosts may use this only for an exclusively owned helper or concrete-execution session.
+    /// Normal run admission still verifies the session incarnation.
+    pub async fn resolve_runtime(
         &self,
         session_id: &SessionId,
     ) -> std::result::Result<AgentRuntime, AgentSessionRunError> {
@@ -2280,21 +2501,28 @@ where
                 "session runtime settings are required before prompting".to_owned(),
             )
         })?;
-        let inference_identity = SessionRunInferenceIdentity::from_settings(inference_settings);
+        let inference_identity = SessionRunInferenceIdentity::from_settings(
+            inference_settings,
+            record.execution_token().map_err(session_store_error)?,
+        );
         let factory = self.runtime_factory.as_ref().ok_or_else(|| {
             super::AgentSessionRuntimeError::Internal(
                 "session runtime factory is not configured".to_owned(),
             )
         })?;
-        let mcp_runtime = self
-            .ensure_mcp_runtime(session_id, record, captured.incarnation, factory)
-            .await?;
         let runtime = factory
-            .runtime_for_session(record, self.clone(), mcp_runtime)
-            .await;
+            .build(record)
+            .await
+            .map_err(super::AgentSessionRuntimeError::from);
         let _operation = self
             .validate_incarnation(session_id, captured.incarnation)
             .await?;
+        self.store
+            .load(session_id)
+            .await
+            .map_err(session_store_error)?
+            .check_execution_token(&inference_identity.execution_token)
+            .map_err(session_store_error)?;
         Ok((runtime?, inference_identity))
     }
 
@@ -2344,53 +2572,42 @@ where
         let mut record = self.load(session_id).await?.record;
         operation.register_loaded_summary(record.summary());
         let incarnation = operation.incarnation();
-        let Some(audit) = record
-            .agent_definition
+        if let Some(update) = self
+            .runtime_factory
             .as_ref()
-            .and_then(|bundle| bundle.pending_switch_audit.clone())
-        else {
-            return Ok(CapturedRuntimeRecord {
-                record,
-                incarnation,
-            });
-        };
-        let already_appended = record.timeline_events().any(|event| {
-            matches!(
-                &event.content,
-                TimelineContent::Json { value }
-                    if value.get("auditId").and_then(Value::as_str) == Some(audit.id.as_str())
-            )
-        });
-        if !already_appended {
-            let event = PendingTimelineEvent::new(
-                session_id.clone(),
-                record.snapshot().turn,
-                crate::PendingTimelineItemId::New,
-                crate::TimelineEventKind::ItemStarted,
-                Some(crate::TimelineChannel::new("session_info")),
-                TimelineContent::Json {
-                    value: serde_json::json!({
-                        "kind": "agent_switch",
-                        "version": 1,
-                        "auditId": audit.id,
-                        "oldAgentName": audit.old_name,
-                        "newAgentName": audit.new_name,
-                    }),
-                },
-            );
-            let assigned = self
+            .map(|factory| factory.configuration_for_cycle(&record))
+            .transpose()?
+            .flatten()
+        {
+            if !update.timeline.is_empty() {
+                let receipt = self
+                    .store
+                    .append_timeline(
+                        session_id,
+                        record.execution_token().map_err(session_store_error)?,
+                        update.timeline,
+                    )
+                    .await
+                    .map_err(session_store_error)?;
+                record.adopt_commit(receipt.commit);
+                record.append_journal_events(
+                    receipt
+                        .events
+                        .iter()
+                        .cloned()
+                        .map(SessionJournalEvent::Timeline),
+                );
+                self.timeline.publish_all(receipt.events);
+            }
+            record = self
                 .store
-                .append_timeline(session_id, record.revision, vec![event])
+                .set_agent_definition_if_execution(
+                    session_id,
+                    record.execution_token().map_err(session_store_error)?,
+                    update.configuration,
+                )
                 .await
                 .map_err(session_store_error)?;
-            self.timeline.publish_all(assigned);
-            record = self.load(session_id).await?.record;
-        }
-        if let Some(mut bundle) = record.agent_definition.clone() {
-            bundle.pending_switch_audit = None;
-            record = AgentSessionRuntime::new(&self.store)
-                .set_agent_definition(session_id, Some(bundle))
-                .await?;
         }
         operation.publish_host_summary(record.summary());
         Ok(CapturedRuntimeRecord {
@@ -2457,133 +2674,6 @@ where
             )
             .await?;
         Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn ensure_mcp_runtime(
-        &self,
-        session_id: &SessionId,
-        record: &super::SessionRecord,
-        incarnation: super::SessionIncarnation,
-        factory: &AgentSessionRuntimeFactory,
-    ) -> std::result::Result<Option<Arc<McpClientRuntime>>, super::AgentSessionRuntimeError> {
-        let lifecycle = self.mcp_lifecycle.read().await;
-        if lifecycle.shutdown || self.shutdown_token.is_cancelled() {
-            return Err(super::AgentSessionRuntimeError::FailedPrecondition(
-                "session coordinator is shut down".to_owned(),
-            ));
-        }
-        let preparation_guard = self
-            .mcp_preparation_guards
-            .lock()
-            .expect("MCP preparation guard map lock poisoned")
-            .entry(session_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _preparation = preparation_guard.lock().await;
-        let Some(feature) = factory.mcp_feature_for_session(record)? else {
-            let _operation = self.validate_incarnation(session_id, incarnation).await?;
-            self.evict_mcp_runtime(session_id);
-            return Ok(None);
-        };
-        let prepared = factory.prepare_mcp_runtime(&feature).await;
-        let operation = self.validate_incarnation(session_id, incarnation).await?;
-        let prepared = prepared?;
-        let Some(prepared) = prepared else {
-            self.evict_mcp_runtime(session_id);
-            return Ok(None);
-        };
-        let cached = self
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .get(session_id)
-            .cloned();
-        drop(operation);
-        if let Some(cached) = cached
-            && cached.can_reuse(&prepared)
-        {
-            let preflight = factory
-                .preflight_cached_mcp_authentication(
-                    &prepared.connections,
-                    &cached.credentialed_servers,
-                )
-                .await;
-            let _operation = self.validate_incarnation(session_id, incarnation).await?;
-            preflight?;
-            let still_cached = self
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned")
-                .get(session_id)
-                .is_some_and(|current| Arc::ptr_eq(&current.runtime, &cached.runtime));
-            if !still_cached {
-                return Err(stale_runtime_resolution());
-            }
-            return Ok(Some(cached.runtime));
-        }
-        let started = async {
-            let root_uri = factory.mcp_root_uri()?;
-            McpClientRuntime::start(prepared.config, root_uri, CancellationToken::new())
-                .await
-                .map_err(|error| {
-                    mcp_start_error(error.server_key, error.error, &prepared.connections)
-                })
-        }
-        .await;
-        let operation = match self.validate_incarnation(session_id, incarnation).await {
-            Ok(operation) => operation,
-            Err(error) => {
-                if let Ok(runtime) = started {
-                    drop(runtime.shutdown().await);
-                }
-                return Err(error);
-            }
-        };
-        let runtime = started?;
-        let replaced = self
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .insert(
-                session_id.clone(),
-                CachedMcpRuntime {
-                    runtime: Arc::clone(&runtime),
-                    fingerprint: prepared.fingerprint,
-                    credentialed_servers: prepared.credentialed_servers,
-                },
-            );
-        drop(operation);
-        if let Some(replaced) = replaced {
-            self.retire_mcp_runtime(session_id.clone(), replaced.runtime);
-        }
-        Ok(Some(runtime))
-    }
-
-    fn evict_mcp_runtime(&self, session_id: &SessionId) {
-        let evicted = self
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .remove(session_id);
-        if let Some(evicted) = evicted {
-            self.retire_mcp_runtime(session_id.clone(), evicted.runtime);
-        }
-    }
-
-    fn retire_mcp_runtime(
-        &self,
-        session_id: SessionId,
-        runtime: Arc<McpClientRuntime>,
-    ) -> Arc<McpRuntimeRetirement> {
-        let retirement = McpRuntimeRetirement::start(session_id, runtime);
-        let mut retirements = self
-            .retired_mcp_runtimes
-            .lock()
-            .expect("retired MCP runtime lock poisoned");
-        retirements.retain(|retirement| !retirement.completion.is_complete());
-        retirements.push(Arc::clone(&retirement));
-        retirement
     }
 
     async fn validate_pause_owner(
@@ -2721,6 +2811,7 @@ fn start_queued(
         id,
         token,
         runtime: queued.runtime,
+        runtime_factory: queued.runtime_factory,
         inference_identity: queued.inference_identity,
         input: queued.input,
         outcome_txs: vec![(queued.id, queued.outcome_tx)],
@@ -2732,21 +2823,42 @@ fn start_queued(
 fn pop_next_start(
     state: &mut SessionRunState,
     run_drain: &Arc<RunDrain>,
+    session_id: &SessionId,
 ) -> Option<SessionRunStart> {
-    let queued = state.queued.pop_front()?;
-    let token = CancellationToken::new();
+    let queued = loop {
+        let queued = state.queued.pop_front()?;
+        if queued
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            cancel_queued(session_id, VecDeque::from([queued]), "origin canceled");
+        } else {
+            break queued;
+        }
+    };
+    let independently_cancellable = queued.cancellation.is_some();
+    let token = queued.cancellation.unwrap_or_default();
     let id = queued.id;
     let mut input = queued.input;
     let limits = queued.limits;
     let runtime = queued.runtime;
+    let runtime_factory = queued.runtime_factory;
     let inference_identity = queued.inference_identity;
     let mut outcome_txs = vec![(queued.id, queued.outcome_tx)];
     if let AgentSessionRunInput::Prompt(first) = input {
         let mut prompts = vec![first];
         while let Some(next) = state.queued.front() {
             if !matches!(next.input, AgentSessionRunInput::Prompt(_))
+                || independently_cancellable
+                || next.cancellation.is_some()
                 || next.limits != limits
                 || next.runtime.is_some()
+                || !match (&runtime_factory, &next.runtime_factory) {
+                    (Some(left), Some(right)) => left.same_host_binding(right),
+                    (None, None) => true,
+                    _ => false,
+                }
             {
                 break;
             }
@@ -2772,6 +2884,7 @@ fn pop_next_start(
         id,
         token,
         runtime,
+        runtime_factory,
         inference_identity,
         input,
         outcome_txs,
@@ -2796,61 +2909,6 @@ fn stale_runtime_resolution() -> super::AgentSessionRuntimeError {
     super::AgentSessionRuntimeError::FailedPrecondition(
         "session changed during runtime resolution".to_owned(),
     )
-}
-
-fn mcp_start_error(
-    server_key: String,
-    error: crate::LlmError,
-    connections: &[super::runtime_factory::McpResolvedConnection],
-) -> super::AgentSessionRuntimeError {
-    match error {
-        crate::LlmError::McpAuthorization {
-            status,
-            challenge,
-            message,
-        } => {
-            let endpoint = connections
-                .iter()
-                .find(|server| server.key == server_key)
-                .map_or_else(String::new, |server| server.url.clone());
-            let mcp_authorization = Some(Box::new(crate::McpAuthorizationContext {
-                endpoint,
-                http_status: status,
-                resource_metadata_url: challenge
-                    .as_ref()
-                    .and_then(|value| value.resource_metadata.clone()),
-                scope: challenge.as_ref().and_then(|value| value.scope.clone()),
-                error: challenge.as_ref().and_then(|value| value.error.clone()),
-                error_description: challenge
-                    .as_ref()
-                    .and_then(|value| value.error_description.clone()),
-                error_uri: challenge.as_ref().and_then(|value| value.error_uri.clone()),
-                realm: challenge.as_ref().and_then(|value| value.realm.clone()),
-            }));
-            super::AgentSessionRuntimeError::Authentication {
-                target: crate::AuthTarget::mcp_server(server_key),
-                message,
-                reason: crate::AuthenticationFailureReason::CredentialRequired,
-                mcp_authorization,
-            }
-        }
-        crate::LlmError::Authorization { message, .. } => {
-            super::AgentSessionRuntimeError::Authentication {
-                target: crate::AuthTarget::mcp_server(server_key),
-                message,
-                reason: crate::AuthenticationFailureReason::CredentialRequired,
-                mcp_authorization: None,
-            }
-        }
-        error => super::AgentSessionRuntimeError::from(error),
-    }
-}
-
-async fn shutdown_when_unused(runtime: Arc<McpClientRuntime>) -> Result<()> {
-    while Arc::strong_count(&runtime) > 1 {
-        tokio::task::yield_now().await;
-    }
-    runtime.shutdown().await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2900,7 +2958,37 @@ where
                 }
             },
         };
+        let validated = runtime.completion_validation.is_some();
+        let mut context = coordinator.run_context(&session_id);
+        if let Some(identity) = coordinator.active_runs.lock().await.sessions.get(&session_id)
+            .and_then(|state| state.active.as_ref()).filter(|active| active.id == run_id)
+            .and_then(|active| active.inference_identity.as_ref()) {
+            context = context.with_execution_token(identity.execution_token.clone());
+        }
+        let mut stream = if let AgentSessionRunInput::HostTool(call) = input {
+            let run = super::compat::EphemeralSessionRun {
+                provider: runtime.provider,
+                model: runtime.model,
+                model_cost: runtime.model_cost,
+                input: ResumeInput::Continue,
+                system_prompt_override: None,
+                tools: runtime.tools,
+                middleware_chain: runtime.middleware_chain,
+                retry_config: runtime.retry_config,
+
+                max_provider_turns: runtime.max_provider_turns,
+                host_context: runtime.host_context,
+                session_id: session_id.clone(),
+                session_store: coordinator.store.clone(),
+                session_run_context: Some(context),
+                cancellation_token: token.clone(),
+                event_sink: coordinator.event_sink.clone(),
+                completion_validation: None,
+            };
+            crate::agent::r#loop::AgentLoopState::direct_tool_stream(run, call).await?
+        } else {
         let builder = match input {
+            AgentSessionRunInput::HostTool(_) => unreachable!(),
             AgentSessionRunInput::Continue => {
                 coordinator.resume(&runtime, session_id.clone(), ResumeInput::Continue)
             }
@@ -2910,33 +2998,27 @@ where
             AgentSessionRunInput::Prompts(prompts) => {
                 coordinator.resume(&runtime, session_id.clone(), ResumeInput::Prompts(prompts))
             }
-            AgentSessionRunInput::ExternalResponse {
-                request_id,
-                response,
-            } => coordinator.resume(
-                &runtime,
-                session_id.clone(),
-                ResumeInput::ExternalResponse {
-                    request_id,
-                    response,
-                },
-            ),
             AgentSessionRunInput::ToolResults(results) => coordinator.resume(
                 &runtime,
                 session_id.clone(),
                 ResumeInput::ToolResults(results),
             ),
-        }
+        }.with_session_run_context(context)
         .with_run_limits(limits);
-        let mut stream = builder.with_cancellation_token(token.clone()).stream();
+        builder.with_cancellation_token(token.clone()).stream()
+        };
 
         let mut assistant_text = String::new();
         while let Some(event) = stream.next().await {
             let event = event?;
-            if is_assistant_text_delta(&event)
+            if !validated && is_assistant_text_delta(&event)
                 && let TimelineContent::TextDelta { delta } = &event.content
             {
                 assistant_text.push_str(delta);
+            }
+            if validated && event.channel.as_ref().is_some_and(|channel| channel.as_str() == CHANNEL_ASSISTANT_TEXT)
+                && let TimelineContent::TextSnapshot { text, .. } = &event.content {
+                assistant_text.clone_from(text);
             }
         }
 
@@ -2999,9 +3081,6 @@ const fn terminal_state(outcome: &RunResult) -> &'static str {
     match outcome {
         Ok(outcome) => match &outcome.status {
             SessionStatus::Failed { .. } => "error",
-            SessionStatus::Suspended(super::Suspension::AwaitingExternalInput { .. }) => {
-                "external_request"
-            }
             SessionStatus::Suspended(super::Suspension::AwaitingToolResults { .. }) => {
                 "awaiting_tool_results"
             }
@@ -3026,6 +3105,13 @@ const fn terminal_state(outcome: &RunResult) -> &'static str {
     }
 }
 
+fn coordinator_error(message: &str) -> LlmError {
+    LlmError::Protocol {
+        provider: "session-host",
+        message: message.into(),
+    }
+}
+
 fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
     crate::LlmError::Protocol {
         provider: "session-store",
@@ -3035,7 +3121,6 @@ fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::runtime_factory::test_sandbox::worker_handle;
     use std::{
         num::NonZeroU64,
         sync::{
@@ -3051,8 +3136,7 @@ mod tests {
     use super::*;
     use crate::{
         BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem,
-        CompletionRequest, ExternalRequestKind, LlmStream, ModelApi, ModelRef,
-        PendingTimelineEvent, PermissionLevel, PermissionPattern, PermissionResponse, ProviderId,
+        CompletionRequest, LlmStream, ModelApi, ModelRef, PendingTimelineEvent, ProviderId,
         Revision, SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
         SessionCompletionCoordinationPreparation, SessionCopy, SessionJournalEvent, SessionRecord,
         SessionStart, SessionStartMessage, SessionStatus, SessionStoreResult, SessionTimelineEvent,
@@ -3233,9 +3317,26 @@ mod tests {
         inner: MemorySessionStore,
         delay_next_load: Arc<std::sync::atomic::AtomicBool>,
         entered: Arc<Notify>,
+        configuration_barrier: Option<Arc<(Notify, Notify)>>,
     }
 
     impl SessionStore for SlowLoadStore {
+        async fn set_agent_definition_if_execution(
+            &self,
+            id: &SessionId,
+            expected: crate::ExecutionToken,
+            definition: Option<Value>,
+        ) -> SessionStoreResult<SessionRecord> {
+            if let Some(barrier) = &self.configuration_barrier {
+                barrier.0.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), barrier.1.notified())
+                    .await
+                    .unwrap();
+            }
+            self.inner
+                .set_agent_definition_if_execution(id, expected, definition)
+                .await
+        }
         fn create(
             &self,
             request: SessionCreateRequest,
@@ -3276,28 +3377,28 @@ mod tests {
         fn append_timeline(
             &self,
             id: &SessionId,
-            revision: Revision,
+            revision: crate::ExecutionToken,
             events: Vec<PendingTimelineEvent>,
-        ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send
+        ) -> impl std::future::Future<Output = SessionStoreResult<crate::TimelineAppendReceipt>> + Send
         {
             self.inner.append_timeline(id, revision, events)
         }
         fn append_journal(
             &self,
             id: &SessionId,
-            revision: Revision,
+            revision: crate::ExecutionToken,
             events: Vec<SessionJournalEvent>,
-        ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        ) -> impl std::future::Future<Output = SessionStoreResult<crate::SessionCommitReceipt>> + Send
+        {
             self.inner.append_journal(id, revision, events)
         }
-        fn mutate_masks(
+        fn mutate(
             &self,
             id: &SessionId,
-            mutation: super::SessionMaskMutation,
-        ) -> impl std::future::Future<
-            Output = SessionStoreResult<super::SessionMaskMutationOutcome>,
-        > + Send {
-            self.inner.mutate_masks(id, mutation)
+            mutation: crate::SessionMutation,
+        ) -> impl std::future::Future<Output = SessionStoreResult<crate::SessionMutationOutcome>> + Send
+        {
+            self.inner.mutate(id, mutation)
         }
         fn set_metadata_value_conditionally(
             &self,
@@ -3327,7 +3428,7 @@ mod tests {
         fn set_agent_definition(
             &self,
             id: &SessionId,
-            definition: Option<AgentDefinitionBundle>,
+            definition: Option<serde_json::Value>,
         ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
             self.inner.set_agent_definition(id, definition)
         }
@@ -3425,7 +3526,7 @@ mod tests {
                     failure: crate::AuthenticationFailure {
                         target: crate::AuthTarget::provider("configured-provider"),
                         reason: crate::AuthenticationFailureReason::CredentialRejected,
-                        mcp_authorization: None,
+                        host_context: None,
                     },
                     message: "provider rejected the configured credential".to_owned(),
                 })
@@ -3551,7 +3652,7 @@ mod tests {
 
     fn create_request(
         inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
         metadata_values: BTreeMap<String, Value>,
     ) -> SessionCreateRequest {
         let mut request = SessionCreateRequest::new(SessionId::generate());
@@ -3561,51 +3662,37 @@ mod tests {
         request
     }
 
-    fn empty_test_agent() -> crate::ResolvedAgent {
-        let mut registry = crate::AgentDefinitionRegistry::new();
-        registry
-            .load_yaml(
-                r"
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: test }
-spec: {}
-",
-            )
-            .expect("load test definition");
-        registry.resolve_agent("test").expect("resolve test agent")
-    }
-
-    fn mcp_test_agent() -> crate::ResolvedAgent {
-        let mut registry = crate::AgentDefinitionRegistry::new();
-        registry
-            .load_yaml(
-                r"
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: test }
-spec: { features: [{ featureSetRef: { name: mcp } }] }
----
-apiVersion: waltr.dev/v1alpha1
-kind: FeatureSet
-metadata: { name: mcp }
-spec: { mcp: {} }
-",
-            )
-            .expect("load MCP test definition");
-        registry.resolve_agent("test").expect("resolve test agent")
+    fn with_fake_host(factory: AgentSessionRuntimeFactory) -> AgentSessionRuntimeFactory {
+        struct ProviderHost(AgentSessionRuntimeFactory);
+        impl crate::AgentHostRuntimeFactory for ProviderHost {
+            fn build<'a>(&'a self, record: &'a SessionRecord) -> crate::HostRuntimeFuture<'a> {
+                Box::pin(async move {
+                    let settings = record.inference_settings.as_ref().ok_or_else(|| {
+                        crate::LlmError::Protocol {
+                            provider: "test-host",
+                            message: "inference settings required".into(),
+                        }
+                    })?;
+                    self.0
+                        .provider_builder(settings)
+                        .await
+                        .map(|builder| builder.build())
+                        .map_err(|error| AgentSessionRunError::from(error).into())
+                })
+            }
+        }
+        factory
+            .clone()
+            .with_host_runtime_factory(Arc::new(ProviderHost(factory)))
     }
 
     async fn runtime_sessions<P>(provider: Arc<P>) -> SessionCoordinator<MemorySessionStore>
     where
         P: LlmStream + 'static,
     {
-        let environment = AgentSessionRuntimeFactory::new(
-            worker_handle(std::env::temp_dir()).await,
-            std::env::temp_dir(),
-            FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-queue-test-auth.json")),
-            empty_test_agent(),
-        )
+        let environment = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+            std::env::temp_dir().join("waltr-agent-queue-test-auth.json"),
+        ))
         .with_runtime_provider(move |_| {
             Ok(crate::AgentRuntimeProvider::new(
                 ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
@@ -3613,7 +3700,8 @@ spec: { mcp: {} }
             ))
         });
 
-        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
+        SessionCoordinator::new(MemorySessionStore::new())
+            .with_runtime_factory(with_fake_host(environment))
     }
 
     async fn completed_session(sessions: &SessionCoordinator<MemorySessionStore>) -> SessionId {
@@ -3626,7 +3714,10 @@ spec: {}
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
-                Some(AgentDefinitionBundle::new("test", vec![source.to_owned()])),
+                Some(crate::agent::session::opaque_test_configuration(
+                    "test",
+                    vec![source.to_owned()],
+                )),
                 BTreeMap::new(),
             ))
             .await
@@ -3690,25 +3781,12 @@ spec: {}
         );
     }
 
-    async fn establish_incarnation(
-        sessions: &SessionCoordinator<MemorySessionStore>,
-        record: &SessionRecord,
-    ) -> crate::agent::session::SessionIncarnation {
-        let operation = sessions
-            .control
-            .session(record.id.clone())
-            .operation()
-            .await;
-        operation.register_loaded_summary(record.summary());
-        operation.incarnation()
-    }
-
     fn authentication_runtime_error() -> crate::AgentSessionRuntimeError {
         crate::AgentSessionRuntimeError::Authentication {
             target: crate::AuthTarget::provider("configured-provider"),
             message: "provider OAuth credential is required".to_owned(),
             reason: crate::AuthenticationFailureReason::CredentialRequired,
-            mcp_authorization: None,
+            host_context: None,
         }
     }
 
@@ -3862,6 +3940,7 @@ spec: {}
             crate::SessionEvent::UserMessageCreated {
                 id: "user-message:atomic-initial:j3".to_owned(),
                 session_id: id,
+                incarnation: session.record.metadata.incarnation.clone(),
                 prompt_index: 1,
                 user_message_count: 2,
                 text,
@@ -3914,559 +3993,6 @@ spec: {}
         }
 
         assert!(sink.events.lock().expect("event sink lock").is_empty());
-    }
-
-    #[tokio::test]
-    async fn wipe_sessions_clears_records_cached_mcp_runtimes_and_publishes_once() {
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let first = sessions
-            .create(SessionCreateRequest::new(SessionId::generate()))
-            .await
-            .unwrap();
-        let second = sessions
-            .create(SessionCreateRequest::new(SessionId::generate()))
-            .await
-            .unwrap();
-        for session_id in [&first.record.id, &second.record.id] {
-            let runtime = McpClientRuntime::start(
-                crate::mcp::McpConfig::new(),
-                "file:///tmp".to_owned(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            sessions
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned")
-                .insert(
-                    session_id.clone(),
-                    CachedMcpRuntime {
-                        runtime,
-                        fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                            trace_propagation: false,
-                            connections: Vec::new(),
-                        },
-                        credentialed_servers: BTreeSet::new(),
-                    },
-                );
-        }
-        let mut watch = sessions.watch_sessions();
-
-        sessions.wipe_sessions().await.unwrap();
-
-        assert!(sessions.list().await.unwrap().is_empty());
-        assert!(
-            sessions
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned")
-                .is_empty()
-        );
-        let update = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
-            .await
-            .unwrap()
-            .expect("wipe should publish");
-        assert_eq!(update.sequence, 3);
-        assert_eq!(update.event, SessionListEvent::Cleared);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), watch.next())
-                .await
-                .is_err(),
-            "wipe should publish exactly one event"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_atomically_drains_cached_mcp_runtimes() {
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let session_id = SessionId::new("shutdown-mcp-cache");
-        let runtime = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .insert(
-                session_id,
-                CachedMcpRuntime {
-                    runtime,
-                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                        trace_propagation: false,
-                        connections: Vec::new(),
-                    },
-                    credentialed_servers: BTreeSet::new(),
-                },
-            );
-
-        sessions.shutdown().await;
-
-        assert!(
-            sessions
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned")
-                .is_empty()
-        );
-        assert!(
-            sessions
-                .mcp_preparation_guards
-                .lock()
-                .expect("MCP preparation guard map lock poisoned")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_shutdown_callers_wait_for_the_same_runtime_drain() {
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let session_id = SessionId::new("concurrent-shutdown-mcp-cache");
-        let runtime = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let held = Arc::clone(&runtime);
-        sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .insert(
-                session_id,
-                CachedMcpRuntime {
-                    runtime,
-                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                        trace_propagation: false,
-                        connections: Vec::new(),
-                    },
-                    credentialed_servers: BTreeSet::new(),
-                },
-            );
-
-        let first = tokio::spawn({
-            let sessions = sessions.clone();
-            async move { sessions.shutdown().await }
-        });
-        tokio::task::yield_now().await;
-        first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
-        let second = tokio::spawn({
-            let sessions = sessions.clone();
-            async move { sessions.shutdown().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!second.is_finished());
-
-        drop(held);
-        tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_awaits_a_runtime_retired_before_cache_drain() {
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let runtime = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let held = Arc::clone(&runtime);
-        let retirement =
-            sessions.retire_mcp_runtime(SessionId::new("retired-before-shutdown"), runtime);
-        let waiter = tokio::spawn({
-            let retirement = Arc::clone(&retirement);
-            async move { retirement.wait().await }
-        });
-        tokio::task::yield_now().await;
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-
-        let shutdown = tokio::spawn({
-            let sessions = sessions.clone();
-            async move { sessions.shutdown().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!shutdown.is_finished());
-
-        drop(held);
-        tokio::time::timeout(Duration::from_secs(1), shutdown)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn resolved_agent_without_mcp_skips_runtime_configuration_and_start() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let mut definitions = crate::AgentDefinitionRegistry::new();
-        definitions
-            .load_yaml(
-                r"
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: no-mcp }
-spec: {}
-",
-            )
-            .expect("load definition");
-        let factory = AgentSessionRuntimeFactory::new(
-            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            definitions
-                .resolve_agent("no-mcp")
-                .expect("resolve definition"),
-        );
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let record = SessionRecord::new("no-mcp-session");
-        let incarnation = establish_incarnation(&sessions, &record).await;
-
-        let runtime = sessions
-            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
-            .await
-            .expect("disabled MCP should skip invalid configuration");
-
-        assert!(runtime.is_none());
-        assert!(
-            sessions
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_resolution_evicts_cache_while_active_arc_survives() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let factory = AgentSessionRuntimeFactory::new(
-            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            mcp_test_agent(),
-        )
-        .with_mcp_connection_resolver(|_| Box::pin(async { Ok(Vec::new()) }));
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let record = SessionRecord::new("empty-eviction");
-        let incarnation = establish_incarnation(&sessions, &record).await;
-        let runtime = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("empty MCP runtime should start");
-        let active_user = Arc::clone(&runtime);
-        sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .insert(
-                record.id.clone(),
-                CachedMcpRuntime {
-                    runtime,
-                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                        trace_propagation: false,
-                        connections: Vec::new(),
-                    },
-                    credentialed_servers: BTreeSet::new(),
-                },
-            );
-
-        let resolved = sessions
-            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
-            .await
-            .expect("empty resolution succeeds");
-
-        assert!(resolved.is_none());
-        assert!(
-            sessions
-                .mcp_sessions
-                .lock()
-                .expect("MCP runtime cache lock poisoned")
-                .is_empty()
-        );
-        assert!(!active_user.has_server("missing"));
-    }
-
-    #[tokio::test]
-    async fn failed_replacement_preserves_but_does_not_return_cached_runtime() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let connection = super::super::runtime_factory::McpResolvedConnection {
-            key: "broken".to_owned(),
-            kind: super::super::runtime_factory::McpConnectionKind::Stdio,
-            command: "/definitely/missing/waltr-mcp-server".to_owned(),
-            url: String::new(),
-        };
-        let resolver_connection = connection.clone();
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(directory.path()).await,
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            mcp_test_agent(),
-        )
-        .with_mcp_connection_resolver(move |_| {
-            let connection = resolver_connection.clone();
-            Box::pin(async move { Ok(vec![connection]) })
-        });
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let record = SessionRecord::new("failed-replacement");
-        let incarnation = establish_incarnation(&sessions, &record).await;
-        let old = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("empty MCP runtime should start");
-        sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .insert(
-                record.id.clone(),
-                CachedMcpRuntime {
-                    runtime: Arc::clone(&old),
-                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                        trace_propagation: true,
-                        connections: Vec::new(),
-                    },
-                    credentialed_servers: BTreeSet::new(),
-                },
-            );
-
-        assert!(
-            sessions
-                .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
-                .await
-                .is_err(),
-            "failed reconstruction must not return stale tools"
-        );
-        let stored = sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .get(&record.id)
-            .expect("old cache remains stored")
-            .runtime
-            .clone();
-        assert!(Arc::ptr_eq(&stored, &old));
-    }
-
-    #[tokio::test]
-    async fn mcp_start_rejects_missing_worker_root_without_replacing_cached_runtime() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let factory = AgentSessionRuntimeFactory::new(
-            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            mcp_test_agent(),
-        )
-        .with_mcp_connection_resolver(|_| {
-            Box::pin(async {
-                Ok(vec![super::super::runtime_factory::McpResolvedConnection {
-                    key: "broken".to_owned(),
-                    kind: super::super::runtime_factory::McpConnectionKind::Stdio,
-                    command: "/definitely/missing/waltr-mcp-server".to_owned(),
-                    url: String::new(),
-                }])
-            })
-        });
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let record = SessionRecord::new("missing-mcp-worker-root");
-        let incarnation = establish_incarnation(&sessions, &record).await;
-
-        let error = sessions
-            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
-            .await
-            .expect_err("configured root must not start MCP without the worker");
-        assert!(matches!(
-            error,
-            super::super::AgentSessionRuntimeError::FailedPrecondition(message)
-                if message == "sandbox worker root is unavailable"
-        ));
-        assert!(sessions.mcp_sessions.lock().unwrap().is_empty());
-
-        let old = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("empty MCP runtime should start");
-        sessions.mcp_sessions.lock().unwrap().insert(
-            record.id.clone(),
-            CachedMcpRuntime {
-                runtime: Arc::clone(&old),
-                fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                    trace_propagation: false,
-                    connections: Vec::new(),
-                },
-                credentialed_servers: BTreeSet::new(),
-            },
-        );
-        let error = sessions
-            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
-            .await
-            .expect_err("missing worker root must not return cached MCP runtime");
-        assert!(matches!(
-            error,
-            super::super::AgentSessionRuntimeError::FailedPrecondition(message)
-                if message == "sandbox worker root is unavailable"
-        ));
-        assert!(Arc::ptr_eq(
-            &sessions.mcp_sessions.lock().unwrap()[&record.id].runtime,
-            &old
-        ));
-    }
-
-    #[tokio::test]
-    async fn provider_only_inference_update_preserves_and_reuses_cached_mcp_runtime() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let connection = super::super::runtime_factory::McpResolvedConnection {
-            key: "current".to_owned(),
-            kind: super::super::runtime_factory::McpConnectionKind::StreamableHttp,
-            command: String::new(),
-            url: "https://mcp.example/rpc".to_owned(),
-        };
-        let resolver_connection = connection.clone();
-        let factory = AgentSessionRuntimeFactory::new(
-            crate::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            mcp_test_agent(),
-        )
-        .with_mcp_connection_resolver(move |_| {
-            let connection = resolver_connection.clone();
-            Box::pin(async move { Ok(vec![connection]) })
-        });
-        let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let session = sessions
-            .create(create_request(
-                Some(test_inference_settings()),
-                None,
-                BTreeMap::new(),
-            ))
-            .await
-            .expect("create session");
-        let runtime = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("empty MCP runtime should start");
-        let active_user = Arc::clone(&runtime);
-        sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .insert(
-                session.record.id.clone(),
-                CachedMcpRuntime {
-                    runtime: Arc::clone(&runtime),
-                    fingerprint: super::super::runtime_factory::McpRuntimeFingerprint {
-                        trace_propagation: true,
-                        connections: vec![
-                            super::super::runtime_factory::McpRuntimeFingerprintConnection::from_resolved(
-                                &connection,
-                            ),
-                        ],
-                    },
-                    credentialed_servers: BTreeSet::new(),
-                },
-            );
-        let mut updated_settings = test_inference_settings();
-        updated_settings.provider.model_id = "updated-model".to_owned();
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            sessions.set_inference_settings(&session.record.id, Some(updated_settings)),
-        )
-        .await
-        .expect("provider-only update must not wait for active MCP users")
-        .expect("update inference settings");
-
-        let stored = sessions
-            .mcp_sessions
-            .lock()
-            .expect("MCP runtime cache lock poisoned")
-            .get(&session.record.id)
-            .expect("MCP cache remains stored")
-            .runtime
-            .clone();
-        assert!(Arc::ptr_eq(&stored, &runtime));
-        let current_record = sessions
-            .load(&session.record.id)
-            .await
-            .expect("load updated session")
-            .record;
-        let incarnation = establish_incarnation(&sessions, &current_record).await;
-        let reused = sessions
-            .ensure_mcp_runtime(&session.record.id, &current_record, incarnation, &factory)
-            .await
-            .expect("reconstruct MCP runtime")
-            .expect("MCP runtime remains selected");
-        assert!(Arc::ptr_eq(&reused, &runtime));
-        assert!(Arc::ptr_eq(&active_user, &runtime));
-    }
-
-    #[tokio::test]
-    async fn newly_available_mcp_credentials_prevent_anonymous_runtime_reuse() {
-        let runtime = McpClientRuntime::start(
-            crate::mcp::McpConfig::new(),
-            "file:///tmp".to_owned(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("empty MCP runtime should start");
-        let fingerprint = super::super::runtime_factory::McpRuntimeFingerprint {
-            trace_propagation: true,
-            connections: vec![
-                super::super::runtime_factory::McpRuntimeFingerprintConnection {
-                    key: "protected".to_owned(),
-                    kind: super::super::runtime_factory::McpConnectionKind::StreamableHttp,
-                    target: "https://mcp.example/rpc".to_owned(),
-                },
-            ],
-        };
-        let cached = CachedMcpRuntime {
-            runtime,
-            fingerprint: fingerprint.clone(),
-            credentialed_servers: BTreeSet::new(),
-        };
-        let authenticated = super::super::runtime_factory::PreparedMcpRuntime {
-            fingerprint,
-            connections: vec![super::super::runtime_factory::McpResolvedConnection {
-                key: "protected".to_owned(),
-                kind: super::super::runtime_factory::McpConnectionKind::StreamableHttp,
-                command: String::new(),
-                url: "https://mcp.example/rpc".to_owned(),
-            }],
-            config: crate::mcp::McpConfig::new(),
-            credentialed_servers: BTreeSet::from(["protected".to_owned()]),
-        };
-
-        assert!(
-            !cached.can_reuse(&authenticated),
-            "anonymous transport must be replaced when bearer capability appears"
-        );
-        let equivalent = super::super::runtime_factory::PreparedMcpRuntime {
-            credentialed_servers: BTreeSet::new(),
-            ..authenticated
-        };
-        assert!(cached.can_reuse(&equivalent));
     }
 
     #[tokio::test]
@@ -4537,7 +4063,7 @@ spec: {}
     #[tokio::test]
     async fn runtime_creation_preserves_agent_definition_bundle() {
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let bundle = AgentDefinitionBundle::new(
+        let bundle = crate::agent::session::opaque_test_configuration(
             "selected",
             vec![
                 r"apiVersion: waltr.dev/v1alpha1
@@ -4555,439 +4081,6 @@ spec: {}
             .expect("create session with agent definition");
 
         assert_eq!(created.record.agent_definition, Some(bundle));
-    }
-
-    async fn catalog_runtime_sessions() -> SessionCoordinator<MemorySessionStore> {
-        let source = r"
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: alpha }
-spec: { systemPrompt: alpha prompt }
----
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: beta }
-spec: { systemPrompt: beta prompt }
----
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: gamma }
-spec: { systemPrompt: gamma prompt }
-";
-        let catalog =
-            crate::AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "alpha").unwrap();
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(std::env::temp_dir()).await,
-            std::env::temp_dir(),
-            FileCredentialStore::new(
-                std::env::temp_dir().join("waltr-agent-switch-test-auth.json"),
-            ),
-            catalog.resolved("alpha").unwrap().clone(),
-        )
-        .with_agent_catalog(catalog)
-        .with_runtime_provider(|_| {
-            Ok(crate::AgentRuntimeProvider::new(
-                ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
-                Arc::new(TextOnlyProvider),
-            ))
-        });
-        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory)
-    }
-
-    #[tokio::test]
-    async fn switch_is_immediate_but_audit_waits_for_next_cycle_and_coalesces() {
-        let sessions = catalog_runtime_sessions().await;
-        let session = sessions
-            .create(create_request(
-                Some(test_inference_settings()),
-                None,
-                BTreeMap::new(),
-            ))
-            .await
-            .unwrap();
-        let id = session.record.id;
-
-        let beta = sessions.switch_agent(&id, "beta").await.unwrap();
-        assert_eq!(beta.record.summary().agent_name.as_deref(), Some("beta"));
-        sessions.switch_agent(&id, "gamma").await.unwrap();
-        assert!(
-            sessions
-                .timeline(&id, TimelineQuery::forward(None, 20))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        let captured = sessions
-            .capture_runtime_record_for_cycle(&id)
-            .await
-            .unwrap();
-        assert_eq!(
-            captured
-                .record
-                .agent_definition
-                .as_ref()
-                .unwrap()
-                .agent_name,
-            "gamma"
-        );
-        assert!(
-            captured
-                .record
-                .agent_definition
-                .as_ref()
-                .unwrap()
-                .pending_switch_audit
-                .is_none()
-        );
-        let events = sessions
-            .timeline(&id, TimelineQuery::forward(None, 20))
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        let TimelineContent::Json { value } = &events[0].content else {
-            panic!("switch audit must be JSON");
-        };
-        assert_eq!(value["kind"], "agent_switch");
-        assert_eq!(value["oldAgentName"], "alpha");
-        assert_eq!(value["newAgentName"], "gamma");
-        assert!(value.get("source").is_none());
-        assert!(value.get("prompt").is_none());
-
-        sessions
-            .capture_runtime_record_for_cycle(&id)
-            .await
-            .unwrap();
-        assert_eq!(
-            sessions
-                .timeline(&id, TimelineQuery::forward(None, 20))
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn switch_after_capture_does_not_change_captured_cycle_bundle() {
-        let sessions = catalog_runtime_sessions().await;
-        let session = sessions
-            .create(create_request(
-                Some(test_inference_settings()),
-                None,
-                BTreeMap::new(),
-            ))
-            .await
-            .unwrap();
-        let id = session.record.id;
-        let before = sessions
-            .capture_runtime_record_for_cycle(&id)
-            .await
-            .unwrap();
-
-        sessions.switch_agent(&id, "beta").await.unwrap();
-
-        assert!(before.record.agent_definition.is_none());
-        let after = sessions
-            .capture_runtime_record_for_cycle(&id)
-            .await
-            .unwrap();
-        assert_eq!(after.record.agent_definition.unwrap().agent_name, "beta");
-    }
-
-    #[tokio::test]
-    async fn missing_catalog_agent_fails_without_mutating_selection() {
-        let sessions = catalog_runtime_sessions().await;
-        let session = sessions
-            .create(SessionCreateRequest::new(SessionId::generate()))
-            .await
-            .unwrap();
-
-        assert!(
-            sessions
-                .switch_agent(&session.record.id, "missing")
-                .await
-                .is_err()
-        );
-        assert!(
-            sessions
-                .load(&session.record.id)
-                .await
-                .unwrap()
-                .record
-                .agent_definition
-                .is_none()
-        );
-    }
-
-    struct SwitchPermissionProvider;
-
-    impl LlmStream for SwitchPermissionProvider {
-        fn name(&self) -> &'static str {
-            "switch_permission_provider"
-        }
-
-        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            Box::pin(async move {
-                let events = if request.tool_results().next().is_some() {
-                    vec![Ok(CompletionEvent::Finished)]
-                } else {
-                    vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
-                        "question-call",
-                        "question",
-                        json!({
-                            "questions": [{
-                                "question": "Continue?",
-                                "header": "Switch",
-                                "options": [{ "label": "Yes", "description": "Continue" }],
-                                "multiple": false,
-                                "custom": false
-                            }]
-                        }),
-                    )))]
-                };
-                Ok(Box::pin(stream::iter(events)) as BoxCompletionStream)
-            })
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn switched_deny_constrains_retained_allow_always_approval() {
-        let source = r"
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: alpha }
-spec:
-  permissions: [{ name: question, permission: ask }]
----
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: beta }
-spec:
-  permissions: [{ name: question, permission: deny }]
-";
-        let catalog =
-            crate::AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "alpha").unwrap();
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(std::env::temp_dir()).await,
-            std::env::temp_dir(),
-            FileCredentialStore::new(
-                std::env::temp_dir().join("waltr-agent-switch-permission-auth.json"),
-            ),
-            catalog.resolved("alpha").unwrap().clone(),
-        )
-        .with_agent_catalog(catalog)
-        .with_runtime_provider(|_| {
-            Ok(crate::AgentRuntimeProvider::new(
-                ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
-                Arc::new(SwitchPermissionProvider),
-            ))
-        });
-        let sessions =
-            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
-        let session = sessions
-            .create(create_request(
-                Some(test_inference_settings()),
-                None,
-                BTreeMap::new(),
-            ))
-            .await
-            .unwrap();
-        let id = session.record.id;
-        let initial = sessions
-            .submit_prompt(id.clone(), "ask", RunConflictPolicy::ReplaceActive)
-            .await
-            .unwrap();
-        initial.handle.wait().await.unwrap();
-        let record = sessions.load(&id).await.unwrap().record;
-        let permission_request = record
-            .snapshot()
-            .external_requests
-            .into_iter()
-            .find(|request| request.kind == ExternalRequestKind::Permission)
-            .expect("alpha should request whole-tool permission");
-        let patterns: Vec<PermissionPattern> =
-            serde_json::from_value(permission_request.payload["patterns"].clone()).unwrap();
-
-        sessions.switch_agent(&id, "beta").await.unwrap();
-        let resumed = sessions
-            .resume_external_response(
-                id.clone(),
-                permission_request.id,
-                json!(PermissionResponse::AllowAlways {
-                    patterns: patterns.clone(),
-                }),
-                RunConflictPolicy::ReplaceActive,
-            )
-            .await
-            .unwrap();
-        resumed.handle.wait().await.unwrap();
-
-        let record = sessions.load(&id).await.unwrap().record;
-        let snapshot = record.snapshot();
-        assert_eq!(
-            snapshot.middleware_state["permissions"]["patterns"],
-            json!(patterns)
-        );
-        let beta_runtime = sessions.resolve_runtime(&id).await.unwrap();
-        assert_eq!(
-            beta_runtime.permission_policy.evaluate_tool("question"),
-            PermissionLevel::Deny
-        );
-        assert!(
-            snapshot
-                .external_requests
-                .iter()
-                .all(|request| request.kind != ExternalRequestKind::Question)
-        );
-        assert!(snapshot.tool_results().any(|result| {
-            result.call_id == "question-call"
-                && result.is_error
-                && result.content.contains("tool is not permitted: question")
-        }));
-    }
-
-    struct SwitchTaskProvider;
-
-    impl LlmStream for SwitchTaskProvider {
-        fn name(&self) -> &'static str {
-            "switch_task_provider"
-        }
-
-        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            Box::pin(async move {
-                let results = request.tool_results().collect::<Vec<_>>();
-                let has_result =
-                    |call_id: &str| results.iter().any(|result| result.call_id == call_id);
-                let events = match request.prompt {
-                    "spawn alpha" if !has_result("alpha-task") => {
-                        vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
-                            "alpha-task",
-                            "task",
-                            json!({ "mode": "sync", "prompt": "alpha child" }),
-                        )))]
-                    }
-                    "spawn beta" if !has_result("beta-task") => {
-                        vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
-                            "beta-task",
-                            "task",
-                            json!({ "mode": "sync", "prompt": "beta child" }),
-                        )))]
-                    }
-                    "alpha child" | "beta child" => vec![
-                        Ok(CompletionEvent::Delta("child done".to_owned())),
-                        Ok(CompletionEvent::Finished),
-                    ],
-                    "spawn alpha" | "spawn beta" => vec![Ok(CompletionEvent::Finished)],
-                    prompt => panic!("unexpected task request: {prompt:?} {results:?}"),
-                };
-                Ok(Box::pin(stream::iter(events)) as BoxCompletionStream)
-            })
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn task_children_inherit_the_runtime_captured_agent_bundle() {
-        let source = r"
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: alpha }
-spec:
-  features: [{ task: { maxSubagentDepth: 1, defaultPermissions: true } }]
----
-apiVersion: waltr.dev/v1alpha1
-kind: Agent
-metadata: { name: beta }
-spec:
-  features: [{ task: { maxSubagentDepth: 1, defaultPermissions: true } }]
-";
-        let catalog =
-            crate::AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "alpha").unwrap();
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(std::env::temp_dir()).await,
-            std::env::temp_dir(),
-            FileCredentialStore::new(
-                std::env::temp_dir().join("waltr-agent-switch-task-auth.json"),
-            ),
-            catalog.resolved("alpha").unwrap().clone(),
-        )
-        .with_agent_catalog(catalog)
-        .with_runtime_provider(|_| {
-            Ok(crate::AgentRuntimeProvider::new(
-                ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
-                Arc::new(SwitchTaskProvider),
-            ))
-        });
-        let sessions =
-            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
-        let parent = sessions
-            .create(create_request(
-                Some(test_inference_settings()),
-                None,
-                BTreeMap::new(),
-            ))
-            .await
-            .unwrap();
-        let parent_id = parent.record.id;
-        let alpha_runtime = sessions.resolve_runtime(&parent_id).await.unwrap();
-
-        sessions.switch_agent(&parent_id, "beta").await.unwrap();
-        sessions
-            .prompt(&alpha_runtime, parent_id.clone(), "spawn alpha")
-            .stream()
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<crate::Result<Vec<_>>>()
-            .unwrap();
-        let alpha_child_id = sessions
-            .list()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|summary| {
-                summary
-                    .metadata_values
-                    .get("waltr.task.tool_call_id")
-                    .is_some_and(|value| value == "alpha-task")
-            })
-            .expect("alpha child summary")
-            .id;
-        let alpha_child = sessions.load(&alpha_child_id).await.unwrap();
-        assert_eq!(
-            alpha_child.record.agent_definition.unwrap().agent_name,
-            "alpha"
-        );
-
-        let beta_runtime = sessions.resolve_runtime(&parent_id).await.unwrap();
-        sessions
-            .prompt(&beta_runtime, parent_id.clone(), "spawn beta")
-            .stream()
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<crate::Result<Vec<_>>>()
-            .unwrap();
-        let beta_child_id = sessions
-            .list()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|summary| {
-                summary
-                    .metadata_values
-                    .get("waltr.task.tool_call_id")
-                    .is_some_and(|value| value == "beta-task")
-            })
-            .expect("beta child summary")
-            .id;
-        let beta_child = sessions.load(&beta_child_id).await.unwrap();
-        assert_eq!(
-            beta_child.record.agent_definition.unwrap().agent_name,
-            "beta"
-        );
     }
 
     #[tokio::test]
@@ -5068,6 +4161,297 @@ spec:
         )
         .await
         .expect("runtime startup must release the mutation gate");
+    }
+
+    #[tokio::test]
+    async fn cycle_configuration_commit_checks_captured_execution_after_optional_audit() {
+        struct CountingProvider(Arc<AtomicUsize>);
+        impl LlmStream for CountingProvider {
+            fn name(&self) -> &'static str {
+                "cycle-commit-test"
+            }
+            fn stream_request<'a>(
+                &'a self,
+                request: CompletionRequest<'a>,
+            ) -> crate::BoxStreamFuture<'a> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                    TextOnlyProvider.stream_request(request).await
+                })
+            }
+        }
+        struct CycleHost {
+            audit: bool,
+            builds: Arc<AtomicUsize>,
+            requests: Arc<AtomicUsize>,
+        }
+        impl crate::AgentHostRuntimeFactory for CycleHost {
+            fn configuration_for_cycle(
+                &self,
+                record: &SessionRecord,
+            ) -> Result<Option<crate::HostConfigurationUpdate>> {
+                Ok(Some(crate::HostConfigurationUpdate {
+                    configuration: Some(serde_json::json!({"authorized":"cycle"})),
+                    timeline: if self.audit {
+                        vec![PendingTimelineEvent::assistant_text_snapshot(
+                            record.id.clone(),
+                            0,
+                            crate::PendingTimelineItemId::New,
+                            "configuration audit",
+                        )]
+                    } else {
+                        Vec::new()
+                    },
+                }))
+            }
+            fn build<'a>(&'a self, record: &'a SessionRecord) -> crate::HostRuntimeFuture<'a> {
+                Box::pin(async move {
+                    self.builds.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert_eq!(
+                        record.agent_definition,
+                        Some(serde_json::json!({"authorized":"cycle"}))
+                    );
+                    assert_eq!(
+                        record.metadata_value("title"),
+                        Some(&serde_json::json!("latest"))
+                    );
+                    Ok(AgentRuntime::builder(
+                        ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                        Arc::new(CountingProvider(self.requests.clone())),
+                    )
+                    .build())
+                })
+            }
+        }
+        for audit in [false, true] {
+            for change in ["definition", "settings", "journal", "metadata"] {
+                let barrier = Arc::new((Notify::new(), Notify::new()));
+                let inner = MemorySessionStore::new();
+                let store = SlowLoadStore {
+                    inner: inner.clone(),
+                    delay_next_load: Arc::new(AtomicBool::new(false)),
+                    entered: Arc::new(Notify::new()),
+                    configuration_barrier: Some(barrier.clone()),
+                };
+                let builds = Arc::new(AtomicUsize::new(0));
+                let requests = Arc::new(AtomicUsize::new(0));
+                let directory = tempfile::tempdir().unwrap();
+                let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+                    directory.path().join("auth.json"),
+                ))
+                .with_host_runtime_factory(Arc::new(CycleHost {
+                    audit,
+                    builds: builds.clone(),
+                    requests: requests.clone(),
+                }));
+                let sessions = SessionCoordinator::new(store).with_runtime_factory(factory);
+                let id = sessions
+                    .create(create_request(
+                        Some(test_inference_settings()),
+                        None,
+                        BTreeMap::new(),
+                    ))
+                    .await
+                    .unwrap()
+                    .record
+                    .id;
+                let interleave = async {
+                    tokio::time::timeout(Duration::from_secs(5), barrier.0.notified())
+                        .await
+                        .unwrap();
+                    let before = inner.load(&id).await.unwrap();
+                    assert_eq!(before.execution_sequence.get(), u64::from(audit));
+                    match change {
+                        "definition" => {
+                            inner
+                                .set_agent_definition(
+                                    &id,
+                                    Some(serde_json::json!({"external":"preserved"})),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        "settings" => {
+                            let mut settings = test_inference_settings();
+                            settings.provider.model_id = "external".into();
+                            inner
+                                .set_inference_settings(&id, Some(settings))
+                                .await
+                                .unwrap();
+                        }
+                        "journal" => {
+                            inner
+                                .append_journal(
+                                    &id,
+                                    before.execution_token().unwrap(),
+                                    vec![SessionJournalEvent::MiddlewareStateUpdated {
+                                        namespace: "external".into(),
+                                        state: serde_json::json!(true),
+                                    }],
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        "metadata" => {
+                            inner
+                                .set_metadata_value(
+                                    &id,
+                                    "title".into(),
+                                    serde_json::json!("latest"),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    let committed = inner.load(&id).await.unwrap();
+                    barrier.1.notify_one();
+                    committed
+                };
+                let (submission, committed) =
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::join!(
+                            sessions.submit_prompt(
+                                id.clone(),
+                                "run",
+                                RunConflictPolicy::QueueIfActive
+                            ),
+                            interleave
+                        )
+                    })
+                    .await
+                    .unwrap();
+                if change == "metadata" {
+                    tokio::time::timeout(Duration::from_secs(5), submission.unwrap().handle.wait())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(builds.load(AtomicOrdering::SeqCst), 1);
+                    assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+                    let final_record = inner.load(&id).await.unwrap();
+                    assert_eq!(
+                        final_record.metadata_value("title"),
+                        Some(&serde_json::json!("latest"))
+                    );
+                    assert_eq!(
+                        final_record.agent_definition,
+                        Some(serde_json::json!({"authorized":"cycle"}))
+                    );
+                } else {
+                    let error = submission
+                        .err()
+                        .expect("external execution must reject cycle commit");
+                    assert!(
+                        error.to_string().contains("stale session execution token"),
+                        "{error:?}"
+                    );
+                    assert_eq!(inner.load(&id).await.unwrap(), committed);
+                    assert_eq!(builds.load(AtomicOrdering::SeqCst), 0);
+                    assert_eq!(requests.load(AtomicOrdering::SeqCst), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_resolution_adopts_own_configuration_and_rejects_external_execution_changes() {
+        struct BlockingHost {
+            entered: Notify,
+            release: Notify,
+        }
+        impl crate::AgentHostRuntimeFactory for BlockingHost {
+            fn configuration_for_cycle(
+                &self,
+                _: &SessionRecord,
+            ) -> Result<Option<crate::HostConfigurationUpdate>> {
+                Ok(Some(crate::HostConfigurationUpdate {
+                    configuration: Some(serde_json::json!({"authorized":"cycle"})),
+                    timeline: Vec::new(),
+                }))
+            }
+            fn build<'a>(&'a self, record: &'a SessionRecord) -> crate::HostRuntimeFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(
+                        record.agent_definition,
+                        Some(serde_json::json!({"authorized":"cycle"}))
+                    );
+                    assert_eq!(record.execution_sequence.get(), 1);
+                    self.entered.notify_one();
+                    tokio::time::timeout(Duration::from_secs(5), self.release.notified())
+                        .await
+                        .unwrap();
+                    Ok(AgentRuntime::builder(
+                        ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                        Arc::new(TextOnlyProvider),
+                    )
+                    .build())
+                })
+            }
+        }
+        for execution_change in [false, true] {
+            let host = Arc::new(BlockingHost {
+                entered: Notify::new(),
+                release: Notify::new(),
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+                directory.path().join("auth.json"),
+            ))
+            .with_host_runtime_factory(host.clone());
+            let sessions =
+                SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+            let id = sessions
+                .create(create_request(
+                    Some(test_inference_settings()),
+                    None,
+                    BTreeMap::new(),
+                ))
+                .await
+                .unwrap()
+                .record
+                .id;
+            let update = async {
+                tokio::time::timeout(Duration::from_secs(5), host.entered.notified())
+                    .await
+                    .unwrap();
+                if execution_change {
+                    sessions
+                        .set_agent_definition(&id, Some(serde_json::json!({"external":"change"})))
+                        .await
+                        .unwrap();
+                } else {
+                    sessions
+                        .set_metadata_value(&id, "title", serde_json::json!("concurrent"))
+                        .await
+                        .unwrap();
+                }
+                host.release.notify_one();
+            };
+            let (resolved, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(sessions.resolve_runtime(&id), update)
+            })
+            .await
+            .unwrap();
+            if execution_change {
+                assert!(
+                    resolved
+                        .unwrap_err()
+                        .to_string()
+                        .contains("stale session execution token")
+                );
+            } else {
+                assert!(resolved.is_ok());
+                assert_eq!(
+                    sessions
+                        .load(&id)
+                        .await
+                        .unwrap()
+                        .record
+                        .metadata_value("title"),
+                    Some(&serde_json::json!("concurrent"))
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -5212,7 +4596,7 @@ spec:
         let incomplete = sessions
             .create(create_request(
                 Some(test_inference_settings()),
-                Some(AgentDefinitionBundle::new(
+                Some(crate::agent::session::opaque_test_configuration(
                     "test",
                     vec![
                         r"apiVersion: waltr.dev/v1alpha1
@@ -5776,6 +5160,278 @@ spec: {}"
         ));
     }
 
+    async fn cancellable_fixture() -> (
+        tempfile::TempDir,
+        SessionCoordinator<MemorySessionStore>,
+        Arc<QueuedPromptProvider>,
+        SessionId,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let runtime_provider = provider.clone();
+        let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+            directory.path().join("auth.json"),
+        ))
+        .with_runtime_provider(move |_| {
+            Ok(crate::AgentRuntimeProvider::new(
+                ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                runtime_provider.clone(),
+            ))
+        });
+        let sessions = SessionCoordinator::new(MemorySessionStore::new())
+            .with_runtime_factory(with_fake_host(factory));
+        let id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        (directory, sessions, provider, id)
+    }
+
+    #[tokio::test]
+    async fn semantic_user_event_contains_the_committed_prompt_cursor() {
+        struct Sink(StdMutex<Option<tokio::sync::oneshot::Sender<crate::SessionEvent>>>);
+        impl crate::SessionEventSink for Sink {
+            fn send(&self, event: crate::SessionEvent) -> crate::SessionEventSinkFuture {
+                if let Some(tx) = self.0.lock().unwrap().take() {
+                    let _sent = tx.send(event);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let (_directory, sessions, provider, id) = cancellable_fixture().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sessions = sessions.with_session_event_sink(Arc::new(Sink(StdMutex::new(Some(tx)))));
+        let submission = sessions
+            .submit_prompt_cancellable(
+                id.clone(),
+                "durable first message".into(),
+                RunConflictPolicy::QueueIfActive,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::SessionEvent::UserMessageCreated { cursor, .. } = event;
+        assert_eq!(cursor, Some(TimelineCursor::new(1)));
+        assert!(sessions.load(&id).await.unwrap().record.timeline_events().any(|event| matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "durable first message")));
+        provider.wait_for_request_count(1).await;
+        submission.handle.cancel_and_wait().await.unwrap();
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_origin_cancellation_preserves_other_queued_work() {
+        let (_directory, sessions, provider, id) = cancellable_fixture().await;
+        let active = sessions
+            .submit_prompt_cancellable(
+                id.clone(),
+                "active".into(),
+                RunConflictPolicy::QueueIfActive,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let expired = sessions
+            .submit_prompt_cancellable(
+                id.clone(),
+                "expired".into(),
+                RunConflictPolicy::QueueIfActive,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let valid = sessions
+            .submit_prompt(id.clone(), "valid", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        assert!(matches!(
+            expired.handle.cancel_and_wait().await,
+            Err(AgentSessionRunError::Canceled { .. })
+        ));
+        active.handle.cancel_and_wait().await.unwrap();
+        assert_eq!(
+            valid.handle.wait().await.unwrap().status,
+            SessionStatus::Finished
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|prompts| !prompts.iter().any(|prompt| prompt == "expired"))
+        );
+        drop(requests);
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_origin_waiter_drop_does_not_cancel_valid_work() {
+        let (_directory, sessions, provider, id) = cancellable_fixture().await;
+        let token = CancellationToken::new();
+        let active = sessions
+            .submit_prompt_cancellable(
+                id.clone(),
+                "active".into(),
+                RunConflictPolicy::QueueIfActive,
+                token.clone(),
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let run_id = active.run_id;
+        drop(active.handle);
+        assert!(!token.is_cancelled());
+        assert_eq!(sessions.active_state(&id).await.unwrap().run_id, run_id);
+        let valid = sessions
+            .submit_prompt(id, "valid", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        provider.release_active();
+        valid.handle.wait().await.unwrap();
+        assert_eq!(provider.requests.lock().await.len(), 2);
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_origin_stale_handle_cannot_cancel_recreated_session() {
+        let (_directory, sessions, provider, id) = cancellable_fixture().await;
+        let token = CancellationToken::new();
+        let old = sessions
+            .submit_prompt_cancellable(
+                id.clone(),
+                "old".into(),
+                RunConflictPolicy::QueueIfActive,
+                token.clone(),
+            )
+            .await
+            .unwrap();
+        let stale = old.handle.cancellation().unwrap();
+        old.handle.wait().await.unwrap();
+        sessions.delete(&id).await.unwrap();
+        let mut request = create_request(Some(test_inference_settings()), None, BTreeMap::new());
+        request.id = id.clone();
+        sessions.create(request).await.unwrap();
+        let current = sessions
+            .submit_prompt_cancellable(
+                id.clone(),
+                "active".into(),
+                RunConflictPolicy::QueueIfActive,
+                token.clone(),
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(2).await;
+        stale.cancel().await;
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            sessions.active_state(&id).await.unwrap().run_id,
+            current.run_id
+        );
+        provider.release_active();
+        current.handle.wait().await.unwrap();
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_runs_retain_their_origin_coordination_factory() {
+        struct CompletionOrigin {
+            label: &'static str,
+            calls: Arc<StdMutex<Vec<&'static str>>>,
+        }
+        impl crate::SessionCompletionCoordinationHandler for CompletionOrigin {
+            fn prepare(
+                &self,
+                _: crate::SessionRunCompletionSnapshot,
+            ) -> crate::SessionCompletionCoordinationFuture {
+                self.calls.lock().unwrap().push(self.label);
+                Box::pin(async { Ok(crate::SessionCompletionCoordinationPreparation::Continue) })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let runtime_provider = provider.clone();
+        let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+            directory.path().join("auth.json"),
+        ))
+        .with_runtime_provider(move |_| {
+            Ok(crate::AgentRuntimeProvider::new(
+                ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                runtime_provider.clone(),
+            ))
+        });
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let sinks = (0..3)
+            .map(|_| {
+                Arc::new(RecordingEventSink {
+                    events: StdMutex::new(Vec::new()),
+                    fail: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let scoped = ["A", "B", "C"]
+            .into_iter()
+            .zip(&sinks)
+            .map(|(label, sink)| {
+                sessions.clone().with_runtime_factory(
+                    with_fake_host(factory.clone()).with_run_coordination(
+                        sink.clone(),
+                        Arc::new(CompletionOrigin {
+                            label,
+                            calls: calls.clone(),
+                        }),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let id = scoped[0]
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        let active = scoped[0]
+            .submit_prompt(id.clone(), "active", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let second = scoped[1]
+            .submit_prompt(id.clone(), "second", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let third = scoped[2]
+            .submit_prompt(id, "third", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        provider.release_active();
+        active.handle.wait().await.unwrap();
+        second.handle.wait().await.unwrap();
+        third.handle.wait().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["A", "B", "C"]);
+        assert_eq!(
+            provider.requests.lock().await.len(),
+            3,
+            "different origins must not batch"
+        );
+        for sink in sinks {
+            assert_eq!(sink.events.lock().unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn queued_runtime_authentication_failure_is_durable() {
         let provider = Arc::new(QueuedPromptProvider::new());
@@ -5783,12 +5439,9 @@ spec: {}"
         let resolution_count = Arc::clone(&resolutions);
         let runtime_provider = Arc::clone(&provider);
         let directory = tempfile::tempdir().expect("temp directory");
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(directory.path()).await,
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            empty_test_agent(),
-        )
+        let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+            directory.path().join("auth.json"),
+        ))
         .with_runtime_provider(move |_| {
             if resolution_count.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(crate::AgentRuntimeProvider::new(
@@ -5799,8 +5452,8 @@ spec: {}"
                 Err(authentication_runtime_error())
             }
         });
-        let sessions =
-            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let sessions = SessionCoordinator::new(MemorySessionStore::new())
+            .with_runtime_factory(with_fake_host(factory));
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5862,12 +5515,9 @@ spec: {}"
         let resolutions = Arc::new(AtomicU64::new(0));
         let runtime_provider = provider.clone();
         let directory = tempfile::tempdir().unwrap();
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(directory.path()).await,
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            empty_test_agent(),
-        )
+        let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+            directory.path().join("auth.json"),
+        ))
         .with_runtime_provider(move |_| {
             if resolutions.fetch_add(1, Ordering::SeqCst) == 1 {
                 Err(crate::AgentSessionRuntimeError::FailedPrecondition(
@@ -5880,8 +5530,8 @@ spec: {}"
                 ))
             }
         });
-        let sessions =
-            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let sessions = SessionCoordinator::new(MemorySessionStore::new())
+            .with_runtime_factory(with_fake_host(factory));
         let id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -5950,15 +5600,12 @@ spec: {}"
     #[tokio::test]
     async fn continue_authentication_preflight_does_not_append_rollback() {
         let directory = tempfile::tempdir().expect("temp directory");
-        let factory = AgentSessionRuntimeFactory::new(
-            worker_handle(directory.path()).await,
-            directory.path().to_path_buf(),
-            FileCredentialStore::new(directory.path().join("auth.json")),
-            empty_test_agent(),
-        )
+        let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+            directory.path().join("auth.json"),
+        ))
         .with_runtime_provider(|_| Err(authentication_runtime_error()));
-        let sessions =
-            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let sessions = SessionCoordinator::new(MemorySessionStore::new())
+            .with_runtime_factory(with_fake_host(factory));
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
@@ -6004,7 +5651,7 @@ spec: {}"
                     failure: crate::AuthenticationFailure {
                         target: crate::AuthTarget::provider("preparation"),
                         reason: crate::AuthenticationFailureReason::CredentialRejected,
-                        mcp_authorization: None,
+                        host_context: None,
                     },
                     message: "preparation failed".to_owned(),
                 }
@@ -6029,17 +5676,26 @@ spec: {}"
             );
             Err(self.error())
         }
+    }
 
-        async fn render_template_reference(
-            &self,
-            _ctx: &mut crate::middleware::context::TemplateRenderContext<'_>,
-            _reference: &crate::template::TemplateReference,
-        ) -> crate::Result<crate::template::TemplateReferenceRender> {
-            if self.template {
-                Err(self.error())
-            } else {
-                Ok(crate::template::TemplateReferenceRender::Continue)
-            }
+    impl crate::AgentHostContext for PreparationFailure {
+        fn render_prompt<'a>(
+            &'a self,
+            _context: crate::HostContext<'a>,
+            prompt: &'a str,
+            _submission: u64,
+            _prompt_index: usize,
+        ) -> crate::HostPromptFuture<'a> {
+            Box::pin(async move {
+                if self.template {
+                    Err(self.error())
+                } else {
+                    Ok(crate::HostPromptRender {
+                        prompt: prompt.into(),
+                        tool_ids: Vec::new(),
+                    })
+                }
+            })
         }
     }
 
@@ -6095,6 +5751,10 @@ spec: {}"
             template,
             authentication,
         })
+        .with_host_context(Arc::new(PreparationFailure {
+            template,
+            authentication,
+        }))
         .build();
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let mut request = SessionCreateRequest::new(SessionId::generate());
@@ -6102,7 +5762,7 @@ spec: {}"
             messages: vec![crate::SessionStartMessage::user("durable prompt").unwrap()],
         };
         let created = sessions.create(request).await.unwrap().record;
-        let id = created.id;
+        let id = created.id.clone();
         let prior_failures = usize::from(matches!(
             &prior_outcome,
             Some(SessionJournalEvent::Failed { .. })
@@ -6110,7 +5770,7 @@ spec: {}"
         if let Some(event) = prior_outcome {
             sessions
                 .store
-                .append_journal(&id, created.revision, vec![event])
+                .append_journal(&id, created.execution_token().unwrap(), vec![event])
                 .await
                 .unwrap();
         }
@@ -6191,7 +5851,7 @@ spec: {}"
 
         let mut saw_streaming = false;
         let mut saw_finished = false;
-        for _ in 0..8 {
+        loop {
             let update = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
                 .await
                 .unwrap()
@@ -6217,7 +5877,7 @@ spec: {}"
         let id = sessions
             .create(create_request(
                 Some(test_inference_settings()),
-                Some(AgentDefinitionBundle::new("test", vec![
+                Some(crate::agent::session::opaque_test_configuration("test", vec![
                     "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n"
                         .to_owned(),
                 ])),
@@ -6547,6 +6207,7 @@ spec: {}"
             inner,
             delay_next_load: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             entered: Arc::clone(&entered),
+            configuration_barrier: None,
         };
         let sessions = SessionCoordinator::new(store);
         sessions.set_completion_admission_handler(Arc::new(FailingCompletionHandler));
@@ -6554,6 +6215,14 @@ spec: {}"
         let inference_identity = SessionRunInferenceIdentity {
             provider_key: "test".to_owned(),
             model_id: "test-model".to_owned(),
+            execution_token: sessions
+                .store
+                .inner
+                .load(&id)
+                .await
+                .unwrap()
+                .execution_token()
+                .unwrap(),
         };
         let admission = sessions.run_completion_admission(&id, 1, &inference_identity);
         let (_, result) = tokio::join!(entered.notified(), admission);
@@ -6649,16 +6318,14 @@ spec: {}"
         sessions.set_completion_admission_handler(Arc::new(SnapshotCompletionHandler(
             StdMutex::new(Some(sender)),
         )));
-        let mut metadata = BTreeMap::new();
-        metadata.insert("waltr.session.purpose".to_owned(), json!("interactive"));
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
-                Some(AgentDefinitionBundle::new("test", vec![
+                Some(crate::agent::session::opaque_test_configuration("test", vec![
                     "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n"
                         .to_owned(),
                 ])),
-                metadata,
+                BTreeMap::new(),
             ))
             .await
             .unwrap();
@@ -6674,7 +6341,8 @@ spec: {}"
         let snapshot = receiver.await.unwrap();
 
         assert_eq!(snapshot.context_tokens, Some(130));
-        assert_eq!(snapshot.purpose.as_deref(), Some("interactive"));
+        assert_eq!(snapshot.incarnation, session.record.metadata.incarnation);
+        assert!(snapshot.revision > session.record.revision);
         assert_eq!(snapshot.provider_key, "test");
         assert_eq!(snapshot.model_id, "test-model");
         assert_eq!(snapshot.session_id, session.record.id);
@@ -6683,17 +6351,17 @@ spec: {}"
     }
 
     #[tokio::test]
-    async fn completion_snapshot_keeps_inference_identity_captured_by_the_active_run() {
+    async fn external_inference_change_invalidates_active_run_without_completion_or_resend() {
         let provider = Arc::new(QueuedPromptProvider::new());
         let sessions = runtime_sessions(Arc::clone(&provider)).await;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
         sessions.set_completion_admission_handler(Arc::new(SnapshotCompletionHandler(
             StdMutex::new(Some(sender)),
         )));
         let session = sessions
             .create(create_request(
                 Some(test_inference_settings()),
-                Some(AgentDefinitionBundle::new("test", vec![
+                Some(crate::agent::session::opaque_test_configuration("test", vec![
                     "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n"
                         .to_owned(),
                 ])),
@@ -6718,11 +6386,38 @@ spec: {}"
             .await
             .unwrap();
         provider.release_active();
-        submission.handle.wait().await.unwrap();
-        let snapshot = receiver.await.unwrap();
-
-        assert_eq!(snapshot.provider_key, "test");
-        assert_eq!(snapshot.model_id, "test-model");
+        let error = tokio::time::timeout(Duration::from_secs(10), submission.handle.wait())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("stale session execution token"),
+            "{error:?}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        let record = sessions.load(&session.record.id).await.unwrap().record;
+        assert_eq!(
+            record.inference_settings.as_ref().unwrap().provider.key,
+            "changed-provider"
+        );
+        assert!(!record.journal.iter().any(|event| matches!(
+            event,
+            SessionJournalEvent::TurnFinished { .. } | SessionJournalEvent::Finished
+        )));
+        assert!(!record.timeline_events().any(|event| {
+            event
+                .channel
+                .as_ref()
+                .is_some_and(|channel| channel.as_str() == CHANNEL_ASSISTANT_TEXT)
+                && matches!(
+                    event.content,
+                    TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. }
+                )
+        }));
     }
 
     #[tokio::test]

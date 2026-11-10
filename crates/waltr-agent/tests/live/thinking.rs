@@ -124,7 +124,6 @@ async fn assert_provider_thinking(
             | TimelineContent::TextSnapshot { .. }
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
-            | TimelineContent::ExternalRequest { .. }
             | TimelineContent::ContentRef { .. }
             | TimelineContent::Json { .. } => {}
         }

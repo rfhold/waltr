@@ -1,6 +1,6 @@
 # Timeline
 
-The agent timeline is the public, durable event stream produced by `crates/waltr-agent/`. It describes assistant text, provider thinking, tool calls, tool progress, tool results, external requests, and session status without depending on server, client, TUI, or web layers.
+The agent timeline is the public, durable event stream for assistant text, thinking, tool calls, progress, results, and status. Private server interactions are a separate live snapshot/watch contract, not history.
 
 ## Owning Layer
 
@@ -30,7 +30,6 @@ Timeline channels are string-backed display categories. Built-in channel constan
 | `tool_progress_info` | Informational tool progress. |
 | `tool_progress_error` | Error-oriented tool progress. |
 | `tool_result` | Provider-neutral tool result. |
-| `external_request` | Host input request such as permission or question handling. |
 
 Some status events are channel-less. Channel-filtered queries include only events whose `channel` is present in the requested channel set.
 
@@ -40,7 +39,7 @@ Every logical timeline item receives an identifier in the form `iN`, where `N` i
 
 Item identifiers are opaque and classify nothing. Consumers use event kind, channel, content, status, and parent relationships to interpret an item. Rollback and provider retry never reuse an identifier because allocation follows the complete physical timeline, including events hidden from the effective branch. Updates and child events may reference only items on the current effective branch.
 
-This identity format is a hard storage cutover. Session records containing legacy caller-generated identifiers are unsupported and receive no migration or compatibility translation; operators must clear persisted sessions and cached client timelines when deploying the change.
+This identity format is a hard storage cutover. Legacy caller-generated identifiers receive no migration or compatibility translation. Incompatible retained sessions require a separately authorized bounded reset; see [coordinated upgrade](../runbooks/server-capability-cutover.md). Never automatically clear data after a decode failure.
 
 | Area | Contract |
 | --- | --- |
@@ -51,7 +50,6 @@ This identity format is a hard storage cutover. Session records containing legac
 | Tool call preview | A provider tool call emits an `ItemStarted` event on `tool_call` before local tool execution starts. |
 | Tool progress | Tool progress emits timeline events while the tool runs. Progress events set `parent_id` to the tool call item id. |
 | Tool result | Tool completion emits an `ItemFinished` event on `tool_result` with `parent_id` set to the tool call item id. |
-| External request | Host-required input emits opened and resolved external request events on `external_request`. |
 | Session status | Runtime status changes may emit channel-less status events. |
 
 The timeline remains an immutable event log. Consumers may derive projections without replacing or mutating durable events.
@@ -100,7 +98,7 @@ Focused coverage lives in:
 | Path | Covers |
 | --- | --- |
 | [../../crates/waltr-agent/src/agent/session/storage/memory.rs](../../crates/waltr-agent/src/agent/session/storage/memory.rs) | Store item allocation, rollback non-reuse, query, cursor ordering, channel filtering, and text reconstruction semantics. |
-| [../../crates/waltr-agent/tests/agent/loop.rs](../../crates/waltr-agent/tests/agent/loop.rs) | Live loop event ordering, assistant/thinking deltas, tool progress parenting, and durable text reconstruction. |
+| [../../crates/waltr-server/tests/agent_host/loop.rs](../../crates/waltr-server/tests/agent_host/loop.rs) | Host loop ordering, deltas, tool progress, and durable text reconstruction. |
 
 ## References
 

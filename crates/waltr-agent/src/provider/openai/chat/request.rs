@@ -14,12 +14,22 @@ pub(super) fn chat_body(
     prompt_cache_retention: Option<&str>,
     request: &CompletionRequest<'_>,
 ) -> Value {
+    chat_body_with_input(model, prompt_cache, prompt_cache_retention, request, None)
+}
+
+pub(super) fn chat_body_with_input(
+    model: &str,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<&str>,
+    request: &CompletionRequest<'_>,
+    input: Option<&crate::TransientInput>,
+) -> Value {
     let mut body = json!({
         "model": model,
         "stream": true,
         "store": false,
         "stream_options": { "include_usage": true },
-        "messages": chat_messages(request),
+        "messages": chat_messages_with_input(request, input),
         "tools": chat_tools(&request.tools),
     });
     if prompt_cache {
@@ -31,7 +41,15 @@ pub(super) fn chat_body(
     body
 }
 
+#[cfg(test)]
 pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
+    chat_messages_with_input(request, None)
+}
+
+fn chat_messages_with_input(
+    request: &CompletionRequest<'_>,
+    input: Option<&crate::TransientInput>,
+) -> Vec<Value> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = request.system_prompt {
         messages.push(json!({ "role": "system", "content": system_prompt }));
@@ -39,12 +57,20 @@ pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     let mut pending_text = String::new();
     let mut pending_calls: Vec<Value> = Vec::new();
     let mut pending_images: Vec<Value> = Vec::new();
+    let mut prompt_index = 0usize;
     for item in request.replay_items() {
         match item {
             CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
                 flush_tool_images(&mut messages, &mut pending_images);
-                messages.push(json!({ "role": "user", "content": prompt }));
+                if let Some(input) = input.filter(|input| input.matches_prompt(prompt_index)) {
+                    let mut content = input.content(crate::TransientInputApi::OpenAiChat);
+                    content.push(json!({"type": "text", "text": prompt}));
+                    messages.push(json!({"role": "user", "content": content}));
+                } else {
+                    messages.push(json!({ "role": "user", "content": prompt }));
+                }
+                prompt_index += 1;
             }
             CompletionReplayItem::Turn(item) => match item {
                 TurnItem::AssistantText(text) => {

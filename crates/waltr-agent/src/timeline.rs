@@ -7,10 +7,7 @@ use serde_json::Value;
 
 use crate::{
     ToolCall, ToolResult,
-    agent::session::{
-        ExternalRequest, ExternalRequestStatus, PendingWorkStatus, SessionId, SessionStatus,
-        Suspension,
-    },
+    agent::session::{PendingWorkStatus, SessionId, SessionStatus, Suspension},
 };
 
 /// Assistant text display channel.
@@ -28,7 +25,7 @@ pub const CHANNEL_TOOL_PROGRESS_ERROR: &str = "tool_progress_error";
 /// Tool result display channel.
 pub const CHANNEL_TOOL_RESULT: &str = "tool_result";
 /// External request display channel.
-pub const CHANNEL_EXTERNAL_REQUEST: &str = "external_request";
+
 /// Provider usage and cost metrics display channel.
 pub const CHANNEL_METRICS: &str = "metrics";
 
@@ -209,9 +206,9 @@ pub enum TimelineEventKind {
     /// A timeline item reached a terminal state.
     ItemFinished,
     /// An external request opened and is awaiting host input.
-    ExternalRequestOpened,
+
     /// An external request resolved or was canceled.
-    ExternalRequestResolved,
+
     /// Session runtime status changed.
     SessionStatusChanged,
 }
@@ -301,8 +298,6 @@ pub enum TimelineStatus {
     Pending,
     /// Runtime is waiting for tool results.
     AwaitingToolResults,
-    /// Runtime is waiting for external input.
-    AwaitingExternalInput,
     /// Runtime was interrupted while work was active.
     Interrupted,
     /// External input was resolved.
@@ -327,9 +322,6 @@ impl From<&SessionStatus> for TimelineStatus {
             SessionStatus::Suspended(Suspension::AwaitingToolResults { .. }) => {
                 Self::AwaitingToolResults
             }
-            SessionStatus::Suspended(Suspension::AwaitingExternalInput { .. }) => {
-                Self::AwaitingExternalInput
-            }
             SessionStatus::Suspended(Suspension::Interrupted { .. }) => Self::Interrupted,
             SessionStatus::Finished => Self::Finished,
             SessionStatus::Failed { .. } => Self::Failed,
@@ -344,16 +336,6 @@ impl From<&PendingWorkStatus> for TimelineStatus {
             PendingWorkStatus::Canceled(_) => Self::Canceled,
             PendingWorkStatus::Finished(_) => Self::Finished,
             PendingWorkStatus::Failed { .. } => Self::Failed,
-        }
-    }
-}
-
-impl From<&ExternalRequestStatus> for TimelineStatus {
-    fn from(status: &ExternalRequestStatus) -> Self {
-        match status {
-            ExternalRequestStatus::Pending => Self::Pending,
-            ExternalRequestStatus::Responded(_) => Self::Resolved,
-            ExternalRequestStatus::Canceled(_) => Self::Canceled,
         }
     }
 }
@@ -382,11 +364,6 @@ pub enum TimelineContent {
     ToolResult {
         /// Tool result payload.
         result: ToolResult,
-    },
-    /// Durable external request payload.
-    ExternalRequest {
-        /// External request payload.
-        request: ExternalRequest,
     },
     /// Reference to content stored out-of-line.
     ContentRef {
@@ -680,7 +657,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::agent::session::{CancelReason, ExternalResponse};
 
     #[test]
     fn channel_constants_are_documented_strings() {
@@ -691,17 +667,15 @@ mod tests {
             CHANNEL_TOOL_PROGRESS_INFO,
             CHANNEL_TOOL_PROGRESS_ERROR,
             CHANNEL_TOOL_RESULT,
-            CHANNEL_EXTERNAL_REQUEST,
         ];
 
-        assert_eq!(constants.len(), 7);
+        assert_eq!(constants.len(), 6);
         assert_eq!(CHANNEL_ASSISTANT_TEXT, "assistant_text");
         assert_eq!(CHANNEL_THINKING, "thinking");
         assert_eq!(CHANNEL_TOOL_CALL, "tool_call");
         assert_eq!(CHANNEL_TOOL_PROGRESS_INFO, "tool_progress_info");
         assert_eq!(CHANNEL_TOOL_PROGRESS_ERROR, "tool_progress_error");
         assert_eq!(CHANNEL_TOOL_RESULT, "tool_result");
-        assert_eq!(CHANNEL_EXTERNAL_REQUEST, "external_request");
         assert_eq!(
             TimelineChannel::from("custom_status").as_str(),
             "custom_status"
@@ -809,32 +783,6 @@ mod tests {
         assert_eq!(event.content, pending.content);
         assert_eq!(event.status, pending.status);
         assert_eq!(event.metadata, pending.metadata);
-    }
-
-    #[test]
-    fn statuses_cover_current_session_and_work_statuses() {
-        assert_eq!(
-            TimelineStatus::from(&SessionStatus::BuildingRequest),
-            TimelineStatus::BuildingRequest
-        );
-        assert_eq!(
-            TimelineStatus::from(&SessionStatus::Suspended(Suspension::AwaitingToolResults {
-                work: Vec::new()
-            })),
-            TimelineStatus::AwaitingToolResults
-        );
-        assert_eq!(
-            TimelineStatus::from(&PendingWorkStatus::Canceled(
-                CancelReason::SessionInterrupted
-            )),
-            TimelineStatus::Canceled
-        );
-        assert_eq!(
-            TimelineStatus::from(&ExternalRequestStatus::Responded(ExternalResponse::new(
-                json!({ "answer": true })
-            ))),
-            TimelineStatus::Resolved
-        );
     }
 
     #[test]

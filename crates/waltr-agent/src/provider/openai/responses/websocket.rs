@@ -17,7 +17,7 @@ use crate::stream::{BoxCompletionStream, CompletionEvent, CompletionRequest, Llm
 
 use super::super::cache::prompt_cache_key;
 use super::parser::ResponsesParser;
-use super::request::{responses_input, responses_tools};
+use super::request::responses_tools;
 
 /// `OpenAI` Responses websocket streaming provider.
 #[derive(Debug, Clone)]
@@ -104,11 +104,33 @@ fn response_create_payload(
     prompt_cache_retention: Option<&str>,
     request: &CompletionRequest<'_>,
 ) -> Value {
+    response_create_payload_with_input(
+        model,
+        reasoning,
+        prompt_cache,
+        prompt_cache_retention,
+        request,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preserves the text-only encoder contract while adding transient input"
+)]
+fn response_create_payload_with_input(
+    model: &str,
+    reasoning: Option<&OpenAiReasoningConfig>,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<&str>,
+    request: &CompletionRequest<'_>,
+    input: Option<&crate::TransientInput>,
+) -> Value {
     let mut create = json!({
         "type": "response.create",
         "model": model,
         "store": false,
-        "input": responses_input(request),
+        "input": super::request::responses_input_with_attachments(request, input),
         "tools": responses_tools(&request.tools),
         // With store:false, reasoning items can only be replayed when they
         // carry encrypted content, so always ask for it: reasoning models emit
@@ -131,6 +153,37 @@ fn response_create_payload(
 }
 
 impl LlmStream for OpenAiResponsesWebSocket {
+    fn transient_api(&self) -> Option<crate::TransientInputApi> {
+        Some(crate::TransientInputApi::OpenAiResponses)
+    }
+    fn preflight_transient_request(
+        &self,
+        request: &CompletionRequest<'_>,
+        input: &crate::AdmittedTransientInput,
+    ) -> crate::Result<()> {
+        let request = request.for_provider_identity(
+            RESPONSES_WEBSOCKET_NAME,
+            &self.responses_url,
+            &self.model,
+        );
+        input
+            .input()
+            .check_body(&response_create_payload_with_input(
+                &self.model,
+                self.reasoning.as_ref(),
+                self.prompt_cache,
+                self.prompt_cache_retention.as_deref(),
+                &request,
+                Some(input.input()),
+            ))
+    }
+    fn stream_transient_request<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: &'a crate::AdmittedTransientInput,
+    ) -> crate::BoxStreamFuture<'a> {
+        self.stream_with_input(request, Some(input.input()))
+    }
     fn name(&self) -> &'static str {
         RESPONSES_WEBSOCKET_NAME
     }
@@ -155,12 +208,45 @@ impl LlmStream for OpenAiResponsesWebSocket {
         &'a self,
         request: CompletionRequest<'a>,
     ) -> crate::stream::BoxStreamFuture<'a> {
+        self.stream_with_input(request, None)
+    }
+}
+
+impl OpenAiResponsesWebSocket {
+    fn stream_with_input<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: Option<&'a crate::TransientInput>,
+    ) -> crate::BoxStreamFuture<'a> {
         Box::pin(async move {
+            let transient = input.is_some();
             let request = request.for_provider_identity(
                 RESPONSES_WEBSOCKET_NAME,
                 &self.responses_url,
                 &self.model,
             );
+            let create = response_create_payload_with_input(
+                &self.model,
+                self.reasoning.as_ref(),
+                self.prompt_cache,
+                self.prompt_cache_retention.as_deref(),
+                &request,
+                input,
+            );
+            if let Some(input) = input {
+                input.check_body(&create)?;
+            }
+            let encoded = if transient {
+                Some(
+                    String::from_utf8(crate::transient_input::encode_body(&create)?).map_err(
+                        |_| crate::transient_input::invalid("transient body UTF-8 encoding failed"),
+                    )?,
+                )
+            } else {
+                None
+            };
+            let text = encoded.unwrap_or_else(|| create.to_string());
+            drop(create);
             let mut websocket_request = self.responses_url.as_str().into_client_request()?;
             for (name, value) in &self.headers {
                 let value = HeaderValue::from_str(value).map_err(|error| LlmError::Protocol {
@@ -194,13 +280,6 @@ impl LlmStream for OpenAiResponsesWebSocket {
             connect_span.record("terminal_state", "connected");
             connect_span.in_scope(|| tracing::debug!("provider websocket connected"));
 
-            let create = response_create_payload(
-                &self.model,
-                self.reasoning.as_ref(),
-                self.prompt_cache,
-                self.prompt_cache_retention.as_deref(),
-                &request,
-            );
             let send_span = tracing::info_span!(
                 "websocket.client.send",
                 provider = RESPONSES_WEBSOCKET_NAME,
@@ -209,7 +288,7 @@ impl LlmStream for OpenAiResponsesWebSocket {
                 terminal_state = tracing::field::Empty,
             );
             websocket
-                .send(Message::Text(create.to_string().into()))
+                .send(Message::Text(text.into()))
                 .instrument(send_span.clone())
                 .await?;
             send_span.record("terminal_state", "sent");
@@ -235,7 +314,7 @@ impl LlmStream for OpenAiResponsesWebSocket {
                     0_u64,
                     0_u64,
                 ),
-                |(
+                move |(
                     mut websocket,
                     mut parser,
                     mut pending,
@@ -337,29 +416,37 @@ impl LlmStream for OpenAiResponsesWebSocket {
                         };
 
                         match message {
-                            Message::Text(text) => match parser.parse_event(text.as_str()) {
-                                Ok(events) => pending.extend(events.into_iter().rev()),
-                                Err(error) => {
-                                    record_stream_error(
-                                        &stream_span,
-                                        &error,
-                                        message_count,
-                                        event_count,
-                                    );
-                                    return Some((
-                                        Err(error),
-                                        (
-                                            websocket,
-                                            parser,
-                                            pending,
-                                            true,
-                                            stream_span,
+                            Message::Text(text) => {
+                                match parser.parse_event(text.as_str()).map_err(|error| {
+                                    if transient {
+                                        crate::transient_input::sanitize_error(error)
+                                    } else {
+                                        error
+                                    }
+                                }) {
+                                    Ok(events) => pending.extend(events.into_iter().rev()),
+                                    Err(error) => {
+                                        record_stream_error(
+                                            &stream_span,
+                                            &error,
                                             message_count,
                                             event_count,
-                                        ),
-                                    ));
+                                        );
+                                        return Some((
+                                            Err(error),
+                                            (
+                                                websocket,
+                                                parser,
+                                                pending,
+                                                true,
+                                                stream_span,
+                                                message_count,
+                                                event_count,
+                                            ),
+                                        ));
+                                    }
                                 }
-                            },
+                            }
                             Message::Close(_) => {
                                 record_stream_end(
                                     &stream_span,

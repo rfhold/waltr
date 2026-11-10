@@ -32,6 +32,21 @@ pub(super) fn messages_request(
     options: MessagesRequestOptions<'_>,
     request: &CompletionRequest<'_>,
 ) -> Value {
+    messages_request_with_input(model, max_tokens, thinking, options, request, None)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preserves the text-only encoder contract while adding transient input"
+)]
+pub(super) fn messages_request_with_input(
+    model: &str,
+    max_tokens: u32,
+    thinking: Option<&AnthropicThinkingConfig>,
+    options: MessagesRequestOptions<'_>,
+    request: &CompletionRequest<'_>,
+    input: Option<&crate::TransientInput>,
+) -> Value {
     let MessagesRequestOptions {
         prompt_cache,
         oauth_billing_version,
@@ -42,7 +57,7 @@ pub(super) fn messages_request(
         "model": model,
         "max_tokens": max_tokens,
         "stream": true,
-        "messages": anthropic_messages(request, prompt_cache, static_breakpoint),
+        "messages": anthropic_messages(request, prompt_cache, static_breakpoint, input),
         "tools": anthropic_tools(&request.tools, prompt_cache),
     });
     if let Some(system_prompt) = request.system_prompt {
@@ -118,20 +133,28 @@ fn anthropic_messages(
     request: &CompletionRequest<'_>,
     prompt_cache: bool,
     static_breakpoint: bool,
+    input: Option<&crate::TransientInput>,
 ) -> Vec<Value> {
     let mut messages = Vec::new();
     let mut assistant_content: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    let mut prompt_index = 0usize;
     for item in request.replay_items() {
         match item {
             CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_content(&mut messages, &mut assistant_content);
-                if tool_results.is_empty() {
+                if let Some(input) = input.filter(|input| input.matches_prompt(prompt_index)) {
+                    let mut content = input.content(crate::TransientInputApi::Anthropic);
+                    content.push(json!({"type": "text", "text": prompt}));
+                    tool_results.extend(content);
+                    flush_tool_results(&mut messages, &mut tool_results);
+                } else if tool_results.is_empty() {
                     messages.push(json!({ "role": "user", "content": prompt }));
                 } else {
                     tool_results.push(json!({ "type": "text", "text": prompt }));
                     flush_tool_results(&mut messages, &mut tool_results);
                 }
+                prompt_index += 1;
             }
             CompletionReplayItem::Turn(item) => match item {
                 TurnItem::AssistantText(text) => {

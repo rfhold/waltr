@@ -301,6 +301,7 @@ pub(crate) struct SessionRunContext {
     session: SessionHandle,
     timeline: SessionTimelineBroadcaster,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
+    execution_token: Option<super::ExecutionToken>,
 }
 
 impl std::fmt::Debug for SessionRunContext {
@@ -323,11 +324,21 @@ impl SessionRunContext {
             session,
             timeline,
             event_sink,
+            execution_token: None,
         }
     }
 
     pub(crate) async fn operation(&self) -> SessionOperation {
         self.session.operation().await
+    }
+
+    pub(crate) fn with_execution_token(mut self, token: super::ExecutionToken) -> Self {
+        self.execution_token = Some(token);
+        self
+    }
+
+    pub(crate) fn execution_token(&self) -> Option<&super::ExecutionToken> {
+        self.execution_token.as_ref()
     }
 
     pub(crate) fn register_loaded_summary(

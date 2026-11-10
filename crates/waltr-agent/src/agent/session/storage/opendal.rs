@@ -12,16 +12,14 @@ use opendal::Operator;
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    mutate_on_record, sorted_session_summaries, timeline_item_text_from_record,
     timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
-        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
-    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -153,7 +151,7 @@ impl OpenDalSessionStore {
             match read {
                 Ok(bytes) => {
                     let bytes = bytes.to_bytes().to_vec();
-                    let record = serde_json::from_slice(&bytes).map_err(backend_error)?;
+                    let record = super::decode_record(&bytes)?;
                     return Ok((record, etag, bytes));
                 }
                 Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {
@@ -199,7 +197,7 @@ impl OpenDalSessionStore {
                 continue;
             }
             let bytes = self.operator.read(path).await.map_err(backend_error)?;
-            records.push(serde_json::from_slice(bytes.to_bytes().as_ref()).map_err(backend_error)?);
+            records.push(super::decode_record(bytes.to_bytes().as_ref())?);
         }
         Ok(sorted_session_summaries(records))
     }
@@ -207,23 +205,18 @@ impl OpenDalSessionStore {
     async fn update_record<T: Send>(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         update: impl Fn(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
-    ) -> SessionStoreResult<(Revision, T)> {
+    ) -> SessionStoreResult<(super::super::SessionCommitReceipt, T)> {
         let guard = self.mutation_guard(id).await?;
         let _mutation = guard.lock().await;
         for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
             let (mut record, etag, original) = self.load_record_with_etag(id).await?;
-            if record.revision != expected_revision {
-                return Err(SessionStoreError::StaleRevision {
-                    id: id.clone(),
-                    expected: expected_revision,
-                    actual: record.revision,
-                });
-            }
+            record.check_execution_token(&expected_token)?;
             let revision = record.revision.next();
-            record.revision = revision;
+            record.advance_revision(true);
             let value = update(&mut record, revision)?;
+            let receipt = record.commit_receipt()?;
             if self
                 .write_updated_record(
                     id,
@@ -236,7 +229,7 @@ impl OpenDalSessionStore {
                 )
                 .await?
             {
-                return Ok((revision, value));
+                return Ok((receipt, value));
             }
             if attempt == OPENDAL_CAS_ATTEMPTS {
                 return Err(cas_contention(id, attempt));
@@ -248,13 +241,21 @@ impl OpenDalSessionStore {
     async fn update_metadata_record(
         &self,
         id: &SessionId,
+        expected: Option<&super::super::ExecutionToken>,
         update: impl Fn(&mut SessionRecord) + Send,
     ) -> SessionStoreResult<SessionRecord> {
         let guard = self.mutation_guard(id).await?;
         let _mutation = guard.lock().await;
         for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
             let (mut record, etag, original) = self.load_record_with_etag(id).await?;
+            if let Some(expected) = expected {
+                record.check_execution_token(expected)?;
+            }
+            let revision = record.revision;
             update(&mut record);
+            if record.revision == revision {
+                return Ok(record);
+            }
             if self
                 .write_updated_record(
                     id,
@@ -390,6 +391,7 @@ impl SessionStore for OpenDalSessionStore {
         let store = self.clone();
         async move {
             let record = request.materialize();
+            super::super::metadata::validate_record(&record)?;
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
                 Err(SessionStoreError::NotFound { .. }) => {
@@ -440,46 +442,48 @@ impl SessionStore for OpenDalSessionStore {
     fn append_timeline(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<PendingTimelineEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::TimelineAppendReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (_, assigned) = store
-                .update_record(&id, expected_revision, |record, _| {
+            let (commit, events) = store
+                .update_record(&id, expected_token, |record, _| {
                     append_timeline_to_record(record, &id, events.clone())
                 })
                 .await?;
-            Ok(assigned)
+            Ok(super::super::TimelineAppendReceipt { commit, events })
         }
     }
 
     fn append_journal(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<SessionJournalEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::SessionCommitReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (revision, ()) = store
-                .update_record(&id, expected_revision, |record, _| {
+            let (receipt, ()) = store
+                .update_record(&id, expected_token, |record, _| {
                     record.append_journal_events(events.clone());
                     record.touch_activity();
                     Ok(())
                 })
                 .await?;
-            Ok(revision)
+            Ok(receipt)
         }
     }
 
-    fn mutate_masks(
+    fn mutate(
         &self,
         id: &SessionId,
-        mutation: SessionMaskMutation,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+        mutation: crate::SessionMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<crate::SessionMutationOutcome>> + Send
     {
         let store = self.clone();
         let id = id.clone();
@@ -489,8 +493,7 @@ impl SessionStore for OpenDalSessionStore {
             for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
                 let (mut record, etag, original) = store.load_record_with_etag(&id).await?;
                 let revision = record.revision.next();
-                record.revision = revision;
-                let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                let outcome = mutate_on_record(&mut record, revision, &mutation)?;
                 if store
                     .write_updated_record(
                         &id,
@@ -523,16 +526,17 @@ impl SessionStore for OpenDalSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_set(&key, &value)?;
             let guard = store.mutation_guard(&id).await?;
             let _mutation = guard.lock().await;
             for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
                 let (mut record, etag, original) = store.load_record_with_etag(&id).await?;
-                let changed = condition == MetadataSetCondition::Unconditional
-                    || !record.metadata.values.contains_key(&key);
+                let changed = condition.matches(&record, &key)
+                    && record.metadata.values.get(&key) != Some(&value);
                 if !changed {
                     return Ok(MetadataSetOutcome { record, changed });
                 }
-                record.set_metadata_value(key.clone(), value.clone());
+                super::super::metadata::set_value(&mut record, key.clone(), value.clone())?;
                 if store
                     .write_updated_record(
                         &id,
@@ -563,8 +567,9 @@ impl SessionStore for OpenDalSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_key(&key)?;
             store
-                .update_metadata_record(&id, |record| {
+                .update_metadata_record(&id, None, |record| {
                     record.remove_metadata_value(&key);
                 })
                 .await
@@ -580,7 +585,7 @@ impl SessionStore for OpenDalSessionStore {
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| {
+                .update_metadata_record(&id, None, |record| {
                     record.set_inference_settings(inference_settings.clone());
                 })
                 .await
@@ -590,16 +595,30 @@ impl SessionStore for OpenDalSessionStore {
     fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| {
+                .update_metadata_record(&id, None, |record| {
                     record.set_agent_definition(agent_definition.clone());
                 })
                 .await
+        }
+    }
+
+    fn set_agent_definition_if_execution(
+        &self,
+        id: &SessionId,
+        expected: super::super::ExecutionToken,
+        agent_definition: Option<serde_json::Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        async move {
+            self.update_metadata_record(id, Some(&expected), |record| {
+                record.set_agent_definition(agent_definition.clone())
+            })
+            .await
         }
     }
 
@@ -659,6 +678,360 @@ mod tests {
         operator: Operator,
         rejections: Arc<AtomicUsize>,
         attempts: Arc<AtomicUsize>,
+    }
+
+    enum Interleave {
+        Metadata,
+        Execution,
+        Uncertain,
+    }
+
+    struct InterleavingCompareAndSwap {
+        operator: Operator,
+        attempts: Arc<AtomicUsize>,
+        interleave: Interleave,
+    }
+
+    impl OpenDalCompareAndSwap for InterleavingCompareAndSwap {
+        fn compare_exchange<'a>(
+            &'a self,
+            key: &'a str,
+            expected: &'a [u8],
+            replacement: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = SessionStoreResult<bool>> + Send + 'a>> {
+            Box::pin(async move {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                let bytes = self
+                    .operator
+                    .read(key)
+                    .await
+                    .map_err(backend_error)?
+                    .to_bytes();
+                if bytes.as_ref() != expected {
+                    return Ok(false);
+                }
+                if attempt == 0 {
+                    if matches!(self.interleave, Interleave::Uncertain) {
+                        self.operator
+                            .write(key, replacement.to_vec())
+                            .await
+                            .map_err(backend_error)?;
+                        return Err(SessionStoreError::Backend {
+                            message: "uncertain write acknowledgment".into(),
+                        });
+                    }
+                    let mut record = super::super::decode_record(&bytes)?;
+                    if matches!(self.interleave, Interleave::Metadata) {
+                        super::super::super::metadata::set_value(
+                            &mut record,
+                            "title".into(),
+                            serde_json::json!("concurrent"),
+                        )?;
+                    } else {
+                        record.advance_revision(true);
+                        record.append_journal_event(SessionJournalEvent::Interrupted);
+                    }
+                    self.operator
+                        .write(
+                            key,
+                            serde_json::to_vec_pretty(&record).map_err(backend_error)?,
+                        )
+                        .await
+                        .map_err(backend_error)?;
+                    return Ok(false);
+                }
+                self.operator
+                    .write(key, replacement.to_vec())
+                    .await
+                    .map_err(backend_error)?;
+                Ok(true)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_configuration_rechecks_cas_and_never_retries_uncertain_ack() {
+        for interleave in [
+            Interleave::Metadata,
+            Interleave::Execution,
+            Interleave::Uncertain,
+        ] {
+            let metadata = matches!(interleave, Interleave::Metadata);
+            let execution = matches!(interleave, Interleave::Execution);
+            let operator = Operator::new(services::Memory::default()).unwrap().finish();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let store = OpenDalSessionStore::new(operator.clone(), "sessions")
+                .with_compare_and_swap(Arc::new(InterleavingCompareAndSwap {
+                    operator,
+                    attempts: attempts.clone(),
+                    interleave,
+                }));
+            let id = SessionId::new("conditional-configuration-cas");
+            let initial = store
+                .create(SessionCreateRequest::new(id.clone()))
+                .await
+                .unwrap();
+            let result = store
+                .set_agent_definition_if_execution(
+                    &id,
+                    initial.execution_token().unwrap(),
+                    Some(serde_json::json!({"cycle":true})),
+                )
+                .await;
+            let record = store.load(&id).await.unwrap();
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                if metadata { 2 } else { 1 }
+            );
+            if metadata {
+                assert_eq!(result.unwrap(), record);
+                assert_eq!(
+                    record.metadata_value("title"),
+                    Some(&serde_json::json!("concurrent"))
+                );
+                assert_eq!(record.revision.get(), 2);
+                assert_eq!(record.execution_sequence.get(), 1);
+            } else if execution {
+                assert!(matches!(
+                    result,
+                    Err(SessionStoreError::StaleExecution { .. })
+                ));
+                assert!(record.agent_definition.is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(SessionStoreError::Backend { message }) if message == "uncertain write acknowledgment")
+                );
+                assert_eq!(
+                    record.agent_definition,
+                    Some(serde_json::json!({"cycle":true}))
+                );
+                assert_eq!(record.execution_sequence.get(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tokenless_conditional_configuration_preserves_metadata_and_checks_execution_noop() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions");
+        let other = OpenDalSessionStore::new(operator, "sessions/");
+        let id = SessionId::new("conditional-configuration-process-owned");
+        let mut request = SessionCreateRequest::new(id.clone());
+        request
+            .metadata_values
+            .insert("title".into(), serde_json::json!("latest"));
+        request
+            .metadata_values
+            .insert("removed".into(), serde_json::json!(true));
+        let initial = store.create(request).await.unwrap();
+        let token = initial.execution_token().unwrap();
+        assert_eq!(
+            store
+                .set_agent_definition_if_execution(&id, token.clone(), None)
+                .await
+                .unwrap(),
+            initial
+        );
+        other
+            .remove_metadata_value(&id, "removed".into())
+            .await
+            .unwrap();
+        let configured = store
+            .set_agent_definition_if_execution(
+                &id,
+                token.clone(),
+                Some(serde_json::json!({"cycle":true})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            configured.metadata_value("title"),
+            Some(&serde_json::json!("latest"))
+        );
+        assert!(configured.metadata_value("removed").is_none());
+        assert_eq!(configured.revision.get(), 2);
+        assert_eq!(configured.execution_sequence.get(), 1);
+        assert!(matches!(
+            other
+                .set_agent_definition_if_execution(&id, token, configured.agent_definition.clone())
+                .await,
+            Err(SessionStoreError::StaleExecution { .. })
+        ));
+        let token = configured.execution_token().unwrap();
+        assert_eq!(
+            other
+                .set_agent_definition_if_execution(
+                    &id,
+                    token.clone(),
+                    configured.agent_definition.clone()
+                )
+                .await
+                .unwrap(),
+            configured
+        );
+        other
+            .append_journal(&id, token.clone(), vec![SessionJournalEvent::Finished])
+            .await
+            .unwrap();
+        let committed = store.load(&id).await.unwrap();
+        assert!(matches!(
+            store
+                .set_agent_definition_if_execution(&id, token, configured.agent_definition.clone())
+                .await,
+            Err(SessionStoreError::StaleExecution { .. })
+        ));
+        assert_eq!(store.load(&id).await.unwrap(), committed);
+    }
+
+    #[tokio::test]
+    async fn append_rechecks_token_after_definite_cas_rejection_and_preserves_title() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(InterleavingCompareAndSwap {
+                operator,
+                attempts: attempts.clone(),
+                interleave: Interleave::Metadata,
+            }),
+        );
+        let id = SessionId::new("metadata-cas-conflict");
+        let record = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        let receipt = store
+            .append_journal(
+                &id,
+                record.execution_token().unwrap(),
+                vec![SessionJournalEvent::Finished],
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(receipt.revision, Revision::new(2));
+        assert_eq!(receipt.execution_token.sequence.get(), 1);
+        assert_eq!(
+            receipt.metadata.values["title"],
+            serde_json::json!("concurrent")
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().journal,
+            vec![SessionJournalEvent::Finished]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_rejects_execution_conflict_after_definite_cas_rejection() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(InterleavingCompareAndSwap {
+                operator,
+                attempts: attempts.clone(),
+                interleave: Interleave::Execution,
+            }),
+        );
+        let id = SessionId::new("execution-cas-conflict");
+        let record = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        let error = store
+            .append_journal(
+                &id,
+                record.execution_token().unwrap(),
+                vec![SessionJournalEvent::Finished],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SessionStoreError::StaleExecution { .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load(&id).await.unwrap().journal,
+            vec![SessionJournalEvent::Interrupted]
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_cas_ack_is_not_retried_even_when_replacement_committed() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(InterleavingCompareAndSwap {
+                operator,
+                attempts: attempts.clone(),
+                interleave: Interleave::Uncertain,
+            }),
+        );
+        let id = SessionId::new("uncertain-cas");
+        let record = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        let error = store
+            .append_journal(
+                &id,
+                record.execution_token().unwrap(),
+                vec![SessionJournalEvent::Finished],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SessionStoreError::Backend { message } if message == "uncertain write acknowledgment")
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load(&id).await.unwrap().journal,
+            vec![SessionJournalEvent::Finished]
+        );
+    }
+
+    #[tokio::test]
+    async fn bytewise_cas_uses_exact_legacy_bytes_before_persisting_execution_sequence() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(TestCompareAndSwap {
+                operator: operator.clone(),
+                rejections: Arc::new(AtomicUsize::new(0)),
+                attempts: attempts.clone(),
+            }),
+        );
+        let mut record = SessionRecord::new("legacy-bytewise-cas");
+        record.revision = Revision::new(17);
+        record.journal.push(SessionJournalEvent::Interrupted);
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("execution_sequence");
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        operator
+            .write(&store.key(&record.id), original.clone())
+            .await
+            .unwrap();
+        let loaded = store.load(&record.id).await.unwrap();
+        assert_eq!(loaded.execution_sequence.get(), 17);
+        assert_eq!(
+            operator
+                .read(&store.key(&record.id))
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            original.as_slice()
+        );
+        let receipt = store
+            .append_journal(
+                &record.id,
+                loaded.execution_token().unwrap(),
+                vec![SessionJournalEvent::Finished],
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.execution_token.sequence.get(), 18);
+        assert_eq!(
+            store.load(&record.id).await.unwrap().journal[0],
+            record.journal[0]
+        );
     }
 
     impl OpenDalCompareAndSwap for TestCompareAndSwap {
@@ -752,7 +1125,12 @@ mod tests {
             append_store
                 .append_journal(
                     &append_id,
-                    Revision::ZERO,
+                    append_store
+                        .load(&append_id)
+                        .await
+                        .unwrap()
+                        .execution_token()
+                        .unwrap(),
                     vec![SessionJournalEvent::PromptAppended {
                         prompt: "preserved".to_owned(),
                     }],
@@ -774,7 +1152,7 @@ mod tests {
             definition_store
                 .set_agent_definition(
                     &definition_id,
-                    Some(AgentDefinitionBundle::new(
+                    Some(crate::agent::session::opaque_test_configuration(
                         "selected",
                         vec!["kind: Agent".to_owned()],
                     )),
@@ -788,17 +1166,17 @@ mod tests {
         assert!(!definition.is_finished());
         drop(held);
 
-        assert_eq!(append.await.unwrap().unwrap(), Revision::new(1));
+        assert_eq!(append.await.unwrap().unwrap().revision, Revision::new(1));
         inference.await.unwrap().unwrap();
         definition.await.unwrap().unwrap();
         let record = first.load(&id).await.unwrap();
-        assert_eq!(record.revision, Revision::new(1));
+        assert_eq!(record.revision, Revision::new(3));
         assert_eq!(record.journal.len(), 1);
         assert_eq!(
             record.inference_settings,
             Some(inference_settings("updated"))
         );
-        assert_eq!(record.agent_definition.unwrap().agent_name, "selected");
+        assert_eq!(record.agent_definition.unwrap()["name"], "selected");
     }
 
     #[tokio::test]
@@ -862,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokenless_backend_rejects_atomic_mask_mutation_without_persisting_it() {
+    async fn tokenless_backend_rejects_atomic_metadata_and_masks_without_partial_persistence() {
         let operator = Operator::new(services::Memory::default()).unwrap().finish();
         let store = OpenDalSessionStore::new(operator, "sessions");
         let id = SessionId::new("tokenless-mask");
@@ -873,7 +1251,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![crate::PendingTimelineEvent::assistant_text_snapshot(
                     id.clone(),
                     0,
@@ -886,19 +1264,24 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::new(1),
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![SessionJournalEvent::TurnFinished { turn: 0 }],
             )
             .await
             .unwrap();
-        let mut mutation = SessionMaskMutation::new(Some(crate::TimelineCursor::new(1)));
+        let mut mutation = crate::SessionMaskMutation::new(Some(crate::TimelineCursor::new(1)));
         mutation.add.push(crate::SessionMaskAddition::new(
             "summary",
             crate::ThroughCursor::new(crate::TimelineCursor::new(1)),
             crate::ReplacementUserContent::new("compacted"),
         ));
 
-        let error = store.mutate_masks(&id, mutation).await.unwrap_err();
+        let error = store.mutate(&id, crate::SessionMutation {
+            masks: Some(mutation),
+            updates: vec![crate::MetadataUpdate { target: crate::MetadataTarget::Session,
+                key: "opaque".into(), value: Some(serde_json::json!({"free": true})) }],
+            ..Default::default()
+        }).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -908,6 +1291,7 @@ mod tests {
         let record = store.load(&id).await.unwrap();
         assert_eq!(record.revision, Revision::new(2));
         assert!(record.active_masks().is_empty());
+        assert!(record.metadata_value("opaque").is_none());
     }
 
     #[tokio::test]
@@ -943,16 +1327,16 @@ mod tests {
             .unwrap();
 
         let error = store
-            .set_metadata_value_conditionally(
-                &id,
-                "key".to_owned(),
-                serde_json::json!("value"),
-                MetadataSetCondition::Absent,
-            )
+            .mutate(&id, crate::SessionMutation {
+                updates: vec![crate::MetadataUpdate { target: crate::MetadataTarget::Session,
+                    key: "key".into(), value: Some(serde_json::json!("value")) }],
+                ..Default::default()
+            })
             .await
             .unwrap_err();
 
         assert_eq!(attempts.load(Ordering::SeqCst), OPENDAL_CAS_ATTEMPTS);
+        assert!(store.load(&id).await.unwrap().metadata_value("key").is_none());
         assert!(matches!(
             error,
             SessionStoreError::Backend { message }
@@ -981,7 +1365,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![PendingTimelineEvent::assistant_text_delta(
                     id.clone(),
                     0,
@@ -994,16 +1378,15 @@ mod tests {
         rejections.store(1, Ordering::SeqCst);
 
         let outcome = store
-            .set_metadata_value_conditionally(
-                &id,
-                "key".to_owned(),
-                serde_json::json!("value"),
-                MetadataSetCondition::Absent,
-            )
+            .mutate(&id, crate::SessionMutation {
+                updates: vec![crate::MetadataUpdate { target: crate::MetadataTarget::Session,
+                    key: "key".into(), value: Some(serde_json::json!("value")) }],
+                ..Default::default()
+            })
             .await
             .unwrap();
 
-        assert!(outcome.changed);
+        assert_eq!(outcome.record.metadata_value("key"), Some(&serde_json::json!("value")));
         assert_eq!(
             outcome.record.timeline_cursor_high_water(),
             crate::TimelineCursor::new(1)

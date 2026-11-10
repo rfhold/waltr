@@ -17,7 +17,7 @@ use axum::{
     routing::get,
 };
 use waltr_agent::{
-    MetadataSetCondition, PendingTimelineEvent, PendingTimelineItemId, Revision, S3SessionStore,
+    MetadataSetCondition, PendingTimelineEvent, PendingTimelineItemId, S3SessionStore,
     S3SessionWriteMode, SessionCreateRequest, SessionId, SessionRecord, SessionStore,
     SessionStoreError, TimelineCursor,
 };
@@ -119,17 +119,18 @@ async fn conditional_revision_update_reports_stale_after_conflict_reload() {
         .push_back(ConflictAction::AdvanceRevision);
 
     let error = store
-        .append_journal(&id, Revision::ZERO, Vec::new())
+        .append_journal(
+            &id,
+            store.load(&id).await.unwrap().execution_token().unwrap(),
+            Vec::new(),
+        )
         .await
         .expect_err("changed revision must be stale");
 
-    assert_eq!(
-        error,
-        SessionStoreError::StaleRevision {
-            id,
-            expected: Revision::ZERO,
-            actual: Revision::new(1),
-        }
+    assert!(
+        matches!(error, SessionStoreError::StaleExecution { expected, actual }
+        if expected.session_id == id && expected.sequence == waltr_agent::ExecutionSequence::ZERO
+            && actual.sequence == waltr_agent::ExecutionSequence::new(1))
     );
 }
 
@@ -145,7 +146,7 @@ async fn conditional_metadata_retry_reapplies_update_to_latest_record() {
     store
         .append_timeline(
             &id,
-            Revision::ZERO,
+            store.load(&id).await.unwrap().execution_token().unwrap(),
             vec![PendingTimelineEvent::assistant_text_delta(
                 id.clone(),
                 0,
@@ -272,6 +273,96 @@ async fn single_writer_accepts_missing_etag_and_puts_without_if_match() {
             .iter()
             .all(Option::is_none)
     );
+}
+
+#[tokio::test]
+async fn single_writer_conditional_configuration_preserves_metadata_and_checks_execution_noop() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fake = FakeS3::start(false).await;
+        let client = fake.client().await;
+        let store = S3SessionStore::new_with_write_mode(
+            client.clone(),
+            "bucket",
+            "sessions",
+            S3SessionWriteMode::SingleWriter,
+        );
+        let other = S3SessionStore::new_with_write_mode(
+            client,
+            "bucket",
+            "sessions/",
+            S3SessionWriteMode::SingleWriter,
+        );
+        let id = SessionId::new("conditional-configuration-process-owned");
+        let initial = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        let token = initial.execution_token().unwrap();
+        assert_eq!(
+            store
+                .set_agent_definition_if_execution(&id, token.clone(), None)
+                .await
+                .unwrap(),
+            initial
+        );
+        other
+            .set_metadata_value(&id, "title".into(), json!("latest"))
+            .await
+            .unwrap();
+        let configured = store
+            .set_agent_definition_if_execution(&id, token.clone(), Some(json!({"cycle":true})))
+            .await
+            .unwrap();
+        assert_eq!(configured.metadata_value("title"), Some(&json!("latest")));
+        assert_eq!(configured.revision.get(), 2);
+        assert_eq!(configured.execution_sequence.get(), 1);
+        assert!(matches!(
+            other
+                .set_agent_definition_if_execution(&id, token, configured.agent_definition.clone())
+                .await,
+            Err(SessionStoreError::StaleExecution { .. })
+        ));
+        let token = configured.execution_token().unwrap();
+        assert_eq!(
+            other
+                .set_agent_definition_if_execution(
+                    &id,
+                    token.clone(),
+                    configured.agent_definition.clone()
+                )
+                .await
+                .unwrap(),
+            configured
+        );
+        assert_eq!(fake.state.put_count.load(Ordering::SeqCst), 3);
+        other
+            .append_journal(
+                &id,
+                token.clone(),
+                vec![waltr_agent::SessionJournalEvent::Finished],
+            )
+            .await
+            .unwrap();
+        let committed = store.load(&id).await.unwrap();
+        assert!(matches!(
+            store
+                .set_agent_definition_if_execution(&id, token, configured.agent_definition.clone())
+                .await,
+            Err(SessionStoreError::StaleExecution { .. })
+        ));
+        assert_eq!(store.load(&id).await.unwrap(), committed);
+        assert_eq!(fake.state.put_count.load(Ordering::SeqCst), 4);
+        assert!(
+            fake.state
+                .if_matches
+                .lock()
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+    })
+    .await
+    .expect("bounded single-writer configuration regression");
 }
 
 #[tokio::test]
@@ -498,6 +589,8 @@ async fn put_object(
                     serde_json::from_slice(object.as_deref().expect("existing object"))
                         .expect("session record");
                 record.revision = record.revision.next();
+                record.execution_sequence =
+                    waltr_agent::ExecutionSequence::new(record.execution_sequence.get() + 1);
                 *object = Some(serde_json::to_vec_pretty(&record).expect("serialize record"));
                 drop(object);
                 state.etag_version.fetch_add(1, Ordering::SeqCst);

@@ -13,13 +13,13 @@ use tokio::sync::Mutex;
 /// Current durable outbound OAuth credential representation.
 pub const OAUTH_CREDENTIAL_VERSION: u32 = 1;
 
-/// One provider or MCP OAuth credential.
+/// One provider OAuth credential.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredential {
     /// Stored representation version.
     pub version: u32,
     /// Non-secret authorization incarnation, retained on refresh but replaced on authorization.
-    /// Legacy credentials without an identity cannot authorize MCP Apps.
+    /// Identity is retained across refreshes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_id: Option<String>,
     /// Shared token material.
@@ -54,23 +54,11 @@ impl OAuthCredential {
         }
     }
 
-    /// Create an MCP credential.
-    #[must_use]
-    pub fn mcp(token: OAuthTokenSet, context: McpOAuthContext) -> Self {
-        Self {
-            version: OAUTH_CREDENTIAL_VERSION,
-            authority_id: Some(uuid::Uuid::now_v7().to_string()),
-            token,
-            context: OAuthCredentialContext::Mcp(Box::new(context)),
-        }
-    }
-
     /// Provider metadata when this is a provider credential.
     #[must_use]
     pub const fn provider_metadata(&self) -> Option<&BTreeMap<String, String>> {
         match &self.context {
             OAuthCredentialContext::Provider { metadata } => Some(metadata),
-            OAuthCredentialContext::Mcp(_) => None,
         }
     }
 
@@ -79,30 +67,11 @@ impl OAuthCredential {
     pub const fn provider_metadata_mut(&mut self) -> Option<&mut BTreeMap<String, String>> {
         match &mut self.context {
             OAuthCredentialContext::Provider { metadata } => Some(metadata),
-            OAuthCredentialContext::Mcp(_) => None,
-        }
-    }
-
-    /// MCP context when this is an MCP credential.
-    #[must_use]
-    pub fn mcp_context(&self) -> Option<&McpOAuthContext> {
-        match &self.context {
-            OAuthCredentialContext::Provider { .. } => None,
-            OAuthCredentialContext::Mcp(context) => Some(context.as_ref()),
-        }
-    }
-
-    /// Mutable MCP context when this is an MCP credential.
-    #[must_use]
-    pub fn mcp_context_mut(&mut self) -> Option<&mut McpOAuthContext> {
-        match &mut self.context {
-            OAuthCredentialContext::Provider { .. } => None,
-            OAuthCredentialContext::Mcp(context) => Some(context.as_mut()),
         }
     }
 }
 
-/// Shared OAuth token set for provider and MCP credentials.
+/// Provider OAuth token set.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthTokenSet {
     /// Current access token.
@@ -191,8 +160,6 @@ pub enum OAuthCredentialContext {
         #[serde(default)]
         metadata: BTreeMap<String, String>,
     },
-    /// MCP resource, registration, and endpoints.
-    Mcp(Box<McpOAuthContext>),
 }
 
 impl std::fmt::Debug for OAuthCredentialContext {
@@ -202,66 +169,8 @@ impl std::fmt::Debug for OAuthCredentialContext {
                 .debug_struct("Provider")
                 .field("metadata_keys", &metadata.keys().collect::<Vec<_>>())
                 .finish(),
-            Self::Mcp(context) => formatter.debug_tuple("Mcp").field(context).finish(),
         }
     }
-}
-
-/// Durable MCP-specific OAuth context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpOAuthContext {
-    /// Exact protected resource identifier.
-    pub resource: String,
-    /// Selected authorization server issuer.
-    pub issuer: String,
-    /// Client registration used for this resource and issuer.
-    pub registration: McpOAuthRegistration,
-    /// Discovered authorization server endpoints.
-    pub endpoints: McpOAuthEndpoints,
-}
-
-/// How an MCP OAuth client registration was obtained.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum McpOAuthRegistrationMethod {
-    /// Registration supplied by configuration.
-    #[default]
-    Preregistered,
-    /// Client ID Metadata Document registration.
-    ClientMetadata,
-    /// Dynamic Client Registration registration.
-    Dynamic,
-    /// Registration mechanism introduced by a newer credential version.
-    #[serde(other)]
-    Unknown,
-}
-
-/// Durable MCP OAuth client registration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpOAuthRegistration {
-    /// Registration mechanism.
-    pub method: McpOAuthRegistrationMethod,
-    /// OAuth client identifier.
-    pub client_id: String,
-    /// Exact redirect URI used by the client.
-    pub redirect_uri: String,
-    /// Token endpoint authentication method.
-    pub token_endpoint_auth_method: String,
-    /// Registration creation timestamp in Unix milliseconds.
-    pub created_at_ms: Option<i64>,
-    /// Registration expiration timestamp in Unix milliseconds.
-    pub expires_at_ms: Option<i64>,
-}
-
-/// Durable discovered endpoints for MCP OAuth.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpOAuthEndpoints {
-    /// Authorization endpoint.
-    pub authorization: String,
-    /// Token endpoint.
-    pub token: String,
-    /// Optional token revocation endpoint.
-    pub revocation: Option<String>,
 }
 
 /// Credential plus SQL/file storage envelope fields.
@@ -405,7 +314,7 @@ impl CredentialStore {
         self.0.delete(target_key.to_owned()).await
     }
 
-    pub(crate) async fn claim_refresh(
+    pub async fn claim_refresh(
         &self,
         target_key: &str,
         claim: OAuthRefreshClaim,
@@ -413,7 +322,7 @@ impl CredentialStore {
         self.0.claim_refresh(target_key.to_owned(), claim).await
     }
 
-    pub(crate) async fn commit_refresh(
+    pub async fn commit_refresh(
         &self,
         target_key: &str,
         claim: OAuthRefreshClaim,
@@ -805,7 +714,7 @@ fn unix_time_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn apps_authority_id_is_new_on_authorization_and_optional_on_legacy_replay() {
+    fn authority_id_is_new_on_authorization_and_optional_on_replay() {
         let first = super::OAuthCredential::provider(
             super::OAuthTokenSet::bearer("a", None, None),
             Default::default(),
@@ -846,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_store_uses_revision_claim_and_cas_for_every_target() {
-        for target in ["provider:test", "mcp:test"] {
+        for target in ["provider:test", "provider:other"] {
             let directory = tempfile::tempdir().unwrap();
             let store = FileCredentialStore::new(directory.path().join("auth.json"));
             OAuthCredentialStore::write(&store, target.to_owned(), provider("old"))

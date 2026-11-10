@@ -86,6 +86,43 @@ impl AnthropicMessages {
 }
 
 impl LlmStream for AnthropicMessages {
+    fn transient_api(&self) -> Option<crate::TransientInputApi> {
+        Some(crate::TransientInputApi::Anthropic)
+    }
+
+    fn preflight_transient_request(
+        &self,
+        request: &CompletionRequest<'_>,
+        input: &crate::AdmittedTransientInput,
+    ) -> crate::Result<()> {
+        let request =
+            request.for_provider_identity(ANTHROPIC_MESSAGES_NAME, &self.messages_url, &self.model);
+        input
+            .input()
+            .check_body(&request::messages_request_with_input(
+                &self.model,
+                self.max_tokens,
+                self.thinking.as_ref(),
+                request::MessagesRequestOptions::new(
+                    self.prompt_cache,
+                    self.oauth_billing_version.as_deref(),
+                ),
+                &request,
+                Some(input.input()),
+            ))
+    }
+
+    fn stream_transient_request<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: &'a crate::AdmittedTransientInput,
+    ) -> BoxStreamFuture<'a> {
+        Box::pin(stream::send_request_with_input(
+            self,
+            request,
+            Some(input.input()),
+        ))
+    }
     fn name(&self) -> &'static str {
         ANTHROPIC_MESSAGES_NAME
     }

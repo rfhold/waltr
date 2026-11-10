@@ -2,18 +2,11 @@
 
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
-use crate::{
-    Result,
-    resource::TemplateSearchResults,
-    template::{TemplateReference, TemplateReferenceRender},
-};
+use crate::Result;
 
 use super::{
-    AgentMiddleware, HookOutcome, Suspension,
-    context::{
-        ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, TemplateRenderContext,
-        TemplateSearchContext, ToolCallContext, ToolDraft, ToolResultContext,
-    },
+    AgentMiddleware, HookOutcome,
+    context::{ModelRequestDraft, RequestContext, SystemPromptParts, ToolDraft, ToolResultContext},
 };
 
 type BoxHookFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -43,33 +36,10 @@ trait ChainMiddleware: Send + Sync {
         request: &'a mut ModelRequestDraft,
     ) -> BoxHookFuture<'a, HookOutcome>;
 
-    fn search_templates<'a>(
-        &'a self,
-        ctx: &'a TemplateSearchContext<'_>,
-        results: &'a mut TemplateSearchResults,
-    ) -> BoxHookFuture<'a, ()>;
-
-    fn render_template_reference<'a>(
-        &'a self,
-        ctx: &'a mut TemplateRenderContext<'_>,
-        reference: &'a TemplateReference,
-    ) -> BoxHookFuture<'a, TemplateReferenceRender>;
-
-    fn before_tool_call<'a>(
-        &'a self,
-        ctx: &'a mut ToolCallContext<'_>,
-    ) -> BoxHookFuture<'a, HookOutcome>;
-
     fn after_tool_call<'a>(
         &'a self,
         ctx: &'a mut ToolResultContext<'_>,
     ) -> BoxHookFuture<'a, HookOutcome>;
-
-    fn on_suspend<'a>(
-        &'a self,
-        ctx: &'a mut RunContext<'_>,
-        suspension: &'a mut Suspension,
-    ) -> BoxHookFuture<'a, ()>;
 }
 
 impl<T> ChainMiddleware for T
@@ -108,44 +78,11 @@ where
         Box::pin(AgentMiddleware::before_provider_request(self, ctx, request))
     }
 
-    fn search_templates<'a>(
-        &'a self,
-        ctx: &'a TemplateSearchContext<'_>,
-        results: &'a mut TemplateSearchResults,
-    ) -> BoxHookFuture<'a, ()> {
-        Box::pin(AgentMiddleware::search_templates(self, ctx, results))
-    }
-
-    fn render_template_reference<'a>(
-        &'a self,
-        ctx: &'a mut TemplateRenderContext<'_>,
-        reference: &'a TemplateReference,
-    ) -> BoxHookFuture<'a, TemplateReferenceRender> {
-        Box::pin(AgentMiddleware::render_template_reference(
-            self, ctx, reference,
-        ))
-    }
-
-    fn before_tool_call<'a>(
-        &'a self,
-        ctx: &'a mut ToolCallContext<'_>,
-    ) -> BoxHookFuture<'a, HookOutcome> {
-        Box::pin(AgentMiddleware::before_tool_call(self, ctx))
-    }
-
     fn after_tool_call<'a>(
         &'a self,
         ctx: &'a mut ToolResultContext<'_>,
     ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::after_tool_call(self, ctx))
-    }
-
-    fn on_suspend<'a>(
-        &'a self,
-        ctx: &'a mut RunContext<'_>,
-        suspension: &'a mut Suspension,
-    ) -> BoxHookFuture<'a, ()> {
-        Box::pin(AgentMiddleware::on_suspend(self, ctx, suspension))
     }
 }
 
@@ -217,9 +154,6 @@ impl MiddlewareChain {
         for middleware in &self.middleware {
             middleware.list_tools(ctx, tools).await?;
         }
-        tools
-            .tools
-            .retain(|tool| super::tools::tool_is_visible(&ctx.permission_policy, tool, true));
 
         Ok(())
     }
@@ -254,48 +188,8 @@ impl MiddlewareChain {
     }
 
     /// Run template-search middleware in insertion order.
-    pub(crate) async fn search_templates(
-        &self,
-        ctx: &TemplateSearchContext<'_>,
-        results: &mut TemplateSearchResults,
-    ) -> Result<()> {
-        for middleware in &self.middleware {
-            middleware.search_templates(ctx, results).await?;
-        }
-
-        Ok(())
-    }
 
     /// Run template-render middleware until the first owner renders the reference.
-    pub(crate) async fn render_template_reference(
-        &self,
-        ctx: &mut TemplateRenderContext<'_>,
-        reference: &TemplateReference,
-    ) -> Result<TemplateReferenceRender> {
-        for middleware in &self.middleware {
-            let rendered = middleware.render_template_reference(ctx, reference).await?;
-            if !matches!(rendered, TemplateReferenceRender::Continue) {
-                return Ok(rendered);
-            }
-        }
-
-        Ok(TemplateReferenceRender::Continue)
-    }
-
-    /// Run pre-tool-call middleware until the first non-continue outcome.
-    pub(crate) async fn before_tool_call(
-        &self,
-        ctx: &mut ToolCallContext<'_>,
-    ) -> Result<HookOutcome> {
-        for middleware in &self.middleware {
-            let outcome = middleware.before_tool_call(ctx).await?;
-            if !matches!(outcome, HookOutcome::Continue) {
-                return Ok(outcome);
-            }
-        }
-
-        Ok(HookOutcome::Continue)
-    }
 
     /// Run post-tool-call middleware until the first non-continue outcome.
     pub(crate) async fn after_tool_call(
@@ -310,19 +204,6 @@ impl MiddlewareChain {
         }
 
         Ok(HookOutcome::Continue)
-    }
-
-    /// Run suspension middleware in insertion order.
-    pub(crate) async fn on_suspend(
-        &self,
-        ctx: &mut RunContext<'_>,
-        suspension: &mut Suspension,
-    ) -> Result<()> {
-        for middleware in &self.middleware {
-            middleware.on_suspend(ctx, suspension).await?;
-        }
-
-        Ok(())
     }
 }
 
@@ -409,8 +290,6 @@ mod tests {
             middleware_state,
             session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override,
-            middleware_chain: MiddlewareChain::new(),
-            permission_policy: crate::PermissionPolicy::default(),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             session_id: "test-session",
             turn: 0,
@@ -487,13 +366,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_listing_filters_middleware_owned_tools() {
+    async fn tool_listing_retains_generic_middleware_owned_tools() {
         let mut chain = MiddlewareChain::new();
         chain.push(ToolProducerMiddleware);
         let mut middleware_state = crate::middleware::context::MiddlewareStateLog::default();
         let mut system_prompt_override = None;
         let mut ctx = request_context(&mut middleware_state, &mut system_prompt_override);
-        ctx.permission_policy = crate::PermissionPolicy::new(crate::PermissionLevel::Deny);
         let mut tools = ToolDraft::default();
 
         chain
@@ -501,6 +379,6 @@ mod tests {
             .await
             .expect("tool listing should run");
 
-        assert!(tools.tools.is_empty());
+        assert_eq!(tools.tools.len(), 1);
     }
 }

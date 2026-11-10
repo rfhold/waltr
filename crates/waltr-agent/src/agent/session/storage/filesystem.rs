@@ -7,16 +7,14 @@ use std::{
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    mutate_on_record, sorted_session_summaries, timeline_item_text_from_record,
     timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
-        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
-    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -158,7 +156,7 @@ impl FilesystemSessionStore {
                 backend_error(error)
             }
         })?;
-        serde_json::from_slice(&bytes).map_err(backend_error)
+        super::decode_record(&bytes)
     }
 
     fn save_sync(&self, record: &SessionRecord) -> SessionStoreResult<()> {
@@ -193,7 +191,7 @@ impl FilesystemSessionStore {
                 continue;
             }
             let bytes = fs::read(&path).map_err(backend_error)?;
-            records.push(serde_json::from_slice::<SessionRecord>(&bytes).map_err(backend_error)?);
+            records.push(super::decode_record(&bytes)?);
         }
         Ok(sorted_session_summaries(records))
     }
@@ -201,34 +199,37 @@ impl FilesystemSessionStore {
     fn update_sync<T>(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T>,
-    ) -> SessionStoreResult<(Revision, T)> {
+    ) -> SessionStoreResult<(super::super::SessionCommitReceipt, T)> {
         self.with_session_lock(id, || {
             let mut record = self.load_sync(id)?;
-            if record.revision != expected_revision {
-                return Err(SessionStoreError::StaleRevision {
-                    id: id.clone(),
-                    expected: expected_revision,
-                    actual: record.revision,
-                });
-            }
+            record.check_execution_token(&expected_token)?;
             let revision = record.revision.next();
-            record.revision = revision;
+            record.advance_revision(true);
             let value = update(&mut record, revision)?;
+            let receipt = record.commit_receipt()?;
             self.save_sync(&record)?;
-            Ok((revision, value))
+            Ok((receipt, value))
         })
     }
 
     fn update_metadata_sync(
         &self,
         id: &SessionId,
+        expected: Option<&super::super::ExecutionToken>,
         update: impl FnOnce(&mut SessionRecord),
     ) -> SessionStoreResult<SessionRecord> {
         self.with_session_lock(id, || {
             let mut record = self.load_sync(id)?;
+            if let Some(expected) = expected {
+                record.check_execution_token(expected)?;
+            }
+            let revision = record.revision;
             update(&mut record);
+            if record.revision == revision {
+                return Ok(record);
+            }
             self.save_sync(&record)?;
             Ok(record)
         })
@@ -241,12 +242,13 @@ impl FilesystemSessionStore {
         value: Value,
         condition: MetadataSetCondition,
     ) -> SessionStoreResult<MetadataSetOutcome> {
+        super::super::metadata::validate_set(&key, &value)?;
         self.with_session_lock(id, || {
             let mut record = self.load_sync(id)?;
-            let changed = condition == MetadataSetCondition::Unconditional
-                || !record.metadata.values.contains_key(&key);
+            let changed = condition.matches(&record, &key)
+                && record.metadata.values.get(&key) != Some(&value);
             if changed {
-                record.set_metadata_value(key, value);
+                super::super::metadata::set_value(&mut record, key, value)?;
                 self.save_sync(&record)?;
             }
             Ok(MetadataSetOutcome { record, changed })
@@ -285,6 +287,7 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         async move {
             let record = request.materialize();
+            super::super::metadata::validate_record(&record)?;
             store
                 .blocking(move |store| {
                     let id = record.id.clone();
@@ -347,19 +350,20 @@ impl SessionStore for FilesystemSessionStore {
     fn append_timeline(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<PendingTimelineEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::TimelineAppendReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
                 .blocking(move |store| {
-                    let (_, assigned) =
-                        store.update_sync(&id, expected_revision, |record, _| {
+                    let (commit, events) =
+                        store.update_sync(&id, expected_token, |record, _| {
                             append_timeline_to_record(record, &id, events)
                         })?;
-                    Ok(assigned)
+                    Ok(super::super::TimelineAppendReceipt { commit, events })
                 })
                 .await
         }
@@ -368,31 +372,31 @@ impl SessionStore for FilesystemSessionStore {
     fn append_journal(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<SessionJournalEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::SessionCommitReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
                 .blocking(move |store| {
-                    let (revision, ()) =
-                        store.update_sync(&id, expected_revision, |record, _| {
-                            record.append_journal_events(events);
-                            record.touch_activity();
-                            Ok(())
-                        })?;
-                    Ok(revision)
+                    let (receipt, ()) = store.update_sync(&id, expected_token, |record, _| {
+                        record.append_journal_events(events);
+                        record.touch_activity();
+                        Ok(())
+                    })?;
+                    Ok(receipt)
                 })
                 .await
         }
     }
 
-    fn mutate_masks(
+    fn mutate(
         &self,
         id: &SessionId,
-        mutation: SessionMaskMutation,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+        mutation: crate::SessionMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<crate::SessionMutationOutcome>> + Send
     {
         let store = self.clone();
         let id = id.clone();
@@ -402,8 +406,7 @@ impl SessionStore for FilesystemSessionStore {
                     store.with_session_lock(&id, || {
                         let mut record = store.load_sync(&id)?;
                         let revision = record.revision.next();
-                        record.revision = revision;
-                        let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                        let outcome = mutate_on_record(&mut record, revision, &mutation)?;
                         store.save_sync(&record)?;
                         Ok(outcome)
                     })
@@ -438,9 +441,10 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_key(&key)?;
             store
                 .blocking(move |store| {
-                    store.update_metadata_sync(&id, |record| {
+                    store.update_metadata_sync(&id, None, |record| {
                         record.remove_metadata_value(&key);
                     })
                 })
@@ -458,7 +462,7 @@ impl SessionStore for FilesystemSessionStore {
         async move {
             store
                 .blocking(move |store| {
-                    store.update_metadata_sync(&id, |record| {
+                    store.update_metadata_sync(&id, None, |record| {
                         record.set_inference_settings(inference_settings);
                     })
                 })
@@ -469,18 +473,37 @@ impl SessionStore for FilesystemSessionStore {
     fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
                 .blocking(move |store| {
-                    store.update_metadata_sync(&id, |record| {
+                    store.update_metadata_sync(&id, None, |record| {
                         record.set_agent_definition(agent_definition);
                     })
                 })
                 .await
+        }
+    }
+
+    fn set_agent_definition_if_execution(
+        &self,
+        id: &SessionId,
+        expected: super::super::ExecutionToken,
+        agent_definition: Option<serde_json::Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                store.update_metadata_sync(&id, Some(&expected), |record| {
+                    record.set_agent_definition(agent_definition)
+                })
+            })
+            .await
+            .map_err(backend_error)?
         }
     }
 
@@ -564,7 +587,7 @@ mod tests {
         let (append, metadata) = tokio::join!(
             first.append_journal(
                 &id,
-                Revision::ZERO,
+                first.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "preserved".to_owned(),
                 }],
@@ -572,10 +595,10 @@ mod tests {
             second.set_metadata_value(&id, "key".to_owned(), serde_json::json!("value")),
         );
 
-        assert_eq!(append.unwrap(), Revision::new(1));
+        assert!(append.unwrap().revision >= Revision::new(1));
         metadata.unwrap();
         let record = first.load(&id).await.unwrap();
-        assert_eq!(record.revision, Revision::new(1));
+        assert_eq!(record.revision, Revision::new(2));
         assert_eq!(record.journal.len(), 1);
         assert_eq!(
             record.metadata_value("key"),
@@ -604,7 +627,7 @@ mod tests {
         first
             .append_timeline(
                 &id,
-                Revision::ZERO,
+                first.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![PendingTimelineEvent::assistant_text_delta(
                     id.clone(),
                     0,
@@ -774,7 +797,7 @@ mod tests {
         store
             .append_journal(
                 &first,
-                Revision::ZERO,
+                first_record.execution_token().unwrap(),
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "again".to_owned(),
                 }],

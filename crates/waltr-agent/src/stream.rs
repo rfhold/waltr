@@ -1032,6 +1032,43 @@ impl ToolCall {
 
 /// Bare-bones interface for testing LLM text streaming providers.
 pub trait LlmStream: Send + Sync {
+    /// Supported transient encoding API; model capabilities are separately host-pinned.
+    fn transient_api(&self) -> Option<crate::TransientInputApi> {
+        None
+    }
+
+    /// Process-local input retained by an invocation-bound provider adapter.
+    fn transient_input(&self) -> Option<&crate::TransientInput> {
+        None
+    }
+
+    /// Check exact encoded body size without constructing base64. Admission is
+    /// already held; this internal measurement must never be persisted or traced.
+    ///
+    /// # Errors
+    /// Rejects unsupported adapters, invalid targets, or excessive encoded bodies.
+    fn preflight_transient_request(
+        &self,
+        _request: &CompletionRequest<'_>,
+        _input: &crate::AdmittedTransientInput,
+    ) -> crate::Result<()> {
+        Err(crate::transient_input::invalid(
+            "provider transient preflight unavailable",
+        ))
+    }
+
+    /// Encode authorized invocation-local input. The default fails closed.
+    fn stream_transient_request<'a>(
+        &'a self,
+        _request: CompletionRequest<'a>,
+        _input: &'a crate::AdmittedTransientInput,
+    ) -> BoxStreamFuture<'a> {
+        Box::pin(async {
+            Err(crate::transient_input::invalid(
+                "provider API does not support transient input",
+            ))
+        })
+    }
     /// Provider name used in diagnostics.
     fn name(&self) -> &'static str;
 
@@ -1051,7 +1088,9 @@ pub trait LlmStream: Send + Sync {
     /// Project the provider-native wire payload for a request without sending it.
     ///
     /// Providers that implement this must guarantee `stream_request` sends
-    /// exactly this payload for the same input. Returns `None` when the
+    /// exactly this payload for the same input, except invocation-bound transient
+    /// adapters return an explicitly labeled metadata-only non-replayable view
+    /// without encoding payloads. Returns `None` when the
     /// provider has no native projection.
     fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
         let _ = request;
@@ -1066,6 +1105,27 @@ impl<T> LlmStream for Arc<T>
 where
     T: LlmStream + ?Sized,
 {
+    fn transient_api(&self) -> Option<crate::TransientInputApi> {
+        self.as_ref().transient_api()
+    }
+    fn transient_input(&self) -> Option<&crate::TransientInput> {
+        self.as_ref().transient_input()
+    }
+
+    fn preflight_transient_request(
+        &self,
+        request: &CompletionRequest<'_>,
+        input: &crate::AdmittedTransientInput,
+    ) -> crate::Result<()> {
+        self.as_ref().preflight_transient_request(request, input)
+    }
+    fn stream_transient_request<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: &'a crate::AdmittedTransientInput,
+    ) -> BoxStreamFuture<'a> {
+        self.as_ref().stream_transient_request(request, input)
+    }
     fn name(&self) -> &'static str {
         self.as_ref().name()
     }

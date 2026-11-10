@@ -5,10 +5,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    definition::AgentDefinitionBundle,
-    timeline::{PendingTimelineEvent, PendingTimelineItemId, TimelineCursor},
-};
+use crate::timeline::{PendingTimelineEvent, PendingTimelineItemId, TimelineCursor};
 
 use super::{
     InferenceSettings, Revision, SessionCopy, SessionId, SessionJournalEvent, SessionRecord,
@@ -23,7 +20,7 @@ pub struct SessionCreateRequest {
     /// Durable inference settings captured for the session.
     pub inference_settings: Option<InferenceSettings>,
     /// Self-contained selected agent definition.
-    pub agent_definition: Option<AgentDefinitionBundle>,
+    pub agent_definition: Option<serde_json::Value>,
     /// Opaque host metadata preserved exactly.
     pub metadata_values: BTreeMap<String, Value>,
     /// Initial durable conversation state.
@@ -60,6 +57,7 @@ impl SessionCreateRequest {
             SessionStart::Copy { copy, messages } => {
                 let cursor = copy.boundary();
                 let turn = copy.next_turn();
+                metadata.item_values = copy.item_metadata();
                 (copy.materialize(&id), cursor, turn, messages)
             }
         };
@@ -83,6 +81,7 @@ impl SessionCreateRequest {
         SessionRecord {
             id,
             revision: Revision::ZERO,
+            execution_sequence: super::ExecutionSequence::ZERO,
             metadata,
             inference_settings,
             agent_definition,

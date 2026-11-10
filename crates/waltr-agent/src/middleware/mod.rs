@@ -2,98 +2,15 @@
 
 use std::future::Future;
 
-pub(crate) mod agents;
 pub mod chain;
 pub mod context;
-pub(crate) mod file_templates;
-pub(crate) mod mcp_instructions;
-pub(crate) mod mcp_prompts;
-pub(crate) mod mcp_resources;
-pub(crate) mod mcp_skills;
 pub(crate) mod prompt;
-pub(crate) mod question_suspension;
-pub(crate) mod sandbox_skills;
-pub(crate) mod sandbox_snapshot;
-pub(crate) mod skills;
-pub(crate) mod tool_metadata;
-pub(crate) mod tools;
 
-use crate::{
-    Result, ToolResult,
-    resource::TemplateSearchResults,
-    template::{TemplateReference, TemplateReferenceRender},
-};
+use crate::Result;
 
 use self::context::{
-    ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, TemplateRenderContext,
-    TemplateSearchContext, ToolCallContext, ToolDraft, ToolResultContext,
+    ModelRequestDraft, RequestContext, SystemPromptParts, ToolDraft, ToolResultContext,
 };
-
-/// Provider-neutral external request kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalRequestKind {
-    /// Permission approval request.
-    Permission,
-    /// Structured user question request.
-    Question,
-    /// Middleware-defined request kind.
-    Custom(String),
-}
-
-/// Provider-neutral external request status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalRequestStatus {
-    /// Request is awaiting an external response.
-    Pending,
-    /// Request has been answered.
-    Answered,
-    /// Request was canceled before an answer was applied.
-    Canceled,
-}
-
-/// Provider-neutral external request draft for middleware suspensions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalRequestDraft {
-    /// Runtime request identifier.
-    pub id: String,
-    /// Request kind.
-    pub kind: ExternalRequestKind,
-    /// Originating tool call id, when applicable.
-    pub tool_call_id: Option<String>,
-    /// Human-readable prompt for hosts and logs.
-    pub prompt: String,
-    /// Request-specific payload.
-    pub payload: serde_json::Value,
-    /// Current request status.
-    pub status: ExternalRequestStatus,
-}
-
-/// Minimal runtime suspension draft for middleware hook outcomes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Suspension {
-    /// Human-readable suspension reason or routing key.
-    pub reason: String,
-    /// External request that caused the suspension, when any.
-    pub external_request: Option<ExternalRequestDraft>,
-}
-
-impl Suspension {
-    /// Create a suspension draft.
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            external_request: None,
-        }
-    }
-
-    /// Create a suspension draft backed by an external request.
-    pub fn external(reason: impl Into<String>, external_request: ExternalRequestDraft) -> Self {
-        Self {
-            reason: reason.into(),
-            external_request: Some(external_request),
-        }
-    }
-}
 
 /// Outcome returned by middleware hooks that can alter runtime progression.
 #[derive(Debug)]
@@ -101,9 +18,8 @@ pub(crate) enum HookOutcome {
     /// Continue normal hook-chain or runtime progression.
     Continue,
     /// Replace the current tool execution with a synthetic result.
-    ReplaceToolResult(ToolResult),
-    /// Persist a suspension and stop runtime progression.
-    Suspend(Suspension),
+    #[cfg(test)]
+    ReplaceToolResult(crate::ToolResult),
 }
 
 /// Middleware hooks for request construction, streaming, tools, and run lifecycle.
@@ -145,30 +61,8 @@ pub(crate) trait AgentMiddleware: Send + Sync {
     }
 
     /// Append matching prompt-template options for host autocomplete.
-    fn search_templates(
-        &self,
-        _ctx: &TemplateSearchContext<'_>,
-        _results: &mut TemplateSearchResults,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
-    }
 
     /// Render one parsed prompt-template reference when this middleware owns it.
-    fn render_template_reference(
-        &self,
-        _ctx: &mut TemplateRenderContext<'_>,
-        _reference: &TemplateReference,
-    ) -> impl Future<Output = Result<TemplateReferenceRender>> + Send {
-        async { Ok(TemplateReferenceRender::Continue) }
-    }
-
-    /// Observe or alter a tool call before execution.
-    fn before_tool_call(
-        &self,
-        _ctx: &mut ToolCallContext<'_>,
-    ) -> impl Future<Output = Result<HookOutcome>> + Send {
-        async { Ok(HookOutcome::Continue) }
-    }
 
     /// Observe or alter a tool result after execution.
     fn after_tool_call(
@@ -176,14 +70,5 @@ pub(crate) trait AgentMiddleware: Send + Sync {
         _ctx: &mut ToolResultContext<'_>,
     ) -> impl Future<Output = Result<HookOutcome>> + Send {
         async { Ok(HookOutcome::Continue) }
-    }
-
-    /// Observe or edit a suspension before it is emitted.
-    fn on_suspend(
-        &self,
-        _ctx: &mut RunContext<'_>,
-        _suspension: &mut Suspension,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
     }
 }

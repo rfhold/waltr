@@ -22,53 +22,42 @@ pub struct SessionMaterializedContext {
     pub prompt_turns: Vec<PromptTurn>,
     pub turns: Vec<CompletionTurn>,
     pub next_turn: u64,
+    /// Opaque annotations for retained canonical items, not provider request content.
+    pub item_metadata: super::ItemMetadata,
 }
 
 impl SessionRecord {
     /// Materialize raw or mask-effective provider-neutral context.
     #[must_use]
     pub fn materialize_context(&self, mode: SessionContextMode) -> SessionMaterializedContext {
-        materialize_snapshot(self, self.snapshot(), mode)
+        if mode == SessionContextMode::Raw {
+            let mut context = materialize_snapshot(self.snapshot());
+            context.item_metadata = metadata_for_journal(self, &self.effective_journal_events().into_iter().cloned().collect::<Vec<_>>());
+            return context;
+        }
+        let mut journal = self
+            .effective_journal_events()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for mask in self.active_masks() {
+            if let Some(ids) = &mask.item_ids {
+                super::copy::apply_item_replacement(
+                    &mut journal,
+                    ids,
+                    Some(&mask.replacement.text),
+                );
+            } else if let Some(turn) = completed_turn_at(self, mask.selector.cursor) {
+                super::copy::apply_prefix_replacement(&mut journal, turn, &mask.replacement.text);
+            }
+        }
+        let mut context = materialize_snapshot(SessionSnapshot::from_journal(self.id.clone(), &journal));
+        context.item_metadata = metadata_for_journal(self, &journal);
+        context
     }
 }
 
-fn materialize_snapshot(
-    record: &SessionRecord,
-    mut snapshot: SessionSnapshot,
-    mode: SessionContextMode,
-) -> SessionMaterializedContext {
-    if mode == SessionContextMode::Effective {
-        for active in record.active_session_masks() {
-            let mask = active.mask;
-            let selected_turn = completed_turn_at(record, mask.selector.cursor)
-                .expect("active masks are validated at durable mutation time");
-            let earliest_turn = snapshot
-                .prompt_turns
-                .iter()
-                .filter(|prompt| prompt.turn <= selected_turn)
-                .map(|prompt| prompt.turn)
-                .chain(
-                    snapshot
-                        .turns
-                        .iter()
-                        .filter(|turn| turn.turn <= selected_turn)
-                        .map(|turn| turn.turn),
-                )
-                .min()
-                .unwrap_or(0);
-            snapshot
-                .prompt_turns
-                .retain(|prompt| prompt.turn > selected_turn);
-            snapshot.turns.retain(|turn| turn.turn > selected_turn);
-            snapshot.prompt_turns.insert(
-                0,
-                PromptTurn {
-                    turn: earliest_turn,
-                    prompt: mask.replacement.text,
-                },
-            );
-        }
-    }
+fn materialize_snapshot(snapshot: SessionSnapshot) -> SessionMaterializedContext {
     let current_prompt = snapshot
         .prompt_turns
         .last()
@@ -78,7 +67,16 @@ fn materialize_snapshot(
         prompt_turns: snapshot.prompt_turns,
         turns: snapshot.turns,
         next_turn: snapshot.turn,
+        item_metadata: Default::default(),
     }
+}
+
+fn metadata_for_journal(record: &SessionRecord, journal: &[SessionJournalEvent]) -> super::ItemMetadata {
+    let ids = journal.iter().filter_map(|event| match event {
+        SessionJournalEvent::Timeline(event) => Some(&event.item_id), _ => None,
+    }).collect::<std::collections::HashSet<_>>();
+    record.metadata.item_values.iter().filter(|(id, _)| ids.contains(id))
+        .map(|(id, values)| (id.clone(), values.clone())).collect()
 }
 
 pub(super) fn completed_turn_at(

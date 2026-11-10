@@ -9,6 +9,10 @@ use tracing::Instrument as _;
 use crate::stream::{BoxCompletionStream, CompletionEvent, ToolCall};
 use crate::{LlmError, Result};
 
+#[path = "diagnostics.rs"]
+mod diagnostics;
+use diagnostics::{Diagnostics, Stage};
+
 pub(super) const CHAT_COMPLETIONS_NAME: &str = "openai_chat_completions";
 pub(super) const RESPONSES_NAME: &str = "openai_responses";
 pub(super) const RESPONSES_WEBSOCKET_NAME: &str = "openai_responses_websocket";
@@ -24,20 +28,35 @@ pub(super) const fn chargeable_input_tokens(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "keeps ordinary and bounded transient serialization on the same HTTP transport"
+)]
 pub(super) async fn stream_openai_http(
     provider: &'static str,
     url: &str,
     body: Value,
+    transient: bool,
     headers: impl IntoIterator<Item = (String, String)>,
     parse_event: impl FnMut(&str) -> Result<Vec<CompletionEvent>> + Send + 'static,
 ) -> Result<BoxCompletionStream> {
-    // `body` is the projected payload journaled by the agent loop; crash
-    // recovery retries the whole turn rather than resuming mid-stream.
-    let mut request_builder = crate::outbound_http::client().post(url).json(&body);
+    let mut diagnostics = Diagnostics::new(body["tools"].as_array().map_or(0, Vec::len));
+    // Ordinary bodies match the journaled projection. Invocation-local bodies
+    // have metadata-only audits and cannot be reconstructed after restart.
+    let builder = crate::outbound_http::client().post(url);
+    let mut request_builder = if transient {
+        builder
+            .header("content-type", "application/json")
+            .body(crate::transient_input::encode_body(&body)?)
+    } else {
+        builder.json(&body)
+    };
+    drop(body);
     for (name, value) in headers {
         request_builder = request_builder.header(name.as_str(), value);
     }
+    diagnostics.stage(Stage::Serialized);
     let span = tracing::info_span!(
         "http.client.request",
         http_request_method = "POST",
@@ -45,14 +64,26 @@ pub(super) async fn stream_openai_http(
         provider,
         http_response_status_code = tracing::field::Empty,
     );
-    let response = request_builder.send().instrument(span.clone()).await?;
+    diagnostics.stage(Stage::Send);
+    let response = request_builder
+        .send()
+        .instrument(span.clone())
+        .await
+        .inspect_err(|error| diagnostics.http_error(error))?;
 
     let status = response.status();
+    diagnostics.headers(status.as_u16());
     span.record("http_response_status_code", status.as_u16());
     if !status.is_success() {
         tracing::warn!(status = status.as_u16(), "provider http request failed");
         let headers = response_headers(response.headers());
-        let text = response.text().await?;
+        diagnostics.stage(Stage::ErrorBodyStart);
+        let text = response
+            .text()
+            .await
+            .inspect_err(|error| diagnostics.http_error(error))?;
+        diagnostics.stage(Stage::ErrorBodyEnd);
+        diagnostics.stage(Stage::Failed);
         return Err(LlmError::Api {
             provider,
             message: text.clone(),
@@ -63,6 +94,7 @@ pub(super) async fn stream_openai_http(
         });
     }
     span.in_scope(|| tracing::debug!(status = status.as_u16(), "provider http stream opened"));
+    diagnostics.stage(Stage::Open);
     let stream_span = tracing::info_span!(
         "provider.stream_body",
         provider,
@@ -82,6 +114,7 @@ pub(super) async fn stream_openai_http(
             stream_span,
             0_u64,
             0_u64,
+            diagnostics,
         ),
         move |(
             mut bytes,
@@ -93,6 +126,7 @@ pub(super) async fn stream_openai_http(
             stream_span,
             mut chunk_count,
             mut event_count,
+            mut diagnostics,
         )| async move {
             if finished {
                 return None;
@@ -100,8 +134,10 @@ pub(super) async fn stream_openai_http(
 
             loop {
                 if let Some(event) = pending_events.pop_front() {
+                    diagnostics.event();
                     match event {
                         CompletionEvent::Finished => {
+                            diagnostics.stage(Stage::Finished);
                             event_count += 1;
                             stream_span.record("terminal_state", "finished");
                             stream_span.record("chunk_count", chunk_count);
@@ -125,6 +161,7 @@ pub(super) async fn stream_openai_http(
                                     stream_span,
                                     chunk_count,
                                     event_count,
+                                    diagnostics,
                                 ),
                             ));
                         }
@@ -142,6 +179,7 @@ pub(super) async fn stream_openai_http(
                                     stream_span,
                                     chunk_count,
                                     event_count,
+                                    diagnostics,
                                 ),
                             ));
                         }
@@ -149,9 +187,14 @@ pub(super) async fn stream_openai_http(
                 }
 
                 if let Some(event) = pending_sse.pop_front() {
+                    diagnostics.sse();
                     match parse_event(&event) {
-                        Ok(events) => pending_events.extend(events),
+                        Ok(events) => {
+                            diagnostics.parsed();
+                            pending_events.extend(events);
+                        }
                         Err(error) => {
+                            diagnostics.parse_error();
                             stream_span.record("terminal_state", "error");
                             stream_span.record("chunk_count", chunk_count);
                             stream_span.record("event_count", event_count);
@@ -168,6 +211,7 @@ pub(super) async fn stream_openai_http(
                                     stream_span,
                                     chunk_count,
                                     event_count,
+                                    diagnostics,
                                 ),
                             ));
                         }
@@ -177,10 +221,12 @@ pub(super) async fn stream_openai_http(
 
                 match bytes.next().await {
                     Some(Ok(chunk)) => {
+                        diagnostics.chunk();
                         chunk_count += 1;
                         pending_sse.extend(sse.push(chunk.as_ref()));
                     }
                     Some(Err(error)) => {
+                        diagnostics.http_error(&error);
                         stream_span.record("terminal_state", "error");
                         stream_span.record("chunk_count", chunk_count);
                         stream_span.record("event_count", event_count);
@@ -197,10 +243,12 @@ pub(super) async fn stream_openai_http(
                                 stream_span,
                                 chunk_count,
                                 event_count,
+                                diagnostics,
                             ),
                         ));
                     }
                     None => {
+                        diagnostics.stage(Stage::Eof);
                         stream_span.record("terminal_state", "eof");
                         stream_span.record("chunk_count", chunk_count);
                         stream_span.record("event_count", event_count);

@@ -1,27 +1,6 @@
-//! Shared authentication primitives for providers and MCP servers.
+//! Provider authentication and opaque host failure envelopes.
 
 use serde::{Deserialize, Serialize};
-
-/// Sanitized authorization context returned by an MCP server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpAuthorizationContext {
-    /// Configured protected MCP endpoint.
-    pub endpoint: String,
-    /// HTTP status returned by the protected endpoint.
-    pub http_status: u16,
-    /// Protected resource metadata URL from the bearer challenge.
-    pub resource_metadata_url: Option<String>,
-    /// Required scope string from the bearer challenge.
-    pub scope: Option<String>,
-    /// Bearer error code.
-    pub error: Option<String>,
-    /// Sanitized bearer error description.
-    pub error_description: Option<String>,
-    /// Bearer error documentation URL.
-    pub error_uri: Option<String>,
-    /// Authentication realm.
-    pub realm: Option<String>,
-}
 
 /// Machine-readable outbound authentication failure reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,13 +23,13 @@ pub enum AuthenticationFailureReason {
 /// Durable, target-scoped outbound authentication failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthenticationFailure {
-    /// Configured provider or MCP server that failed authentication.
+    /// Configured provider or host target that failed authentication.
     pub target: AuthTarget,
     /// Machine-readable reason for the failure.
     pub reason: AuthenticationFailureReason,
-    /// Sanitized MCP challenge context, when available.
+    /// Opaque host-owned authentication context, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_authorization: Option<Box<McpAuthorizationContext>>,
+    pub host_context: Option<serde_json::Value>,
 }
 
 /// Runtime/config target that can require authentication.
@@ -62,9 +41,11 @@ pub enum AuthTarget {
         /// Provider key from config.
         key: String,
     },
-    /// Streamable HTTP MCP server credentials.
-    McpServer {
-        /// MCP server key from config.
+    /// Opaque host-owned authentication target.
+    Host {
+        /// Host-defined namespace.
+        namespace: String,
+        /// Host-defined target key.
         key: String,
     },
 }
@@ -76,18 +57,12 @@ impl AuthTarget {
         Self::Provider { key: key.into() }
     }
 
-    /// Create an MCP server auth target.
-    #[must_use]
-    pub fn mcp_server(key: impl Into<String>) -> Self {
-        Self::McpServer { key: key.into() }
-    }
-
     /// Stable credential-store key for this target.
     #[must_use]
     pub fn credential_key(&self) -> String {
         match self {
             Self::Provider { key } => format!("provider:{key}"),
-            Self::McpServer { key } => format!("mcp:{key}"),
+            Self::Host { namespace, key } => format!("{namespace}:{key}"),
         }
     }
 
@@ -95,7 +70,7 @@ impl AuthTarget {
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Provider { key } | Self::McpServer { key } => key,
+            Self::Provider { key } | Self::Host { key, .. } => key,
         }
     }
 }

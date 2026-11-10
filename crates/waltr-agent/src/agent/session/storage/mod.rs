@@ -8,6 +8,8 @@ mod opendal;
 mod postgresql;
 mod s3;
 mod scylla;
+#[cfg(test)]
+mod revisions;
 
 use std::{collections::HashSet, error::Error, fmt, future::Future};
 
@@ -18,12 +20,9 @@ pub use postgresql::{opendal_postgresql_session_store, run_postgresql_migrations
 pub use s3::{S3SessionStore, S3SessionWriteMode};
 pub use scylla::ScyllaSessionStore;
 
-use crate::{
-    definition::AgentDefinitionBundle,
-    timeline::{
-        AgentTimelineEvent, PendingTimelineEvent, PendingTimelineItemId, TimelineContent,
-        TimelineCursor, TimelineDirection, TimelineItemId, TimelineItemText, TimelineQuery,
-    },
+use crate::timeline::{
+    AgentTimelineEvent, PendingTimelineEvent, PendingTimelineItemId, TimelineContent,
+    TimelineCursor, TimelineDirection, TimelineItemId, TimelineItemText, TimelineQuery,
 };
 use serde_json::Value;
 
@@ -42,10 +41,23 @@ pub type SessionStoreResult<T> = Result<T, SessionStoreError>;
 /// Storage failure returned by session stores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStoreError {
+    /// Legacy records remain readable but cannot authorize execution without an incarnation.
+    ExecutionCompatibility {
+        id: SessionId,
+    },
+    /// Execution assumptions changed, or this is a different durable incarnation.
+    StaleExecution {
+        expected: super::ExecutionToken,
+        actual: super::ExecutionToken,
+    },
     /// The requested session does not exist.
-    NotFound { id: SessionId },
+    NotFound {
+        id: SessionId,
+    },
     /// A session with the requested id already exists.
-    AlreadyExists { id: SessionId },
+    AlreadyExists {
+        id: SessionId,
+    },
     /// The caller expected a stale revision.
     StaleRevision {
         id: SessionId,
@@ -78,12 +90,26 @@ pub enum SessionStoreError {
         reason: String,
     },
     /// A mask mutation failed validation or its pinned timeline precondition.
-    MaskMutation { error: SessionMaskError },
+    MaskMutation {
+        error: SessionMaskError,
+    },
+    MetadataMutation {
+        error: super::MetadataError,
+    },
 }
 
 impl fmt::Display for SessionStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ExecutionCompatibility { id } => write!(
+                formatter,
+                "session {} has no durable incarnation; execution token unavailable for legacy record",
+                id.as_str()
+            ),
+            Self::StaleExecution { expected, actual } => write!(
+                formatter,
+                "stale session execution token: expected {expected:?}, actual {actual:?}"
+            ),
             Self::NotFound { id } => write!(formatter, "session not found: {}", id.as_str()),
             Self::AlreadyExists { id } => {
                 write!(formatter, "session already exists: {}", id.as_str())
@@ -128,6 +154,7 @@ impl fmt::Display for SessionStoreError {
             Self::MaskMutation { error } => {
                 write!(formatter, "session mask mutation failed: {error}")
             }
+            Self::MetadataMutation { error } => error.fmt(formatter),
         }
     }
 }
@@ -136,6 +163,7 @@ impl Error for SessionStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::MaskMutation { error } => Some(error),
+            Self::MetadataMutation { error } => Some(error),
             _ => None,
         }
     }
@@ -144,6 +172,12 @@ impl Error for SessionStoreError {
 impl From<SessionMaskError> for SessionStoreError {
     fn from(error: SessionMaskError) -> Self {
         Self::MaskMutation { error }
+    }
+}
+
+impl From<super::MetadataError> for SessionStoreError {
+    fn from(error: super::MetadataError) -> Self {
+        Self::MetadataMutation { error }
     }
 }
 
@@ -170,28 +204,69 @@ pub trait SessionStore: Send + Sync {
     /// List known sessions, newest activity first.
     fn list(&self) -> impl Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send;
 
-    /// Append pending timeline events and return them with assigned cursors.
+    /// Append with an incarnation-bound execution token and return committed facts and cursors.
     fn append_timeline(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::ExecutionToken,
         events: Vec<PendingTimelineEvent>,
-    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
+    ) -> impl Future<Output = SessionStoreResult<super::TimelineAppendReceipt>> + Send;
 
-    /// Append internal journal events if the revision matches.
+    /// Append internal journal events if the durable execution token matches.
     fn append_journal(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::ExecutionToken,
         events: Vec<SessionJournalEvent>,
-    ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
+    ) -> impl Future<Output = SessionStoreResult<super::SessionCommitReceipt>> + Send;
 
     /// Atomically subtract and add persistent replacement masks.
     fn mutate_masks(
         &self,
         id: &SessionId,
         mutation: SessionMaskMutation,
-    ) -> impl Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send;
+    ) -> impl Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send {
+        async move {
+            self.mutate(
+                id,
+                super::SessionMutation {
+                    masks: Some(mutation),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .masks
+            .ok_or_else(|| SessionStoreError::Backend {
+                message: "missing mask outcome".into(),
+            })
+        }
+    }
+
+    /// Atomically evaluate metadata/source predicates and commit metadata plus dependent masks.
+    /// Backends without complete-record atomic mutation must explicitly reject this operation.
+    fn mutate(
+        &self,
+        _id: &SessionId,
+        _mutation: super::SessionMutation,
+    ) -> impl Future<Output = SessionStoreResult<super::SessionMutationOutcome>> + Send {
+        async {
+            Err(SessionStoreError::Backend {
+                message: "atomic session mutation unsupported".into(),
+            })
+        }
+    }
+
+    /// Read bounded opaque values without exposing provider or engine metadata as authority.
+    fn metadata(
+        &self,
+        id: &SessionId,
+        target: super::MetadataTarget,
+    ) -> impl Future<Output = SessionStoreResult<std::collections::BTreeMap<String, Value>>> + Send {
+        async move {
+            let record = self.load(id).await?;
+            Ok(record.metadata_values(&target)?.cloned().unwrap_or_default())
+        }
+    }
 
     /// Set a host-defined metadata value and return the updated record.
     fn set_metadata_value(
@@ -235,12 +310,27 @@ pub trait SessionStore: Send + Sync {
         inference_settings: Option<InferenceSettings>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
-    /// Set the agent-definition bundle on the latest complete record without changing revision.
+    /// Set the agent-definition bundle; actual changes advance both revision domains.
     fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+
+    /// Set cycle configuration only if execution still matches, including for a no-op.
+    /// Implementations must check atomically; unsupported stores fail closed.
+    fn set_agent_definition_if_execution(
+        &self,
+        _id: &SessionId,
+        _expected: super::ExecutionToken,
+        _agent_definition: Option<Value>,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        async {
+            Err(SessionStoreError::Backend {
+                message: "conditional execution configuration unsupported".into(),
+            })
+        }
+    }
 
     /// Read timeline events using a bounded store-neutral query.
     fn timeline(
@@ -277,12 +367,68 @@ pub trait SessionStore: Send + Sync {
     }
 }
 
-pub(super) fn mutate_masks_on_record(
+pub(super) fn decode_record(bytes: &[u8]) -> SessionStoreResult<SessionRecord> {
+    let record = serde_json::from_slice(bytes).map_err(|error| SessionStoreError::Backend {
+        message: error.to_string(),
+    })?;
+    super::metadata::validate_record(&record)?;
+    Ok(record)
+}
+
+pub(super) fn mutate_on_record(
     record: &mut SessionRecord,
     revision: Revision,
-    mutation: &SessionMaskMutation,
-) -> SessionStoreResult<SessionMaskMutationOutcome> {
-    super::mask::mutate_record_masks(record, revision, mutation).map_err(Into::into)
+    mutation: &super::SessionMutation,
+) -> SessionStoreResult<super::SessionMutationOutcome> {
+    if !super::context::json_within_limit(mutation, super::MAX_SESSION_MUTATION_BYTES) {
+        return Err(super::MetadataError::Bounds.into());
+    }
+    let mask_predicates = mutation.masks.as_ref().map(|masks| &masks.metadata_predicates);
+    if mutation.predicates.len().saturating_add(mutation.updates.len())
+        .saturating_add(mask_predicates.map_or(0, Vec::len)) > super::MAX_METADATA_MUTATION_ENTRIES
+        || !super::context::json_within_limit(
+            &(&mutation.predicates, &mutation.updates, mask_predicates), super::MAX_METADATA_BYTES)
+    {
+        return Err(super::MetadataError::Bounds.into());
+    }
+    if let Some(expected) = &mutation.expected_incarnation
+        && record.metadata.incarnation.as_ref() != Some(expected)
+    {
+        return Err(super::MetadataError::Precondition.into());
+    }
+    if let Some(expected) = mutation.expected_revision
+        && record.revision != expected
+    {
+        return Err(SessionStoreError::StaleRevision {
+            id: record.id.clone(),
+            expected,
+            actual: record.revision,
+        });
+    }
+    if mutation.expected_context.as_ref().is_some_and(|identity| !identity.matches(record)) {
+        return Err(SessionMaskError::ContextMismatch.into());
+    }
+    let mut updated = record.clone();
+    // Mask/source predicates observe the same pre-update state as metadata predicates.
+    let masks = mutation.masks.as_ref()
+        .map(|masks| super::mask::mutate_record_masks(&mut updated, revision, masks))
+        .transpose()?;
+    let mut metadata = record.clone();
+    super::metadata::apply(&mut metadata, mutation)?;
+    updated.metadata.values = metadata.metadata.values;
+    updated.metadata.item_values = metadata.metadata.item_values;
+    if !mutation.updates.is_empty() {
+        updated.touch_metadata();
+    }
+    updated.revision = revision;
+    if mutation.masks.is_some() {
+        updated.execution_sequence = record.execution_sequence.next();
+    }
+    *record = updated;
+    Ok(super::SessionMutationOutcome {
+        record: record.clone(),
+        masks,
+    })
 }
 
 pub(super) fn append_timeline_to_record(
@@ -405,7 +551,6 @@ pub(super) fn timeline_item_text_from_record(
             TimelineContent::Empty
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
-            | TimelineContent::ExternalRequest { .. }
             | TimelineContent::Json { .. } => {}
         }
     }
@@ -438,10 +583,22 @@ fn channel_matches(
 }
 
 #[cfg(test)]
+pub(super) async fn fixture_token<S: SessionStore>(
+    store: &S,
+    id: &SessionId,
+    sequence: u64,
+) -> super::ExecutionToken {
+    let mut token = store.load(id).await.unwrap().execution_token().unwrap();
+    token.sequence = super::ExecutionSequence::new(sequence);
+    token
+}
+
+#[cfg(test)]
 pub(super) async fn assert_mask_store_contract<S>(store: S, label: &str)
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    super::metadata::assert_store_contract(store.clone(), label).await;
     let id = SessionId::new(format!("mask-contract-{label}"));
     store
         .create(SessionCreateRequest::new(id.clone()))
@@ -450,7 +607,7 @@ where
     store
         .append_timeline(
             &id,
-            Revision::ZERO,
+            fixture_token(&store, &id, 0).await,
             vec![PendingTimelineEvent::assistant_text_snapshot(
                 id.clone(),
                 0,
@@ -463,7 +620,7 @@ where
     store
         .append_journal(
             &id,
-            Revision::new(1),
+            fixture_token(&store, &id, 1).await,
             vec![SessionJournalEvent::TurnFinished { turn: 0 }],
         )
         .await
@@ -501,7 +658,7 @@ where
     store
         .append_journal(
             &id,
-            added.revision,
+            persisted.execution_token().unwrap(),
             vec![SessionJournalEvent::Rollback {
                 target: super::SessionRollbackTarget {
                     journal_len: rollback_len,
@@ -539,7 +696,7 @@ where
     let assigned = store
         .append_timeline(
             &id,
-            persisted.revision,
+            persisted.execution_token().unwrap(),
             vec![PendingTimelineEvent::assistant_text_snapshot(
                 id.clone(),
                 1,
@@ -549,10 +706,10 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(assigned[0].cursor, subtracted.cursor.next());
+    assert_eq!(assigned.events[0].cursor, subtracted.cursor.next());
     assert_eq!(
         store.load(&id).await.unwrap().timeline_cursor_high_water(),
-        assigned[0].cursor
+        assigned.events[0].cursor
     );
 }
 

@@ -1,23 +1,17 @@
 //! Deterministic agent integration tests.
 
-#[path = "support/agent_definitions.rs"]
-mod agent_definitions;
-#[path = "support/sandbox.rs"]
-mod sandbox;
 #[path = "support/scripted_provider.rs"]
 mod scripted_provider;
 
+#[path = "agent/completion.rs"]
+mod completion;
+#[path = "agent/context_semantics.rs"]
+mod context_semantics;
+#[path = "agent/metadata_midstream.rs"]
+mod metadata_midstream;
 #[path = "agent/loop.rs"]
 mod r#loop;
-#[path = "agent/mcp.rs"]
-mod mcp;
-#[path = "agent/permissions.rs"]
-mod permissions;
-#[path = "agent/question.rs"]
-mod question;
 #[path = "agent/session.rs"]
 mod session;
 #[path = "agent/session_storage.rs"]
 mod session_storage;
-#[path = "agent/task.rs"]
-mod task;

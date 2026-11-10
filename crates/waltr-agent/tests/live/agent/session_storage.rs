@@ -1,4 +1,4 @@
-//! Ignored durable session storage resume tests.
+//! Ignored generic durable storage and live provider round-trip tests.
 
 use std::{
     collections::BTreeMap,
@@ -8,17 +8,6 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use waltr_agent::{
-    AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
-    MetadataSetCondition, OpenDalSessionStore, PendingTimelineEvent, PendingTimelineItemId,
-    ReplacementUserContent, ResumeInput, Revision, S3SessionStore, ScyllaSessionStore,
-    SessionCoordinator, SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskAddition,
-    SessionMaskError, SessionMaskMutation, SessionStore, SessionStoreError, ThroughCursor,
-    TimelineChannel, TimelineContent, TimelineCursor, TimelineEventKind, TimelineQuery,
-    TimelineStatus, opendal_postgresql_session_store,
-    tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
-};
 use opendal::{Operator, services};
 use scylla::{client::session::Session, client::session_builder::SessionBuilder};
 use serde_json::json;
@@ -29,6 +18,7 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 use tokio::time::{Duration, sleep};
+use waltr_agent::*;
 
 use crate::live_provider;
 
@@ -65,8 +55,8 @@ async fn scylla_session_store_resumes_from_container() -> waltr_agent::Result<()
 
 #[tokio::test]
 #[ignore = "requires Docker"]
-async fn scylla_conditional_metadata_is_atomic_and_preserves_record_state() -> waltr_agent::Result<()>
-{
+async fn scylla_conditional_metadata_is_atomic_and_preserves_record_state()
+-> waltr_agent::Result<()> {
     install_rustls_crypto_provider();
     let scylla = Box::pin(ScyllaContainer::start()).await?;
     let first =
@@ -82,7 +72,12 @@ async fn scylla_conditional_metadata_is_atomic_and_preserves_record_state() -> w
     first
         .append_timeline(
             &id,
-            Revision::ZERO,
+            first
+                .load(&id)
+                .await
+                .map_err(store_error)?
+                .execution_token()
+                .map_err(store_error)?,
             vec![PendingTimelineEvent::assistant_text_delta(
                 id.clone(),
                 0,
@@ -208,10 +203,16 @@ async fn opendal_postgresql_compare_and_swap_preserves_concurrent_writes() -> wa
         .await
         .map_err(store_error)?;
 
+    let token = first
+        .load(&id)
+        .await
+        .map_err(store_error)?
+        .execution_token()
+        .map_err(store_error)?;
     let (journal, metadata) = tokio::join!(
         first.append_journal(
             &id,
-            Revision::ZERO,
+            token,
             vec![SessionJournalEvent::PromptAppended {
                 prompt: "preserved".to_owned(),
             }],
@@ -226,7 +227,7 @@ async fn opendal_postgresql_compare_and_swap_preserves_concurrent_writes() -> wa
     journal.map_err(store_error)?;
     assert!(metadata.map_err(store_error)?.changed);
     let record = first.load(&id).await.map_err(store_error)?;
-    assert_eq!(record.revision, Revision::new(1));
+    assert_eq!(record.revision, Revision::new(2));
     assert_eq!(record.snapshot().prompts, ["preserved"]);
     assert_eq!(record.metadata_value("owner"), Some(&json!("metadata")));
 
@@ -271,7 +272,14 @@ where
         .with_system_prompt(
             "You are validating durable session storage. Follow the user instructions exactly.",
         )
-        .with_question_tool(QuestionConfig::new())
+        .with_tool(AgentTool::new(
+            ToolDefinition::new(
+                "storage_receipt",
+                "Return a storage receipt",
+                json!({"type":"object","properties":{}}),
+            ),
+            |context| Ok(context.result("storage confirmed")),
+        ))
         .build();
     let sessions = SessionCoordinator::new(store.clone());
     let session = sessions
@@ -282,26 +290,19 @@ where
     let first = collect(
         sessions
             .prompt(&agent, session_id.clone(),
-                "Call the question tool exactly once to ask: 'Confirm durable storage resume?'. Do not answer directly before the tool result. After the user response is provided on resume, reply with exactly: storage resume complete",
+                "Call storage_receipt exactly once, then reply with exactly: storage receipt complete",
             )
             .stream(),
     )
     .await?;
-    let request = first
-        .external_request_ids
-        .first()
-        .unwrap_or_else(|| panic!("{label}: expected external question request"))
-        .clone();
-
+    assert!(first.finished, "{label}: first turn did not finish");
+    let sessions = SessionCoordinator::new(store.clone());
     let resumed = collect(
         sessions
-            .resume(
+            .prompt(
                 &agent,
                 session_id.clone(),
-                ResumeInput::ExternalResponse {
-                    request_id: request,
-                    response: ExternalResponse::new(json!("resume confirmed")),
-                },
+                "Read the storage_receipt result from the previous durable turn. If it was storage confirmed, reply exactly: storage resume complete. Do not call tools again.",
             )
             .stream(),
     )
@@ -318,8 +319,8 @@ where
     assert!(
         snapshot
             .tool_results()
-            .any(|result| result.name == QUESTION_TOOL_NAME
-                && result.content.contains("resume confirmed")),
+            .any(|result| result.name == "storage_receipt"
+                && result.content.contains("storage confirmed")),
         "{label}: stored session did not persist the resumed question result: {stored:?}"
     );
 
@@ -346,7 +347,12 @@ where
     store
         .append_timeline(
             &id,
-            Revision::ZERO,
+            store
+                .load(&id)
+                .await
+                .map_err(store_error)?
+                .execution_token()
+                .map_err(store_error)?,
             vec![PendingTimelineEvent::assistant_text_snapshot(
                 id.clone(),
                 0,
@@ -359,7 +365,12 @@ where
     store
         .append_journal(
             &id,
-            Revision::new(1),
+            store
+                .load(&id)
+                .await
+                .map_err(store_error)?
+                .execution_token()
+                .map_err(store_error)?,
             vec![SessionJournalEvent::TurnFinished { turn: 0 }],
         )
         .await
@@ -409,7 +420,7 @@ where
     let assigned = store
         .append_timeline(
             &id,
-            persisted.revision,
+            persisted.execution_token().map_err(store_error)?,
             vec![PendingTimelineEvent::assistant_text_snapshot(
                 id.clone(),
                 1,
@@ -419,7 +430,11 @@ where
         )
         .await
         .map_err(store_error)?;
-    assert_eq!(assigned[0].cursor, subtracted.cursor.next(), "{label}");
+    assert_eq!(
+        assigned.events[0].cursor,
+        subtracted.cursor.next(),
+        "{label}"
+    );
     Ok(())
 }
 
@@ -485,7 +500,6 @@ where
             TimelineQuery::forward(None, 512).with_channels([
                 TimelineChannel::from(CHANNEL_TOOL_CALL),
                 TimelineChannel::from(CHANNEL_TOOL_RESULT),
-                TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST),
             ]),
         )
         .await
@@ -501,12 +515,6 @@ where
             .iter()
             .any(|event| crate::session::channel_is(event, CHANNEL_TOOL_RESULT)),
         "{label}: tool result channel was not present in storage timeline"
-    );
-    assert!(
-        tool_and_external_events
-            .iter()
-            .any(|event| crate::session::channel_is(event, CHANNEL_EXTERNAL_REQUEST)),
-        "{label}: external request channel was not present in storage timeline"
     );
 
     let mut assistant_text_by_item = BTreeMap::new();
@@ -524,7 +532,6 @@ where
             TimelineContent::Empty
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
-            | TimelineContent::ExternalRequest { .. }
             | TimelineContent::ContentRef { .. }
             | TimelineContent::Json { .. } => {}
         }
@@ -561,7 +568,6 @@ where
 struct CollectedSession {
     text: String,
     finished: bool,
-    external_request_ids: Vec<ExternalRequestId>,
 }
 
 async fn collect(
@@ -576,11 +582,6 @@ async fn collect(
             {
                 collected.text.push_str(delta);
             }
-            TimelineContent::ExternalRequest { request }
-                if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
-            {
-                collected.external_request_ids.push(request.id.clone());
-            }
             TimelineContent::Empty
                 if event.kind == TimelineEventKind::SessionStatusChanged
                     && event.status == Some(TimelineStatus::Finished) =>
@@ -592,7 +593,6 @@ async fn collect(
             | TimelineContent::TextSnapshot { .. }
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
-            | TimelineContent::ExternalRequest { .. }
             | TimelineContent::ContentRef { .. }
             | TimelineContent::Json { .. } => {}
         }

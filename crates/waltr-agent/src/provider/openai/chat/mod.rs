@@ -63,6 +63,34 @@ impl OpenAiChatCompletions {
 }
 
 impl LlmStream for OpenAiChatCompletions {
+    fn transient_api(&self) -> Option<crate::TransientInputApi> {
+        Some(crate::TransientInputApi::OpenAiChat)
+    }
+    fn preflight_transient_request(
+        &self,
+        request: &CompletionRequest<'_>,
+        input: &crate::AdmittedTransientInput,
+    ) -> crate::Result<()> {
+        let request = request.for_provider_identity(
+            CHAT_COMPLETIONS_NAME,
+            &self.completions_url,
+            &self.model,
+        );
+        input.input().check_body(&request::chat_body_with_input(
+            &self.model,
+            self.prompt_cache,
+            self.prompt_cache_retention.as_deref(),
+            &request,
+            Some(input.input()),
+        ))
+    }
+    fn stream_transient_request<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: &'a crate::AdmittedTransientInput,
+    ) -> crate::BoxStreamFuture<'a> {
+        self.stream_with_input(request, Some(input.input()))
+    }
     fn name(&self) -> &'static str {
         CHAT_COMPLETIONS_NAME
     }
@@ -85,18 +113,33 @@ impl LlmStream for OpenAiChatCompletions {
         &'a self,
         request: CompletionRequest<'a>,
     ) -> crate::stream::BoxStreamFuture<'a> {
+        self.stream_with_input(request, None)
+    }
+}
+
+impl OpenAiChatCompletions {
+    fn stream_with_input<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: Option<&'a crate::TransientInput>,
+    ) -> crate::BoxStreamFuture<'a> {
         Box::pin(async move {
+            let transient = input.is_some();
             let request = request.for_provider_identity(
                 CHAT_COMPLETIONS_NAME,
                 &self.completions_url,
                 &self.model,
             );
-            let body = chat_body(
+            let body = request::chat_body_with_input(
                 &self.model,
                 self.prompt_cache,
                 self.prompt_cache_retention.as_deref(),
                 &request,
+                input,
             );
+            if let Some(input) = input {
+                input.check_body(&body)?;
+            }
             let mut parser =
                 ChatParser::new(CHAT_COMPLETIONS_NAME, &self.completions_url, &self.model);
 
@@ -104,8 +147,17 @@ impl LlmStream for OpenAiChatCompletions {
                 CHAT_COMPLETIONS_NAME,
                 &self.completions_url,
                 body,
+                transient,
                 self.headers.clone(),
-                move |data| parser.parse_event(data),
+                move |data| {
+                    parser.parse_event(data).map_err(|error| {
+                        if transient {
+                            crate::transient_input::sanitize_error(error)
+                        } else {
+                            error
+                        }
+                    })
+                },
             )
             .await
         })

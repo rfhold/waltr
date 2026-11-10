@@ -10,16 +10,14 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    mutate_on_record, sorted_session_summaries, timeline_item_text_from_record,
     timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
-        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
-    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -115,7 +113,7 @@ impl S3SessionStore {
             .await
             .map_err(backend_error)?
             .into_bytes();
-        let record = serde_json::from_slice(bytes.as_ref()).map_err(backend_error)?;
+        let record = super::decode_record(bytes.as_ref())?;
         Ok((record, etag))
     }
 
@@ -196,7 +194,7 @@ impl S3SessionStore {
                     .await
                     .map_err(backend_error)?
                     .into_bytes();
-                records.push(serde_json::from_slice(bytes.as_ref()).map_err(backend_error)?);
+                records.push(super::decode_record(bytes.as_ref())?);
             }
             if output.is_truncated().unwrap_or(false) {
                 continuation_token = output.next_continuation_token().map(str::to_owned);
@@ -210,22 +208,17 @@ impl S3SessionStore {
     async fn update_record<T: Send>(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         update: impl Fn(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
-    ) -> SessionStoreResult<(Revision, T)> {
+    ) -> SessionStoreResult<(super::super::SessionCommitReceipt, T)> {
         let _guard = self.session_guard(id).await?;
         for attempt in 1..=self.put_attempts() {
             let (mut record, etag) = self.load_record_with_etag(id).await?;
-            if record.revision != expected_revision {
-                return Err(SessionStoreError::StaleRevision {
-                    id: id.clone(),
-                    expected: expected_revision,
-                    actual: record.revision,
-                });
-            }
+            record.check_execution_token(&expected_token)?;
             let revision = record.revision.next();
-            record.revision = revision;
+            record.advance_revision(true);
             let value = update(&mut record, revision)?;
+            let receipt = record.commit_receipt()?;
             let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
             let if_match = self.conditional_etag(id, etag)?;
             let result = self
@@ -238,7 +231,7 @@ impl S3SessionStore {
                 .send()
                 .await;
             match result {
-                Ok(_) => return Ok((revision, value)),
+                Ok(_) => return Ok((receipt, value)),
                 Err(error)
                     if self.write_mode == S3SessionWriteMode::ConditionalEtagCas
                         && error.raw_response().is_some_and(|response| {
@@ -258,12 +251,20 @@ impl S3SessionStore {
     async fn update_metadata_record(
         &self,
         id: &SessionId,
+        expected: Option<&super::super::ExecutionToken>,
         update: impl Fn(&mut SessionRecord) + Send,
     ) -> SessionStoreResult<SessionRecord> {
         let _guard = self.session_guard(id).await?;
         for attempt in 1..=self.put_attempts() {
             let (mut record, etag) = self.load_record_with_etag(id).await?;
+            if let Some(expected) = expected {
+                record.check_execution_token(expected)?;
+            }
+            let revision = record.revision;
             update(&mut record);
+            if record.revision == revision {
+                return Ok(record);
+            }
             let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
             let if_match = self.conditional_etag(id, etag)?;
             let result = self
@@ -364,6 +365,7 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         async move {
             let record = request.materialize();
+            super::super::metadata::validate_record(&record)?;
             let _guard = store.session_guard(&record.id).await?;
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
@@ -420,46 +422,48 @@ impl SessionStore for S3SessionStore {
     fn append_timeline(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<PendingTimelineEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::TimelineAppendReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (_, assigned) = store
-                .update_record(&id, expected_revision, |record, _| {
+            let (commit, events) = store
+                .update_record(&id, expected_token, |record, _| {
                     append_timeline_to_record(record, &id, events.clone())
                 })
                 .await?;
-            Ok(assigned)
+            Ok(super::super::TimelineAppendReceipt { commit, events })
         }
     }
 
     fn append_journal(
         &self,
         id: &SessionId,
-        expected_revision: Revision,
+        expected_token: super::super::ExecutionToken,
         events: Vec<SessionJournalEvent>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+    ) -> impl std::future::Future<Output = SessionStoreResult<super::super::SessionCommitReceipt>> + Send
+    {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (revision, ()) = store
-                .update_record(&id, expected_revision, |record, _| {
+            let (receipt, ()) = store
+                .update_record(&id, expected_token, |record, _| {
                     record.append_journal_events(events.clone());
                     record.touch_activity();
                     Ok(())
                 })
                 .await?;
-            Ok(revision)
+            Ok(receipt)
         }
     }
 
-    fn mutate_masks(
+    fn mutate(
         &self,
         id: &SessionId,
-        mutation: SessionMaskMutation,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+        mutation: crate::SessionMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<crate::SessionMutationOutcome>> + Send
     {
         let store = self.clone();
         let id = id.clone();
@@ -468,8 +472,7 @@ impl SessionStore for S3SessionStore {
             for attempt in 1..=store.put_attempts() {
                 let (mut record, etag) = store.load_record_with_etag(&id).await?;
                 let revision = record.revision.next();
-                record.revision = revision;
-                let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                let outcome = mutate_on_record(&mut record, revision, &mutation)?;
                 let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
                 let if_match = store.conditional_etag(&id, etag)?;
                 let result = store
@@ -510,15 +513,16 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_set(&key, &value)?;
             let _guard = store.session_guard(&id).await?;
             for attempt in 1..=store.put_attempts() {
                 let (mut record, etag) = store.load_record_with_etag(&id).await?;
-                let changed = condition == MetadataSetCondition::Unconditional
-                    || !record.metadata.values.contains_key(&key);
+                let changed = condition.matches(&record, &key)
+                    && record.metadata.values.get(&key) != Some(&value);
                 if !changed {
                     return Ok(MetadataSetOutcome { record, changed });
                 }
-                record.set_metadata_value(key.clone(), value.clone());
+                super::super::metadata::set_value(&mut record, key.clone(), value.clone())?;
                 let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
                 let if_match = store.conditional_etag(&id, etag)?;
                 let result = store
@@ -557,8 +561,9 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            super::super::metadata::validate_key(&key)?;
             store
-                .update_metadata_record(&id, |record| {
+                .update_metadata_record(&id, None, |record| {
                     record.remove_metadata_value(&key);
                 })
                 .await
@@ -574,7 +579,7 @@ impl SessionStore for S3SessionStore {
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| {
+                .update_metadata_record(&id, None, |record| {
                     record.set_inference_settings(inference_settings.clone());
                 })
                 .await
@@ -584,16 +589,30 @@ impl SessionStore for S3SessionStore {
     fn set_agent_definition(
         &self,
         id: &SessionId,
-        agent_definition: Option<AgentDefinitionBundle>,
+        agent_definition: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| {
+                .update_metadata_record(&id, None, |record| {
                     record.set_agent_definition(agent_definition.clone());
                 })
                 .await
+        }
+    }
+
+    fn set_agent_definition_if_execution(
+        &self,
+        id: &SessionId,
+        expected: super::super::ExecutionToken,
+        agent_definition: Option<serde_json::Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        async move {
+            self.update_metadata_record(id, Some(&expected), |record| {
+                record.set_agent_definition(agent_definition.clone())
+            })
+            .await
         }
     }
 

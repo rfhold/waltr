@@ -1,8 +1,10 @@
 //! Agent-owned raw and mask-effective session timeline projection.
 
+use std::collections::HashSet;
+
 use crate::{
     AgentTimelineEvent, CHANNEL_USER_TEXT, TimelineChannel, TimelineContent, TimelineCursor,
-    TimelineEventKind, TimelineQuery, TimelineStatus,
+    TimelineEventKind, TimelineItemId, TimelineQuery, TimelineStatus,
 };
 
 use super::{Revision, SessionId, SessionMaskId, SessionRecord};
@@ -27,6 +29,8 @@ pub struct SessionTimelinePage {
     pub raw_page_boundary: Option<TimelineCursor>,
     /// Whether another raw page exists beyond `raw_page_boundary`.
     pub has_more: bool,
+    /// Opaque metadata for durable canonical items visible on this page.
+    pub item_metadata: super::ItemMetadata,
 }
 
 /// One event and its typed presentation metadata.
@@ -94,10 +98,16 @@ pub(super) fn project_timeline(
     mode: SessionTimelineMode,
     query: TimelineQuery,
 ) -> SessionTimelinePage {
-    match mode {
+    let mut page = match mode {
         SessionTimelineMode::Raw => project_raw(record, query),
         SessionTimelineMode::Effective => project_effective(record, query),
-    }
+    };
+    let ids = page.events.iter().filter_map(|event| match &event.event {
+        SessionTimelineProjectedEvent::Durable(event) => Some(&event.item_id), _ => None,
+    }).collect::<HashSet<_>>();
+    page.item_metadata = record.metadata.item_values.iter().filter(|(id, _)| ids.contains(id))
+        .map(|(id, values)| (id.clone(), values.clone())).collect();
+    page
 }
 
 fn project_raw(record: &SessionRecord, query: TimelineQuery) -> SessionTimelinePage {
@@ -116,6 +126,7 @@ fn project_raw(record: &SessionRecord, query: TimelineQuery) -> SessionTimelineP
         projection_revision: record.revision,
         raw_page_boundary,
         has_more,
+        item_metadata: Default::default(),
     }
 }
 
@@ -126,13 +137,35 @@ fn project_effective(record: &SessionRecord, query: TimelineQuery) -> SessionTim
             projection_revision: record.revision,
             raw_page_boundary: None,
             has_more: false,
+            item_metadata: Default::default(),
         };
     }
     let active = record
         .active_session_masks()
         .into_iter()
-        .max_by_key(|active| active.mask.selector.cursor);
-    let selected_through = active.as_ref().map(|active| active.mask.selector.cursor);
+        .map(|active| {
+            let ids = active
+                .mask
+                .item_ids
+                .as_ref()
+                .map(|ids| ids.iter().cloned().collect::<HashSet<_>>());
+            let anchor = ids
+                .as_ref()
+                .and_then(|ids| {
+                    record
+                        .timeline_events()
+                        .filter(|event| ids.contains(&event.item_id))
+                        .map(|event| event.cursor)
+                        .max()
+                })
+                .unwrap_or(active.mask.selector.cursor);
+            MaskProjection {
+                active,
+                anchor,
+                ids,
+            }
+        })
+        .collect::<Vec<_>>();
     let raw = record
         .timeline_events()
         .filter(|event| match query.direction {
@@ -146,34 +179,32 @@ fn project_effective(record: &SessionRecord, query: TimelineQuery) -> SessionTim
         .cloned()
         .collect::<Vec<_>>();
     let (events, raw_page_boundary, has_more) = match query.direction {
-        crate::TimelineDirection::Forward => project_effective_iter(
-            record,
-            &query,
-            active.as_ref(),
-            selected_through,
-            raw.into_iter(),
-        ),
-        crate::TimelineDirection::Backward => project_effective_iter(
-            record,
-            &query,
-            active.as_ref(),
-            selected_through,
-            raw.into_iter().rev(),
-        ),
+        crate::TimelineDirection::Forward => {
+            project_effective_iter(record, &query, &active, raw.into_iter())
+        }
+        crate::TimelineDirection::Backward => {
+            project_effective_iter(record, &query, &active, raw.into_iter().rev())
+        }
     };
     SessionTimelinePage {
         events,
         projection_revision: record.revision,
         raw_page_boundary,
         has_more,
+        item_metadata: Default::default(),
     }
+}
+
+struct MaskProjection {
+    active: super::ActiveSessionMask,
+    anchor: TimelineCursor,
+    ids: Option<HashSet<TimelineItemId>>,
 }
 
 fn project_effective_iter(
     record: &SessionRecord,
     query: &TimelineQuery,
-    active: Option<&super::ActiveSessionMask>,
-    selected_through: Option<TimelineCursor>,
+    active: &[MaskProjection],
     raw: impl Iterator<Item = AgentTimelineEvent>,
 ) -> (
     Vec<SessionTimelineProjectionEvent>,
@@ -188,14 +219,14 @@ fn project_effective_iter(
             break;
         };
         raw_page_boundary = Some(event.cursor);
-        if selected_through.is_some_and(|cursor| event.cursor <= cursor) {
-            if active.is_some_and(|active| active.mask.selector.cursor == event.cursor)
-                && channel_selected(query, CHANNEL_USER_TEXT)
-            {
-                events.push(mask_replacement_projection(
-                    record,
-                    active.expect("active mask was checked"),
-                ));
+        if let Some(mask) = active.iter().find(|mask| {
+            mask.ids.as_ref().map_or_else(
+                || event.cursor <= mask.active.mask.selector.cursor,
+                |ids| ids.contains(&event.item_id),
+            )
+        }) {
+            if mask.anchor == event.cursor && channel_selected(query, CHANNEL_USER_TEXT) {
+                events.push(mask_replacement_projection(record, &mask.active));
             }
         } else if event_channel_selected(query, &event) {
             events.push(durable_projection(event));

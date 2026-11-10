@@ -6,7 +6,7 @@ use std::{collections::HashSet, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::TimelineCursor;
+use crate::{TimelineCursor, TimelineItemId};
 
 use super::{Revision, SessionJournalEvent, SessionRecord};
 
@@ -73,6 +73,9 @@ pub struct SessionMask {
     pub key: String,
     /// Selected source prefix.
     pub selector: ThroughCursor,
+    /// Explicit canonical source items; absent in legacy prefix masks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_ids: Option<Vec<TimelineItemId>>,
     /// Synthetic user replacement.
     pub replacement: ReplacementUserContent,
 }
@@ -87,10 +90,11 @@ pub struct ActiveSessionMask {
 }
 
 /// Replacement mask requested for addition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMaskAddition {
     pub key: String,
     pub selector: ThroughCursor,
+    pub item_ids: Option<Vec<TimelineItemId>>,
     pub replacement: ReplacementUserContent,
 }
 
@@ -104,13 +108,29 @@ impl SessionMaskAddition {
         Self {
             key: key.into(),
             selector,
+            item_ids: None,
+            replacement,
+        }
+    }
+
+    /// Select an exact nonempty set of replay-consistent source items at a completed boundary.
+    pub fn items(
+        key: impl Into<String>,
+        boundary: TimelineCursor,
+        item_ids: Vec<TimelineItemId>,
+        replacement: ReplacementUserContent,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            selector: ThroughCursor::new(boundary),
+            item_ids: Some(item_ids),
             replacement,
         }
     }
 }
 
 /// Explicit active-mask subtraction resolved before additions are applied.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMaskSubtraction {
     pub ids: Vec<SessionMaskId>,
     pub keys: Vec<String>,
@@ -118,10 +138,20 @@ pub struct SessionMaskSubtraction {
 }
 
 /// Atomic durable mask mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMaskMutation {
     /// Latest effective raw timeline boundary expected by the caller.
     pub expected_timeline_boundary: Option<TimelineCursor>,
+    /// Optional exact context precondition evaluated inside the same storage transaction.
+    pub expected_context: Option<super::ContextIdentity>,
+    /// Pinned source plus complete known administrative state for disjoint sibling mutations.
+    pub expected_completed_source: Option<super::ContextIdentity>,
+    /// Required alongside `expected_completed_source`; never silently refreshed from storage.
+    pub expected_active_masks: Option<Vec<(String, SessionMaskId)>>,
+    /// Opaque metadata values observed before the dependent mask edits.
+    pub metadata_predicates: Vec<super::MetadataPredicate>,
+    /// Stable key and exact active identity expected before any subtraction or addition.
+    pub expected_masks: Vec<(String, Option<SessionMaskId>)>,
     pub subtract: SessionMaskSubtraction,
     pub add: Vec<SessionMaskAddition>,
 }
@@ -132,6 +162,11 @@ impl SessionMaskMutation {
     pub const fn new(expected_timeline_boundary: Option<TimelineCursor>) -> Self {
         Self {
             expected_timeline_boundary,
+            expected_context: None,
+            expected_completed_source: None,
+            expected_active_masks: None,
+            metadata_predicates: Vec::new(),
+            expected_masks: Vec::new(),
             subtract: SessionMaskSubtraction {
                 ids: Vec::new(),
                 keys: Vec::new(),
@@ -155,6 +190,11 @@ pub struct SessionMaskMutationOutcome {
 /// Typed replacement-mask validation or precondition failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionMaskError {
+    ContextMismatch,
+    MaskIdentityMismatch {
+        key: String,
+    },
+    InvalidItems,
     BoundaryMismatch {
         expected: Option<TimelineCursor>,
         actual: Option<TimelineCursor>,
@@ -193,6 +233,12 @@ pub enum SessionMaskError {
 impl fmt::Display for SessionMaskError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ContextMismatch => formatter.write_str("exact context snapshot mismatch"),
+            Self::MaskIdentityMismatch { key } => {
+                write!(formatter, "active mask identity mismatch: {key}")
+            }
+            Self::InvalidItems => formatter
+                .write_str("invalid, empty, oversized, or replay-inconsistent item selection"),
             Self::BoundaryMismatch { expected, actual } => write!(
                 formatter,
                 "latest effective timeline boundary mismatch: expected {expected:?}, actual {actual:?}"
@@ -239,25 +285,76 @@ pub(super) fn mutate_record_masks(
     revision: Revision,
     mutation: &SessionMaskMutation,
 ) -> Result<SessionMaskMutationOutcome, SessionMaskError> {
-    let actual_boundary = record.timeline_events().last().map(|event| event.cursor);
-    if actual_boundary != mutation.expected_timeline_boundary {
-        return Err(SessionMaskError::BoundaryMismatch {
-            expected: mutation.expected_timeline_boundary,
-            actual: actual_boundary,
-        });
-    }
-
     let mutation_items = mutation
         .subtract
         .ids
         .len()
         .saturating_add(mutation.subtract.keys.len())
         .saturating_add(mutation.subtract.overlaps.len())
-        .saturating_add(mutation.add.len());
+        .saturating_add(mutation.add.len())
+        .saturating_add(mutation.expected_masks.len());
     if mutation_items > MAX_SESSION_MASK_MUTATION_ITEMS {
         return Err(SessionMaskError::MutationTooLarge {
             items: mutation_items,
             limit: MAX_SESSION_MASK_MUTATION_ITEMS,
+        });
+    }
+    super::metadata::apply(
+        &mut record.clone(),
+        &super::SessionMutation {
+            predicates: mutation.metadata_predicates.clone(),
+            ..Default::default()
+        },
+    )
+    .map_err(|_| SessionMaskError::ContextMismatch)?;
+    if mutation
+        .expected_context
+        .as_ref()
+        .is_some_and(|context| !context.matches(record))
+    {
+        return Err(SessionMaskError::ContextMismatch);
+    }
+    let original_masks = record.active_masks();
+    if let Some(context) = &mutation.expected_completed_source {
+        let actual = original_masks
+            .iter()
+            .map(|mask| (mask.key.clone(), mask.id.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = mutation.expected_active_masks.as_ref().map(|masks| {
+            masks
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
+        if !context.matches_completed_source(record)
+            || mutation.expected_active_masks.as_ref().is_none_or(|masks| {
+                masks.len() > MAX_ACTIVE_SESSION_MASKS
+                    || expected
+                        .as_ref()
+                        .is_none_or(|expected| expected.len() != masks.len())
+            })
+            || expected.as_ref() != Some(&actual)
+        {
+            return Err(SessionMaskError::ContextMismatch);
+        }
+    } else if mutation.expected_active_masks.is_some() {
+        return Err(SessionMaskError::ContextMismatch);
+    }
+    for (key, expected) in &mutation.expected_masks {
+        if original_masks
+            .iter()
+            .find(|mask| &mask.key == key)
+            .map(|mask| &mask.id)
+            != expected.as_ref()
+        {
+            return Err(SessionMaskError::MaskIdentityMismatch { key: key.clone() });
+        }
+    }
+    let actual_boundary = record.timeline_events().last().map(|event| event.cursor);
+    if actual_boundary != mutation.expected_timeline_boundary {
+        return Err(SessionMaskError::BoundaryMismatch {
+            expected: mutation.expected_timeline_boundary,
+            actual: actual_boundary,
         });
     }
 
@@ -271,6 +368,10 @@ pub(super) fn mutate_record_masks(
     }
     for addition in &mutation.add {
         validate_addition(addition)?;
+        if let Some(ids) = &addition.item_ids {
+            super::SessionCopy::selected(record, addition.selector.cursor, ids)
+                .map_err(|_| SessionMaskError::InvalidItems)?;
+        }
     }
 
     let ids = mutation.subtract.ids.iter().collect::<HashSet<_>>();
@@ -280,16 +381,17 @@ pub(super) fn mutate_record_masks(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let mut active = record.active_masks();
+    let mut active = original_masks;
     let mut removed_mask_ids = Vec::new();
     active.retain(|mask| {
         let remove = ids.contains(&mask.id)
             || keys.contains(mask.key.as_str())
-            || mutation
-                .subtract
-                .overlaps
-                .iter()
-                .any(|selector| selectors_overlap(mask.selector, *selector));
+            || mutation.subtract.overlaps.iter().any(|selector| {
+                mask.item_ids.as_ref().map_or_else(
+                    || selectors_overlap(mask.selector, *selector),
+                    |ids| items_overlap_prefix(record, ids, selector.cursor),
+                )
+            });
         if remove {
             removed_mask_ids.push(mask.id.clone());
         }
@@ -310,7 +412,7 @@ pub(super) fn mutate_record_masks(
         if let Some(overlap) = active
             .iter()
             .chain(added_masks.iter())
-            .find(|mask| selectors_overlap(mask.selector, addition.selector))
+            .find(|mask| masks_overlap(record, mask, addition))
         {
             return Err(SessionMaskError::ReplacementOverlap {
                 left: overlap.selector,
@@ -321,6 +423,7 @@ pub(super) fn mutate_record_masks(
             id: SessionMaskId::generate(),
             key: addition.key.clone(),
             selector: addition.selector,
+            item_ids: addition.item_ids.clone(),
             replacement: addition.replacement.clone(),
         });
     }
@@ -348,6 +451,29 @@ pub(super) fn mutate_record_masks(
         removed_mask_ids,
         added_masks,
     })
+}
+
+fn masks_overlap(record: &SessionRecord, left: &SessionMask, right: &SessionMaskAddition) -> bool {
+    match (&left.item_ids, &right.item_ids) {
+        (Some(left), Some(right)) => {
+            let right = right.iter().collect::<HashSet<_>>();
+            left.iter().any(|id| right.contains(id))
+        }
+        (Some(ids), None) => items_overlap_prefix(record, ids, right.selector.cursor),
+        (None, Some(ids)) => items_overlap_prefix(record, ids, left.selector.cursor),
+        (None, None) => selectors_overlap(left.selector, right.selector),
+    }
+}
+
+fn items_overlap_prefix(
+    record: &SessionRecord,
+    ids: &[TimelineItemId],
+    cursor: TimelineCursor,
+) -> bool {
+    let ids = ids.iter().collect::<HashSet<_>>();
+    record
+        .timeline_events()
+        .any(|event| event.cursor <= cursor && ids.contains(&event.item_id))
 }
 
 fn validate_addition(addition: &SessionMaskAddition) -> Result<(), SessionMaskError> {
@@ -401,8 +527,369 @@ mod tests {
     use crate::agent::session::SessionRollbackTarget;
     use crate::{
         MemorySessionStore, PendingTimelineEvent, PendingTimelineItemId, SessionContextMode,
-        SessionCreateRequest, SessionStore, SessionStoreError, TimelineContent,
+        SessionCopy, SessionCreateRequest, SessionStore, SessionStoreError, TimelineContent,
     };
+
+    async fn sibling_source() -> (
+        MemorySessionStore,
+        SessionRecord,
+        super::super::ContextIdentity,
+        serde_json::Value,
+    ) {
+        let store = MemorySessionStore::new();
+        let (record, context, checkpoint) = populate_sibling_source(&store).await;
+        (store, record, context, checkpoint)
+    }
+
+    async fn populate_sibling_source(
+        store: &impl SessionStore,
+    ) -> (
+        SessionRecord,
+        super::super::ContextIdentity,
+        serde_json::Value,
+    ) {
+        let id = super::super::SessionId::new("siblings");
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        store
+            .append_timeline(
+                &id,
+                store.load(&id).await.unwrap().execution_token().unwrap(),
+                vec![
+                    PendingTimelineEvent::assistant_text_snapshot(
+                        id.clone(),
+                        0,
+                        PendingTimelineItemId::New,
+                        "left original",
+                    ),
+                    PendingTimelineEvent::assistant_text_snapshot(
+                        id.clone(),
+                        0,
+                        PendingTimelineItemId::New,
+                        "right original",
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                &id,
+                store.load(&id).await.unwrap().execution_token().unwrap(),
+                vec![SessionJournalEvent::TurnFinished { turn: 0 }],
+            )
+            .await
+            .unwrap();
+        let checkpoint = serde_json::json!({"opaque": "checkpoint"});
+        let record = store
+            .set_metadata_value_conditionally(
+                &id,
+                "host.checkpoint".into(),
+                checkpoint.clone(),
+                super::super::MetadataSetCondition::Unconditional,
+            )
+            .await
+            .unwrap()
+            .record;
+        let context = super::super::ContextIdentity::capture(
+            &record, TimelineCursor::new(2), "pinned-authority").unwrap();
+        (record, context, checkpoint)
+    }
+
+    fn sibling_mutation(
+        context: &super::super::ContextIdentity,
+        checkpoint: &serde_json::Value,
+        key: &str,
+        cursor: u64,
+        known: Vec<(String, SessionMaskId)>,
+    ) -> SessionMaskMutation {
+        let mut mutation = SessionMaskMutation::new(Some(context.boundary()));
+        mutation.expected_completed_source = Some(context.clone());
+        mutation.expected_active_masks = Some(known);
+        mutation.metadata_predicates.push(super::super::MetadataPredicate {
+            target: super::super::MetadataTarget::Session,
+            key: "host.checkpoint".into(), expected: Some(checkpoint.clone()),
+        });
+        mutation.expected_masks = vec![(key.into(), None)];
+        mutation.add.push(SessionMaskAddition::items(
+            key,
+            context.boundary(),
+            vec![TimelineItemId::from_first_cursor(TimelineCursor::new(
+                cursor,
+            ))],
+            ReplacementUserContent::new(format!("{key} summary")),
+        ));
+        mutation
+    }
+
+    #[tokio::test]
+    async fn disjoint_siblings_apply_with_original_source_and_exact_known_administrative_successors()
+     {
+        let (store, record, context, checkpoint) = sibling_source().await;
+        let first = store
+            .mutate_masks(
+                &record.id,
+                sibling_mutation(&context, &checkpoint, "left", 1, Vec::new()),
+            )
+            .await
+            .unwrap();
+        let known = first
+            .added_masks
+            .iter()
+            .map(|mask| (mask.key.clone(), mask.id.clone()))
+            .collect();
+        let second = store
+            .mutate_masks(
+                &record.id,
+                sibling_mutation(&context, &checkpoint, "right", 2, known),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.added_masks.len(), 1);
+        let current = store.load(&record.id).await.unwrap();
+        assert_eq!(current.active_masks().len(), 2);
+        assert!(!context.matches(&current));
+        assert!(context.matches_completed_source(&current));
+        assert_eq!(
+            current.metadata.values["host.checkpoint"],
+            checkpoint
+        );
+        let effective = current.materialize_context(SessionContextMode::Effective);
+        assert_eq!(
+            effective
+                .prompt_turns
+                .iter()
+                .map(|prompt| prompt.prompt.as_str())
+                .collect::<Vec<_>>(),
+            ["left summary", "right summary"]
+        );
+        assert!(effective.turns.is_empty());
+        let rollback_len = current.journal.len() as u64;
+        let left = current
+            .active_masks()
+            .into_iter()
+            .find(|mask| mask.key == "left")
+            .unwrap();
+        let known = current
+            .active_masks()
+            .iter()
+            .map(|mask| (mask.key.clone(), mask.id.clone()))
+            .collect();
+        let mut replacement = sibling_mutation(
+            &context,
+            &checkpoint,
+            "left",
+            1,
+            known,
+        );
+        replacement.expected_masks = vec![("left".into(), Some(left.id.clone()))];
+        replacement.subtract.keys.push("left".into());
+        replacement.add[0].replacement = ReplacementUserContent::new("left replacement");
+        store.mutate_masks(&record.id, replacement).await.unwrap();
+        let replaced = store.load(&record.id).await.unwrap();
+        let copy = SessionCopy::from_record_effective(&replaced, context.boundary()).unwrap();
+        let mut request = SessionCreateRequest::new("durable-helper");
+        request.start = super::super::SessionStart::Copy {
+            copy,
+            messages: Vec::new(),
+        };
+        let helper_record = store.create(request).await.unwrap();
+        assert!(
+            !serde_json::to_string(&helper_record)
+                .unwrap()
+                .contains("original")
+        );
+        let helper = helper_record.materialize_context(SessionContextMode::Raw);
+        assert_eq!(
+            helper
+                .prompt_turns
+                .iter()
+                .map(|prompt| prompt.prompt.as_str())
+                .collect::<Vec<_>>(),
+            ["left replacement", "right summary"]
+        );
+        let original = SessionCopy::selected(
+            &replaced,
+            context.boundary(),
+            &[TimelineItemId::from_first_cursor(TimelineCursor::new(1))],
+        )
+        .unwrap();
+        assert!(original.timeline().iter().any(|event| event.item_id == TimelineItemId::from_first_cursor(TimelineCursor::new(1)) && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "left original")));
+        assert!(context.matches_completed_source(&replaced));
+        store
+            .append_journal(
+                &record.id,
+                replaced.execution_token().unwrap(),
+                vec![SessionJournalEvent::Rollback {
+                    target: SessionRollbackTarget {
+                        journal_len: rollback_len,
+                        after_cursor: Some(context.boundary()),
+                        next_turn: 1,
+                        remove_prompt_index: None,
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let rolled_back = store.load(&record.id).await.unwrap();
+        assert_eq!(
+            rolled_back
+                .active_masks()
+                .iter()
+                .find(|mask| mask.key == "left")
+                .unwrap()
+                .id,
+            left.id
+        );
+        assert!(!context.matches_completed_source(&rolled_back));
+        let mut request = SessionCreateRequest::new("rollback-helper");
+        request.start = super::super::SessionStart::Copy {
+            copy: SessionCopy::from_record_effective(&rolled_back, context.boundary()).unwrap(),
+            messages: Vec::new(),
+        };
+        let helper = store
+            .create(request)
+            .await
+            .unwrap()
+            .materialize_context(SessionContextMode::Raw);
+        assert_eq!(
+            helper
+                .prompt_turns
+                .iter()
+                .map(|prompt| prompt.prompt.as_str())
+                .collect::<Vec<_>>(),
+            ["left summary", "right summary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_context_preconditions_compare_the_pre_transaction_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = super::super::FilesystemSessionStore::new(directory.path());
+        let (record, context, checkpoint) = populate_sibling_source(&store).await;
+        let mut first = sibling_mutation(&context, &checkpoint, "left", 1, Vec::new());
+        first.expected_completed_source = None;
+        first.expected_active_masks = None;
+        first.expected_context = Some(context.clone());
+        let committed = store.mutate_masks(&record.id, first.clone()).await.unwrap();
+        let before = store.load(&record.id).await.unwrap();
+        assert!(!context.matches(&before));
+        assert!(store.mutate_masks(&record.id, first).await.is_err());
+        assert_eq!(store.load(&record.id).await.unwrap(), before);
+        let known = committed
+            .added_masks
+            .iter()
+            .map(|mask| (mask.key.clone(), mask.id.clone()))
+            .collect();
+        store
+            .mutate_masks(
+                &record.id,
+                sibling_mutation(&context, &checkpoint, "right", 2, known),
+            )
+            .await
+            .unwrap();
+        let current = store.load(&record.id).await.unwrap();
+        assert_eq!(current.active_masks().len(), 2);
+        assert!(context.matches_completed_source(&current));
+    }
+
+    #[tokio::test]
+    async fn unseen_sibling_or_newer_checkpoint_is_explicit_conflict_and_preserves_committed_effects()
+     {
+        let (store, record, context, checkpoint) = sibling_source().await;
+        let left = sibling_mutation(&context, &checkpoint, "left", 1, Vec::new());
+        let right = sibling_mutation(&context, &checkpoint, "right", 2, Vec::new());
+        let (left, right) = tokio::join!(
+            store.mutate_masks(&record.id, left),
+            store.mutate_masks(&record.id, right)
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert_eq!(
+            store.load(&record.id).await.unwrap().active_masks().len(),
+            1
+        );
+        let committed = left.or(right).unwrap();
+        let (key, cursor) = if committed.added_masks[0].key == "left" {
+            ("right", 2)
+        } else {
+            ("left", 1)
+        };
+        let known = committed
+            .added_masks
+            .iter()
+            .map(|mask| (mask.key.clone(), mask.id.clone()))
+            .collect();
+        let pending = sibling_mutation(&context, &checkpoint, key, cursor, known);
+        store
+            .set_metadata_value(
+                &record.id,
+                "host.checkpoint".into(),
+                serde_json::json!({"newer":"checkpoint"}),
+            )
+            .await
+            .unwrap();
+        let before = store.load(&record.id).await.unwrap();
+        assert!(store.mutate_masks(&record.id, pending).await.is_err());
+        assert_eq!(store.load(&record.id).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn sibling_source_identity_rejects_revision_rollback_incarnation_agent_and_inference_drift()
+     {
+        let (_store, record, context, checkpoint) = sibling_source().await;
+        let mut cases = Vec::new();
+        let mut changed = record.clone();
+        changed.revision = changed.revision.next();
+        cases.push(changed);
+        let mut changed = record.clone();
+        changed.metadata.incarnation = Some("another incarnation".into());
+        cases.push(changed);
+        let mut changed = record.clone();
+        changed.agent_definition = Some(crate::agent::session::opaque_test_configuration(
+            "changed",
+            vec!["changed".into()],
+        ));
+        cases.push(changed);
+        let mut changed = record.clone();
+        changed.inference_settings = Some(crate::InferenceSettings {
+            provider: crate::InferenceProviderSettings {
+                key: "changed".into(),
+                api: crate::ModelApi::OpenAiResponses,
+                url: "https://unused.invalid".into(),
+                model_id: "changed".into(),
+                model_cost: None,
+                headers: Default::default(),
+                oauth: None,
+                reasoning_effort: None,
+            },
+        });
+        cases.push(changed);
+        let mut changed = record.clone();
+        changed.append_journal_event(SessionJournalEvent::Rollback {
+            target: SessionRollbackTarget {
+                journal_len: record.journal.len() as u64,
+                after_cursor: Some(context.boundary()),
+                next_turn: 1,
+                remove_prompt_index: None,
+            },
+        });
+        cases.push(changed);
+        for mut changed in cases {
+            assert!(!context.matches_completed_source(&changed));
+            let before = changed.clone();
+            assert_eq!(
+                mutate_record_masks(
+                    &mut changed,
+                    record.revision.next(),
+                    &sibling_mutation(&context, &checkpoint, "left", 1, Vec::new())
+                ),
+                Err(SessionMaskError::ContextMismatch)
+            );
+            assert_eq!(changed, before);
+        }
+    }
 
     fn completed_record() -> SessionRecord {
         let mut record = SessionRecord::new("masked");
@@ -519,7 +1006,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::ZERO,
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![SessionJournalEvent::PromptAppended {
                     prompt: "question".to_owned(),
                 }],
@@ -529,7 +1016,7 @@ mod tests {
         store
             .append_timeline(
                 &id,
-                Revision::new(1),
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![
                     PendingTimelineEvent::user_text_snapshot(
                         id.clone(),
@@ -550,7 +1037,7 @@ mod tests {
         store
             .append_journal(
                 &id,
-                Revision::new(2),
+                store.load(&id).await.unwrap().execution_token().unwrap(),
                 vec![SessionJournalEvent::TurnFinished { turn: 0 }],
             )
             .await
