@@ -78,6 +78,8 @@ Capture, playback and codec conversion belong to clients. Opaque upload/read gra
 
 The accepted transport, stream, workspace, result and lease budgets remain enforced by their owning registries. The obsolete server `interaction_limits` constructor field is removed; v2 registries and typed resource contracts own these bounds.
 
+Routine blob storage receives an explicit workspace topology. Local and embedded workers require a canonical local workspace and reject directory identity overlap. The private worker handshake verifies the socket worker's absolute workspace identity. That directory need not exist on the server. Host-side exclusion resolves present path prefixes and rejects storage path overlap or aliases even when the workspace is absent. Private blob operations remain descriptor-rooted. Both modes enforce ownership, ancestor modes, no-follow opens, exclusive locks, empty-root checks and quotas.
+
 ### Interaction Trace Ownership
 
 Invocation and operation history is authoritative for execution and cleanup. V2 admission uses `routine.v2.start` and `routine.v2.interact` spans. The original owned driver retains its `routine.invocation` span after admission returns; `routine.host_call` spans carry that explicit parent across the script boundary. Incoming trace context is validated and tracestate is cleared at the Routine boundary. Library composition installs no additional global subscriber or exporter. Never include credentials, source, helper inputs/results, native paths or media payloads in diagnostics.

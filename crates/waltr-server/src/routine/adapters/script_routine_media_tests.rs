@@ -539,7 +539,7 @@ async fn vertical_with_upload(
     let blobs = Arc::new(
         FilesystemBlobStore::new(FilesystemConfig {
             private_root: private,
-            workspace_root: workspace.clone(),
+            workspace_root: crate::routine::blob::filesystem::WorkspaceRoot::Local(workspace.clone()),
             clock: Arc::new(blob::MonotonicClock::default()),
         })
         .unwrap(),

@@ -75,7 +75,7 @@ async fn normal_dispatcher_live_ask_grants_only_the_exact_original_source_and_ca
     ).unwrap()).await.unwrap();
     let history = persistence.script_invocation_store();
     let management_revision = state.snapshot().scripts()["context-management"].revision().to_owned();
-    let production = ProductionRuntime::new(ProductionInput { state, persistence, workspace, private_parent:root.clone(), authority:RoutineAuthority::default() }, sessions.clone(), factory).await.unwrap();
+    let production = ProductionRuntime::new(ProductionInput { state, persistence, workspace: WorkspaceRoot::Local(workspace), private_parent:root.clone(), authority:RoutineAuthority::default() }, sessions.clone(), factory).await.unwrap();
     let origin = crate::local_admission::ValidatedLocalOrigin(Arc::new(CancellationToken::new()));
     let principal = crate::access_auth::AuthenticatedPrincipal::local_process(&origin);
     for name in ["approved", "denied", "cancelled"] {

@@ -334,6 +334,16 @@ The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not
 
 ## Routine Payload Storage
 
+The shared preview/prod Pulumi workload gives the server a separate, ephemeral `server-private` emptyDir with a `256Mi` size limit.
+A nonroot init container uses the server image and runs only `/usr/bin/install -d -m 0700 /private-volume/routines`.
+It mounts only that volume and receives no application Secret or worker workspace.
+The pod's `fsGroup` prepares the volume before the init container creates the UID/GID `65532` child.
+The server mounts only the `routines` subPath at `/run/waltr-private` and sets `TMPDIR=/run/waltr-private`.
+The writable volume root stays outside the server's visible ancestor chain; `/` and `/run` retain mode `0755`.
+The private child has mode `0700`; Routine private blob checks retain their group/other-write rejection for every ancestor.
+The worker has no private-volume mount; all containers retain nonroot identity, a read-only root filesystem, no privilege escalation, and no capabilities.
+This temp storage matches the current `256Mi` temp-volume bound; it does not replace durable payload storage below.
+
 Routine program envelopes and selected text bodies use immutable storage, independently of session storage and SQL targets.
 
 | Variable | Contract |

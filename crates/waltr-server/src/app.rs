@@ -1212,6 +1212,11 @@ where
     } else {
         None
     };
+    let routine_workspace = if sandbox_socket.is_some() {
+        crate::routine::blob::filesystem::WorkspaceRoot::SocketWorker(workspace_root.clone())
+    } else {
+        crate::routine::blob::filesystem::WorkspaceRoot::Local(workspace_root.clone())
+    };
     let sandbox = SandboxHost::start(workspace_root.clone(), sandbox_socket)
         .await
         .map_err(|_| ResourceError::unavailable("sandbox worker could not start"))?;
@@ -1311,7 +1316,7 @@ where
         .compose_routines(ProductionInput {
             state: agent_state,
             persistence: persistence.clone(),
-            workspace: workspace_root,
+            workspace: routine_workspace,
             private_parent: routine_private_parent,
             authority: routine_authority,
         })

@@ -443,7 +443,9 @@ describe("hosted MCP OAuth deployment", () => {
     assert.equal(server.image, "registry.example.test/waltr:test");
     assert.equal(worker.image, "registry.example.test/waltr-sandbox:test");
     assert.deepEqual(server.envFrom, [{ secretRef: { name: "waltr-app" } }]);
-    assert.equal(server.env, undefined);
+    assert.deepEqual(server.env, [
+      { name: "TMPDIR", value: "/run/waltr-private" },
+    ]);
     assert.equal(
       environment().WALTR_SANDBOX_SOCKET,
       "/run/waltr-sandbox/gateway.sock",
@@ -494,7 +496,7 @@ describe("hosted MCP OAuth deployment", () => {
     );
     assert.equal(
       worker.volumeMounts.some((mount: any) =>
-        ["data", "mcp-oauth-wrapping-keys", "postgres-ca", "tmp"].includes(
+        ["data", "mcp-oauth-wrapping-keys", "postgres-ca", "tmp", "server-private"].includes(
           mount.name,
         ),
       ),
@@ -503,6 +505,87 @@ describe("hosted MCP OAuth deployment", () => {
     assert.doesNotMatch(
       JSON.stringify(worker),
       /waltr-app|password|secret|access.key/i,
+    );
+  });
+
+  test("prepares a private Routine temp parent as nonroot before the server starts", () => {
+    const pod = (resource("kubernetes:apps/v1:Deployment", "waltr").inputs.spec as any)
+      .template.spec;
+    assert.deepEqual(pod.securityContext, {
+      runAsNonRoot: true,
+      runAsUser: 65532,
+      runAsGroup: 65532,
+      fsGroup: 65532,
+      fsGroupChangePolicy: "OnRootMismatch",
+      seccompProfile: { type: "RuntimeDefault" },
+    });
+    assert.equal(pod.initContainers.length, 1);
+    const [init] = pod.initContainers;
+    const [server, worker] = pod.containers;
+    assert.equal(init.name, "waltr-private-init");
+    assert.equal(init.image, server.image);
+    assert.equal(init.imagePullPolicy, server.imagePullPolicy);
+    assert.deepEqual(init.command, ["/usr/bin/install"]);
+    assert.deepEqual(init.args, ["-d", "-m", "0700", "/private-volume/routines"]);
+    assert.equal(init.workingDir, "/");
+    assert.deepEqual(init.securityContext, {
+      runAsNonRoot: true,
+      runAsUser: 65532,
+      runAsGroup: 65532,
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ["ALL"] },
+    });
+    assert.equal(init.env, undefined);
+    assert.equal(init.envFrom, undefined);
+    assert.deepEqual(init.volumeMounts, [
+      { name: "server-private", mountPath: "/private-volume" },
+    ]);
+    assert.deepEqual(
+      pod.volumes.find((volume: any) => volume.name === "server-private"),
+      { name: "server-private", emptyDir: { sizeLimit: "256Mi" } },
+    );
+    assert.deepEqual(server.env, [
+      { name: "TMPDIR", value: "/run/waltr-private" },
+    ]);
+    assert.equal(server.command, undefined);
+    assert.equal(server.args, undefined);
+    assert.deepEqual(server.securityContext, {
+      runAsNonRoot: true,
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ["ALL"] },
+    });
+    assert.deepEqual(
+      server.volumeMounts.filter((mount: any) => mount.name === "server-private"),
+      [{ name: "server-private", mountPath: "/run/waltr-private", subPath: "routines" }],
+    );
+    assert.equal(
+      worker.volumeMounts.some((mount: any) => mount.name === "server-private"),
+      false,
+    );
+    assert.deepEqual(server.envFrom, [{ secretRef: { name: "waltr-app" } }]);
+    assert.deepEqual(
+      server.volumeMounts.filter((mount: any) => mount.name !== "server-private"),
+      [
+        { name: "data", mountPath: "/data" },
+        { name: "tmp", mountPath: "/tmp" },
+        { name: "sandbox-socket", mountPath: "/run/waltr-sandbox" },
+        {
+          name: "mcp-oauth-wrapping-keys",
+          mountPath: "/var/run/secrets/waltr/mcp-oauth",
+          readOnly: true,
+        },
+        { name: "postgres-ca", mountPath: "/var/run/secrets/waltr/postgres", readOnly: true },
+      ],
+    );
+    assert.deepEqual(
+      pod.volumes.find((volume: any) => volume.name === "tmp"),
+      { name: "tmp", emptyDir: { sizeLimit: "256Mi" } },
+    );
+    assert.deepEqual(
+      pod.volumes.find((volume: any) => volume.name === "data"),
+      { name: "data", persistentVolumeClaim: { claimName: "waltr-data" } },
     );
   });
 

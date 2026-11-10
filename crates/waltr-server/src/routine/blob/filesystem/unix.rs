@@ -397,19 +397,37 @@ fn same(a: &File, b: &File) -> Result<bool, BlobError> {
     Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
 }
 impl Root {
-    fn new(path: &Path, workspace: &Path) -> Result<Self, BlobError> {
+    fn new(path: &Path, workspace: &WorkspaceRoot) -> Result<Self, BlobError> {
         let mut chain = directories(path)?;
-        let workspace = directories(workspace)?;
         let root = chain.last().ok_or(BlobError::Invalid)?;
-        let worker = workspace.last().ok_or(BlobError::Invalid)?;
-        for ancestor in &chain {
-            if same(ancestor, worker)? {
-                return Err(BlobError::Denied);
+        match workspace {
+            WorkspaceRoot::Local(workspace) => {
+                let workspace = directories(workspace)?;
+                let worker = workspace.last().ok_or(BlobError::Invalid)?;
+                for ancestor in &chain {
+                    if same(ancestor, worker)? {
+                        return Err(BlobError::Denied);
+                    }
+                }
+                for ancestor in &workspace {
+                    if same(ancestor, root)? {
+                        return Err(BlobError::Denied);
+                    }
+                }
             }
-        }
-        for ancestor in &workspace {
-            if same(ancestor, root)? {
-                return Err(BlobError::Denied);
+            WorkspaceRoot::SocketWorker(workspace) => {
+                if !workspace.is_absolute()
+                    || workspace
+                        .components()
+                        .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+                {
+                    return Err(BlobError::Invalid);
+                }
+                if crate::workspace_paths::overlaps(workspace, path)
+                    .map_err(|_| BlobError::Unavailable)?
+                {
+                    return Err(BlobError::Denied);
+                }
             }
         }
         let uid = rustix::process::geteuid().as_raw();
@@ -1511,7 +1529,17 @@ impl FilesystemBlobStore {
         private: &Path,
         workspace: &Path,
     ) -> Result<(), BlobError> {
-        let root = Root::new(private, workspace)?;
+        let root = Root::new(private, &WorkspaceRoot::Local(workspace.to_path_buf()))?;
+        root.remove_directory()
+    }
+    pub(in crate::routine::blob) fn check_socket_root(
+        private: &Path,
+        workspace: &Path,
+    ) -> Result<(), BlobError> {
+        let root = Root::new(
+            private,
+            &WorkspaceRoot::SocketWorker(workspace.to_path_buf()),
+        )?;
         root.remove_directory()
     }
 }

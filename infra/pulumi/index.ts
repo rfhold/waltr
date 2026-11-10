@@ -488,6 +488,27 @@ const deployment = new k8s.apps.v1.Deployment(
             seccompProfile: { type: "RuntimeDefault" },
           },
           terminationGracePeriodSeconds: 30,
+          initContainers: [
+            {
+              name: "waltr-private-init",
+              image,
+              imagePullPolicy: "IfNotPresent",
+              command: ["/usr/bin/install"],
+              args: ["-d", "-m", "0700", "/private-volume/routines"],
+              workingDir: "/",
+              securityContext: {
+                runAsNonRoot: true,
+                runAsUser: 65532,
+                runAsGroup: 65532,
+                allowPrivilegeEscalation: false,
+                readOnlyRootFilesystem: true,
+                capabilities: { drop: ["ALL"] },
+              },
+              volumeMounts: [
+                { name: "server-private", mountPath: "/private-volume" },
+              ],
+            },
+          ],
           containers: [
             {
               name: "waltr",
@@ -498,6 +519,7 @@ const deployment = new k8s.apps.v1.Deployment(
                 { name: "apps-http", containerPort: 14334, protocol: "TCP" },
               ],
               envFrom: [{ secretRef: { name: appSecret.metadata.name } }],
+              env: [{ name: "TMPDIR", value: "/run/waltr-private" }],
               securityContext: {
                 runAsNonRoot: true,
                 allowPrivilegeEscalation: false,
@@ -526,6 +548,11 @@ const deployment = new k8s.apps.v1.Deployment(
               volumeMounts: [
                 { name: "data", mountPath: "/data" },
                 { name: "tmp", mountPath: "/tmp" },
+                {
+                  name: "server-private",
+                  mountPath: "/run/waltr-private",
+                  subPath: "routines",
+                },
                 { name: "sandbox-socket", mountPath: "/run/waltr-sandbox" },
                 {
                   name: "mcp-oauth-wrapping-keys",
@@ -570,6 +597,7 @@ const deployment = new k8s.apps.v1.Deployment(
               persistentVolumeClaim: { claimName: data.metadata.name },
             },
             { name: "tmp", emptyDir: { sizeLimit: "256Mi" } },
+            { name: "server-private", emptyDir: { sizeLimit: "256Mi" } },
             { name: "sandbox-socket", emptyDir: {} },
             {
               name: "workspace",

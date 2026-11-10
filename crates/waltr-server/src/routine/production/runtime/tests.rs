@@ -14,6 +14,7 @@ mod media_upstream;
 mod media_workflows;
 mod tracing;
 mod title_overlap;
+mod socket_workspace;
 
 #[derive(Default)]
 struct ScriptedProvider {

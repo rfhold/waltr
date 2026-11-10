@@ -6,7 +6,7 @@ use crate::{
     routine::{
         blob::{
             self,
-            filesystem::{FilesystemBlobStore, FilesystemConfig},
+            filesystem::{FilesystemBlobStore, FilesystemConfig, WorkspaceRoot},
         },
         definition::{Definition, Trigger},
         history::{Caller, InvocationBinding},
@@ -44,8 +44,8 @@ pub struct ProductionInput {
     pub state: AgentDefinitionState,
     /// Explicitly initialized application databases.
     pub persistence: Persistence,
-    /// Existing sandbox workspace root.
-    pub workspace: PathBuf,
+    /// Explicit sandbox topology and workspace exclusion boundary.
+    pub workspace: WorkspaceRoot,
     /// Existing private-storage parent outside the workspace.
     pub private_parent: PathBuf,
     /// Explicit operator grants; empty denies privileged operations.
@@ -105,8 +105,12 @@ impl ProductionRuntime {
         )?;
         let private_parent =
             std::fs::canonicalize(&input.private_parent).map_err(|_| PortError::Unavailable)?;
-        let workspace =
-            std::fs::canonicalize(&input.workspace).map_err(|_| PortError::Unavailable)?;
+        let workspace = match input.workspace {
+            WorkspaceRoot::Local(path) => WorkspaceRoot::Local(
+                std::fs::canonicalize(path).map_err(|_| PortError::Unavailable)?,
+            ),
+            remote @ WorkspaceRoot::SocketWorker(_) => remote,
+        };
         let private_path = private_parent.join(format!("waltr-routine-{}", uuid::Uuid::new_v4()));
         #[cfg(unix)]
         {

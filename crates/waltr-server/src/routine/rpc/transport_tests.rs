@@ -55,7 +55,7 @@ impl Fixture {
         let blobs = Arc::new(
             FilesystemBlobStore::new(FilesystemConfig {
                 private_root: private,
-                workspace_root: workspace,
+                workspace_root: crate::routine::blob::filesystem::WorkspaceRoot::Local(workspace),
                 clock: Arc::new(blob::MonotonicClock::default()),
             })
             .unwrap(),
