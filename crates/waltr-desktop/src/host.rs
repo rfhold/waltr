@@ -39,6 +39,11 @@ pub enum Diagnostic {
     Primary(Result<(), Error>),
     /// Native capture cleanup result.
     CaptureCleanup(Result<(), capture::Error>),
+    /// Finite source handles/workers joined and upload cancellation requests completed.
+    /// Does not prove remote terminal cleanup.
+    SourceCleanup(Result<(), Error>),
+    /// Remote terminal and clean EOF proof, independent of the local capture join.
+    RemoteCleanup(bool),
     /// Typing cleanup result.
     TypingCleanup(Result<(), crate::typing::Error>),
     /// Interaction failure boundary (the public error remains unchanged).
@@ -339,8 +344,14 @@ impl Hold {
             factory,
             &binding.audio,
             crate::interaction::Selection {
-                routine: &binding.routine.name,
-                trigger: &binding.routine.trigger,
+                invocation: binding
+                    .resolved
+                    .as_ref()
+                    .filter(|invocation| {
+                        invocation.selection.routine == binding.routine.name
+                            && invocation.selection.entrypoint == binding.routine.trigger
+                    })
+                    .ok_or(Error::Unsupported)?,
                 input: &binding.routine.input,
                 output: &binding.routine.output,
                 max_capture_seconds: binding.max_capture_seconds,

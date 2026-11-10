@@ -13,19 +13,32 @@ use tonic::{Request, Response, Status as RpcStatus};
 use waltr_audio_io::Terminal;
 use waltr_client::{
     NativeGrpcTransport,
-    interaction::wire::{
-        self,
-        interact_response::Event,
-        routine_interaction_service_server::{
-            RoutineInteractionService, RoutineInteractionServiceServer,
-        },
-    },
+    interaction::wire::{self, output_event::Event, routine_service_server::RoutineServiceServer},
 };
 use waltr_desktop::{
     capture::{self, Factory, Source},
     config,
     host::{AudioAdmission, Error, Hold, Status},
 };
+mod support;
+support::fake_service!(Fake;
+    start_invocation: StartInvocationRequest => StartInvocationResponse,
+    list_invocations: ListInvocationsRequest => ListInvocationsResponse,
+    get_invocation: GetInvocationRequest => GetInvocationResponse,
+    list_operations: ListOperationsRequest => ListOperationsResponse,
+    cancel_invocation: CancelInvocationRequest => CancelInvocationResponse,
+    read_text_result: ReadTextResultRequest => ReadTextResultResponse,
+    open_attachment: OpenAttachmentRequest => OpenAttachmentResponse,
+    send_input_batch: SendInputBatchRequest => SendInputBatchResponse,
+    renew_attachment: RenewAttachmentRequest => RenewAttachmentResponse,
+    close_attachment: CloseAttachmentRequest => CloseAttachmentResponse,
+    begin_blob_upload: BeginBlobUploadRequest => BeginBlobUploadResponse,
+    append_blob_upload: AppendBlobUploadRequest => AppendBlobUploadResponse,
+    commit_blob_upload: CommitBlobUploadRequest => CommitBlobUploadResponse,
+    cancel_blob_upload: CancelBlobUploadRequest => CancelBlobUploadResponse,
+    open_blob_read: OpenBlobReadRequest => OpenBlobReadResponse,
+    close_blob_read: CloseBlobReadRequest => CloseBlobReadResponse,
+);
 type Responses = Pin<Box<dyn Stream<Item = Result<wire::InteractResponse, RpcStatus>> + Send>>;
 #[derive(Clone, Default)]
 struct Fake {
@@ -40,11 +53,25 @@ struct Fake {
     reason = "fixture events share the fallible RPC stream item type"
 )]
 const fn event(event: Event) -> Result<wire::InteractResponse, RpcStatus> {
-    Ok(wire::InteractResponse { event: Some(event) })
+    Ok(wire::InteractResponse {
+        output: Some(wire::OutputEvent { event: Some(event) }),
+    })
 }
-#[tonic::async_trait]
-impl RoutineInteractionService for Fake {
-    type InteractStream = Responses;
+fn accepted() -> Result<wire::InteractResponse, RpcStatus> {
+    event(Event::Accepted(wire::InteractionAccepted {
+        invocation_id: "invocation".into(),
+        revision: "revision".into(),
+        limits: Some(support::limits()),
+    }))
+}
+fn output_open() -> Result<wire::InteractResponse, RpcStatus> {
+    event(Event::Open(wire::StreamOpen {
+        stream_id: "out".into(),
+        port: "clean-text".into(),
+        format: Some(wire::stream_open::Format::Text(wire::TextFormat {})),
+    }))
+}
+impl Fake {
     async fn interact(
         &self,
         request: Request<tonic::Streaming<wire::InteractRequest>>,
@@ -52,14 +79,15 @@ impl RoutineInteractionService for Fake {
         self.admissions.fetch_add(1, Ordering::SeqCst);
         let mut input = request.into_inner();
         let first = input.message().await?.unwrap();
-        let Some(wire::interact_request::Event::Open(open)) = first.event else {
+        let Some(wire::interact_request::Frame::Open(open)) = first.frame else {
             panic!("expected open")
         };
+        let open = open.selection.unwrap();
         assert!(
-            open.source_session_id.is_none(),
+            open.source_session.is_none(),
             "production admission forbids source sessions"
         );
-        if open.routine_name == "acceptance-gate" {
+        if open.routine == "acceptance-gate" {
             let fake = self.clone();
             let output = stream::once(async move {
                 assert!(
@@ -68,24 +96,26 @@ impl RoutineInteractionService for Fake {
                         .is_err(),
                     "audio must wait for Accepted"
                 );
-                let accepted = event(Event::Accepted(wire::InteractionAccepted {
-                    invocation_id: "invocation".into(),
-                }));
+                let accepted = accepted();
                 let tail = stream::once(async move {
                     let mut kinds = Vec::new();
                     while let Some(message) = input.message().await.unwrap() {
+                        let Some(wire::interact_request::Frame::Input(message)) = message.frame
+                        else {
+                            panic!("input")
+                        };
                         match message.event.unwrap() {
-                            wire::interact_request::Event::InputOpened(_) => kinds.push("open"),
-                            wire::interact_request::Event::InputChunk(chunk) => {
+                            wire::input_event::Event::Open(_) => kinds.push("open"),
+                            wire::input_event::Event::Chunk(chunk) => {
                                 kinds.push("chunk");
-                                if let Some(wire::interaction_input_chunk::Content::Audio(bytes)) =
-                                    chunk.content
+                                if let Some(wire::stream_chunk::Payload::Audio(bytes)) =
+                                    chunk.payload
                                 {
                                     fake.uploads.fetch_add(bytes.len(), Ordering::SeqCst);
                                 }
                             }
-                            wire::interact_request::Event::InputClosed(_) => kinds.push("close"),
-                            wire::interact_request::Event::InputCompleted(_) => {
+                            wire::input_event::Event::Close(_) => kinds.push("close"),
+                            wire::input_event::Event::Finish(_) => {
                                 kinds.push("finish");
                                 break;
                             }
@@ -94,16 +124,7 @@ impl RoutineInteractionService for Fake {
                     }
                     assert_eq!(kinds, ["open", "chunk", "close", "finish"]);
                     fake.completed.store(true, Ordering::SeqCst);
-                    let mut events =
-                        vec![event(Event::OutputOpened(wire::InteractionOutputOpened {
-                            stream_id: "out".into(),
-                            port_name: "clean-text".into(),
-                            format: Some(wire::InteractionStreamFormat {
-                                content: Some(wire::interaction_stream_format::Content::Text(
-                                    wire::InteractionTextFormat {},
-                                )),
-                            }),
-                        }))];
+                    let mut events = vec![output_open()];
                     events.extend(final_events("test"));
                     stream::iter(events)
                 })
@@ -113,61 +134,45 @@ impl RoutineInteractionService for Fake {
             .flatten();
             return Ok(Response::new(Box::pin(output)));
         }
-        if open.routine_name == "pending" {
+        if open.routine == "pending" {
             while input.message().await?.is_some() {}
             return Err(RpcStatus::cancelled("closed before admission"));
         }
-        if open.routine_name == "early-success" {
-            let mut events = vec![
-                event(Event::Accepted(wire::InteractionAccepted {
-                    invocation_id: "invocation".into(),
-                })),
-                event(Event::OutputOpened(wire::InteractionOutputOpened {
-                    stream_id: "out".into(),
-                    port_name: "clean-text".into(),
-                    format: Some(wire::InteractionStreamFormat {
-                        content: Some(wire::interaction_stream_format::Content::Text(
-                            wire::InteractionTextFormat {},
-                        )),
-                    }),
-                })),
-            ];
+        if open.routine == "early-success" {
+            let mut events = vec![accepted(), output_open()];
             events.extend(final_events("test"));
             return Ok(Response::new(Box::pin(stream::iter(events))));
         }
-        if open.routine_name == "disconnect-before-accepted" {
+        if open.routine == "disconnect-before-accepted" {
             return Ok(Response::new(Box::pin(stream::iter([Err(
                 RpcStatus::unavailable("synthetic disconnect"),
             )]))));
         }
-        if open.routine_name == "early-rejected" {
+        if open.routine == "early-rejected" {
             return Ok(Response::new(Box::pin(stream::iter([event(
-                Event::ValidationFailure(Default::default()),
+                Event::Rejected(wire::InteractionRejected {
+                    code: 1,
+                    reason: "fixture".into(),
+                }),
             )]))));
         }
-        if open.routine_name.starts_with("early-") {
+        if open.routine.starts_with("early-") {
             return Ok(Response::new(Box::pin(stream::iter([
-                event(Event::Accepted(wire::InteractionAccepted {
-                    invocation_id: "SECRET_INVOCATION_SENTINEL".into(),
-                })),
-                event(Event::Completed(wire::InteractionCompleted {
-                    status: match open.routine_name.as_str() {
-                        "early-failed" => wire::RoutineInvocationStatus::Failed,
-                        "early-interrupted" => wire::RoutineInvocationStatus::Interrupted,
-                        _ => wire::RoutineInvocationStatus::Succeeded,
+                accepted(),
+                event(Event::Terminal(wire::InteractionTerminal {
+                    status: match open.routine.as_str() {
+                        "early-failed" => wire::InvocationStatus::Failed,
+                        "early-interrupted" => wire::InvocationStatus::Interrupted,
+                        _ => wire::InvocationStatus::Succeeded,
                     } as i32,
-                    failure: (open.routine_name != "early-protocol").then(|| {
-                        wire::RoutineFailure {
-                            code: "SECRET_CODE_SENTINEL".into(),
-                            message: "SECRET_MESSAGE_SENTINEL".into(),
-                        }
-                    }),
+                    cleanup_complete: true,
+                    ..Default::default()
                 })),
             ]))));
         }
-        if open.routine_name.starts_with("delay-open-") {
+        if open.routine.starts_with("delay-open-") {
             let ms = open
-                .routine_name
+                .routine
                 .rsplit('-')
                 .next()
                 .unwrap()
@@ -177,29 +182,37 @@ impl RoutineInteractionService for Fake {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
         let fake = self.clone();
-        let mut prefix = vec![
-            event(Event::Accepted(wire::InteractionAccepted {
-                invocation_id: "invocation".into(),
-            })),
-            event(Event::OutputOpened(wire::InteractionOutputOpened {
-                stream_id: "out".into(),
-                port_name: "clean-text".into(),
-                format: Some(wire::InteractionStreamFormat {
-                    content: Some(wire::interaction_stream_format::Content::Text(
-                        wire::InteractionTextFormat {},
-                    )),
-                }),
-            })),
-        ];
-        if open.routine_name.starts_with("typing") {
+        let mut prefix = vec![accepted(), output_open()];
+        if open.routine == "pcm" {
             prefix.extend([
-                text_event("one", "draft", false),
-                text_event("one", "first\r", true),
-                text_event("two", "draft", false),
+                event(Event::Open(wire::StreamOpen {
+                    stream_id: "speaker".into(),
+                    port: "speaker".into(),
+                    format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
+                        sample_rate: 24000,
+                        channels: 1,
+                    })),
+                })),
+                event(Event::Chunk(wire::StreamChunk {
+                    stream_id: "speaker".into(),
+                    sequence: 0,
+                    payload: Some(wire::stream_chunk::Payload::Audio(vec![1, 0, 2, 0])),
+                })),
+                event(Event::Close(wire::StreamClose {
+                    stream_id: "speaker".into(),
+                    next_sequence: 1,
+                })),
             ]);
         }
-        let delay = if open.routine_name.starts_with("delay-accepted-") {
-            open.routine_name
+        if open.routine.starts_with("typing") {
+            prefix.extend([
+                text_event(0, "one", "draft", false),
+                text_event(1, "one", "first\r", true),
+                text_event(2, "two", "draft", false),
+            ]);
+        }
+        let delay = if open.routine.starts_with("delay-accepted-") {
+            open.routine
                 .rsplit('-')
                 .next()
                 .unwrap()
@@ -211,37 +224,40 @@ impl RoutineInteractionService for Fake {
         let tail = stream::once(async move {
             let mut closed = false;
             while let Some(message) = input.message().await? {
+                let Some(wire::interact_request::Frame::Input(message)) = message.frame else {
+                    panic!("input")
+                };
                 match message.event {
-                    Some(wire::interact_request::Event::InputChunk(chunk)) => {
-                        if let Some(wire::interaction_input_chunk::Content::Audio(bytes)) =
-                            chunk.content
-                        {
+                    Some(wire::input_event::Event::Chunk(chunk)) => {
+                        if let Some(wire::stream_chunk::Payload::Audio(bytes)) = chunk.payload {
                             fake.uploads.fetch_add(bytes.len(), Ordering::SeqCst);
                             fake.pcm.lock().unwrap().extend(bytes);
                         }
                     }
-                    Some(wire::interact_request::Event::InputClosed(value)) => {
+                    Some(wire::input_event::Event::Close(_value)) => {
                         assert!(!closed);
-                        assert_eq!(value.status, 1);
-                        assert!(value.failure.is_none());
                         closed = true;
                     }
-                    Some(wire::interact_request::Event::InputCompleted(_)) => {
+                    Some(wire::input_event::Event::Finish(_)) => {
                         assert!(closed, "normal input close must precede completion");
                         break;
                     }
-                    Some(wire::interact_request::Event::Cancel(_)) => {
-                        return Err(RpcStatus::cancelled("cancelled"));
+                    Some(wire::input_event::Event::Cancel(_)) => {
+                        return Ok(vec![event(Event::Terminal(wire::InteractionTerminal {
+                            status: 5,
+                            cleanup_complete: true,
+                            ..Default::default()
+                        }))]);
                     }
                     _ => (),
                 }
             }
             fake.completed.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if open.routine_name == "failed" || open.routine_name == "typing-failed" {
+            if open.routine == "failed" || open.routine == "typing-failed" {
                 return Err(RpcStatus::data_loss("static failure"));
             }
-            Ok(final_events(&open.routine_name))
+            Ok(final_events(&open.routine))
         })
         .map(|result| stream::iter(result.unwrap_or_else(|e| vec![Err(e)])))
         .flatten();
@@ -253,13 +269,6 @@ impl RoutineInteractionService for Fake {
         })
         .flatten();
         Ok(Response::new(Box::pin(prefix.chain(tail))))
-    }
-    type RunStream = Responses;
-    async fn run(
-        &self,
-        _request: Request<wire::RunInteractionRequest>,
-    ) -> Result<Response<Responses>, RpcStatus> {
-        Err(RpcStatus::unimplemented("unused"))
     }
 }
 async fn fixture() -> (
@@ -274,7 +283,7 @@ async fn fixture() -> (
         Some((listener.accept().await.map(|v| v.0), listener))
     });
     let fake = Fake::default();
-    let service = RoutineInteractionServiceServer::new(fake.clone());
+    let service = RoutineServiceServer::new(fake.clone());
     let stop = CancellationToken::new();
     let stopped = stop.clone();
     let server = tokio::spawn(async move {
@@ -402,6 +411,7 @@ keybinds:
 "#).unwrap();
     let mut b = c.keybinds.remove(0);
     b.routine.name = name.into();
+    b.resolved = Some(support::invocation(name));
     b.command.as_mut().unwrap().argv[4] = path.to_str().unwrap().into();
     b
 }
@@ -1009,7 +1019,7 @@ async fn rpc_waits_for_first_audio_then_preserves_protocol_boundary() {
     };
     assert!(
         position(Diagnostic::Stage(Stage::Accepted))
-            < position(Diagnostic::RpcFailure(RpcFailure::Protocol))
+            < position(Diagnostic::RpcFailure(RpcFailure::Output))
     );
     assert!(
         position(Diagnostic::Stage(Stage::FirstFrameObserved))
@@ -1050,27 +1060,67 @@ async fn early_successful_eof_cancels_capture_without_release_or_terminal_comman
 }
 
 #[tokio::test]
+async fn missing_or_mismatched_current_selection_never_captures_or_admits() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    for missing in [true, false] {
+        let mut binding = binding(&dir.path().join("never"), "test");
+        if missing {
+            binding.resolved = None;
+        } else {
+            binding.resolved.as_mut().unwrap().selection.entrypoint = "different".into();
+        }
+        let mock = Arc::new(Mock::default());
+        let (hold, _) = Hold::press(&AudioAdmission::default()).unwrap();
+        assert_eq!(
+            hold.run(
+                &binding,
+                &transport,
+                Arc::new(MockFactory(mock.clone())),
+                &CancellationToken::new()
+            )
+            .await,
+            Err(Error::Unsupported)
+        );
+        assert!(!mock.started.load(Ordering::SeqCst));
+        assert_eq!(fake.admissions.load(Ordering::SeqCst), 0);
+    }
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn shared_pipeline_waits_for_acceptance_then_closes_and_finishes_in_order() {
     let (transport, fake, stop, server) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("once");
     let binding = binding(&path, "acceptance-gate");
     let mock = Arc::new(Mock::default());
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let seen = diagnostics.clone();
     let (hold, control) = Hold::press(&AudioAdmission::default()).unwrap();
     control.release();
     assert_eq!(
-        hold.run(
-            &binding,
-            &transport,
-            Arc::new(MockFactory(mock.clone())),
-            &CancellationToken::new()
-        )
-        .await,
+        hold.observed(waltr_desktop::host::Observer::new(move |event| seen
+            .lock()
+            .unwrap()
+            .push(event)))
+            .run(
+                &binding,
+                &transport,
+                Arc::new(MockFactory(mock.clone())),
+                &CancellationToken::new()
+            )
+            .await,
         Ok(())
     );
     assert_eq!(fake.uploads.load(Ordering::SeqCst), 100);
     assert!(fake.completed.load(Ordering::SeqCst));
     assert!(mock.joined.load(Ordering::SeqCst));
+    let events = diagnostics.lock().unwrap();
+    assert!(events.contains(&waltr_desktop::host::Diagnostic::CaptureCleanup(Ok(()))));
+    assert!(events.contains(&waltr_desktop::host::Diagnostic::RemoteCleanup(true)));
+    drop(events);
     assert!(path.exists());
     stop.cancel();
     server.await.unwrap();
@@ -1131,6 +1181,179 @@ async fn small_frames_survive_delayed_open_and_accepted_with_exact_pcm_after_rel
 }
 
 struct ChatConsumer(AtomicUsize);
+#[tokio::test]
+async fn production_capture_formats_reach_capture_and_transport() {
+    use waltr_desktop::{interaction, typing::Guard};
+    let (transport, fake, stop, server) = fixture().await;
+    let mut invocation = support::invocation("test");
+    invocation.limits.definition.ports[0].formats = vec!["pcm16le-24000-mono".into()];
+    invocation.limits.definition.ports[1].formats = vec!["utf8".into()];
+    let mock = Arc::new(Mock::default());
+    let release = CancellationToken::new();
+    release.cancel();
+    let cancel = CancellationToken::new();
+    let generation = CancellationToken::new();
+    let guard = Guard {
+        cancel: &cancel,
+        generation: &generation,
+        valid: &|| true,
+    };
+    let consumer = ChatConsumer(AtomicUsize::new(0));
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        interaction::run(
+            &transport,
+            Arc::new(MockFactory(mock.clone())),
+            &config::Audio {
+                device: config::DeviceSelector::Default,
+                sample_rate_hz: 24000,
+                channels: 1,
+            },
+            interaction::Selection {
+                invocation: &invocation,
+                input: "audio",
+                output: "clean-text",
+                max_capture_seconds: None,
+            },
+            &release,
+            &guard,
+            &Default::default(),
+            &consumer,
+        ),
+    )
+    .await
+    .unwrap();
+    stop.cancel();
+    server.await.unwrap();
+    assert!(matches!(result, Ok(Some(_))), "{result:?}");
+    assert!(mock.started.load(Ordering::SeqCst));
+    assert!(mock.joined.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.uploads.load(Ordering::SeqCst), 100);
+    assert_eq!(consumer.0.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Default)]
+struct NativeConsumer {
+    bytes: std::cell::Cell<usize>,
+    closes: std::cell::Cell<usize>,
+    finished: std::cell::Cell<Option<bool>>,
+}
+impl waltr_desktop::media::OutputSink for NativeConsumer {
+    fn supports(&self, port: &waltr_client::RoutinePort) -> bool {
+        port.media == waltr_client::RoutineMedia::Audio && port.formats == ["pcm16le-24000-mono"]
+    }
+    fn write<'a>(
+        &'a self,
+        frame: waltr_desktop::media::Frame<'a>,
+        guard: &'a waltr_desktop::typing::Guard<'_>,
+    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            guard.check().map_err(|_| Error::Cancelled)?;
+            if let waltr_desktop::media::Frame::Stream(event) = frame {
+                match event {
+                    waltr_client::interaction::InteractionEvent::Chunk(chunk) => {
+                        if let Some(wire::stream_chunk::Payload::Audio(bytes)) = &chunk.payload {
+                            assert!(bytes.len() <= 65536);
+                            self.bytes.set(self.bytes.get() + bytes.len());
+                        }
+                    }
+                    waltr_client::interaction::InteractionEvent::Close(close)
+                        if close.stream_id == "speaker" =>
+                    {
+                        self.closes.set(self.closes.get() + 1)
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
+    }
+    fn finish<'a>(
+        &'a self,
+        success: bool,
+        _guard: &'a waltr_desktop::typing::Guard<'_>,
+    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            assert!(self.finished.replace(Some(success)).is_none());
+            Ok(())
+        })
+    }
+}
+impl waltr_desktop::interaction::Consumer for NativeConsumer {
+    fn sink(&self) -> Option<&dyn waltr_desktop::media::OutputSink> {
+        Some(self)
+    }
+    fn progress(&self, _: waltr_desktop::interaction::Progress) {}
+    fn output<'a>(
+        &'a self,
+        _: &'a waltr_client::interaction::InteractionOutput,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: &'a waltr_desktop::typing::Guard<'_>,
+    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn typed_pcm_sink_is_explicit_and_finishes_after_validated_streams() {
+    use waltr_desktop::{interaction, typing::Guard};
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let binding = binding(&dir.path().join("never"), "pcm");
+    let mock = Arc::new(Mock::default());
+    let release = CancellationToken::new();
+    release.cancel();
+    let cancel = CancellationToken::new();
+    let generation = CancellationToken::new();
+    let guard = Guard {
+        cancel: &cancel,
+        generation: &generation,
+        valid: &|| true,
+    };
+    let selection = || interaction::Selection {
+        invocation: binding.resolved.as_ref().unwrap(),
+        input: "audio",
+        output: "clean-text",
+        max_capture_seconds: None,
+    };
+    assert!(matches!(
+        interaction::run(
+            &transport,
+            Arc::new(MockFactory(mock.clone())),
+            &binding.audio,
+            selection(),
+            &release,
+            &guard,
+            &Default::default(),
+            &ChatConsumer(AtomicUsize::new(0))
+        )
+        .await,
+        Err(Error::Unsupported)
+    ));
+    assert!(!mock.started.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 0);
+    let consumer = NativeConsumer::default();
+    let result = interaction::run(
+        &transport,
+        Arc::new(MockFactory(mock.clone())),
+        &binding.audio,
+        selection(),
+        &release,
+        &guard,
+        &Default::default(),
+        &consumer,
+    )
+    .await;
+    assert!(matches!(result, Ok(Some(_))));
+    assert_eq!(consumer.bytes.get(), 4);
+    assert_eq!(consumer.closes.get(), 1);
+    assert_eq!(consumer.finished.get(), Some(true));
+    assert!(mock.joined.load(Ordering::SeqCst));
+    stop.cancel();
+    server.await.unwrap();
+}
 impl waltr_desktop::interaction::Consumer for ChatConsumer {
     fn progress(&self, _: waltr_desktop::interaction::Progress) {}
     fn output<'a>(
@@ -1190,8 +1413,7 @@ async fn shared_chat_consumer_releases_or_cancels_with_small_frames_before_admis
                     Arc::new(MockFactory(mock.clone())),
                     &binding.audio,
                     interaction::Selection {
-                        routine: "delay-accepted-250",
-                        trigger: "dictate",
+                        invocation: binding.resolved.as_ref().unwrap(),
                         input: "audio",
                         output: "clean-text",
                         max_capture_seconds: None,
@@ -1362,58 +1584,75 @@ async fn actor_requires_explicit_typing_capability_and_delivers_with_current_fen
 
 fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
     if name == "hour-notes" {
-        let mut events = vec![text_event("one", &"x".repeat(512 * 1024 - 64), true)];
+        let text = "x".repeat(512 * 1024 - 64);
+        let mut events: Vec<_> = text
+            .as_bytes()
+            .chunks(60000)
+            .enumerate()
+            .map(|(i, bytes)| {
+                event(Event::Chunk(wire::StreamChunk {
+                    stream_id: "out".into(),
+                    sequence: i as u64,
+                    payload: Some(wire::stream_chunk::Payload::Text(wire::TextRevision {
+                        segment_id: "one".into(),
+                        text: String::from_utf8(bytes.to_vec()).unwrap(),
+                        mutation: 1,
+                        committed: (i + 1) * 60000 >= text.len(),
+                    })),
+                }))
+            })
+            .collect();
+        let count = events.len() as u64;
         events.extend([
-            event(Event::OutputClosed(wire::InteractionOutputClosed {
+            event(Event::Close(wire::StreamClose {
                 stream_id: "out".into(),
-                status: 1,
-                failure: None,
+                next_sequence: count,
             })),
-            event(Event::Completed(wire::InteractionCompleted {
-                status: wire::RoutineInvocationStatus::Succeeded as i32,
-                failure: None,
+            event(Event::Terminal(wire::InteractionTerminal {
+                status: wire::InvocationStatus::Succeeded as i32,
+                cleanup_complete: true,
+                ..Default::default()
             })),
         ]);
         return events;
     }
     if name.starts_with("typing") {
         return vec![
-            text_event("two", "\nsecond\t界", true),
-            event(Event::OutputClosed(wire::InteractionOutputClosed {
+            text_event(3, "two", "\nsecond\t界", true),
+            event(Event::Close(wire::StreamClose {
                 stream_id: "out".into(),
-                status: 1,
-                failure: None,
+                next_sequence: 4,
             })),
-            event(Event::Completed(wire::InteractionCompleted {
-                status: wire::RoutineInvocationStatus::Succeeded as i32,
-                failure: None,
+            event(Event::Terminal(wire::InteractionTerminal {
+                status: wire::InvocationStatus::Succeeded as i32,
+                cleanup_complete: true,
+                ..Default::default()
             })),
         ];
     }
     let mut events = vec![
-        event(Event::OutputChunk(wire::InteractionOutputChunk {
+        event(Event::Chunk(wire::StreamChunk {
             stream_id: "out".into(),
-            content: Some(wire::interaction_output_chunk::Content::Text(
-                wire::TextUpdate {
-                    segment_id: "one".into(),
-                    text: if name == "large" {
-                        "x".repeat(256 * 1024 + 1)
-                    } else {
-                        "literal $(touch nope); '{{ invocationId }}'".into()
-                    },
-                    operation: 2,
-                    committed: name != "uncommitted",
+            sequence: 0,
+            payload: Some(wire::stream_chunk::Payload::Text(wire::TextRevision {
+                segment_id: "one".into(),
+                text: if name == "large" {
+                    "x".repeat(256 * 1024 + 1)
+                } else {
+                    "literal $(touch nope); '{{ invocationId }}'".into()
                 },
-            )),
+                mutation: 2,
+                committed: name != "uncommitted",
+            })),
         })),
-        event(Event::OutputClosed(wire::InteractionOutputClosed {
+        event(Event::Close(wire::StreamClose {
             stream_id: "out".into(),
-            status: 1,
-            failure: None,
+            next_sequence: 1,
         })),
-        event(Event::Completed(wire::InteractionCompleted {
-            status: wire::RoutineInvocationStatus::Succeeded as i32,
-            failure: None,
+        event(Event::Terminal(wire::InteractionTerminal {
+            status: wire::InvocationStatus::Succeeded as i32,
+            cleanup_complete: true,
+            ..Default::default()
         })),
     ];
     if name == "incomplete" {
@@ -1422,17 +1661,21 @@ fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
     events
 }
 
-fn text_event(id: &str, text: &str, committed: bool) -> Result<wire::InteractResponse, RpcStatus> {
-    event(Event::OutputChunk(wire::InteractionOutputChunk {
+fn text_event(
+    sequence: u64,
+    id: &str,
+    text: &str,
+    committed: bool,
+) -> Result<wire::InteractResponse, RpcStatus> {
+    event(Event::Chunk(wire::StreamChunk {
         stream_id: "out".into(),
-        content: Some(wire::interaction_output_chunk::Content::Text(
-            wire::TextUpdate {
-                segment_id: id.into(),
-                text: text.into(),
-                operation: 2,
-                committed,
-            },
-        )),
+        sequence,
+        payload: Some(wire::stream_chunk::Payload::Text(wire::TextRevision {
+            segment_id: id.into(),
+            text: text.into(),
+            mutation: 2,
+            committed,
+        })),
     }))
 }
 

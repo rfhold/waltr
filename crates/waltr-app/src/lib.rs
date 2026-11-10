@@ -9,7 +9,11 @@ mod app_container;
 pub mod audio_permissions;
 mod dictation;
 mod native_audio;
+mod native_media;
+use native_media::{routine_media, routine_media_append, routine_media_bytes};
 mod native_audio_telemetry;
+#[cfg(test)]
+mod native_media_test_support;
 #[cfg(test)]
 use native_audio_telemetry as dictation_telemetry;
 mod shortcuts;
@@ -154,6 +158,7 @@ async fn logout_access(
 #[serde(rename_all = "camelCase")]
 struct RuntimeStarted {
     dictation: bool,
+    routine_media: bool,
     generation: u64,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     native_apps: native_apps::Bootstrap,
@@ -507,6 +512,11 @@ async fn start_runtime(
         ))]
         eprintln!("WALTR_NATIVE_PROBE positive-control");
         Ok(RuntimeStarted {
+            routine_media: cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            )),
             dictation: cfg!(any(
                 all(target_os = "macos", target_arch = "aarch64"),
                 target_os = "linux",
@@ -1046,6 +1056,8 @@ pub fn run() {
     app_container::configure_apps_csp(context.config_mut());
     let builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    let builder = builder.plugin(tauri_plugin_dialog::init());
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     let builder = builder.invoke_system(app_container::confined_invoke_script());
     let app = builder
         .plugin(tauri_plugin_opener::init())
@@ -1137,6 +1149,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            routine_media,
+            routine_media_append,
+            routine_media_bytes,
             start_runtime,
             dictation_start,
             dictation_finish,

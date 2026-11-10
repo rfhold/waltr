@@ -2,10 +2,14 @@
 
 | Path | Info |
 | --- | --- |
+| [README.md](README.md) | Native Routine consumers, opaque file IPC, playback ownership, and platform limits. |
 | [src/server_controller.rs](src/server_controller.rs) | Process-owned embedded server, app-private paths, ephemeral loopback endpoint, and generation bearer. |
 | [src/bridge.rs](src/bridge.rs) | Selected Local/remote client runtime, access coordinator, generation lifecycle, and bounded publication. |
 | [src/native_audio/](src/native_audio/) | Shared microphone admission, audio runtime fences, and desktop audio hold adapter. |
 | [src/dictation.rs](src/dictation.rs) | Chat dictation identities, status, preview, IPC, and shared native interaction consumer. |
+| [src/native_media.rs](src/native_media.rs) | Shared-client media operations, Rust-owned file selection, bounded raw file IPC, and joined cleanup. |
+| [src/native_media/playback.rs](src/native_media/playback.rs) | Bounded CPAL playback and dedicated stream-owner thread. |
+| [src/native_media/download.rs](src/native_media/download.rs) | Retained raw checkout/read/close task and fixed-deadline cleanup receipts. |
 | [src/native_audio_telemetry.rs](src/native_audio_telemetry.rs) | Shared audio diagnostics; preserves the literal historical telemetry target. |
 | [src/shortcuts.rs](src/shortcuts.rs) | Process-owned desktop registration and ingress-epoch runtime routing. |
 | [src/activity.rs](src/activity.rs) | Text-free client-operation leases through permission, effects, and cleanup. |
@@ -68,6 +72,11 @@ Preserve exactly one command or `typing` action; never add a fallback, retry, re
 Cancel audio before teardown or Android remote-pause preservation. Drain audio tasks before logout credential deletion and disposal completion.
 Keep UI lifecycle retirement nonblocking. Publish bounded selected-port preview only through current identity, access, cancellation, and credential guards.
 Clear preview on cancellation or terminal completion. Publish final text only after successful clean completion.
+
+Keep the background definition watch registered independently of visible UI routes. Pin exact definitions and source eligibility before audio or media admission; cancel and join on relevant changes, not every snapshot.
+Keep native file paths, reader grants, and playback PCM in Rust. Expose only generation-bound opaque handles and bounded raw file chunks through the custom media commands, never frontend filesystem or dialog grants.
+Stage explicitly selected saves with create_new in an exclusive private namespace, publish without overwrite, and never unlink the selected path during cleanup. Revoke all affected effects before any cleanup wait; join sources, readers, playback, and media operations before credential deletion or replacement. Keep nonqueued media credits and pending dialog permits with their actual owners through cleanup. See [native media ownership](README.md#native-ownership-and-cleanup).
+On unverified logout cleanup, preserve access and credentials for retained owners and return failure. Only an explicit retry after verified cleanup and actual download-task joins may complete logout; never forget pending cleanup when clearing active-operation state.
 
 Keep generic client-hook activity in the bridge, independent of the audio host.
 Keep microphone admission audio-only; do not gate unrelated hooks behind it.

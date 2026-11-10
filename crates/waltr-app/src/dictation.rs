@@ -1,12 +1,12 @@
 //! Chat dictation identity, status publication, IPC, and capture/RPC consumer.
 use crate::audio_permissions::{AudioPermissions, PermissionResult};
 use crate::native_audio_telemetry::{self as telemetry, Operation};
-use waltr_client::RoutineInteractionTransport;
-use waltr_desktop::capture;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+use waltr_client::RoutineInteractionTransport;
+use waltr_desktop::capture;
 
 const MAX_ID: u64 = 9_007_199_254_740_991;
 
@@ -72,7 +72,14 @@ impl Host {
         self.audio.lock().credentials = Some(credentials);
     }
     pub fn access(&self, allowed: bool) {
+        let generation = self.audio.lock().generation;
+        self.access_for(generation, allowed);
+    }
+    pub(crate) fn access_for(&self, generation: u64, allowed: bool) -> bool {
         let mut audio = self.audio.lock();
+        if audio.generation != generation {
+            return false;
+        }
         let mut state = self.lock();
         audio.access(allowed);
         if !allowed && let Some(record) = &mut state.latest {
@@ -81,6 +88,7 @@ impl Host {
             record.status.preview.clear();
             record.status.final_text = None;
         }
+        true
     }
     pub fn check_credentials(&self) {
         let audio = self.audio.lock();
@@ -95,6 +103,7 @@ impl Host {
             }
         }
     }
+    #[cfg(test)]
     pub fn cancel_all(&self) {
         let audio = self.audio.lock();
         let mut state = self.lock();
@@ -155,6 +164,25 @@ impl Host {
             telemetry::admission("chat", "unavailable");
             return Err("Native dictation is unavailable".into());
         }
+        let catalog = audio
+            .catalog
+            .as_ref()
+            .ok_or("Routine discovery is not available")?;
+        if !catalog.matches_chat(
+            &selection.routine,
+            &selection.trigger,
+            &selection.input,
+            &selection.output,
+        ) {
+            return Err("Dictation selection changed".into());
+        }
+        let invocation = catalog.resolve(
+            &selection.routine,
+            &selection.trigger,
+            Some(session.into()),
+            format!("native-chat-{generation}-{operation}"),
+        )?;
+        let pinned = catalog.pin(invocation.clone(), true);
         let permit = self.audio.gate.reserve().map_err(|_| {
             telemetry::admission("chat", "busy");
             "Native audio is busy"
@@ -170,6 +198,7 @@ impl Host {
             final_text: None,
         };
         audio.active = Some(cancel.clone());
+        audio.pinned = Some(pinned);
         audio.active_revision = audio
             .credentials
             .as_ref()
@@ -187,6 +216,7 @@ impl Host {
                 generation,
                 operation,
                 selection,
+                invocation,
                 cancel,
                 finish,
                 credential: audio
@@ -270,6 +300,7 @@ pub struct Job {
     generation: u64,
     operation: u64,
     selection: Selection,
+    invocation: waltr_desktop::interaction::Invocation,
     cancel: CancellationToken,
     finish: CancellationToken,
     credential: Option<(waltr_client::NativeCredentialProvider, u64)>,
@@ -411,8 +442,7 @@ impl Job {
             factory,
             &audio,
             waltr_desktop::interaction::Selection {
-                routine: &self.selection.routine,
-                trigger: &self.selection.trigger,
+                invocation: &self.invocation,
                 input: &self.selection.input,
                 output: &self.selection.output,
                 max_capture_seconds: None,
@@ -429,7 +459,9 @@ impl Job {
             self.activity.fail();
         }
         match result {
-            Ok(output) if self.valid() => {
+            Ok(output)
+                if self.valid() && !cleanup_failed.load(std::sync::atomic::Ordering::Acquire) =>
+            {
                 self.publish_current("succeeded", output.map(|output| output.text));
             }
             _ => {

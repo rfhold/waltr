@@ -54,9 +54,11 @@ fn host() -> Arc<Host> {
     let host = Arc::new(Host::default());
     host.bind(1);
     host.access(true);
+    host.audio.observe(&support::snapshot("test"));
     host
 }
 fn job(host: &Arc<Host>, operation: u64, name: &str) -> Job {
+    host.audio.observe(&support::snapshot(name));
     host.start(1, operation, selection(name), "local-draft")
         .unwrap()
         .1
@@ -394,6 +396,7 @@ fn cancel_before_start_is_bounded_monotonic_tombstone() {
     assert!(host.control(1, 0, "status").is_err());
     host.bind(2);
     host.access(true);
+    host.audio.observe(&support::snapshot("test"));
     assert!(host.control(1, 42, "status").is_err());
     assert!(
         host.start(2, 1, selection("test"), "draft")
@@ -979,6 +982,7 @@ async fn foreground_pause_cancels_audio_without_retiring_authenticated_generatio
     assert_eq!(host.audio.lock().generation, 1);
     assert!(host.audio.lock().allowed);
     assert!(host.audio.gate.reserve().is_ok());
+    host.audio.observe(&support::snapshot("test"));
     assert!(
         host.start(1, 1, selection("test"), "draft")
             .unwrap()
@@ -1236,14 +1240,35 @@ async fn logout_drain_precedes_credential_teardown_and_reply() {
                 .next()
                 .unwrap();
             assert!(
-                logout.find("drain_audio").unwrap() < logout.find("coordinator.stop()").unwrap()
+                logout.find("complete_logout(").unwrap()
+                    < logout.find("coordinator.stop()").unwrap()
             );
             assert!(
-                logout.find("drain_audio").unwrap()
+                logout.find("complete_logout(").unwrap()
                     < logout.find("CredentialStore::delete_server").unwrap()
             );
             assert!(
-                logout.find("drain_audio").unwrap() < logout.find("reply.send(deleted)").unwrap()
+                logout.find("complete_logout(").unwrap()
+                    < logout.find("reply.send(result)").unwrap()
+            );
+            let barrier = source
+                .split("async fn complete_logout")
+                .nth(1)
+                .unwrap()
+                .split("async fn reconcile_consumers")
+                .next()
+                .unwrap();
+            assert!(
+                barrier.find("drain_generation_audio").unwrap()
+                    < barrier.find("complete().await").unwrap()
+            );
+            assert!(
+                barrier.find("if !clean").unwrap()
+                    < barrier.find("join_downloads().await").unwrap()
+            );
+            assert!(
+                barrier.find("join_downloads().await").unwrap()
+                    < barrier.find("complete().await").unwrap()
             );
             stop.cancel();
             server.await.unwrap();
@@ -1457,7 +1482,7 @@ fn native_ipc_and_lifecycle_source_contracts() {
         assert!(!consumer.contains("async fn duplex"));
     }
     assert!(driver.contains("tokio::try_join!(receive, send)"));
-    assert!(driver.contains("ready.await"));
+    assert!(driver.contains("Accepted"));
     let lib = include_str!("lib.rs");
     let lifecycle = lib
         .split("fn stop_client_bridge(")
@@ -1494,6 +1519,10 @@ fn native_ipc_and_lifecycle_source_contracts() {
     );
     let bridge = include_str!("bridge.rs");
     assert!(bridge.contains("let audio_transport = transport.clone()"));
-    assert!(bridge.contains("drain_audio(&audio, &mut audio_tasks).await"));
+    assert!(
+        bridge.contains(
+            "drain_generation_audio(&audio, &mut audio_tasks, publisher.generation).await"
+        )
+    );
     assert!(bridge.contains("while tasks.join_next().await.is_some()"));
 }

@@ -8,11 +8,16 @@
 //! use waltr_desktop::{actor::Actor, capture::Native, config, host::AudioAdmission, shortcut::Router, typing::NativeFactory};
 //! use tokio_util::sync::CancellationToken;
 //!
-//! # async fn example<T: RoutineInteractionTransport>(transport: T, valid: Rc<dyn Fn() -> bool>) {
-//! let config = config::load_ambient().expect("valid startup config");
+//! # async fn example<T: RoutineInteractionTransport>(transport: T, valid: Rc<dyn Fn() -> bool>, definitions: &[waltr_client::ClientManualRoutineDefinition], limits: waltr_client::interaction::wire::ServerLimits, source_session: Option<String>) {
+//! let mut config = config::load_ambient().expect("valid startup config");
+//! for binding in &mut config.keybinds {
+//!     let definition = definitions.iter().find(|d| d.routine_name == binding.routine.name).expect("current definition").clone();
+//!     let parameters = waltr_desktop::interaction::default_parameters(&definition.parameters).expect("valid defaults");
+//!     binding.resolved = Some(waltr_desktop::interaction::Invocation::new(definition, limits.clone(), binding.routine.trigger.clone(), parameters, binding.id.clone(), source_session.clone()).expect("eligible current invocation"));
+//! }
 //! let bindings: Vec<_> = config.keybinds.iter().map(|b| (b.id.clone(), b.key.clone())).collect();
 //! let (router, mut events) = Router::channel();
-//! // valid synchronously checks the pinned profile, access, and credential revision.
+//! // valid synchronously checks the pinned catalog, profile, access, and credential revision.
 //! let (actor, status) = Actor::with_effects(config, transport, Arc::new(Native),
 //!     AudioAdmission::default(), Rc::new(NativeFactory), valid).unwrap();
 //! let generation = CancellationToken::new();
@@ -40,5 +45,6 @@ pub mod command;
 pub mod config;
 pub mod host;
 pub mod interaction;
+pub mod media;
 pub mod shortcut;
 pub mod typing;

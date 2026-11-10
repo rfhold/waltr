@@ -536,6 +536,11 @@ mod tests {
 
     #[test]
     fn disabled_initialization_is_fail_open_and_global_free() {
+        if !crate::native_audio_telemetry::isolated_exporter_test(
+            "observability::tests::disabled_initialization_is_fail_open_and_global_free",
+        ) {
+            return;
+        }
         let guard = init_for_mode(ExportMode::Disabled);
         assert!(guard.tracer.is_none());
         assert!(guard.logger.is_none());
@@ -993,9 +998,9 @@ mod tests {
         }
         use crate::audio_permissions::PermissionResult;
         use crate::dictation_telemetry::Operation;
-        use waltr_desktop::host::{Diagnostic, Error, RpcFailure, Stage};
         use opentelemetry::trace::TracerProvider as _;
         use tracing::Instrument as _;
+        use waltr_desktop::host::{Diagnostic, Error, RpcFailure, Stage};
         let collapsed = waltr_client::ClientError::new("SECRET_ERROR_SENTINEL");
         assert_eq!(
             RpcFailure::from_client(&collapsed, RpcFailure::Output),

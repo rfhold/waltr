@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-routine-media-bytes"
+description = "Enables the routine_media_bytes command without any pre-configured scope."
+commands.allow = ["routine_media_bytes"]
+
+[[permission]]
+identifier = "deny-routine-media-bytes"
+description = "Denies the routine_media_bytes command without any pre-configured scope."
+commands.deny = ["routine_media_bytes"]

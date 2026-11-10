@@ -263,6 +263,9 @@ pub fn validate_chord(key: &str) -> Result<(), ConfigError> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Keybind {
+    /// Current catalog selection installed by the host, never loaded from local YAML.
+    #[serde(skip)]
+    pub resolved: Option<crate::interaction::Invocation>,
     /// Unique local binding identifier.
     #[serde(deserialize_with = "crate::bounded::string::<_, MAX_FIELD_BYTES>")]
     pub id: String,

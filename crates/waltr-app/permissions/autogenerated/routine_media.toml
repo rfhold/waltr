@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-routine-media"
+description = "Enables the routine_media command without any pre-configured scope."
+commands.allow = ["routine_media"]
+
+[[permission]]
+identifier = "deny-routine-media"
+description = "Denies the routine_media command without any pre-configured scope."
+commands.deny = ["routine_media"]

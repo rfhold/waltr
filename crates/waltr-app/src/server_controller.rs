@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+use rand::TryRngCore as _;
+use tokio::sync::oneshot;
 use waltr_server::{
     LocalBearer,
     embedded::{
@@ -19,8 +21,6 @@ use waltr_server::{
         EmbeddedServerConfig, build_embedded_server,
     },
 };
-use rand::TryRngCore as _;
-use tokio::sync::oneshot;
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -142,6 +142,7 @@ impl AppPrivateRoots {
     fn server_config(&self, bearer: LocalBearer) -> EmbeddedServerConfig {
         let server_data = self.data.join("server");
         EmbeddedServerConfig {
+            routine_authority: Default::default(),
             resources_root: self.config.join("server"),
             waltr_database_path: server_data.join("waltr.sqlite3"),
             mcp_database_path: server_data.join("mcp.sqlite3"),
@@ -153,7 +154,6 @@ impl AppPrivateRoots {
             default_agent: "coding".to_owned(),
             local_bearer: bearer,
             outbound_policy: EmbeddedOutboundPolicy::default(),
-            interaction_limits: Default::default(),
         }
     }
 
@@ -819,7 +819,10 @@ mod tests {
             paths[0].join(".waltr/resources"),
             PathBuf::from("/private/config/server/.waltr/resources")
         );
-        assert_eq!(paths[1], PathBuf::from("/private/data/server/waltr.sqlite3"));
+        assert_eq!(
+            paths[1],
+            PathBuf::from("/private/data/server/waltr.sqlite3")
+        );
         assert_eq!(paths[2], PathBuf::from("/private/data/server/mcp.sqlite3"));
         assert_eq!(paths[3], PathBuf::from("/private/data/server/sessions"));
         assert_eq!(paths[4], PathBuf::from("/private/data/workspace"));

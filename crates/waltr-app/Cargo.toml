@@ -55,6 +55,7 @@ url.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
+waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false, features = ["test"] }
 waltr-audio-io.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
@@ -69,7 +70,11 @@ rustls-platform-verifier = "0.7.0"
 tauri = { version = "=2.10.1", features = ["tray-icon"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cpal = "=0.16.0"
 security-framework = "3.7.0"
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+cpal = "=0.15.3"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = { version = "=0.6.4" }
@@ -80,6 +85,7 @@ block2 = { version = "=0.6.2" }
 waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false, features = ["apps-host-assets", "apps-served-assets"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+tauri-plugin-dialog = { version = "=2.7.3", default-features = false, features = ["gtk3"] }
 waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false, features = ["shell"] }
 
 [lints.rust]

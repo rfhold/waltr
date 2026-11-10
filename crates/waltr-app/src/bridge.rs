@@ -281,7 +281,9 @@ impl<T: Clone + Send + Sync> Publisher<T> {
 }
 
 enum HostRequest {
-    Dictation(crate::dictation::Job),
+    Media(crate::native_media::Request),
+    MediaRaw(crate::native_media::RawRequest),
+    Dictation(Box<crate::dictation::Job>),
     Hold(crate::native_audio::Held),
     Access(waltr_client::NativeAccessAction),
     LogoutAccess {
@@ -883,6 +885,8 @@ impl RuntimeBridge {
     ) -> impl FnMut() -> Option<crate::native_audio::Held> {
         self.stop();
         self.bind_native_generation(generation);
+        self.audio
+            .observe(&crate::native_media_test_support::snapshot("test"));
         audio_access(&self.dictation, &self.shortcut_epoch, generation, true);
         let (requests, mut receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let (stop, _) = watch::channel(false);
@@ -963,7 +967,9 @@ impl RuntimeBridge {
                 Ok((status, job, requests))
             })?;
         if let Some(job) = job
-            && requests.try_send(HostRequest::Dictation(job)).is_err()
+            && requests
+                .try_send(HostRequest::Dictation(Box::new(job)))
+                .is_err()
         {
             let _cancelled = self.dictation.control(generation, operation, "cancel");
             return Err("Native client is busy".into());
@@ -980,9 +986,93 @@ impl RuntimeBridge {
             self.dictation.control(generation, operation, action)
         })
     }
+    pub(crate) async fn media(
+        &self,
+        args: crate::native_media::Args,
+        selected: Option<crate::native_media::Selected>,
+        ticket: (Option<u64>, u64),
+    ) -> Result<serde_json::Value, String> {
+        if self.media_ticket(args.generation)? != ticket {
+            return Err("Native media is unavailable".into());
+        }
+        let permit = crate::native_media::credit(
+            false,
+            matches!(args.operation.as_str(), "cancel" | "dropPlayback"),
+        )?;
+        let (reply, result) = oneshot::channel();
+        {
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = running.as_ref().ok_or("Native client is not running")?;
+            running
+                .requests
+                .try_send(HostRequest::Media(crate::native_media::Request {
+                    args,
+                    selected,
+                    reply,
+                    ticket,
+                    _permit: permit,
+                }))
+                .map_err(|_| "Native client is busy")?;
+        }
+        result
+            .await
+            .map_err(|_| "Native client generation was replaced".to_owned())?
+    }
+    pub(crate) fn media_ticket(&self, generation: u64) -> Result<(Option<u64>, u64), String> {
+        self.with_current(generation, || {
+            let audio = self.audio.lock();
+            if !audio.allowed {
+                return Err("Native media is unavailable".into());
+            }
+            Ok((
+                audio
+                    .credentials
+                    .as_ref()
+                    .map(waltr_client::NativeCredentialProvider::credential_revision),
+                audio.picker_epoch,
+            ))
+        })
+    }
+    pub(crate) async fn media_raw(
+        &self,
+        args: crate::native_media::Args,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let permit = crate::native_media::credit(true, false)?;
+        if bytes.len() > 65536 {
+            return Err("Native client is busy".into());
+        }
+        let (reply, result) = oneshot::channel();
+        {
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = running.as_ref().ok_or("Native client is not running")?;
+            running
+                .requests
+                .try_send(HostRequest::MediaRaw(crate::native_media::RawRequest {
+                    args,
+                    bytes,
+                    reply,
+                    _permit: permit,
+                }))
+                .map_err(|_| "Native client is busy")?;
+        }
+        result
+            .await
+            .map_err(|_| "Native client generation was replaced".to_owned())?
+    }
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn cancel_audio(&self) {
-        self.shortcut_epoch.bind(0);
-        self.dictation.cancel_all();
+        self.cancel_generation_audio(self.active_generation.load(Ordering::Acquire));
+    }
+    fn cancel_generation_audio(&self, generation: u64) {
+        self.shortcut_epoch.set_enabled(generation, false);
+        self.dictation.access_for(generation, false);
     }
 
     /// Dispatch one frontend command through the generation's serialized queue.
@@ -1120,7 +1210,7 @@ impl RuntimeBridge {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        self.cancel_audio();
+        self.cancel_generation_audio(generation);
         running.stop.send_replace(true);
         if preserve_auth {
             #[cfg(any(target_os = "android", test))]
@@ -1224,7 +1314,7 @@ impl RuntimeBridge {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
-            self.cancel_audio();
+            self.cancel_generation_audio(running.generation);
             running.stop.send_replace(true);
             self.clear_authorization_generation(running.generation);
         }
@@ -1477,6 +1567,8 @@ async fn run_generation(
                 permission_required = startup == PlatformStartup::NotificationPermissionRequired;
             }
             request = requests.recv() => match request {
+                Some(HostRequest::Media(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
+                Some(HostRequest::MediaRaw(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::Access(_) | HostRequest::Dictation(_) | HostRequest::Hold(_)) => {},
                 Some(HostRequest::LogoutAccess { reply }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
@@ -1555,6 +1647,12 @@ async fn run_connected_generation(
     } else {
         publisher.publish_state(initial_payload);
     }
+    // Background native holds and chat need discovery even when the Routines view is hidden.
+    let _catalog_interest = dispatch_command(
+        &mut stream,
+        ClientCommand::RegisterRoutineDefinitionWatchInterest,
+    )
+    .await;
 
     let mut access = target
         .access
@@ -1579,6 +1677,7 @@ async fn run_connected_generation(
         })
         .unwrap_or_default();
     audio.credentials(credentials.clone());
+    audio.audio.observe(&stream.snapshot());
     audio_access(
         &audio,
         &shortcut_epoch,
@@ -1597,6 +1696,15 @@ async fn run_connected_generation(
         }
     });
     let mut audio_tasks = tokio::task::JoinSet::new();
+    let media = crate::native_media::Host::new(
+        stream.snapshot(),
+        audio_transport.clone(),
+        credentials.clone(),
+        audio.audio.clone(),
+        publisher.generation,
+    );
+    let media = media.with_current_generation(publisher.active_generation.clone());
+    let mut media_tasks = tokio::task::JoinSet::new();
     let mut connected_recorded = false;
     let exit = loop {
         if !publisher.is_current() {
@@ -1613,6 +1721,7 @@ async fn run_connected_generation(
         tokio::select! {
             _ = stop.changed() => break ConnectedExit::Stopped,
             _ = audio_tasks.join_next(), if !audio_tasks.is_empty() => {},
+            _ = media_tasks.join_next(), if !media_tasks.is_empty() => {},
             changed = platform.changed() => {
                 if changed.is_err() {
                     break ConnectedExit::Stopped;
@@ -1629,9 +1738,13 @@ async fn run_connected_generation(
                 match output {
                     waltr_client::NativeAccessOutput::ClientCommand { command, logout_barrier: _ } => {
                         audio_access(&audio, &shortcut_epoch, publisher.generation, false);
+                        if complete_logout(&media, (&audio, &mut audio_tasks, publisher.generation), || publisher.is_current(), async || Ok(())).await.is_err() {
+                            continue;
+                        }
                         let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
                         let result = tokio::select! { biased; _ = stop.changed() => break ConnectedExit::Stopped, result = dispatch_command(&mut stream, *command) => result };
                         if let Ok(snapshot) = result {
+                            reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
                             audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
                             access_host.observe(access.as_ref(), &credentials, &snapshot, started_probe).await;
                             publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) });
@@ -1655,6 +1768,14 @@ async fn run_connected_generation(
                 }
             }
             request = requests.recv() => match request {
+                Some(HostRequest::Media(request)) => {
+                    let media = media.clone();
+                    media_tasks.spawn_local(async move { media.dispatch(request).await; });
+                }
+                Some(HostRequest::MediaRaw(request)) => {
+                    let media = media.clone();
+                    media_tasks.spawn_local(async move { media.dispatch_raw(request).await; });
+                }
                 Some(HostRequest::Hold(held)) => {
                     if let Some(app) = target.app.clone() {
                         let transport = audio_transport.clone();
@@ -1674,15 +1795,23 @@ async fn run_connected_generation(
                     }
                 }
                 Some(HostRequest::LogoutAccess { reply }) => {
-                    shortcut_epoch.set_enabled(publisher.generation, false);
-                    drain_audio(&audio, &mut audio_tasks).await;
-                    if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
-                    if let Some(coordinator) = access.take() { coordinator.stop().await; }
-                    let _ = credentials.clear_bearer_token();
-                    let deleted = crate::credential_store::CredentialStore::delete_server(&target.id).await.map_err(|_| "Secure credentials could not be removed".to_owned());
-                    let result = dispatch_command(&mut stream, ClientCommand::LogoutWaltr).await;
-                    if let Ok(snapshot) = result { publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) }); }
-                    drop(reply.send(deleted));
+                    audio_access(&audio, &shortcut_epoch, publisher.generation, false);
+                    let current = publisher.active_generation.clone();
+                    let generation = publisher.generation;
+                    let result = complete_logout(
+                        &media, (&audio, &mut audio_tasks, generation),
+                        || current.load(Ordering::Acquire) == generation,
+                        async || {
+                            if let Some(coordinator) = access.take() { coordinator.stop().await; }
+                            if !publisher.is_current() { return Err("Native client generation was replaced".into()); }
+                            let _ = credentials.clear_bearer_token();
+                            let deleted = crate::credential_store::CredentialStore::delete_server(&target.id).await.map_err(|_| "Secure credentials could not be removed".to_owned());
+                            let result = dispatch_command(&mut stream, ClientCommand::LogoutWaltr).await;
+                            if let Ok(snapshot) = result { publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) }); }
+                            deleted
+                        },
+                    ).await;
+                    drop(reply.send(result));
                 }
                 Some(HostRequest::Access(action)) => {
                     if !publisher.is_current() { continue; }
@@ -1696,6 +1825,10 @@ async fn run_connected_generation(
                     if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
                     if matches!(*command, ClientCommand::StartWaltrLogin | ClientCommand::CompleteWaltrLogin { .. } | ClientCommand::FailWaltrLogin { .. } | ClientCommand::ReprobeWaltrAccess | ClientCommand::LogoutWaltr | ClientCommand::WaltrAccessExpired { .. }) {
                         audio_access(&audio, &shortcut_epoch, publisher.generation, false);
+                        if let Err(error) = complete_logout(&media, (&audio, &mut audio_tasks, publisher.generation), || publisher.is_current(), async || Ok(())).await {
+                            drop(reply.send(Err(error)));
+                            continue;
+                        }
                     }
                     access_host.cancel_command(access.as_ref(), &credentials, &stream.snapshot(), &command).await;
                     let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
@@ -1729,6 +1862,7 @@ async fn run_connected_generation(
                         };
                     };
                     if let Ok(snapshot) = &result {
+                        reconcile_consumers(&media, &audio, snapshot, &mut audio_tasks, publisher.generation).await;
                         audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(snapshot));
                         access_host.observe(access.as_ref(), &credentials, snapshot, started_probe).await;
                     }
@@ -1744,6 +1878,7 @@ async fn run_connected_generation(
                 None => break ConnectedExit::Stopped,
             },
             snapshot = stream.next() => {
+                reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
                 audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
                 access_host.observe(access.as_ref(), &credentials, &snapshot, false).await;
                 publisher.publish_state(BridgePayload::State {
@@ -1753,7 +1888,11 @@ async fn run_connected_generation(
         }
     };
     shortcut_epoch.set_enabled(publisher.generation, false);
-    drain_audio(&audio, &mut audio_tasks).await;
+    audio.access_for(publisher.generation, false);
+    media.drain().await;
+    while media_tasks.join_next().await.is_some() {}
+    drain_generation_audio(&audio, &mut audio_tasks, publisher.generation).await;
+    media.join_downloads().await;
     monitor_stop.cancel();
     let _joined = credential_monitor.await;
     if let Some(access) = access {
@@ -1762,6 +1901,52 @@ async fn run_connected_generation(
     let _ = credentials.clear_bearer_token();
     presentation.clear_authorization_attempt();
     exit
+}
+
+async fn complete_logout<F, Fut>(
+    media: &crate::native_media::Host,
+    audio: (&crate::dictation::Host, &mut tokio::task::JoinSet<()>, u64),
+    current: impl Fn() -> bool,
+    complete: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    audio.0.access_for(audio.2, false);
+    let clean = media.drain().await;
+    drain_generation_audio(audio.0, audio.1, audio.2).await;
+    if !current() {
+        return Err("Native client generation was replaced".into());
+    }
+    if !clean {
+        return Err("Native media cleanup could not be verified".into());
+    }
+    if !media.join_downloads().await {
+        return Err("Native media cleanup could not be verified".into());
+    }
+    if !current() {
+        return Err("Native client generation was replaced".into());
+    }
+    complete().await
+}
+
+async fn reconcile_consumers(
+    media: &crate::native_media::Host,
+    audio: &crate::dictation::Host,
+    snapshot: &waltr_client::ClientSnapshot,
+    tasks: &mut tokio::task::JoinSet<()>,
+    generation: u64,
+) {
+    let changed = audio.audio.observe_for(generation, snapshot);
+    let media_changed = media.revoke_if_changed(snapshot);
+    if changed || media_changed || !snapshot_connected(snapshot) {
+        media.revoke();
+        audio.access_for(generation, false);
+        media.drain().await;
+        while tasks.join_next().await.is_some() {}
+    }
+    media.reconcile(snapshot).await;
 }
 
 fn audio_access(
@@ -1774,14 +1959,25 @@ fn audio_access(
     if !allowed {
         epoch.set_enabled(generation, false);
     }
-    audio.access(allowed);
+    if !audio.access_for(generation, allowed) {
+        return;
+    }
     if allowed {
         epoch.set_enabled(generation, true);
     }
 }
 
+#[cfg(test)]
 pub async fn drain_audio(audio: &crate::dictation::Host, tasks: &mut tokio::task::JoinSet<()>) {
     audio.access(false);
+    while tasks.join_next().await.is_some() {}
+}
+async fn drain_generation_audio(
+    audio: &crate::dictation::Host,
+    tasks: &mut tokio::task::JoinSet<()>,
+    generation: u64,
+) {
+    audio.access_for(generation, false);
     while tasks.join_next().await.is_some() {}
 }
 
@@ -1854,6 +2050,10 @@ fn recovery_after<T: Clone>(
         events,
     }
 }
+
+#[cfg(test)]
+#[path = "bridge_logout_tests.rs"]
+mod logout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2091,7 +2291,21 @@ mod tests {
                     "error": format!("request to {endpoint} used {bearer}")
                 }
             },
-            "resources": [endpoint, bearer]
+            "resources": [endpoint, bearer],
+            "interactions": {
+                "session": {
+                    "generation": "broker-generation",
+                    "revision": 1,
+                    "connected": true,
+                    "error": null,
+                    "pending": [{
+                        "identity": { "sessionId": "session", "generation": "broker-generation", "id": "request", "operationId": "operation" },
+                        "request": { "kind": "urlConsent", "message": format!("consent {bearer}"), "url": format!("{endpoint}/private") },
+                        "responding": false,
+                        "error": null
+                    }]
+                }
+            }
         });
         assert!(auth_url_contains_endpoint(private_auth_url, endpoint));
         redact_snapshot_projection(&mut snapshot, [endpoint, bearer], true);
@@ -2107,6 +2321,10 @@ mod tests {
             Some(&serde_json::Value::String(String::new()))
         );
         assert!(!serialized.to_ascii_lowercase().contains("redacted"));
+        assert_eq!(
+            payload_snapshot(&payload).pointer("/interactions/session/pending/0/identity/operationId"),
+            Some(&serde_json::Value::String("operation".into()))
+        );
     }
 
     #[test]

@@ -1,19 +1,7 @@
-//! Local fake RPC and synthetic capture only. No device, key, clipboard, or remote service access.
+//! Local v2 RPC and synthetic capture only; no device or external effects.
 use super::*;
 use crate::audio_permissions::{PermissionBackend, PermissionReply};
 use futures_util::{Stream, StreamExt, stream};
-use waltr_audio_io::Terminal;
-use waltr_client::{
-    NativeGrpcTransport,
-    interaction::wire::{
-        self,
-        interact_response::Event,
-        routine_interaction_service_server::{
-            RoutineInteractionService, RoutineInteractionServiceServer,
-        },
-    },
-};
-use waltr_desktop::capture::{self, Factory, Source};
 use std::{
     pin::Pin,
     sync::{
@@ -24,8 +12,15 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status as RpcStatus};
+use waltr_audio_io::Terminal;
+use waltr_client::{
+    NativeGrpcTransport,
+    interaction::wire::{self, output_event::Event, routine_service_server::RoutineServiceServer},
+};
+use waltr_desktop::capture::{self, Factory, Source};
 #[path = "dictation_cases.rs"]
 mod cases;
+use crate::native_media_test_support as support;
 type Responses = Pin<Box<dyn Stream<Item = Result<wire::InteractResponse, RpcStatus>> + Send>>;
 #[derive(Clone, Default)]
 struct Fake {
@@ -34,16 +29,30 @@ struct Fake {
     completed: Arc<AtomicBool>,
     preview_step: Arc<AtomicUsize>,
 }
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "fixture events share the fallible RPC stream item type"
-)]
-const fn event(event: Event) -> Result<wire::InteractResponse, RpcStatus> {
-    Ok(wire::InteractResponse { event: Some(event) })
+fn event(event: Event) -> Result<wire::InteractResponse, RpcStatus> {
+    Ok(wire::InteractResponse {
+        output: Some(wire::OutputEvent { event: Some(event) }),
+    })
 }
-#[tonic::async_trait]
-impl RoutineInteractionService for Fake {
-    type InteractStream = Responses;
+impl Fake {
+    async fn watch_live_output(
+        &self,
+        _: Request<wire::WatchLiveOutputRequest>,
+    ) -> Result<
+        Response<<Self as wire::routine_service_server::RoutineService>::WatchLiveOutputStream>,
+        RpcStatus,
+    > {
+        Err(RpcStatus::unimplemented("unused"))
+    }
+    async fn read_blob(
+        &self,
+        _: Request<wire::ReadBlobRequest>,
+    ) -> Result<
+        Response<<Self as wire::routine_service_server::RoutineService>::ReadBlobStream>,
+        RpcStatus,
+    > {
+        Err(RpcStatus::unimplemented("unused"))
+    }
     async fn interact(
         &self,
         request: Request<tonic::Streaming<wire::InteractRequest>>,
@@ -51,87 +60,80 @@ impl RoutineInteractionService for Fake {
         self.admissions.fetch_add(1, Ordering::SeqCst);
         let mut input = request.into_inner();
         let first = input.message().await?.unwrap();
-        let Some(wire::interact_request::Event::Open(open)) = first.event else {
+        let Some(wire::interact_request::Frame::Open(open)) = first.frame else {
             panic!("expected open")
         };
-        assert!(
-            open.source_session_id.is_none(),
-            "production admission forbids source sessions"
-        );
-        if open.routine_name == "SECRET_CONFIG_SENTINEL_reject" {
+        let selection = open.selection.unwrap();
+        assert_eq!(selection.revision, "revision");
+        assert_eq!(selection.entrypoint, "dictate");
+        let name = selection.routine;
+        if name == "SECRET_CONFIG_SENTINEL_reject" {
             return Err(RpcStatus::unavailable("SECRET_ERROR_SENTINEL"));
         }
-        if open.routine_name == "remote-rejected" {
+        if name == "remote-rejected" {
             return Ok(Response::new(Box::pin(stream::iter([event(
-                Event::ValidationFailure(Default::default()),
+                Event::Rejected(wire::InteractionRejected {
+                    code: wire::RejectionCode::Invalid as i32,
+                    reason: "rejected".into(),
+                }),
             )]))));
         }
-        if matches!(
-            open.routine_name.as_str(),
-            "remote-failed" | "remote-interrupted"
-        ) {
+        let accepted = || {
+            event(Event::Accepted(wire::InteractionAccepted {
+                invocation_id: "invocation".into(),
+                revision: "revision".into(),
+                limits: Some(support::limits()),
+            }))
+        };
+        if matches!(name.as_str(), "remote-failed" | "remote-interrupted") {
             return Ok(Response::new(Box::pin(stream::iter([
-                event(Event::Accepted(wire::InteractionAccepted {
-                    invocation_id: "SECRET_INVOCATION_SENTINEL".into(),
-                })),
-                event(Event::Completed(wire::InteractionCompleted {
-                    status: if open.routine_name == "remote-failed" {
-                        wire::RoutineInvocationStatus::Failed
+                accepted(),
+                event(Event::Terminal(wire::InteractionTerminal {
+                    status: if name == "remote-failed" {
+                        wire::InvocationStatus::Failed as i32
                     } else {
-                        wire::RoutineInvocationStatus::Interrupted
-                    } as i32,
-                    failure: Some(wire::RoutineFailure {
-                        code: "SECRET_CODE_SENTINEL".into(),
-                        message: "SECRET_MESSAGE_SENTINEL".into(),
-                    }),
+                        wire::InvocationStatus::Interrupted as i32
+                    },
+                    cleanup_complete: true,
+                    text_results: vec![],
+                    result: None,
                 })),
             ]))));
         }
-        if open.routine_name == "pending" {
+        if name == "pending" {
             while input.message().await?.is_some() {}
             return Err(RpcStatus::cancelled("closed before admission"));
         }
         let fake = self.clone();
         let mut prefix = vec![
-            event(Event::Accepted(wire::InteractionAccepted {
-                invocation_id: "invocation".into(),
-            })),
-            event(Event::OutputOpened(wire::InteractionOutputOpened {
+            accepted(),
+            event(Event::Open(wire::StreamOpen {
                 stream_id: "out".into(),
-                port_name: "clean-text".into(),
-                format: Some(wire::InteractionStreamFormat {
-                    content: Some(wire::interaction_stream_format::Content::Text(
-                        wire::InteractionTextFormat {},
-                    )),
-                }),
+                port: "clean-text".into(),
+                format: Some(wire::stream_open::Format::Text(wire::TextFormat {})),
             })),
         ];
-        if open.routine_name == "early-success" {
+        if name == "early-success" {
             prefix.extend(final_events("test"));
             return Ok(Response::new(Box::pin(stream::iter(prefix))));
         }
-        if matches!(open.routine_name.as_str(), "ambiguous" | "other-port") {
-            prefix.push(event(Event::OutputOpened(wire::InteractionOutputOpened {
+        if matches!(name.as_str(), "ambiguous" | "other-port") {
+            prefix.push(event(Event::Open(wire::StreamOpen {
                 stream_id: "extra".into(),
-                port_name: if open.routine_name == "ambiguous" {
+                port: if name == "ambiguous" {
                     "clean-text"
                 } else {
                     "other"
                 }
                 .into(),
-                format: Some(wire::InteractionStreamFormat {
-                    content: Some(wire::interaction_stream_format::Content::Text(
-                        wire::InteractionTextFormat {},
-                    )),
-                }),
+                format: Some(wire::stream_open::Format::Text(wire::TextFormat {})),
             })));
-            prefix.push(event(Event::OutputClosed(wire::InteractionOutputClosed {
+            prefix.push(event(Event::Close(wire::StreamClose {
                 stream_id: "extra".into(),
-                status: 1,
-                failure: None,
+                next_sequence: 0,
             })));
         }
-        let live = open.routine_name == "live";
+        let live = name == "live";
         let progress = self.preview_step.clone();
         let previews = stream::unfold(0, move |step| {
             let progress = progress.clone();
@@ -143,59 +145,67 @@ impl RoutineInteractionService for Fake {
                     tokio::task::yield_now().await;
                 }
                 Some((
-                    event(Event::OutputChunk(wire::InteractionOutputChunk {
-                        stream_id: "out".into(),
-                        content: Some(wire::interaction_output_chunk::Content::Text(
-                            wire::TextUpdate {
-                                segment_id: "one".into(),
-                                text: if step == 0 { "hello" } else { "hello world" }.into(),
-                                operation: 2,
-                                committed: step == 2,
-                            },
-                        )),
-                    })),
+                    text(
+                        step as u64,
+                        if step == 0 {
+                            "hello".into()
+                        } else {
+                            "hello world".into()
+                        },
+                        step == 2,
+                    ),
                     step + 1,
                 ))
             }
         });
         let tail = stream::once(async move {
             while let Some(message) = input.message().await? {
-                match message.event {
-                    Some(wire::interact_request::Event::InputChunk(chunk)) => {
-                        if let Some(wire::interaction_input_chunk::Content::Audio(bytes)) =
-                            chunk.content
-                        {
+                match message.frame {
+                    Some(wire::interact_request::Frame::Input(wire::InputEvent {
+                        event: Some(wire::input_event::Event::Chunk(chunk)),
+                    })) => {
+                        if let Some(wire::stream_chunk::Payload::Audio(bytes)) = chunk.payload {
                             fake.uploads.fetch_add(bytes.len(), Ordering::SeqCst);
                         }
                     }
-                    Some(wire::interact_request::Event::InputCompleted(_)) => break,
-                    Some(wire::interact_request::Event::Cancel(_)) => {
-                        return Err(RpcStatus::cancelled("cancelled"));
-                    }
+                    Some(wire::interact_request::Frame::Input(wire::InputEvent {
+                        event: Some(wire::input_event::Event::Finish(_)),
+                    })) => break,
                     _ => (),
                 }
             }
             fake.completed.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if open.routine_name == "failed" {
+            if name == "failed" {
                 return Err(RpcStatus::data_loss("static failure"));
             }
-            Ok(final_events(&open.routine_name))
+            Ok(final_events(&name))
         })
-        .map(|result| stream::iter(result.unwrap_or_else(|e| vec![Err(e)])))
+        .map(|r| stream::iter(r.unwrap_or_else(|e| vec![Err(e)])))
         .flatten();
         Ok(Response::new(Box::pin(
             stream::iter(prefix).chain(previews).chain(tail),
         )))
     }
-    type RunStream = Responses;
-    async fn run(
-        &self,
-        _request: Request<wire::RunInteractionRequest>,
-    ) -> Result<Response<Responses>, RpcStatus> {
-        Err(RpcStatus::unimplemented("unused"))
-    }
 }
+support::fake_service!(Fake;
+    start_invocation: StartInvocationRequest => StartInvocationResponse,
+    list_invocations: ListInvocationsRequest => ListInvocationsResponse,
+    list_operations: ListOperationsRequest => ListOperationsResponse,
+    cancel_invocation: CancelInvocationRequest => CancelInvocationResponse,
+    get_invocation: GetInvocationRequest => GetInvocationResponse,
+    open_attachment: OpenAttachmentRequest => OpenAttachmentResponse,
+    send_input_batch: SendInputBatchRequest => SendInputBatchResponse,
+    renew_attachment: RenewAttachmentRequest => RenewAttachmentResponse,
+    close_attachment: CloseAttachmentRequest => CloseAttachmentResponse,
+    begin_blob_upload: BeginBlobUploadRequest => BeginBlobUploadResponse,
+    append_blob_upload: AppendBlobUploadRequest => AppendBlobUploadResponse,
+    commit_blob_upload: CommitBlobUploadRequest => CommitBlobUploadResponse,
+    cancel_blob_upload: CancelBlobUploadRequest => CancelBlobUploadResponse,
+    open_blob_read: OpenBlobReadRequest => OpenBlobReadResponse,
+    close_blob_read: CloseBlobReadRequest => CloseBlobReadResponse,
+    read_text_result: ReadTextResultRequest => ReadTextResultResponse,
+);
 async fn fixture() -> (
     NativeGrpcTransport,
     Fake,
@@ -208,7 +218,7 @@ async fn fixture() -> (
         Some((listener.accept().await.map(|v| v.0), listener))
     });
     let fake = Fake::default();
-    let service = RoutineInteractionServiceServer::new(fake.clone());
+    let service = RoutineServiceServer::new(fake.clone());
     let stop = CancellationToken::new();
     let stopped = stop.clone();
     let server = tokio::spawn(async move {
@@ -257,7 +267,7 @@ impl Factory for MockFactory {
         Ok(Box::new(Samples {
             state: state.clone(),
             remaining: if state.burst.load(Ordering::SeqCst) {
-                1000
+                100_000
             } else {
                 1
             },
@@ -308,33 +318,42 @@ impl Source for Samples {
         self.state.joined.store(true, Ordering::SeqCst);
     }
 }
+fn text(sequence: u64, text: String, committed: bool) -> Result<wire::InteractResponse, RpcStatus> {
+    event(Event::Chunk(wire::StreamChunk {
+        stream_id: "out".into(),
+        sequence,
+        payload: Some(wire::stream_chunk::Payload::Text(wire::TextRevision {
+            segment_id: "one".into(),
+            text,
+            mutation: wire::TextMutation::Replace as i32,
+            committed,
+        })),
+    }))
+}
 fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
     let mut events = vec![
-        event(Event::OutputChunk(wire::InteractionOutputChunk {
+        text(
+            0,
+            if name == "SECRET_CONFIG_SENTINEL" {
+                "SECRET_TRANSCRIPT_SENTINEL".into()
+            } else if name == "large" {
+                "x".repeat(256 * 1024 + 1)
+            } else {
+                "literal $(touch nope); '{{ invocationId }}'".into()
+            },
+            name != "uncommitted",
+        ),
+        event(Event::Close(wire::StreamClose {
             stream_id: "out".into(),
-            content: Some(wire::interaction_output_chunk::Content::Text(
-                wire::TextUpdate {
-                    segment_id: "one".into(),
-                    text: if name == "SECRET_CONFIG_SENTINEL" {
-                        "SECRET_TRANSCRIPT_SENTINEL".into()
-                    } else if name == "large" {
-                        "x".repeat(256 * 1024 + 1)
-                    } else {
-                        "literal $(touch nope); '{{ invocationId }}'".into()
-                    },
-                    operation: 2,
-                    committed: name != "uncommitted",
-                },
-            )),
+            next_sequence: if name == "live" { 3 } else { 1 },
         })),
-        event(Event::OutputClosed(wire::InteractionOutputClosed {
-            stream_id: "out".into(),
-            status: 1,
-            failure: None,
-        })),
-        event(Event::Completed(wire::InteractionCompleted {
-            status: wire::RoutineInvocationStatus::Succeeded as i32,
-            failure: None,
+        event(Event::Terminal(wire::InteractionTerminal {
+            status: wire::InvocationStatus::Succeeded as i32,
+            cleanup_complete: true,
+            text_results: vec![],
+            result: Some(wire::StructuredValue {
+                json: b"{}".to_vec(),
+            }),
         })),
     ];
     if name == "live" {

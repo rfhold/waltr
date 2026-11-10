@@ -4,7 +4,10 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 pub fn confined_invoke_script() -> String {
     include_str!("../scripts/confined-ipc.js")
-        .replace("__WALTR_OS_NAME__", &format!("\"{}\"", std::env::consts::OS))
+        .replace(
+            "__WALTR_OS_NAME__",
+            &format!("\"{}\"", std::env::consts::OS),
+        )
         .replace(
             "__WALTR_PROCESS_IPC_MESSAGE_FN__",
             include_str!("../scripts/process-ipc-message-fn.js"),
@@ -147,6 +150,9 @@ mod tests {
             "dictation_finish",
             "dictation_status",
             "dictation_cancel",
+            "routine_media",
+            "routine_media_append",
+            "routine_media_bytes",
             "start_runtime",
             "client_dispatch",
             "client_state",

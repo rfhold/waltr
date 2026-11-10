@@ -2,19 +2,24 @@
 use crate::audio_permissions::{AudioPermissions, PermissionResult};
 use crate::native_audio_telemetry as telemetry;
 use crate::native_audio_telemetry::Operation;
-use waltr_client::RoutineInteractionTransport;
-use waltr_desktop::{capture, host::AudioAdmission};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+use waltr_client::RoutineInteractionTransport;
+use waltr_desktop::{capture, host::AudioAdmission};
+mod catalog;
 
 #[derive(Default)]
 pub(crate) struct State {
     pub generation: u64,
     pub allowed: bool,
+    pub media_epoch: u64,
+    pub picker_epoch: u64,
     pub active: Option<CancellationToken>,
     pub active_revision: Option<u64>,
     pub credentials: Option<waltr_client::NativeCredentialProvider>,
+    pub(super) catalog: Option<catalog::Catalog>,
+    pub(super) pinned: Option<catalog::Pin>,
 }
 impl State {
     pub(crate) fn bind(&mut self, generation: u64) {
@@ -27,6 +32,8 @@ impl State {
     pub(crate) fn access(&mut self, allowed: bool) {
         self.allowed = allowed;
         if !allowed {
+            self.media_epoch = self.media_epoch.wrapping_add(1);
+            self.picker_epoch = self.picker_epoch.wrapping_add(1);
             self.cancel();
         }
     }
@@ -69,6 +76,47 @@ impl Host {
             telemetry::admission("hold", "unavailable");
             return Err("Native audio is unavailable".into());
         }
+        let catalog = state
+            .catalog
+            .as_ref()
+            .ok_or("Routine discovery is not available")?;
+        let invocation = catalog.resolve(
+            &binding.routine.name,
+            &binding.routine.trigger,
+            None,
+            format!("native-hold-{}", state.generation),
+        )?;
+        let pinned = catalog.pin(invocation.clone(), false);
+        let binding = Arc::new(waltr_desktop::config::Keybind {
+            resolved: Some(invocation),
+            id: binding.id.clone(),
+            key: binding.key.clone(),
+            mode: waltr_desktop::config::Mode::Hold,
+            max_capture_seconds: binding.max_capture_seconds,
+            routine: waltr_desktop::config::Routine {
+                name: binding.routine.name.clone(),
+                trigger: binding.routine.trigger.clone(),
+                input: binding.routine.input.clone(),
+                output: binding.routine.output.clone(),
+            },
+            audio: waltr_desktop::config::Audio {
+                device: binding.audio.device.clone(),
+                sample_rate_hz: binding.audio.sample_rate_hz,
+                channels: binding.audio.channels,
+            },
+            command: binding
+                .command
+                .as_ref()
+                .map(|c| waltr_desktop::command::CommandSpec {
+                    argv: c.argv.clone(),
+                    stdin: c.stdin.clone(),
+                    timeout_seconds: c.timeout_seconds,
+                }),
+            typing: binding
+                .typing
+                .as_ref()
+                .map(|_| waltr_desktop::config::TypingSpec {}),
+        });
         let (hold, control) = waltr_desktop::host::Hold::press(&self.gate).map_err(|_| {
             telemetry::admission("hold", "busy");
             "Native audio is busy"
@@ -77,6 +125,7 @@ impl Host {
         let diagnostics = Operation::new("hold");
         let token = CancellationToken::new();
         state.active = Some(token.clone());
+        state.pinned = Some(pinned);
         state.active_revision = state
             .credentials
             .as_ref()
@@ -99,6 +148,31 @@ impl Host {
         );
         drop(state);
         Ok(result)
+    }
+    pub fn observe(&self, snapshot: &waltr_client::ClientSnapshot) -> bool {
+        let generation = self.lock().generation;
+        self.observe_for(generation, snapshot)
+    }
+    pub(crate) fn observe_for(
+        &self,
+        generation: u64,
+        snapshot: &waltr_client::ClientSnapshot,
+    ) -> bool {
+        let catalog = catalog::Catalog::new(snapshot);
+        let mut state = self.lock();
+        if state.generation != generation {
+            return false;
+        }
+        let changed = state
+            .pinned
+            .as_ref()
+            .is_some_and(|pin| !catalog.current(pin));
+        if changed {
+            state.cancel();
+            state.pinned = None;
+        }
+        state.catalog = Some(catalog);
+        changed
     }
 }
 pub struct Held {
@@ -184,7 +258,9 @@ impl Held {
                 !matches!(
                     error,
                     waltr_desktop::host::Error::Cancelled
-                        | waltr_desktop::host::Error::Typing(waltr_desktop::typing::Error::Cancelled)
+                        | waltr_desktop::host::Error::Typing(
+                            waltr_desktop::typing::Error::Cancelled
+                        )
                 )
             }) {
                 self.activity.fail();

@@ -4,12 +4,12 @@ use std::io;
 
 #[cfg(feature = "native-apps-test")]
 use axum::{Router, routing::get};
-use waltr_server::app_container::{AppsContainerConfig, SpawnedAppsContainer, spawn_app_container};
 use serde::Serialize;
 #[cfg(feature = "native-apps-test")]
 use tokio::sync::oneshot;
 #[cfg(feature = "native-apps-test")]
 use tokio::task::JoinHandle;
+use waltr_server::app_container::{AppsContainerConfig, SpawnedAppsContainer, spawn_app_container};
 
 #[cfg(feature = "native-apps-test")]
 pub(crate) const IDENTIFIER: &str = "dev.waltr.app.native-apps-test";

@@ -177,6 +177,17 @@ impl Operation {
             Diagnostic::TypingCleanup(result) => {
                 snapshot.typing_cleanup = result.map_or_else(typing_category, |()| "ok");
             }
+            Diagnostic::SourceCleanup(result) => {
+                if result.is_err() && snapshot.primary == "none" {
+                    snapshot.primary = "interaction_cleanup";
+                    snapshot.failure_stage = "cleanup";
+                }
+            }
+            Diagnostic::RemoteCleanup(false) if snapshot.primary == "none" => {
+                snapshot.primary = "interaction_cleanup";
+                snapshot.failure_stage = "cleanup";
+            }
+            Diagnostic::RemoteCleanup(_) => {}
             Diagnostic::RpcFailure(error) => {
                 if snapshot.rpc.is_none() {
                     let category = match error {
