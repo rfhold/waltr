@@ -51,8 +51,8 @@ pub mod waltr {
         }
     }
     pub mod routine {
-        pub mod v1 {
-            include!("waltr/routine/v1/waltr.routine.v1.rs");
+        pub mod v2 {
+            include!("waltr/routine/v2/waltr.routine.v2.rs");
         }
     }
     pub mod sandbox {

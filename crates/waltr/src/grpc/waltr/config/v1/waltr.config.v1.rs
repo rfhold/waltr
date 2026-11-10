@@ -161,6 +161,9 @@ pub struct SpeechSynthesisOptions {
     pub speaking_rate: ::core::option::Option<f64>,
     #[prost(double, optional, tag="6")]
     pub pitch: ::core::option::Option<f64>,
+    /// Optional upstream voice model selector, independent of the catalog model key.
+    #[prost(string, optional, tag="7")]
+    pub model_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

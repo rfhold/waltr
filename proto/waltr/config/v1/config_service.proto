@@ -119,6 +119,8 @@ message SpeechSynthesisOptions {
   uint32 channels = 4;
   optional double speaking_rate = 5;
   optional double pitch = 6;
+  // Optional upstream voice model selector, independent of the catalog model key.
+  optional string model_name = 7;
 }
 
 message SpeechCapabilities {

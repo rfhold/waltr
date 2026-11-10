@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package waltr.session.v1;
+
+service InteractionService {
+  rpc GetInteractions(GetInteractionsRequest) returns (GetInteractionsResponse);
+  rpc WatchInteractions(WatchInteractionsRequest) returns (stream WatchInteractionsResponse);
+  rpc RespondInteraction(RespondInteractionRequest) returns (RespondInteractionResponse);
+}
+
+message GetInteractionsRequest { string session_id = 1; }
+message GetInteractionsResponse { InteractionSnapshot snapshot = 1; }
+message WatchInteractionsRequest { string session_id = 1; }
+// Full replacement snapshots; reconnect always receives current pending state.
+message WatchInteractionsResponse { InteractionSnapshot snapshot = 1; }
+message InteractionSnapshot {
+  string generation = 1;
+  uint64 revision = 2;
+  repeated PendingInteraction pending = 3;
+}
+message PendingInteraction {
+  string id = 1;
+  string operation_id = 2;
+  string session_id = 3;
+  oneof request {
+    PermissionInteraction permission = 4;
+    QuestionInteraction question = 5;
+    FormInteraction form = 6;
+    UrlConsentInteraction url_consent = 7;
+  }
+}
+message PermissionInteraction {
+  string message = 1;
+  string identity = 2;
+  string claims_json = 3;
+  string suggested_patterns_json = 4;
+}
+message QuestionInteraction { repeated InteractionQuestion questions = 1; }
+message InteractionQuestion {
+  string question = 1;
+  string header = 2;
+  repeated InteractionQuestionOption options = 3;
+  bool multiple = 4;
+  bool custom = 5;
+}
+message InteractionQuestionOption { string label = 1; string description = 2; }
+message FormInteraction { string message = 1; string requested_schema_json = 2; }
+message UrlConsentInteraction { string message = 1; string url = 2; }
+message RespondInteractionRequest {
+  string session_id = 1;
+  string generation = 2;
+  string id = 3;
+  string operation_id = 4;
+  oneof response {
+    PermissionInteractionResponse permission = 5;
+    QuestionInteractionResponse question = 6;
+    ElicitationInteractionResponse form = 7;
+    ElicitationInteractionResponse url_consent = 8;
+  }
+}
+message PermissionInteractionResponse {
+  enum Decision {
+    DECISION_UNSPECIFIED = 0;
+    DECISION_ALLOW_ONCE = 1;
+    DECISION_ALLOW_ALWAYS = 2;
+    DECISION_DENY = 3;
+    DECISION_CANCEL_WORK = 4;
+  }
+  Decision decision = 1;
+  string patterns_json = 2;
+  optional string message = 3;
+}
+message QuestionInteractionResponse { repeated InteractionQuestionAnswer answers = 1; }
+message InteractionQuestionAnswer { repeated string values = 1; }
+message ElicitationInteractionResponse {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_ACCEPT = 1;
+    ACTION_DECLINE = 2;
+    ACTION_CANCEL = 3;
+  }
+  Action action = 1;
+  optional string content_json = 2;
+}
+message RespondInteractionResponse {}

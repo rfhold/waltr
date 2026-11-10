@@ -1,0 +1,837 @@
+syntax = "proto3";
+
+package waltr.routine.v2;
+
+// Additive, initially unregistered API. Authentication supplies the principal on
+// every call; no request field grants capabilities, session access or ownership.
+// Unless narrowed below: public opaque IDs <=256 UTF-8 bytes; catalog names,
+// entrypoint/port/stream/segment IDs and correlation <=128 bytes; revisions <=256
+// bytes; opaque watch cursors <=1024 bytes. Reject empty required identities,
+// oversized envelopes and unknown enum values before allocating payload work.
+// INVALID_ARGUMENT: malformed/default/ordering; PERMISSION_DENIED: scope/auth;
+// FAILED_PRECONDITION: stale generation/state/expiry; RESOURCE_EXHAUSTED: quota;
+// UNAVAILABLE: dependency/ambiguous acknowledgment. Never retry mutations based
+// on these classifications alone, and never include raw payloads in errors.
+service RoutineService {
+  // Complete initial and subsequent snapshots, never partial graph descriptors.
+  rpc WatchDefinitions(WatchDefinitionsRequest) returns (stream WatchDefinitionsResponse);
+  // Detached manual execution. Lost admission acknowledgments MUST NOT be retried automatically.
+  rpc StartInvocation(StartInvocationRequest) returns (StartInvocationResponse);
+  rpc ListInvocations(ListInvocationsRequest) returns (ListInvocationsResponse);
+  rpc GetInvocation(GetInvocationRequest) returns (GetInvocationResponse);
+  // Observation replay only; never resumes execution or grants a live lease.
+  rpc WatchInvocations(WatchInvocationsRequest) returns (stream WatchInvocationsResponse);
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  // Idempotent authorized request, serviced independently of media queue credit.
+  rpc CancelInvocation(CancelInvocationRequest) returns (CancelInvocationResponse);
+  rpc ReadTextResult(ReadTextResultRequest) returns (ReadTextResultResponse);
+  // Native-only duplex. Both directions share the split-lane interaction domain.
+  rpc Interact(stream InteractRequest) returns (stream InteractResponse);
+  // Browser-compatible unary control/input plus server-streamed output.
+  rpc OpenAttachment(OpenAttachmentRequest) returns (OpenAttachmentResponse);
+  rpc SendInputBatch(SendInputBatchRequest) returns (SendInputBatchResponse);
+  rpc WatchLiveOutput(WatchLiveOutputRequest) returns (stream WatchLiveOutputResponse);
+  rpc RenewAttachment(RenewAttachmentRequest) returns (RenewAttachmentResponse);
+  rpc CloseAttachment(CloseAttachmentRequest) returns (CloseAttachmentResponse);
+  rpc BeginBlobUpload(BeginBlobUploadRequest) returns (BeginBlobUploadResponse);
+  rpc AppendBlobUpload(AppendBlobUploadRequest) returns (AppendBlobUploadResponse);
+  rpc CommitBlobUpload(CommitBlobUploadRequest) returns (CommitBlobUploadResponse);
+  rpc CancelBlobUpload(CancelBlobUploadRequest) returns (CancelBlobUploadResponse);
+  rpc OpenBlobRead(OpenBlobReadRequest) returns (OpenBlobReadResponse);
+  // Sequential owned stream; drop/expiry revokes the reader. No seek/resume.
+  rpc ReadBlob(ReadBlobRequest) returns (stream ReadBlobResponse);
+  rpc CloseBlobRead(CloseBlobReadRequest) returns (CloseBlobReadResponse);
+}
+
+// Exact UTF-8 JSON octets, not protobuf Struct/double. A complete value is at most
+// 65536 encoded bytes, subject to the declared contract and engine exact-number
+// rules. Reject invalid UTF-8, duplicate keys, nonfinite/unsafe engine numbers,
+// excessive depth and undeclared keys; never coerce opaque string identities.
+message StructuredValue {
+  bytes json = 1;
+}
+
+// Definition::Contract: exact schemaVersion and JSON serialization of Schema.
+// waltr.value/v1 is NOT JSON Schema: null, nullable{schema}, boolean,
+// number{min,max}, string{maxLength}, array{maxItems,items},
+// object{properties,required}; closed fields. Depth <=16, nodes <=256,
+// object properties <=128, array maxItems <=4096, string maxLength <=65536.
+message ValueContract {
+  string schema_version = 1;
+  bytes schema_json = 2;
+}
+
+enum Trigger {
+  TRIGGER_UNSPECIFIED = 0;
+  TRIGGER_MANUAL = 1;
+  TRIGGER_EVENT = 2;
+  TRIGGER_INTERACTIVE = 3;
+  TRIGGER_TOOL = 4;
+  TRIGGER_INLINE = 5;
+  TRIGGER_MCP = 6;
+  TRIGGER_SCHEDULE = 7;
+  TRIGGER_PROGRESS = 8;
+  TRIGGER_LIFECYCLE = 9;
+}
+
+// Host-published public request eligibility, not a capability/consent grant or
+// admission guarantee. GLOBAL means no source; SESSION requires a nonempty
+// source_session authorized by current host policy.
+enum StartContext {
+  START_CONTEXT_UNSPECIFIED = 0;
+  START_CONTEXT_GLOBAL = 1;
+  START_CONTEXT_SESSION = 2;
+}
+message Entrypoint {
+  string name = 1;
+  Trigger trigger = 2;
+  optional string selector = 3;
+  // At most two unique offers; UNSPECIFIED/unknown/duplicate values reject.
+  // Empty means neither public Start nor Interact is offered; clients MUST NOT
+  // infer defaults from capabilities, selector or business parameter schemas.
+  // GLOBAL only forbids a source; SESSION only requires one; both allow either.
+  // Trigger still restricts the family: manual for StartInvocation, interactive
+  // for Interact/OpenAttachment; event/lifecycle/etc are not manually runnable
+  // merely because a context is present. The live per-principal catalog snapshot
+  // publishes current host policy, which preflight MUST enforce. Historical
+  // pinned offers preserve admission provenance, never current start authority.
+  repeated StartContext start_contexts = 4;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_INPUT = 1;
+  DIRECTION_OUTPUT = 2;
+}
+
+enum Media {
+  MEDIA_UNSPECIFIED = 0;
+  MEDIA_AUDIO = 1;
+  MEDIA_TEXT = 2;
+  MEDIA_IMAGE = 3;
+  MEDIA_FILE = 4;
+}
+
+message Port {
+  string name = 1;
+  Direction direction = 2;
+  Media media = 3;
+  bool required = 4;
+  // Aggregate per-port payload, NOT the 64 KiB per-chunk allowance.
+  uint64 max_bytes = 5;
+  // Exact admitted format identities; at most 16, each <=128 UTF-8 bytes.
+  repeated string formats = 6;
+}
+
+message Budgets {
+  uint32 value_bytes = 1;
+  uint32 result_bytes = 2;
+  uint32 host_calls = 3;
+  uint32 in_flight = 4;
+  // Ordinary default 30000; media.execute preflight permits <=5400000.
+  uint64 deadline_ms = 5;
+}
+
+// Complete immutable PUBLIC Definition projection. No task graph, raw program
+// source, private host configuration or legacy decoder. Historical detail retains
+// this pinned projection even when the live catalog changes/deletes its entry.
+message Definition {
+  reserved 6;
+  reserved "source";
+  string name = 1;
+  string description = 2;
+  string revision = 3;
+  string api_version = 4;
+  string engine = 5;
+  // 1..32 named declarations, preserving exact descriptor keys and selectors.
+  repeated Entrypoint entrypoints = 7;
+  ValueContract parameters = 8;
+  ValueContract result = 9;
+  // At most 32; formats and aggregate ceilings come from the admitted definition.
+  repeated Port ports = 10;
+  // At most 64 exact required identities, never a caller grant.
+  repeated string capabilities = 11;
+  Budgets budgets = 12;
+}
+
+// Effective, nonzero server values, not client defaults. Admission may narrow
+// these limits. Zero/absent required limits and unknown enum/oneof values fail
+// validation. Clients must cap protobuf envelope allocation before decoding.
+message ServerLimits {
+  uint32 chunk_bytes = 1;
+  uint32 input_batch_bytes = 2;
+  uint32 input_batch_events = 3;
+  uint32 edge_bytes = 4;
+  uint32 edge_chunks = 5;
+  uint64 input_bytes = 6;
+  uint64 output_bytes = 7;
+  uint64 input_duration_ms = 8;
+  uint64 total_duration_ms = 9;
+  uint64 queue_wait_ms = 10;
+  uint64 idle_ms = 11;
+  uint32 streams_per_direction = 12;
+  uint32 text_segments = 13;
+  uint32 retained_text_bytes = 14;
+  uint64 attachment_lease_ms = 15;
+  uint64 attachment_attach_timeout_ms = 16;
+  uint64 attachment_absolute_lifetime_ms = 17;
+  uint64 file_bytes = 18;
+  uint64 image_bytes = 19;
+  // Legacy nonzero compatibility placeholder for current consumers, NOT an
+  // enforced dimension cap or trusted image fact. Must not govern client security
+  // acceptance; the server does not decode images or enforce dimension limits.
+  uint32 image_dimension = 20;
+  // Legacy nonzero compatibility placeholder for current consumers, NOT an
+  // enforced pixel cap or trusted image fact. Must not govern client security
+  // acceptance; the server does not enforce pixel limits.
+  uint64 image_pixels = 21;
+  uint64 helper_attachment_bytes = 22;
+  uint64 helper_source_bytes = 23;
+  uint64 helper_encoded_bytes = 24;
+  uint32 helper_attachments = 25;
+  uint64 binary_output_lease_ms = 26;
+  uint64 text_result_bytes = 27;
+  uint64 text_results_encoded_bytes = 28;
+  uint32 text_results = 29;
+  uint32 page_size = 30;
+  uint32 structured_value_bytes = 31;
+  uint32 definition_bytes = 32;
+  uint32 definitions_per_snapshot = 33;
+  uint32 definition_snapshot_bytes = 34;
+  uint32 operation_projection_bytes = 35;
+  reserved 36, 37;
+  reserved "deferred_proposal_bytes", "deferred_provenance_bytes";
+  uint64 blob_invocation_bytes = 38;
+  uint64 blob_principal_bytes = 39;
+  uint32 blob_objects = 40;
+  uint32 blob_readers = 41;
+  uint64 ordinary_deadline_ms = 42;
+}
+
+message WatchDefinitionsRequest {}
+message WatchDefinitionsResponse {
+  string catalog_revision = 1;
+  repeated Definition definitions = 2;
+  // Host-supported capabilities, not grants to this principal.
+  repeated string supported_capabilities = 3;
+  ServerLimits limits = 4;
+}
+
+message InvocationSelection {
+  string routine = 1;
+  // Exact discovered revision is required; stale selection rejects before admission.
+  string revision = 2;
+  string entrypoint = 3;
+  StructuredValue parameters = 4;
+  // Correlation only: MUST NOT deduplicate, retry or authorize execution.
+  string correlation = 5;
+  // Request to capture this exact authorized source, not a client-supplied snapshot
+  // or pause grant. Host chooses capture policy and issues opaque snapshot identity.
+  // Present must be nonempty and the entrypoint must currently offer SESSION;
+  // absent requires GLOBAL. Published eligibility never replaces authorization.
+  optional string source_session = 6;
+}
+
+message StartInvocationRequest {
+  InvocationSelection selection = 1;
+}
+message StartInvocationResponse {
+  Invocation invocation = 1;
+}
+
+enum InvocationStatus {
+  INVOCATION_STATUS_UNSPECIFIED = 0;
+  INVOCATION_STATUS_ADMITTED = 1;
+  INVOCATION_STATUS_RUNNING = 2;
+  INVOCATION_STATUS_SUCCEEDED = 3;
+  INVOCATION_STATUS_FAILED = 4;
+  INVOCATION_STATUS_INTERRUPTED = 5;
+  INVOCATION_STATUS_UNCERTAIN = 6;
+}
+
+enum Ownership {
+  OWNERSHIP_UNSPECIFIED = 0;
+  OWNERSHIP_DETACHED = 1;
+  OWNERSHIP_LEASED = 2;
+  OWNERSHIP_TOOL = 3;
+}
+
+message HelperReference {
+  string session_id = 1;
+  string definition_identity = 2;
+  // Provenance only; ordinary helper read/consent authorization still applies.
+  optional string operation_id = 3;
+}
+
+message TextResultDescriptor {
+  uint32 version = 1;
+  string id = 2;
+  string name = 3;
+  string sha256 = 4;
+  uint64 utf8_bytes = 5;
+  uint64 encoded_charge = 6;
+  optional string helper_id = 7;
+}
+
+// Bounded summary/detail, never live authority or raw invocation inputs.
+// Cursor is immutable admission order, not an update sequence.
+message Invocation {
+  uint32 version = 1;
+  uint64 cursor = 2;
+  string id = 3;
+  string routine = 4;
+  string revision = 5;
+  string entrypoint = 6;
+  Trigger origin = 7;
+  Ownership ownership = 8;
+  string correlation = 9;
+  optional string snapshot = 10;
+  InvocationStatus status = 11;
+  int64 admitted_ms = 12;
+  int64 updated_ms = 13;
+  // Present only on durable success; large selected text is descriptor-only.
+  StructuredValue result = 14;
+  repeated TextResultDescriptor text_results = 15;
+  repeated BlobDescriptor binary_results = 16;
+  repeated HelperReference helpers = 17;
+  // Positive uint64 from the shared durable SQL observation journal order. Same
+  // ordering domain as Operation.observation_revision, consistent across Get,
+  // List and watch. Strictly advances for EVERY visible mutation: status,
+  // operation completion/uncertainty and text/helper/binary descriptor changes.
+  // Same record ID + observation_revision MUST have identical fields; time-derived metadata
+  // is frozen in that versioned view, not recomputed under the same revision.
+  // Clients ignore older per-ID revisions (e.g. delayed watch after newer Get).
+  // Lossless u64/string consumers required, never JS number. Not adjacent, not
+  // engine/retry/program version, admission cursor, updated_ms or watch token.
+  uint64 observation_revision = 18;
+  // Stable actual source ID persisted only after host authorization/preflight,
+  // never an unchecked client claim, helper ID or parsed snapshot/correlation.
+  // Provenance, NOT access authority; distinct from opaque snapshot. Association
+  // survives later invocation failure and live catalog change/deletion.
+  optional string source_session = 19;
+}
+
+message ListInvocationsRequest {
+  uint64 after_cursor = 1;
+  // 1..100, no implicit unbounded default. Authorize before pagination.
+  uint32 limit = 2;
+  // Exact nonempty source ID when present. Absent means ALL authorized records,
+  // not global-only. Check current source-session access before querying and
+  // apply authorized source filtering BEFORE LIMIT; never filter an unscoped page.
+  optional string source_session = 3;
+}
+message ListInvocationsResponse {
+  // Consistent versioned record + descriptor rows, same fields as Get/watch for
+  // the same ID and observation_revision; never assembled across mutations.
+  repeated Invocation invocations = 1;
+  uint64 next_cursor = 2;
+}
+message GetInvocationRequest {
+  string invocation_id = 1;
+}
+message GetInvocationResponse {
+  // Atomic consistent record + descriptor view at observation_revision, not a
+  // row combined with later text/helper/binary descriptors. Same revision has
+  // the same fields across Get/List/watch, despite response delivery reordering.
+  Invocation invocation = 1;
+  Definition pinned_definition = 2;
+}
+enum ObservationPhase {
+  OBSERVATION_PHASE_UNSPECIFIED = 0;
+  OBSERVATION_PHASE_SNAPSHOT = 1;
+  OBSERVATION_PHASE_CHANGES = 2;
+  OBSERVATION_PHASE_RESET_REQUIRED = 3;
+}
+message WatchInvocationsRequest {
+  // Opaque observation change cursor, distinct from admission/operation cursors.
+  // Empty requests initial bounded snapshot. Expired cursors fail OUT_OF_RANGE;
+  // clients explicitly resnapshot. No output or execution replay is promised.
+  // Repeated observations of an invocation are upserts, not new admissions.
+  string after_cursor = 1;
+  // 1..100 combined invocation/operation records per bounded response.
+  uint32 limit = 2;
+  // Same exact authorized source filter and absent=ALL semantics as List.
+  // Applies to invocation rows AND operation upserts via their trusted parent.
+  // Nonempty when present. Cursor (including partial snapshot position/high-water)
+  // binds this filter AND authenticated principal; changing either cannot reuse
+  // it. Independently keyed histories may share a physical watch only for the
+  // SAME filter. No helper/snapshot/correlation inference or substring matching.
+  optional string source_session = 3;
+}
+message WatchInvocationsResponse {
+  // Snapshot pages are consistent at snapshot_high_water. After the final page,
+  // emit every authorized journal change strictly after that high-water, including
+  // updates to already-emitted rows. Never use admission cursor or updated_ms as
+  // the change cursor. Authorize before page limits; no timestamp uniqueness claim.
+  repeated Invocation invocations = 1;
+  // Service-specific durable CHANGE cursor, not invocation admission order.
+  // A partial snapshot cursor also captures its position and fixed high-water;
+  // resuming it must not skip remaining snapshot rows or concurrent changes.
+  string cursor = 2;
+  bool snapshot_complete = 3;
+  ObservationPhase phase = 4;
+  // Same fixed high-water on every page of a bounded consistent initial snapshot.
+  // Final snapshot cursor equals this value; no gaps between snapshot and changes.
+  string snapshot_high_water = 5;
+  // RESET_REQUIRED has no rows and closes the stream; explicitly discard the
+  // cursor and resnapshot. Expired cursors may instead return OUT_OF_RANGE.
+  string reset_reason = 6;
+  // Dynamic operation snapshots/upserts, including completion/uncertainty updates
+  // to an already-emitted operation INSERT cursor. Same atomic journal high-water
+  // as invocations; never raw host arguments/media/credentials.
+  repeated Operation operations = 7;
+}
+
+enum OperationStatus {
+  OPERATION_STATUS_UNSPECIFIED = 0;
+  OPERATION_STATUS_DISPATCHED = 1;
+  OPERATION_STATUS_COMPLETED = 2;
+  OPERATION_STATUS_FAILED = 3;
+  OPERATION_STATUS_UNCERTAIN = 4;
+}
+message Operation {
+  uint32 version = 1;
+  uint64 cursor = 2;
+  string id = 3;
+  string invocation_id = 4;
+  string name = 5;
+  OperationStatus status = 6;
+  // Deliberate policy-owned safe projections, <=4096 encoded bytes each.
+  // Never arbitrary arguments, attachments, prompts, credentials or raw logs.
+  StructuredValue arguments = 7;
+  StructuredValue result = 8;
+  int64 updated_ms = 9;
+  // Positive durable observation journal order, in the SAME monotonic domain as
+  // Invocation.observation_revision. Advances for every visible operation
+  // mutation, including completion/uncertainty; immutable cursor remains INSERT
+  // order. Same operation ID + revision has identical fields in ListOperations
+  // and watch; list rows use the consistent versioned observation view. Clients
+  // ignore older per-ID revisions. Lossless uint64, no adjacency/timestamp or
+  // execution/retry semantics; never a substitute for opaque watch cursors.
+  uint64 observation_revision = 10;
+}
+message ListOperationsRequest {
+  string invocation_id = 1;
+  uint64 after_cursor = 2;
+  uint32 limit = 3;
+}
+message ListOperationsResponse {
+  repeated Operation operations = 1;
+  uint64 next_cursor = 2;
+}
+message CancelInvocationRequest {
+  string invocation_id = 1;
+}
+message CancelInvocationResponse {
+  // Acknowledges cancellation request, NOT successful cleanup or effect rollback.
+  InvocationStatus status = 1;
+}
+message ReadTextResultRequest {
+  string invocation_id = 1;
+  string result_id = 2;
+  uint64 offset = 3;
+  uint32 max_bytes = 4;
+}
+message ReadTextResultResponse {
+  // <=65536 raw UTF-8 octets; codepoints may span chunks. Offset==size is EOF;
+  // offset>size is invalid. Durable text is independent of binary lease expiry.
+  bytes data = 1;
+  uint64 next_offset = 2;
+  bool eof = 3;
+}
+
+message Pcm16Le {
+  uint32 sample_rate = 1;
+  uint32 channels = 2;
+}
+message TextFormat {}
+message StreamOpen {
+  string port = 1;
+  string stream_id = 2;
+  // Input port and format MUST exactly match its pinned InteractionOpen input
+  // declaration; no undeclared input or post-admission format substitution.
+  oneof format {
+    // Exact rate 8000..48000 Hz, channels 1..8; no implicit resampling/conversion.
+    Pcm16Le pcm16le = 3;
+    TextFormat text = 4;
+  }
+}
+enum TextMutation {
+  TEXT_MUTATION_UNSPECIFIED = 0;
+  TEXT_MUTATION_APPEND = 1;
+  TEXT_MUTATION_REPLACE = 2;
+}
+message TextRevision {
+  string segment_id = 1;
+  TextMutation mutation = 2;
+  string text = 3;
+  // Stable segment freezes forever after this update. Close requires all committed.
+  bool committed = 4;
+}
+message StreamChunk {
+  string stream_id = 1;
+  // Strict zero-based per-stream order. Duplicate/gapped sequences reject.
+  uint64 sequence = 2;
+  oneof payload {
+    // <=65536 bytes, complete PCM frames matching the immutable open format.
+    bytes audio = 3;
+    // Segment ID plus text <=65536 bytes, separately from protobuf envelope size.
+    TextRevision text = 4;
+  }
+}
+message StreamClose {
+  string stream_id = 1;
+  // Exact next sequence, closes once after all prior chunks. No writes after close.
+  uint64 next_sequence = 2;
+}
+message BlobInput {
+  string port = 1;
+  // Public committed identity mapped by authenticated invocation scope, not a path,
+  // filesystem store ID, engine handle, URL, or bearer authorization grant.
+  // MUST belong to this same authenticated invocation AND declared upload port;
+  // Commit verifies exact declared size/digest and, for images, allowed format,
+  // MIME and minimum signature only, not full image validity. Providers decode
+  // images and may reject malformed data; no local dimension/pixel limit applies.
+  string blob_id = 2;
+}
+message InputFinish {}
+message InteractionCancel {}
+message InputEvent {
+  oneof event {
+    StreamOpen open = 1;
+    StreamChunk chunk = 2;
+    StreamClose close = 3;
+    BlobInput blob = 4;
+    // All required input streams must be closed. Finish is NOT cancel/release.
+    InputFinish finish = 5;
+    InteractionCancel cancel = 6;
+  }
+}
+// Finite binary metadata pinned before HostFactory preflight, not payload or
+// proof of validation/capability. Exact declared size is required for public
+// interaction inputs even though the private storage foundation also supports
+// unknown-length uploads. Metadata must satisfy the admitted definition and host
+// policy: files <=64 MiB, images <=20 MiB; helper consumption separately <=8 MiB.
+message BinaryInputDeclaration {
+  string display_name = 1;
+  string content_type = 2;
+  // Presence required; zero is distinct from absent and allowed only if storage
+  // and the pinned port/purpose policy permit an empty object.
+  optional uint64 declared_bytes = 3;
+  // When present, exactly 32 bytes. Commit verifies the actual digest.
+  optional bytes expected_sha256 = 4;
+  // Required matching purpose, not inferred from MIME. Files remain inert;
+  // PNG/JPEG/WebP claims require matching MIME and minimum signature checks only,
+  // not full validity. Providers decode and may reject malformed images; the
+  // server neither decodes images nor enforces dimension/pixel limits.
+  oneof purpose {
+    FilePurpose file = 5;
+    ImageFormat image = 6;
+  }
+}
+// One present input port, separate from closed business parameters. Host creates
+// cold stream readers or pins binary metadata before preflight. No caller-supplied
+// invocation/principal/authority and no payload is carried here.
+message InputDeclaration {
+  string port = 1;
+  // Required matching input media and exact allowed format in the pinned
+  // definition. Unspecified image purpose, absent oneof and invalid PCM fail.
+  // Live audio/text lengths need not be known; their admitted format is immutable
+  // and must exactly match subsequent StreamOpen. Outputs remain host-selected.
+  oneof format {
+    Pcm16Le pcm16le = 2;
+    TextFormat text = 3;
+    BinaryInputDeclaration binary = 4;
+  }
+}
+message InteractionOpen {
+  InvocationSelection selection = 1;
+  // At most 32 unique known input ports, each <=128 UTF-8 bytes. Declare every
+  // present input, including all required inputs, BEFORE preflight/admission.
+  // Missing required, duplicate/unknown/output ports, default/unknown purpose,
+  // absent finite size or metadata/format mismatch reject before admission or
+  // effects. Optional ports may be absent, but cannot be invented after admission.
+  // Complete open is bounded by discovered input_batch_bytes before decoding.
+  repeated InputDeclaration inputs = 2;
+}
+message InteractRequest {
+  // First message MUST be open, exactly once; subsequent messages MUST be input.
+  oneof frame {
+    InteractionOpen open = 1;
+    InputEvent input = 2;
+  }
+}
+message InteractionAccepted {
+  // Service-generated UUID, returned only after durable admission commit. The
+  // transport registers pending ownership before invoke/preflight, using trusted
+  // InvocationBinding to bind cold streams, never correlation or client IDs.
+  string invocation_id = 1;
+  string revision = 2;
+  ServerLimits limits = 3;
+}
+enum RejectionCode {
+  REJECTION_CODE_UNSPECIFIED = 0;
+  REJECTION_CODE_INVALID = 1;
+  REJECTION_CODE_DENIED = 2;
+  REJECTION_CODE_UNSUPPORTED = 3;
+  REJECTION_CODE_BUSY = 4;
+  REJECTION_CODE_STALE = 5;
+  REJECTION_CODE_UNAVAILABLE = 6;
+}
+message InteractionRejected {
+  RejectionCode code = 1;
+  // Trusted bounded classification only; never source, transcript or raw error.
+  string reason = 2;
+}
+message BlobOutput {
+  string port = 1;
+  BlobDescriptor blob = 2;
+  // Live output only, excluded from durable history and snapshots.
+  BinaryOutputCredentials output_grant = 3;
+}
+message InteractionTerminal {
+  InvocationStatus status = 1;
+  StructuredValue result = 2;
+  bool cleanup_complete = 3;
+  repeated TextResultDescriptor text_results = 4;
+}
+// Exactly one accepted/rejected first. Rejection is followed by clean EOF only.
+// After acceptance: output opens/chunks/closes/blob descriptors, exactly one
+// terminal, then clean EOF. Transport EOF without terminal is failure. Success
+// requires required output closes, committed text, producer/owner join and verified
+// cleanup; the consumer additionally verifies clean EOF and its own capture join.
+message OutputEvent {
+  oneof event {
+    InteractionAccepted accepted = 1;
+    InteractionRejected rejected = 2;
+    StreamOpen open = 3;
+    StreamChunk chunk = 4;
+    StreamClose close = 5;
+    BlobOutput blob = 6;
+    InteractionTerminal terminal = 7;
+  }
+}
+message InteractResponse {
+  OutputEvent output = 1;
+}
+
+// Sensitive bearer-like data: MUST be redacted from Debug/telemetry/errors and
+// excluded from URLs, snapshots, history and persistence. Generated Debug is NOT
+// safe for logging these messages. Each call additionally requires current auth,
+// matching invocation, principal, server generation and live secret ownership.
+message AttachmentCredentials {
+  string attachment_id = 1;
+  // Cryptographically random, 32..64 bytes; compared without timing disclosure.
+  bytes secret = 2;
+  string invocation_id = 3;
+  string generation = 4;
+}
+message OpenAttachmentRequest {
+  InteractionOpen open = 1;
+}
+message OpenAttachmentResponse {
+  oneof admission {
+    AttachmentAdmission accepted = 1;
+    InteractionRejected rejected = 2;
+  }
+}
+message AttachmentAdmission {
+  InteractionAccepted invocation = 1;
+  AttachmentCredentials credentials = 2;
+  // Wall-clock estimates for presentation; enforcement uses monotonic host time.
+  int64 lease_expires_ms = 3;
+  int64 absolute_expires_ms = 4;
+  int64 attach_by_ms = 5;
+}
+message SendInputBatchRequest {
+  AttachmentCredentials credentials = 1;
+  // Strict zero-based batch sequence. Serialize sends. No automatic resend after
+  // ambiguous acknowledgment; no new start after lost Open acknowledgment.
+  uint64 sequence = 2;
+  // Entire batch bounded by discovered encoded-byte AND event-count limits.
+  // Validated atomically; a failed/ambiguous dispatch is not retry authority.
+  repeated InputEvent events = 3;
+}
+message SendInputBatchResponse {
+  // Acknowledges the entire ordered batch admitted to bounded input ownership,
+  // not successful inference/effects or invocation completion.
+  uint64 accepted_sequence = 1;
+}
+message WatchLiveOutputRequest {
+  AttachmentCredentials credentials = 1;
+}
+message WatchLiveOutputResponse {
+  // Same first/terminal/EOF rules as Interact. Exactly one output subscriber;
+  // no resume cursor/replay. Output drop cancels the SAME invocation owner.
+  OutputEvent output = 1;
+}
+message RenewAttachmentRequest {
+  AttachmentCredentials credentials = 1;
+}
+message RenewAttachmentResponse {
+  // Explicit finite renewal, never beyond the original absolute expiry.
+  int64 lease_expires_ms = 1;
+  int64 absolute_expires_ms = 2;
+}
+enum AttachmentCloseMode {
+  ATTACHMENT_CLOSE_MODE_UNSPECIFIED = 0;
+  ATTACHMENT_CLOSE_MODE_FINISH_INPUT = 1;
+  ATTACHMENT_CLOSE_MODE_RELEASE_OWNER = 2;
+  ATTACHMENT_CLOSE_MODE_CANCEL = 3;
+}
+message CloseAttachmentRequest {
+  AttachmentCredentials credentials = 1;
+  // FINISH_INPUT preserves output ownership; RELEASE_OWNER/CANCEL cancel and
+  // join. Control, renewal and cancellation MUST bypass saturated data queues.
+  AttachmentCloseMode mode = 2;
+}
+message CloseAttachmentResponse {
+  InvocationStatus status = 1;
+  bool cleanup_complete = 2;
+}
+
+enum ImageFormat {
+  IMAGE_FORMAT_UNSPECIFIED = 0;
+  IMAGE_FORMAT_PNG = 1;
+  IMAGE_FORMAT_JPEG = 2;
+  IMAGE_FORMAT_WEBP = 3;
+}
+// Legacy metadata retained for wire compatibility, not trusted image facts.
+// The current server does not populate BlobMetadata.image or decode dimensions.
+// Presence and values must not govern client security acceptance.
+message ImageInfo {
+  ImageFormat format = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+}
+message BlobMetadata {
+  // Display-only: <=255 bytes, no separators/controls/URLs/traversal.
+  string display_name = 1;
+  string content_type = 2;
+  uint64 bytes = 3;
+  // Exactly 32 digest bytes, not base64-in-JSON.
+  bytes sha256 = 4;
+  // Legacy optional metadata; unset by the current server. Presence does not
+  // attest full image validity or trusted dimensions and must not govern client
+  // security acceptance. Image checks cover allowed format/MIME/minimum signature
+  // only; providers decode and may reject malformed images.
+  ImageInfo image = 5;
+}
+message BlobDescriptor {
+  string blob_id = 1;
+  BlobMetadata metadata = 2;
+  // Observation-time remaining monotonic validity, NOT UTC or authority. Output
+  // transfer uses a fixed 15-minute NONrenewable lease. History retains metadata
+  // only; expiry/restart never reconstructs bytes or reader authority. Absent for
+  // invocation-owned input, zero for unavailable output. Never restart this TTL.
+  optional uint64 remaining_validity_ms = 3;
+}
+// Sensitive process-lifetime output grant. Same redaction rules as attachment
+// credentials; bound to current auth principal, durable invocation, output port,
+// public blob mapping and process incarnation. Registry owns the opaque Rust
+// OutputLease through teardown/expiry; history IDs cannot reconstruct it.
+message BinaryOutputCredentials {
+  string invocation_id = 1;
+  string port = 2;
+  string blob_id = 3;
+  string generation = 4;
+  bytes secret = 5;
+}
+// Single-use stream admission authority; current auth and complete binding still
+// required. Exactly one active consumer per output grant. Never log/persist it.
+message BlobReaderCredentials {
+  string invocation_id = 1;
+  string reader_id = 2;
+  string generation = 3;
+  bytes secret = 4;
+}
+message FilePurpose {}
+message BeginBlobUploadRequest {
+  string invocation_id = 1;
+  string display_name = 2;
+  string content_type = 3;
+  optional uint64 declared_bytes = 4;
+  optional bytes expected_sha256 = 5;
+  // Required purpose. Files <=64 MiB remain inert; images <=20 MiB require allowed
+  // PNG/JPEG/WebP format, matching MIME and minimum signature checks only, not
+  // full validity. No local dimension/pixel limit applies. Providers decode and
+  // may reject malformed images. Helper byte limits are separately smaller.
+  oneof purpose {
+    FilePurpose file = 6;
+    ImageFormat image = 7;
+  }
+  // Required exact admitted binary input declaration port. All repeated metadata
+  // (including size/digest presence and purpose) MUST EXACTLY match its pinned
+  // preflight declaration. Missing/unknown ports or late mismatches fail upload
+  // before consumption/effects; no new post-admission input may be invented.
+  // Bytes remain quarantined until commit verifies exact declared size, optional
+  // digest and, for images, the format/MIME/minimum signature checks above.
+  // BlobInput must use this same port.
+  string port = 8;
+}
+message BeginBlobUploadResponse {
+  // Public scope-bound quarantine identity; not private store identity/authority.
+  string upload_id = 1;
+  uint32 chunk_bytes = 2;
+}
+message AppendBlobUploadRequest {
+  string invocation_id = 1;
+  string upload_id = 2;
+  uint64 sequence = 3;
+  uint64 offset = 4;
+  // 1..65536 bytes, exact ordered append. Duplicates/gaps fail; do not retry
+  // automatically on failure/lost acknowledgment. No partial upload consumption.
+  bytes data = 5;
+}
+message AppendBlobUploadResponse {
+  uint64 accepted_sequence = 1;
+  uint64 next_offset = 2;
+}
+message CommitBlobUploadRequest {
+  string invocation_id = 1;
+  string upload_id = 2;
+  uint64 next_sequence = 3;
+  uint64 bytes = 4;
+}
+message CommitBlobUploadResponse {
+  BlobDescriptor blob = 1;
+}
+message CancelBlobUploadRequest {
+  string invocation_id = 1;
+  string upload_id = 2;
+}
+message CancelBlobUploadResponse {}
+message OpenBlobReadRequest {
+  // Required even for a completed output lease: authorize principal against the
+  // durable invocation, then resolve this generation's public blob mapping.
+  string invocation_id = 1;
+  oneof access {
+    // Only while the authenticated invocation still owns the committed input.
+    string input_blob_id = 2;
+    BinaryOutputCredentials output_grant = 3;
+  }
+}
+message OpenBlobReadResponse {
+  // Opens at the beginning only, no offset/seek/resumption contract.
+  BlobReaderCredentials credentials = 1;
+  BlobDescriptor blob = 2;
+}
+message ReadBlobRequest {
+  BlobReaderCredentials credentials = 1;
+  // 1..65536 per sequential chunk. Ownership and active lease expiry checked at
+  // every chunk boundary, including stalled transfers. No automatic retry or
+  // output resumption; drop revokes this reader and releases its credit.
+  uint32 max_bytes = 2;
+}
+message ReadBlobResponse {
+  bytes data = 1;
+  // Strict zero-based chunk sequence, detects truncation/reordering, not replay.
+  uint64 sequence = 2;
+  // Exactly one final EOF frame followed by clean transport EOF; premature
+  // transport EOF or lease expiry is failure, never a successful short download.
+  bool eof = 3;
+}
+message CloseBlobReadRequest {
+  BlobReaderCredentials credentials = 1;
+}
+message CloseBlobReadResponse {}

@@ -22,7 +22,6 @@ service SessionService {
   rpc GetTimeline(GetTimelineRequest) returns (GetTimelineResponse);
   rpc WatchTimeline(WatchTimelineRequest) returns (stream WatchTimelineResponse);
   rpc SubmitUserMessage(SubmitUserMessageRequest) returns (SubmitUserMessageResponse);
-  rpc RespondExternalRequest(RespondExternalRequestRequest) returns (RespondExternalRequestResponse);
   rpc InterruptSession(InterruptSessionRequest) returns (InterruptSessionResponse);
   rpc RollbackSession(RollbackSessionRequest) returns (RollbackSessionResponse);
   rpc ContinueSession(ContinueSessionRequest) returns (ContinueSessionResponse);
@@ -236,15 +235,7 @@ message SubmitUserMessageRequest {
 
 message SubmitUserMessageResponse {}
 
-message RespondExternalRequestRequest {
-  string session_id = 1;
-  string request_id = 2;
 
-  // JSON payload encoded as UTF-8 JSON until response schemas stabilize.
-  string response_json = 3;
-}
-
-message RespondExternalRequestResponse {}
 
 message InterruptSessionRequest {
   string session_id = 1;
@@ -366,8 +357,8 @@ enum TimelineEventKind {
   TIMELINE_EVENT_KIND_CONTENT_DELTA = 2;
   TIMELINE_EVENT_KIND_ITEM_UPDATED = 3;
   TIMELINE_EVENT_KIND_ITEM_FINISHED = 4;
-  TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_OPENED = 5;
-  TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_RESOLVED = 6;
+  reserved 5, 6;
+  reserved "TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_OPENED", "TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_RESOLVED";
   TIMELINE_EVENT_KIND_SESSION_STATUS_CHANGED = 7;
 }
 
@@ -380,7 +371,8 @@ enum TimelineStatus {
   TIMELINE_STATUS_RUNNING_TOOL = 5;
   TIMELINE_STATUS_PENDING = 6;
   TIMELINE_STATUS_AWAITING_TOOL_RESULTS = 7;
-  TIMELINE_STATUS_AWAITING_EXTERNAL_INPUT = 8;
+  reserved 8;
+  reserved "TIMELINE_STATUS_AWAITING_EXTERNAL_INPUT";
   TIMELINE_STATUS_INTERRUPTED = 9;
   TIMELINE_STATUS_RESOLVED = 10;
   TIMELINE_STATUS_FINISHED = 11;
@@ -390,13 +382,14 @@ enum TimelineStatus {
 }
 
 message TimelineContent {
+  reserved 6;
+  reserved "external_request";
   oneof content {
     EmptyTimelineContent empty = 1;
     TextDeltaTimelineContent text_delta = 2;
     TextSnapshotTimelineContent text_snapshot = 3;
     ToolCallTimelineContent tool_call = 4;
     ToolResultTimelineContent tool_result = 5;
-    ExternalRequestTimelineContent external_request = 6;
     ContentRefTimelineContent content_ref = 7;
     JsonTimelineContent json = 8;
   }
@@ -425,9 +418,6 @@ message ToolResultTimelineContent {
   bool error = 4;
 }
 
-message ExternalRequestTimelineContent {
-  ExternalRequest request = 1;
-}
 
 message ContentRefTimelineContent {
   string content_id = 1;
@@ -495,7 +485,8 @@ enum SessionProgressPhase {
   SESSION_PROGRESS_PHASE_COMPLETION_BARRIER = 3;
   SESSION_PROGRESS_PHASE_PAUSED = 4;
   SESSION_PROGRESS_PHASE_AWAITING_TOOL_RESULTS = 5;
-  SESSION_PROGRESS_PHASE_AWAITING_EXTERNAL_INPUT = 6;
+  reserved 6;
+  reserved "SESSION_PROGRESS_PHASE_AWAITING_EXTERNAL_INPUT";
   SESSION_PROGRESS_PHASE_INTERRUPTED = 7;
   SESSION_PROGRESS_PHASE_FINISHED = 8;
   SESSION_PROGRESS_PHASE_FAILED = 9;
@@ -512,7 +503,8 @@ enum SessionRunStage {
 
 message SessionCapabilities {
   SessionPromptDisposition prompt_disposition = 1;
-  bool can_respond_external_request = 2;
+  reserved 2;
+  reserved "can_respond_external_request";
   bool can_interrupt = 3;
 }
 
@@ -599,13 +591,15 @@ enum SessionPhase {
 message Suspension {
   SuspensionKind kind = 1;
   repeated PendingWork work = 2;
-  ExternalRequest request = 3;
+  reserved 3;
+  reserved "request";
 }
 
 enum SuspensionKind {
   SUSPENSION_KIND_UNSPECIFIED = 0;
   SUSPENSION_KIND_AWAITING_TOOL_RESULTS = 1;
-  SUSPENSION_KIND_AWAITING_EXTERNAL_INPUT = 2;
+  reserved 2;
+  reserved "SUSPENSION_KIND_AWAITING_EXTERNAL_INPUT";
   SUSPENSION_KIND_INTERRUPTED = 3;
 }
 
@@ -621,22 +615,4 @@ enum PendingWorkStatus {
   PENDING_WORK_STATUS_CANCELED = 2;
   PENDING_WORK_STATUS_FINISHED = 3;
   PENDING_WORK_STATUS_FAILED = 4;
-}
-
-message ExternalRequest {
-  string id = 1;
-  ExternalRequestKind kind = 2;
-  optional string tool_call_id = 3;
-  string prompt = 4;
-
-  // JSON payload encoded as UTF-8 JSON until request payload protos stabilize.
-  string payload_json = 5;
-}
-
-enum ExternalRequestKind {
-  EXTERNAL_REQUEST_KIND_UNSPECIFIED = 0;
-  EXTERNAL_REQUEST_KIND_PERMISSION = 1;
-  EXTERNAL_REQUEST_KIND_QUESTION = 2;
-  EXTERNAL_REQUEST_KIND_TOOL_INPUT = 3;
-  EXTERNAL_REQUEST_KIND_CUSTOM = 4;
 }
