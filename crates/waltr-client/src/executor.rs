@@ -7,9 +7,9 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::transport::{
-    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, RoutineDefinitionWatchStream,
+    ConfigWatchUpdate, DefaultGrpcTransport, RoutineDefinitionWatchStream,
     RoutineInvocationWatchStream, SessionTimelineWatchStream, SessionWatchStream,
-    StatusWatchStream,
+    StatusWatchStream, WaltrTransport,
 };
 use crate::{
     AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientError, ClientEvent,
@@ -221,7 +221,7 @@ impl GrpcEffectExecutor {
     pub(crate) async fn watch_routine_invocation_updates(
         &self,
         request_id: String,
-        after_sequence: Option<u64>,
+        after_sequence: Option<String>,
         metadata_filters: std::collections::BTreeMap<String, String>,
     ) -> Result<RoutineInvocationWatchStream, ClientError> {
         self.transport
@@ -268,6 +268,19 @@ impl GrpcEffectExecutor {
     {
         Box::pin(async move {
             match effect {
+                ClientEffect::Interaction(effect) => {
+                    use crate::{InteractionEffect as E, InteractionEvent as V};
+                    let event = match effect {
+                        E::Respond { identity, epoch, request } => V::Responded { identity, epoch, error: self.transport.respond_interaction(request).await.err() },
+                        E::Refresh { session_id, epoch, baseline } => match self.transport.get_interactions(session_id.clone()).await {
+                            Ok(snapshot) => V::Refreshed { session_id, epoch, baseline, snapshot },
+                            Err(error) => V::RefreshFailed { session_id, epoch, baseline, error },
+                        },
+                        E::Sleep { session_id, epoch } => { sleep(1_000).await; V::Retry { session_id, epoch } }
+                        E::Watch { session_id, epoch } => V::Failed { session_id, epoch, error: ClientError::new("Interaction watch requires runtime ownership") },
+                    };
+                    vec![ClientEvent::Interaction(event)]
+                }
                 ClientEffect::McpApp(effect) => {
                     use crate::{McpAppEffect, McpAppEvent};
                     let event = match effect {
@@ -448,6 +461,7 @@ impl GrpcEffectExecutor {
                     operation_key,
                     request_id,
                     routine_name,
+                    routine_revision,
                     trigger_name,
                     source_session_id,
                     inputs,
@@ -456,9 +470,10 @@ impl GrpcEffectExecutor {
                     .start_manual_routine(StartManualRoutineArgs {
                         request_id: request_id.clone(),
                         routine_name,
+                        routine_revision,
                         trigger_name,
                         source_session_id,
-                        inputs,
+                        parameters: inputs,
                     })
                     .await
                 {
@@ -477,6 +492,22 @@ impl GrpcEffectExecutor {
                         })]
                     }
                     Err(error) => vec![ClientEvent::Routine(RoutineEvent::StartFailed {
+                        operation_key,
+                        request_id,
+                        error,
+                    })],
+                },
+                ClientEffect::Routine(RoutineEffect::Request {
+                    operation_key,
+                    request_id,
+                    command,
+                }) => match self.transport.request_routine(command).await {
+                    Ok(result) => vec![ClientEvent::Routine(RoutineEvent::Requested {
+                        operation_key,
+                        request_id,
+                        result,
+                    })],
+                    Err(error) => vec![ClientEvent::Routine(RoutineEvent::RequestFailed {
                         operation_key,
                         request_id,
                         error,
@@ -519,7 +550,7 @@ impl GrpcEffectExecutor {
                     Ok(detail) => vec![ClientEvent::Routine(RoutineEvent::DetailLoaded {
                         request_id,
                         invocation_id,
-                        detail,
+                        detail: Box::new(detail),
                     })],
                     Err(error) => vec![ClientEvent::Routine(RoutineEvent::DetailFailed {
                         request_id,
@@ -834,26 +865,6 @@ impl GrpcEffectExecutor {
                     })],
                     Err(error) => vec![ClientEvent::Session(
                         SessionEvent::UserMessageSubmitFailed {
-                            operation_key,
-                            error,
-                        },
-                    )],
-                },
-                ClientEffect::Session(SessionEffect::RespondExternalRequest {
-                    operation_key,
-                    session_id,
-                    request_id,
-                    response_json,
-                }) => match self
-                    .transport
-                    .respond_external_request(session_id, request_id, response_json)
-                    .await
-                {
-                    Ok(()) => vec![ClientEvent::Session(
-                        SessionEvent::ExternalRequestResponded { operation_key },
-                    )],
-                    Err(error) => vec![ClientEvent::Session(
-                        SessionEvent::ExternalRequestRespondFailed {
                             operation_key,
                             error,
                         },

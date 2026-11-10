@@ -73,7 +73,7 @@ pub struct SessionView {
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
-/// Stable associations derived from known session metadata keys.
+/// Presentation-only associations derived from untrusted session metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAssociationsView {
@@ -95,8 +95,8 @@ impl From<&BTreeMap<String, serde_json::Value>> for SessionAssociationsView {
         };
 
         Self {
-            task_parent_session_id: string_value("waltr.task.parent_session_id"),
-            task_description: string_value("waltr.task.description"),
+            task_parent_session_id: string_value("task.parent_session_id"),
+            task_description: string_value("task.description"),
             routine_invocation_id: string_value("waltr.routine.invocation_id"),
         }
     }
@@ -274,7 +274,6 @@ pub enum SessionProgressPhaseView {
     CompletionBarrier,
     Paused,
     AwaitingToolResults,
-    AwaitingExternalInput,
     Interrupted,
     Finished,
     Failed,
@@ -299,8 +298,6 @@ pub enum SessionRunStageView {
 pub struct SessionCapabilitiesView {
     /// How a newly submitted prompt will be handled.
     pub prompt_disposition: SessionPromptDispositionView,
-    /// Whether the pending external request can be answered now.
-    pub can_respond_external_request: bool,
     /// Whether a real process-local active run can be interrupted.
     pub can_interrupt: bool,
 }
@@ -325,8 +322,6 @@ pub enum SessionSuspensionKindView {
     Unspecified,
     /// Session is waiting for outstanding tool results.
     AwaitingToolResults,
-    /// Session is waiting for external input.
-    AwaitingExternalInput,
     /// Session execution was interrupted.
     Interrupted,
     /// Suspension kind is unknown to this client version.
@@ -499,8 +494,6 @@ pub enum TimelineEventKindView {
     ContentDelta,
     ItemUpdated,
     ItemFinished,
-    ExternalRequestOpened,
-    ExternalRequestResolved,
     SessionStatusChanged,
     Unknown,
 }
@@ -519,7 +512,6 @@ pub enum TimelineStatusView {
     RunningTool,
     Pending,
     AwaitingToolResults,
-    AwaitingExternalInput,
     Interrupted,
     Resolved,
     Finished,
@@ -551,9 +543,6 @@ pub enum TimelineContentView {
         content: String,
         error: bool,
     },
-    ExternalRequest {
-        request: Option<ExternalRequestView>,
-    },
     ContentRef {
         content_id: String,
         bytes: u64,
@@ -562,16 +551,6 @@ pub enum TimelineContentView {
         value_json: String,
     },
     Unknown,
-}
-
-/// Stable external request view embedded in timeline content.
-#[allow(missing_docs)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalRequestView {
-    pub id: String,
-    pub kind: i32,
-    pub payload_json: String,
 }
 
 impl From<SessionSummary> for SessionView {
@@ -670,7 +649,6 @@ impl From<i32> for SessionProgressPhaseView {
             Ok(SessionProgressPhase::CompletionBarrier) => Self::CompletionBarrier,
             Ok(SessionProgressPhase::Paused) => Self::Paused,
             Ok(SessionProgressPhase::AwaitingToolResults) => Self::AwaitingToolResults,
-            Ok(SessionProgressPhase::AwaitingExternalInput) => Self::AwaitingExternalInput,
             Ok(SessionProgressPhase::Interrupted) => Self::Interrupted,
             Ok(SessionProgressPhase::Finished) => Self::Finished,
             Ok(SessionProgressPhase::Failed) => Self::Failed,
@@ -695,7 +673,6 @@ impl From<SessionCapabilities> for SessionCapabilitiesView {
     fn from(capabilities: SessionCapabilities) -> Self {
         Self {
             prompt_disposition: capabilities.prompt_disposition.into(),
-            can_respond_external_request: capabilities.can_respond_external_request,
             can_interrupt: capabilities.can_interrupt,
         }
     }
@@ -795,7 +772,6 @@ impl From<i32> for SessionSuspensionKindView {
         match SuspensionKind::try_from(value) {
             Ok(SuspensionKind::Unspecified) => Self::Unspecified,
             Ok(SuspensionKind::AwaitingToolResults) => Self::AwaitingToolResults,
-            Ok(SuspensionKind::AwaitingExternalInput) => Self::AwaitingExternalInput,
             Ok(SuspensionKind::Interrupted) => Self::Interrupted,
             Err(_) => Self::Unknown,
         }
@@ -945,13 +921,6 @@ impl From<TimelineContent> for TimelineContentView {
                 content: content.content,
                 error: content.error,
             },
-            Some(timeline_content::Content::ExternalRequest(content)) => Self::ExternalRequest {
-                request: content.request.map(|request| ExternalRequestView {
-                    id: request.id,
-                    kind: request.kind,
-                    payload_json: request.payload_json,
-                }),
-            },
             Some(timeline_content::Content::ContentRef(content)) => Self::ContentRef {
                 content_id: content.content_id,
                 bytes: content.bytes,
@@ -971,8 +940,6 @@ impl From<i32> for TimelineEventKindView {
             Ok(TimelineEventKind::ContentDelta) => Self::ContentDelta,
             Ok(TimelineEventKind::ItemUpdated) => Self::ItemUpdated,
             Ok(TimelineEventKind::ItemFinished) => Self::ItemFinished,
-            Ok(TimelineEventKind::ExternalRequestOpened) => Self::ExternalRequestOpened,
-            Ok(TimelineEventKind::ExternalRequestResolved) => Self::ExternalRequestResolved,
             Ok(TimelineEventKind::SessionStatusChanged) => Self::SessionStatusChanged,
             Err(_) => Self::Unknown,
         }
@@ -991,7 +958,6 @@ impl From<i32> for TimelineStatusView {
             Ok(TimelineStatus::RunningTool) => Self::RunningTool,
             Ok(TimelineStatus::Pending) => Self::Pending,
             Ok(TimelineStatus::AwaitingToolResults) => Self::AwaitingToolResults,
-            Ok(TimelineStatus::AwaitingExternalInput) => Self::AwaitingExternalInput,
             Ok(TimelineStatus::Interrupted) => Self::Interrupted,
             Ok(TimelineStatus::Resolved) => Self::Resolved,
             Ok(TimelineStatus::Finished) => Self::Finished,
@@ -1070,11 +1036,11 @@ mod tests {
     fn session_view_projects_known_associations_and_preserves_their_metadata() {
         let fields = BTreeMap::from([
             (
-                "waltr.task.parent_session_id".to_owned(),
+                "task.parent_session_id".to_owned(),
                 proto_value(Kind::StringValue("parent-1".to_owned())),
             ),
             (
-                "waltr.task.description".to_owned(),
+                "task.description".to_owned(),
                 proto_value(Kind::StringValue("Investigate failure".to_owned())),
             ),
             (
@@ -1097,7 +1063,7 @@ mod tests {
             }
         );
         assert_eq!(
-            view.metadata["waltr.task.description"],
+            view.metadata["task.description"],
             serde_json::json!("Investigate failure")
         );
     }
@@ -1108,11 +1074,11 @@ mod tests {
             metadata: Some(prost_types::Struct {
                 fields: BTreeMap::from([
                     (
-                        "waltr.task.parent_session_id".to_owned(),
+                        "task.parent_session_id".to_owned(),
                         proto_value(Kind::NumberValue(42.0)),
                     ),
                     (
-                        "waltr.task.description".to_owned(),
+                        "task.description".to_owned(),
                         proto_value(Kind::BoolValue(true)),
                     ),
                     (
@@ -1130,15 +1096,36 @@ mod tests {
     }
 
     #[test]
+    fn session_view_does_not_project_legacy_task_audit_keys() {
+        let view = SessionView::from(SessionSummary {
+            metadata: Some(prost_types::Struct {
+                fields: BTreeMap::from([
+                    (
+                        "waltr.task.parent_session_id".to_owned(),
+                        proto_value(Kind::StringValue("legacy-parent".to_owned())),
+                    ),
+                    (
+                        "waltr.task.description".to_owned(),
+                        proto_value(Kind::StringValue("Legacy description".to_owned())),
+                    ),
+                ]),
+            }),
+            ..SessionSummary::default()
+        });
+
+        assert_eq!(view.associations, SessionAssociationsView::default());
+        assert_eq!(
+            view.metadata["waltr.task.description"],
+            serde_json::json!("Legacy description")
+        );
+    }
+
+    #[test]
     fn session_status_view_projects_suspension_kinds() {
         for (kind, expected) in [
             (
                 SuspensionKind::AwaitingToolResults as i32,
                 SessionSuspensionKindView::AwaitingToolResults,
-            ),
-            (
-                SuspensionKind::AwaitingExternalInput as i32,
-                SessionSuspensionKindView::AwaitingExternalInput,
             ),
             (
                 SuspensionKind::Interrupted as i32,
@@ -1256,10 +1243,6 @@ mod tests {
                 SessionProgressPhaseView::AwaitingToolResults,
             ),
             (
-                SessionProgressPhase::AwaitingExternalInput,
-                SessionProgressPhaseView::AwaitingExternalInput,
-            ),
-            (
                 SessionProgressPhase::Interrupted,
                 SessionProgressPhaseView::Interrupted,
             ),
@@ -1352,7 +1335,6 @@ mod tests {
             }),
             capabilities: Some(SessionCapabilities {
                 prompt_disposition: SessionPromptDisposition::Queued as i32,
-                can_respond_external_request: true,
                 can_interrupt: true,
             }),
             ..SessionSummary::default()
@@ -1373,7 +1355,6 @@ mod tests {
             view.capabilities.prompt_disposition,
             SessionPromptDispositionView::Queued
         );
-        assert!(view.capabilities.can_respond_external_request);
         assert!(view.capabilities.can_interrupt);
     }
 
@@ -1399,7 +1380,6 @@ mod tests {
             view.capabilities.prompt_disposition,
             SessionPromptDispositionView::Unknown
         );
-        assert!(!view.capabilities.can_respond_external_request);
         assert!(!view.capabilities.can_interrupt);
     }
 

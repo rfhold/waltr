@@ -17,6 +17,12 @@ Waltr client is the shared state machine for clients to talk to the server.
 
 # Contracts
 
+Routine APIs use v2 exclusively. See [the shell API](README.md) for observation, form descriptors, media ownership, and transfers.
+Keep opaque watch cursors separate from admission order and per-record observation revisions.
+Never expose attachment secrets or output grants through snapshots, serialization, errors, or debug output.
+Keep media output concurrent with input. Normal input finish does not cancel the invocation.
+Keep native media futures caller-owned; a local task join and a remote cleanup proof represent different facts.
+
 Client interactivity should use reducer-style state transitions so TUI and web can share the same server data behavior.
 
 `AccessStatus`, access events, and access commands model Waltr login independently from provider/upstream-MCP `AuthTarget` authorization. Expiry/logout must clear protected snapshots, invalidate watch epochs, and prevent reconnect until credentials change; login restores status before interested child watches.

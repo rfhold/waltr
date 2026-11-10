@@ -408,7 +408,6 @@ fn known_method(service: &str, method: &str) -> Option<MethodAttributes> {
                 "GetTimeline",
                 "WatchTimeline",
                 "SubmitUserMessage",
-                "RespondExternalRequest",
                 "InterruptSession",
                 "RollbackSession",
                 "ContinueSession",
@@ -418,22 +417,38 @@ fn known_method(service: &str, method: &str) -> Option<MethodAttributes> {
                 "CloseSessionMcpApp",
             ]
         ),
-        "waltr.routine.v1.RoutineInteractionService" => service_methods!(
+        "waltr.session.v1.InteractionService" => service_methods!(
             method,
-            "waltr.routine.v1.RoutineInteractionService",
-            "routine_interaction",
-            ["Interact", "Run"]
+            "waltr.session.v1.InteractionService",
+            "interaction",
+            ["GetInteractions", "WatchInteractions", "RespondInteraction"]
         ),
-        "waltr.routine.v1.RoutineService" => service_methods!(
+        "waltr.routine.v2.RoutineService" => service_methods!(
             method,
-            "waltr.routine.v1.RoutineService",
+            "waltr.routine.v2.RoutineService",
             "routine",
             [
-                "WatchManualRoutines",
-                "StartManualRoutine",
-                "ListRoutineInvocations",
-                "GetRoutineInvocation",
-                "WatchRoutineInvocations",
+                "WatchDefinitions",
+                "StartInvocation",
+                "ListInvocations",
+                "GetInvocation",
+                "WatchInvocations",
+                "ListOperations",
+                "CancelInvocation",
+                "ReadTextResult",
+                "Interact",
+                "OpenAttachment",
+                "SendInputBatch",
+                "WatchLiveOutput",
+                "RenewAttachment",
+                "CloseAttachment",
+                "BeginBlobUpload",
+                "AppendBlobUpload",
+                "CommitBlobUpload",
+                "CancelBlobUpload",
+                "OpenBlobRead",
+                "ReadBlob",
+                "CloseBlobRead",
             ]
         ),
         _ => None,
@@ -647,7 +662,7 @@ mod tests {
         let spans = capture_spans(|| {
             let parent = tracing::info_span!("native.audio.operation");
             parent.in_scope(|| {
-                for method in ["Interact", "Run", "SECRET_UNKNOWN_METHOD"] {
+                for method in ["Interact", "OpenAttachment", "SECRET_UNKNOWN_METHOD"] {
                     let mut service = NativeTraceLayer.layer(ReadyService {
                         response: Some(response(
                             http::StatusCode::OK,
@@ -656,9 +671,7 @@ mod tests {
                         )),
                     });
                     let request = http::Request::builder()
-                        .uri(format!(
-                            "/waltr.routine.v1.RoutineInteractionService/{method}"
-                        ))
+                        .uri(format!("/waltr.routine.v2.RoutineService/{method}"))
                         .body(())
                         .unwrap();
                     let mut future = service.call(request);
@@ -676,14 +689,14 @@ mod tests {
             .unwrap();
         for (name, method, service) in [
             (
-                "routine_interaction.Interact",
+                "routine.Interact",
                 "Interact",
-                "waltr.routine.v1.RoutineInteractionService",
+                "waltr.routine.v2.RoutineService",
             ),
             (
-                "routine_interaction.Run",
-                "Run",
-                "waltr.routine.v1.RoutineInteractionService",
+                "routine.OpenAttachment",
+                "OpenAttachment",
+                "waltr.routine.v2.RoutineService",
             ),
             ("grpc.unknown", "unknown", "unknown"),
         ] {
@@ -853,17 +866,15 @@ mod tests {
 
         let known = method_attributes("/waltr.session.v1.SessionService/ListSessions");
         assert_eq!(known.operation, "session.ListSessions");
-        for method in ["Interact", "Run"] {
-            let known = method_attributes(&format!(
-                "/waltr.routine.v1.RoutineInteractionService/{method}"
-            ));
-            assert_eq!(known.service, "waltr.routine.v1.RoutineInteractionService");
+        for method in ["Interact", "OpenAttachment"] {
+            let known = method_attributes(&format!("/waltr.routine.v2.RoutineService/{method}"));
+            assert_eq!(known.service, "waltr.routine.v2.RoutineService");
             assert_eq!(known.method, method);
-            assert_eq!(known.operation, format!("routine_interaction.{method}"));
+            assert_eq!(known.operation, format!("routine.{method}"));
         }
         for path in [
             "/private.UserService/GetUser",
-            "/waltr.routine.v1.RoutineInteractionService/SECRET_UNKNOWN_METHOD",
+            "/waltr.routine.v2.RoutineService/SECRET_UNKNOWN_METHOD",
         ] {
             let unknown = method_attributes(path);
             assert_eq!(unknown.operation, "grpc.unknown");

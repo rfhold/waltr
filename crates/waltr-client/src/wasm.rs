@@ -17,11 +17,13 @@ use crate::{ClientCommand, ClientCommandRequest, ClientRuntime, ClientStateStrea
 mod interaction;
 
 #[wasm_bindgen(
-    inline_js = "export function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }"
+    inline_js = "export function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); } export function utcMs() { return Date.now(); }"
 )]
 unsafe extern "C" {
     #[wasm_bindgen(js_name = sleepMs)]
     async fn sleep_ms(milliseconds: u32);
+    #[wasm_bindgen(js_name=utcMs)]
+    fn utc_ms() -> f64;
 }
 
 /// Browser-facing shared reducer client.

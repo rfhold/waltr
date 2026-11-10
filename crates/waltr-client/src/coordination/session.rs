@@ -353,44 +353,6 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             state.set_session_submit_user_message_failed(operation_key, session_id, &error);
             ClientUpdate::default()
         }
-        SessionEvent::ExternalRequestRespondRequested {
-            operation_key,
-            session_id,
-            request_id,
-            response_json,
-        } => {
-            state.set_session_respond_external_request_loading(
-                operation_key.clone(),
-                session_id.clone(),
-                request_id.clone(),
-            );
-            ClientUpdate::with_effect(ClientEffect::Session(
-                SessionEffect::RespondExternalRequest {
-                    operation_key,
-                    session_id,
-                    request_id,
-                    response_json,
-                },
-            ))
-        }
-        SessionEvent::ExternalRequestResponded { operation_key } => {
-            let (session_id, request_id) = operation_session_and_request_id(state, &operation_key);
-            state.set_session_respond_external_request_ready(operation_key, session_id, request_id);
-            ClientUpdate::default()
-        }
-        SessionEvent::ExternalRequestRespondFailed {
-            operation_key,
-            error,
-        } => {
-            let (session_id, request_id) = operation_session_and_request_id(state, &operation_key);
-            state.set_session_respond_external_request_failed(
-                operation_key,
-                session_id,
-                request_id,
-                &error,
-            );
-            ClientUpdate::default()
-        }
         SessionEvent::InterruptRequested {
             operation_key,
             session_id,
@@ -619,17 +581,6 @@ fn operation_session_and_target(
     }
 }
 
-fn operation_session_and_request_id(state: &ClientState, operation_key: &str) -> (String, String) {
-    match state.operations.get(operation_key) {
-        Some(crate::ClientOperationState::SessionRespondExternalRequest {
-            session_id,
-            request_id,
-            ..
-        }) => (session_id.clone(), request_id.clone()),
-        _ => (String::new(), String::new()),
-    }
-}
-
 #[allow(clippy::semicolon_if_nothing_returned)]
 fn apply_watch_event(state: &mut ClientState, update: SessionWatchUpdate) {
     match update.event {
@@ -827,7 +778,6 @@ mod tests {
                 } else {
                     crate::SessionPromptDisposition::Immediate as i32
                 },
-                can_respond_external_request: queued_count == 0,
                 can_interrupt: queued_count > 0,
             }),
             ..crate::SessionSummary::default()
@@ -880,7 +830,6 @@ mod tests {
             capabilities.prompt_disposition,
             crate::SessionPromptDisposition::Immediate as i32
         );
-        assert!(capabilities.can_respond_external_request);
         assert!(!capabilities.can_interrupt);
     }
 
@@ -938,18 +887,12 @@ mod tests {
                 matches!(
                     operation,
                     crate::ClientOperationState::SessionSubmitUserMessage { .. }
-                        | crate::ClientOperationState::SessionRespondExternalRequest { .. }
                         | crate::ClientOperationState::SessionContinue { .. }
                 )
             })
             .expect("keyed operation");
         let (actual_session_id, failure) = match operation {
             crate::ClientOperationState::SessionSubmitUserMessage {
-                session_id,
-                authentication_failure,
-                ..
-            }
-            | crate::ClientOperationState::SessionRespondExternalRequest {
                 session_id,
                 authentication_failure,
                 ..
@@ -979,10 +922,6 @@ mod tests {
 
         let exposed = match crate::ClientOperationView::from(operation.clone()) {
             crate::ClientOperationView::SessionSubmitUserMessage {
-                authentication_failure,
-                ..
-            }
-            | crate::ClientOperationView::SessionRespondExternalRequest {
                 authentication_failure,
                 ..
             }
@@ -1016,27 +955,6 @@ mod tests {
         ));
         assert!(update.effects().is_empty());
         assert_failed_operation(&client, "submit-session", active_attempt.as_ref());
-    }
-
-    #[test]
-    fn failed_response_retains_outbound_auth_without_auth_effects() {
-        let mut client = Client::new();
-        seed_active_attempt(&mut client);
-        let active_attempt = client.state().auth.active_attempt.clone();
-        let update = client.respond_external_request("respond-session", "request", "{}");
-        let [ClientEffect::Session(SessionEffect::RespondExternalRequest { operation_key, .. })] =
-            update.effects()
-        else {
-            panic!("respond effect")
-        };
-        let update = client.apply(ClientEvent::Session(
-            SessionEvent::ExternalRequestRespondFailed {
-                operation_key: operation_key.clone(),
-                error: auth_error(),
-            },
-        ));
-        assert!(update.effects().is_empty());
-        assert_failed_operation(&client, "respond-session", active_attempt.as_ref());
     }
 
     #[test]

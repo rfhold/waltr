@@ -10,6 +10,8 @@ mod client;
 mod coordination;
 mod error;
 mod executor;
+mod interactions;
+pub use interactions::*;
 pub mod interaction;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
 mod native_access;
@@ -57,6 +59,41 @@ pub use error::{
 pub use executor::{
     ConfigChange, ConfigChangeStream, GrpcEffectExecutor, SessionChangeStream, StatusChangeStream,
 };
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
+pub use native_access::{
+    NativeAccessAction, NativeAccessBootstrap, NativeAccessConfig, NativeAccessCoordinator,
+    NativeAccessDiscoveryError, NativeAccessOutput, NativeAccessProgress,
+    NativeAuthorizationCallback, NativeCallbackPolicy, NativeLoopbackPolicy,
+    NativeRefreshTokenStore, NativeRefreshTokenStoreError, NonPersistentNativeRefreshTokenStore,
+    discover_native_access_config,
+};
+pub use routine::*;
+pub use transport::{
+    AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
+    GenericAuthAttemptStatus, InteractionWatchStream, RoutineDefinitionWatchStream, RoutineInteractionTransport,
+    RoutineInvocationWatchStream, SessionTimelinePage, SessionTimelineProjectionMode,
+    SessionTimelineWatchEvent, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
+    WaltrTransport,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
+pub use view::{
+    CatalogMatchConfidenceView, CatalogMatchSourceView, CatalogMatchView,
+    CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
+    CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSummaryView, ConfigView,
+    InferenceDefaultsView, InferenceProviderSettingsView,
+    InferenceSettingsMatchView, InferenceSettingsView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
+    ProviderView, SelectableAgentView, SessionAssociationsView, SessionCapabilitiesView,
+    SessionCoordinationPhaseView, SessionCoordinationReasonView, SessionCoordinationView,
+    SessionDictationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
+    SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
+    SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
+    TimelineStatusView, TimestampView,
+};
 pub use waltr::grpc::waltr::catalog::v1::{
     CatalogDefaultField, CatalogDriftField, CatalogDriftSeverity, CatalogMatch,
     CatalogMatchConfidence, CatalogModelCapabilitySummary, CatalogModelCostSummary,
@@ -75,7 +112,7 @@ pub use waltr::grpc::waltr::resource::v1::{
     ResourceOrigin, ResourceValue,
 };
 pub use waltr::grpc::waltr::session::v1::{
-    ExternalRequest, ExternalRequestKind, InferenceProviderSettings, InferenceSettings,
+    InferenceProviderSettings, InferenceSettings,
     InferenceSettingsMatch, InferenceSettingsRequest, ListAgentsResponse, PendingWork,
     PendingWorkStatus, ProjectedTimelineEvent, RollbackTarget, SearchSessionTemplatesRequest,
     SearchSessionTemplatesResponse, SelectableAgent, SessionCapabilities, SessionCoordinationPhase,
@@ -88,53 +125,6 @@ pub use waltr::grpc::waltr::session::v1::{
     search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
-#[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
-pub use native_access::{
-    NativeAccessAction, NativeAccessBootstrap, NativeAccessConfig, NativeAccessCoordinator,
-    NativeAccessDiscoveryError, NativeAccessOutput, NativeAccessProgress,
-    NativeAuthorizationCallback, NativeCallbackPolicy, NativeLoopbackPolicy,
-    NativeRefreshTokenStore, NativeRefreshTokenStoreError, NonPersistentNativeRefreshTokenStore,
-    discover_native_access_config,
-};
-pub use routine::{
-    ClientManualRoutineDefinition, ClientRoutineAdmission, ClientRoutineDefinitionSnapshot,
-    ClientRoutineEventKind, ClientRoutineFailure, ClientRoutineFieldViolation,
-    ClientRoutineInputDefinition, ClientRoutineInvocationDetail, ClientRoutineInvocationEvent,
-    ClientRoutineInvocationPage, ClientRoutineInvocationSnapshot, ClientRoutineInvocationStatus,
-    ClientRoutineInvocationSummary, ClientRoutineInvocationWatchUpdate, ClientRoutineResult,
-    ClientRoutineResultDefinition, ClientRoutineScope, ClientRoutineStartOutcome,
-    ClientRoutineTask, ClientRoutineTaskDescriptor, ClientRoutineTaskStatus,
-    ClientRoutineTriggerKind, ClientRoutineValidationFailure, ClientRoutineValue,
-    ClientRoutineValueType, MAX_RETAINED_ROUTINE_DETAILS, MAX_RETAINED_ROUTINE_INVOCATIONS,
-    MAX_RETAINED_ROUTINE_STARTS, ROUTINE_INVOCATION_SNAPSHOT_SIZE,
-    ROUTINE_SOURCE_SESSION_ID_METADATA_KEY, StartManualRoutineArgs,
-};
-pub use transport::{
-    AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
-    GenericAuthAttemptStatus, WaltrTransport, RoutineDefinitionWatchStream,
-    RoutineInteractionTransport, RoutineInvocationWatchStream, SessionTimelinePage,
-    SessionTimelineProjectionMode, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
-    SessionWatchEvent, SessionWatchUpdate,
-};
-#[cfg(not(target_arch = "wasm32"))]
-pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
-pub use view::{
-    CatalogMatchConfidenceView, CatalogMatchSourceView, CatalogMatchView,
-    CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
-    CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSummaryView, ConfigView,
-    ExternalRequestView, InferenceDefaultsView, InferenceProviderSettingsView,
-    InferenceSettingsMatchView, InferenceSettingsView, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
-    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
-    OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
-    ProviderView, SelectableAgentView, SessionAssociationsView, SessionCapabilitiesView,
-    SessionCoordinationPhaseView, SessionCoordinationReasonView, SessionCoordinationView,
-    SessionDictationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
-    SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
-    SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
-    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
-    TimelineStatusView, TimestampView,
-};
 
 #[cfg(test)]
 mod direct_transport_tests {

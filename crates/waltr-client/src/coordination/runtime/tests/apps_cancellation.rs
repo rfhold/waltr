@@ -62,7 +62,6 @@ apps_service! {
     update_session_agent(UpdateSessionAgentRequest) -> UpdateSessionAgentResponse,
     get_timeline(GetTimelineRequest) -> GetTimelineResponse,
     submit_user_message(SubmitUserMessageRequest) -> SubmitUserMessageResponse,
-    respond_external_request(RespondExternalRequestRequest) -> RespondExternalRequestResponse,
     interrupt_session(InterruptSessionRequest) -> InterruptSessionResponse,
     rollback_session(RollbackSessionRequest) -> RollbackSessionResponse,
     continue_session(ContinueSessionRequest) -> ContinueSessionResponse,

@@ -17,6 +17,42 @@ pub struct Client {
 }
 
 impl Client {
+    /// Retain session interaction observation without owning its live work.
+    pub fn retain_interactions(&mut self, session_id: impl Into<String>) -> ClientUpdate {
+        self.apply(ClientEvent::Interaction(crate::InteractionEvent::Retain { session_id: session_id.into() }))
+    }
+    /// Release observation; never cancel or deny the underlying operation.
+    pub fn release_interactions(&mut self, session_id: impl Into<String>) -> ClientUpdate {
+        self.apply(ClientEvent::Interaction(crate::InteractionEvent::Release { session_id: session_id.into() }))
+    }
+    /// Submit a typed response to the exact observed request without replay.
+    pub fn respond_interaction(&mut self, identity: crate::InteractionIdentity, response: crate::InteractionResponse) -> ClientUpdate {
+        self.apply(ClientEvent::Interaction(crate::InteractionEvent::Respond { identity, response }))
+    }
+    /// Release a matching receipt and its selected page without an RPC.
+    pub fn release_routine_request(
+        &mut self,
+        operation_key: OperationKey,
+        request_id: String,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(RoutineEvent::RequestReleased {
+            operation_key,
+            request_id,
+        }))
+    }
+    /// Issue a keyed Routine read or mutation without collection optimism.
+    pub fn request_routine(
+        &mut self,
+        operation_key: OperationKey,
+        request_id: String,
+        command: crate::RoutineRequest,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(RoutineEvent::Request {
+            operation_key,
+            request_id,
+            command,
+        }))
+    }
     pub(crate) fn clear_mcp_apps(&mut self) {
         self.state.apps = crate::McpAppsSnapshot::default();
         self.state.apps_completed_requests.clear();
@@ -80,6 +116,7 @@ impl Client {
         }
 
         match event {
+            ClientEvent::Interaction(event) => crate::interactions::reduce(&mut self.state, event),
             ClientEvent::McpApp(event) => crate::apps::reduce(&mut self.state, event),
             ClientEvent::Access(event) => access::reduce(&mut self.state, event),
             ClientEvent::Auth(event) => auth::reduce(&mut self.state, event),
@@ -316,7 +353,7 @@ impl Client {
         self.apply(ClientEvent::Session(SessionEvent::ListRequested))
     }
 
-    /// Register interest in the global manual Routine definition watch.
+    /// Register interest in the current authenticated Routine catalog.
     #[must_use]
     pub fn register_routine_definition_watch_interest(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Routine(
@@ -324,7 +361,7 @@ impl Client {
         ))
     }
 
-    /// Release interest in the global manual Routine definition watch.
+    /// Release interest in the current authenticated Routine catalog.
     #[must_use]
     pub fn release_routine_definition_watch_interest(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Routine(
@@ -381,16 +418,18 @@ impl Client {
         operation_key: OperationKey,
         request_id: impl Into<String>,
         routine_name: impl Into<String>,
+        routine_revision: impl Into<String>,
         trigger_name: impl Into<String>,
-        source_session_id: impl Into<String>,
-        inputs: std::collections::BTreeMap<String, crate::ClientRoutineValue>,
+        source_session_id: Option<String>,
+        inputs: crate::RoutineJson,
     ) -> ClientUpdate {
         self.apply(ClientEvent::Routine(RoutineEvent::StartRequested {
             operation_key,
             request_id: request_id.into(),
             routine_name: routine_name.into(),
+            routine_revision: routine_revision.into(),
             trigger_name: trigger_name.into(),
-            source_session_id: source_session_id.into(),
+            source_session_id,
             inputs,
         }))
     }
@@ -411,7 +450,7 @@ impl Client {
         }))
     }
 
-    /// Load full task-level detail for one durable invocation.
+    /// Load the pinned definition and dynamic operations for one invocation.
     pub fn load_routine_invocation_detail(
         &mut self,
         request_id: impl Into<String>,
@@ -526,24 +565,6 @@ impl Client {
                 operation_key,
                 session_id: session_id.into(),
                 text: text.into(),
-            },
-        ))
-    }
-
-    /// Request that an external request be responded to.
-    pub fn respond_external_request(
-        &mut self,
-        session_id: impl Into<String>,
-        request_id: impl Into<String>,
-        response_json: impl Into<String>,
-    ) -> ClientUpdate {
-        let operation_key = self.state.next_operation_key();
-        self.apply(ClientEvent::Session(
-            SessionEvent::ExternalRequestRespondRequested {
-                operation_key,
-                session_id: session_id.into(),
-                request_id: request_id.into(),
-                response_json: response_json.into(),
             },
         ))
     }
@@ -667,6 +688,9 @@ impl Client {
         if status::needs_watch_request(&self.state) {
             return self.request_status_watch();
         }
+
+        let interactions = crate::interactions::maintain(&mut self.state);
+        if !interactions.is_empty() { return interactions; }
 
         if self.state.config.watch.interests > 0 {
             let update = config::maintain_watch(&mut self.state);
@@ -1292,6 +1316,7 @@ impl Client {
 #[allow(clippy::too_many_lines)]
 fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
     match event {
+        ClientEvent::Interaction(event) => crate::interactions::event_is_current(state, event),
         ClientEvent::McpApp(crate::McpAppEvent::Failed { request_id, .. }) => state
             .apps
             .requests
@@ -1386,13 +1411,6 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             operation_key,
         ),
         ClientEvent::Session(
-            SessionEvent::ExternalRequestResponded { operation_key }
-            | SessionEvent::ExternalRequestRespondFailed { operation_key, .. },
-        ) => operation_is_current(
-            state.sessions.respond_external_request.key.as_ref(),
-            operation_key,
-        ),
-        ClientEvent::Session(
             SessionEvent::Interrupted { operation_key }
             | SessionEvent::InterruptFailed { operation_key, .. },
         ) => operation_is_current(state.sessions.interrupt.key.as_ref(), operation_key),
@@ -1452,6 +1470,7 @@ fn operation_is_current(current: Option<&OperationKey>, completed: &OperationKey
 #[allow(clippy::manual_let_else)]
 fn waltr_login_error(event: &ClientEvent) -> Option<String> {
     let error = match event {
+        ClientEvent::Interaction(crate::InteractionEvent::Failed { error, .. } | crate::InteractionEvent::RefreshFailed { error, .. } | crate::InteractionEvent::Responded { error: Some(error), .. }) => error,
         ClientEvent::McpApp(crate::McpAppEvent::Failed { error, .. }) => error,
         ClientEvent::Auth(
             AuthEvent::ListFailed(error)
@@ -1486,7 +1505,6 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
             | SessionEvent::TimelineWatchFailed { error, .. }
             | SessionEvent::TimelineWatchOpenFailed { error, .. }
             | SessionEvent::UserMessageSubmitFailed { error, .. }
-            | SessionEvent::ExternalRequestRespondFailed { error, .. }
             | SessionEvent::InterruptFailed { error, .. }
             | SessionEvent::RollbackFailed { error, .. }
             | SessionEvent::ContinueFailed { error, .. }
@@ -1500,6 +1518,7 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
             | RoutineEvent::InvocationWatchFailed(error)
             | RoutineEvent::StartFailed { error, .. }
             | RoutineEvent::OlderPageFailed { error, .. }
+            | RoutineEvent::RequestFailed { error, .. }
             | RoutineEvent::DetailFailed { error, .. },
         ) => error,
         _ => return None,

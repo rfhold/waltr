@@ -530,7 +530,7 @@ nanos: number, };
 
 export type SessionPhaseView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "suspended" | "finished" | "failed" | "unknown";
 
-export type SessionSuspensionKindView = "unspecified" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "unknown";
+export type SessionSuspensionKindView = "unspecified" | "awaitingToolResults" | "interrupted" | "unknown";
 
 export type SessionStatusView = {
 /**
@@ -572,7 +572,7 @@ queuedCount: number,
  */
 continuationArmed: boolean, };
 
-export type SessionProgressPhaseView = "unknown" | "idle" | "running" | "completionBarrier" | "paused" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "finished" | "failed";
+export type SessionProgressPhaseView = "unknown" | "idle" | "running" | "completionBarrier" | "paused" | "awaitingToolResults" | "interrupted" | "finished" | "failed";
 
 export type SessionRunStageView = "unknown" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool";
 
@@ -609,10 +609,6 @@ export type SessionCapabilitiesView = {
  * How a newly submitted prompt will be handled.
  */
 promptDisposition: SessionPromptDispositionView,
-/**
- * Whether the pending external request can be answered now.
- */
-canRespondExternalRequest: boolean,
 /**
  * Whether a real process-local active run can be interrupted.
  */
@@ -784,13 +780,35 @@ associations: SessionAssociationsView,
  */
 metadata: Record<string, unknown>, };
 
-export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "externalRequestOpened" | "externalRequestResolved" | "sessionStatusChanged" | "unknown";
+export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "sessionStatusChanged" | "unknown";
 
-export type TimelineStatusView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "pending" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "resolved" | "finished" | "failed" | "canceled" | "unknown";
+export type TimelineStatusView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "pending" | "awaitingToolResults" | "interrupted" | "resolved" | "finished" | "failed" | "canceled" | "unknown";
 
-export type ExternalRequestView = { id: string, kind: number, payloadJson: string, };
+export type InteractionIdentity = { sessionId: string, generation: string, id: string, operationId: string, };
 
-export type TimelineContentView = { "kind": "empty" } | { "kind": "textDelta", delta: string, } | { "kind": "textSnapshot", text: string, } | { "kind": "toolCall", id: string, name: string, arguments_json: string, } | { "kind": "toolResult", id: string, name: string, content: string, error: boolean, } | { "kind": "externalRequest", request: ExternalRequestView | null, } | { "kind": "contentRef", content_id: string, bytes: bigint, } | { "kind": "json", value_json: string, } | { "kind": "unknown" };
+export type InteractionRequestView = { "kind": "permission", message: string, identity: string, claims: Array<string>, suggestions: Array<string>, } | { "kind": "question", questions: Array<InteractionQuestionView>, } | { "kind": "form", message: string, fields: Array<InteractionFormField>, } | { "kind": "urlConsent", message: string, url: string, } | { "kind": "unsupported", message: string, form: boolean, };
+
+export type InteractionQuestionView = { question: string, header: string, options: Array<InteractionOptionView>, multiple: boolean, custom: boolean, };
+
+export type InteractionOptionView = { label: string, description: string, };
+
+export type InteractionFormField = { name: string, title: string | null, description: string | null, required: boolean, default: InteractionFormValue | null, choiceTitles: { [key in string]?: string }, schema: InteractionFieldSchema, };
+
+export type InteractionFieldSchema = { "kind": "string", choices: Array<string> | null, minLength: bigint | null, maxLength: bigint | null, format: string | null, } | { "kind": "number", integer: boolean, minimum: number | null, maximum: number | null, } | { "kind": "boolean" } | { "kind": "stringArray", choices: Array<string>, minItems: bigint | null, maxItems: bigint | null, };
+
+export type InteractionFormValue = string | number | boolean | Array<string>;
+
+export type InteractionResponse = { "kind": "permission", decision: InteractionPermissionDecision, suggestionIndices: Array<number>, message: string | null, } | { "kind": "question", answers: Array<Array<string>>, } | { "kind": "form", action: InteractionElicitationAction, values: { [key in string]?: InteractionFormValue }, } | { "kind": "urlConsent", action: InteractionElicitationAction, };
+
+export type InteractionPermissionDecision = "allowOnce" | "allowAlways" | "deny" | "cancelWork";
+
+export type InteractionElicitationAction = "accept" | "decline" | "cancel";
+
+export type PendingInteractionView = { identity: InteractionIdentity, request: InteractionRequestView, responding: boolean, error: string | null, };
+
+export type SessionInteractionsView = { generation: string | null, revision: bigint, connected: boolean, error: string | null, pending: Array<PendingInteractionView>, };
+
+export type TimelineContentView = { "kind": "empty" } | { "kind": "textDelta", delta: string, } | { "kind": "textSnapshot", text: string, } | { "kind": "toolCall", id: string, name: string, arguments_json: string, } | { "kind": "toolResult", id: string, name: string, content: string, error: boolean, } | { "kind": "contentRef", content_id: string, bytes: bigint, } | { "kind": "json", value_json: string, } | { "kind": "unknown" };
 
 export type TimelineEventView = {
 /**
@@ -1276,26 +1294,6 @@ sessionId: string,
 /**
  * Structured outbound authentication failure, when present.
  */
-authenticationFailure: AuthenticationFailureSnapshot | null, } | { "kind": "sessionRespondExternalRequest",
-/**
- * Stable operation status name.
- */
-status: string,
-/**
- * Last operation error, when present.
- */
-error: string | null,
-/**
- * Session id responded to.
- */
-sessionId: string,
-/**
- * External request id.
- */
-requestId: string,
-/**
- * Structured outbound authentication failure, when present.
- */
 authenticationFailure: AuthenticationFailureSnapshot | null, } | { "kind": "sessionInterrupt",
 /**
  * Stable operation status name.
@@ -1472,10 +1470,6 @@ agentUpdate: OperationSnapshot,
  */
 submitUserMessage: OperationSnapshot,
 /**
- * External request response operation snapshot.
- */
-respondExternalRequest: OperationSnapshot,
-/**
  * Session interrupt operation snapshot.
  */
 interrupt: OperationSnapshot,
@@ -1500,233 +1494,65 @@ timelines: { [key in string]?: SessionTimelineView },
  */
 templateSearches: { [key in string]?: SessionTemplateSearchSnapshot }, };
 
-export type ClientRoutineValue = { "type": "string", "value": string } | { "type": "boolean", "value": boolean };
+export type RoutineJson = string;
 
-export type ClientRoutineValueType = "string" | "boolean";
+export type RoutineRevision = string;
 
-export type ClientRoutineScope = "session";
+export type RoutineContract = { schemaVersion: string,
+/**
+ * Exact dialect JSON. Shells render this closed descriptor, not JSON Schema.
+ */
+schemaJson: RoutineJson, schema: RoutineSchema, };
 
-export type ClientRoutineInputDefinition = {
-/**
- * Input name.
- */
-name: string,
-/**
- * Closed input type.
- */
-type: ClientRoutineValueType,
-/**
- * Whether the input is required.
- */
-required: boolean,
-/**
- * Optional typed initial value supplied by the definition.
- */
-defaultValue: ClientRoutineValue | null,
-/**
- * Optional minimum string length.
- */
-minimumStringLength: bigint | null,
-/**
- * Optional string pattern.
- */
-stringPattern: string | null, };
+export type RoutineSchema = { "type": "null" } | { "type": "nullable", schema: RoutineSchema, } | { "type": "boolean" } | { "type": "number", min: number, max: number, } | { "type": "string", maxLength: number, } | { "type": "array", maxItems: number, items: RoutineSchema, } | { "type": "object", properties: { [key in string]?: RoutineSchema }, required: Array<string>, };
 
-export type ClientRoutineResultDefinition = {
-/**
- * Result name.
- */
-name: string,
-/**
- * Closed result type.
- */
-type: ClientRoutineValueType, };
+export type RoutineLimits = { chunkBytes: number, inputBatchBytes: number, inputBatchEvents: number, edgeBytes: number, edgeChunks: number, streamsPerDirection: number, textSegments: number, retainedTextBytes: number, imageDimension: number, helperAttachments: number, textResults: number, pageSize: number, structuredValueBytes: number, definitionBytes: number, definitionsPerSnapshot: number, definitionSnapshotBytes: number, operationProjectionBytes: number, blobObjects: number, blobReaders: number, inputBytes: RoutineRevision, outputBytes: RoutineRevision, inputDurationMs: RoutineRevision, totalDurationMs: RoutineRevision, queueWaitMs: RoutineRevision, idleMs: RoutineRevision, attachmentLeaseMs: RoutineRevision, attachmentAttachTimeoutMs: RoutineRevision, attachmentAbsoluteLifetimeMs: RoutineRevision, fileBytes: RoutineRevision, imageBytes: RoutineRevision, imagePixels: RoutineRevision, helperAttachmentBytes: RoutineRevision, helperSourceBytes: RoutineRevision, helperEncodedBytes: RoutineRevision, binaryOutputLeaseMs: RoutineRevision, textResultBytes: RoutineRevision, textResultsEncodedBytes: RoutineRevision, blobInvocationBytes: RoutineRevision, blobPrincipalBytes: RoutineRevision, ordinaryDeadlineMs: RoutineRevision, };
 
-export type ClientManualRoutineDefinition = {
-/**
- * Routine name.
- */
-routineName: string,
-/**
- * Manual trigger name.
- */
-triggerName: string,
-/**
- * Human-readable display name.
- */
-displayName: string,
-/**
- * Human-readable description.
- */
-description: string,
-/**
- * Closed scope.
- */
-scope: ClientRoutineScope,
-/**
- * Inputs in declaration order.
- */
-inputs: Array<ClientRoutineInputDefinition>,
-/**
- * Results in declaration order.
- */
-results: Array<ClientRoutineResultDefinition>,
-/**
- * Immutable definition revision used by new admissions.
- */
-routineRevision: string, };
+export type RoutineRequest = { "type": "invocations", afterCursor: RoutineRevision, limit: number, sourceSession: string | null, } | { "type": "operations", invocationId: string, afterCursor: RoutineRevision, limit: number, } | { "type": "cancel", invocationId: string, };
 
-export type ClientRoutineResult = {
-/**
- * Result name.
- */
-name: string,
-/**
- * Typed result value.
- */
-value: ClientRoutineValue, };
+export type RoutineRequestState = { requestId: string, command: RoutineRequest, status: RoutineRequestStatus, error: string | null, nextCursor: RoutineRevision | null, cancellationStatus: ClientRoutineInvocationStatus | null, selectedInvocations: Array<ClientRoutineInvocationSummary>, };
 
-export type ClientRoutineFieldViolation = {
-/**
- * Input field path.
- */
-fieldPath: string,
-/**
- * Validation message.
- */
-message: string, };
+export type RoutineRequestStatus = "loading" | "ready" | "failed" | "expired";
 
-export type ClientRoutineValidationFailure = {
-/**
- * General validation message.
- */
-message: string,
-/**
- * Violations in server order.
- */
-violations: Array<ClientRoutineFieldViolation>, };
+export type RoutineEntrypoint = { name: string, trigger: ClientRoutineTriggerKind, selector: string | null, startContexts: Array<RoutineStartContext>, };
 
-export type ClientRoutineFailure = {
-/**
- * Stable failure code.
- */
-code: string,
-/**
- * Safe failure text.
- */
-message: string, };
+export type RoutineStartContext = "global" | "session";
 
-export type ClientRoutineTriggerKind = "manual" | "event";
+export type RoutineDirection = "input" | "output";
 
-export type ClientRoutineInvocationStatus = "admitted" | "running" | "succeeded" | "failed" | "interrupted";
+export type RoutineMedia = "audio" | "text" | "image" | "file";
 
-export type ClientRoutineTaskStatus = "pending" | "running" | "succeeded" | "skipped" | "blocked" | "failed" | "interrupted";
+export type RoutinePort = { name: string, direction: RoutineDirection, media: RoutineMedia, required: boolean, maxBytes: RoutineRevision, formats: Array<string>, };
 
-export type ClientRoutineInvocationSummary = {
-/**
- * Monotonic admission order.
- */
-admissionSequence: bigint,
-/**
- * Server-generated durable public identity.
- */
-invocationId: string,
-/**
- * Routine name pinned at admission.
- */
-routineName: string,
-/**
- * Routine revision pinned at admission.
- */
-routineRevision: string,
-/**
- * Trigger name pinned at admission.
- */
-triggerName: string,
-/**
- * Trigger category.
- */
-triggerKind: ClientRoutineTriggerKind,
-/**
- * Correlation identifier supplied by the trigger.
- */
-correlationId: string,
-/**
- * Immutable trigger metadata.
- */
-metadata: { [key in string]?: string },
-/**
- * Event source cursor when applicable.
- */
-sourceCursor: string | null,
-/**
- * Current durable status.
- */
-status: ClientRoutineInvocationStatus,
-/**
- * Admission timestamp in Unix milliseconds.
- */
-admittedAtMs: bigint,
-/**
- * Start timestamp in Unix milliseconds.
- */
-startedAtMs: bigint | null,
-/**
- * Completion timestamp in Unix milliseconds.
- */
-completedAtMs: bigint | null,
-/**
- * Last update timestamp in Unix milliseconds.
- */
-updatedAtMs: bigint,
-/**
- * Sanitized terminal failure.
- */
-terminalError: ClientRoutineFailure | null,
-/**
- * Latest durable event sequence represented by this summary.
- */
-latestSequence: bigint, };
+export type RoutineBudgets = { valueBytes: number, resultBytes: number, hostCalls: number, inFlight: number, deadlineMs: RoutineRevision, };
 
-export type ClientRoutineTask = {
-/**
- * Declared task name.
- */
-name: string,
-/**
- * Declared task type.
- */
-type: string,
-/**
- * Current task status.
- */
-status: ClientRoutineTaskStatus,
-/**
- * Ordered task results.
- */
-results: Array<ClientRoutineResult>,
-/**
- * Helper or destination session references by declared key.
- */
-sessionReferences: { [key in string]?: string },
-/**
- * Sanitized task failure.
- */
-error: ClientRoutineFailure | null, };
+export type RoutineOwnership = "detached" | "leased" | "tool";
 
-export type ClientRoutineInvocationDetail = {
-/**
- * Durable invocation summary.
- */
-summary: ClientRoutineInvocationSummary,
-/**
- * Tasks in declaration order.
- */
-tasks: Array<ClientRoutineTask>,
-/**
- * Ordered terminal invocation results.
- */
-results: Array<ClientRoutineResult>, };
+export type RoutineTextResult = { id: string, name: string, sha256: string, utf8Bytes: RoutineRevision, encodedCharge: RoutineRevision, helperId: string | null, };
+
+export type RoutineHelperReference = { sessionId: string, definitionIdentity: string, operationId: string | null, };
+
+export type RoutineImageInfo = { format: string, width: number, height: number, };
+
+export type RoutineBlobDescriptor = { blobId: string, displayName: string, contentType: string, bytes: RoutineRevision, sha256: Array<number>, image: RoutineImageInfo | null, remainingValidityMs: RoutineRevision | null, };
+
+export type RoutineOperationStatus = "dispatched" | "completed" | "failed" | "uncertain";
+
+export type RoutineOperation = { version: number, cursor: RoutineRevision, id: string, invocationId: string, name: string, status: RoutineOperationStatus, arguments: RoutineJson | null, result: RoutineJson | null, updatedMs: bigint, observationRevision: RoutineRevision, };
+
+export type ClientManualRoutineDefinition = { routineName: string, description: string, routineRevision: string, apiVersion: string, engine: string, entrypoints: Array<RoutineEntrypoint>, parameters: RoutineContract, result: RoutineContract, ports: Array<RoutinePort>, capabilities: Array<string>, budgets: RoutineBudgets, };
+
+export type ClientRoutineFieldViolation = { fieldPath: string, message: string, };
+
+export type ClientRoutineValidationFailure = { message: string, violations: Array<ClientRoutineFieldViolation>, };
+
+export type ClientRoutineTriggerKind = "manual" | "event" | "interactive" | "tool" | "inline" | "mcp" | "schedule" | "progress" | "lifecycle";
+
+export type ClientRoutineInvocationStatus = "admitted" | "running" | "succeeded" | "failed" | "interrupted" | "uncertain";
+
+export type ClientRoutineInvocationSummary = { version: number, admissionSequence: RoutineRevision, invocationId: string, routineName: string, routineRevision: string, triggerName: string, triggerKind: ClientRoutineTriggerKind, ownership: RoutineOwnership, correlationId: string, snapshot: string | null, sourceSession: string | null, status: ClientRoutineInvocationStatus, admittedAtMs: bigint, updatedAtMs: bigint, result: RoutineJson | null, textResults: Array<RoutineTextResult>, binaryResults: Array<RoutineBlobDescriptor>, helpers: Array<RoutineHelperReference>, observationRevision: RoutineRevision, };
+
+export type ClientRoutineInvocationDetail = { summary: ClientRoutineInvocationSummary, pinnedDefinition: ClientManualRoutineDefinition, operations: Array<RoutineOperation>, nextOperationCursor: RoutineRevision | null, };
 
 export type RoutineDefinitionSnapshot = {
 /**
@@ -1740,9 +1566,29 @@ digest: string,
 /**
  * Definitions in canonical server order.
  */
-definitions: Array<ClientManualRoutineDefinition>, };
+definitions: Array<ClientManualRoutineDefinition>,
+/**
+ * Exact host capability identities; not caller authority.
+ */
+supportedCapabilities: Array<string>,
+/**
+ * Effective host limits from the current catalog.
+ */
+limits: RoutineLimits | null, };
 
 export type RoutineHistorySnapshot = {
+/**
+ * Stable high-water identity while the initial snapshot spans pages.
+ */
+snapshotHighWater: string | null,
+/**
+ * Whether observation completed its initial snapshot.
+ */
+snapshotComplete: boolean,
+/**
+ * Bounded dynamic operation projections, distinct from declared tasks.
+ */
+operations: Array<RoutineOperation>,
 /**
  * Invocation watch health.
  */
@@ -1752,13 +1598,13 @@ watch: OperationSnapshot,
  */
 recent: Array<ClientRoutineInvocationSummary>,
 /**
- * Last successfully reduced durable event sequence.
+ * Last successfully reduced opaque watch cursor.
  */
-throughSequence: bigint | null,
+throughSequence: string | null,
 /**
- * Exclusive admission cursor for another older page.
+ * Exclusive admission AFTER cursor from the last explicit page.
  */
-olderPageToken: bigint | null,
+olderPageToken: RoutineRevision | null,
 /**
  * Current older-page operation.
  */
@@ -1798,11 +1644,11 @@ triggerName: string,
 /**
  * Source session supplied at start only.
  */
-sourceSessionId: string,
+sourceSessionId: string | null,
 /**
  * Submitted inputs retained for validation correction.
  */
-inputs: { [key in string]?: ClientRoutineValue },
+inputs: RoutineJson | null,
 /**
  * Stable local operation status.
  */
@@ -1821,6 +1667,10 @@ validationFailure: ClientRoutineValidationFailure | null,
 error: string | null, };
 
 export type RoutineSnapshot = {
+/**
+ * Bounded keyed request receipts.
+ */
+requests: { [key in string]?: RoutineRequestState },
 /**
  * Global definition watch and complete ordered projection.
  */
@@ -1843,6 +1693,10 @@ details: { [key in string]?: RoutineDetailSnapshot },
 starts: { [key in string]?: RoutineStartOperationView }, };
 
 export type ClientSnapshot = {
+/**
+ * Full current interaction observations keyed by retained session id.
+ */
+interactions: { [key in string]?: SessionInteractionsView },
 /**
  * Transient owner-bound Apps results and request tracking.
  */
@@ -1946,7 +1800,27 @@ export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
 export type ClientTimelineDirection = "forward" | "backward";
 
-export type ClientCommand = { "type": "startWaltrLogin" } | { "type": "completeWaltrLogin",
+export type ClientCommand = { "type": "retainInteractions", sessionId: string, } | { "type": "releaseInteractions", sessionId: string, } | { "type": "respondInteraction", identity: InteractionIdentity, response: InteractionResponse, } | { "type": "releaseRoutineRequest",
+/**
+ * Caller-owned receipt key.
+ */
+operationKey: string,
+/**
+ * Exact receipt identity to release.
+ */
+requestId: string, } | { "type": "routineRequest",
+/**
+ * Caller-owned receipt key.
+ */
+operationKey: string,
+/**
+ * Current completion identity.
+ */
+requestId: string,
+/**
+ * Shell-neutral server-data operation.
+ */
+command: RoutineRequest, } | { "type": "startWaltrLogin" } | { "type": "completeWaltrLogin",
 /**
  * Attempt generation returned after starting login.
  */
@@ -2100,17 +1974,21 @@ requestId: string,
  */
 routineName: string,
 /**
+ * Exact revision from the current catalog.
+ */
+routineRevision: string,
+/**
  * Trigger name.
  */
 triggerName: string,
 /**
  * Source session identity.
  */
-sourceSessionId: string,
+sourceSessionId: string | null,
 /**
- * Typed inputs keyed by declared name.
+ * Exact structured business parameters, separate from media metadata.
  */
-inputs: { [key in string]?: ClientRoutineValue }, } | { "type": "loadOlderRoutineInvocations",
+inputs: RoutineJson, } | { "type": "loadOlderRoutineInvocations",
 /**
  * Correlation-only request identity.
  */
@@ -2270,19 +2148,7 @@ sessionId: string,
 /**
  * User message text.
  */
-text: string, } | { "type": "respondExternalRequest",
-/**
- * Session id to respond to.
- */
-sessionId: string,
-/**
- * External request id.
- */
-requestId: string,
-/**
- * JSON response payload.
- */
-responseJson: string, } | { "type": "interruptSession",
+text: string, } | { "type": "interruptSession",
 /**
  * Session id to interrupt.
  */

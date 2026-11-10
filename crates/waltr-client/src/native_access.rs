@@ -2187,9 +2187,19 @@ mod tests {
                 Err(NativeRefreshTokenStoreError::Malformed)
             }
         }
+        // Keep two dispatchers alive so first-use callsite registration on an
+        // unsubscribed peer cannot cache `never` via tracing's single-dispatch shortcut.
+        let _registration_guard =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let captured = Capture::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let dispatch = tracing::Dispatch::new(subscriber);
+        // Exercise that first use outside this test's subscriber before capturing.
+        std::thread::spawn(|| telemetry::emit(telemetry::Stage::Load, telemetry::Outcome::Miss, 0))
+            .join()
+            .unwrap();
+        assert!(captured.0.lock().unwrap().is_empty());
+        tracing::dispatcher::with_default(&dispatch, || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 assert!(load_refresh_token(&MalformedStore).await.is_err());
                 assert!(save_refresh_token(&MalformedStore, b"SECRET_MALFORMED_SENTINEL").await.is_err());

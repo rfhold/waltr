@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use waltr::grpc::waltr::session::v1::{
     AgentSelectionRequest, ContinueSessionRequest, CreateSessionRequest, DeleteSessionRequest,
     GetTimelineRequest, InferenceSettingsRequest, InterruptSessionRequest, ListAgentsRequest,
-    ListAgentsResponse, ListSessionsRequest, ProjectedTimelineEvent, RespondExternalRequestRequest,
+    ListAgentsResponse, ListSessionsRequest, ProjectedTimelineEvent,
     RollbackSessionRequest, RollbackTarget, SearchSessionTemplatesRequest,
     SearchSessionTemplatesResponse, SessionSummary, SubmitUserMessageRequest, TimelineEvent,
     TimelineProjectionMetadata, TimelineProjectionMode, TimelineQuery, TimelineTruncation,
@@ -616,40 +616,6 @@ where
         .session_client(&credentials)
         .await?
         .submit_user_message(SubmitUserMessageRequest { session_id, text })
-        .await
-        .map_err(|error| status_error(&error, &credentials))?;
-
-    Ok(())
-}
-
-#[allow(
-    clippy::future_not_send,
-    reason = "browser RPC futures are locally polled"
-)]
-pub(super) async fn respond_external_request<T>(
-    transport: &T,
-    session_id: String,
-    request_id: String,
-    response_json: String,
-) -> Result<(), ClientError>
-where
-    T: RemoteTransport,
-    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
-        Body<Data = Bytes> + Send + 'static,
-    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
-        Into<StdError> + Send,
-{
-    let credentials = transport.request_credentials();
-    transport
-        .session_client(&credentials)
-        .await?
-        .respond_external_request(RespondExternalRequestRequest {
-            session_id,
-            request_id,
-            response_json,
-        })
         .await
         .map_err(|error| status_error(&error, &credentials))?;
 

@@ -17,7 +17,7 @@ pub use config::{
     SessionDictationView,
 };
 pub use session::{
-    ExternalRequestView, InferenceProviderSettingsView, InferenceSettingsMatchView,
+    InferenceProviderSettingsView, InferenceSettingsMatchView,
     InferenceSettingsView, ProjectedTimelineEntryView, SelectableAgentView,
     SessionAssociationsView, SessionCapabilitiesView, SessionCoordinationPhaseView,
     SessionCoordinationReasonView, SessionCoordinationView, SessionMetricsView, SessionPhaseView,
@@ -40,19 +40,17 @@ mod tests {
         CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
         CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSearchSnapshot,
         CatalogModelSummaryView, CatalogSnapshot, ClientAuthTarget, ClientCommand,
-        ClientManualRoutineDefinition, ClientOperationView, ClientRoutineFailure,
-        ClientRoutineFieldViolation, ClientRoutineInputDefinition, ClientRoutineInvocationDetail,
-        ClientRoutineInvocationStatus, ClientRoutineInvocationSummary, ClientRoutineResult,
-        ClientRoutineResultDefinition, ClientRoutineScope, ClientRoutineTask,
-        ClientRoutineTaskStatus, ClientRoutineTriggerKind, ClientRoutineValidationFailure,
-        ClientRoutineValue, ClientRoutineValueType, ClientSessionTemplateKind,
-        ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
-        Configuration, McpAuthorizationContextSnapshot, Model, ModelCapabilities,
-        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
-        OperationSnapshot, Provider, ProviderType, ResourceEditBaselineView, RollbackTargetView,
-        RoutineDefinitionSnapshot, RoutineDetailSnapshot, RoutineHistorySnapshot, RoutineSnapshot,
-        RoutineStartOperationView, SessionAgentCatalogSnapshot, SessionSnapshot,
-        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
+        ClientManualRoutineDefinition, ClientOperationView, ClientRoutineFieldViolation,
+        ClientRoutineInvocationDetail, ClientRoutineInvocationStatus,
+        ClientRoutineInvocationSummary, ClientRoutineTriggerKind, ClientRoutineValidationFailure,
+        ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
+        ClientTimelineDirection, ConfigSnapshot, Configuration, McpAuthorizationContextSnapshot,
+        Model, ModelCapabilities, ModelCatalogMatch, ModelLimits, ModelOptions, ModelType,
+        OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType,
+        ResourceEditBaselineView, RollbackTargetView, RoutineDefinitionSnapshot,
+        RoutineDetailSnapshot, RoutineHistorySnapshot, RoutineSnapshot, RoutineStartOperationView,
+        SessionAgentCatalogSnapshot, SessionSnapshot, SessionTemplateOptionView,
+        SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -279,7 +277,18 @@ mod tests {
             SessionView::decl(),
             TimelineEventKindView::decl(),
             TimelineStatusView::decl(),
-            ExternalRequestView::decl(),
+            crate::InteractionIdentity::decl(),
+            crate::InteractionRequestView::decl(),
+            crate::InteractionQuestionView::decl(),
+            crate::InteractionOptionView::decl(),
+            crate::InteractionFormField::decl(),
+            crate::InteractionFieldSchema::decl(),
+            crate::InteractionFormValue::decl(),
+            crate::InteractionResponse::decl(),
+            crate::InteractionPermissionDecision::decl(),
+            crate::InteractionElicitationAction::decl(),
+            crate::PendingInteractionView::decl(),
+            crate::SessionInteractionsView::decl(),
             TimelineContentView::decl(),
             TimelineEventView::decl(),
             TimelinePresentationView::decl(),
@@ -305,21 +314,33 @@ mod tests {
             StatusSnapshot::decl(),
             SessionAgentCatalogSnapshot::decl(),
             SessionSnapshot::decl(),
-            ClientRoutineValue::decl(),
-            ClientRoutineValueType::decl(),
-            ClientRoutineScope::decl(),
-            ClientRoutineInputDefinition::decl(),
-            ClientRoutineResultDefinition::decl(),
+            crate::RoutineJson::decl(),
+            crate::RoutineRevision::decl(),
+            crate::RoutineContract::decl(),
+            crate::RoutineSchema::decl(),
+            crate::RoutineLimits::decl(),
+            crate::RoutineRequest::decl(),
+            crate::RoutineRequestState::decl(),
+            crate::RoutineRequestStatus::decl(),
+            crate::RoutineEntrypoint::decl(),
+            crate::RoutineStartContext::decl(),
+            crate::RoutineDirection::decl(),
+            crate::RoutineMedia::decl(),
+            crate::RoutinePort::decl(),
+            crate::RoutineBudgets::decl(),
+            crate::RoutineOwnership::decl(),
+            crate::RoutineTextResult::decl(),
+            crate::RoutineHelperReference::decl(),
+            crate::RoutineImageInfo::decl(),
+            crate::RoutineBlobDescriptor::decl(),
+            crate::RoutineOperationStatus::decl(),
+            crate::RoutineOperation::decl(),
             ClientManualRoutineDefinition::decl(),
-            ClientRoutineResult::decl(),
             ClientRoutineFieldViolation::decl(),
             ClientRoutineValidationFailure::decl(),
-            ClientRoutineFailure::decl(),
             ClientRoutineTriggerKind::decl(),
             ClientRoutineInvocationStatus::decl(),
-            ClientRoutineTaskStatus::decl(),
             ClientRoutineInvocationSummary::decl(),
-            ClientRoutineTask::decl(),
             ClientRoutineInvocationDetail::decl(),
             RoutineDefinitionSnapshot::decl(),
             RoutineHistorySnapshot::decl(),
@@ -351,8 +372,12 @@ mod tests {
             format!("// Generated by waltr-client. Do not edit directly.\n\n{bindings}\n");
 
         assert!(bindings.contains("export type ClientCommand"));
-        assert!(bindings.contains("admissionSequence: bigint,"));
+        assert!(bindings.contains("admissionSequence: RoutineRevision,"));
         assert!(!bindings.contains("admissionSequence: bigint | null"));
+        assert!(bindings.contains("type InteractionIdentity ="));
+        assert!(bindings.contains("suggestionIndices:"));
+        assert!(bindings.contains("\"respondInteraction\""));
+        assert!(!bindings.contains("ExternalRequest"));
 
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../waltr-web/src/generated/waltr-client.ts");

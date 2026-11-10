@@ -1,13 +1,10 @@
 #![allow(clippy::future_not_send)]
 
-use waltr_client::{
-    ClientCommand, ClientRuntime, ClientTimelineDirection, SessionPhaseView, TimelineContentView,
-    TimelineEventKindView, TimelineStatusView,
-};
+use waltr_client::{ClientCommand, ClientRuntime, ClientTimelineDirection, TimelineContentView};
 
 use crate::support::{
     server::{
-        server_endpoint_with_resolved_external_request, server_endpoint_with_rollback_timeline,
+        server_endpoint_with_rollback_timeline,
         server_endpoint_with_seeded_timeline,
     },
     snapshots::{dispatch_stream_command, next_snapshot_until, no_sleep},
@@ -260,76 +257,6 @@ async fn rollback_before_cursor_truncates_timeline_through_client_state() {
         text_snapshot(&durable(&timeline.events[0]).content),
         "first prompt"
     );
-}
-
-#[tokio::test]
-async fn rollback_to_open_external_request_restores_unresolved_prompt_through_client_state() {
-    let (endpoint, session_id) = server_endpoint_with_resolved_external_request()
-        .await
-        .expect("seeded server should start");
-    let mut stream = ClientRuntime::for_endpoint(endpoint).into_state_stream(no_sleep);
-
-    wait_for_system_ready(&mut stream).await;
-    dispatch_stream_command(
-        &mut stream,
-        ClientCommand::RegisterSessionTimelineWatchInterest {
-            session_id: session_id.clone(),
-            after_cursor: Some(0),
-            channels: Vec::new(),
-            initial_limit: None,
-        },
-    )
-    .await
-    .expect("timeline watch interest should dispatch");
-    next_snapshot_until(&mut stream, |snapshot| {
-        snapshot
-            .sessions
-            .timelines
-            .get(&session_id)
-            .is_some_and(|timeline| timeline.events.len() == 2)
-    })
-    .await;
-
-    dispatch_stream_command(
-        &mut stream,
-        ClientCommand::RollbackSessionToCursor {
-            session_id: session_id.clone(),
-            cursor: 1,
-        },
-    )
-    .await
-    .expect("rollback to open external request should dispatch");
-
-    let snapshot = next_snapshot_until(&mut stream, |snapshot| {
-        let prompt_restored =
-            snapshot
-                .sessions
-                .timelines
-                .get(&session_id)
-                .is_some_and(|timeline| {
-                    timeline.events.len() == 1
-                        && durable(&timeline.events[0]).kind
-                            == TimelineEventKindView::ExternalRequestOpened
-                        && durable(&timeline.events[0]).status == Some(TimelineStatusView::Pending)
-                });
-        let session_suspended = snapshot.sessions.current.iter().any(|session| {
-            session.id == session_id && session.status.phase == SessionPhaseView::Suspended
-        });
-        prompt_restored && session_suspended
-    })
-    .await;
-    let timeline = snapshot
-        .sessions
-        .timelines
-        .get(&session_id)
-        .expect("timeline should be present");
-
-    assert_eq!(timeline.watch.error, None);
-    assert_eq!(durable(&timeline.events[0]).cursor, 1);
-    assert!(matches!(
-        durable(&timeline.events[0]).content,
-        TimelineContentView::ExternalRequest { .. }
-    ));
 }
 
 #[tokio::test]

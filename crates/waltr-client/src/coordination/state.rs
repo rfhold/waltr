@@ -11,8 +11,8 @@ use crate::transport::{
 use crate::{
     AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientManualRoutineDefinition,
     ClientRoutineInvocationDetail, ClientRoutineInvocationSummary, ClientRoutineValidationFailure,
-    ClientRoutineValue, Configuration, GenericAuthAttempt, ResourceCatalog, RollbackTarget,
-    SelectableAgent, SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
+    Configuration, GenericAuthAttempt, ResourceCatalog, RollbackTarget, SelectableAgent,
+    SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
 };
 use waltr::grpc::waltr::session::v1::ProjectedTimelineEvent;
 
@@ -107,6 +107,8 @@ const MAX_AUTH_POLL_FAILURES: u8 = 5;
 /// Full headless state for Waltr shells.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientState {
+    /// Server-owned pending interaction observations and local response receipts.
+    pub interactions: crate::InteractionClientState,
     /// Transient protected MCP Apps data, never session history.
     pub apps: crate::McpAppsSnapshot,
     pub(crate) apps_completed_requests: VecDeque<String>,
@@ -311,8 +313,6 @@ pub struct SessionClientState {
     pub agent_update: OperationState,
     /// User message submit operation state.
     pub submit_user_message: OperationState,
-    /// External request response operation state.
-    pub respond_external_request: OperationState,
     /// Session interrupt operation state.
     pub interrupt: OperationState,
     /// Session rollback operation state.
@@ -331,6 +331,10 @@ pub struct SessionClientState {
 /// Global Routine coordination state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoutineClientState {
+    /// Bounded command receipts, independent of authoritative collections.
+    pub requests: BTreeMap<String, crate::RoutineRequestState>,
+    /// Completion-ordered selected pages, bounded to 200 aggregate rows.
+    pub selected_page_order: std::collections::VecDeque<String>,
     /// Authoritative global definitions in server order.
     pub definitions: Vec<ClientManualRoutineDefinition>,
     /// Digest of the complete definition projection.
@@ -344,7 +348,17 @@ pub struct RoutineClientState {
     /// Independent bounded invocation histories by source session id.
     pub session_histories: BTreeMap<String, SessionRoutineHistoryState>,
     /// Last successfully reduced durable event sequence.
-    pub through_sequence: Option<u64>,
+    pub through_sequence: Option<String>,
+    /// Consistent initial observation boundary.
+    pub snapshot_high_water: Option<String>,
+    /// Whether initial snapshot paging finished.
+    pub snapshot_complete: bool,
+    /// Host-published capabilities.
+    pub supported_capabilities: Vec<String>,
+    /// Current effective catalog ceilings.
+    pub limits: Option<waltr::grpc::waltr::routine::v2::ServerLimits>,
+    /// Latest bounded operation observations by identity.
+    pub operations: BTreeMap<String, crate::RoutineOperation>,
     /// Exclusive cursor for the next older page.
     pub older_page_token: Option<u64>,
     /// Current older-page operation.
@@ -366,7 +380,13 @@ pub struct SessionRoutineHistoryState {
     /// Watch lifecycle and interest count.
     pub watch: WatchState,
     /// Last successfully reduced global durable event sequence.
-    pub through_sequence: Option<u64>,
+    pub through_sequence: Option<String>,
+    /// Consistent initial observation boundary.
+    pub snapshot_high_water: Option<String>,
+    /// Whether initial snapshot paging finished.
+    pub snapshot_complete: bool,
+    /// Latest bounded operation observations for this source filter.
+    pub operations: BTreeMap<String, crate::RoutineOperation>,
     pub(crate) force_snapshot: bool,
 }
 
@@ -411,9 +431,9 @@ pub struct RoutineStartOperationState {
     /// Trigger name submitted by the shell.
     pub trigger_name: String,
     /// Source session supplied only for this start.
-    pub source_session_id: String,
+    pub source_session_id: Option<String>,
     /// Original typed inputs for correction after validation failure.
-    pub inputs: BTreeMap<String, ClientRoutineValue>,
+    pub inputs: Option<crate::RoutineJson>,
     /// Current local command status.
     pub status: OperationStatus,
     /// Associated durable invocation identity after admission.
@@ -481,7 +501,9 @@ fn durable_projected_event(event: crate::TimelineEvent) -> ProjectedTimelineEven
     ProjectedTimelineEvent {
         presentation: waltr::grpc::waltr::session::v1::TimelinePresentation::Durable as i32,
         mask_id: None,
-        event: Some(waltr::grpc::waltr::session::v1::projected_timeline_event::Event::Durable(event)),
+        event: Some(
+            waltr::grpc::waltr::session::v1::projected_timeline_event::Event::Durable(event),
+        ),
     }
 }
 
@@ -660,19 +682,6 @@ pub enum ClientOperationState {
         /// Structured outbound authentication failure, when present.
         authentication_failure: Option<crate::OutboundAuthenticationFailure>,
     },
-    /// External request response command result.
-    SessionRespondExternalRequest {
-        /// Current operation status.
-        status: OperationStatus,
-        /// Last operation error, when present.
-        error: Option<String>,
-        /// Session id responded to.
-        session_id: String,
-        /// External request id.
-        request_id: String,
-        /// Structured outbound authentication failure, when present.
-        authentication_failure: Option<crate::OutboundAuthenticationFailure>,
-    },
     /// Session interrupt command result.
     SessionInterrupt {
         /// Current operation status.
@@ -739,7 +748,6 @@ impl ClientOperationState {
             | Self::SessionDelete { status, error, .. }
             | Self::SessionWipe { status, error }
             | Self::SessionSubmitUserMessage { status, error, .. }
-            | Self::SessionRespondExternalRequest { status, error, .. }
             | Self::SessionInterrupt { status, error, .. }
             | Self::SessionContinue { status, error, .. } => {
                 fail_loading_operation(status, error, MESSAGE, || {})
@@ -789,14 +797,6 @@ impl ClientOperationState {
             Self::SessionSubmitUserMessage { session_id, .. }
             | Self::SessionInterrupt { session_id, .. }
             | Self::SessionRollback { session_id, .. } => session_id.clear(),
-            Self::SessionRespondExternalRequest {
-                session_id,
-                request_id,
-                ..
-            } => {
-                session_id.clear();
-                request_id.clear();
-            }
             Self::SessionContinue {
                 session_id, target, ..
             } => {
@@ -945,6 +945,7 @@ impl ClientState {
     }
 
     fn clear_protected_state(&mut self, policy: ClearPolicy) {
+        self.interactions.invalidate(policy == ClearPolicy::TransientExpiry);
         self.apps = crate::McpAppsSnapshot::default();
         self.apps_completed_requests.clear();
         self.terminalize_loading_operations(policy);
@@ -1328,7 +1329,8 @@ impl ClientState {
                     .statuses
                     .insert(auth_target_key(&target), auth_status);
             } else {
-                attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
+                attempt.lifecycle =
+                    waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
                 "Authorization completion status was unavailable."
                     .clone_into(&mut attempt.failure_reason);
             }
@@ -2481,72 +2483,6 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_session_respond_external_request_loading(
-        &mut self,
-        key: OperationKey,
-        session_id: String,
-        request_id: String,
-    ) {
-        self.sessions.respond_external_request.status = OperationStatus::Loading;
-        self.sessions.respond_external_request.error = None;
-        self.sessions.respond_external_request.key = Some(key.clone());
-        self.operations.insert(
-            key,
-            ClientOperationState::SessionRespondExternalRequest {
-                status: OperationStatus::Loading,
-                error: None,
-                session_id,
-                request_id,
-                authentication_failure: None,
-            },
-        );
-    }
-
-    pub(crate) fn set_session_respond_external_request_ready(
-        &mut self,
-        key: OperationKey,
-        session_id: String,
-        request_id: String,
-    ) {
-        self.sessions.respond_external_request.status = OperationStatus::Ready;
-        self.sessions.respond_external_request.error = None;
-        self.sessions.respond_external_request.key = Some(key.clone());
-        self.operations.insert(
-            key,
-            ClientOperationState::SessionRespondExternalRequest {
-                status: OperationStatus::Ready,
-                error: None,
-                session_id,
-                request_id,
-                authentication_failure: None,
-            },
-        );
-    }
-
-    pub(crate) fn set_session_respond_external_request_failed(
-        &mut self,
-        key: OperationKey,
-        session_id: String,
-        request_id: String,
-        error: &crate::ClientError,
-    ) {
-        let authentication_failure = error.authentication_failure().cloned();
-        let message = error.to_string();
-        self.sessions.respond_external_request.status = OperationStatus::Failed;
-        self.sessions.respond_external_request.error = Some(message.clone());
-        self.sessions.respond_external_request.key = Some(key.clone());
-        self.operations.insert(
-            key,
-            ClientOperationState::SessionRespondExternalRequest {
-                status: OperationStatus::Failed,
-                error: Some(message),
-                session_id,
-                request_id,
-                authentication_failure,
-            },
-        );
-    }
-
     pub(crate) fn set_session_interrupt_loading(&mut self, key: OperationKey, session_id: String) {
         self.sessions.interrupt.status = OperationStatus::Loading;
         self.sessions.interrupt.error = None;
@@ -2812,12 +2748,15 @@ impl ClientState {
     }
 
     fn remove_session(&mut self, id: &str) {
+        self.interactions.sessions.remove(id);
+        self.interactions.watches.remove(id);
         self.sessions.current.remove(id);
         self.sessions.timelines.remove(id);
         self.sessions.template_searches.remove(id);
     }
 
     fn clear_session_derived_state(&mut self) {
+        self.interactions.invalidate(false);
         self.sessions.current.clear();
         self.sessions.timelines.clear();
         self.sessions.template_searches.clear();
@@ -2927,7 +2866,8 @@ pub fn auth_target_key(target: &AuthTarget) -> String {
 }
 
 fn auth_attempt_is_pollable(attempt: &AuthAttemptState) -> bool {
-    attempt.completion_mode == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
+    attempt.completion_mode
+        == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
         && matches!(
             waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(attempt.lifecycle),
             Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending
@@ -2944,7 +2884,9 @@ const fn auth_lifecycle_failure(
 ) -> &'static str {
     match lifecycle {
         waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed => "Authorization failed.",
-        waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Canceled => "Authorization was canceled.",
+        waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Canceled => {
+            "Authorization was canceled."
+        }
         waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Expired => "Authorization expired.",
         _ => "",
     }

@@ -4,11 +4,10 @@ use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWat
 use crate::{
     AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
     ClientRoutineDefinitionSnapshot, ClientRoutineInvocationDetail, ClientRoutineInvocationPage,
-    ClientRoutineInvocationWatchUpdate, ClientRoutineValidationFailure, ClientRoutineValue,
-    GenericAuthAttempt, GenericAuthAttemptStatus, InferenceSettingsRequest, OperationKey, Provider,
-    ResourceCatalog, RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateKind,
-    SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus, TimelineQuery,
-    TimelineWatchKey,
+    ClientRoutineInvocationWatchUpdate, ClientRoutineValidationFailure, GenericAuthAttempt,
+    GenericAuthAttemptStatus, InferenceSettingsRequest, OperationKey, Provider, ResourceCatalog,
+    RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateKind, SessionTemplateOption,
+    SessionTemplateSearchTarget, SystemStatus, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -18,6 +17,8 @@ pub type StreamId = u64;
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
+    /// Authoritative interaction observations and typed response completions.
+    Interaction(crate::InteractionEvent),
     /// Transient MCP Apps operation completion.
     McpApp(crate::McpAppEvent),
     /// Waltr access authentication event.
@@ -42,6 +43,25 @@ pub enum ClientEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum RoutineEvent {
+    RequestReleased {
+        operation_key: OperationKey,
+        request_id: String,
+    },
+    Request {
+        operation_key: OperationKey,
+        request_id: String,
+        command: crate::RoutineRequest,
+    },
+    Requested {
+        operation_key: OperationKey,
+        request_id: String,
+        result: crate::RoutineRequestResult,
+    },
+    RequestFailed {
+        operation_key: OperationKey,
+        request_id: String,
+        error: ClientError,
+    },
     DefinitionWatchInterestRegistered,
     DefinitionWatchInterestReleased,
     DefinitionWatchStartedForOpen {
@@ -51,7 +71,7 @@ pub enum RoutineEvent {
         open_id: u64,
         error: ClientError,
     },
-    DefinitionWatchChanged(ClientRoutineDefinitionSnapshot),
+    DefinitionWatchChanged(Box<ClientRoutineDefinitionSnapshot>),
     DefinitionWatchFailed(ClientError),
     DefinitionWatchEnded,
     DefinitionReconnectReady,
@@ -101,9 +121,10 @@ pub enum RoutineEvent {
         operation_key: OperationKey,
         request_id: String,
         routine_name: String,
+        routine_revision: String,
         trigger_name: String,
-        source_session_id: String,
-        inputs: std::collections::BTreeMap<String, ClientRoutineValue>,
+        source_session_id: Option<String>,
+        inputs: crate::RoutineJson,
     },
     StartAccepted {
         operation_key: OperationKey,
@@ -142,7 +163,7 @@ pub enum RoutineEvent {
     DetailLoaded {
         request_id: String,
         invocation_id: String,
-        detail: ClientRoutineInvocationDetail,
+        detail: Box<ClientRoutineInvocationDetail>,
     },
     DetailFailed {
         request_id: String,
@@ -782,29 +803,6 @@ pub enum SessionEvent {
         /// Failure returned by the submit effect.
         error: ClientError,
     },
-    /// A caller requested a response to an external request.
-    ExternalRequestRespondRequested {
-        /// Operation key allocated when the command was requested.
-        operation_key: OperationKey,
-        /// Session id to respond to.
-        session_id: String,
-        /// External request id.
-        request_id: String,
-        /// JSON response payload.
-        response_json: String,
-    },
-    /// An external request response completed successfully.
-    ExternalRequestResponded {
-        /// Operation key allocated when the command was requested.
-        operation_key: OperationKey,
-    },
-    /// An external request response failed.
-    ExternalRequestRespondFailed {
-        /// Operation key allocated when the command was requested.
-        operation_key: OperationKey,
-        /// Failure returned by the response effect.
-        error: ClientError,
-    },
     /// A caller requested an active session interruption.
     InterruptRequested {
         /// Operation key allocated when the command was requested.
@@ -900,6 +898,8 @@ pub enum SessionEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEffect {
+    /// Interaction observation or one non-replayed typed response.
+    Interaction(crate::InteractionEffect),
     /// Owner-bound MCP Apps RPC.
     McpApp(crate::McpAppEffect),
     /// Auth side-effect intent.
@@ -920,6 +920,11 @@ pub enum ClientEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum RoutineEffect {
+    Request {
+        operation_key: OperationKey,
+        request_id: String,
+        command: crate::RoutineRequest,
+    },
     WatchDefinitions {
         open_id: u64,
         request_id: String,
@@ -927,7 +932,7 @@ pub enum RoutineEffect {
     WatchInvocations {
         open_id: u64,
         request_id: String,
-        after_sequence: Option<u64>,
+        after_sequence: Option<String>,
         metadata_filters: std::collections::BTreeMap<String, String>,
         session_id: Option<String>,
     },
@@ -935,9 +940,10 @@ pub enum RoutineEffect {
         operation_key: OperationKey,
         request_id: String,
         routine_name: String,
+        routine_revision: String,
         trigger_name: String,
-        source_session_id: String,
-        inputs: std::collections::BTreeMap<String, ClientRoutineValue>,
+        source_session_id: Option<String>,
+        inputs: crate::RoutineJson,
     },
     ListInvocations {
         request_id: String,
@@ -1210,17 +1216,6 @@ pub enum SessionEffect {
         session_id: String,
         /// User message text.
         text: String,
-    },
-    /// Respond to an external session request.
-    RespondExternalRequest {
-        /// Operation key allocated when the command was requested.
-        operation_key: OperationKey,
-        /// Session id to respond to.
-        session_id: String,
-        /// External request id.
-        request_id: String,
-        /// JSON response payload.
-        response_json: String,
     },
     /// Interrupt an active session run.
     Interrupt {

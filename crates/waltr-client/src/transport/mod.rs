@@ -7,24 +7,13 @@ mod interaction;
 pub use interaction::RoutineInteractionTransport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
 mod native_trace;
-mod routine;
+pub(crate) mod routine;
 mod session;
+mod pending_interactions;
+pub use pending_interactions::InteractionWatchStream;
 mod status;
 
 pub use config::ConfigWatchStream;
-use waltr::grpc::waltr::catalog::v1::{
-    GetModelCatalogDriftRequest, GetModelCatalogDriftResponse, SearchCatalogModelsRequest,
-    SearchCatalogModelsResponse, SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
-    catalog_service_client::CatalogServiceClient,
-};
-pub use waltr::grpc::waltr::resource::v1::ResourceCatalog as ConfigWatchUpdate;
-use waltr::grpc::waltr::resource::v1::{
-    ResourceCatalog, resource_service_client::ResourceServiceClient,
-};
-use waltr::grpc::waltr::routine::v1::routine_interaction_service_client::RoutineInteractionServiceClient;
-use waltr::grpc::waltr::routine::v1::routine_service_client::RoutineServiceClient;
-use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
-use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use prost::Message;
 pub use routine::{RoutineDefinitionWatchStream, RoutineInvocationWatchStream};
 pub use session::{
@@ -35,6 +24,19 @@ pub use session::{
 pub use status::StatusWatchStream;
 use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
+use waltr::grpc::waltr::catalog::v1::{
+    GetModelCatalogDriftRequest, GetModelCatalogDriftResponse, SearchCatalogModelsRequest,
+    SearchCatalogModelsResponse, SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
+    catalog_service_client::CatalogServiceClient,
+};
+pub use waltr::grpc::waltr::resource::v1::ResourceCatalog as ConfigWatchUpdate;
+use waltr::grpc::waltr::resource::v1::{
+    ResourceCatalog, resource_service_client::ResourceServiceClient,
+};
+use waltr::grpc::waltr::routine::v2::routine_service_client::RoutineServiceClient;
+use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
+use waltr::grpc::waltr::session::v1::interaction_service_client::InteractionServiceClient;
+use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, RwLock};
@@ -64,6 +66,20 @@ pub type DefaultGrpcTransport = WasmGrpcTransport;
 
 /// Runtime-neutral transport adapter used by the shared effect executor.
 pub trait WaltrTransport {
+    fn get_interactions(&self, _session_id: String) -> impl Future<Output = Result<waltr::grpc::waltr::session::v1::InteractionSnapshot, ClientError>> {
+        async { Err(ClientError::new("Interactions transport unavailable")) }
+    }
+    fn watch_interactions(&self, _session_id: String) -> impl Future<Output = Result<InteractionWatchStream, ClientError>> {
+        async { Err(ClientError::new("Interactions transport unavailable")) }
+    }
+    fn respond_interaction(&self, _request: waltr::grpc::waltr::session::v1::RespondInteractionRequest) -> impl Future<Output = Result<(), ClientError>> {
+        async { Err(ClientError::new("Interactions transport unavailable")) }
+    }
+    /// Execute a v2 Routine read or cancellation without mutation retries.
+    fn request_routine(
+        &self,
+        command: crate::RoutineRequest,
+    ) -> impl Future<Output = Result<crate::RoutineRequestResult, ClientError>>;
     /// Stream type returned by configuration watch subscriptions.
     type ConfigWatchStream: futures_core::Stream<Item = Result<ConfigWatchUpdate, ClientError>>;
 
@@ -219,14 +235,6 @@ pub trait WaltrTransport {
         text: String,
     ) -> impl Future<Output = Result<(), ClientError>>;
 
-    /// Respond to an external request.
-    fn respond_external_request(
-        &self,
-        session_id: String,
-        request_id: String,
-        response_json: String,
-    ) -> impl Future<Output = Result<(), ClientError>>;
-
     /// Interrupt an active session run.
     fn interrupt_session(
         &self,
@@ -247,7 +255,7 @@ pub trait WaltrTransport {
         target: RollbackTarget,
     ) -> impl Future<Output = Result<(), ClientError>>;
 
-    /// Subscribe to complete global manual Routine definition snapshots.
+    /// Subscribe to the complete authenticated Routine catalog.
     fn watch_manual_routines(
         &self,
         request_id: String,
@@ -268,7 +276,7 @@ pub trait WaltrTransport {
         metadata_filters: std::collections::BTreeMap<String, String>,
     ) -> impl Future<Output = Result<ClientRoutineInvocationPage, ClientError>>;
 
-    /// Load full task-level detail for one invocation.
+    /// Load the pinned definition and dynamic operations for one invocation.
     fn get_routine_invocation(
         &self,
         request_id: String,
@@ -279,7 +287,7 @@ pub trait WaltrTransport {
     fn watch_routine_invocations(
         &self,
         request_id: String,
-        after_sequence: Option<u64>,
+        after_sequence: Option<String>,
         snapshot_size: u32,
         metadata_filters: std::collections::BTreeMap<String, String>,
     ) -> impl Future<Output = Result<RoutineInvocationWatchStream, ClientError>>;
@@ -287,6 +295,7 @@ pub trait WaltrTransport {
 
 trait RemoteTransport {
     type Inner;
+    fn interaction_client(&self, credentials: &RequestCredentials) -> impl Future<Output = Result<InteractionServiceClient<Self::Inner>, ClientError>>;
 
     fn request_credentials(&self) -> RequestCredentials;
 
@@ -319,11 +328,6 @@ trait RemoteTransport {
         &self,
         credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<RoutineServiceClient<Self::Inner>, ClientError>>;
-
-    fn interaction_client(
-        &self,
-        credentials: &RequestCredentials,
-    ) -> impl Future<Output = Result<RoutineInteractionServiceClient<Self::Inner>, ClientError>>;
 }
 
 #[derive(Clone, Default)]
@@ -336,6 +340,51 @@ struct RequestCredentials {
     credential_revision: u64,
     #[cfg(not(target_arch = "wasm32"))]
     authorization: Option<AsciiMetadataValue>,
+}
+
+impl RequestCredentials {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn media_waker(&self) -> Arc<futures_util::task::AtomicWaker> {
+        let waker = Arc::new(futures_util::task::AtomicWaker::new());
+        let mut state = self.provider.write_state();
+        state.media_wakers.retain(|(_, w)| w.strong_count() > 0);
+        state
+            .media_wakers
+            .push((self.lease_generation, Arc::downgrade(&waker)));
+        waker
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_media_queue(&self, queue: &Arc<crate::interaction::InteractionQueue>) {
+        let mut state = self.provider.write_state();
+        state.media_queues.retain(|(_, w)| w.strong_count() > 0);
+        state
+            .media_queues
+            .push((self.lease_generation, Arc::downgrade(queue)));
+        if state.lease_generation != self.lease_generation {
+            queue.cancel();
+        }
+    }
+    fn is_current(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.provider.read_state().lease_generation == self.lease_generation
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+    }
+    fn same_generation(&self, other: &Self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.lease_generation == other.lease_generation && self.is_current()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = other;
+            true
+        }
+    }
 }
 
 #[allow(
@@ -352,6 +401,21 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    async fn get_interactions(&self, session_id: String) -> Result<waltr::grpc::waltr::session::v1::InteractionSnapshot, ClientError> {
+        pending_interactions::get(self, session_id).await
+    }
+    async fn watch_interactions(&self, session_id: String) -> Result<InteractionWatchStream, ClientError> {
+        pending_interactions::watch(self, session_id).await
+    }
+    async fn respond_interaction(&self, request: waltr::grpc::waltr::session::v1::RespondInteractionRequest) -> Result<(), ClientError> {
+        pending_interactions::respond(self, request).await
+    }
+    async fn request_routine(
+        &self,
+        command: crate::RoutineRequest,
+    ) -> Result<crate::RoutineRequestResult, ClientError> {
+        routine::request_routine(self, command).await
+    }
     type ConfigWatchStream = ConfigWatchStream;
 
     async fn get_config(&self) -> Result<ResourceCatalog, ClientError> {
@@ -539,15 +603,6 @@ where
         session::submit_user_message(self, session_id, text).await
     }
 
-    async fn respond_external_request(
-        &self,
-        session_id: String,
-        request_id: String,
-        response_json: String,
-    ) -> Result<(), ClientError> {
-        session::respond_external_request(self, session_id, request_id, response_json).await
-    }
-
     async fn interrupt_session(&self, session_id: String) -> Result<(), ClientError> {
         session::interrupt_session(self, session_id).await
     }
@@ -610,7 +665,7 @@ where
     async fn watch_routine_invocations(
         &self,
         request_id: String,
-        after_sequence: Option<u64>,
+        after_sequence: Option<String>,
         snapshot_size: u32,
         metadata_filters: std::collections::BTreeMap<String, String>,
     ) -> Result<RoutineInvocationWatchStream, ClientError> {
@@ -673,6 +728,8 @@ struct NativeCredentialState {
     lease_generation: u64,
     credential_revision: u64,
     authorization: Option<AsciiMetadataValue>,
+    media_wakers: Vec<(u64, std::sync::Weak<futures_util::task::AtomicWaker>)>,
+    media_queues: Vec<(u64, std::sync::Weak<crate::interaction::InteractionQueue>)>,
 }
 
 /// Generation lease used to reject stale native credential updates.
@@ -725,9 +782,12 @@ impl NativeCredentialProvider {
         state.lease_generation = state.lease_generation.saturating_add(1);
         state.credential_revision = state.credential_revision.saturating_add(1);
         state.authorization = Some(authorization);
-        Ok(NativeCredentialLease {
+        let lease = NativeCredentialLease {
             lease_generation: state.lease_generation,
-        })
+        };
+        drop(state);
+        self.invalidate_media();
+        Ok(lease)
     }
 
     /// Begin a credential generation, clearing any previous token.
@@ -780,9 +840,12 @@ impl NativeCredentialProvider {
         state.lease_generation = state.lease_generation.saturating_add(1);
         state.credential_revision = state.credential_revision.saturating_add(1);
         state.authorization = None;
-        NativeCredentialLease {
+        let lease = NativeCredentialLease {
             lease_generation: state.lease_generation,
-        }
+        };
+        drop(state);
+        self.invalidate_media();
+        lease
     }
 
     /// Clear credentials only when both the lease and token revision are current.
@@ -805,7 +868,29 @@ impl NativeCredentialProvider {
         state.lease_generation = state.lease_generation.saturating_add(1);
         state.credential_revision = state.credential_revision.saturating_add(1);
         state.authorization = None;
+        drop(state);
+        self.invalidate_media();
         true
+    }
+
+    fn invalidate_media(&self) {
+        let mut state = self.write_state();
+        let generation = state.lease_generation;
+        let (current_wakers, wakers) = std::mem::take(&mut state.media_wakers)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(g, _)| *g == generation);
+        let (current_queues, queues) = std::mem::take(&mut state.media_queues)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(g, _)| *g == generation);
+        state.media_wakers = current_wakers;
+        state.media_queues = current_queues;
+        drop(state);
+        for queue in queues.into_iter().filter_map(|(_, q)| q.upgrade()) {
+            queue.cancel();
+        }
+        for waker in wakers.into_iter().filter_map(|(_, w)| w.upgrade()) {
+            waker.wake();
+        }
     }
 
     fn request_credentials(&self) -> RequestCredentials {
@@ -1008,6 +1093,9 @@ impl NativeGrpcTransport {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RemoteTransport for NativeGrpcTransport {
+    async fn interaction_client(&self, credentials: &RequestCredentials) -> Result<InteractionServiceClient<Self::Inner>, ClientError> {
+        Ok(InteractionServiceClient::with_interceptor(self.channel().await?, Self::interceptor_for(credentials)))
+    }
     type Inner = InterceptedService<NativeChannel, NativeBearerInterceptor>;
 
     fn request_credentials(&self) -> RequestCredentials {
@@ -1073,16 +1161,6 @@ impl RemoteTransport for NativeGrpcTransport {
             Self::interceptor_for(credentials),
         ))
     }
-
-    async fn interaction_client(
-        &self,
-        credentials: &RequestCredentials,
-    ) -> Result<RoutineInteractionServiceClient<Self::Inner>, ClientError> {
-        Ok(RoutineInteractionServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
-    }
 }
 
 /// Browser gRPC-web transport backed by `fetch`.
@@ -1107,6 +1185,9 @@ impl WasmGrpcTransport {
 
 #[cfg(target_arch = "wasm32")]
 impl RemoteTransport for WasmGrpcTransport {
+    async fn interaction_client(&self, _: &RequestCredentials) -> Result<InteractionServiceClient<Self::Inner>, ClientError> {
+        Ok(InteractionServiceClient::new(tonic_web_wasm_client::Client::new(self.api_base.clone())))
+    }
     type Inner = tonic_web_wasm_client::Client;
 
     fn request_credentials(&self) -> RequestCredentials {
@@ -1159,15 +1240,6 @@ impl RemoteTransport for WasmGrpcTransport {
     ) -> Result<RoutineServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(RoutineServiceClient::new(transport))
-    }
-
-    async fn interaction_client(
-        &self,
-        _: &RequestCredentials,
-    ) -> Result<RoutineInteractionServiceClient<Self::Inner>, ClientError> {
-        Ok(RoutineInteractionServiceClient::new(
-            tonic_web_wasm_client::Client::new(self.api_base.clone()),
-        ))
     }
 }
 
