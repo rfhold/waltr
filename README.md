@@ -39,6 +39,27 @@ Run only the web development stack:
 
 `pnpm dev:web`
 
+# Routines And Speech
+
+Routines define workflows in JavaScript with bounded host calls, explicit capabilities, and deadlines.
+The bundled `ask-and-speak` Routine accepts a question and asks a tool-free LLM to answer from model knowledge.
+It waits for the complete answer, retains the text, and streams synthesized audio.
+
+Speech synthesis accepts a JavaScript string or a text input port:
+
+```js
+await host.call('media.synthesize', {
+  text: answer,
+  output: 'audio',
+  speech: {from: 'defaults'}
+});
+```
+
+The Defaults resource selects independent models for LLM inference, speech recognition, diarization, and speech synthesis.
+JavaScript calls can select exact models; helpers can explicitly inherit the source session's model.
+
+See the [audio examples](docs/examples/routines/audio-interactions.md) and [ask-and-speak resource](docs/examples/routines/ask-and-speak.yaml).
+
 # Configuration
 
 Waltr stores persisted YAML resources under `.waltr/resources`. Bundled resources provide defaults, and exact-path files provide overrides.
