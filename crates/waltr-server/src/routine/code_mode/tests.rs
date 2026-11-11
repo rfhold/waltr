@@ -17,6 +17,24 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use waltr_agent::*;
 use waltr_script::Engine;
 
+impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
+    // Exercise the underlying leased invocation fences without public transport narrowing.
+    async fn call_internal(
+        &self,
+        input: CodeInput,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<Value, PortError> {
+        let binding = self.prepare(&input, Origin::Mcp)?;
+        self.run(
+            input,
+            binding,
+            (Origin::Mcp, uuid::Uuid::new_v4().to_string()),
+            cancellation,
+        )
+        .await
+    }
+}
+
 struct CodeProvider<F>(F);
 impl<F> LlmStream for CodeProvider<F>
 where
@@ -284,6 +302,8 @@ impl CodeDispatchStore for FaultDispatchStore {
     }
 }
 pub(crate) struct Fixture {
+    pub(crate) requests: Arc<AtomicUsize>,
+    pub(crate) resolutions: Arc<AtomicUsize>,
     skill_reads: Arc<AtomicUsize>,
     dir: std::path::PathBuf,
     sandbox: crate::sandbox::LocalSandbox,
@@ -292,7 +312,7 @@ pub(crate) struct Fixture {
     sessions: SessionCoordinator<MemorySessionStore>,
     record: SessionRecord,
     principal: AuthenticatedPrincipal,
-    effects: Arc<AtomicUsize>,
+    pub(crate) effects: Arc<AtomicUsize>,
     second: Arc<AtomicUsize>,
     revoked: Arc<AtomicBool>,
     block: Arc<AtomicBool>,
@@ -334,8 +354,17 @@ impl Fixture {
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let stop = CancellationToken::new();
         let stopped = stop.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
         let http = tokio::spawn(async move {
-            axum::serve(listener, mcp::server::streamable_http_router(upstream))
+            let router =
+                mcp::server::streamable_http_router(upstream).layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        async move { next.run(request).await }
+                    },
+                ));
+            axum::serve(listener, router)
                 .with_graceful_shutdown(stopped.cancelled_owned())
                 .await
                 .unwrap();
@@ -394,6 +423,8 @@ impl Fixture {
             .await
             .unwrap();
         let broker = InteractionBroker::new();
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolved = resolutions.clone();
         let base = AgentSessionRuntimeFactory::new(
             sandbox.handle(),
             root.clone(),
@@ -404,6 +435,7 @@ impl Fixture {
         .with_capability_policy(ServerPermissionPolicy::sessions(broker.clone()))
         .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(model(), provider.clone())))
         .with_mcp_connection_resolver(move |_| {
+            resolved.fetch_add(1, Ordering::SeqCst);
             let url = url.clone();
             Box::pin(async move {
                 Ok(vec![McpResolvedConnection {
@@ -488,6 +520,8 @@ impl Fixture {
             .clone()
             .with_runtime_factory(installed.session_factory(sessions));
         Self {
+            requests,
+            resolutions,
             broker,
             dir,
             sandbox,
@@ -522,6 +556,20 @@ impl Fixture {
             .bind(&self.principal, &self.record, runtime, dispatcher)
             .unwrap()
     }
+    pub(crate) async fn public_adapter(&self) -> Arc<CodeModeAdapter<MemorySessionStore>> {
+        let (runtime, dispatcher) = self
+            .host
+            .helpers
+            .as_ref()
+            .clone()
+            .for_concrete_calls()
+            .runtime_with_dispatcher(&self.record, self.sessions.clone(), None)
+            .await
+            .unwrap();
+        self.host
+            .bind(&self.principal, &self.record, runtime, dispatcher)
+            .unwrap()
+    }
     pub(crate) async fn finish(self) {
         self.service.shutdown().await.unwrap();
         self.sessions.shutdown().await;
@@ -530,15 +578,19 @@ impl Fixture {
         self.sandbox.shutdown().await;
     }
     async fn pending(&self) -> (SessionId, crate::interaction::InteractionSnapshot) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async { loop {
-            for summary in self.sessions.store().list().await.unwrap() {
-                let snapshot = self.broker.snapshot(&summary.id);
-                if !snapshot.pending.is_empty() {
-                    return (summary.id, snapshot);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                for summary in self.sessions.store().list().await.unwrap() {
+                    let snapshot = self.broker.snapshot(&summary.id);
+                    if !snapshot.pending.is_empty() {
+                        return (summary.id, snapshot);
+                    }
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        } }).await.expect("helper did not enter original live consent within five seconds")
+        })
+        .await
+        .expect("helper did not enter original live consent within five seconds")
     }
     fn approve(
         &self,
@@ -626,7 +678,7 @@ async fn stale_adapter_denies_every_action_after_session_delete_and_recreate() {
         },
     ] {
         assert!(matches!(
-            PublicCodePort::call(&adapter, input, CancellationToken::new()).await,
+            adapter.call_internal(input, CancellationToken::new()).await,
             Err(PortError::Denied)
         ));
     }
@@ -653,15 +705,15 @@ async fn guest_schema_batch_limit_precedes_schema_reads_and_following_effect() {
     let source = "await host.call('tools.schemas',{targets:Array.from({length:9},()=>({server:'upstream',tool:'effect'}))}); await host.call('tools.execute',{target:{server:'upstream',tool:'effect'},callId:'effect',arguments:{}}); return true;";
     let fixture = Fixture::new(true, "deny", source).await;
     let adapter = fixture.adapter().await;
-    let output = PublicCodePort::call(
-        &adapter,
-        CodeInput::Execute {
-            source: source.into(),
-        },
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let output = adapter
+        .call_internal(
+            CodeInput::Execute {
+                source: source.into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     assert_eq!(output["status"], "failed");
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
     let pool = sqlx::SqlitePool::connect(&format!(
@@ -686,15 +738,15 @@ async fn exact_alias_collision_targets_both_execute_without_conflation() {
     let source = "for(const tool of ['alias-collision','alias_collision']) { const r=await host.call('tools.execute',{target:{server:'upstream',tool},callId:tool,arguments:{}}); if(r.status!=='completed')throw new Error(r.status); } return true;";
     let fixture = Fixture::new(true, "deny", source).await;
     let adapter = fixture.adapter().await;
-    let output = PublicCodePort::call(
-        &adapter,
-        CodeInput::Execute {
-            source: source.into(),
-        },
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let output = adapter
+        .call_internal(
+            CodeInput::Execute {
+                source: source.into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     assert_eq!(output["status"], "succeeded");
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.second.load(Ordering::SeqCst), 1);
@@ -761,16 +813,18 @@ async fn reserved_admission_commit_with_lost_ack_never_starts_or_replays_source(
 }
 
 #[tokio::test]
-async fn real_js_named_helper_retains_original_live_permission_owner_without_payload() {
+async fn public_code_named_helper_retains_internal_upstream_and_live_permission_owner() {
     let source = "const r=await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'Perform one operation',maxTurns:3,deadlineMs:10000,responseBytes:65536,completionBytes:65536}); if(r.status!=='accepted')throw new Error(r.status); return r.result.response;";
     let fixture = Fixture::new(true, "deny", source).await;
-    let mut profile = fixture.adapter().await.grant.profile.clone();
+    let mut profile = fixture.public_adapter().await.grant.profile.clone();
     profile.helpers.insert("worker".into());
     fixture
         .host
         .grant(fixture.principal.clone(), &fixture.record, profile)
         .unwrap();
-    let adapter = fixture.adapter().await;
+    let adapter = fixture.public_adapter().await;
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 0);
     let approval = async {
         let (original, snapshot) = fixture.pending().await;
         assert_ne!(original, fixture.record.id);
@@ -793,6 +847,7 @@ async fn real_js_named_helper_retains_original_live_permission_owner_without_pay
     assert_eq!(result["status"], "succeeded");
     assert_eq!(result["result"], "helper finished");
     assert_eq!(fixture.second.load(Ordering::SeqCst), 1);
+    assert!(fixture.requests.load(Ordering::SeqCst) > 0);
     assert_eq!(
         fixture
             .sessions
@@ -821,7 +876,7 @@ async fn stale_origin_cannot_approve_helper_effect(skills: bool, approve: bool) 
     let other = SessionCoordinator::new(fixture.sessions.store().clone());
     let mut replaced = false;
     let mut initial_reads = 0;
-    let call = adapter.call(
+    let call = adapter.call_internal(
         CodeInput::Execute {
             source: source.into(),
         },
@@ -896,7 +951,7 @@ async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_cal
         .unwrap();
     let adapter = fixture.adapter().await;
     let result = adapter
-        .call(
+        .call_internal(
             CodeInput::Execute {
                 source: source.into(),
             },
@@ -911,7 +966,7 @@ async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_cal
     assert_eq!(fixture.second.load(Ordering::SeqCst), 0);
     let source = "for(let i=0;i<256;i++)await host.call('tools.schemas',{targets:[]}); return await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'work',maxTurns:1,deadlineMs:1000,responseBytes:65536,completionBytes:65536});";
     let result = adapter
-        .call(
+        .call_internal(
             CodeInput::Execute {
                 source: source.into(),
             },
@@ -954,7 +1009,7 @@ async fn helper_deadline_closes_pending_original_consent_without_effect_or_late_
     let adapter = fixture.adapter().await;
     let ((id, snapshot), result) = tokio::join!(
         fixture.pending(),
-        adapter.call(
+        adapter.call_internal(
             CodeInput::Execute {
                 source: source.into()
             },
@@ -1133,7 +1188,7 @@ async fn discovery_is_bounded_schema_on_demand_and_hidden_inventory_is_not_a_gra
     let fixture = Fixture::new(true, "deny", one_effect()).await;
     let adapter = fixture.adapter().await;
     let page = adapter
-        .call(
+        .call_internal(
             CodeInput::Discover { after: None },
             CancellationToken::new(),
         )
@@ -1148,7 +1203,7 @@ async fn discovery_is_bounded_schema_on_demand_and_hidden_inventory_is_not_a_gra
         "{page}"
     );
     let schemas = adapter
-        .call(
+        .call_internal(
             CodeInput::Schemas {
                 targets: vec![ConcreteToolTarget::new("upstream", "effect").unwrap()],
             },
@@ -1159,7 +1214,7 @@ async fn discovery_is_bounded_schema_on_demand_and_hidden_inventory_is_not_a_gra
     assert_eq!(schemas["schemas"].as_array().unwrap().len(), 1);
     assert!(
         adapter
-            .call(
+            .call_internal(
                 CodeInput::Schemas {
                     targets: vec![ConcreteToolTarget::new("upstream", "app_only").unwrap()]
                 },
@@ -1172,7 +1227,7 @@ async fn discovery_is_bounded_schema_on_demand_and_hidden_inventory_is_not_a_gra
     let hidden = Fixture::new(false, "deny", one_effect()).await;
     let adapter = hidden.adapter().await;
     let page = adapter
-        .call(
+        .call_internal(
             CodeInput::Discover { after: None },
             CancellationToken::new(),
         )
@@ -1180,7 +1235,7 @@ async fn discovery_is_bounded_schema_on_demand_and_hidden_inventory_is_not_a_gra
         .unwrap();
     assert!(page["tools"].as_array().unwrap().is_empty());
     let output = adapter
-        .call(
+        .call_internal(
             CodeInput::Execute {
                 source: one_effect().into(),
             },
@@ -1244,7 +1299,7 @@ async fn sql_association_refuses_same_identity_and_different_revision_after_ack_
         .unwrap();
     assert!(
         adapter
-            .call(
+            .call_internal(
                 CodeInput::Execute {
                     source: one_effect().into()
                 },
@@ -1262,7 +1317,7 @@ async fn current_remote_declaration_revocation_blocks_the_pinned_concrete_tool()
     let adapter = fixture.adapter().await;
     fixture.revoked.store(true, Ordering::SeqCst);
     let output = adapter
-        .call(
+        .call_internal(
             CodeInput::Execute {
                 source: one_effect().into(),
             },
@@ -1350,7 +1405,7 @@ async fn cancellation_and_revocation_join_the_original_owner_without_replaying_e
         let cancelled = cancellation.clone();
         let call = tokio::spawn(async move {
             adapter
-                .call(
+                .call_internal(
                     CodeInput::Execute {
                         source: one_effect().into(),
                     },
@@ -1397,14 +1452,14 @@ async fn source_and_selected_schema_bounds_fail_before_any_effect() {
     ] {
         assert!(
             adapter
-                .call(CodeInput::Execute { source }, CancellationToken::new())
+                .call_internal(CodeInput::Execute { source }, CancellationToken::new())
                 .await
                 .is_err()
         );
     }
     assert!(
         adapter
-            .call(
+            .call_internal(
                 CodeInput::Schemas {
                     targets: vec![ConcreteToolTarget::new("upstream", "effect").unwrap(); 9]
                 },
@@ -1508,7 +1563,7 @@ async fn authenticated_bearer_expiry_cancels_the_actual_child_before_the_next_ef
     fixture.block.store(true, Ordering::SeqCst);
     let call = tokio::spawn(async move {
         adapter
-            .call(
+            .call_internal(
                 CodeInput::Execute {
                     source: partial().into(),
                 },
@@ -1542,7 +1597,7 @@ async fn authenticated_bearer_expiry_cancels_the_actual_child_before_the_next_ef
 }
 
 #[tokio::test]
-async fn dropped_public_waiter_leaves_service_owned_drain_and_never_replays_the_association() {
+async fn dropped_leased_waiter_leaves_service_owned_drain_and_never_replays_the_association() {
     let fixture = Fixture::new(true, "allow", one_effect()).await;
     let adapter = fixture.adapter().await;
     let input = CodeInput::Execute {
@@ -1712,7 +1767,7 @@ async fn session_replacement_during_an_effect_denies_the_next_dispatch() {
     fixture.block.store(true, Ordering::SeqCst);
     let call = tokio::spawn(async move {
         adapter
-            .call(
+            .call_internal(
                 CodeInput::Execute {
                     source: partial().into(),
                 },

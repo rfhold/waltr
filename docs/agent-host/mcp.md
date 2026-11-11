@@ -1,10 +1,12 @@
 # Server MCP Integration
 
-The server host exposes tools, prompt templates, resource reads, resource templates, and opt-in Skills from configured MCP servers. Generic protocol behavior lives in [MCP protocol](../mcp/protocol.md); this guide covers server-owned adaptation, policy, and live interactions.
+The server host adapts tools, prompt templates, resource reads, resource templates, and opt-in Skills from configured MCP servers for internal agent sessions. Generic protocol behavior lives in [MCP protocol](../mcp/protocol.md); this guide covers server-owned adaptation, policy, and live interactions.
 
 `ServerAgentRuntimeFactory` owns the session MCP registry and concrete runtime construction. The generic agent receives neutral tools and hooks, not MCP clients. Host retirement cancels and joins runtime shutdown.
 
 ## Entry Points
+
+Waltr's ordinary public MCP catalog exposes Waltr-owned tools, enabled filesystem/shell capabilities, resources, and served Apps. It does not aggregate configured upstream MCP servers. Public `capability__*` discovery and calls do not resolve upstream connections, refresh credentials, or start MCP clients. Guessed `capability__<server>__<tool>` names are rejected before dispatch journaling. Internal agent MCP selection, authentication, resources, Skills, and session Apps retain their normal behavior. Separately granted public `code` requests retain JavaScript execution and named helpers, but omit all upstream concrete targets from discovery and deny their schemas and execution before upstream runtime assembly. Named helpers retain their own internal agent authority. Custom public code ports must enforce the same no-proxy boundary.
 
 | API | Purpose |
 | --- | --- |
@@ -78,7 +80,7 @@ A name alone grants no authority; later destination edits use ordinary upstream 
 `McpServerConfig` retains the logical endpoint for source identity and declaration checks.
 Only its private transport destination changes, with a memory-only generation bearer and a distinct authority identifier.
 Every private bearer lookup checks the current logical connection and generation lifetime.
-The external capability catalog excludes the logical self resource, so self discovery cannot recurse.
+The external capability catalog contains no upstream MCP tools, including tools from the logical self resource, so self discovery cannot recurse.
 
 The private client bypasses proxies, refuses all redirects, and enables generic endpoint redaction.
 The application never persists the private endpoint or bearer in resource YAML, OAuth credentials, or session metadata.
@@ -115,7 +117,7 @@ Names are sanitized for provider visibility. Visible aliases are not authority: 
 
 ## Tool Calls
 
-Provider calls, templates, Apps, reviewed JavaScript, and authenticated external tools all use the same server capability dispatcher:
+Provider calls, templates, session Apps, and reviewed JavaScript use the server capability dispatcher for upstream MCP tools. Public external calls share the dispatcher implementation but receive only Waltr-owned filesystem/shell capabilities:
 
 - Session-bound tool calls and results are recorded as generic timeline events and journal-backed session projection data. Sessionless external calls use the SQL journal described below instead.
 - Permission behavior can target the generated tool name through normal tool selectors.

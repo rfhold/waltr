@@ -286,7 +286,6 @@ pub struct WaltrMcpServer {
     catalog: Arc<mcp::SkillCatalog>,
     readiness: Option<crate::readiness::Readiness>,
     code: Option<Arc<dyn crate::routine::code_mode::PublicCodePort>>,
-    self_resource: Option<String>,
 }
 
 impl std::fmt::Debug for WaltrMcpServer {
@@ -387,16 +386,6 @@ impl WaltrMcpServer {
                     ),
                 ],
             )?;
-        // Self tools are already served here; never recursively wrap the bound self transport.
-        let self_resource = resources
-            .resource_catalog()
-            .effective_configuration
-            .and_then(|configuration| {
-                configuration
-                    .mcp_servers
-                    .get("waltr")
-                    .map(|server| server.url.clone())
-            });
         Ok(Self {
             anonymous_disabled: false,
             hosted_issuer: None,
@@ -406,7 +395,6 @@ impl WaltrMcpServer {
             catalog: Arc::new(catalog),
             readiness: None,
             code: None,
-            self_resource,
         })
     }
 
@@ -820,7 +808,6 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                     .is_some_and(|runtime| runtime.code.public_enabled(&principal))
             });
         let external = self.sessions.external_tools();
-        let self_resource = self.self_resource.clone();
         let admitted = self.origin(&context);
         Box::pin(async move {
             let mut list = mcp::McpToolList {
@@ -843,8 +830,7 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
             }
             if let Some(external) = external {
                 admitted?;
-                list.tools
-                    .extend(external.list(self_resource.as_deref()).await?);
+                list.tools.extend(external.list().await?);
             }
             Ok(list)
         })
@@ -867,7 +853,7 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                             "external workspace capabilities are not configured",
                         )
                     })?
-                    .call(call, context, principal, server.self_resource.as_deref())
+                    .call(call, context, principal)
                     .await;
             }
             if call.name == "code" {
@@ -1443,10 +1429,17 @@ mod tests {
         LlmError, SessionListUpdate,
     };
 
-    struct UnusedSessionHost;
+    #[derive(Default)]
+    struct UnusedSessionHost {
+        external: Option<Arc<crate::agent_host::external::ExternalToolHost>>,
+    }
 
     #[tonic::async_trait]
     impl SessionHost for UnusedSessionHost {
+        fn external_tools(&self) -> Option<Arc<crate::agent_host::external::ExternalToolHost>> {
+            self.external.clone()
+        }
+
         async fn shutdown(&self) {}
 
         fn set_completion_admission_handler(
@@ -1585,6 +1578,132 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn public_capabilities_never_prepare_or_proxy_default_agent_mcp() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = crate::sandbox::LocalSandbox::start(root.path().into())
+            .await
+            .unwrap();
+        let persistence = crate::persistence::Persistence::initialize(
+            crate::persistence::DatabaseConfig::for_tests().unwrap(),
+        )
+        .await
+        .unwrap();
+        let catalog = crate::agent_host::AgentDefinitionCatalog::from_sources(vec![
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: default}\nspec:\n  features:\n    - filesystem: {root: '$(session.workspace.root)', profile: auto}\n    - shell: {root: '$(session.workspace.root)'}\n    - mcp: {skills: true}\n".into(),
+        ], "default").unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resolver_attempts = attempts.clone();
+        let factory = crate::agent_host::runtime_factory::ServerAgentRuntimeFactory::new(
+            sandbox.handle(),
+            root.path().into(),
+            crate::auth::FileCredentialStore::new(root.path().join("auth.json")),
+            catalog.resolved("default").unwrap().clone(),
+        )
+        .with_mcp_connection_resolver(move |_| {
+            resolver_attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(waltr_agent::AgentSessionRuntimeError::FailedPrecondition(
+                    "upstream MCP OAuth refresh token was rejected".into(),
+                ))
+            })
+        });
+        let external = crate::agent_host::external::ExternalToolHost::new(
+            factory,
+            crate::interaction::InteractionBroker::new(),
+        );
+        external
+            .install_journal(persistence.external_dispatch_store())
+            .unwrap();
+        let state = AgentDefinitionState::load(root.path(), &[], "coding").unwrap();
+        let server = WaltrMcpServer::new(
+            Arc::new(UnusedSessionHost {
+                external: Some(external.clone()),
+            }),
+            state,
+        )
+        .unwrap()
+        .with_anonymous_disabled();
+        let router = mcp::server::streamable_http_router(Arc::new(server));
+        let listed = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let names = listed["result"]["tools"]
+            .as_array()
+            .expect("public discovery succeeds")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            "status",
+            "create",
+            "edit",
+            "destroy",
+            "execute",
+            "query",
+            "capability__read",
+            "capability__glob",
+            "capability__grep",
+            "capability__edit",
+            "capability__write",
+            "capability__delete",
+            "capability__apply_patch",
+        ];
+        if cfg!(feature = "shell") {
+            expected.push("capability__shell");
+        }
+        let mut actual = names.clone();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        for name in [
+            "capability__axol__effect",
+            "capability__waltr__status",
+            "capability__read_mcp_resource",
+        ] {
+            let rejected = mcp_request(&router, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":{}}})).await;
+            assert_eq!(rejected["error"]["code"], -32020, "{rejected}");
+            assert_eq!(rejected["error"]["data"]["bodyValue"], "known tool schema");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM external_capability_dispatch")
+            .fetch_one(persistence.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "rejected upstream guesses never enter the dispatch journal"
+        );
+        let write = mcp_request(&router, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capability__write","arguments":{"filePath":"own.txt","content":"own capability"}}})).await;
+        assert!(write.get("error").is_none(), "{write}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("own.txt")).unwrap(),
+            "own capability"
+        );
+        #[cfg(feature = "shell")]
+        {
+            let shell = mcp_request(&router, json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"capability__shell","arguments":{"command":"cat own.txt","description":"Read fixture file"}}})).await;
+            assert!(shell.get("error").is_none(), "{shell}");
+            assert!(shell.to_string().contains("own capability"), "{shell}");
+        }
+        let resources = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":5,"method":"resources/list"}),
+        )
+        .await;
+        assert!(resources.get("error").is_none(), "{resources}");
+        let upstream = mcp_request(&router, json!({"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"upstream://private"}})).await;
+        assert!(upstream.get("error").is_some(), "{upstream}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        external.shutdown().await;
+        sandbox.shutdown().await;
+    }
+
     #[test]
     fn canonical_uri_components_round_trip_and_reject_aliases() {
         for input in ["agents/coding.yaml", "session /?#%", "unicode-\u{00e9}"] {
@@ -1643,10 +1762,11 @@ mod tests {
 
     #[cfg(feature = "test")]
     #[tokio::test]
-    async fn optional_code_mcp_http_uses_explicit_caller_port_and_schema_on_demand() {
+    async fn optional_code_mcp_http_never_exposes_upstream_targets() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let default = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state.clone()).unwrap();
+        let default =
+            WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state.clone()).unwrap();
         let router = mcp::server::streamable_http_router(Arc::new(default.clone()));
         let listed = mcp_request(
             &router,
@@ -1664,7 +1784,7 @@ mod tests {
         assert!(disabled.get("error").is_some());
         let fixture =
             crate::routine::code_mode::tests::Fixture::new(true, "allow", "return null;").await;
-        let adapter = fixture.adapter().await;
+        let adapter = fixture.public_adapter().await;
         let enabled = default.with_code_port(Arc::new(adapter));
         let router = mcp::server::streamable_http_router(Arc::new(enabled));
         let listed = mcp_request(
@@ -1677,10 +1797,31 @@ mod tests {
         assert!(!tools.iter().any(|tool| tool["name"] == "effect"));
         let discover=mcp_request(&router,json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"code","arguments":{"action":"discover"}}})).await;
         assert!(!discover.to_string().contains("input_schema"));
+        assert_eq!(
+            discover["result"]["structuredContent"]["tools"],
+            json!([]),
+            "{discover}"
+        );
+        let schemas=mcp_request(&router,json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"code","arguments":{"action":"schemas","targets":[{"server":"upstream","tool":"effect"}]}}})).await;
+        assert!(schemas.get("error").is_some(), "{schemas}");
         let execute=mcp_request(&router,json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"const effect=await host.call('tools.execute',{target:{server:'upstream',tool:'effect'},callId:'public-effect',arguments:{}}); return {selected:effect.status};"}}})).await;
         let output = &execute["result"]["structuredContent"];
-        assert_eq!(output["status"], "succeeded", "{execute}");
-        assert_eq!(output["result"]["selected"], "completed");
+        assert_eq!(output["status"], "failed", "{execute}");
+        let guest_schemas=mcp_request(&router,json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"return await host.call('tools.schemas',{targets:[{server:'upstream',tool:'effect'}]});"}}})).await;
+        assert_eq!(
+            guest_schemas["result"]["structuredContent"]["status"], "failed",
+            "{guest_schemas}"
+        );
+        let own=mcp_request(&router,json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"return {own:true};"}}})).await;
+        assert_eq!(
+            own["result"]["structuredContent"]["status"], "succeeded",
+            "{own}"
+        );
+        assert_eq!(own["result"]["structuredContent"]["result"]["own"], true);
+        use std::sync::atomic::Ordering;
+        assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 0);
         let invalid=mcp_request(&router,json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"code","arguments":{"action":"execute","source":"return true;","capabilities":["all"]}}})).await;
         assert!(invalid.get("error").is_some());
         fixture.finish().await;
@@ -1690,7 +1831,8 @@ mod tests {
     async fn direct_edit_http_contract_rejects_envelopes_and_null_anchors_without_writes() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let server = Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap());
+        let server =
+            Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state).unwrap());
         let router = mcp::server::streamable_http_router(server.clone());
         let uri = "waltr://resources/agents%2Fcoding.yaml";
         let original = server.resource_detail(uri).unwrap();
@@ -2070,7 +2212,7 @@ mod tests {
     async fn resource_handlers_create_edit_and_destroy_without_overwrite() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap();
+        let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state).unwrap();
 
         let uri = "waltr://resources/agents%2Fcoding.yaml";
         let inspected = server.resource_detail(uri).unwrap();
@@ -2287,7 +2429,8 @@ mod tests {
     async fn agent_definition_actions_classify_and_sanitize_failures() {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        let inner = Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap());
+        let inner =
+            Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state).unwrap());
 
         let validation = inner
             .inspect_resources(InspectResourcesInput {
@@ -2340,7 +2483,7 @@ mod tests {
     fn test_server() -> Arc<WaltrMcpServer> {
         let root = crate::test_support::temp_root();
         let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
-        Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state).unwrap())
+        Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state).unwrap())
     }
 
     #[tokio::test]
@@ -2367,7 +2510,7 @@ mod tests {
         };
         assert!(readiness.is_ready().await);
         let server = Arc::new(
-            WaltrMcpServer::new(Arc::new(UnusedSessionHost), state)
+            WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state)
                 .unwrap()
                 .with_readiness(readiness),
         );

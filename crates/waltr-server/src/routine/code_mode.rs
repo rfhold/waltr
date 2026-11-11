@@ -80,6 +80,8 @@ pub trait CodeDispatchStore: Send + Sync {
 
 /// Optional ordinary MCP execution/discovery port, already scoped to actual caller authority.
 /// A shared handler cannot substitute request metadata for this authenticated binding.
+/// Implementations must not discover, publish schemas for, or execute upstream MCP targets.
+/// Named agent helpers retain their own internal authority; they are not direct MCP proxies.
 pub trait PublicCodePort: Send + Sync {
     /// A fresh explicit call. Request correlation and MRTR state are never retry authority.
     fn call(&self, input: CodeInput, cancellation: CancellationToken) -> PortFuture<Value>;
@@ -352,6 +354,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeHost<S> {
             record: record.clone(),
             grant,
             request_principal: principal.clone(),
+            public_only: false,
         }))
     }
     /// Install actual normal-session runtime composition for a host-bound principal.
@@ -414,6 +417,7 @@ pub struct CodeModeAdapter<S: SessionStore + Clone + Send + Sync + 'static> {
     record: SessionRecord,
     grant: Grant,
     request_principal: AuthenticatedPrincipal,
+    public_only: bool,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> std::fmt::Debug for CodeModeAdapter<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -516,6 +520,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                 {
                     return Err(PortError::Denied);
                 }
+                if self.public_only {
+                    return bounded(json!({"schemas":[]}));
+                }
                 let executor = self.executor().await?;
                 let result = tokio::select! { biased;
                     ()=cancel.cancelled()=>Err(PortError::Denied),
@@ -556,6 +563,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                             runtime: self.runtime.clone(),
                             record: current,
                             grant: self.grant.clone(),
+                            public_only: self.public_only,
                         }),
                     },
                 });
@@ -658,7 +666,18 @@ fn agent_error(error: PortError) -> waltr_agent::LlmError {
 
 impl<S: SessionStore + Clone + Send + Sync + 'static> PublicCodePort for Arc<CodeModeAdapter<S>> {
     fn call(&self, input: CodeInput, cancellation: CancellationToken) -> PortFuture<Value> {
-        let adapter = self.clone();
+        let mut grant = self.grant.clone();
+        // Concrete targets identify upstream MCP tools, never Waltr's own capabilities.
+        grant.profile.targets.clear();
+        let adapter = CodeModeAdapter {
+            host: self.host.clone(),
+            runtime: self.runtime.clone(),
+            dispatcher: self.dispatcher.clone(),
+            record: self.record.clone(),
+            grant,
+            request_principal: self.request_principal.clone(),
+            public_only: true,
+        };
         Box::pin(async move {
             let binding = adapter.prepare(&input, Origin::Mcp)?;
             adapter
@@ -836,6 +855,7 @@ struct CodeBindings<S: SessionStore + Clone + Send + Sync + 'static> {
     runtime: AgentRuntime,
     record: SessionRecord,
     grant: Grant,
+    public_only: bool,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory for CodeBindings<S> {
     fn bind(
@@ -850,6 +870,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
         let grant = self.grant.clone();
         let helpers = self.helpers.clone();
         let live = self.live.clone();
+        let public_only = self.public_only;
         Box::pin(async move {
             grant.check()?;
             if caller.principal != super::rpc::principal_id(&grant.principal) {
@@ -859,34 +880,38 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 .inference_settings
                 .clone()
                 .ok_or(PortError::Invalid)?;
-            let mut request = SessionCreateRequest::new(SessionId::generate());
-            request.inference_settings = Some(inference.clone());
-            request.agent_definition = record.agent_definition.clone();
-            let id = sessions
-                .create(request)
-                .await
-                .map_err(|_| PortError::Unavailable)?
-                .id()
-                .clone();
-            let tool_record = sessions
-                .load(&id)
-                .await
-                .map_err(|_| PortError::Unavailable)?
-                .record;
-            let (runtime, dispatcher) = helpers
-                .as_ref()
-                .clone()
-                .for_concrete_calls()
-                .with_permission_restriction(grant.profile.restriction.clone())
-                .runtime_for_record(&tool_record, sessions.clone())
-                .await
-                .map_err(|_| PortError::Unavailable)?;
-            let tools = Arc::new(SessionAuthorizedToolExecutor::new(
-                sessions.clone(),
-                id,
-                runtime,
-                dispatcher,
-            ));
+            let tools: Arc<dyn AuthorizedToolExecutor> = if public_only {
+                Arc::new(PublicToolsClosed)
+            } else {
+                let mut request = SessionCreateRequest::new(SessionId::generate());
+                request.inference_settings = Some(inference.clone());
+                request.agent_definition = record.agent_definition.clone();
+                let id = sessions
+                    .create(request)
+                    .await
+                    .map_err(|_| PortError::Unavailable)?
+                    .id()
+                    .clone();
+                let tool_record = sessions
+                    .load(&id)
+                    .await
+                    .map_err(|_| PortError::Unavailable)?
+                    .record;
+                let (runtime, dispatcher) = helpers
+                    .as_ref()
+                    .clone()
+                    .for_concrete_calls()
+                    .with_permission_restriction(grant.profile.restriction.clone())
+                    .runtime_for_record(&tool_record, sessions.clone())
+                    .await
+                    .map_err(|_| PortError::Unavailable)?;
+                Arc::new(SessionAuthorizedToolExecutor::new(
+                    sessions.clone(),
+                    id,
+                    runtime,
+                    dispatcher,
+                ))
+            };
             let helper = CoordinatorHelperRunner::new(
                 sessions,
                 helpers,
@@ -909,5 +934,33 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 targets: grant.profile.targets,
             })
         })
+    }
+}
+
+struct PublicToolsClosed;
+impl AuthorizedToolExecutor for PublicToolsClosed {
+    fn execute(
+        &self,
+        _: crate::agent_host::authorized_tools::AuthorizedToolRequest,
+        _: CancellationToken,
+    ) -> crate::agent_host::authorized_tools::AuthorizedToolFuture<waltr_agent::ToolResult> {
+        Box::pin(async { Err(crate::agent_host::authorized_tools::AuthorizedToolError::Denied) })
+    }
+    fn schemas(
+        &self,
+        targets: Vec<ConcreteToolTarget>,
+        _: CancellationToken,
+    ) -> crate::agent_host::authorized_tools::AuthorizedToolFuture<Vec<waltr_agent::ToolDefinition>>
+    {
+        Box::pin(async move {
+            if targets.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(crate::agent_host::authorized_tools::AuthorizedToolError::Denied)
+            }
+        })
+    }
+    fn cleanup(&self) -> crate::agent_host::authorized_tools::AuthorizedToolFuture<()> {
+        Box::pin(async { Ok(()) })
     }
 }

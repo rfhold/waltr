@@ -324,7 +324,6 @@ pub struct ServerAgentRuntimeFactory {
     policy: Arc<dyn super::dispatcher::CapabilityPolicy>,
     restriction: Option<PermissionPolicy>,
     concrete_only: bool,
-    external_self_resource: Option<String>,
     self_mcp: Arc<std::sync::OnceLock<crate::self_mcp::SelfMcpBinding>>,
     pub(crate) run_events: Option<Arc<dyn crate::agent_host::SessionEventSink>>,
     pub(crate) run_completion: Option<Arc<dyn super::SessionCompletionCoordinationHandler>>,
@@ -433,14 +432,7 @@ impl ServerAgentRuntimeFactory {
         &self,
         broker: crate::interaction::InteractionBroker,
         destination: crate::interaction::InteractionDestination,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<
-        (
-            super::dispatcher::CapabilityDispatcher,
-            Option<Arc<McpClientRuntime>>,
-        ),
-        AgentSessionRuntimeError,
-    > {
+    ) -> Result<super::dispatcher::CapabilityDispatcher, AgentSessionRuntimeError> {
         let _root = self.sandbox_root()?;
         let catalog = self.catalog_provider.as_ref().map(|provide| provide());
         let definition = catalog
@@ -461,62 +453,18 @@ impl ServerAgentRuntimeFactory {
         }
         #[cfg(feature = "shell")]
         if definition.features.shell.is_some() {
-            capabilities.push(ShellConfig::new(_root.clone()).into_agent_tool(self.sandbox.clone()));
+            capabilities
+                .push(ShellConfig::new(_root.clone()).into_agent_tool(self.sandbox.clone()));
         }
-        let prepared = match &definition.features.mcp {
-            Some(feature) => self.prepare_mcp_runtime(feature).await?,
-            None => None,
-        };
-        let runtime = if let Some(prepared) = prepared {
-            let runtime =
-                McpClientRuntime::start(prepared.config, self.mcp_root_uri()?, cancellation)
-                    .await
-                    .map_err(|error| {
-                        AgentSessionRuntimeError::FailedPrecondition(error.to_string())
-                    })?;
-            capabilities.extend(
-                runtime
-                    .agent_tools(policy.clone())
-                    .await
-                    .into_iter()
-                    .filter(|capability| {
-                        capability.mcp_app_source.as_ref().is_none_or(|source| {
-                            source.ui.visible_to(mcp::apps::UiVisibility::Model)
-                        })
-                    }),
-            );
-            Some(runtime)
-        } else {
-            None
-        };
-        let dispatcher =
-            match super::dispatcher::CapabilityDispatcher::new(capabilities, None, policy) {
-                Ok(dispatcher) => dispatcher.with_context(
+        // Public capabilities are host-owned only; upstream MCP belongs to session runtimes.
+        super::dispatcher::CapabilityDispatcher::new(capabilities, None, policy)
+            .map(|dispatcher| {
+                dispatcher.with_context(
                     super::middleware::chain::MiddlewareChain::new(),
                     PermissionPolicy::new(PermissionLevel::Allow),
-                ),
-                Err(error) => {
-                    if let Some(runtime) = &runtime {
-                        drop(runtime.shutdown().await);
-                    }
-                    return Err(AgentSessionRuntimeError::FailedPrecondition(
-                        error.to_string(),
-                    ));
-                }
-            };
-        Ok((dispatcher, runtime))
-    }
-
-    pub(crate) fn without_external_self_resource(&self, resource: Option<&str>) -> Self {
-        let mut factory = self.clone();
-        factory.external_self_resource = resource
-            .or_else(|| {
-                self.self_mcp
-                    .get()
-                    .map(crate::self_mcp::SelfMcpBinding::logical_url)
+                )
             })
-            .map(str::to_owned);
-        factory
+            .map_err(|error| AgentSessionRuntimeError::FailedPrecondition(error.to_string()))
     }
 
     pub(crate) fn install_self_mcp(&self, binding: crate::self_mcp::SelfMcpBinding) {
@@ -624,7 +572,6 @@ impl ServerAgentRuntimeFactory {
             policy: Arc::new(super::dispatcher::UnconfiguredPolicy),
             restriction: None,
             concrete_only: false,
-            external_self_resource: None,
             self_mcp: Arc::new(std::sync::OnceLock::new()),
             run_events: None,
             run_completion: None,
@@ -1270,9 +1217,6 @@ impl ServerAgentRuntimeFactory {
                 return Err(missing_mcp_servers(&missing));
             }
         }
-        if let Some(resource) = &self.external_self_resource {
-            connections.retain(|connection| &connection.url != resource);
-        }
         if connections.is_empty() {
             return Ok(None);
         }
@@ -1371,7 +1315,11 @@ impl ServerAgentRuntimeFactory {
             mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
         }
         for server in connections {
-            if let Some(binding) = self.self_mcp.get().filter(|binding| binding.matches(server)) {
+            if let Some(binding) = self
+                .self_mcp
+                .get()
+                .filter(|binding| binding.matches(server))
+            {
                 let binding = binding.clone();
                 let provider_binding = binding.clone();
                 let factory = self.clone();
@@ -1571,7 +1519,11 @@ impl ServerAgentRuntimeFactory {
         &self,
         server: &McpResolvedConnection,
     ) -> Result<Option<String>, AgentSessionRuntimeError> {
-        if let Some(binding) = self.self_mcp.get().filter(|binding| binding.matches(server)) {
+        if let Some(binding) = self
+            .self_mcp
+            .get()
+            .filter(|binding| binding.matches(server))
+        {
             return if binding.active() && self.mcp_connection_current(server).await {
                 Ok(binding.token().ok())
             } else {
@@ -1987,7 +1939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_catalog_excludes_only_the_bound_self_resource_not_its_name() {
+    async fn internal_mcp_catalog_retains_self_and_remote_resources() {
         let root = tempfile::tempdir().unwrap();
         let factory = test_factory(
             root.path().into(),
@@ -2011,19 +1963,11 @@ mod tests {
                 ])
             })
         });
-        let external = factory.without_external_self_resource(Some("http://127.0.0.1:1234/mcp"));
         for selection in [
             McpServerSelection::default(),
             McpServerSelection::Include(BTreeSet::from(["self-alias".into(), "waltr".into()])),
         ] {
             let feature = mcp_feature(selection, false);
-            let prepared = external
-                .prepare_mcp_runtime(&feature)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(prepared.connections.len(), 1);
-            assert_eq!(prepared.connections[0].key, "waltr");
             assert_eq!(
                 factory
                     .prepare_mcp_runtime(&feature)
@@ -2039,7 +1983,7 @@ mod tests {
             McpServerSelection::Include(BTreeSet::from(["missing".into()])),
             false,
         );
-        assert!(external.prepare_mcp_runtime(&missing).await.is_err());
+        assert!(factory.prepare_mcp_runtime(&missing).await.is_err());
     }
 
     #[tokio::test]

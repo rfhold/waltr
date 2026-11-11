@@ -29,9 +29,6 @@ impl SelfMcpBinding {
         &self.logical == connection
     }
 
-    pub(crate) fn logical_url(&self) -> &str {
-        &self.logical.url
-    }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }

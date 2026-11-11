@@ -194,7 +194,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeComposition for Compos
             }
             let factory = owner.factory(principal.clone(), &record).await?;
             let (runtime, dispatcher) = factory
-                .runtime_for_record(&record, owner.sessions.clone())
+                .for_concrete_calls()
+                .runtime_with_dispatcher(&record, owner.sessions.clone(), None)
                 .await
                 .map_err(|_| PortError::Denied)?;
             let adapter = owner.code.bind(&principal, &record, runtime, dispatcher)?;

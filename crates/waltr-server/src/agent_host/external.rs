@@ -119,22 +119,14 @@ impl ExternalToolHost {
             .map_err(|_| ServerError::internal("external capability journal is already installed"))
     }
 
-    pub(crate) async fn list(
-        &self,
-        self_resource: Option<&str>,
-    ) -> ServerResult<Vec<mcp::McpToolDefinition>> {
+    pub(crate) async fn list(&self) -> ServerResult<Vec<mcp::McpToolDefinition>> {
         let _admission = self.lifecycle.read().await;
         if self.shutdown.is_cancelled() {
             return Err(ServerError::internal("capability host is shutting down"));
         }
-        let (dispatcher, runtime) = self
+        let dispatcher = self
             .factory
-            .without_external_self_resource(self_resource)
-            .external_dispatcher(
-                self.broker.clone(),
-                InteractionDestination::Unavailable,
-                self.shutdown.child_token(),
-            )
+            .external_dispatcher(self.broker.clone(), InteractionDestination::Unavailable)
             .await
             .map_err(host_error)?;
         let tools = dispatcher
@@ -148,9 +140,6 @@ impl ExternalToolHost {
                 )
             })
             .collect();
-        if let Some(runtime) = runtime {
-            runtime.shutdown().await.map_err(host_error)?;
-        }
         Ok(tools)
     }
 
@@ -159,7 +148,6 @@ impl ExternalToolHost {
         call: mcp::McpToolCall,
         context: ServerContext,
         principal: AuthenticatedPrincipal,
-        self_resource: Option<&str>,
     ) -> ServerResult<mcp::McpToolResult> {
         let admission = self.lifecycle.read().await;
         if self.shutdown.is_cancelled() {
@@ -197,7 +185,7 @@ impl ExternalToolHost {
             });
             operations.insert(id.clone(), operation.clone());
             drop(operations);
-            let factory = self.factory.without_external_self_resource(self_resource);
+            let factory = self.factory.clone();
             let broker = self.broker.clone();
             let operation_id = id.clone();
             let owned_call = call.clone();
@@ -206,8 +194,8 @@ impl ExternalToolHost {
             tasks.spawn(async move {
                 let result = async {
                     let route = Arc::new(Route { modes, events: events.clone() });
-                    let (dispatcher, runtime) = factory.external_dispatcher(broker,
-                        InteractionDestination::External(route), cancellation.clone()).await.map_err(host_error)?;
+                    let dispatcher = factory.external_dispatcher(broker,
+                        InteractionDestination::External(route)).await.map_err(host_error)?;
                     let result = async {
                         let name = owned_call.name.strip_prefix("capability__")
                             .ok_or_else(|| ServerError::invalid_params("invalid capability name"))?;
@@ -223,7 +211,6 @@ impl ExternalToolHost {
                         };
                         dispatch_durable(journal.as_ref(), &dispatcher, dispatch, cancellation.clone()).await
                     }.await;
-                    if let Some(runtime) = runtime { runtime.shutdown().await.map_err(host_error)?; }
                     result
                 }.await;
                 drop(events.send(Event::Complete(result)).await);
@@ -392,15 +379,13 @@ mod tests {
         .with_runtime_provider(|_| {
             panic!("external capability calls must never construct an inference provider")
         });
-        let (dispatcher, runtime) = factory
+        let dispatcher = factory
             .external_dispatcher(
                 InteractionBroker::new(),
                 InteractionDestination::Unavailable,
-                CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert!(runtime.is_none());
         let identity = dispatcher
             .capabilities()
             .find(|capability| capability.definition().name == "read")

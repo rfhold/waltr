@@ -222,15 +222,13 @@ async fn external_journal_failure_prevents_worker_prepare_and_write() {
         crate::auth::FileCredentialStore::new(root.path().join("auth.json")),
         catalog.resolved("default").unwrap().clone(),
     );
-    let (dispatcher, runtime) = factory
+    let dispatcher = factory
         .external_dispatcher(
             InteractionBroker::new(),
             InteractionDestination::Unavailable,
-            CancellationToken::new(),
         )
         .await
         .unwrap();
-    assert!(runtime.is_none());
     let dispatch = association(
         &dispatcher,
         "worker",
