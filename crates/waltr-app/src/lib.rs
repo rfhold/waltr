@@ -28,6 +28,8 @@ mod policy;
 mod server_controller;
 mod server_profiles;
 
+struct CredentialRoot(std::path::PathBuf);
+
 #[cfg(all(
     feature = "native-apps-test",
     not(all(target_os = "macos", target_arch = "aarch64"))
@@ -130,7 +132,7 @@ async fn remove_server(
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         retire_native_assets(&app, None).await;
     }
-    credential_store::CredentialStore::delete_server(&server_id)
+    credential_store::CredentialStore::delete_server(app.state::<CredentialRoot>().0.clone(), &server_id)
         .await
         .map_err(|_| "Secure credentials could not be removed")?;
     profiles.remove(&server_id)
@@ -373,7 +375,8 @@ async fn start_runtime(
                 Some(native_auth::AccessBinding::from_bootstrap(
                     profile.id.clone(),
                     bootstrap,
-                )?)
+                    app.state::<CredentialRoot>().0.clone(),
+                ).await?)
             }
             Err(_) => {
                 tracing::warn!(
@@ -1086,6 +1089,7 @@ pub fn run() {
             app.manage(server);
             app.manage(RuntimeSelection::default());
             app.manage(audio_permissions::host(app.handle(), 0));
+            app.manage(CredentialRoot(app.path().app_data_dir().map_err(std::io::Error::other)?.join("native-refresh-v1")));
             let registry = app
                 .path()
                 .app_data_dir()

@@ -69,6 +69,7 @@ pub enum BridgePayload {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessDiagnostic {
+    restoring: bool,
     persistence_warning: bool,
     failed: bool,
 }
@@ -77,6 +78,8 @@ impl AccessDiagnostic {
     fn observe(&mut self, progress: &waltr_client::NativeAccessProgress) {
         use waltr_client::NativeAccessProgress as Progress;
         match progress {
+            Progress::Restoring => { self.restoring = true; self.failed = false; }
+            Progress::RestorationFinished => self.restoring = false,
             Progress::Warning { .. } => self.persistence_warning = true,
             Progress::Failed { .. } => self.failed = true,
             Progress::Discovering | Progress::Succeeded | Progress::RefreshSucceeded => {
@@ -1659,7 +1662,12 @@ async fn run_connected_generation(
         .as_ref()
         .map(|binding| binding.spawn(credentials.clone()));
     let mut access_host = crate::native_auth::AccessHost::default();
-    let mut access_diagnostic = AccessDiagnostic::default();
+    let mut access_diagnostic = AccessDiagnostic { restoring: access.is_some(), ..AccessDiagnostic::default() };
+    if access_diagnostic.restoring {
+        if let Some(event) = publisher.publish_control(BridgePayload::Access { diagnostic: access_diagnostic }).await {
+            publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_access = Some(event);
+        }
+    }
     let audio = target
         .app
         .as_ref()
@@ -1805,19 +1813,31 @@ async fn run_connected_generation(
                             if let Some(coordinator) = access.take() { coordinator.stop().await; }
                             if !publisher.is_current() { return Err("Native client generation was replaced".into()); }
                             let _ = credentials.clear_bearer_token();
-                            let deleted = crate::credential_store::CredentialStore::delete_server(&target.id).await.map_err(|_| "Secure credentials could not be removed".to_owned());
+                            let root = target.app.as_ref().map(|app| {
+                                use tauri::Manager as _;
+                                app.state::<crate::CredentialRoot>().0.clone()
+                            }).or_else(|| target.access.as_ref().map(|binding| binding.root.clone()));
+                            let deleted = if let Some(root) = root {
+                                crate::credential_store::CredentialStore::delete_server(root, &target.id).await.map_err(|_| "Secure credentials could not be removed".to_owned())
+                            } else { Ok(()) };
                             let result = dispatch_command(&mut stream, ClientCommand::LogoutWaltr).await;
                             if let Ok(snapshot) = result { publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) }); }
                             deleted
                         },
                     ).await;
+                    if access.is_none() {
+                        access_diagnostic.restoring = false;
+                        if let Some(event) = publisher.publish_control(BridgePayload::Access { diagnostic: access_diagnostic }).await {
+                            publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_access = Some(event);
+                        }
+                    }
                     drop(reply.send(result));
                 }
                 Some(HostRequest::Access(action)) => {
                     if !publisher.is_current() { continue; }
                     if access.is_none() && matches!(action, waltr_client::NativeAccessAction::Start)
                         && let Some(binding) = &target.access
-                        && let Ok(binding) = binding.fresh()
+                        && let Ok(binding) = binding.fresh().await
                     { access = Some(binding.spawn(credentials.clone())); }
                     if let Some(access) = &access { drop(access.action_sender().send(action).await); }
                 }
@@ -2081,7 +2101,7 @@ mod tests {
         let json = serde_json::to_string(&BridgePayload::Access { diagnostic }).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"access","diagnostic":{"persistenceWarning":true,"failed":false}}"#
+            r#"{"type":"access","diagnostic":{"restoring":false,"persistenceWarning":true,"failed":false}}"#
         );
     }
 

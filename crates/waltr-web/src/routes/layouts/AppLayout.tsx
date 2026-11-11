@@ -9,7 +9,7 @@ export function AppLayout(props: ParentProps) {
   const app = useAppState();
   const accessStatus = () => app.snapshot()?.access.status;
   const authenticated = () => accessStatus() === "authenticated";
-  const loginScreen = () => accessStatus() === "loginRequired" || accessStatus() === "loginInProgress" || accessStatus() === "loginFailed";
+  const loginScreen = () => (!authenticated() && app.accessDiagnostic?.()?.restoring === true) || accessStatus() === "loginRequired" || accessStatus() === "loginInProgress" || accessStatus() === "loginFailed";
   const showSplash = () => (
     (!authenticated() && !loginScreen())
     || (authenticated() && (!app.systemReady() || !app.minimumSplashElapsed()))

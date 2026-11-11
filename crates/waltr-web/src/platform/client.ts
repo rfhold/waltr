@@ -3,6 +3,7 @@ import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 export type ClientSnapshotListener = (snapshot: ClientSnapshot) => void;
 
 export type AccessDiagnostic = {
+  restoring: boolean;
   persistenceWarning: boolean;
   failed: boolean;
 };

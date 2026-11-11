@@ -242,6 +242,10 @@ pub enum NativeLoopbackPolicy {
 /// Secret-free native access progress suitable for host serialization.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NativeAccessProgress {
+    /// Startup refresh-token restoration is pending, including store loading.
+    Restoring,
+    /// Startup restoration ended or was superseded by an explicit action.
+    RestorationFinished,
     /// Metadata discovery is in progress.
     Discovering,
     /// The authorization URL is ready and the callback listener is active.
@@ -277,6 +281,8 @@ pub enum NativeAccessProgress {
 impl fmt::Debug for NativeAccessProgress {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Restoring => formatter.write_str("Restoring"),
+            Self::RestorationFinished => formatter.write_str("RestorationFinished"),
             Self::Discovering => formatter.write_str("Discovering"),
             Self::AwaitingBrowser { timeout_millis, .. } => formatter
                 .debug_struct("AwaitingBrowser")
@@ -576,6 +582,7 @@ async fn coordinate(
         results,
     } = context;
     let restore_lease = credentials.begin_credential_lease();
+    send_progress(&outputs, NativeAccessProgress::Restoring).await;
     telemetry::emit(Stage::Restore, Outcome::Started, restore_lease.generation());
     let restore_results = results.clone();
     let restore_config = config.clone();
@@ -633,7 +640,10 @@ async fn coordinate(
                         }
                         login_persistence = None;
                         completed_attempt = None;
-                        abort_owned(&mut restore_task).await;
+                        if restore_task.is_some() {
+                            abort_owned(&mut restore_task).await;
+                            send_progress(&outputs, NativeAccessProgress::RestorationFinished).await;
+                        }
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         pending_lease = Some(credentials.begin_credential_lease());
@@ -646,6 +656,10 @@ async fn coordinate(
                         }
                     }
                     NativeAccessAction::Cancel => {
+                        if restore_task.is_some() {
+                            abort_owned(&mut restore_task).await;
+                            send_progress(&outputs, NativeAccessProgress::RestorationFinished).await;
+                        }
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         let _ = credentials.clear_bearer_token();
@@ -665,7 +679,10 @@ async fn coordinate(
                         }
                     }
                     NativeAccessAction::Logout => {
-                        abort_owned(&mut restore_task).await;
+                        if restore_task.is_some() {
+                            abort_owned(&mut restore_task).await;
+                            send_progress(&outputs, NativeAccessProgress::RestorationFinished).await;
+                        }
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         pending_lease = None;
@@ -685,7 +702,10 @@ async fn coordinate(
                     }
                     NativeAccessAction::CredentialRejected => {
                         telemetry::emit(Stage::Credential, Outcome::Rejected, credentials.credential_lease().generation());
-                        abort_owned(&mut restore_task).await;
+                        if restore_task.is_some() {
+                            abort_owned(&mut restore_task).await;
+                            send_progress(&outputs, NativeAccessProgress::RestorationFinished).await;
+                        }
                         abort_owned(&mut lifecycle_task).await;
                         let _ = credentials.clear_bearer_token();
                         if delete_refresh_token(refresh_store.as_ref()).await.is_err() {
@@ -791,6 +811,7 @@ async fn coordinate(
                                 }).await;
                             }
                         }
+                        send_progress(&outputs, NativeAccessProgress::RestorationFinished).await;
                     }
                     CoordinatorResult::Login { attempt_id, lease, result } => {
                         if active_attempt.as_ref() != Some(&(attempt_id.clone(), lease)) {
@@ -2140,6 +2161,65 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BoundaryStore { mode: u8 }
+    #[async_trait]
+    impl NativeRefreshTokenStore for BoundaryStore {
+        async fn load(&self) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
+            match self.mode {
+                0 => Ok(None),
+                1 => Err(NativeRefreshTokenStoreError::Unavailable),
+                2 | 3 => Err(NativeRefreshTokenStoreError::Malformed),
+                _ => std::future::pending().await,
+            }
+        }
+        async fn store(&self, _: &[u8]) -> Result<(), NativeRefreshTokenStoreError> { Ok(()) }
+        async fn delete(&self) -> Result<(), NativeRefreshTokenStoreError> {
+            if self.mode == 3 { Err(NativeRefreshTokenStoreError::Unavailable) } else { Ok(()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn restoration_boundaries_cover_missing_unavailable_malformed_and_delete_failure() {
+        for mode in 0..4 {
+            let mut coordinator = NativeAccessCoordinator::spawn_with_store(test_config(), NativeCredentialProvider::new(), Arc::new(BoundaryStore { mode }), 8);
+            assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
+            let mut failed = false;
+            let mut warning = false;
+            time::timeout(Duration::from_secs(1), async {
+                loop {
+                    match coordinator.next_output().await.unwrap() {
+                        NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished) => break,
+                        NativeAccessOutput::Progress(NativeAccessProgress::Failed { .. }) => failed = true,
+                        NativeAccessOutput::Progress(NativeAccessProgress::Warning { .. }) => warning = true,
+                        other => panic!("unexpected restoration output: {other:?}"),
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(failed, mode == 3);
+            assert_eq!(warning, mode == 1);
+            coordinator.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_restore_terminates_on_start_cancel_logout_and_rejection() {
+        for action in [NativeAccessAction::Start, NativeAccessAction::Cancel, NativeAccessAction::Logout, NativeAccessAction::CredentialRejected] {
+            let mut coordinator = NativeAccessCoordinator::spawn_with_store(test_config(), NativeCredentialProvider::new(), Arc::new(BoundaryStore { mode: 4 }), 8);
+            assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
+            coordinator.action_sender().send(action).await.unwrap();
+            assert_eq!(time::timeout(Duration::from_secs(1), coordinator.next_output()).await.unwrap(), Some(NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished)));
+            coordinator.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_restore_disposal_does_not_wait_for_store() {
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(test_config(), NativeCredentialProvider::new(), Arc::new(BoundaryStore { mode: 4 }), 8);
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
+        time::timeout(Duration::from_secs(1), coordinator.stop()).await.unwrap();
+    }
+
     #[cfg(feature = "native-tracing")]
     #[test]
     fn native_auth_production_events_are_bounded_and_secret_free() {
@@ -3265,7 +3345,7 @@ mod tests {
         let actions = coordinator.action_sender();
         actions.send(NativeAccessAction::Start).await.unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand {
                 command: Box::new(ClientCommand::StartWaltrLogin),
                 logout_barrier: false,
@@ -3274,7 +3354,7 @@ mod tests {
         let first_lease = credentials.credential_lease();
         actions.send(NativeAccessAction::Start).await.unwrap();
         assert!(
-            time::timeout(Duration::from_millis(20), coordinator.next_output())
+            time::timeout(Duration::from_millis(20), next_flow_output(&mut coordinator))
                 .await
                 .is_err()
         );
@@ -3293,11 +3373,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(NativeAccessProgress::Canceled))
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand {
                 command: Box::new(ClientCommand::CancelWaltrLogin {
                     attempt_id: "login-shared".to_owned(),
@@ -3306,7 +3386,7 @@ mod tests {
             })
         );
         assert!(
-            time::timeout(Duration::from_millis(20), coordinator.next_output())
+            time::timeout(Duration::from_millis(20), next_flow_output(&mut coordinator))
                 .await
                 .is_err()
         );
@@ -3330,7 +3410,7 @@ mod tests {
             let actions = coordinator.action_sender();
             actions.send(NativeAccessAction::Start).await.unwrap();
             assert!(matches!(
-                coordinator.next_output().await,
+                next_flow_output(&mut coordinator).await,
                 Some(NativeAccessOutput::ClientCommand { command, .. })
                     if *command == ClientCommand::StartWaltrLogin
             ));
@@ -3341,7 +3421,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                coordinator.next_output().await,
+                next_flow_output(&mut coordinator).await,
                 Some(NativeAccessOutput::Progress(
                     NativeAccessProgress::Discovering
                 ))
@@ -3357,7 +3437,7 @@ mod tests {
 
             if terminal_action == NativeAccessAction::Cancel {
                 assert_eq!(
-                    coordinator.next_output().await,
+                    next_flow_output(&mut coordinator).await,
                     Some(NativeAccessOutput::Progress(NativeAccessProgress::Canceled))
                 );
             }
@@ -3369,11 +3449,11 @@ mod tests {
                 }
             };
             assert!(matches!(
-                coordinator.next_output().await,
+                next_flow_output(&mut coordinator).await,
                 Some(NativeAccessOutput::ClientCommand { command, .. }) if *command == expected
             ));
             assert!(
-                time::timeout(Duration::from_millis(20), coordinator.next_output())
+                time::timeout(Duration::from_millis(20), next_flow_output(&mut coordinator))
                     .await
                     .is_err()
             );
@@ -3406,11 +3486,11 @@ mod tests {
         let first_state = query_value(&first_url, "state");
         actions.send(NativeAccessAction::Cancel).await.unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(NativeAccessProgress::Canceled))
         );
         assert!(matches!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand { command, .. })
                 if *command == ClientCommand::CancelWaltrLogin { attempt_id: "first".to_owned() }
         ));
@@ -3435,19 +3515,19 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Exchanging
             ))
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Succeeded
             ))
         );
         assert!(matches!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand { command, .. })
                 if *command == ClientCommand::CompleteWaltrLogin { attempt_id: "second".to_owned() }
         ));
@@ -3489,7 +3569,7 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            time::timeout(Duration::from_millis(20), coordinator.next_output())
+            time::timeout(Duration::from_millis(20), next_flow_output(&mut coordinator))
                 .await
                 .is_err()
         );
@@ -3509,7 +3589,7 @@ mod tests {
 
         actions.send(NativeAccessAction::Logout).await.unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand {
                 command: Box::new(ClientCommand::LogoutWaltr),
                 logout_barrier: true,
@@ -3527,7 +3607,7 @@ mod tests {
 
         actions.send(NativeAccessAction::Logout).await.unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand {
                 command: Box::new(ClientCommand::LogoutWaltr),
                 logout_barrier: true,
@@ -3564,7 +3644,9 @@ mod tests {
     #[tokio::test]
     async fn stop_completes_with_saturated_action_and_output_channels() {
         let credentials = NativeCredentialProvider::new();
-        let coordinator = NativeAccessCoordinator::spawn(test_config(), credentials.clone(), 1);
+        let mut coordinator = NativeAccessCoordinator::spawn(test_config(), credentials.clone(), 1);
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished)));
         let actions = coordinator.action_sender();
         actions.send(NativeAccessAction::Start).await.unwrap();
         time::timeout(Duration::from_secs(1), async {
@@ -3829,31 +3911,33 @@ mod tests {
             8,
         );
 
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Discovering
             ))
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Refreshing
             ))
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::RefreshSucceeded
             ))
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::ClientCommand {
                 command: Box::new(ClientCommand::ReprobeWaltrAccess),
                 logout_barrier: false,
             })
         );
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished)));
         assert!(credentials.has_bearer_token());
         assert_eq!(*store.bearer_seen_during_store.lock().unwrap(), Some(false));
         let request = token_requests.recv().await.unwrap();
@@ -3962,12 +4046,12 @@ mod tests {
                 NativeAccessProgress::RefreshSucceeded,
             ] {
                 assert_eq!(
-                    coordinator.next_output().await,
+                    next_flow_output(&mut coordinator).await,
                     Some(NativeAccessOutput::Progress(progress))
                 );
             }
             assert_eq!(
-                coordinator.next_output().await,
+                next_flow_output(&mut coordinator).await,
                 Some(NativeAccessOutput::ClientCommand {
                     command: Box::new(ClientCommand::ReprobeWaltrAccess),
                     logout_barrier: false,
@@ -4016,7 +4100,7 @@ mod tests {
             4,
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Discovering
             ))
@@ -4104,25 +4188,49 @@ mod tests {
             store.clone(),
             4,
         );
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Discovering
             ))
         );
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Refreshing
             ))
         );
         assert!(matches!(
-            coordinator.next_output().await,
+            next_flow_output(&mut coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Failed { .. }
             ))
         ));
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished)));
         assert!(store.token.lock().unwrap().is_none());
+        coordinator.stop().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restoration_discovery_failure_ends_indicator_and_preserves_refresh_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            write_json_response(&mut stream, "401 Unauthorized", "{}").await;
+        });
+        let store = Arc::new(MockRefreshStore::default());
+        *store.token.lock().unwrap() = Some(b"retained-refresh".to_vec());
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(config, NativeCredentialProvider::new(), store.clone(), 8);
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Discovering)));
+        assert!(matches!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Failed { .. }))));
+        assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished)));
+        assert_eq!(store.token.lock().unwrap().as_deref(), Some(b"retained-refresh".as_slice()));
         coordinator.stop().await;
         server.await.unwrap();
     }
@@ -4167,8 +4275,18 @@ mod tests {
         }
     }
 
+    // Existing flow tests ignore the separately tested restoration boundaries.
+    async fn next_flow_output(coordinator: &mut NativeAccessCoordinator) -> Option<NativeAccessOutput> {
+        loop {
+            match coordinator.next_output().await {
+                Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring | NativeAccessProgress::RestorationFinished)) => continue,
+                output => return output,
+            }
+        }
+    }
+
     async fn next_login_output(coordinator: &mut NativeAccessCoordinator) -> NativeAccessOutput {
-        time::timeout(Duration::from_secs(3), coordinator.next_output())
+        time::timeout(Duration::from_secs(3), next_flow_output(coordinator))
             .await
             .unwrap()
             .unwrap()
@@ -4532,7 +4650,7 @@ mod tests {
     ) -> Url {
         actions.send(NativeAccessAction::Start).await.unwrap();
         assert!(matches!(
-            coordinator.next_output().await,
+            next_flow_output(coordinator).await,
             Some(NativeAccessOutput::ClientCommand { command, .. })
                 if *command == ClientCommand::StartWaltrLogin
         ));
@@ -4543,7 +4661,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            coordinator.next_output().await,
+            next_flow_output(coordinator).await,
             Some(NativeAccessOutput::Progress(
                 NativeAccessProgress::Discovering
             ))
@@ -4551,7 +4669,7 @@ mod tests {
         let Some(NativeAccessOutput::Progress(NativeAccessProgress::AwaitingBrowser {
             authorization_url,
             ..
-        })) = coordinator.next_output().await
+        })) = next_flow_output(coordinator).await
         else {
             panic!("expected authorization URL");
         };

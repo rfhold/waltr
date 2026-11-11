@@ -41,7 +41,7 @@ describe("Tauri client adapter", () => {
       emit = (payload) => handler({ payload });
       return vi.fn();
     });
-    const diagnostic = { persistenceWarning: true, failed: true };
+    const diagnostic = { restoring: false, persistenceWarning: true, failed: true };
     const invoke = vi.fn(async (command) => {
       if (command === "start_runtime") return { generation: 3, dictation: true };
       if (command === "client_state") return { generation: 3, events: [
@@ -57,8 +57,8 @@ describe("Tauri client adapter", () => {
     adapter.accessDiagnostic!.subscribe(listener);
     expect(listener).toHaveBeenLastCalledWith(diagnostic);
     expect(JSON.stringify(listener.mock.calls)).not.toContain("SECRET");
-    emit({ generation: 3, sequence: 9, payload: { type: "access", diagnostic: { persistenceWarning: true, failed: false } } });
-    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith({ persistenceWarning: true, failed: false }));
+    emit({ generation: 3, sequence: 9, payload: { type: "access", diagnostic: { restoring: false, persistenceWarning: true, failed: false } } });
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith({ restoring: false, persistenceWarning: true, failed: false }));
     expect(cancel).not.toHaveBeenCalled();
     emit({ generation: 2, sequence: 10, payload: { type: "access", diagnostic } });
     emit(bridgeState(4, 0, namedSnapshot("resumed")));

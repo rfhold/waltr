@@ -89,6 +89,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
       publishSnapshot(event.payload.snapshot);
     } else if (event.payload.type === "access") {
       publishDiagnostic({
+        restoring: event.payload.diagnostic?.restoring === true,
         persistenceWarning: event.payload.diagnostic?.persistenceWarning === true,
         failed: event.payload.diagnostic?.failed === true,
       });

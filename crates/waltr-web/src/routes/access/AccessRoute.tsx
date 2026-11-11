@@ -57,7 +57,7 @@ export function NativeAccessDiagnostic() {
       <Show when={app.accessDiagnostic?.()?.persistenceWarning}>
         <InlineAlert tone="info">Secure sign-in storage is unavailable. Access may work for this session, but you may need to sign in again after restarting Waltr.</InlineAlert>
       </Show>
-      <Show when={app.accessDiagnostic?.()?.failed}>
+      <Show when={app.accessDiagnostic?.()?.failed && !app.accessDiagnostic?.()?.restoring}>
         <InlineAlert tone="danger">Native sign-in or saved-session restoration failed. Try signing in again.</InlineAlert>
       </Show>
     </>
@@ -68,6 +68,7 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
   const app = useAppState();
   const [localError, setLocalError] = createSignal<string>();
   const access = () => app.snapshot()?.access;
+  const restoring = () => app.accessDiagnostic?.()?.restoring === true;
   const loginUrl = () => waltrLoginUrl(window.location);
   const login = async (event: MouseEvent) => {
     event.preventDefault();
@@ -114,19 +115,20 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
       <section class="access__panel">
         <p class="eyebrow">Waltr access</p>
         <h1 id="access-title">
-          {access()?.status === "loginFailed" ? "Login did not complete" : "Sign in to continue"}
+          {restoring() ? "Restoring sign-in…" : access()?.status === "loginFailed" ? "Login did not complete" : "Sign in to continue"}
         </h1>
         <p class="access__copy">
-          {access()?.status === "loginInProgress"
+          {restoring() ? "Checking your saved session." : access()?.status === "loginInProgress"
             ? "Redirecting to your organization's sign-in page..."
             : "Your Waltr session is missing or has expired. Sign in to restore access."}
         </p>
 
         <NativeAccessDiagnostic />
-        <Show when={access()?.error ?? localError()}>
+        <Show when={!restoring() && (access()?.error ?? localError())}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
 
+        <Show when={!restoring()} fallback={<p role="status" aria-live="polite">Restoring sign-in…</p>}>
         <Show when={access()?.status === "loginInProgress"} fallback={
           <Show when={app.accessOperations()} fallback={
             <InlineAlert tone="info">Waltr access operations are unavailable in this client.</InlineAlert>
@@ -140,6 +142,7 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
             <p class="access__progress" role="status" aria-live="polite">Login in progress</p>
             <button class="ui-button" type="button" disabled={!access()?.activeAttemptId} onClick={cancel}>Cancel login</button>
           </div>
+        </Show>
         </Show>
         <ServerControls />
       </section>

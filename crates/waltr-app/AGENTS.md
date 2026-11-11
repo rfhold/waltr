@@ -21,7 +21,9 @@
 | [../../docs/architecture/clients.md#native-app-audio-composition](../../docs/architecture/clients.md#native-app-audio-composition) | Native audio ownership, IPC, lifecycle, and platform capability contract. |
 | [src/server_profiles.rs](src/server_profiles.rs) | Nonsecret profile registry, strict endpoint normalization, and last-success persistence. |
 | [src/native_auth.rs](src/native_auth.rs) | Verified discovery binding and native authorization browser policy. |
-| [src/credential_store.rs](src/credential_store.rs) | Identity-bound Keychain/AndroidKeyStore refresh persistence and server-wide deletion fences. |
+| [src/credential_store.rs](src/credential_store.rs) | Identity-bound desktop local-file/AndroidKeyStore refresh persistence and server-wide deletion fences. |
+| [src/credential_store/localfile.rs](src/credential_store/localfile.rs) | Unix private files, atomic replacement, and cross-process revocation epochs. |
+| [../waltr-file-acl/](../waltr-file-acl/) | Isolated macOS descriptor ACL inspection; the app retains its unsafe-code boundary. |
 | [src/observability.rs](src/observability.rs) | All-build native OTLP traces, logs, and metrics, fail-open lifecycle, test isolation, and privacy controls. |
 | [src/policy.rs](src/policy.rs) | External URL and local navigation security policies. |
 | [capabilities/](capabilities/) | Minimal local main-WebView IPC grants. |
@@ -98,7 +100,9 @@ Start the embedded server only for Local selection. Retain an active local serve
 
 Keep profiles nonsecret in app-data `servers.json`. Record last success only from an authenticated shared snapshot. Never remove Local.
 
-Bind refresh storage to server ID, normalized endpoint, exact discovered issuer, client ID, effective scope set, and audience. Use Keychain on macOS and AndroidKeyStore-encrypted atomic files on Android. Other desktop targets report unavailable; add no plaintext fallback.
+Bind refresh storage to server ID, normalized endpoint, exact discovered issuer, client ID, effective scope set, and audience. macOS/Linux use native-owned app-data local files with validated owner-only permissions, descriptor-relative no-follow access, atomic replacement, and durable cross-process generation fences. Android retains AndroidKeyStore-encrypted atomic files. Windows reports unavailable pending separate ACL work. Add no backend selector, keyring, migration, or fallback. See the canonical native-access storage contract for the trusted ancestor and failed durable-revocation limits.
+
+Keep the credential root native-owned and pass it through initial binding, fresh sign-in, logout, and removal. Never expose tokens, credential paths, or raw filesystem errors through IPC, profiles, or logs.
 
 Stop auth tasks before server-wide credential deletion. Fence old store handles against detached writes. Delete secure credentials before profile removal; preserve the registry entry on deletion failure. Switch and ordinary disposal retain refresh credentials.
 

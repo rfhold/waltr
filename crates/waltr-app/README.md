@@ -2,6 +2,10 @@
 
 This crate owns the Tauri shell and native consumers of the shared client runtime. It does not own the Routine protocol or server admission policy. See [client architecture](../../docs/architecture/clients.md) and [testing](../../docs/testing.md).
 
+## Native sign-in
+
+Remote sign-in restores native refresh credentials without exposing tokens or storage paths to the WebView. macOS/Linux use owner-only local files, Android retains AndroidKeyStore encryption, and Windows persistence remains unavailable. Desktop cutover requires a fresh sign-in; no Keychain migration or fallback exists. Pending restoration announces “Restoring sign-in…” while ordinary shared snapshots continue to control access. See the [native access contract](../../docs/architecture/access-authentication.md#tauri-native-host-adapter) for filesystem protection and durable revocation limits.
+
 ## Routine consumers
 
 Desktop holds accept `playback: {}` as an exclusive output action alongside `typing` and `command`.

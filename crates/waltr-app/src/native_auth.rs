@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct AccessBinding {
+    pub root: std::path::PathBuf,
     pub config: NativeAccessConfig,
     pub store: Arc<dyn NativeRefreshTokenStore>,
     pub server_id: String,
@@ -25,19 +26,24 @@ pub(crate) fn browser_url(input: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 impl AccessBinding {
-    pub fn from_bootstrap(
+    pub async fn from_bootstrap(
         server_id: String,
         bootstrap: waltr_client::NativeAccessBootstrap,
+        root: std::path::PathBuf,
     ) -> Result<Self, String> {
         let config = bootstrap.config;
-        let store = crate::credential_store::CredentialStore::new(CredentialIdentity {
-            server_id: &server_id,
-            endpoint: &config.endpoint,
-            issuer: &bootstrap.issuer,
-            client_id: &config.client_id,
-            scopes: &config.scopes,
-            audience: config.audience.as_deref(),
-        })
+        let store_root = root.clone();
+        let store_server = server_id.clone();
+        let store_config = config.clone();
+        let store_issuer = bootstrap.issuer.clone();
+        let store = tokio::task::spawn_blocking(move || crate::credential_store::CredentialStore::at(store_root, CredentialIdentity {
+            server_id: &store_server,
+            endpoint: &store_config.endpoint,
+            issuer: &store_issuer,
+            client_id: &store_config.client_id,
+            scopes: &store_config.scopes,
+            audience: store_config.audience.as_deref(),
+        })).await.map_err(|_| "Secure credentials are unavailable")?
         .map_err(|error| {
             let category = match error {
                 waltr_client::NativeRefreshTokenStoreError::Unavailable => "unavailable",
@@ -47,20 +53,22 @@ impl AccessBinding {
             "Secure credentials are unavailable"
         })?;
         Ok(Self {
+            root,
             config,
             store,
             server_id,
             issuer: bootstrap.issuer,
         })
     }
-    pub fn fresh(&self) -> Result<Self, String> {
+    pub async fn fresh(&self) -> Result<Self, String> {
         Self::from_bootstrap(
             self.server_id.clone(),
             waltr_client::NativeAccessBootstrap {
                 config: self.config.clone(),
                 issuer: self.issuer.clone(),
             },
-        )
+            self.root.clone(),
+        ).await
     }
     pub fn spawn(&self, credentials: NativeCredentialProvider) -> NativeAccessCoordinator {
         NativeAccessCoordinator::spawn_with_store(
@@ -208,7 +216,14 @@ mod tests {
         }
     }
     async fn output(coordinator: &mut NativeAccessCoordinator) -> NativeAccessOutput {
-        tokio::time::timeout(std::time::Duration::from_secs(3), coordinator.next_output())
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match coordinator.next_output().await {
+                    Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring | NativeAccessProgress::RestorationFinished)) => continue,
+                    output => break output,
+                }
+            }
+        })
             .await
             .unwrap()
             .unwrap()

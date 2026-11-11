@@ -940,7 +940,8 @@ mod tests {
                                 },
                                 issuer: "SECRET_ISSUER_SENTINEL".into(),
                             },
-                        )
+                            std::env::temp_dir().join("waltr-invalid-identity-no-io"),
+                        ).await
                         .is_err()
                     );
                     let credentials = waltr_client::NativeCredentialProvider::new();

@@ -17,6 +17,44 @@ afterEach(() => {
 });
 
 describe("Waltr access", () => {
+  test.each(["success", "miss", "failure"] as const)("restoration suppresses premature errors and actions until %s", async (outcome) => {
+    let publish!: (snapshot: ClientSnapshot) => void;
+    let diagnostic!: (value: AccessDiagnostic | undefined) => void;
+    const pending = accessSnapshot("loginRequired");
+    pending.access.error = "Session expired";
+    const adapter: ClientAdapter = {
+      snapshot: () => pending,
+      subscribe: (listener) => { publish = listener; return () => {}; },
+      start: async () => {},
+      dispose: () => {},
+      dispatch: async () => pending,
+      access: { openLogin: async () => {}, logout: async () => true },
+      accessDiagnostic: { subscribe: (listener) => {
+        diagnostic = listener;
+        listener({ restoring: true, persistenceWarning: false, failed: false });
+        return () => {};
+      } },
+    };
+    render(() => <AppStateProvider loadClientAdapter={async () => adapter}>
+      <AppLayout><div>Authenticated shell</div></AppLayout>
+    </AppStateProvider>);
+    await screen.findByRole("heading", { name: "Restoring sign-in…" });
+    expect(screen.getByRole("status").textContent).toBe("Restoring sign-in…");
+    expect(screen.queryByText("Session expired")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Sign in" })).toBeNull();
+    if (outcome === "success") {
+      publish(accessSnapshot("unknownChecking"));
+      diagnostic({ restoring: false, persistenceWarning: false, failed: false });
+      expect(screen.queryByText("Session expired")).toBeNull();
+      publish(accessSnapshot("authenticated"));
+      await screen.findByText("Authenticated shell");
+    } else {
+      diagnostic({ restoring: false, persistenceWarning: false, failed: outcome === "failure" });
+      await screen.findByRole("link", { name: "Sign in" });
+      expect(screen.getByText("Session expired")).toBeTruthy();
+      expect(Boolean(screen.queryByText(/Native sign-in or saved-session restoration failed/))).toBe(outcome === "failure");
+    }
+  });
   test("shows restoration failure on access screen and retains persistence warning after login succeeds", async () => {
     let publish!: (snapshot: ClientSnapshot) => void;
     let diagnostic!: (value: AccessDiagnostic | undefined) => void;
@@ -28,7 +66,7 @@ describe("Waltr access", () => {
       dispatch: async () => accessSnapshot("loginRequired"),
       accessDiagnostic: { subscribe: (listener) => {
         diagnostic = listener;
-        listener({ persistenceWarning: true, failed: true });
+        listener({ restoring: false, persistenceWarning: true, failed: true });
         return () => {};
       } },
     };
@@ -37,7 +75,7 @@ describe("Waltr access", () => {
     </AppStateProvider>);
     await screen.findByText("Native sign-in or saved-session restoration failed. Try signing in again.");
     expect(screen.getByText(/Secure sign-in storage is unavailable/)).toBeTruthy();
-    diagnostic({ persistenceWarning: true, failed: false });
+    diagnostic({ restoring: false, persistenceWarning: true, failed: false });
     publish(accessSnapshot("authenticated"));
     await screen.findByText("Authenticated shell");
     expect(screen.getByText(/Secure sign-in storage is unavailable/)).toBeTruthy();

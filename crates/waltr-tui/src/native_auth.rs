@@ -162,6 +162,7 @@ async fn publish_progress(
 ) -> Option<JoinHandle<()>> {
     let mut browser_task = None;
     let event = match progress {
+        NativeAccessProgress::Restoring | NativeAccessProgress::RestorationFinished => return None,
         NativeAccessProgress::Discovering => NativeLoginEvent::Discovering,
         NativeAccessProgress::AwaitingBrowser {
             authorization_url,

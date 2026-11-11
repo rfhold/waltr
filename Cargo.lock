@@ -10436,9 +10436,9 @@ dependencies = [
  "opentelemetry_sdk",
  "rand 0.9.4",
  "reqwest",
+ "rustix",
  "rustls 0.23.40",
  "rustls-platform-verifier",
- "security-framework",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -10456,6 +10456,7 @@ dependencies = [
  "waltr-audio-io",
  "waltr-client",
  "waltr-desktop",
+ "waltr-file-acl",
  "waltr-server",
  "webpki-roots 1.0.7",
  "zeroize",
@@ -10554,6 +10555,10 @@ dependencies = [
  "waltr-audio-io",
  "waltr-client",
 ]
+
+[[package]]
+name = "waltr-file-acl"
+version = "0.3.0"
 
 [[package]]
 name = "waltr-script"

@@ -1,0 +1,9 @@
+[package]
+name = "waltr-file-acl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"

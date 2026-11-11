@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -45,9 +46,11 @@ impl fmt::Debug for CredentialIdentity<'_> {
     }
 }
 
-/// A cloneable identity-bound store. Construction performs no secure-store I/O.
+/// A cloneable identity-bound store bound to the current durable revocation epoch.
 #[derive(Clone)]
 pub struct CredentialStore {
+    root: PathBuf,
+    durable_generation: u64,
     #[cfg_attr(not(any(target_os = "macos", target_os = "android")), allow(dead_code))]
     server: String,
     #[cfg_attr(not(any(target_os = "macos", target_os = "android")), allow(dead_code))]
@@ -65,17 +68,21 @@ struct ServerFence {
 type FenceRegistry = Mutex<HashMap<String, Weak<ServerFence>>>;
 static FENCES: OnceLock<FenceRegistry> = OnceLock::new();
 
-fn server_fence(server: &str) -> Result<Arc<ServerFence>, NativeRefreshTokenStoreError> {
+fn server_fence(root: &std::path::Path, server: &str) -> Result<Arc<ServerFence>, NativeRefreshTokenStoreError> {
+    let mut hash = Sha256::new();
+    hash_field(&mut hash, root.as_os_str().as_encoded_bytes());
+    hash_field(&mut hash, server.as_bytes());
+    let key = hex_digest(hash);
     let mut registry = FENCES
         .get_or_init(Mutex::default)
         .lock()
         .map_err(|_| Unavailable)?;
     registry.retain(|_, fence| fence.strong_count() != 0);
-    if let Some(fence) = registry.get(server).and_then(Weak::upgrade) {
+    if let Some(fence) = registry.get(&key).and_then(Weak::upgrade) {
         return Ok(fence);
     }
     let fence = Arc::new(ServerFence::default());
-    registry.insert(server.to_owned(), Arc::downgrade(&fence));
+    registry.insert(key, Arc::downgrade(&fence));
     Ok(fence)
 }
 
@@ -91,7 +98,8 @@ impl CredentialStore {
     /// `scopes` must be the effective requested scopes (including `openid` and
     /// discovered defaults). Endpoint trailing slashes are insignificant; issuer
     /// path/trailing slash, client ID, and audience are exact identity components.
-    pub fn new(
+    pub fn at(
+        root: PathBuf,
         identity: CredentialIdentity<'_>,
     ) -> Result<Arc<Self>, NativeRefreshTokenStoreError> {
         let CredentialIdentity {
@@ -136,9 +144,14 @@ impl CredentialStore {
         if let Some(audience) = audience {
             hash_field(&mut identity, audience.as_bytes());
         }
-        let fence = server_fence(&server)?;
-        let generation = fence.generation.load(Ordering::SeqCst);
+        let fence = server_fence(&root, &server)?;
+        let (generation, durable_generation) = {
+            let _guard = fence.io.lock().map_err(|_| Unavailable)?;
+            (fence.generation.load(Ordering::SeqCst), platform::generation(&root, &server)?)
+        };
         Ok(Arc::new(Self {
+            root,
+            durable_generation,
             server,
             account: hex_digest(identity),
             fence,
@@ -151,13 +164,13 @@ impl CredentialStore {
     /// in-flight operations and invalidates existing handles, so detached writes
     /// cannot recreate a removed credential. Construct a fresh handle to sign in
     /// again. Still stop the server's auth tasks before removing its configuration.
-    pub async fn delete_server(server_id: &str) -> Result<(), NativeRefreshTokenStoreError> {
+    pub async fn delete_server(root: PathBuf, server_id: &str) -> Result<(), NativeRefreshTokenStoreError> {
         let server = server_namespace(server_id)?;
-        let fence = server_fence(&server)?;
+        let fence = server_fence(&root, &server)?;
         let result = blocking(move || {
             let _guard = fence.io.lock().map_err(|_| Unavailable)?;
             fence.generation.fetch_add(1, Ordering::SeqCst);
-            platform::delete_server(&server)
+            platform::delete_server(&root, &server)
         })
         .await;
         match result {
@@ -174,6 +187,14 @@ impl CredentialStore {
                 category = "malformed"
             ),
         }
+        result
+    }
+
+    #[cfg(test)]
+    fn new(identity: CredentialIdentity<'_>) -> Result<Arc<Self>, NativeRefreshTokenStoreError> {
+        let root = std::env::temp_dir().join(format!("waltr-credential-test-{:032x}", rand::random::<u128>()));
+        let result = Self::at(root.clone(), identity);
+        drop(std::fs::remove_dir_all(root));
         result
     }
 
@@ -286,64 +307,9 @@ fn normalized_url(value: &str, endpoint: bool) -> Result<String, NativeRefreshTo
     })
 }
 
-#[cfg(target_os = "macos")]
-mod platform {
-    use super::*;
-    use security_framework::{
-        item::{ItemClass, ItemSearchOptions},
-        passwords::{delete_generic_password, get_generic_password, set_generic_password},
-    };
-
-    const NOT_FOUND: i32 = -25300;
-
-    fn service(server: &str) -> String {
-        format!("dev.waltr.app.refresh.v1.{server}")
-    }
-
-    pub(super) fn load(
-        store: &CredentialStore,
-    ) -> Result<Option<Vec<u8>>, NativeRefreshTokenStoreError> {
-        match get_generic_password(&service(&store.server), &store.account) {
-            Ok(token) => Ok(Some(token)),
-            Err(error) if error.code() == NOT_FOUND => Ok(None),
-            Err(_) => Err(Unavailable),
-        }
-    }
-
-    pub(super) fn store(
-        store: &CredentialStore,
-        token: &[u8],
-    ) -> Result<(), NativeRefreshTokenStoreError> {
-        set_generic_password(&service(&store.server), &store.account, token)
-            .map_err(|_| Unavailable)
-    }
-
-    pub(super) fn delete(store: &CredentialStore) -> Result<(), NativeRefreshTokenStoreError> {
-        deletion(delete_generic_password(
-            &service(&store.server),
-            &store.account,
-        ))
-    }
-
-    pub(super) fn delete_server(server: &str) -> Result<(), NativeRefreshTokenStoreError> {
-        deletion(
-            ItemSearchOptions::new()
-                .class(ItemClass::generic_password())
-                .service(&service(server))
-                .delete(),
-        )
-    }
-
-    fn deletion(
-        result: Result<(), security_framework::base::Error>,
-    ) -> Result<(), NativeRefreshTokenStoreError> {
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) if error.code() == NOT_FOUND => Ok(()),
-            Err(_) => Err(Unavailable),
-        }
-    }
-}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "credential_store/localfile.rs"]
+mod platform;
 
 /// Install the application-context Kotlin store once, from an Activity JNI hook.
 /// The object must be returned by `SecureTokenStore.initialize(context)`.
@@ -365,6 +331,8 @@ mod platform {
     use std::sync::OnceLock;
 
     static STORE: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+
+    pub(super) fn generation(_: &std::path::Path, _: &str) -> Result<u64, NativeRefreshTokenStoreError> { Ok(0) }
 
     pub(super) fn initialize(
         env: &jni::Env<'_>,
@@ -445,14 +413,16 @@ mod platform {
         execute(2, &store.server, &store.account, &[]).map(|_| ())
     }
 
-    pub(super) fn delete_server(server: &str) -> Result<(), NativeRefreshTokenStoreError> {
+    pub(super) fn delete_server(_: &std::path::Path, server: &str) -> Result<(), NativeRefreshTokenStoreError> {
         execute(3, server, "", &[]).map(|_| ())
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 mod platform {
     use super::*;
+
+    pub(super) fn generation(_: &std::path::Path, _: &str) -> Result<u64, NativeRefreshTokenStoreError> { Ok(0) }
 
     pub(super) fn load(
         _: &CredentialStore,
@@ -465,7 +435,7 @@ mod platform {
     pub(super) fn delete(_: &CredentialStore) -> Result<(), NativeRefreshTokenStoreError> {
         Err(Unavailable)
     }
-    pub(super) fn delete_server(_: &str) -> Result<(), NativeRefreshTokenStoreError> {
+    pub(super) fn delete_server(_: &std::path::Path, _: &str) -> Result<(), NativeRefreshTokenStoreError> {
         Err(Unavailable)
     }
 }
@@ -544,8 +514,9 @@ mod tests {
             server_id: "fence-test",
             ..identity(&scopes)
         };
-        let old = CredentialStore::new(input).unwrap();
-        let other_identity = CredentialStore::new(CredentialIdentity {
+        let root = std::env::temp_dir().join(format!("waltr-fence-test-{:032x}", rand::random::<u128>()));
+        let old = CredentialStore::at(root.clone(), input).unwrap();
+        let other_identity = CredentialStore::at(root.clone(), CredentialIdentity {
             endpoint: "https://other.example",
             ..input
         })
@@ -554,9 +525,10 @@ mod tests {
         old.fence.generation.fetch_add(1, Ordering::SeqCst);
         assert_eq!(old.with_current(|| Ok(())), Err(Unavailable));
         assert_eq!(other_identity.with_current(|| Ok(())), Err(Unavailable));
-        let fresh = CredentialStore::new(input).unwrap();
+        let fresh = CredentialStore::at(root.clone(), input).unwrap();
         assert_eq!(fresh.with_current(|| Ok(())), Ok(()));
         assert_eq!(old.server, server_namespace("fence-test").unwrap());
+        drop(std::fs::remove_dir_all(root));
     }
 
     #[test]
