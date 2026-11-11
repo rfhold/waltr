@@ -68,6 +68,8 @@ Native `Interact` and browser split-lane attachment RPCs use the same service, p
 
 Media adapters own readers, writers, helper input, blobs, text and speech work through cancellation and join. Speech resolves each operation's JavaScript selector or catalog default; an unconfigured required speech direction fails closed. Non-speech media does not select a cloud provider implicitly. JavaScript selects normal helpers through explicit `helper.run` arguments: selection, task, capture, source, turns, deadline and response/completion budgets.
 
+`media.synthesize` accepts exactly one source: a committed-text `port` or any JavaScript `text` string within host-call, string and text byte bounds. Source validation precedes speech effects. String synthesis uses a bounded text stream with a joined feeder and speech producer; cancellation stops both. The `ask-and-speak` Routine waits for one tool-free `routine-answer` completion from inference defaults, then publishes text and streams speech through speech defaults. It copies no source history. `media.read` exposes completed response bytes through the helper's opaque invocation resource; JavaScript decodes those bytes before synthesis.
+
 `spec.captures` maps names to exact named selections and bounded `waltr.value/v1` contracts. Declaration grants no `_helper_capture` permission. Preflight rejects definite capture denial before media or speech effects; Ask requires normal live consent. Named-agent permissions and applicable caller/source restrictions control capture. Payloads use the fifth `host.call` argument: an invocation-local committed resource. `media.select` selects the whole capture or a JSON pointer and retains helper provenance.
 
 Conversation notes require diarization-capable recognition and publish retained transcript, notes and deletion audit separately.
@@ -139,7 +141,7 @@ Image blobs retain a 20 MiB encoded-byte cap and exact PNG/JPEG/WebP MIME allowl
 - Application-domain membership is not concrete tool consent.
 - Default-off code mode does not create service identities.
 - No automatic replay, backend fallback, video support or live deployment/reset is provided by composition.
-- All eleven bundled Routine resources and matching examples use strict JS envelopes and normal named helpers. No permission-evaluation sweep is shipped. Resources own helper selection and capture schemas; hosts own model ceilings and context grants. An example grants no authority.
+- All twelve bundled Routine resources and matching examples use strict JS envelopes and normal named helpers. No permission-evaluation sweep is shipped. Resources own helper selection and capture schemas; hosts own model ceilings and context grants. An example grants no authority.
 
 ## References
 

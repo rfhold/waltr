@@ -1619,6 +1619,13 @@ async fn real_js_cancel_joins_blocked_input_output_and_provider() {
             BTreeMap::new(),
         ),
         (
+            include_str!("../../../tests/fixtures/routines/read-aloud.yaml")
+                .replace("name: read-aloud", "name: media-cancel-output")
+                .replace("{port: 'text', output: 'audio'", "{text: 'Committed first sentence.', output: 'audio'"),
+            vec![],
+            BTreeMap::new(),
+        ),
+        (
             include_str!("../../../tests/fixtures/routines/dictate-clean.yaml")
                 .replace("name: dictate-clean", "name: media-cancel-provider"),
             vec![json!({"blocked":true})],

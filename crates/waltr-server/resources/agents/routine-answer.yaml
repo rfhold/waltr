@@ -1,0 +1,13 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: routine-answer
+spec:
+  description: Answer a question from model knowledge without tools.
+  systemPrompt: |
+    Answer the supplied question concisely in plain language suitable for speech.
+    Use your model knowledge. Admit uncertainty when you do not know the answer.
+    Do not claim to have browsed, used tools, or verified current information.
+    Return only the answer, without Markdown formatting.
+  features: []
+  permissions: []

@@ -328,7 +328,7 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | --- | --- |
 | `media.transcribe` | Host-owned STT with ordered append/replace updates and explicit final commitment |
 | `media.collect` | One bounded collection after successful STT; optional diarized snapshot using the pinned catalog |
-| `media.synthesize` | PCM16LE, 24 kHz, mono from committed text and explicit host-approved speech options |
+| `media.synthesize` | PCM16LE, 24 kHz, mono from exactly one `port` or JavaScript `text` string, with host-approved speech options |
 | `media.tee` | Host-owned fanout with required-consumer backpressure |
 | `media.upload` | Sequential finite upload; no readable handle before integrity and fixed signature checks |
 | `media.select` | Entire committed capture or generic JSON-pointer selection, with helper provenance |
@@ -339,6 +339,10 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | `media.finish` | Seal dispatch and prove required transport completion |
 
 JS receives opaque, engine-bound resources, not payload-sized JSON or ownership grants.
+`media.read` returns response bytes from a helper handle; JavaScript can decode these bytes as UTF-8.
+`media.synthesize` accepts arbitrary `text`, within the engine's string/value limits and the 1 MiB host text ceiling.
+Its text feeder and speech producer share bounded stream credit, cancellation and deadlines, and both join before completion.
+`ask-and-speak` uses a tool-free named helper, waits for its complete answer, retains and emits text, then streams audio.
 Helper callbacks receive proposal descriptors and temporary chunk-reader references; the normal agent retains original responses and evidence.
 Rejection keeps the same helper, cumulative evidence, provider-turn limit, and absolute deadline.
 JavaScript supplies explicit response/completion ceilings within host bounds; the ordinary agent default remains 262144 bytes.

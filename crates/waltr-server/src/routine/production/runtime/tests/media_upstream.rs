@@ -26,6 +26,8 @@ pub(super) struct Metrics {
     pub recognition_configs: std::sync::Mutex<Vec<(String, bool)>>,
     pub synthesis_calls: AtomicUsize,
     pub synthesis_models: std::sync::Mutex<Vec<String>>,
+    pub synthesis_text: std::sync::Mutex<Vec<String>>,
+    pub expected_synthesis_text: std::sync::Mutex<Option<String>>,
     pub dropped: tokio::sync::Notify,
     pub pair: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     pub peak_live: AtomicUsize,
@@ -328,9 +330,15 @@ impl tonic::server::StreamingService<tts::StreamingSynthesizeRequest> for Synthe
                     else {
                         return Err(Status::invalid_argument("text required"));
                     };
-                    assert!(
-                        matches!(value.input_source,Some(tts::streaming_synthesis_input::InputSource::Text(ref text)) if text=="Committed first sentence."||text==" Second sentence.")
-                    );
+                    let Some(tts::streaming_synthesis_input::InputSource::Text(text)) = value.input_source else {
+                        panic!("text required");
+                    };
+                    if let Some(expected) = live.0.expected_synthesis_text.lock().unwrap().as_ref() {
+                        assert!(expected.contains(&text));
+                    } else {
+                        assert!(text == "Committed first sentence." || text == " Second sentence.");
+                    }
+                    live.0.synthesis_text.lock().unwrap().push(text);
                     Ok(Some((
                         tts::StreamingSynthesizeResponse {
                             audio_content: vec![1, 0, 2, 0, 3, 0, 4, 0],

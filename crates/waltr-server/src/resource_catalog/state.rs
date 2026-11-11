@@ -34,7 +34,7 @@ const DEFAULT_AGENT: &str = "coding";
 const ENV_DEFINITION_PATHS: &str = "WALTR_AGENT_DEFINITION_PATHS";
 const ENV_DEFAULT_AGENT: &str = "WALTR_DEFAULT_AGENT";
 
-const BUNDLED_RESOURCES: [(&str, &str); 16] = [
+const BUNDLED_RESOURCES: [(&str, &str); 17] = [
     (
         "agents/coding.yaml",
         include_str!("../../resources/agents/coding.yaml"),
@@ -62,6 +62,10 @@ const BUNDLED_RESOURCES: [(&str, &str); 16] = [
     (
         "agents/routine-title.yaml",
         include_str!("../../resources/agents/routine-title.yaml"),
+    ),
+    (
+        "agents/routine-answer.yaml",
+        include_str!("../../resources/agents/routine-answer.yaml"),
     ),
     (
         "agents/routine-fork.yaml",
@@ -101,7 +105,7 @@ const BUNDLED_RESOURCES: [(&str, &str); 16] = [
     ),
 ];
 
-const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 33] = [
+const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 35] = [
     BUNDLED_RESOURCES[0],
     BUNDLED_RESOURCES[1],
     BUNDLED_RESOURCES[2],
@@ -118,6 +122,7 @@ const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 33] = [
     BUNDLED_RESOURCES[13],
     BUNDLED_RESOURCES[14],
     BUNDLED_RESOURCES[15],
+    BUNDLED_RESOURCES[16],
     (
         "providers/anthropic.yaml",
         include_str!("../../resources/providers/anthropic.yaml"),
@@ -173,6 +178,10 @@ const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 33] = [
     (
         "routines/audio-synthesize.yaml",
         include_str!("../../resources/routines/audio-synthesize.yaml"),
+    ),
+    (
+        "routines/ask-and-speak.yaml",
+        include_str!("../../resources/routines/ask-and-speak.yaml"),
     ),
     (
         "routines/context-categorization.yaml",

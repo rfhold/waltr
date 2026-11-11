@@ -592,8 +592,28 @@ impl MediaHost {
         if request.operation != "helper.run" && request.callback.is_some() {
             return Err(waltr_script::Error::Invalid);
         }
+        if request.operation == "media.synthesize" {
+            let raw = request.arguments.clone().into_json();
+            match (raw.get("port"), raw.get("text")) {
+                (Some(Value::String(_)), None) => {}
+                (None, Some(Value::String(text))) if text.len() <= 1048576 => {}
+                (None, Some(Value::String(_))) => return Err(waltr_script::Error::Limit),
+                _ => return Err(waltr_script::Error::Invalid),
+            }
+            let state = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?;
+            let output = state.outputs.get(required(&args.output)?).ok_or(waltr_script::Error::Identity)?;
+            if output.format() != (Format::Pcm16Le { rate: 24000, channels: 1 }) {
+                return Err(waltr_script::Error::Invalid);
+            }
+        } else if args.text.is_some() {
+            return Err(waltr_script::Error::Invalid);
+        }
         if matches!(request.operation.as_str(), "media.collect" | "media.transcribe" | "media.synthesize") {
-            let format = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?.inputs.get(required(&args.port)?).ok_or(waltr_script::Error::Identity)?.format();
+            let format = if args.text.is_some() {
+                Format::Text
+            } else {
+                self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?.inputs.get(required(&args.port)?).ok_or(waltr_script::Error::Identity)?.format()
+            };
             if request.operation != "media.collect" || format != Format::Text {
                 let backend = self.bindings.speech.select(&args.speech.clone().unwrap_or_default(), request.operation == "media.synthesize", args.snapshot == Some(true)).map_err(|_| waltr_script::Error::Invalid)?.unwrap_or_else(|| self.bindings.speech.clone());
                 backend.preflight(format, args.snapshot == Some(true)).map_err(|_| waltr_script::Error::Invalid)?;
@@ -610,6 +630,7 @@ impl MediaHost {
 struct Arguments {
     outputs: Option<Vec<String>>,
     port: Option<String>,
+    text: Option<String>,
     output: Option<String>,
     #[serde(skip)]
     helper: Option<super::authorized_tools::HelperArguments>,
@@ -705,6 +726,31 @@ impl MediaHost {
                     .join()
                     .await
                     .map_err(media_error)?;
+                json!({"status":"completed"})
+            }
+            "media.synthesize" if args.text.is_some() => {
+                let text = args.text.as_deref().ok_or(waltr_script::Error::Invalid)?;
+                let (writer, input) = self.bindings.streams
+                    .open(stream::Direction::Input, Format::Text, false)
+                    .map_err(media_error)?;
+                let output = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?
+                    .outputs.remove(required(&args.output)?).ok_or(waltr_script::Error::Identity)?;
+                let producer = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?
+                    .synthesize(input, output).map_err(media_error)?;
+                let (fed, joined) = tokio::join!(
+                    async {
+                        let result = write_text(writer, text).await;
+                        if result.is_err() { self.cancel.cancel(); }
+                        result
+                    },
+                    async {
+                        let result = producer.join().await;
+                        if result.is_err() { self.cancel.cancel(); }
+                        result.map_err(media_error)
+                    }
+                );
+                fed?;
+                joined?;
                 json!({"status":"completed"})
             }
             "media.transcribe" | "media.collect" | "media.synthesize" => {
@@ -1144,36 +1190,14 @@ impl MediaHost {
                     return Err(waltr_script::Error::Limit);
                 }
                 if request.operation == "media.emit" {
-                    let mut output = self
+                    let output = self
                         .state
                         .lock()
                         .map_err(|_| waltr_script::Error::Cleanup)?
                         .outputs
                         .remove(required(&args.output)?)
                         .ok_or(waltr_script::Error::Identity)?;
-                    let mut rest = text;
-                    let mut index = 0usize;
-                    while !rest.is_empty() {
-                        let mut end = rest.len().min(60000);
-                        while !rest.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        output
-                            .write(
-                                output.key(),
-                                Chunk::Text(Text {
-                                    segment: format!("result-{index}"),
-                                    text: rest[..end].into(),
-                                    replace: false,
-                                    committed: true,
-                                }),
-                            )
-                            .await
-                            .map_err(media_error)?;
-                        index += 1;
-                        rest = &rest[end..];
-                    }
-                    output.close(output.key()).await.map_err(media_error)?;
+                    write_text(output, text).await?;
                     json!({"status":"completed"})
                 } else {
                     let scope = InvocationTextScope::new(
@@ -1303,6 +1327,25 @@ fn supported(c: TransientModelCapabilities, kind: TransientInputKind) -> bool {
         TransientInputKind::Utf8 => c.text,
     }
 }
+async fn write_text(mut output: Writer, mut text: &str) -> Result<(), waltr_script::Error> {
+    let mut index = 0usize;
+    while !text.is_empty() {
+        let mut end = text.len().min(60000);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.write(output.key(), Chunk::Text(Text {
+            segment: format!("result-{index}"),
+            text: text[..end].into(),
+            replace: false,
+            committed: true,
+        })).await.map_err(media_error)?;
+        index += 1;
+        text = &text[end..];
+    }
+    output.close(output.key()).await.map_err(media_error)
+}
+
 fn resource_text<'a>(
     resource: &'a Resource,
     field: Option<&str>,

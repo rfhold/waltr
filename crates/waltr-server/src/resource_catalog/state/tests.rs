@@ -807,7 +807,7 @@ async fn session_dictation_defaults_validate_and_reload_atomically() {
 }
 
 #[tokio::test]
-async fn all_eleven_bundled_js_workflows_match_examples_and_named_helpers() {
+async fn all_twelve_bundled_js_workflows_match_examples_and_named_helpers() {
     let directory = TestDirectory::new("all-js-workflow-contracts");
     let state = unified_state(&directory).await;
     let snapshot = state.snapshot();
@@ -819,12 +819,22 @@ async fn all_eleven_bundled_js_workflows_match_examples_and_named_helpers() {
         "audio-transcribe-cleanup",
         "audio-conversation-notes",
         "audio-synthesize",
+        "ask-and-speak",
         "context-categorization",
         "context-management",
         "manage-category-context",
         "configuration",
     ];
     assert_eq!(snapshot.scripts().len(), expected.len());
+    let answer = snapshot.catalog.resolved("routine-answer").unwrap();
+    assert!(answer.permissions.is_empty());
+    for path in ["agents/routine-answer.yaml", "routines/ask-and-speak.yaml"] {
+        assert!(state.resource_catalog().resources.iter().any(|resource| {
+            resource.path == path
+                && resource.origin == resource_proto::ResourceOrigin::Bundled as i32
+                && resource.effective_value.is_some()
+        }));
+    }
     for name in expected {
         let resource = fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -870,7 +880,7 @@ async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
         .map(|resource| resource.kind)
         .collect::<BTreeSet<_>>();
     assert_eq!(kinds.len(), 7);
-    assert_eq!(catalog.resources.len(), 33);
+    assert_eq!(catalog.resources.len(), 35);
     let config = catalog.effective_configuration.unwrap();
     assert_eq!(config.providers.len(), 4);
     assert_eq!(
@@ -905,8 +915,8 @@ async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
             && resource.origin == resource_proto::ResourceOrigin::Bundled as i32
             && resource.effective_value.is_some()
     }));
-    assert_eq!(snapshot.scripts().len(), 11);
-    assert_eq!(snapshot.sources().len(), 16);
+    assert_eq!(snapshot.scripts().len(), 12);
+    assert_eq!(snapshot.sources().len(), 17);
     assert!(
         snapshot
             .sources()
@@ -1274,7 +1284,7 @@ fn environment_templates_fail_closed_and_url_joining_is_uri_aware() {
 fn bundled_catalog_is_split_and_lexically_ordered() {
     let loaded = load_default_agent(&[], "coding").unwrap();
     assert_eq!(loaded.resolved.name, "coding");
-    assert_eq!(loaded.bundle.sources.len(), 16);
+    assert_eq!(loaded.bundle.sources.len(), 17);
     assert!(loaded.bundle.sources[0].contains("name: coding"));
     assert!(loaded.bundle.sources[1].contains("name: configuration"));
     assert!(loaded.bundle.sources[2].contains("name: default"));

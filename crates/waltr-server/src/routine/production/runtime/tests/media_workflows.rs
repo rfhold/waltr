@@ -11,6 +11,8 @@ use media_model::Models;
 mod media_cancel;
 #[path = "helper_inputs.rs"]
 mod helper_inputs;
+#[path = "ask_and_speak.rs"]
+mod ask_and_speak;
 #[path = "media_speech_selection.rs"]
 mod speech_selection;
 fn authority() -> RoutineAuthority {
