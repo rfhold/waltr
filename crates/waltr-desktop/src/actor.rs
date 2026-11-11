@@ -53,7 +53,7 @@ impl<T: RoutineInteractionTransport> Actor<T> {
         if config
             .keybinds
             .iter()
-            .any(|binding| binding.typing.is_some())
+            .any(|binding| binding.typing.is_some() || binding.playback.is_some())
         {
             return Err(ActorError::Unsupported);
         }
@@ -84,6 +84,9 @@ impl<T: RoutineInteractionTransport> Actor<T> {
         valid: std::rc::Rc<dyn Fn() -> bool>,
     ) -> Result<(Self, tokio::sync::watch::Receiver<Status>), ActorError> {
         config.validate().map_err(|_| ActorError::Config)?;
+        if config.keybinds.iter().any(|binding| binding.playback.is_some()) {
+            return Err(ActorError::Unsupported);
+        }
         let (status, receiver) = tokio::sync::watch::channel(Status::Idle);
         Ok((
             Self {

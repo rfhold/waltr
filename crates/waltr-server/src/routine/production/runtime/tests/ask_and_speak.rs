@@ -9,6 +9,18 @@ async fn completed_answer_is_retained_and_spoken_without_tools_or_history() {
     ) {
         return;
     }
+    completed_answer(false).await;
+}
+
+#[tokio::test]
+async fn audio_question_is_transcribed_then_answered_and_spoken() {
+    if !crate::test_support::isolated_process_test(
+        "routine::production::runtime::tests::media_workflows::ask_and_speak::audio_question_is_transcribed_then_answered_and_spoken",
+    ) { return; }
+    completed_answer(true).await;
+}
+
+async fn completed_answer(audio_question: bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
         let speech = Upstream::start().await;
         let answer = "Café plants use sunlight. 日本語 🌱";
@@ -102,15 +114,22 @@ async fn completed_answer_is_retained_and_spoken_without_tools_or_history() {
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap().connect().await.unwrap();
         let mut client = p::routine_service_client::RoutineServiceClient::new(channel);
         let definitions = client.watch_definitions(p::WatchDefinitionsRequest {}).await.unwrap().into_inner().message().await.unwrap().unwrap();
-        let definition = definitions.definitions.iter().find(|row| row.name == "ask-and-speak").unwrap();
+        let name = if audio_question { "audio-ask-and-speak" } else { "ask-and-speak" };
+        let definition = definitions.definitions.iter().find(|row| row.name == name).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         tx.send(p::InteractRequest { frame:Some(p::interact_request::Frame::Open(p::InteractionOpen {
-            selection:Some(p::InvocationSelection {routine:definition.name.clone(),revision:definition.revision.clone(),entrypoint:"ask".into(),parameters:Some(p::StructuredValue {json:serde_json::to_vec(&json!({"question":"How do plants use sunlight?"})).unwrap()}),..Default::default()}),
-            inputs:vec![],
+            selection:Some(p::InvocationSelection {routine:definition.name.clone(),revision:definition.revision.clone(),entrypoint:"ask".into(),parameters:Some(p::StructuredValue {json:serde_json::to_vec(&if audio_question { json!({}) } else { json!({"question":"How do plants use sunlight?"}) }).unwrap()}),..Default::default()}),
+            inputs: if audio_question { vec![p::InputDeclaration { port:"question".into(), format:Some(p::input_declaration::Format::Pcm16le(p::Pcm16Le {sample_rate:24000, channels:1})) }] } else {vec![]},
         })) }).await.unwrap();
-        tx.send(input(p::input_event::Event::Finish(p::InputFinish {}))).await.unwrap();
-        drop(tx);
         let mut stream = client.interact(ReceiverStream::new(rx)).await.unwrap().into_inner();
+        let producer = tokio::spawn(async move {
+            if audio_question {
+                tx.send(input(p::input_event::Event::Open(p::StreamOpen {port:"question".into(), stream_id:"question".into(), format:Some(p::stream_open::Format::Pcm16le(p::Pcm16Le {sample_rate:24000, channels:1}))}))).await.unwrap();
+                tx.send(input(p::input_event::Event::Chunk(p::StreamChunk {stream_id:"question".into(), sequence:0, payload:Some(p::stream_chunk::Payload::Audio(vec![0;4800]))}))).await.unwrap();
+                tx.send(input(p::input_event::Event::Close(p::StreamClose {stream_id:"question".into(), next_sequence:1}))).await.unwrap();
+            }
+            tx.send(input(p::input_event::Event::Finish(p::InputFinish {}))).await.unwrap();
+        });
         let mut terminal = None;
         let mut invocation_id = String::new();
         let mut text = String::new();
@@ -127,6 +146,7 @@ async fn completed_answer_is_retained_and_spoken_without_tools_or_history() {
                 _ => {}
             }
         }
+        producer.await.unwrap();
         let terminal = terminal.unwrap();
         assert_eq!(terminal.status,p::InvocationStatus::Succeeded as i32, "{terminal:?}");
         assert!(terminal.cleanup_complete);
@@ -137,7 +157,7 @@ async fn completed_answer_is_retained_and_spoken_without_tools_or_history() {
         }).await.unwrap().into_inner();
         assert_eq!(retained.data, answer.as_bytes());
         assert!(retained.eof);
-        assert_eq!(text, answer);
+        assert_eq!(text, if audio_question { "" } else { answer });
         assert!(!audio.is_empty() && audio.len() % 2 == 0);
         assert_eq!(speech.metrics.synthesis_text.lock().unwrap().concat(), answer);
         let bodies = bodies.lock().unwrap();
@@ -145,7 +165,12 @@ async fn completed_answer_is_retained_and_spoken_without_tools_or_history() {
         assert!(bodies[0]["tools"].is_null() || bodies[0]["tools"].as_array().is_some_and(Vec::is_empty));
         let messages = bodies[0]["input"].as_array().unwrap();
         assert_eq!(messages.iter().filter(|item| item["role"] == "user").count(), 1);
-        assert!(messages.iter().any(|item| item.to_string().contains("How do plants use sunlight?")));
+        if audio_question {
+            assert_eq!(speech.metrics.speech_calls.load(Ordering::SeqCst), 1);
+            assert!(messages.iter().any(|item| item.to_string().contains("Committed conversation")));
+        } else {
+            assert!(messages.iter().any(|item| item.to_string().contains("How do plants use sunlight?")));
+        }
         drop(bodies);
         let records = helper_sessions.store().list().await.unwrap();
         assert_eq!(records.len(), 1);

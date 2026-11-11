@@ -288,8 +288,22 @@ Its `Held` adapter composes desktop audio holds, permission, and output actions.
 Both consumers share one nonqueued `AudioAdmission` gate; this gate excludes only concurrent microphone operations.
 The desktop `interaction` driver below `Hold` owns capture startup, first-nonempty-frame admission, Accepted-gated audio input, concurrent output through EOF, cancellation, and capture joins for both consumers.
 Its typed output consumer seam separates chat preview/status from live external typing; chat does not construct a shortcut binding or command.
+Desktop `playback: {}` selects required PCM audio output instead of text. Startup validation requires exactly one command, typing, or playback action.
+`Hold::run_guarded_with_outputs` passes the explicit native sink through the same capture and RPC lifecycle.
+The app reuses its bounded CPAL owner with a hold-specific generation, access, credential, and cancellation fence at physical output.
+Success requires clean remote completion and verified playback-tail drain. Cancellation retains and joins the actual playback owner before admission release.
+Operation and local cleanup failures synchronously revoke the sink before any subsequent cleanup await.
+The playback sink owns a separate revocation token; it does not cancel caller-owned hold or generation tokens.
+The default output device uses the exact selected format when supported.
+The shared playback owner permits only 24 kHz mono to supported 48 kHz stereo adaptation otherwise.
+Causal linear interpolation retains one source sample across packets and duplicates each output sample into stereo.
+Each source sample emits its preceding midpoint and itself; the first midpoint repeats the first sample. EOF leaves no deferred samples.
+Four source credits remain attached to converted packets, each bounded to 256 KiB. Device-clock drain uses converted frame counts.
+This first-order filter has limited image rejection; it does not replace the capture sinc filter.
+The same physical-output guards cover exact and converted samples. Other unsupported rate or channel combinations fail closed.
 Successful remote EOF before input completion fails the operation and joins cancelled capture without waiting for key-up; it cannot authorize a terminal command or chat final text.
 `Actor::new` accepts command-only configurations. `Actor::with_effects` also installs an explicit typing factory and synchronous effect fence, rejecting typing configurations without that capability before device access.
+Both standalone Actor constructors reject playback; the native app supplies that capability directly to Hold.
 The app retains its process-owned shortcut registrar and ingress/permission adapter across runtime generations rather than replacing it with the caller-driven actor.
 The reservation covers permission, capture startup, RPC work, and cleanup.
 The bridge clones the same credential-aware `NativeGrpcTransport` before it moves the transport into `ClientRuntime`.

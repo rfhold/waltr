@@ -172,14 +172,14 @@ impl Config {
             {
                 return Err(ConfigError::Invalid("invalid PCM_S16LE audio format"));
             }
-            match (&binding.command, &binding.typing) {
-                (Some(command), None) => command
+            match (&binding.command, &binding.typing, &binding.playback) {
+                (Some(command), None, None) => command
                     .validate()
                     .map_err(|_| ConfigError::Invalid("invalid command or template"))?,
-                (None, Some(_)) => (),
+                (None, Some(_), None) | (None, None, Some(_)) => (),
                 _ => {
                     return Err(ConfigError::Invalid(
-                        "exactly one command or typing is required",
+                        "exactly one command, typing, or playback is required",
                     ));
                 }
             }
@@ -287,6 +287,9 @@ pub struct Keybind {
     /// Stream live text hypotheses to the current keyboard focus. Exclusive with command.
     #[serde(default, deserialize_with = "present_action")]
     pub typing: Option<TypingSpec>,
+    /// Play the selected PCM output on the native default output device.
+    #[serde(default, deserialize_with = "present_action")]
+    pub playback: Option<PlaybackSpec>,
 }
 fn present_action<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
@@ -300,6 +303,10 @@ fn present_action<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypingSpec {}
+/// Native playback has no device conversion or fallback policy.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackSpec {}
 /// Supported interaction modes.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]

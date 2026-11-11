@@ -70,6 +70,11 @@ Media adapters own readers, writers, helper input, blobs, text and speech work t
 
 `media.synthesize` accepts exactly one source: a committed-text `port` or any JavaScript `text` string within host-call, string and text byte bounds. Source validation precedes speech effects. String synthesis uses a bounded text stream with a joined feeder and speech producer; cancellation stops both. The `ask-and-speak` Routine waits for one tool-free `routine-answer` completion from inference defaults, then publishes text and streams speech through speech defaults. It copies no source history. `media.read` exposes completed response bytes through the helper's opaque invocation resource; JavaScript decodes those bytes before synthesis.
 
+`audio-ask-and-speak` collects one completed question transcript through STT defaults, then uses the same tool-free helper and TTS defaults.
+It retains `answer` and returns it in the result. Its only output port requires PCM audio; it emits no text stream or token preview.
+The question input permits 120 seconds of 24 kHz mono PCM; transcript and answer limits are 4096 and 8192 bytes.
+The helper deadline is 60 seconds, and the full invocation deadline is 240 seconds.
+
 `spec.captures` maps names to exact named selections and bounded `waltr.value/v1` contracts. Declaration grants no `_helper_capture` permission. Preflight rejects definite capture denial before media or speech effects; Ask requires normal live consent. Named-agent permissions and applicable caller/source restrictions control capture. Payloads use the fifth `host.call` argument: an invocation-local committed resource. `media.select` selects the whole capture or a JSON pointer and retains helper provenance.
 
 Conversation notes require diarization-capable recognition and publish retained transcript, notes and deletion audit separately.

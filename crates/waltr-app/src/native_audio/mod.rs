@@ -116,6 +116,7 @@ impl Host {
                 .typing
                 .as_ref()
                 .map(|_| waltr_desktop::config::TypingSpec {}),
+            playback: binding.playback.as_ref().map(|_| waltr_desktop::config::PlaybackSpec {}),
         });
         let (hold, control) = waltr_desktop::host::Hold::press(&self.gate).map_err(|_| {
             telemetry::admission("hold", "busy");
@@ -242,15 +243,30 @@ impl Held {
                     .is_none_or(|(provider, revision)| provider.credential_revision() == *revision)
         };
         if grant == PermissionResult::Granted && valid() {
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            let playback = self.binding.playback.as_ref().map(|_| crate::native_media::hold_playback::Sink::new(
+                self.binding.routine.output.clone(),
+                crate::native_media::hold_playback::Fence {
+                    host: self.host.clone(), generation: self.generation,
+                    generation_cancel: self.token.clone(), cancel: self.hold.cancellation(),
+                    revoked: CancellationToken::new(),
+                    credential: self.credential.clone(),
+                },
+            ));
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            let playback = playback.as_ref().map(|s| s as &dyn waltr_desktop::media::OutputSink);
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            let playback = None;
             let result = self
                 .hold
-                .run_guarded_with_typing(
+                .run_guarded_with_outputs(
                     &self.binding,
                     transport,
                     factory,
                     &self.token,
                     &valid,
                     Some(typing),
+                    playback,
                 )
                 .await;
             self.diagnostics.primary(result);

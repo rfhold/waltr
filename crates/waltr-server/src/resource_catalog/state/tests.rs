@@ -807,7 +807,7 @@ async fn session_dictation_defaults_validate_and_reload_atomically() {
 }
 
 #[tokio::test]
-async fn all_twelve_bundled_js_workflows_match_examples_and_named_helpers() {
+async fn all_thirteen_bundled_js_workflows_match_examples_and_named_helpers() {
     let directory = TestDirectory::new("all-js-workflow-contracts");
     let state = unified_state(&directory).await;
     let snapshot = state.snapshot();
@@ -820,6 +820,7 @@ async fn all_twelve_bundled_js_workflows_match_examples_and_named_helpers() {
         "audio-conversation-notes",
         "audio-synthesize",
         "ask-and-speak",
+        "audio-ask-and-speak",
         "context-categorization",
         "context-management",
         "manage-category-context",
@@ -880,7 +881,7 @@ async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
         .map(|resource| resource.kind)
         .collect::<BTreeSet<_>>();
     assert_eq!(kinds.len(), 7);
-    assert_eq!(catalog.resources.len(), 35);
+    assert_eq!(catalog.resources.len(), 36);
     let config = catalog.effective_configuration.unwrap();
     assert_eq!(config.providers.len(), 4);
     assert_eq!(
@@ -915,7 +916,7 @@ async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
             && resource.origin == resource_proto::ResourceOrigin::Bundled as i32
             && resource.effective_value.is_some()
     }));
-    assert_eq!(snapshot.scripts().len(), 12);
+    assert_eq!(snapshot.scripts().len(), 13);
     assert_eq!(snapshot.sources().len(), 17);
     assert!(
         snapshot

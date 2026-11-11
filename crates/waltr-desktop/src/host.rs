@@ -193,6 +193,11 @@ pub struct Hold {
     observer: Observer,
 }
 impl Hold {
+    /// Cancellation fence for native output owners retained by this hold.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.control.cancel.clone()
+    }
     /// Attach optional diagnostics without altering existing callers.
     #[must_use]
     pub fn observed(mut self, observer: Observer) -> Self {
@@ -278,11 +283,31 @@ impl Hold {
         valid: &dyn Fn() -> bool,
         typing_factory: Option<&dyn crate::typing::Factory>,
     ) -> Result<(), Error> {
-        let setup = match (&binding.command, &binding.typing) {
-            (Some(_), None) => Ok(None),
-            (None, Some(_)) => typing_factory
+        self.run_guarded_with_outputs(
+            binding, transport, factory, generation, valid, typing_factory, None,
+        )
+        .await
+    }
+    /// Execute with explicitly installed native output consumers; cleanup retains admission.
+    /// # Errors
+    /// Returns Unsupported for missing or incompatible output backends.
+    #[allow(clippy::too_many_arguments, clippy::future_not_send)]
+    pub async fn run_guarded_with_outputs<T: RoutineInteractionTransport>(
+        self,
+        binding: &Keybind,
+        transport: &T,
+        factory: Arc<dyn capture::Factory>,
+        generation: &CancellationToken,
+        valid: &dyn Fn() -> bool,
+        typing_factory: Option<&dyn crate::typing::Factory>,
+        playback: Option<&dyn crate::media::OutputSink>,
+    ) -> Result<(), Error> {
+        let setup = match (&binding.command, &binding.typing, &binding.playback) {
+            (Some(_), None, None) => Ok(None),
+            (None, Some(_), None) => typing_factory
                 .ok_or(Error::Unsupported)
                 .and_then(|factory| factory.create().map(Some).map_err(Error::Typing)),
+            (None, None, Some(_)) if playback.is_some() => Ok(None),
             _ => Err(Error::Unsupported),
         };
         let mut sink = match setup {
@@ -295,7 +320,9 @@ impl Hold {
             }
         };
         let result = self
-            .execute(binding, transport, factory, generation, valid, &mut sink)
+            .execute(
+                binding, transport, factory, generation, valid, &mut sink, playback,
+            )
             .await;
         self.observer.emit(Diagnostic::Primary(result));
         self.observer.emit(Diagnostic::Stage(Stage::Cleanup));
@@ -327,7 +354,21 @@ impl Hold {
         generation: &CancellationToken,
         valid: &dyn Fn() -> bool,
         sink: &mut Option<Box<dyn crate::typing::Session>>,
+        playback: Option<&dyn crate::media::OutputSink>,
     ) -> Result<(), Error> {
+        let selected = binding
+            .resolved
+            .as_ref()
+            .and_then(|i| i.limits.definition.ports.iter().find(|p| p.name == binding.routine.output))
+            .ok_or(Error::Unsupported)?;
+        let expected = if binding.playback.is_some() {
+            waltr_client::RoutineMedia::Audio
+        } else {
+            waltr_client::RoutineMedia::Text
+        };
+        if selected.media != expected {
+            return Err(Error::Unsupported);
+        }
         let cancel = self.control.cancel.clone();
         let guard = crate::typing::Guard {
             cancel: &cancel,
@@ -335,6 +376,7 @@ impl Hold {
             valid,
         };
         let consumer = HoldOutput {
+            playback,
             status: &self.control.status,
             observer: &self.observer,
             typing: std::cell::RefCell::new((sink, crate::typing::Delivery::default(), false)),
@@ -392,6 +434,7 @@ impl Drop for Hold {
 }
 
 struct HoldOutput<'a> {
+    playback: Option<&'a dyn crate::media::OutputSink>,
     status: &'a tokio::sync::watch::Sender<Status>,
     observer: &'a Observer,
     typing: std::cell::RefCell<(
@@ -401,6 +444,9 @@ struct HoldOutput<'a> {
     )>,
 }
 impl crate::interaction::Consumer for HoldOutput<'_> {
+    fn sink(&self) -> Option<&dyn crate::media::OutputSink> {
+        self.playback
+    }
     fn progress(&self, progress: crate::interaction::Progress) {
         if progress == crate::interaction::Progress::Accepted {
             self.status.send_replace(Status::Streaming);

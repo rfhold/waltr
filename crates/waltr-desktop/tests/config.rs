@@ -22,6 +22,19 @@ fn documented_typing_example_uses_cleanup_routine() {
 }
 
 #[test]
+fn playback_is_an_explicit_exclusive_action() {
+    let yaml = VALID.replace("command: { argv: [pbcopy], stdin: '{{ text }}', timeoutSeconds: 10 }", "playback: {}");
+    let config = config::parse(yaml.as_bytes()).unwrap();
+    assert!(config.keybinds[0].playback.is_some());
+    for action in ["typing: {}", "command: {argv: [/usr/bin/true], stdin: '{{ text }}', timeoutSeconds: 10}"] {
+        assert!(config::parse(format!("{yaml}    {action}\n").as_bytes()).is_err());
+    }
+    for invalid in ["playback: null", "playback: {device: default}", "playback: false"] {
+        assert!(config::parse(yaml.replace("playback: {}", invalid).as_bytes()).is_err());
+    }
+}
+
+#[test]
 fn conversation_notes_example_copies_only_final_notes() {
     let config = config::parse(
         include_str!("../../../docs/examples/client-conversation-notes.yaml").as_bytes(),

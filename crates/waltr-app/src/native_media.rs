@@ -28,6 +28,8 @@ pub(crate) mod tests;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod playback;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) mod hold_playback;
 const CHUNK: usize = 65536;
 mod download;
 const IPC_METADATA_BYTES: usize = 1024 * 1024;

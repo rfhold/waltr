@@ -4,6 +4,15 @@ This crate owns the Tauri shell and native consumers of the shared client runtim
 
 ## Routine consumers
 
+Desktop holds accept `playback: {}` as an exclusive output action alongside `typing` and `command`.
+The selected output must require `pcm16le-24000-mono` audio.
+Playback prefers the exact source format on the default device.
+For 24 kHz mono sources only, it can adapt to supported 48 kHz stereo output.
+The shared CPAL owner checks hold cancellation, generation, access, and credential revision before physical output.
+Release ends capture, then waits for the answer and verified playback-tail drain.
+Cancellation joins capture, RPC cleanup, and playback before the hold releases its reservation.
+See the [audio question example](../../docs/examples/routines/audio-interactions.md#audio-question-shortcut).
+
 Chat dictation and desktop holds use the desktop interaction driver, the current shared definition catalog, and one nonqueued microphone reservation. Each operation pins its definition revision, limits, source session, and credential revision. Relevant catalog or access changes cancel and join the operation before replacement; unrelated snapshots do not cancel it. Chat preview is separate from shortcut typing and command effects.
 
 The native media host uses `NativeGrpcTransport` and shared attachment, upload, output, and history readers. Admission validates the complete metadata before RPC. Binary uploads wait for Accepted, use negotiated chunks of at most 64 KiB, and commit quarantine before binding an input. Server validation remains authoritative.
@@ -28,7 +37,14 @@ The existing text, status, upload, download, cancellation, and durable-text oper
 
 On macOS, Linux, and Windows, Rust owns the dialog backend, selected file handles, save destinations, and CPAL playback. The WebView has no dialog or filesystem plugin permission. Saves stage `create_new` content in a random exclusive sibling directory (0700 on Unix), then publish with an atomic no-overwrite hard link. Unsupported hard links fail closed. Cleanup touches only that private namespace, never the selected destination path. This assumes a trusted user-controlled parent and no hostile same-user modification of the private namespace or its ancestors; it is not a general pathname-race defense. Multi-file publication is not atomic: an already published file is never deleted to roll back another failure.
 
-Playback has four credited packets of at most 64 KiB and one stream-owner thread. Priming silence is separate from active underrun, which fails the operation. An explicit end marker drains queued data, then retains the stream through the last callback's backend playback timestamp plus its buffer duration. Invalid timing, a timing horizon above two seconds, or missing callbacks fail rather than claim a verified tail. These backend timestamps are not physical speaker proof. Access and cancellation checks precede sample effects. There is no resampling fallback.
+Playback has four credited source packets of at most 64 KiB and one stream-owner thread. Priming silence is separate from active underrun, which fails the operation. An explicit end marker drains queued data, then retains the stream through the last callback's backend playback timestamp plus its buffer duration. Invalid timing, a timing horizon above two seconds, or missing callbacks fail rather than claim a verified tail. These backend timestamps are not physical speaker proof. Access and cancellation checks precede sample effects.
+
+Playback prefers the exact source format. Its only adaptation converts 24 kHz mono PCM to supported 48 kHz stereo output.
+The owner uses causal linear interpolation across packet boundaries, then duplicates each sample into both channels.
+It emits the midpoint and current sample for each source sample; the first midpoint repeats the first sample.
+This first-order filter has limited image rejection; it is not the capture path's sinc filter.
+No deferred samples remain at EOF. Four retained credits bound converted packets to 256 KiB each, plus one source packet during conversion.
+Device-clock drain uses the output rate and channel count. Unsupported alternatives fail closed.
 
 Bridge work is nonqueued beyond its bounded ingress: one raw-data credit, eight ordinary request credits, and a separate cancellation credit. JSON metadata is capped at 1 MiB before typed cloning, so those nine bridge requests retain at most 9 MiB of encoded metadata; the raw request retains at most 64 KiB of bridge payload. This is not a whole-process allocation bound. Credits remain with workers through cleanup even if callers drop their replies. One picker credit stays with the OS callback until it returns. Same-generation catalog and selection invalidation revokes picker tickets independently of active media pins.
 

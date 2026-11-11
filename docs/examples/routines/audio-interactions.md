@@ -9,6 +9,7 @@ These examples are strict JavaScript Routine envelopes, not task graphs. Resourc
 | [Conversation notes](audio-conversation-notes.yaml) | `record-notes` | Speaker-labeled transcript, explicit deletion audit and final notes |
 | [Synthesis](audio-synthesize.yaml) | `speak` | Committed UTF-8 text to PCM audio |
 | [Ask and speak](ask-and-speak.yaml) | `ask` | Question parameter to a completed answer, text output and PCM audio |
+| [Audio ask and speak](audio-ask-and-speak.yaml) | `ask` | Recorded question to a completed answer and PCM audio |
 
 The [v2 contract](../../../proto/waltr/routine/v2/routine.proto) provides native `Interact` and finite browser attachment/input streams through the same invocation service. The v1 package, `Run` request and task-history decoder are removed.
 
@@ -33,6 +34,30 @@ await host.call('media.synthesize', {text: answer, output: 'audio', speech: {fro
 Any JavaScript string can supply `text`, subject to host-call, string and text byte limits. Both sources use the same speech selection and PCM stream contracts.
 
 `ask-and-speak` accepts a required, nonblank `question` parameter, bounded to 4096 bytes. The normal `routine-answer` Agent has no features or tool permissions. It answers from model knowledge through inference defaults, with one turn and a 60-second helper deadline. The Routine waits for the completed answer, reads its UTF-8 bytes through `media.read`, then decodes them in JavaScript. It retains an `answer` text result, emits text, and synthesizes speech through speech defaults. The result also returns `answer`. The response limit is 8192 bytes; the total deadline is 120 seconds. It copies no session history and speaks no token previews.
+
+## Audio question shortcut
+
+Add this binding to the `keybinds` list in `~/.config/waltr/client.yaml` (or `$XDG_CONFIG_HOME/waltr/client.yaml`):
+
+```yaml
+- id: audio-question
+  key: Ctrl+Alt+A
+  mode: hold
+  maxCaptureSeconds: 120
+  routine: {name: audio-ask-and-speak, trigger: ask, input: question, output: audio}
+  audio: {device: default, sampleRateHz: 24000, channels: 1}
+  playback: {}
+```
+
+Hold Ctrl+Alt+A to record a question. Release the keys to finish capture and hear the completed answer.
+The Routine collects one transcript through STT defaults, answers through inference defaults, and synthesizes the complete answer through TTS defaults.
+It retains the answer in Routine history without a required text stream.
+The transcript limit is 4096 bytes, the answer limit is 8192 bytes, and the invocation deadline is 240 seconds.
+The output limit is 16 MiB of 24 kHz mono PCM.
+The default output device must support that exact format or the bounded 48 kHz stereo playback adaptation.
+The player prefers exact output and permits no other rate or channel conversion. No automatic replay exists.
+The capture reservation remains occupied until playback and cleanup finish. Other capture shortcuts do not queue.
+Restart the client after configuration changes. This action requires a client build with native playback support.
 
 Cleanup consumes collected committed text, not successive interim hypotheses and not one helper per chunk. Conversation filtering returns exactly `retained_transcript` and `deleted_items`; the notes helper receives both fields. The named prompts preserve substantive topics, speaker labels, deletion reasons, decisions, todos and uncertainty while treating source content as untrusted data. Speaker labels are not known human identities.
 

@@ -42,7 +42,16 @@ No v1 fallback exists.
 
 `interaction::Selection` now contains `invocation: &Invocation`, `input`, `output`, and `max_capture_seconds`.
 It no longer contains independent routine and trigger names.
-`interaction::run` requires an audio input and a selected text output from that descriptor.
+`interaction::run` requires an audio input and a selected text or PCM audio output from that descriptor.
+Audio selection requires an explicit `media::OutputSink`; the shared transport validates required output closure and byte limits.
+`Hold::run_guarded_with_outputs` accepts optional typing and native output capabilities.
+Startup bindings require exactly one `command`, `typing: {}`, or `playback: {}` action.
+The app supplies playback through its shared CPAL owner; the standalone Actor rejects playback without device access.
+Playback prefers the exact selected PCM format on the default device.
+The app permits one bounded adaptation: 24 kHz mono to supported 48 kHz stereo output.
+Release closes capture; the hold retains admission until the answer, playback tail, and cleanup finish.
+The driver calls `OutputSink::revoke` synchronously on operation or local cleanup failure, before the next cleanup await.
+Revocation stops queued effects; `finish` retains and joins their owners afterward.
 `interaction::run_with_inputs` has the same arguments plus `&mut [media::BinaryInput]` after `selection`.
 Use it for a capture workflow with additional required file/image inputs.
 The host waits for nonempty PCM before any RPC; empty capture produces no admission.

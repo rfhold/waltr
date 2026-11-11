@@ -9,6 +9,7 @@
 | [src/dictation.rs](src/dictation.rs) | Chat dictation identities, status, preview, IPC, and shared native interaction consumer. |
 | [src/native_media.rs](src/native_media.rs) | Shared-client media operations, Rust-owned file selection, bounded raw file IPC, and joined cleanup. |
 | [src/native_media/playback.rs](src/native_media/playback.rs) | Bounded CPAL playback and dedicated stream-owner thread. |
+| [src/native_media/hold_playback.rs](src/native_media/hold_playback.rs) | Explicit shortcut PCM sink and hold-specific physical output guards. |
 | [src/native_media/download.rs](src/native_media/download.rs) | Retained raw checkout/read/close task and fixed-deadline cleanup receipts. |
 | [src/native_audio_telemetry.rs](src/native_audio_telemetry.rs) | Shared audio diagnostics; preserves the literal historical telemetry target. |
 | [src/shortcuts.rs](src/shortcuts.rs) | Process-owned desktop registration and ingress-epoch runtime routing. |
@@ -68,7 +69,11 @@ Retain the app's process-owned shortcut registrar, ingress epochs, and permissio
 Recheck generation, access, cancellation, and credential revision before capture, RPC, and output-action effects.
 Require the same guards immediately before each actual native text batch.
 Keep live external text with suffix revisions separate from native chat preview.
-Preserve exactly one command or `typing` action; never add a fallback, retry, replay, clipboard path, or automatic submission.
+Require exactly one command, `typing`, or `playback` action; never add a fallback, retry, replay, clipboard path, or automatic submission.
+Use the shared CPAL playback owner for shortcut PCM output. Recheck hold cancellation, generation, access, and credential revision at physical output.
+Prefer exact playback formats; permit only bounded 24 kHz mono to 48 kHz stereo adaptation when exact output is unavailable.
+Keep conversion history across packets, retain source credits through converted playback, and calculate tail drain from device frames.
+Keep the capture reservation through RPC completion and verified playback-tail drain or cancellation join.
 Cancel audio before teardown or Android remote-pause preservation. Drain audio tasks before logout credential deletion and disposal completion.
 Keep UI lifecycle retirement nonblocking. Publish bounded selected-port preview only through current identity, access, cancellation, and credential guards.
 Clear preview on cancellation or terminal completion. Publish final text only after successful clean completion.

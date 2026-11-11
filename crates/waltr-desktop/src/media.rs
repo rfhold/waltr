@@ -422,6 +422,8 @@ impl std::fmt::Debug for Frame<'_> {
 /// Writes apply backpressure. A sink must bound its device/reader queues and retain spawned
 /// work outside each write future, so cancellation of a blocked write never loses its join.
 pub trait OutputSink {
+    /// Synchronously revoke queued effects before cleanup awaits; retain owners for `finish`.
+    fn revoke(&self) {}
     /// Explicit platform/format capability, checked before device capture or admission.
     fn supports(&self, port: &RoutinePort) -> bool;
     /// Recheck the guard immediately before effects. PCM is interleaved little-endian i16.

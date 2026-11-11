@@ -1,0 +1,62 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: audio-ask-and-speak
+description: Transcribe a recorded question, answer from model knowledge, then speak the completed answer.
+spec:
+  source: |
+    export default async function () {
+      const transcript = await host.call('media.collect', {port: 'question', cap: 4096, speech: {from: 'defaults'}});
+      const questionBytes = new Uint8Array(await host.call('media.read', {max: 4096}, null, null, transcript));
+      const question = decodeURIComponent(Array.from(questionBytes, byte => '%' + byte.toString(16).padStart(2, '0')).join(''));
+      if (!question.trim()) throw new Error('question required');
+      const result = await host.call('helper.run', {
+        selection: {kind: 'named', name: 'routine-answer'},
+        inference: {from: 'defaults'}, task: question,
+        maxTurns: 1, deadlineMs: 60000, responseBytes: 8192, completionBytes: 16384
+      });
+      const bytes = new Uint8Array(await host.call('media.read', {field: 'response', max: 8192}, null, null, result));
+      const answer = decodeURIComponent(Array.from(bytes, byte => '%' + byte.toString(16).padStart(2, '0')).join(''));
+      await host.call('media.publish', {name: 'answer'}, null, null, result);
+      await host.call('media.synthesize', {text: answer, output: 'audio', speech: {from: 'defaults'}});
+      await host.call('media.finish', {});
+      return {answer};
+    }
+  entrypoints:
+    ask:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties: {}
+      required: []
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        answer: {type: string, maxLength: 8192}
+      required: [answer]
+  capabilities:
+  - media.execute
+  - helper.run
+  - helper.named.routine-answer
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 32
+    inFlight: 4
+    deadlineMs: 240000
+  ports:
+    question:
+      direction: input
+      media: audio
+      required: true
+      maxBytes: 5760000
+      formats: [pcm16le-24000-mono]
+    audio:
+      direction: output
+      media: audio
+      required: true
+      maxBytes: 16777216
+      formats: [pcm16le-24000-mono]

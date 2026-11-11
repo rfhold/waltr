@@ -105,7 +105,7 @@ const BUNDLED_RESOURCES: [(&str, &str); 17] = [
     ),
 ];
 
-const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 35] = [
+const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 36] = [
     BUNDLED_RESOURCES[0],
     BUNDLED_RESOURCES[1],
     BUNDLED_RESOURCES[2],
@@ -182,6 +182,10 @@ const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 35] = [
     (
         "routines/ask-and-speak.yaml",
         include_str!("../../resources/routines/ask-and-speak.yaml"),
+    ),
+    (
+        "routines/audio-ask-and-speak.yaml",
+        include_str!("../../resources/routines/audio-ask-and-speak.yaml"),
     ),
     (
         "routines/context-categorization.yaml",

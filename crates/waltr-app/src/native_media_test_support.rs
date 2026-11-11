@@ -112,6 +112,7 @@ pub fn snapshot(name: &str) -> ClientSnapshot {
         providers: Default::default(),
         mcp_servers: Default::default(),
         inference_defaults: None,
+        speech_defaults: Default::default(),
         session_dictation: Some(SessionDictationView {
             routine: name.into(),
             trigger: "dictate".into(),

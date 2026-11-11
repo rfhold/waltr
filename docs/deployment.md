@@ -567,10 +567,17 @@ Android pause cancels audio even when the remote auth runtime survives. Resume n
 Desktop startup loads the strict XDG client file, including on macOS; Android chat loads no XDG client configuration.
 Source and host tests establish no signed permission prompt, installed-device capture, Linux portal acceptance, or Android NDK/C++ package compatibility.
 Browser capture uses bounded complete uploads, not native duplex capture or mobile XDG configuration.
-Browser resampling uses linear interpolation without an anti-alias filter; native conversion uses a stateful sinc filter.
+Browser capture resampling uses linear interpolation without an anti-alias filter; native capture conversion uses a stateful sinc filter.
 Hardware, portal, packaged-app, and browser acceptance remain separate [test gates](testing.md#client-audio-and-dictation).
 
 ### Desktop Tray And External Text
+
+Desktop startup configuration also accepts the exclusive `playback: {}` action for a required audio output port.
+See the [Ctrl+Alt+A audio question example](examples/routines/audio-interactions.md#audio-question-shortcut).
+The native default output device must support either exact 24 kHz mono PCM or the bounded 48 kHz stereo playback adaptation.
+The shared player prefers exact output; its only adaptation uses continuous linear interpolation and mono duplication, with device-clock tail drain.
+The shortcut requires a client build with playback support and a server catalog with `audio-ask-and-speak`.
+Configuration remains startup-only; restart the client after changes.
 
 The desktop tray reports only [client-owned Routine activity](architecture/clients.md#client-routine-activity-tray), not server-wide work.
 Its menu contains status, Open Waltr, and Quit; normal window-close and exit behavior do not change.

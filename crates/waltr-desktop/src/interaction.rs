@@ -140,8 +140,8 @@ fn validate_capture_ports(
     }) || !ports.iter().any(|p| {
         p.name == output
             && p.direction == D::Output
-            && p.media == M::Text
-            && p.formats.iter().any(|f| f == "utf8")
+            && ((p.media == M::Text && p.formats.iter().any(|f| f == "utf8"))
+                || (p.media == M::Audio && p.formats.iter().all(|f| f == "pcm16le-24000-mono") && !p.formats.is_empty()))
     }) || ports.iter().any(|p| {
         p.required
             && p.direction == D::Input
@@ -444,6 +444,7 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
         }
     };
     if result.is_err() {
+        if let Some(sink) = consumer.sink() { sink.revoke(); }
         capture.cancel();
         if let Some(session) = &session_owner {
             session.input.cancel();
@@ -454,11 +455,17 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
     ));
     observer.emit(Diagnostic::Stage(Stage::Cleanup));
     let cleanup = capture.join().await;
+    if cleanup.is_err() || guard.check().is_err() {
+        if let Some(sink) = consumer.sink() { sink.revoke(); }
+    }
     observer.emit(Diagnostic::CaptureCleanup(cleanup));
     let sources_cleanup = producer
         .finish(result.as_ref().is_ok_and(Option::is_some) && cleanup.is_ok())
         .await;
     observer.emit(Diagnostic::SourceCleanup(sources_cleanup));
+    if sources_cleanup.is_err() || guard.check().is_err() {
+        if let Some(sink) = consumer.sink() { sink.revoke(); }
+    }
     if let Some(session) = &mut session_owner {
         let proof = if result.is_err() {
             tokio::time::timeout(
@@ -487,6 +494,9 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
         }
         None => Ok(()),
     };
+    if sink_cleanup.is_err() {
+        if let Some(sink) = consumer.sink() { sink.revoke(); }
+    }
     let output = result?;
     cleanup.map_err(Error::Capture)?;
     sources_cleanup?;
@@ -565,10 +575,18 @@ async fn duplex(
                 .output(&session.output, selection.output, None, guard)
                 .await?;
         }
-        let text = session
-            .output
-            .final_text(selection.output)
-            .map_err(|_| protocol(observer, &session.output))?;
+        let audio_output = selection.invocation.limits.definition.ports.iter().any(|p| {
+            p.name == selection.output && p.media == waltr_client::RoutineMedia::Audio
+        });
+        let text = if audio_output {
+            if !session.output.succeeded() {
+                return Err(protocol(observer, &session.output));
+            }
+            String::new()
+        } else {
+            session.output.final_text(selection.output)
+                .map_err(|_| protocol(observer, &session.output))?
+        };
         if !input_finished.get() {
             observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));
             return Err(Error::Interaction);
