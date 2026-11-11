@@ -330,6 +330,7 @@ fn playback_support_requires_current_output_pcm_contract() {
         files: Mutex::new(BTreeMap::new()),
         file_ports: Default::default(),
         playback_ports: vec!["speaker".into()],
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         playback_stream: RefCell::new(None),
         transfers: host.transport.media_transfers(),
         readers: Mutex::new(Vec::new()),

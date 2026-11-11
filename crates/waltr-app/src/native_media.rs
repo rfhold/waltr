@@ -95,6 +95,7 @@ enum DestinationBinding {
     Playback { port: String },
     File { port: String, handle: String },
 }
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PickInput {
@@ -107,6 +108,13 @@ struct PickInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PickOutput {
     port: String,
+    #[cfg_attr(
+        target_os = "android",
+        expect(
+            dead_code,
+            reason = "Android retains the request schema without a native picker"
+        )
+    )]
     suggested_name: String,
 }
 #[derive(Deserialize)]
@@ -211,7 +219,21 @@ impl Declaration {
 }
 
 pub(crate) enum Selected {
+    #[cfg_attr(
+        target_os = "android",
+        expect(
+            dead_code,
+            reason = "shared selection consumer; Android has no native picker"
+        )
+    )]
     Input { file: File, public: Value },
+    #[cfg_attr(
+        target_os = "android",
+        expect(
+            dead_code,
+            reason = "shared selection consumer; Android has no native picker"
+        )
+    )]
     Output { path: PathBuf },
 }
 pub(crate) struct Request {
@@ -401,6 +423,7 @@ struct Sink {
     files: Mutex<BTreeMap<String, Destination>>,
     file_ports: std::collections::BTreeSet<String>,
     playback_ports: Vec<String>,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     playback_stream: RefCell<Option<String>>,
     transfers: interaction::MediaTransfers,
     readers: Mutex<Vec<interaction::BlobReader>>,
@@ -1666,6 +1689,7 @@ impl Host {
             file_ports: destinations.keys().cloned().collect(),
             files: Mutex::new(destinations),
             playback_ports,
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             playback_stream: RefCell::new(None),
             transfers: self.transport.media_transfers(),
             readers: Mutex::new(Vec::new()),
