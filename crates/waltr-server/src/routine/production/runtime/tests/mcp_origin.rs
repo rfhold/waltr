@@ -539,6 +539,48 @@ async fn run(revoke: bool, public_code: bool) {
     .await
     .expect("normal lifecycle invocations must complete before revoking their token");
     drop(observations);
+    if public_code {
+        let initial = sessions.store().list().await.unwrap().len();
+        let default_helper = call(address, token, "code", serde_json::json!({"action":"execute","source":
+            "await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},inference:{from:'defaults'},task:'public defaults positive control',maxTurns:1,deadlineMs:1000,responseBytes:1024,completionBytes:1024});return true;"
+        })).await;
+        let output = &default_helper["result"]["structuredContent"];
+        assert_eq!(output["status"], "succeeded", "{default_helper:?}");
+        assert_eq!(output["cleanupComplete"], true, "{default_helper:?}");
+        assert_eq!(output["result"], true, "{default_helper:?}");
+        assert_eq!(sessions.store().list().await.unwrap().len(), initial + 1);
+        let before = sessions.store().list().await.unwrap().len();
+        let source_less = call(address, token, "code", serde_json::json!({"action":"execute","source":
+            "await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},inference:{from:'source-session'},task:'must not reach provider',maxTurns:1,deadlineMs:1000,responseBytes:1024,completionBytes:1024});"
+        })).await;
+        let output = &source_less["result"]["structuredContent"];
+        assert_eq!(output["status"], "uncertain", "{source_less:?}");
+        assert_eq!(output["cleanupComplete"], true, "{source_less:?}");
+        assert_eq!(output.get("result"), Some(&serde_json::Value::Null), "{source_less:?}");
+        assert_eq!(output.get("admissionError"), Some(&serde_json::Value::Null), "{source_less:?}");
+        let invocation_id = output["invocationId"].as_str().expect("durable invocation id");
+        let mut request = tonic::Request::new(p::GetInvocationRequest {
+            invocation_id: invocation_id.into(),
+        });
+        request.extensions_mut().insert(principal.clone());
+        let invocation = observation_service.get_invocation(request).await.unwrap()
+            .into_inner().invocation.unwrap();
+        assert_eq!(invocation.id, invocation_id);
+        assert_eq!(invocation.routine, "code-mode");
+        assert_eq!(invocation.status, p::InvocationStatus::Uncertain as i32);
+        let mut request = tonic::Request::new(p::ListOperationsRequest {
+            invocation_id: invocation_id.into(), limit: 100, ..Default::default()
+        });
+        request.extensions_mut().insert(principal.clone());
+        let operations = observation_service.list_operations(request).await.unwrap()
+            .into_inner().operations;
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        assert_eq!(operations[0].invocation_id, invocation_id);
+        assert_eq!(operations[0].name, "helper.run");
+        assert_eq!(operations[0].status, p::OperationStatus::Uncertain as i32);
+        assert_eq!(sessions.store().list().await.unwrap().len(), before, "rejection precedes helper creation");
+        assert_eq!(check.turns.load(Ordering::SeqCst), 0);
+    }
     let response=call(address,token,"execute",serde_json::json!({"action":"session.send","input":{"id":"mcp-code-granted","prompt":"Execute the bounded original helper"}})).await;
     assert!(response.get("result").is_some(), "{response:?}");
     tokio::time::timeout(std::time::Duration::from_secs(5), check.entered.notified())

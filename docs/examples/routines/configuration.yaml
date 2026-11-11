@@ -6,7 +6,7 @@ spec:
   source: |
     export default async function (input) {
       if (!input.prompt.trim()) throw new Error('prompt required');
-      const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'configuration'}, task: input.prompt, maxTurns: 12, deadlineMs: 25000, responseBytes: 65536, completionBytes: 65536})).result;
+      const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'configuration'}, inference: {from: 'defaults'}, task: input.prompt, maxTurns: 12, deadlineMs: 25000, responseBytes: 65536, completionBytes: 65536})).result;
       return helper.response;
     }
   entrypoints:

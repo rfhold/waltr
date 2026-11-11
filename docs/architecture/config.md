@@ -153,22 +153,34 @@ Recognition supports the optional boolean `recognition.diarization`, which defau
 Typed transcript snapshots require `recognition.diarization: true` on the host-selected STT model and an endpoint that implements the cumulative, attributed-word contract.
 The conversation-notes Routine requests these snapshots; a non-diarized selection cannot satisfy it.
 Plain transcription and cleanup collect ordinary transcripts without snapshots or a diarization requirement.
-The host supplies independent exact `RoutineAuthority.recognition` and optional `recognition_snapshot` provider/model pairs.
-Ordinary transcription uses only `recognition`; an explicit `recognition_snapshot` supplies only typed snapshots.
-Both selections resolve from one invocation catalog snapshot and retain their own endpoints and model options.
-The explicit snapshot selection requires STT kind, streaming support and `recognition.diarization: true` at startup and invocation admission.
-Invalid or unavailable explicit snapshot selections fail closed, without fallback to ordinary recognition.
-Without `recognition_snapshot`, an explicitly diarized `recognition` selection retains its prior ordinary and snapshot support.
-Snapshot-only hosts need no ordinary recognition selection.
-Media admission accepts input PCM when either available STT path supports it; admission does not predict dynamic JavaScript operations.
-Ordinary and snapshot operations enforce their own exact PCM settings before provider effects, without conversion or cross-selection fallback.
-Standalone hosts supply the separate pair through `WALTR_ROUTINE_STT_SNAPSHOT_PROVIDER` and `WALTR_ROUTINE_STT_SNAPSHOT_MODEL`.
-Standalone helper attachments and capture tools require independent, exact [host ceilings](../deployment.md#standalone-routine-speech).
-Catalog membership and normal agent permissions cannot raise those ceilings.
+The Defaults resource supplies independent optional speech selections:
+
+```yaml
+spec:
+  inference:
+    provider: example-llm
+    model: assistant
+  speech:
+    stt: {provider: example-stt, model: plain}
+    diarize: {provider: example-stt, model: speakers}
+    tts: {provider: example-tts, model: reader, voice: voice-id, language: en-US, rate: 1.0}
+```
+
+These example identities require matching provider resources. Bundled defaults add no production speech identities.
+`inference` retains the LLM default; `speech` supplies ordinary STT, snapshot STT, and TTS defaults.
+TTS options are optional and otherwise use model synthesis settings.
+Absent selections permit unrelated operations; present invalid selections reject catalog publication atomically.
+Snapshot defaults require STT kind, streaming support, and `recognition.diarization: true`.
+No ordinary-STT fallback supplies a missing snapshot default.
+
+JavaScript can select exact models from the invocation's pinned catalog.
+Media admission validates transport and required ports without executing JavaScript for introspection.
+Each operation validates its selected model and PCM before provider effects.
+Named-agent permissions and applicable caller/source restrictions control capture tools.
 
 Speech models reject inference options, token limits, LLM capabilities, cost/catalog matching fields, wrong transport/model kinds, and mismatched option families. Inference providers cannot contain STT/TTS models or speech options. Inference defaults cannot select a speech provider. Existing LLM resources need no new fields.
 
-`resource_catalog::speech::resolve_speech_model(configuration, provider_key, model_key, expected_kind, streaming)` returns owned `ResolvedSpeechModel { provider_key, model_key, endpoint, capabilities, settings }`. `SpeechSettings` is `Recognition(SpeechRecognitionOptions)` or `Synthesis(SpeechSynthesisOptions)`. Resolution uses a pinned snapshot and performs no network calls. The interaction runtime constructs adapters from those resolved settings. Complete catalog validation checks Routine selections and exact model/port PCM compatibility before publication.
+`resource_catalog::speech::resolve_speech_model(configuration, provider_key, model_key, expected_kind, streaming)` returns owned `ResolvedSpeechModel { provider_key, model_key, endpoint, capabilities, settings }`. `SpeechSettings` is `Recognition(SpeechRecognitionOptions)` or `Synthesis(SpeechSynthesisOptions)`. Resolution uses a pinned snapshot and performs no network calls. The interaction runtime constructs adapters from those resolved settings. Catalog validation checks declared defaults; operation preflight checks dynamic selections and exact model/port PCM compatibility.
 
 See [Routines](routines.md#interaction-catalog-and-runtime) for runtime bounds and ownership. See [Routine audio interactions](../examples/routines/audio-interactions.md) for YAML and the implemented public RPC contract.
 

@@ -265,6 +265,10 @@ struct AgentHost {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct HelperArguments {
+    #[serde(default)]
+    pub inference: super::helper::InferenceSelector,
+    #[serde(default)]
+    pub input: super::helper::HelperInput,
     pub selection: HelperSelection,
     pub source: Option<String>,
     pub task: String,
@@ -281,6 +285,7 @@ impl HelperArguments {
         capabilities: &BTreeSet<String>,
         callback: bool,
     ) -> Result<(), PortError> {
+        self.input.validate()?;
         let selection = match &self.selection {
             HelperSelection::Named { name } => format!("helper.named.{name}"),
             HelperSelection::Restricted { profile } => format!("helper.restricted.{profile}"),
@@ -529,6 +534,7 @@ impl HostDispatcher for AgentHost {
                     json!({"status":"completed","result":result})
                 }
                 Operation::Helper(args) => {
+                    let helpers = helpers.select_inference(&args.inference).map_err(|_| waltr_script::Error::Invalid)?.unwrap_or(helpers);
                     let source = args
                         .source
                         .as_ref()
@@ -565,8 +571,8 @@ impl HostDispatcher for AgentHost {
                                     jpeg: false,
                                     webp: false,
                                     pdf: false,
-                                    text: true,
-                                    max_body_bytes: 65536,
+                                    text: args.input.text,
+                                    max_body_bytes: args.input.max_bytes.min(65536),
                                 },
                                 response_bytes: args.response_bytes,
                                 completion_bytes: args.completion_bytes,

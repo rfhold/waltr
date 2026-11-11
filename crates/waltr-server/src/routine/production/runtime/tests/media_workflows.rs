@@ -1,8 +1,5 @@
 use super::media_upstream::Upstream;
 use super::*;
-use crate::permission::{
-    PermissionEffect, PermissionLevel, PermissionPolicy, PermissionToolSelector,
-};
 use std::{sync::atomic::Ordering, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 #[path = "media_browser.rs"]
@@ -17,19 +14,11 @@ mod helper_inputs;
 #[path = "media_speech_selection.rs"]
 mod speech_selection;
 fn authority() -> RoutineAuthority {
-    RoutineAuthority {
-        recognition: Some(("media-stt".into(), "stream".into())),
-        synthesis: Some(("media-tts".into(), "stream".into())),
-        synthesis_choices: vec![crate::routine::media::speech::SynthesisSelection {model:"stream".into(),voice:"voice".into(),language:"en-US".into(),rate:1.0}],
-        media_restriction: Some(PermissionPolicy::new(PermissionLevel::Deny).with_tool_rule(
-            PermissionToolSelector::exact("_helper_capture"),
-            PermissionEffect::allow(),
-        )),
-        ..Default::default()
-    }
+    RoutineAuthority::default()
 }
 fn resources(root: &std::path::Path, endpoint: &str, diarization: bool) {
     seed(root);
+    speech_defaults(root, if diarization { Some(("media-stt", "stream")) } else { None });
     let mirror = serde_json::json!({"apiVersion":"waltr.routine/v1","kind":"Routine","name":"blob-mirror","description":"Production binary port fixture","spec":{"source":"export default async function(){const value=await host.call('media.upload',{port:'source'});await host.call('media.lease',{output:'copy'},null,null,value);await host.call('media.finish',{});return {completed:true};}","entrypoints":{"run":{"trigger":"interactive"}},"parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"object","properties":{},"required":[]}},"result":{"schemaVersion":"waltr.value/v1","schema":{"type":"object","properties":{"completed":{"type":"boolean"}},"required":["completed"]}},"capabilities":["media.execute"],"ports":{"source":{"direction":"input","media":"file","required":true,"maxBytes":67108864,"formats":["blob"]},"copy":{"direction":"output","media":"file","required":true,"maxBytes":67108864,"formats":["blob"]}}}});
     std::fs::write(
         root.join(".waltr/resources/routines/blob-mirror.yaml"),
@@ -48,10 +37,18 @@ fn input(event: p::input_event::Event) -> p::InteractRequest {
         })),
     }
 }
-fn parameters(name: &str) -> Vec<u8> {
-    serde_json::to_vec(&if name == "audio-synthesize" {
-        serde_json::json!({"speech":{"model":"stream","voice":"voice","language":"en-US","rate":1.0}})
-    } else { serde_json::json!({}) }).unwrap()
+fn parameters(_: &str) -> Vec<u8> {
+    b"{}".to_vec()
+}
+fn speech_defaults(root: &std::path::Path, diarize: Option<(&str, &str)>) {
+    let mut defaults: serde_json::Value = serde_yaml_ng::from_str(include_str!("../../../../../resources/defaults/default.yaml")).unwrap();
+    defaults["spec"]["speech"] = serde_json::json!({"stt":{"provider":"media-stt","model":"stream"},"tts":{"provider":"media-tts","model":"stream"}});
+    if let Some((provider, model)) = diarize {
+        defaults["spec"]["speech"]["diarize"] = serde_json::json!({"provider":provider,"model":model});
+    }
+    let path = root.join(".waltr/resources/defaults");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("default.yaml"), serde_json::to_vec(&defaults).unwrap()).unwrap();
 }
 async fn native(
     address: std::net::SocketAddr,
@@ -88,6 +85,18 @@ async fn native_marked(
     bytes: usize,
     expected: p::InvocationStatus,
     marker: u8,
+) -> p::InteractionTerminal {
+    native_gated(address, auth, name, entry, bytes, expected, marker, None).await
+}
+async fn native_gated(
+    address: std::net::SocketAddr,
+    auth: Option<&str>,
+    name: &str,
+    entry: &str,
+    bytes: usize,
+    expected: p::InvocationStatus,
+    marker: u8,
+    gate: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
 ) -> p::InteractionTerminal {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
         .unwrap()
@@ -157,6 +166,12 @@ async fn native_marked(
         .unwrap()
         .into_inner();
     let live = matches!(name, "audio-transcribe" | "audio-synthesize");
+    if let Some((admitted, release)) = gate {
+        let frame = output.message().await.unwrap().unwrap();
+        assert!(matches!(frame.output.unwrap().event, Some(p::output_event::Event::Accepted(_))));
+        admitted.send(()).unwrap();
+        release.await.unwrap();
+    }
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let producer_release = release.clone();
     let input_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -366,14 +381,14 @@ async fn separate_snapshot_pcm_does_not_reject_plain_dictation_and_cleanup() {
 }
 
 #[tokio::test]
-async fn standalone_cleanup_explicit_environment_authority() {
+async fn standalone_cleanup_catalog_defaults() {
     if !crate::test_support::isolated_process_test(
-        "routine::production::runtime::tests::media_workflows::standalone_cleanup_explicit_environment_authority",
+        "routine::production::runtime::tests::media_workflows::standalone_cleanup_catalog_defaults",
     ) {
         return;
     }
     tokio::time::timeout(Duration::from_secs(30), async {
-        for mode in ["allowed", "diarized", "missing-capture", "missing-text", "wrong-model", "conversation-no-diarization"] {
+        for mode in ["allowed", "diarized", "missing-capture", "conversation-no-diarization"] {
             standalone_case(mode != "missing-capture", Some(mode)).await;
         }
     }).await.expect("bounded standalone cleanup configuration contract");
@@ -407,6 +422,7 @@ async fn standalone_case(capture_allowed: bool, cleanup_mode: Option<&str>) {
             yaml,
         )
         .unwrap();
+        speech_defaults(&source, Some(("snapshot-stt", "snapshot")));
         Some(second)
     } else {
         None
@@ -418,6 +434,11 @@ async fn standalone_case(capture_allowed: bool, cleanup_mode: Option<&str>) {
     std::fs::write(mcp.join("waltr.yaml"),format!("apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {{name: waltr}}\nspec: {{transport: streamableHttp, url: 'http://{address}/mcp'}}\n")).unwrap();
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
+    if !capture_allowed {
+        let permissions = source.join(".waltr/resources/permissions");
+        std::fs::create_dir_all(&permissions).unwrap();
+        std::fs::write(permissions.join("routine-helper-capture.yaml"), include_str!("../../../../../resources/permissions/routine-helper-capture.yaml").replace("permission: allow", "permission: deny")).unwrap();
+    }
     let loader = crate::test_support::default_catalog_loader();
     let config_service = ConfigService::new(source, loader.clone()).await.unwrap();
     let state = config_service.state().clone();
@@ -435,39 +456,7 @@ async fn standalone_case(capture_allowed: bool, cleanup_mode: Option<&str>) {
     let model = models.clone();
     let (auth, token, _issuer, issuer_stop, issuer_task) =
         crate::test_support::composition_auth(&persistence, address).await;
-    let mut configured = authority();
-    let inference = bindings::default_inference(&state.snapshot()).unwrap();
-    configured.helper_inputs.push(crate::routine::production::HelperInputAuthority {
-        provider:inference.provider.key.clone(), model:inference.provider.model_id.clone(),
-        capabilities:waltr_agent::TransientModelCapabilities { png:false,jpeg:false,webp:false,pdf:false,text:true,max_body_bytes:1024*1024 },
-    });
-    if !capture_allowed {
-        configured.media_restriction = None;
-    }
-    if let Some(mode) = cleanup_mode {
-        let mut settings = std::collections::BTreeMap::from([
-            ("WALTR_ROUTINE_STT_PROVIDER".into(), "media-stt".into()),
-            ("WALTR_ROUTINE_STT_MODEL".into(), "stream".into()),
-        ]);
-        if matches!(mode, "split" | "split-mismatched") {
-            settings.insert(
-                "WALTR_ROUTINE_STT_SNAPSHOT_PROVIDER".into(),
-                "snapshot-stt".into(),
-            );
-            settings.insert("WALTR_ROUTINE_STT_SNAPSHOT_MODEL".into(), "snapshot".into());
-        }
-        if capture_allowed {
-            settings.insert("WALTR_ROUTINE_MEDIA_TOOLS".into(), "[\"_helper_capture\"]".into());
-        }
-        if mode != "missing-text" {
-            settings.insert("WALTR_ROUTINE_HELPER_INPUTS".into(), serde_json::json!([{
-                "provider": inference.provider.key,
-                "model": if mode == "wrong-model" { "different-model" } else { &inference.provider.model_id },
-                "text": true, "max_body_bytes": 8388608
-            }]).to_string());
-        }
-        configured = crate::routine::production::standalone::speech_authority(&settings).unwrap();
-    }
+    let configured = authority();
     let app=assemble_app(AppServices{config_service,persistence,catalog_loader:loader,access_authenticator:auth,mcp_oauth:None,outbound_private_origins:vec![],outbound_oauth:Default::default(),automatic_self_mcp_resource:None,agent_state:Some(state),local_admission:None,workspace_root:workspace,sandbox_socket:None,routine_authority:configured,routine_private_parent:root.clone()},move|routes,input|{
         let service=Arc::new(Arc::try_unwrap(crate::session::SessionService::from_sessions(waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new()),input)).ok().unwrap().with_test_provider(model));routes.add_service(waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer::from_arc(service.clone()));Ok(service)
     }).await.unwrap();
@@ -602,7 +591,7 @@ async fn standalone_case(capture_allowed: bool, cleanup_mode: Option<&str>) {
     }
     if let Some(mode) = cleanup_mode {
         let succeeds = matches!(mode, "allowed" | "diarized");
-        let expected = if succeeds { p::InvocationStatus::Succeeded } else { p::InvocationStatus::Uncertain };
+        let expected = if succeeds { p::InvocationStatus::Succeeded } else { p::InvocationStatus::Failed };
         let (routine, entry) = if mode == "conversation-no-diarization" { ("audio-conversation-notes", "record-notes") } else { ("audio-transcribe-cleanup", "dictate") };
         let result = native_status(address, Some(&token), routine, entry, 65536, expected).await;
         assert!(result.cleanup_complete);
@@ -756,16 +745,7 @@ async fn embedded_media_uses_generation_auth_native_and_browser_transports() {
     let models = Models::start(upstream.metrics.clone()).await;
     let model = models.clone();
     let token = "media-explicit-local-generation";
-    let catalog_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-dev-defaults.json");
-    let loader = crate::catalog::CatalogLoader::from_path_with_cache(catalog_path, root.join("cache/authority-models.json"));
-    let materializer = crate::catalog::CatalogMaterializer::load(&loader).await.unwrap();
-    let state = crate::resource_catalog::AgentDefinitionState::load_unified_explicit(source.clone(), materializer, "routine-title").unwrap();
-    let inference = bindings::default_inference(&state.snapshot()).unwrap();
-    let mut configured = authority();
-    configured.helper_inputs.push(crate::routine::production::HelperInputAuthority {
-        provider: inference.provider.key, model: inference.provider.model_id,
-        capabilities: waltr_agent::TransientModelCapabilities { png:false,jpeg:false,webp:false,pdf:false,text:true,max_body_bytes:1024*1024 },
-    });
+    let configured = authority();
     let embedded=crate::embedded::build_embedded_server_with_registration(crate::embedded::EmbeddedServerConfig{
         resources_root:source,waltr_database_path:root.join("data/waltr.sqlite3"),mcp_database_path:root.join("data/mcp.sqlite3"),session_root:root.join("sessions"),workspace_root:root.join("workspace"),catalog_source:crate::embedded::EmbeddedCatalogSource::Path(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-dev-defaults.json")),catalog_cache_path:root.join("cache/models.json"),catalog_fallback:None,default_agent:"routine-title".into(),local_bearer:crate::LocalBearer::new(token).unwrap(),outbound_policy:Default::default(),routine_authority:configured,
     },move|routes,input,path|{

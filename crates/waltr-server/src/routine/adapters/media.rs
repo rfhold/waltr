@@ -358,18 +358,6 @@ fn validate_bindings(
         {
             return Err(PortError::Invalid);
         }
-        if present
-            && matches!(port.direction, Direction::Input)
-            && let Some(format) = format
-            && format != Format::Text
-        {
-            // JavaScript chooses the operation after admission; each operation checks its own PCM.
-            if b.speech.preflight(format, false).is_err()
-                && (!b.snapshot || b.speech.preflight(format, true).is_err())
-            {
-                return Err(PortError::UnsupportedCapability);
-            }
-        }
     }
     if b.inputs
         .keys()
@@ -524,7 +512,7 @@ impl MediaHost {
         if request.bytes.is_some() {
             return Err(waltr_script::Error::Invalid);
         }
-        let args: Arguments = if request.operation.starts_with("context.") {
+        let mut args: Arguments = if request.operation.starts_with("context.") {
             if !self
                 .definition
                 .envelope()
@@ -570,6 +558,7 @@ impl MediaHost {
                     .map_err(|_| waltr_script::Error::Denied)?;
             }
             Arguments {
+                helper_runner: self.bindings.helpers.select_inference(&helper.inference).map_err(|_| waltr_script::Error::Invalid)?,
                 helper: Some(helper),
                 ..Arguments::default()
             }
@@ -603,11 +592,13 @@ impl MediaHost {
         if request.operation != "helper.run" && request.callback.is_some() {
             return Err(waltr_script::Error::Invalid);
         }
-        if request.operation == "media.synthesize" {
-            self.bindings
-                .speech
-                .preflight_synthesis(args.speech.as_ref().ok_or(waltr_script::Error::Invalid)?)
-                .map_err(|_| waltr_script::Error::Denied)?;
+        if matches!(request.operation.as_str(), "media.collect" | "media.transcribe" | "media.synthesize") {
+            let format = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?.inputs.get(required(&args.port)?).ok_or(waltr_script::Error::Identity)?.format();
+            if request.operation != "media.collect" || format != Format::Text {
+                let backend = self.bindings.speech.select(&args.speech.clone().unwrap_or_default(), request.operation == "media.synthesize", args.snapshot == Some(true)).map_err(|_| waltr_script::Error::Invalid)?.unwrap_or_else(|| self.bindings.speech.clone());
+                backend.preflight(format, args.snapshot == Some(true)).map_err(|_| waltr_script::Error::Invalid)?;
+                args.backend = Some(backend);
+            } else if args.speech.is_some() || args.snapshot == Some(true) { return Err(waltr_script::Error::Invalid); }
         } else if args.speech.is_some() {
             return Err(waltr_script::Error::Invalid);
         }
@@ -623,8 +614,12 @@ struct Arguments {
     #[serde(skip)]
     helper: Option<super::authorized_tools::HelperArguments>,
     #[serde(skip)]
+    helper_runner: Option<Arc<dyn crate::routine::ports::HelperRunner>>,
+    #[serde(skip)]
     context_operation: Option<crate::routine::context::ContextOperation>,
-    speech: Option<media::speech::SynthesisSelection>,
+    speech: Option<media::speech::SpeechSelector>,
+    #[serde(skip)]
+    backend: Option<Arc<dyn media::speech::SpeechBackend>>,
     field: Option<String>,
     name: Option<String>,
     cap: Option<usize>,
@@ -726,9 +721,6 @@ impl MediaHost {
                         .filter(|cap| *cap > 0 && *cap <= 1048576)
                         .ok_or(waltr_script::Error::Limit)?;
                     let credit = self.charge(cap)?;
-                    if args.snapshot == Some(true) && !self.bindings.snapshot {
-                        return Err(waltr_script::Error::Denied);
-                    }
                     let text = if input.format() == Format::Text {
                         if args.snapshot == Some(true) {
                             return Err(waltr_script::Error::Invalid);
@@ -744,9 +736,7 @@ impl MediaHost {
                             self.bindings.workspace_principal.clone(),
                             self.bindings.workspace_process.clone(),
                         );
-                        let (producer, reader) = self
-                            .bindings
-                            .speech
+                        let (producer, reader) = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?
                             .transcribe_snapshot(input, workspace)
                             .map_err(media_error)?;
                         let (joined, collected) = tokio::join!(
@@ -773,9 +763,7 @@ impl MediaHost {
                             .streams
                             .open(stream::Direction::Output, Format::Text, false)
                             .map_err(media_error)?;
-                        let producer = self
-                            .bindings
-                            .speech
+                        let producer = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?
                             .transcribe(input, output)
                             .map_err(media_error)?;
                         let (joined, collected) = tokio::join!(
@@ -817,13 +805,9 @@ impl MediaHost {
                     .remove(required(&args.output)?)
                     .ok_or(waltr_script::Error::Identity)?;
                 let producer = if request.operation == "media.transcribe" {
-                    self.bindings.speech.transcribe(input, output)
+                    args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?.transcribe(input, output)
                 } else {
-                    self.bindings.speech.synthesize_selected(
-                        input,
-                        output,
-                        args.speech.ok_or(waltr_script::Error::Invalid)?,
-                    )
+                    args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?.synthesize(input, output)
                 }
                 .map_err(media_error)?;
                 producer.join().await.map_err(media_error)?;
@@ -958,9 +942,9 @@ impl MediaHost {
                     .map(|_| self.resource(&request, &context))
                     .transpose()?;
                 let profile = args.helper.ok_or(waltr_script::Error::Invalid)?;
-                let capabilities = if resource.is_some() {
-                    self.bindings
-                        .helpers
+                let helpers = args.helper_runner.unwrap_or_else(|| self.bindings.helpers.clone());
+                let mut capabilities = if resource.is_some() {
+                    helpers
                         .input_capabilities(profile.selection.clone())
                         .await
                         .map_err(|_| waltr_script::Error::Denied)?
@@ -974,9 +958,9 @@ impl MediaHost {
                         max_body_bytes: 65536,
                     }
                 };
+                capabilities.text &= profile.input.text;
                 if resource.is_some() {
-                    self.bindings
-                        .helpers
+                    helpers
                         .preflight_payload(
                             profile.selection.clone(),
                             capabilities,
@@ -988,7 +972,7 @@ impl MediaHost {
                 let credit = self.charge(profile.completion_bytes)?;
                 let attachment = match &resource {
                     Some(Resource::Blob(blob)) => {
-                        if blob.metadata().bytes > 8 * 1024 * 1024 {
+                        if blob.metadata().bytes > profile.input.max_bytes as u64 {
                             return Err(waltr_script::Error::Limit);
                         }
                         let kind = match (
@@ -1051,6 +1035,7 @@ impl MediaHost {
                             return Err(waltr_script::Error::Denied);
                         }
                         let text = resource_text(resource, profile.field.as_deref())?;
+                        if text.len() > profile.input.max_bytes { return Err(waltr_script::Error::Limit); }
                         Some(
                             self.bindings
                                 .attachments
@@ -1068,9 +1053,7 @@ impl MediaHost {
                         limits: self.definition.limits().clone(),
                     }) as Arc<dyn CompletionObserver>
                 });
-                let result = self
-                    .bindings
-                    .helpers
+                let result = helpers
                     .run_with_inputs(
                         HelperRequest {
                             selection: profile.selection.clone(),

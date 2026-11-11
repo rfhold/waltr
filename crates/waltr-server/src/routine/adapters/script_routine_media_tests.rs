@@ -855,7 +855,7 @@ async fn vertical_with_upload(
                 ownership: Ownership::Leased,
                 correlation: "not-the-owner".into(),
             },
-            if program.contains("media.synthesize") { json!({"speech":{"model":"tts","voice":"voice","language":"en-US","rate":1.0}}) } else { json!({}) },
+            json!({}),
         )
         .unwrap()
         .await;

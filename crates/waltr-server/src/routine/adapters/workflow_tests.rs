@@ -7,6 +7,17 @@ mod correction_tests;
 type Helpers = Arc<dyn Fn() -> Arc<dyn HelperRunner> + Send + Sync>;
 
 fn named_workflow_catalog() -> AgentDefinitionCatalog {
+    AgentDefinitionCatalog::from_sources(named_workflow_sources(), "source").unwrap()
+}
+
+fn named_workflow_snapshot() -> Arc<crate::resource_catalog::AgentDefinitionSnapshot> {
+    let root = crate::test_support::temp_root();
+    let path = root.join("agents.yaml");
+    std::fs::write(&path, named_workflow_sources().join("\n---\n")).unwrap();
+    crate::resource_catalog::AgentDefinitionState::load(&root, &[path], "source").unwrap().snapshot()
+}
+
+fn named_workflow_sources() -> Vec<String> {
     let mut sources = bundle().sources;
     for (name, prompt) in [
         ("routine-categorization", "CATEGORIZE"),
@@ -16,7 +27,7 @@ fn named_workflow_catalog() -> AgentDefinitionCatalog {
         sources.push(format!("apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: {name}}}\nspec:\n  systemPrompt: {prompt}\n  features: []\n  permissions:\n    - permissionSetRef: {{name: capture}}\n"));
     }
     sources.push("apiVersion: waltr.dev/v1alpha1\nkind: PermissionSet\nmetadata: {name: capture}\nspec:\n  tools:\n    - name: _helper_capture\n      permission: allow\n".into());
-    AgentDefinitionCatalog::from_sources(sources, "source").unwrap()
+    sources
 }
 
 fn text_helpers<P: LlmStream + 'static>(
@@ -1027,6 +1038,7 @@ async fn categorization_and_category_management_use_real_helpers_and_nullable_re
             .clone()
             .with_runtime_factory(factory.session_factory(sessions.clone()));
         let helper_context = context.clone();
+        let helper_catalog = named_workflow_snapshot();
         let helpers: Helpers = Arc::new(move || {
             Arc::new(
                 CoordinatorHelperRunner::new(
@@ -1038,7 +1050,7 @@ async fn categorization_and_category_management_use_real_helpers_and_nullable_re
                     Some(helper_context.helper_copy()),
                     "owner".into(),
                 )
-                .unwrap(),
+                .unwrap().with_catalog(helper_catalog.clone(), Some(inference())),
             )
         });
         let engine = Arc::new(Engine::new(4).unwrap());
@@ -1179,6 +1191,7 @@ async fn categorization_and_category_management_use_real_helpers_and_nullable_re
                                     Ok(AgentRuntimeProvider::new(model(), supplied.clone()))
                                 }),
                             );
+                            let helper_catalog = named_workflow_snapshot();
                             Arc::new(move || {
                                 Arc::new(
                                     CoordinatorHelperRunner::new(
@@ -1192,7 +1205,7 @@ async fn categorization_and_category_management_use_real_helpers_and_nullable_re
                                         Some(source.clone()),
                                         "owner".into(),
                                     )
-                                    .unwrap(),
+                                    .unwrap().with_catalog(helper_catalog.clone(), Some(inference())),
                                 ) as Arc<dyn HelperRunner>
                             }) as Helpers
                         }

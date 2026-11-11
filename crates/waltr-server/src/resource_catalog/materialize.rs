@@ -179,9 +179,36 @@ struct DefaultsResource {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct DefaultsSpec {
-    inference: InferenceSpec,
+    #[serde(default)]
+    inference: Option<InferenceSpec>,
+    #[serde(default)]
+    speech: Option<SpeechDefaultsSpec>,
     #[serde(default)]
     session_dictation: Option<SessionDictationSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeechDefaultsSpec {
+    stt: Option<SpeechSelectionSpec>,
+    diarize: Option<SpeechSelectionSpec>,
+    tts: Option<SpeechSelectionSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeechSelectionSpec {
+    provider: String,
+    model: String,
+    voice: Option<String>,
+    language: Option<String>,
+    rate: Option<f64>,
+}
+
+impl From<SpeechSelectionSpec> for config_proto::SpeechSelection {
+    fn from(value: SpeechSelectionSpec) -> Self {
+        Self { provider: value.provider, model: value.model, voice: value.voice, language: value.language, rate: value.rate }
+    }
 }
 
 #[derive(Deserialize)]
@@ -408,8 +435,9 @@ pub(super) fn materialize_defaults(
     path: &str,
 ) -> Result<
     (
-        config_proto::InferenceDefaults,
+        Option<config_proto::InferenceDefaults>,
         Option<config_proto::SessionDictation>,
+        Option<config_proto::SpeechDefaults>,
     ),
     AgentDefinitionLoadError,
 > {
@@ -424,12 +452,17 @@ pub(super) fn materialize_defaults(
         Ok(config_proto::SessionDictation { routine: selection.routine, trigger: selection.trigger, input: selection.input, output: selection.output })
     }).transpose()?;
     Ok((
-        config_proto::InferenceDefaults {
-            provider_key: resource.spec.inference.provider,
-            model_key: resource.spec.inference.model,
-            reasoning_effort: resource.spec.inference.reasoning_effort,
-        },
+        resource.spec.inference.map(|inference| config_proto::InferenceDefaults {
+            provider_key: inference.provider,
+            model_key: inference.model,
+            reasoning_effort: inference.reasoning_effort,
+        }),
         dictation,
+        resource.spec.speech.map(|speech| config_proto::SpeechDefaults {
+            stt: speech.stt.map(Into::into),
+            diarize: speech.diarize.map(Into::into),
+            tts: speech.tts.map(Into::into),
+        }),
     ))
 }
 

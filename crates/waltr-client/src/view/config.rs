@@ -26,6 +26,41 @@ pub struct ConfigView {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub session_dictation: Option<SessionDictationView>,
+    /// Optional catalog defaults for Routine speech operations.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub speech_defaults: Option<SpeechDefaultsView>,
+}
+
+/// Exact speech selections by operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechDefaultsView {
+    pub stt: Option<SpeechSelectionView>,
+    pub diarize: Option<SpeechSelectionView>,
+    pub tts: Option<SpeechSelectionView>,
+}
+
+/// Catalog speech identity and optional synthesis overrides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechSelectionView {
+    pub provider: String,
+    pub model: String,
+    pub voice: Option<String>,
+    pub language: Option<String>,
+    pub rate: Option<f64>,
+}
+
+impl From<waltr::grpc::waltr::config::v1::SpeechSelection> for SpeechSelectionView {
+    fn from(v: waltr::grpc::waltr::config::v1::SpeechSelection) -> Self {
+        Self { provider: v.provider, model: v.model, voice: v.voice, language: v.language, rate: v.rate }
+    }
+}
+impl From<SpeechSelectionView> for waltr::grpc::waltr::config::v1::SpeechSelection {
+    fn from(v: SpeechSelectionView) -> Self {
+        Self { provider: v.provider, model: v.model, voice: v.voice, language: v.language, rate: v.rate }
+    }
 }
 
 /// Default interaction selection for session push-to-talk.
@@ -343,6 +378,7 @@ impl From<Configuration> for ConfigView {
                 .map(|(name, server)| (name, McpServerView::from(server)))
                 .collect(),
             inference_defaults: config.inference_defaults.map(InferenceDefaultsView::from),
+            speech_defaults: config.speech_defaults.map(|v| SpeechDefaultsView { stt: v.stt.map(Into::into), diarize: v.diarize.map(Into::into), tts: v.tts.map(Into::into) }),
             session_dictation: config.session_dictation.map(|value| SessionDictationView {
                 routine: value.routine,
                 trigger: value.trigger,
@@ -374,6 +410,7 @@ impl From<ConfigView> for Configuration {
                 .map(|(name, server)| (name, McpServer::from(server)))
                 .collect(),
             inference_defaults: view.inference_defaults.map(InferenceDefaults::from),
+            speech_defaults: view.speech_defaults.map(|v| waltr::grpc::waltr::config::v1::SpeechDefaults { stt: v.stt.map(Into::into), diarize: v.diarize.map(Into::into), tts: v.tts.map(Into::into) }),
             session_dictation: view.session_dictation.map(|value| {
                 waltr::grpc::waltr::config::v1::SessionDictation {
                     routine: value.routine,

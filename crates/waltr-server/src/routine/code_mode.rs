@@ -144,6 +144,7 @@ pub struct CodeModeHost<S: SessionStore + Clone + Send + Sync + 'static> {
     dispatches: Arc<dyn CodeDispatchStore>,
     sessions: SessionCoordinator<S>,
     helpers: Arc<AgentSessionRuntimeFactory>,
+    catalog: Option<crate::resource_catalog::AgentDefinitionState>,
     grants: Mutex<BTreeMap<(String, String), Grant>>,
     stopped: std::sync::atomic::AtomicBool,
 }
@@ -187,9 +188,14 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeHost<S> {
             dispatches,
             sessions,
             helpers,
+            catalog: None,
             grants: Mutex::new(BTreeMap::new()),
             stopped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+    pub(crate) fn with_catalog(mut self, catalog: crate::resource_catalog::AgentDefinitionState) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
     /// Bind one authenticated principal and actual session incarnation to an operator profile.
     /// Replacing or revoking a grant cancels its active executions; request metadata grants nothing.
@@ -564,6 +570,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                             record: current,
                             grant: self.grant.clone(),
                             public_only: self.public_only,
+                            catalog: self.host.catalog.as_ref().map(|state| state.snapshot()),
                         }),
                     },
                 });
@@ -856,6 +863,7 @@ struct CodeBindings<S: SessionStore + Clone + Send + Sync + 'static> {
     record: SessionRecord,
     grant: Grant,
     public_only: bool,
+    catalog: Option<Arc<crate::resource_catalog::AgentDefinitionSnapshot>>,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory for CodeBindings<S> {
     fn bind(
@@ -871,6 +879,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
         let helpers = self.helpers.clone();
         let live = self.live.clone();
         let public_only = self.public_only;
+        let catalog = self.catalog.clone();
         Box::pin(async move {
             grant.check()?;
             if caller.principal != super::rpc::principal_id(&grant.principal) {
@@ -912,10 +921,10 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                     dispatcher,
                 ))
             };
-            let helper = CoordinatorHelperRunner::new(
+            let mut helper = CoordinatorHelperRunner::new(
                 sessions,
                 helpers,
-                inference,
+                inference.clone(),
                 BTreeMap::new(),
                 BTreeMap::new(),
                 None,
@@ -926,6 +935,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 let live = live.clone();
                 Box::pin(async move { live.check().await.map(|_| ()) })
             });
+            if let Some(catalog) = catalog {
+                helper = helper.with_catalog(catalog, (!public_only).then_some(inference));
+            }
             Ok(AdapterBindings {
                 principal: caller.principal,
                 tools,

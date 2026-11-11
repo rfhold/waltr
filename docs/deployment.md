@@ -54,55 +54,28 @@ The `dev` volume contains both SQLite files, including unified outbound credenti
 
 The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. Their `WALTR_OAUTH_*` and `WALTR_TEST_MCP_*` values are test-fixture settings, not server deployment variables. The authenticated Waltr fixture enables the hosted MCP issuer, generates an ephemeral keyring in tmpfs, and sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` only so HTTPS Waltr-to-Waltr CIMD and token requests can reach private Compose aliases. Production deployments must leave this deterministic test exception unset. The fixture does not configure a direct MCP issuer or a preregistered self client.
 
-## Standalone Routine Speech
+## Routine Speech and Helpers
 
-The `waltr-server` binary enables Routine speech only through explicit process environment selections. Provider resources alone do not enable it. Configure each direction independently:
+Standalone and embedded hosts use catalog defaults and JavaScript model selectors.
+The Defaults resource supplies independent `spec.inference`, `spec.speech.stt`, `spec.speech.diarize`, and `spec.speech.tts` selections.
+Each speech selection names an exact provider and model. TTS also accepts optional `voice`, `language`, and `rate` defaults.
+Absent TTS options use the model's catalog synthesis settings.
 
-| Setting | Contract |
-| --- | --- |
-| `WALTR_ROUTINE_STT_PROVIDER`, `WALTR_ROUTINE_STT_MODEL` | Exact catalog provider/model keys for streaming recognition. Set both or neither. |
-| `WALTR_ROUTINE_STT_SNAPSHOT_PROVIDER`, `WALTR_ROUTINE_STT_SNAPSHOT_MODEL` | Separate exact STT keys for transcript snapshots. Requires streaming support and `recognition.diarization: true`. Set both or neither. |
-| `WALTR_ROUTINE_TTS_PROVIDER`, `WALTR_ROUTINE_TTS_MODEL` | Exact catalog provider/model keys for streaming synthesis. Set both or neither. |
-| `WALTR_ROUTINE_TTS_CHOICES` | Optional JSON array of 1–128 exact `{ "model": "reader", "voice": "voice-id", "language": "en-US", "rate": 1.0 }` choices, at most 131072 bytes. Requires the TTS pair; every model must equal its selected model key. Unknown fields are rejected. |
+Speech calls accept `speech: {from: 'defaults'}` or exact `{provider, model}` selections with supported TTS options.
+Omission uses the operation default. Snapshot collection uses `diarize`; ordinary transcription uses `stt`.
+Missing optional defaults do not prevent unrelated Routines. An operation that needs a missing default fails before provider effects.
+Present invalid defaults reject the entire catalog update.
 
-Unset ordinary STT and TTS pairs leave their direction disabled. Partial, empty, non-UTF-8, oversized or malformed settings fail startup without value disclosure. Provider/model identities are at most 256 bytes, with no surrounding whitespace or control characters. Voices are nonempty and at most 256 bytes, languages nonempty and at most 64 bytes, and rates range from 0.25 through 2.0.
+Helpers use `inference: {from: 'defaults'}` unless JavaScript explicitly selects an exact model or `{from: 'source-session'}`.
+Source selection requires an authorized source and copies its inference snapshot.
+Helpers accept bounded text input through `input: {text: true, maxBytes: 8388608}`.
+Named-agent permissions and applicable caller/source restrictions control `_helper_capture`; declarations grant no permission.
+No separate environment tool ceiling applies.
 
-The snapshot pair affects only typed transcript snapshots, not ordinary transcription or cleanup.
-When the snapshot pair is absent, an explicitly diarized ordinary STT selection retains its prior snapshot support.
-A non-diarized ordinary selection supplies no snapshot support.
-An explicit snapshot selection requires valid resources, STT kind, streaming support and diarization at startup and invocation admission.
-An invalid explicit snapshot selection fails closed; the host never substitutes the ordinary selection.
-Snapshot-only configuration works without the ordinary STT pair; it grants no ordinary transcription.
-Media admission accepts PCM that matches either available STT path; JavaScript chooses the operation after admission.
-Each operation checks its own selection and PCM before a provider connection.
-A snapshot-only host can admit snapshot-compatible input, but an ordinary transcription call still fails before provider effects.
-
-Absent `WALTR_ROUTINE_TTS_CHOICES` permits only the selected catalog model's configured voice, language and rate (default rate 1.0). A supplied list replaces that choice; it adds no provider or model wildcard. Per-call choices retain the pinned endpoint, credentials and optional catalog `synthesis.model_name`. Missing resources, wrong model kinds or unavailable streaming support fail at Routine admission against its pinned catalog snapshot, not by choosing a fallback provider.
-
-These speech settings grant no helper input/model authority, tools, code access or capture permission. Embedded hosts and external `build_app(BuildAppOptions)` callers keep their explicitly supplied `routine_authority`; the generic runtime does not read these variables. Restart the standalone process after changing its environment. See the [speech provider contract](architecture/config.md#speech-provider-contract) for catalog configuration.
-
-Standalone media helpers require separate, explicit host ceilings:
-
-| Setting | Contract |
-| --- | --- |
-| `WALTR_ROUTINE_HELPER_INPUTS` | JSON array of 1–128 unique `{ "provider": "codex", "model": "gpt-5.6-sol", "text": true, "max_body_bytes": 8388608 }` entries. Identities match exact inference provider/model keys. Unknown fields fail startup. |
-| `WALTR_ROUTINE_MEDIA_TOOLS` | JSON array of unique, exact builtin capture tool names. The only supported name is `_helper_capture`. Wildcards, shell tools and MCP identities fail startup. |
-
-Each variable accepts at most 131072 bytes. Present empty arrays, malformed values and duplicate identities fail startup without value disclosure.
-Helper provider/model identities follow the 256-byte identity rules above. `text` must equal `true`; `max_body_bytes` ranges from 1 through 33554432.
-No entry enables image, audio or PDF attachments. An absent helper-input variable denies native attachments, including transcript snapshots.
-An absent media-tool variable denies every helper tool. A supplied tool list retains default-deny for all other tools.
-The host ceiling intersects the normal named agent's permissions; neither resource capture declarations nor host ceilings override an agent denial.
-Neither variable grants code access, selects inference defaults, or derives authority from catalog model capabilities.
-
-For text cleanup on `codex/gpt-5.6-sol`, use the helper entry above and `WALTR_ROUTINE_MEDIA_TOOLS='["_helper_capture"]'`.
-The 8 MiB ceiling accommodates JSON escaping for a 1 MiB transcript plus its request envelope.
-Cleanup collects an ordinary transcript and does not require diarization. The conversation-notes Routine still requires a typed transcript snapshot.
-Conversation notes require `recognition.diarization: true` and an endpoint that implements the cumulative, attributed-word contract.
-Keep the ordinary STT pair on the plain dictation model.
-Set the snapshot pair to a separate diarized model key for conversation notes.
-Both selections use the same catalog snapshot; each retains its own endpoint and recognition options.
-The diarization flag alone does not establish backend support or live conversation-note compatibility.
+Each invocation retains one catalog snapshot across reloads.
+The host validates selected model kind, options, transport support, and PCM before provider effects.
+Snapshot speech requires streaming support, `recognition.diarization: true`, and a backend with the cumulative attributed-word contract.
+See the [speech provider contract](architecture/config.md#speech-provider-contract) and [Routine selectors](architecture/routines.md).
 
 ## Workspace Worker Deployment
 
@@ -398,16 +371,8 @@ Hosted grants use the configured OAuth issuer and validated opaque OAuth subject
 Each request retains its original token expiry and revocation lease through a fresh adapter over the selected session's normal runtime.
 Request metadata and guest arguments select neither identity nor profile.
 
-Media hosts also set explicit `RoutineAuthority` fields:
-
-| Field | Contract |
-| --- | --- |
-| `recognition` | Exact provider/model keys for ordinary streaming speech recognition. |
-| `recognition_snapshot` | Optional separate streaming STT selection with diarization. Absence retains snapshot support from an explicitly diarized `recognition` selection. |
-| `synthesis` | Exact provider/model keys for a current streaming speech-synthesis model. No implicit provider or codec fallback exists. |
-| `helper_inputs` | Exact inference provider/model pairs and `TransientModelCapabilities`; absent entries deny attachments. |
-| `synthesis_choices` | Explicit allowed `{model,voice,language,rate}` choices; Routine input must supply `{speech:{...}}`. |
-| `media_restriction` | Normal tool-policy ceiling for media helpers. Absence grants no tools; a source session also imposes its caller policy. |
+Media hosts use the same catalog defaults and JavaScript selectors as standalone deployments.
+`RoutineAuthority` retains explicit code grants and target bindings.
 
 Routine JavaScript selects named helpers, tasks, capture names, source handles, turns, deadlines and response/completion budgets explicitly.
 `spec.captures` declares exact named selections and bounded `waltr.value/v1` contracts.

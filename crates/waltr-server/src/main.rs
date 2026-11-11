@@ -41,23 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr: SocketAddr = listen_addr.parse()?;
 
     let apps = standalone_apps::from_env()?;
-    let mut speech = std::collections::BTreeMap::new();
-    for name in waltr_server::routine::production::standalone::VARIABLES {
-        match env::var(name) {
-            Ok(value) => {
-                speech.insert(name.to_owned(), value);
-            }
-            Err(env::VarError::NotPresent) => {}
-            Err(_) => return Err(format!("{name} must be UTF-8").into()),
-        }
-    }
-    let routine_authority =
-        waltr_server::routine::production::standalone::speech_authority(&speech)?;
-    let app = build_app(waltr_server::BuildAppOptions {
-        routine_authority,
-        ..Default::default()
-    })
-    .await?;
+    let app = build_app(waltr_server::BuildAppOptions::default()).await?;
     #[cfg(feature = "web")]
     let (app, listener, listen_addr) = match apps {
         Some(config) => app.bind_with_apps_config(listen_addr, config).await?,

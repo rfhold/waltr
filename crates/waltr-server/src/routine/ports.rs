@@ -264,6 +264,10 @@ pub struct HelperResult {
 
 /// Independently substitutable helper lifecycle; implementations must join on cleanup.
 pub trait HelperRunner: Send + Sync {
+    /// Resolve an invocation-local model selector before any helper or attachment effects.
+    fn select_inference(&self, selector: &super::adapters::helper::InferenceSelector) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
+        if selector.is_default() { Ok(None) } else { Err(PortError::UnsupportedCapability) }
+    }
     /// Reject definitely denied declared captures before upstream effects. Ask remains live.
     /// Adapters without a policy projection must fail closed for declared captures.
     fn preflight_captures(&self) -> PortFuture<()> {

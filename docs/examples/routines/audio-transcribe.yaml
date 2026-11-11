@@ -5,7 +5,7 @@ description: live ordered speech transcription
 spec:
   source: |
     export default async function () {
-      await host.call('media.transcribe', {port: 'audio', output: 'transcript'});
+      await host.call('media.transcribe', {port: 'audio', output: 'transcript', speech: {from: 'defaults'}});
       await host.call('media.finish', {});
       return {completed: true};
     }

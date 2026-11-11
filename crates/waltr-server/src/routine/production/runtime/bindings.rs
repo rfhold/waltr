@@ -32,37 +32,6 @@ mod lifecycle;
 mod semantic;
 mod tools;
 
-fn resolve_snapshot_recognition(
-    configuration: &waltr::grpc::waltr::config::v1::Configuration,
-    selection: &Option<(String, String)>,
-) -> Result<Option<crate::resource_catalog::speech::ResolvedSpeechModel>, PortError> {
-    selection
-        .as_ref()
-        .map(|(provider, model)| {
-            use crate::resource_catalog::speech::{SpeechSettings, resolve_speech_model};
-            let resolved = resolve_speech_model(
-                configuration,
-                provider,
-                model,
-                waltr::grpc::waltr::config::v1::ModelType::Stt,
-                true,
-            )
-            .map_err(|_| PortError::Invalid)?;
-            if !matches!(&resolved.settings, SpeechSettings::Recognition(options) if options.diarization)
-            {
-                return Err(PortError::Invalid);
-            }
-            crate::routine::media::speech::GoogleSpeech::with_recognition_selections(
-                None,
-                Some(resolved.clone()),
-                None,
-            )
-            .map_err(|_| PortError::Invalid)?;
-            Ok(resolved)
-        })
-        .transpose()
-}
-
 pub(crate) trait CodeComposition: Send + Sync {
     fn public_enabled(&self, principal: &AuthenticatedPrincipal) -> bool;
     fn public_port(
@@ -108,16 +77,12 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
         blobs: Arc<FilesystemBlobStore>,
         text: Arc<dyn TextResultStore>,
     ) -> Result<Arc<Self>, PortError> {
-        resolve_snapshot_recognition(
-            state.snapshot().configuration(),
-            &options.recognition_snapshot,
-        )?;
         let code = Arc::new(CodeModeHost::new(
             service.clone(),
             persistence.script_code_dispatch_store(),
             sessions.clone(),
             factory.clone(),
-        ));
+        ).with_catalog(state.clone()));
         let owner = Arc::new(Self {
             state,
             options,
@@ -337,7 +302,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
             {
                 return Err(PortError::Conflict);
             }
-            let inference;
+            let mut inference = None;
             let tool_admitted = caller_policy.is_some();
             let mut restriction =
                 caller_policy.unwrap_or_else(|| PermissionPolicy::new(PermissionLevel::Deny));
@@ -381,11 +346,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         .1
                         .permission_policy();
                 }
-                let selected_inference = record
-                    .inference_settings
-                    .clone()
-                    .ok_or(PortError::Invalid)?;
-                inference = selected_inference;
+                inference = record.inference_settings.clone();
                 bundle = record.agent_definition.clone();
                 if request
                     .definition
@@ -428,7 +389,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 if name == "configuration" {
                     return Err(PortError::Denied);
                 }
-                inference = default_inference(&snapshot)?;
             }
             if name == "configuration" {
                 let level = restriction.evaluate_tool("configure-waltr");
@@ -445,7 +405,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 let helper_inference = inference.clone();
                 let helper_principal = request.principal.clone();
                 let helper_restriction = restriction.clone();
-                let helper_inputs = options.helper_inputs.iter().map(|input| ((input.provider.clone(), input.model.clone()), input.capabilities)).collect::<BTreeMap<_,_>>();
+                let helper_catalog = snapshot.clone();
                 let helpers = Arc::new(move || {
                     Ok(Arc::new(
                         CoordinatorHelperRunner::new(
@@ -457,7 +417,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                             None,
                             helper_principal.clone(),
                         )?
-                        .with_input_models(helper_inputs.clone())
+                        .with_catalog(helper_catalog.clone(), helper_inference.clone())
                         .with_permission_restriction(helper_restriction.clone()),
                     ) as Arc<dyn HelperRunner>)
                 });
@@ -488,20 +448,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 });
             }
             let media = request.transport.is_some();
-            let restriction = if media {
-                let ceiling = options
-                    .media_restriction
-                    .clone()
-                    .unwrap_or_else(|| PermissionPolicy::new(PermissionLevel::Deny));
-                if request.source_session.is_some() {
-                    restriction.intersection(ceiling)
-                } else {
-                    ceiling
-                }
-            } else {
-                restriction
-            };
-            let helpers = Arc::new(
+            let helpers =
                 CoordinatorHelperRunner::new(
                     sessions.clone(),
                     factory.clone(),
@@ -511,9 +458,10 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     copy,
                     request.principal.clone(),
                 )?
-                .with_input_models(options.helper_inputs.iter().map(|input| ((input.provider.clone(), input.model.clone()), input.capabilities)).collect())
-                .with_permission_restriction(restriction.clone()),
-            );
+                .with_catalog(snapshot.clone(), inference.clone());
+            let helpers = Arc::new(if !media || request.source_session.is_some() || tool_admitted {
+                helpers.with_permission_restriction(restriction.clone())
+            } else { helpers });
             let result: Arc<dyn HostFactory> = if let Some(transport) = request.transport {
                 let principal_pools = {
                     let mut pools = pools.lock().map_err(|_| PortError::Unavailable)?;
@@ -525,52 +473,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         .or_insert_with(Pools::principal)
                         .clone()
                 };
-                let configuration = snapshot.configuration();
-                let resolve = |selection: &Option<(String, String)>, kind| {
-                    selection
-                        .as_ref()
-                        .map(|(provider, model)| {
-                            crate::resource_catalog::speech::resolve_speech_model(
-                                configuration,
-                                provider,
-                                model,
-                                kind,
-                                true,
-                            )
-                            .map_err(|_| PortError::Invalid)
-                        })
-                        .transpose()
-                };
-                let recognition = resolve(
-                    &options.recognition,
-                    waltr::grpc::waltr::config::v1::ModelType::Stt,
-                )?;
-                let synthesis = resolve(
-                    &options.synthesis,
-                    waltr::grpc::waltr::config::v1::ModelType::Tts,
-                )?;
-                let recognition_snapshot =
-                    resolve_snapshot_recognition(configuration, &options.recognition_snapshot)?;
-                let snapshot = recognition_snapshot.as_ref().or(recognition.as_ref()).is_some_and(|resolved| matches!(&resolved.settings, crate::resource_catalog::speech::SpeechSettings::Recognition(options) if options.diarization));
-                let speech: Arc<dyn crate::routine::media::speech::SpeechBackend> = if recognition
-                    .is_none()
-                    && recognition_snapshot.is_none()
-                    && synthesis.is_none()
-                {
-                    Arc::new(NoSpeech)
-                } else {
-                    Arc::new(
-                        crate::routine::media::speech::GoogleSpeech::with_recognition_selections(
-                            recognition,
-                            recognition_snapshot,
-                            synthesis,
-                        )
-                        .and_then(|speech| {
-                            speech.with_synthesis_choices(options.synthesis_choices.clone())
-                        })
-                        .map_err(|_| PortError::UnsupportedCapability)?,
-                    )
-                };
+                let speech = Arc::new(crate::routine::media::speech::CatalogSpeech(snapshot.clone()));
                 Arc::new(MediaHostFactory {
                     bindings: transport.bind_factory(Arc::new(MediaComposition {
                         principal: request.principal.clone(),
@@ -581,7 +484,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         context,
                         principal_pools,
                         process_pools,
-                        snapshot,
+                        snapshot: true,
                     })),
                 })
             } else {
@@ -595,6 +498,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     ),
                     sessions,
                     inference,
+                    catalog: snapshot,
                     bundle,
                     executor: Arc::new(tokio::sync::Mutex::new(None)),
                     stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -693,7 +597,8 @@ impl InvocationAdapterFactory for Bound {
 struct LazyTools<S: SessionStore + Clone + Send + Sync + 'static> {
     factory: Arc<AgentSessionRuntimeFactory>,
     sessions: SessionCoordinator<S>,
-    inference: InferenceSettings,
+    inference: Option<InferenceSettings>,
+    catalog: Arc<crate::resource_catalog::AgentDefinitionSnapshot>,
     bundle: Option<Value>,
     executor: Arc<tokio::sync::Mutex<Option<Arc<SessionAuthorizedToolExecutor<S>>>>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
@@ -708,7 +613,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> LazyTools<S> {
             return Ok(executor.clone());
         }
         let mut request = SessionCreateRequest::new(SessionId::generate());
-        request.inference_settings = Some(self.inference.clone());
+        request.inference_settings = Some(match &self.inference { Some(inference) => inference.clone(), None => default_inference(&self.catalog)? });
         request.agent_definition = self.bundle.clone();
         let created = self
             .sessions
@@ -744,36 +649,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> LazyTools<S> {
     }
 }
 
-struct NoSpeech;
-impl crate::routine::media::speech::SpeechBackend for NoSpeech {
-    fn transcribe(
-        &self,
-        _: crate::routine::media::stream::Reader,
-        _: crate::routine::media::stream::Writer,
-    ) -> Result<crate::routine::media::Producer, crate::routine::media::Error> {
-        Err(crate::routine::media::Error::Invalid)
-    }
-    fn transcribe_snapshot(
-        &self,
-        _: crate::routine::media::stream::Reader,
-        _: crate::routine::media::snapshot::Workspace,
-    ) -> Result<
-        (
-            crate::routine::media::Producer,
-            crate::routine::media::snapshot::SnapshotReader,
-        ),
-        crate::routine::media::Error,
-    > {
-        Err(crate::routine::media::Error::Invalid)
-    }
-    fn synthesize(
-        &self,
-        _: crate::routine::media::stream::Reader,
-        _: crate::routine::media::stream::Writer,
-    ) -> Result<crate::routine::media::Producer, crate::routine::media::Error> {
-        Err(crate::routine::media::Error::Invalid)
-    }
-}
 struct MediaComposition {
     principal: String,
     helpers: Arc<dyn HelperRunner>,

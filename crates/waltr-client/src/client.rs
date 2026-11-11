@@ -2345,6 +2345,7 @@ mod tests {
             mcp_servers: mcp_servers([mcp_server("filesystem")]),
             inference_defaults: None,
             session_dictation: None,
+            speech_defaults: None,
         });
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(

@@ -13,6 +13,32 @@ pub struct Configuration {
     pub inference_defaults: ::core::option::Option<InferenceDefaults>,
     #[prost(message, optional, tag="5")]
     pub session_dictation: ::core::option::Option<SessionDictation>,
+    #[prost(message, optional, tag="6")]
+    pub speech_defaults: ::core::option::Option<SpeechDefaults>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpeechDefaults {
+    #[prost(message, optional, tag="1")]
+    pub stt: ::core::option::Option<SpeechSelection>,
+    #[prost(message, optional, tag="2")]
+    pub diarize: ::core::option::Option<SpeechSelection>,
+    #[prost(message, optional, tag="3")]
+    pub tts: ::core::option::Option<SpeechSelection>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpeechSelection {
+    #[prost(string, tag="1")]
+    pub provider: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="3")]
+    pub voice: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag="5")]
+    pub rate: ::core::option::Option<f64>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

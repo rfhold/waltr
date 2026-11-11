@@ -28,6 +28,48 @@ pub struct ResolvedSpeechModel {
     pub settings: SpeechSettings,
 }
 
+/// Resolve one exact selection, applying only operation-compatible overrides.
+pub fn resolve_selection(configuration: &proto::Configuration, selection: &proto::SpeechSelection, kind: ModelType, snapshot: bool) -> Result<ResolvedSpeechModel, String> {
+    if [&selection.provider, &selection.model].iter().any(|value| value.is_empty() || value.len() > 256 || value.trim() != value.as_str() || value.chars().any(char::is_control)) {
+        return Err("speech selection requires exact provider and model keys".into());
+    }
+    let mut resolved = resolve_speech_model(configuration, &selection.provider, &selection.model, kind, true)?;
+    match &mut resolved.settings {
+        SpeechSettings::Recognition(options) => {
+            if selection.voice.is_some() || selection.language.is_some() || selection.rate.is_some() {
+                return Err("synthesis options are not recognition options".into());
+            }
+            if snapshot && !options.diarization {
+                return Err("diarize requires streaming speaker attribution".into());
+            }
+        }
+        SpeechSettings::Synthesis(options) => {
+            if let Some(voice) = &selection.voice {
+                if voice.is_empty() || voice.len() > 256 || voice.chars().any(char::is_control) { return Err("invalid synthesis voice".into()); }
+                options.voice = voice.clone();
+            }
+            if let Some(language) = &selection.language {
+                if language.is_empty() || language.len() > 64 || language.chars().any(char::is_control) { return Err("invalid synthesis language".into()); }
+                options.language_code = language.clone();
+            }
+            if let Some(rate) = selection.rate {
+                if !rate.is_finite() || !(0.25..=2.0).contains(&rate) { return Err("invalid synthesis rate".into()); }
+                options.speaking_rate = Some(rate);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+pub(super) fn validate_defaults(configuration: &proto::Configuration) -> Result<(), String> {
+    if let Some(defaults) = &configuration.speech_defaults {
+        for (selection, kind, snapshot) in [(&defaults.stt, ModelType::Stt, false), (&defaults.diarize, ModelType::Stt, true), (&defaults.tts, ModelType::Tts, false)] {
+            if let Some(selection) = selection { resolve_selection(configuration, selection, kind, snapshot)?; }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve explicit keys from a pinned catalog snapshot; never performs I/O.
 pub fn resolve_speech_model(
     configuration: &proto::Configuration,

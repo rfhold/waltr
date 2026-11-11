@@ -18,7 +18,7 @@ spec:
         categories[key].item_ids.push(item.item_id);
       }
       const coverage = {categories, checkpoint};
-      const helper = (await host.call('helper.run', {selection:{kind:'named',name:'routine-context-strategy'},source:snapshot.source,task:JSON.stringify({coverage,instruction:input.instruction}),capture:'context-strategy',maxTurns:3,deadlineMs:20000,responseBytes:65536,completionBytes:65536})).result;
+      const helper = (await host.call('helper.run', {selection:{kind:'named',name:'routine-context-strategy'},inference:{from:'source-session'},source:snapshot.source,task:JSON.stringify({coverage,instruction:input.instruction}),capture:'context-strategy',maxTurns:3,deadlineMs:20000,responseBytes:65536,completionBytes:65536})).result;
       if (helper.captures.length !== 1) throw new Error('one strategy required');
       const strategy = helper.captures[0].value;
       if (strategy.kind === 'no_change') return {decisions:[]};

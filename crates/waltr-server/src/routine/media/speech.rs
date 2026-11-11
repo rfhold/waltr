@@ -15,39 +15,13 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use waltr_audio::{audio::PcmS16Le, client::Client, config::Config, stt, tts};
 
-/// Explicit per-call choices, without endpoints, provider keys or credentials.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SynthesisSelection {
-    /// Exact pinned synthesis model key.
-    pub model: String,
-    /// Supported provider voice identity.
-    pub voice: String,
-    /// Provider language code.
-    pub language: String,
-    /// Finite speaking rate in the supported range.
-    pub rate: f64,
-}
-impl SynthesisSelection {
-    pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.model.is_empty() || self.model.len() > 256 || self.voice.is_empty() || self.voice.len() > 256
-            || self.language.is_empty() || self.language.len() > 64 || !self.rate.is_finite() || !(0.25..=2.0).contains(&self.rate) {
-            return Err(Error::Invalid);
-        }
-        Ok(())
-    }
-}
-
 /// Object-safe producer boundary. Construction pins network-free resolved settings;
 /// execution uses the input invocation's existing absolute deadline.
 pub trait SpeechBackend: Send + Sync {
-    /// Validate explicit choices without consuming streams or connecting.
-    fn preflight_synthesis(&self, _selection: &SynthesisSelection) -> Result<(), Error> { Err(Error::Invalid) }
-    /// One call's choices never mutate a shared backend.
-    fn synthesize_selected(&self, input: Reader, output: Writer, selection: SynthesisSelection) -> Result<Producer, Error> {
-        self.preflight_synthesis(&selection)?;
-        drop((input, output));
-        Err(Error::Invalid)
+    /// Resolve a call against the invocation's pinned catalog, without I/O.
+    fn select(&self, selection: &SpeechSelector, synthesis: bool, snapshot: bool) -> Result<Option<Arc<dyn SpeechBackend>>, Error> {
+        let _ = (synthesis, snapshot);
+        if matches!(selection, SpeechSelector::Defaults(_)) { Ok(None) } else { Err(Error::Invalid) }
     }
     /// Check pinned direction and format without opening a provider connection.
     fn preflight(&self, _input: Format, _snapshot: bool) -> Result<(), Error> {
@@ -65,6 +39,53 @@ pub trait SpeechBackend: Send + Sync {
     /// Synthesize committed input text into raw 24 kHz mono PCM output.
     fn synthesize(&self, input: Reader, output: Writer) -> Result<Producer, Error>;
 }
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum SpeechSelector {
+    Defaults(DefaultSpeechSelection),
+    Exact(ExactSpeechSelection),
+}
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultSpeechSelection { pub from: DefaultSource }
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultSource { Defaults }
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSpeechSelection {
+    pub provider: String,
+    pub model: String,
+    pub voice: Option<String>,
+    pub language: Option<String>,
+    pub rate: Option<f64>,
+}
+impl Default for SpeechSelector {
+    fn default() -> Self { Self::Defaults(DefaultSpeechSelection { from: DefaultSource::Defaults }) }
+}
+
+/// Per-operation resolution retains the invocation revision across catalog reloads.
+pub struct CatalogSpeech(pub Arc<crate::resource_catalog::AgentDefinitionSnapshot>);
+impl SpeechBackend for CatalogSpeech {
+    fn select(&self, selection: &SpeechSelector, synthesis: bool, snapshot: bool) -> Result<Option<Arc<dyn SpeechBackend>>, Error> {
+        use waltr::grpc::waltr::config::v1::{ModelType, SpeechSelection};
+        let configuration = self.0.configuration();
+        let selection = match selection {
+            SpeechSelector::Defaults(_) => {
+                let defaults = configuration.speech_defaults.as_ref().ok_or(Error::Invalid)?;
+                (if synthesis { &defaults.tts } else if snapshot { &defaults.diarize } else { &defaults.stt }).clone().ok_or(Error::Invalid)?
+            }
+            SpeechSelector::Exact(selection) => SpeechSelection { provider: selection.provider.clone(), model: selection.model.clone(), voice: selection.voice.clone(), language: selection.language.clone(), rate: selection.rate },
+        };
+        let resolved = crate::resource_catalog::speech::resolve_selection(configuration, &selection, if synthesis { ModelType::Tts } else { ModelType::Stt }, snapshot).map_err(|_| Error::Invalid)?;
+        let backend = if synthesis { GoogleSpeech::new(None, Some(resolved)) } else if snapshot { GoogleSpeech::with_recognition_selections(None, Some(resolved), None) } else { GoogleSpeech::new(Some(resolved), None) }?;
+        Ok(Some(Arc::new(backend)))
+    }
+    fn transcribe(&self, _: Reader, _: Writer) -> Result<Producer, Error> { Err(Error::Invalid) }
+    fn transcribe_snapshot(&self, _: Reader, _: super::snapshot::Workspace) -> Result<(Producer, super::snapshot::SnapshotReader), Error> { Err(Error::Invalid) }
+    fn synthesize(&self, _: Reader, _: Writer) -> Result<Producer, Error> { Err(Error::Invalid) }
+}
+
 /// Bounded adapters with explicitly pinned endpoint and speech settings.
 /// Ordinary stream frames remain capped at 16 KiB provider messages. The explicit
 /// snapshot path admits compact wire frames up to 8 MiB and formatted notes to 1 MiB.
@@ -73,7 +94,6 @@ pub struct GoogleSpeech {
     recognition: Option<ResolvedSpeechModel>,
     recognition_snapshot: Option<ResolvedSpeechModel>,
     synthesis: Option<ResolvedSpeechModel>,
-    synthesis_choices: Vec<SynthesisSelection>,
 }
 impl GoogleSpeech {
     /// Validate settings without connecting; at least one speech direction is required.
@@ -161,40 +181,16 @@ impl GoogleSpeech {
                 return Err(Error::Invalid);
             }
         }
-        let synthesis_choices = synthesis.as_ref().and_then(|resolved| match &resolved.settings {
-            SpeechSettings::Synthesis(options) => Some(SynthesisSelection { model:resolved.model_key.clone(), voice:options.voice.clone(), language:options.language_code.clone(), rate:options.speaking_rate.unwrap_or(1.0) }),
-            _ => None,
-        }).into_iter().collect();
         Ok(Self {
             recognition,
             recognition_snapshot,
             synthesis,
-            synthesis_choices,
         })
     }
     fn snapshot_recognition(&self) -> Option<&ResolvedSpeechModel> {
         self.recognition_snapshot
             .as_ref()
             .or(self.recognition.as_ref())
-    }
-    /// Replace allowed choices under the same host-pinned provider/model identity.
-    pub fn with_synthesis_choices(mut self, choices: Vec<SynthesisSelection>) -> Result<Self, Error> {
-        if choices.len() > 128 { return Err(Error::Limit); }
-        for choice in &choices {
-            choice.validate()?;
-            if self.synthesis.as_ref().is_none_or(|resolved| resolved.model_key != choice.model) { return Err(Error::Invalid); }
-        }
-        if !choices.is_empty() { self.synthesis_choices = choices; }
-        Ok(self)
-    }
-    fn selected_synthesis(&self, selection: &SynthesisSelection) -> Result<Self, Error> {
-        self.preflight_synthesis(selection)?;
-        let mut selected = self.clone();
-        let SpeechSettings::Synthesis(options) = &mut selected.synthesis.as_mut().ok_or(Error::Invalid)?.settings else { return Err(Error::Invalid); };
-        options.voice = selection.voice.clone();
-        options.language_code = selection.language.clone();
-        options.speaking_rate = Some(selection.rate);
-        Ok(selected)
     }
 }
 #[derive(Default)]
@@ -260,14 +256,6 @@ async fn connect_bounded(
     }
 }
 impl SpeechBackend for GoogleSpeech {
-    fn preflight_synthesis(&self, selection: &SynthesisSelection) -> Result<(), Error> {
-        selection.validate()?;
-        if self.synthesis.is_none() || !self.synthesis_choices.contains(selection) { return Err(Error::Invalid); }
-        Ok(())
-    }
-    fn synthesize_selected(&self, input: Reader, output: Writer, selection: SynthesisSelection) -> Result<Producer, Error> {
-        self.selected_synthesis(&selection)?.synthesize(input, output)
-    }
     fn preflight(&self, input: Format, snapshot: bool) -> Result<(), Error> {
         match input {
             Format::Text if !snapshot && self.synthesis.is_some() => Ok(()),
@@ -914,45 +902,16 @@ mod tests {
                 .is_err()
         );
     }
-    fn synthesis() -> GoogleSpeech {
-        use waltr::grpc::waltr::config::v1 as proto;
-        GoogleSpeech::new(None, Some(ResolvedSpeechModel {
-            provider_key:"enabled".into(), model_key:"pinned".into(), endpoint:"http://localhost:1".into(),
-            capabilities:proto::SpeechCapabilities { streaming:true, unary:false },
-            settings:SpeechSettings::Synthesis(proto::SpeechSynthesisOptions {
-                voice:"voice-a".into(), language_code:"en-US".into(), sample_rate_hz:24000, channels:1,
-                speaking_rate:Some(1.0), model_name:Some("upstream-pinned".into()), ..Default::default()
-            }),
-        })).unwrap()
-    }
     #[test]
-    fn explicit_synthesis_rejects_unapproved_or_unsupported_choices_without_network() {
-        let speech = synthesis();
-        let allowed = SynthesisSelection { model:"pinned".into(), voice:"voice-a".into(), language:"en-US".into(), rate:1.0 };
-        speech.preflight_synthesis(&allowed).unwrap();
-        for change in [
-            SynthesisSelection { model:"foreign".into(), ..allowed.clone() },
-            SynthesisSelection { voice:"voice-b".into(), ..allowed.clone() },
-            SynthesisSelection { language:"fr-FR".into(), ..allowed.clone() },
-            SynthesisSelection { rate:0.0, ..allowed.clone() },
-            SynthesisSelection { rate:f64::NAN, ..allowed.clone() },
-        ] { assert!(speech.preflight_synthesis(&change).is_err()); }
-        assert!(synthesis().with_synthesis_choices(vec![SynthesisSelection { model:"foreign".into(), ..allowed }]).is_err());
-        assert!(serde_json::from_value::<SynthesisSelection>(serde_json::json!({"model":"pinned","voice":"voice-a","language":"en-US","rate":1,"endpoint":"https://foreign"})).is_err());
-    }
-    #[tokio::test]
-    async fn concurrent_synthesis_selection_keeps_shared_backend_options_immutable() {
-        let first = SynthesisSelection { model:"pinned".into(), voice:"voice-a".into(), language:"en-US".into(), rate:1.0 };
-        let second = SynthesisSelection { voice:"voice-b".into(), language:"fr-FR".into(), rate:1.25, ..first.clone() };
-        let speech = Arc::new(synthesis().with_synthesis_choices(vec![first.clone(), second.clone()]).unwrap());
-        let (a, b) = tokio::join!(async { speech.selected_synthesis(&first).unwrap() }, async { speech.selected_synthesis(&second).unwrap() });
-        let options = |backend: &GoogleSpeech| match &backend.synthesis.as_ref().unwrap().settings {
-            SpeechSettings::Synthesis(options) => (options.voice.clone(), options.language_code.clone(), options.speaking_rate, options.model_name.clone()),
-            _ => panic!("synthesis settings"),
-        };
-        assert_eq!(options(&a), ("voice-a".into(), "en-US".into(), Some(1.0), Some("upstream-pinned".into())));
-        assert_eq!(options(&b), ("voice-b".into(), "fr-FR".into(), Some(1.25), Some("upstream-pinned".into())));
-        assert_eq!(options(&speech), options(&a));
+    fn speech_selector_rejects_ambiguous_or_credential_bearing_inputs() {
+        for value in [
+            serde_json::json!({"from":"defaults","provider":"p","model":"m"}),
+            serde_json::json!({"provider":"p","model":"m","endpoint":"https://foreign"}),
+            serde_json::json!({"provider":"p","model":"m","apiKey":"secret"}),
+            serde_json::json!({"model":"m"}),
+        ] {
+            assert!(serde_json::from_value::<SpeechSelector>(value).is_err());
+        }
     }
     #[test]
     fn cumulative_speaker_words_are_validated_independently_of_portion_transcript() {

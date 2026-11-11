@@ -773,12 +773,17 @@ impl ServerAgentRuntimeFactory {
     pub(crate) fn helper_capture_policy(
         &self,
         bundle: &AgentDefinitionBundle,
-        model: &ModelRef,
     ) -> Result<PermissionPolicy, AgentSessionRuntimeError> {
         let definition = bundle.resolve().map_err(|_| {
             AgentSessionRuntimeError::FailedPrecondition("invalid pinned helper definition".into())
         })?;
-        let policy = self.definition_permission_policy(&definition, model, &[]);
+        let mut policy = PermissionPolicy::new(PermissionLevel::Deny);
+        for entry in &definition.permissions {
+            if !matches!(&entry.selector, AgentPermissionSelector::Name(name) if name == "_helper_capture") {
+                continue;
+            }
+            policy = self.apply_definition_permission(policy, "_helper_capture".into(), &entry.permission);
+        }
         Ok(match &self.restriction {
             Some(restriction) => policy.intersection(restriction.clone()),
             None => policy,
@@ -848,8 +853,15 @@ impl ServerAgentRuntimeFactory {
                 AgentPermissionSelector::Feature(feature) => feature_tools(*feature),
             };
             for name in names {
+                policy = self.apply_definition_permission(policy, name, &entry.permission);
+            }
+        }
+        policy
+    }
+
+    fn apply_definition_permission(&self, mut policy: PermissionPolicy, name: String, permission: &ResolvedPermission) -> PermissionPolicy {
                 let selector = PermissionToolSelector::exact(name);
-                match &entry.permission {
+                match permission {
                     ResolvedPermission::Tool(effect) => {
                         policy = policy.with_tool_rule(selector, effect.clone());
                     }
@@ -883,8 +895,6 @@ impl ServerAgentRuntimeFactory {
                         }
                     }
                 }
-            }
-        }
         policy
     }
 
@@ -1736,6 +1746,35 @@ mod tests {
 
     fn empty_test_agent() -> ResolvedAgent {
         resolved_test_agent("spec: {}")
+    }
+
+    #[test]
+    fn helper_capture_projection_matches_runtime_policy_without_a_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let model = ModelRef::new(ProviderId::OpenAi, "test", ModelApi::OpenAiResponses);
+        for permissions in [
+            "[]",
+            "[{name: _helper_capture, permission: allow}]",
+            "[{name: _helper_capture, permission: ask}]",
+            "[{name: _helper_capture, permission: deny}]",
+            "[{name: _helper_capture, permission: allow}, {name: _helper_capture, permission: deny}]",
+        ] {
+            let source = format!("apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: test}}\nspec:\n  features: [{{shell: {{root: $(session.workspace.root), defaultPermissions: true}}}}]\n  permissions: {permissions}\n");
+            let bundle = AgentDefinitionBundle::new("test", vec![source]);
+            let definition = bundle.resolve().unwrap();
+            for restriction in [PermissionLevel::Allow, PermissionLevel::Ask, PermissionLevel::Deny] {
+                let restriction = PermissionPolicy::new(restriction);
+                let factory = ServerAgentRuntimeFactory::new(
+                    crate::agent_host::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
+                    root.clone(), FileCredentialStore::new(root.join("auth.json")), definition.clone(),
+                ).with_permission_restriction(restriction.clone());
+                let expected = factory.definition_permission_policy(&definition, &model, &[]).intersection(restriction);
+                let projected = factory.helper_capture_policy(&bundle).unwrap();
+                assert_eq!(projected.evaluate_tool("_helper_capture"), expected.evaluate_tool("_helper_capture"));
+                assert_eq!(projected.evaluate_tool("shell"), PermissionLevel::Deny);
+            }
+        }
     }
 
     fn mcp_feature(selection: McpServerSelection, trace_propagation: bool) -> McpFeatureConfig {

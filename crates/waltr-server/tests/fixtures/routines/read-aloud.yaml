@@ -5,7 +5,7 @@ description: Unregistered committed-text-only PCM speech synthesis
 spec:
   source: |
     export default async function (input) {
-      await host.call('media.synthesize', {port: 'text', output: 'audio', speech: input.speech});
+      await host.call('media.synthesize', {port: 'text', output: 'audio', speech: {from: 'defaults'}});
       await host.call('media.finish', {});
       return {completed: true};
     }
@@ -15,16 +15,8 @@ spec:
     schemaVersion: waltr.value/v1
     schema:
       type: object
-      properties:
-        speech:
-          type: object
-          properties:
-            model: {type: string, maxLength: 128}
-            voice: {type: string, maxLength: 256}
-            language: {type: string, maxLength: 64}
-            rate: {type: number, min: 0.25, max: 4}
-          required: [model, voice, language, rate]
-      required: [speech]
+      properties: {}
+      required: []
   result: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {completed: {type: boolean}}, required: [completed]}}
   capabilities: [media.execute]
   budgets: {valueBytes: 65536, resultBytes: 65536, hostCalls: 32, inFlight: 4, deadlineMs: 5400000}

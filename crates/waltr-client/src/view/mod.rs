@@ -14,7 +14,7 @@ pub use config::{
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
-    SessionDictationView,
+    SessionDictationView, SpeechDefaultsView, SpeechSelectionView,
 };
 pub use session::{
     InferenceProviderSettingsView, InferenceSettingsMatchView,
@@ -73,6 +73,11 @@ mod tests {
             etag: "v1".to_owned(),
             mcp_servers: HashMap::new(),
             inference_defaults: None,
+            speech_defaults: Some(waltr::grpc::waltr::config::v1::SpeechDefaults {
+                stt: Some(waltr::grpc::waltr::config::v1::SpeechSelection { provider: "stt".into(), model: "plain".into(), ..Default::default() }),
+                diarize: Some(waltr::grpc::waltr::config::v1::SpeechSelection { provider: "stt".into(), model: "speakers".into(), ..Default::default() }),
+                tts: Some(waltr::grpc::waltr::config::v1::SpeechSelection { provider: "tts".into(), model: "reader".into(), voice: Some("voice".into()), language: Some("en-US".into()), rate: Some(1.25) }),
+            }),
             session_dictation: Some(waltr::grpc::waltr::config::v1::SessionDictation {
                 routine: "dictation".into(),
                 trigger: "hold".into(),
@@ -243,6 +248,8 @@ mod tests {
             McpServerView::decl(),
             InferenceDefaultsView::decl(),
             SessionDictationView::decl(),
+            SpeechDefaultsView::decl(),
+            SpeechSelectionView::decl(),
             ProviderView::decl(),
             ConfigView::decl(),
             CatalogModelRefView::decl(),

@@ -264,6 +264,10 @@ input: string,
  */
 output: string, };
 
+export type SpeechDefaultsView = { stt: SpeechSelectionView | null, diarize: SpeechSelectionView | null, tts: SpeechSelectionView | null, };
+
+export type SpeechSelectionView = { provider: string, model: string, voice: string | null, language: string | null, rate: number | null, };
+
 export type ProviderView = {
 /**
  * Provider type as a shell-friendly enum.
@@ -314,7 +318,11 @@ inferenceDefaults: InferenceDefaultsView | null,
 /**
  * Optional configured push-to-talk selection; absent disables session dictation.
  */
-sessionDictation?: SessionDictationView | null, };
+sessionDictation?: SessionDictationView | null,
+/**
+ * Optional catalog defaults for Routine speech operations.
+ */
+speechDefaults?: SpeechDefaultsView | null, };
 
 export type CatalogModelRefView = {
 /**

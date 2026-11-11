@@ -88,7 +88,7 @@ pub use view::{
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
     ProviderView, SelectableAgentView, SessionAssociationsView, SessionCapabilitiesView,
     SessionCoordinationPhaseView, SessionCoordinationReasonView, SessionCoordinationView,
-    SessionDictationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
+    SessionDictationView, SpeechDefaultsView, SpeechSelectionView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
     SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
     SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
     TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,

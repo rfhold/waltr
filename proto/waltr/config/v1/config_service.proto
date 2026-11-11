@@ -10,6 +10,21 @@ message Configuration {
   map<string, McpServer> mcp_servers = 3;
   InferenceDefaults inference_defaults = 4;
   SessionDictation session_dictation = 5;
+  SpeechDefaults speech_defaults = 6;
+}
+
+message SpeechDefaults {
+  SpeechSelection stt = 1;
+  SpeechSelection diarize = 2;
+  SpeechSelection tts = 3;
+}
+
+message SpeechSelection {
+  string provider = 1;
+  string model = 2;
+  optional string voice = 3;
+  optional string language = 4;
+  optional double rate = 5;
 }
 
 message SessionDictation {

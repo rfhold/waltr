@@ -136,6 +136,7 @@ async fn two_strategy_children_overlap_before_the_gate_and_both_publish_acknowle
         .clone()
         .with_runtime_factory(factory.session_factory(sessions.clone()));
     let effective = context.helper_copy();
+    let helper_catalog = named_workflow_snapshot();
     let helpers: Helpers = Arc::new(move || {
         Arc::new(
             CoordinatorHelperRunner::new(
@@ -147,7 +148,7 @@ async fn two_strategy_children_overlap_before_the_gate_and_both_publish_acknowle
                 Some(effective.clone()),
                 "owner".into(),
             )
-            .unwrap(),
+            .unwrap().with_catalog(helper_catalog.clone(), Some(inference())),
         )
     });
     let engine = Arc::new(Engine::new(4).unwrap());

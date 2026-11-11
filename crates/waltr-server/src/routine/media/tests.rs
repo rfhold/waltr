@@ -1202,16 +1202,7 @@ async fn synthesis_model_name_reaches_wire_and_omission_preserves_default() {
         let (mut input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
         let (output, mut reader) = s.open(Direction::Output, pcm(), false).unwrap();
         let owner = speech
-            .synthesize_selected(
-                source,
-                output,
-                super::speech::SynthesisSelection {
-                    model: "catalog-reader".into(),
-                    voice: "expresso-happy".into(),
-                    language: "en-US".into(),
-                    rate: 1.0,
-                },
-            )
+            .synthesize(source, output)
             .unwrap();
         input
             .write(input.key(), text("a", "hello", true, true))

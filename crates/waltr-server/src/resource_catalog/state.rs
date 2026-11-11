@@ -1182,11 +1182,15 @@ fn build_snapshot(
                 serde_json::to_value(server).expect("generated MCP server serializes")
             }
             ResourceKind::Defaults => {
-                let (defaults, dictation) = materialize_defaults(&source, &path)?;
-                configuration.inference_defaults = Some(defaults.clone());
+                let (defaults, dictation, speech) = materialize_defaults(&source, &path)?;
+                configuration.inference_defaults = defaults.clone();
                 configuration.session_dictation = dictation.clone();
+                configuration.speech_defaults = speech.clone();
                 let mut value =
-                    serde_json::to_value(defaults).expect("generated defaults serialize");
+                    defaults.map(|defaults| serde_json::to_value(defaults).expect("generated defaults serialize")).unwrap_or_else(|| serde_json::json!({}));
+                if let Some(speech) = speech {
+                    value["speech"] = serde_json::to_value(speech).expect("generated speech defaults serialize");
+                }
                 if let Some(dictation) = dictation {
                     value["sessionDictation"] =
                         serde_json::to_value(dictation).expect("generated dictation serializes");
@@ -1261,6 +1265,8 @@ fn build_snapshot(
         }
     }
     let catalog = compile_catalog(&sources, default_agent)?;
+    super::speech::validate_defaults(&configuration)
+        .map_err(|message| invalid_value("defaults/default.yaml", message))?;
     let etag = materialized_snapshot_etag(&entries, &configuration);
     if let Some(defaults) = &configuration.inference_defaults {
         let provider = configuration
@@ -1289,6 +1295,14 @@ fn build_snapshot(
                     defaults.provider_key, defaults.model_key
                 ),
             ));
+        }
+        let model = &provider.models[&defaults.model_key];
+        if model.r#type != waltr::grpc::waltr::config::v1::ModelType::Llm as i32
+            || defaults.reasoning_effort.as_ref().is_some_and(|effort| {
+                !model.options.as_ref().is_some_and(|options| options.reasoning_efforts.contains(effort))
+            })
+        {
+            return Err(invalid_value("defaults/default.yaml", "inference defaults require an LLM model with supported reasoning options".into()));
         }
     }
     configuration.etag.clone_from(&etag);

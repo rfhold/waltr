@@ -145,7 +145,7 @@ The fork helper stores `<fork-direction>\n<exact direction>\n</fork-direction>` 
 
 Routine JavaScript owns category schemas, checkpoint keys, background excerpts, title/fork/compaction policy and media helper arguments. Keep context operations generic. Original history requires declared capability plus independent source authorization, never a Routine name or public metadata. Private approved manage-context evidence binds only its exact normal dispatch.
 
-Resources declare exact capture selections/contracts; declarations grant no helper tool permission. Preflight rejects definite capture denial before speech effects. Normal live Ask consent remains separate. Host authority supplies exact inference attachment capabilities and allowed synthesis choices, not hidden helper profiles.
+Resources declare exact capture selections/contracts; declarations grant no helper tool permission. Preflight rejects definite capture denial before speech effects. Normal live Ask consent remains separate. JavaScript selects inference and speech models from the pinned catalog or operation defaults; verified host encoders bound attachment support.
 
 Persist and verify immutable payloads before SQL references. Keep owner/quota/state publication atomic and uncertainty non-replayable. Migration 0016 refuses populated incompatible Routine state; no converter, body fallback, automatic wipe or orphan collector exists. Embedded object roots remain explicit and outside the workspace. Preserve current namespaces unless exact deletion receives separate authorization.
 

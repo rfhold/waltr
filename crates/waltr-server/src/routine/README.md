@@ -268,7 +268,7 @@ Required media ports fail preflight because these adapters provide no media I/O.
 
 | JavaScript operation | Strict argument shape | Required capabilities |
 | --- | --- | --- |
-| `helper.run` | `{selection,task,capture?,source?,maxTurns,deadlineMs,responseBytes,completionBytes}`, optional callback and fifth-argument payload resource | `helper.run` and exact helper identity |
+| `helper.run` | `{selection,inference?,input?,task,capture?,source?,maxTurns,deadlineMs,responseBytes,completionBytes}`, optional callback and fifth-argument payload resource | `helper.run` and exact helper identity |
 | `tools.execute` | `{target:{server,tool},callId,arguments}` | `tools.execute` and constructor-mapped `tool.<id>` |
 | `tools.schemas` | `{targets:[{server,tool}]}` | `tools.schemas` and each mapped target |
 
@@ -327,7 +327,7 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | JavaScript operation | Behavior |
 | --- | --- |
 | `media.transcribe` | Host-owned STT with ordered append/replace updates and explicit final commitment |
-| `media.collect` | One bounded collection after successful STT; optional host-pinned diarization snapshot |
+| `media.collect` | One bounded collection after successful STT; optional diarized snapshot using the pinned catalog |
 | `media.synthesize` | PCM16LE, 24 kHz, mono from committed text and explicit host-approved speech options |
 | `media.tee` | Host-owned fanout with required-consumer backpressure |
 | `media.upload` | Sequential finite upload; no readable handle before integrity and fixed signature checks |

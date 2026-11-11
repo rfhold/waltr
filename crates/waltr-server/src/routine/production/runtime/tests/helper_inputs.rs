@@ -87,18 +87,9 @@ async fn resource_selected_capture_and_payload_use_assembled_normal_helper() {
         let loader = crate::test_support::default_catalog_loader();
         let config = ConfigService::new(resources, loader.clone()).await.unwrap();
         let state = config.state().clone();
-        let inference = bindings::default_inference(&state.snapshot()).unwrap();
         let persistence = Persistence::initialize(crate::persistence::DatabaseConfig::from_urls(
             &format!("sqlite://{}",root.join("waltr.sqlite3").display()), &format!("sqlite://{}",root.join("mcp.sqlite3").display())).unwrap()).await.unwrap();
-        let authority = RoutineAuthority {
-            recognition:Some(("media-stt".into(),"stream".into())),
-            helper_inputs:vec![crate::routine::production::HelperInputAuthority {
-                provider:inference.provider.key, model:inference.provider.model_id,
-                capabilities:waltr_agent::TransientModelCapabilities {png:false,jpeg:false,webp:false,pdf:false,text:true,max_body_bytes:1048576},
-            }],
-            media_restriction:Some(PermissionPolicy::new(PermissionLevel::Deny).with_tool_rule(PermissionToolSelector::exact("_helper_capture"),PermissionEffect::allow())),
-            ..Default::default()
-        };
+        let authority = RoutineAuthority::default();
         let provider = Arc::new(waltr_agent::provider::openai::OpenAiResponses::new("test").with_url(format!("http://{model_address}/responses")));
         let sessions = SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
         let helper_sessions = sessions.clone();

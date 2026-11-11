@@ -32,6 +32,8 @@ use waltr_agent::{
 use waltr_script::{CallbackRef, Limits, StructuredValue};
 
 const CAPTURE_TOOL: &str = "_helper_capture";
+mod inference;
+pub use inference::{HelperInput, InferenceSelector};
 type OriginGuard = Arc<dyn Fn() -> PortFuture<()> + Send + Sync>;
 
 // Only typed variants enter diagnostics; error messages and opaque host context never do.
@@ -155,7 +157,9 @@ struct OwnerState<S: SessionStore + Clone + Send + Sync + 'static> {
 pub struct CoordinatorHelperRunner<S: SessionStore + Clone + Send + Sync + 'static> {
     sessions: SessionCoordinator<S>,
     factory: Arc<AgentSessionRuntimeFactory>,
-    inference: InferenceSettings,
+    inference: Option<InferenceSettings>,
+    catalog: Option<Arc<crate::resource_catalog::AgentDefinitionSnapshot>>,
+    source_inference: Option<InferenceSettings>,
     restricted: BTreeMap<String, RestrictedHelperProfile>,
     captures: Arc<Mutex<BTreeMap<String, Contract>>>,
     capture_bindings: Arc<Mutex<Option<BTreeMap<String, HelperSelection>>>>,
@@ -183,6 +187,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for CoordinatorHelpe
             sessions: self.sessions.clone(),
             factory: self.factory.clone(),
             inference: self.inference.clone(),
+            catalog: self.catalog.clone(),
+            source_inference: self.source_inference.clone(),
             restricted: self.restricted.clone(),
             captures: self.captures.clone(),
             capture_bindings: self.capture_bindings.clone(),
@@ -213,7 +219,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
     pub fn new(
         sessions: SessionCoordinator<S>,
         factory: Arc<AgentSessionRuntimeFactory>,
-        inference: InferenceSettings,
+        inference: impl Into<Option<InferenceSettings>>,
         restricted: BTreeMap<String, RestrictedHelperProfile>,
         captures: BTreeMap<String, Contract>,
         source: Option<SessionCopy>,
@@ -236,7 +242,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
         Ok(Self {
             sessions,
             factory,
-            inference,
+            inference: inference.into(),
+            catalog: None,
+            source_inference: None,
             restricted,
             captures: Arc::new(Mutex::new(captures)),
             capture_bindings: Arc::new(Mutex::new(None)),
@@ -265,8 +273,15 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_input_models(mut self, models: BTreeMap<(String, String), waltr_agent::TransientModelCapabilities>) -> Self {
         self.input_models = models;
+        self
+    }
+
+    pub(crate) fn with_catalog(mut self, catalog: Arc<crate::resource_catalog::AgentDefinitionSnapshot>, source: Option<InferenceSettings>) -> Self {
+        self.catalog = Some(catalog);
+        self.source_inference = source;
         self
     }
 
@@ -282,6 +297,14 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
 }
 
 impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for CoordinatorHelperRunner<S> {
+    fn select_inference(&self, selector: &InferenceSelector) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
+        let Some(catalog) = &self.catalog else {
+            return if selector.is_default() { Ok(None) } else { Err(PortError::UnsupportedCapability) };
+        };
+        let mut selected = self.clone();
+        selected.inference = Some(selector.resolve(catalog, self.source_inference.as_ref())?);
+        Ok(Some(Arc::new(selected)))
+    }
     fn preflight_captures(&self) -> PortFuture<()> {
         let this = self.clone();
         Box::pin(async move {
@@ -293,17 +316,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                     HelperSelection::Named { name } => {
                         let bundle = this.named.lock().map_err(|_| PortError::Unavailable)?
                             .as_ref().and_then(|named| named.get(name)).cloned().ok_or(PortError::Denied)?;
-                        let provider = match this.inference.provider.api {
-                            waltr_agent::ModelApi::AnthropicMessages => waltr_agent::ProviderId::Anthropic,
-                            _ => waltr_agent::ProviderId::OpenAi,
-                        };
-                        let model = waltr_agent::ModelRef::new(
-                            provider,
-                            this.inference.provider.model_id.clone(),
-                            this.inference.provider.api,
-                        );
                         this.factory
-                            .helper_capture_policy(&bundle, &model)
+                            .helper_capture_policy(&bundle)
                             .map_err(|error| {
                                 helper_failure(
                                     "capture_preflight",
@@ -347,11 +361,16 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
             let inference = match &selection {
                 HelperSelection::Named { name } => {
                     if !this.named.lock().map_err(|_| PortError::Unavailable)?.as_ref().is_some_and(|named| named.contains_key(name)) { return Err(PortError::Denied); }
-                    &this.inference
+                    this.inference.as_ref().ok_or(PortError::Invalid)?
                 }
                 HelperSelection::Restricted { profile } => &this.restricted.get(profile).ok_or(PortError::Denied)?.inference,
             };
-            this.input_models.get(&(inference.provider.key.clone(), inference.provider.model_id.clone())).copied().ok_or(PortError::UnsupportedCapability)
+            if this.catalog.is_some() {
+                // Every supported inference encoder implements UTF-8; image/PDF model support is not catalogued.
+                Ok(waltr_agent::TransientModelCapabilities { png: false, jpeg: false, webp: false, pdf: false, text: true, max_body_bytes: 32 * 1024 * 1024 })
+            } else {
+                this.input_models.get(&(inference.provider.key.clone(), inference.provider.model_id.clone())).copied().ok_or(PortError::UnsupportedCapability)
+            }
         })
     }
     fn run_with_inputs(&self, request: HelperRequest, source: Option<SessionCopy>, payload: Option<HelperPayload>, cancellation: CancellationToken) -> PortFuture<HelperResult> {
@@ -390,7 +409,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                     {
                         return Err(PortError::Denied);
                     }
-                    this.inference.provider.api
+                    this.inference.as_ref().ok_or(PortError::Invalid)?.provider.api
                 }
                 HelperSelection::Restricted { profile } => {
                     let profile = this.restricted.get(&profile).ok_or(PortError::Denied)?;
@@ -433,14 +452,17 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
             }
             let mut pinned = BTreeMap::new();
             for name in names {
-                let bundle = this.factory.bundle_for_agent(&name).map_err(|error| {
+                let bundle = if let Some(catalog) = &this.catalog {
+                    catalog.catalog().resolved(&name).ok_or(PortError::Denied)?;
+                    AgentDefinitionBundle::new(&name, catalog.sources().to_vec())
+                } else { this.factory.bundle_for_agent(&name).map_err(|error| {
                     helper_failure(
                         "pin_named",
                         runtime_category(&error),
                         None,
                         PortError::Denied,
                     )
-                })?;
+                })? };
                 pinned.insert(name, bundle);
             }
             *named = Some(pinned);
@@ -542,7 +564,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                     let identity = bundle.identity();
                     create.agent_definition =
                         Some(serde_json::to_value(bundle).map_err(|_| PortError::Invalid)?);
-                    create.inference_settings = Some(this.inference.clone());
+                    create.inference_settings = Some(this.inference.clone().ok_or(PortError::Invalid)?);
                     (None, identity, request.task)
                 }
                 HelperSelection::Restricted { profile } => {

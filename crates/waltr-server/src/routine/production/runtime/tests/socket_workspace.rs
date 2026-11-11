@@ -1,7 +1,20 @@
 use super::*;
 
 #[tokio::test]
+async fn concurrent_socket_workspace_composition_is_bounded() {
+    let runs = (0..4).map(|_| tokio::task::spawn_blocking(socket_workspace_absent_on_server_runs_production_routines));
+    for result in futures_util::future::join_all(runs).await {
+        result.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn socket_workspace_absent_on_server_runs_production_routines() {
+    if !crate::test_support::isolated_process_test(
+        "routine::production::runtime::tests::socket_workspace::socket_workspace_absent_on_server_runs_production_routines",
+    ) {
+        return;
+    }
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let root = crate::test_support::temp_root();
         let resources = root.join("resources");
