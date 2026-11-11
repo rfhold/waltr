@@ -26,6 +26,8 @@ export type AppState = {
   dictationPreferenceScope?: Accessor<string | undefined>;
   accessOperations: Accessor<AccessOperations | undefined>;
   accessDiagnostic?: Accessor<import("../platform/client").AccessDiagnostic | undefined>;
+  audioFailure?: Accessor<import("../platform/client").AudioFailure | undefined>;
+  dismissAudioFailure?: (diagnosticId: number) => Promise<void>;
   openAuthorizationAttempt: Accessor<((attemptId: string) => Promise<void>) | undefined>;
   openExternalUrl: Accessor<((url: string) => Promise<void>) | undefined>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;

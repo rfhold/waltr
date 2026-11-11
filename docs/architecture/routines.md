@@ -97,6 +97,18 @@ Routine blob storage receives an explicit workspace topology. Local and embedded
 
 Invocation and operation history is authoritative for execution and cleanup. V2 admission uses `routine.v2.start` and `routine.v2.interact` spans. The original owned driver retains its `routine.invocation` span after admission returns; `routine.host_call` spans carry that explicit parent across the script boundary. Incoming trace context is validated and tracestate is cleared at the Routine boundary. Library composition installs no additional global subscriber or exporter. Never include credentials, source, helper inputs/results, native paths or media payloads in diagnostics.
 
+Invocation spans include a bounded Routine name, validated generated invocation ID, outcome, failed stage, and trusted error category.
+Host spans include the invocation ID and an allowlisted host method; unknown methods become `unknown`.
+Engine failure categories come from the interpreter enum before terminal status projection.
+Host early returns record failure, cancellation, or uncertainty; only abandoned spans remain incomplete.
+Failure logs carry fixed stage/category fields under the current trace context.
+Names and identifiers belong in spans or logs, never metric labels.
+
+The causally parented `routine.output_accounting` span records `output_bytes_admitted`, including snapshot output quota admission.
+Retained output resources own this separate span; they do not retain the invocation span.
+Admission precedes queue publication, so failed or abandoned sends can increase this count.
+Zero means no output bytes were admitted; positive values prove neither client receipt nor physical playback.
+
 ## Code
 
 `spec.features: [{codeMode: true}]` opts a normal agent into the optional code tool. The host additionally configures the exact principal, durable session incarnation, profile and normal permission intersection. An absent feature adds no tool. No principal-scoped code adapter is shared globally across callers. Public MCP code exposure remains optional and is not enabled by default.

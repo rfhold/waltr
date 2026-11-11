@@ -399,7 +399,7 @@ impl InvocationService {
         let entry_completion = completion.clone();
         use tracing::Instrument as _;
         let trace = super::telemetry::Operation::new(
-            tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.invocation", outcome = tracing::field::Empty),
+            tracing::info_span!(target: "waltr_server::routine::telemetry", "routine.invocation", routine_name = super::telemetry::routine_name(&definition.envelope().name), invocation_id = super::telemetry::invocation_id(&id), outcome = tracing::field::Empty, failed_stage = tracing::field::Empty, error_category = tracing::field::Empty),
         );
         let task_span = trace.span.clone();
         let task = runtime.spawn(
@@ -420,6 +420,7 @@ impl InvocationService {
                     factory,
                 );
                 if AssertUnwindSafe(work).catch_unwind().await.is_err() {
+                    super::telemetry::failure("invocation", "panic");
                     *completion.outcome.lock().expect("completion mutex") = Some(Outcome {
                         id: task_id,
                         status: None,
@@ -641,6 +642,14 @@ async fn run(
     let prepared = match preflight {
         Ok(host) => host,
         Err(error) => {
+            super::telemetry::failure(
+                "preflight",
+                if cancel.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "admission"
+                },
+            );
             reusable.store(true, Ordering::Release);
             drop(send.send(Err(error)));
             return;
@@ -651,6 +660,7 @@ async fn run(
         gate.maintenance || gate.shutdown
     };
     if cancel.is_cancelled() || stopped {
+        super::telemetry::failure("prepare", "cancelled");
         let clean = prepared.reservation.abort().await.is_ok();
         reusable.store(clean, Ordering::Release);
         if !clean {
@@ -669,6 +679,7 @@ async fn run(
             .as_ref()
             .is_some_and(|snapshot| prepared.snapshot.as_ref() != Some(snapshot))
     {
+        super::telemetry::failure("prepare", "identity");
         let clean = prepared.reservation.abort().await.is_ok();
         reusable.store(clean, Ordering::Release);
         if !clean {
@@ -693,6 +704,14 @@ async fn run(
         gate.maintenance || gate.shutdown
     };
     if preparation.is_err() || cancel.is_cancelled() || stopped {
+        super::telemetry::failure(
+            "prepare",
+            if cancel.is_cancelled() || stopped {
+                "cancelled"
+            } else {
+                "preparation"
+            },
+        );
         let clean = AssertUnwindSafe(prepared.reservation.abort())
             .catch_unwind()
             .await
@@ -742,6 +761,7 @@ async fn run(
         Ok(result) => result,
         Err(_) => {
             // Ambiguous history admission still cannot abandon an acquired pause.
+            super::telemetry::failure("admission", "panic");
             drop(
                 AssertUnwindSafe(prepared.reservation.abort())
                     .catch_unwind()
@@ -758,6 +778,7 @@ async fn run(
         }
     };
     if let Err(error) = admission {
+        super::telemetry::failure("admission", "persistence");
         // A failed commit acknowledgment does not prove absence. Never start a
         // guest after ambiguous admission; reconcile its durable observation.
         let recover = async {
@@ -806,15 +827,18 @@ async fn run(
     let execution = execute(&shared, &id, &definition, input, &cancel, &prepared);
     let (outcome, release) = match AssertUnwindSafe(execution).catch_unwind().await {
         Ok(pair) => pair,
-        Err(_) => (
-            Outcome {
-                id: id.clone(),
-                status: None,
-                result: None,
-                cleanup_complete: false,
-            },
-            false,
-        ),
+        Err(_) => {
+            super::telemetry::failure("execution", "panic");
+            (
+                Outcome {
+                    id: id.clone(),
+                    status: None,
+                    result: None,
+                    cleanup_complete: false,
+                },
+                false,
+            )
+        }
     };
     if release {
         reusable.store(true, Ordering::Release);
@@ -851,6 +875,7 @@ async fn execute(
         .is_ok()
     {
         if cancel.is_cancelled() {
+            super::telemetry::failure("engine_start", "cancelled");
             status = Status::Interrupted;
         } else {
             let host = Arc::new(JournalHost {
@@ -882,6 +907,12 @@ async fn execute(
                         report = &mut joined => report,
                     };
                     cleanup = report.cleanup_complete;
+                    if let Err(error) = &report.result {
+                        super::telemetry::failure(
+                            "engine",
+                            super::telemetry::script_category(*error),
+                        );
+                    }
                     if cancel.is_cancelled() {
                         status = Status::Interrupted;
                     } else if let Ok(value) = report.result {
@@ -898,19 +929,28 @@ async fn execute(
                         {
                             status = Status::Succeeded;
                             result = Some(value.into_json());
+                        } else {
+                            super::telemetry::failure("result_validation", "value");
                         }
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    super::telemetry::failure(
+                        "engine_start",
+                        super::telemetry::script_category(error),
+                    );
                     status = Status::Failed;
                 }
             }
         }
+    } else {
+        super::telemetry::failure("running", "persistence");
     }
     if !entered_engine {
         cleanup = prepared.reservation.abort().await.is_ok();
     }
     if !cleanup || failed.load(Ordering::Acquire) {
+        super::telemetry::failure("cleanup", "cleanup");
         status = Status::Uncertain;
         result = None;
     }
@@ -924,6 +964,7 @@ async fn execute(
         false
     };
     if !finalized {
+        super::telemetry::failure("finalize", "cleanup");
         status = Status::Uncertain;
         result = None;
     }
@@ -932,6 +973,9 @@ async fn execute(
         .terminal(id.into(), status, result.clone(), shared.clock.now_ms())
         .await
         .ok();
+    if durable.is_none() {
+        super::telemetry::failure("terminal", "persistence");
+    }
     let outcome = Outcome {
         id: id.into(),
         status: durable,
@@ -966,10 +1010,13 @@ impl HostDispatcher for JournalHost {
         let cancel = self.cancel.clone();
         use tracing::Instrument as _;
         let trace = self.trace.with_subscriber(|(_, dispatcher)| {
-            tracing::dispatcher::with_default(dispatcher, || super::telemetry::Operation::new(tracing::info_span!(target: "waltr_server::routine::telemetry", parent: &self.trace, "routine.host_call", outcome = tracing::field::Empty)))
+            tracing::dispatcher::with_default(dispatcher, || super::telemetry::Operation::new(tracing::info_span!(target: "waltr_server::routine::telemetry", parent: &self.trace, "routine.host_call", invocation_id = super::telemetry::invocation_id(&self.id), host_method = super::telemetry::host_method(&request.operation), outcome = tracing::field::Empty, failed_stage = tracing::field::Empty, error_category = tracing::field::Empty)))
         }).unwrap_or_else(|| super::telemetry::Operation::new(tracing::Span::none()));
         let span = trace.span.clone();
         Box::pin(async move {
+            let mut stage = "admission";
+            let mut dispatch_error = None;
+            let work = AssertUnwindSafe(async {
             if cancel.is_cancelled() {
                 return Err(waltr_script::Error::Cancelled);
             }
@@ -1001,6 +1048,7 @@ impl HostDispatcher for JournalHost {
                 updated_ms: clock.now_ms(),
             };
             let id = operation.id.clone();
+            stage = "dispatch_intent";
             if store.dispatch_intent(operation).await.is_err() {
                 failed.store(true, Ordering::Release);
                 cancel.cancel();
@@ -1010,11 +1058,13 @@ impl HostDispatcher for JournalHost {
                 return Err(waltr_script::Error::Cancelled);
             }
             let name = request.operation.clone();
+            stage = "dispatch";
             let reply = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(waltr_script::Error::Cancelled),
                 reply = async { inner.dispatch(request, context).await } => reply,
             };
+            dispatch_error = reply.as_ref().err().copied();
             let (status, result) = match &reply {
                 Ok(value) => match policy.project_result(&name, value) {
                     Ok(projection)
@@ -1032,6 +1082,7 @@ impl HostDispatcher for JournalHost {
                 },
                 Err(_) => (OperationStatus::Uncertain, None),
             };
+            if dispatch_error.is_none() { stage = "acknowledgment"; }
             if store
                 .operation_done(id, status, result, clock.now_ms())
                 .await
@@ -1042,8 +1093,27 @@ impl HostDispatcher for JournalHost {
                 cancel.cancel();
                 return Err(waltr_script::Error::Cleanup);
             }
-            trace.outcome(if reply.is_ok() { "success" } else { "failure" });
             reply
+            }).catch_unwind().await;
+            match work {
+                Ok(reply) => {
+                    if let Err(error) = &reply {
+                        super::telemetry::failure(stage, super::telemetry::script_category(dispatch_error.unwrap_or(*error)));
+                    }
+                    trace.outcome(match &reply {
+                        Ok(_) => "success",
+                        Err(waltr_script::Error::Cancelled) => "cancelled",
+                        Err(waltr_script::Error::Cleanup) => "uncertain",
+                        Err(_) => "failure",
+                    });
+                    reply
+                }
+                Err(panic) => {
+                    super::telemetry::failure(stage, "panic");
+                    trace.outcome("failure");
+                    std::panic::resume_unwind(panic)
+                }
+            }
         }.instrument(span))
     }
     fn cleanup(&self, invocation: InvocationId) -> CleanupFuture {
@@ -1064,5 +1134,9 @@ pub(crate) fn bounded_projection(value: &Value) -> Result<(), PortError> {
 }
 
 #[cfg(test)]
-#[path = "service/tests.rs"]
-mod tests;
+mod tests {
+    include!("service/tests.rs");
+    mod diagnostics {
+        include!("service/diagnostics_tests.rs");
+    }
+}

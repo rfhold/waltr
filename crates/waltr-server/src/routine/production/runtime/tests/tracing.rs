@@ -68,9 +68,9 @@ fn register<S: waltr_agent::SessionStore + Clone + 'static>(
 fn seed_trace(root: &std::path::Path) {
     seed(root);
     let value = serde_json::json!({"apiVersion":"waltr.routine/v1","kind":"Routine","name":"trace-probe","description":"Trace ownership fixture","spec":{
-        "source":"export default async function () { return (await host.call('helper.run', {selection:{kind:'named',name:'routine-title'},task:'SECRET_TRACE_INPUT',maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536})).result.response; }",
+        "source":"export default async function (input) { const response = (await host.call('helper.run', {selection:{kind:'named',name:'routine-title'},task:'SECRET_TRACE_INPUT',maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536})).result.response; if(input) throw new Error('SECRET_SCRIPT_ERROR'); return response; }",
         "entrypoints":{"run":{"trigger":"manual"}},"capabilities":["helper.run","helper.named.routine-title"],
-        "parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"null"}},
+        "parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"boolean"}},
         "result":{"schemaVersion":"waltr.value/v1","schema":{"type":"string","maxLength":64}}
     }});
     std::fs::write(
@@ -108,7 +108,9 @@ async fn exercise_trace(
         .unwrap();
     let valid = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
     for browser in [false, true] {
-        for cancel in [false, true] {
+        for mode in ["success", "cancel", "script_failure"] {
+            let cancel = mode == "cancel";
+            let script_failure = mode == "script_failure";
             for (parent, duplicate) in [
                 (Some(valid), false),
                 (None, false),
@@ -136,7 +138,11 @@ async fn exercise_trace(
                     revision: definition.revision.clone(),
                     entrypoint: "run".into(),
                     parameters: Some(p::StructuredValue {
-                        json: b"null".to_vec(),
+                        json: if script_failure {
+                            b"true".to_vec()
+                        } else {
+                            b"false".to_vec()
+                        },
                     }),
                     ..Default::default()
                 };
@@ -247,12 +253,13 @@ async fn exercise_trace(
                                 .into_inner()
                                 .invocation
                                 .unwrap();
-                            assert_ne!(
-                                detail.status,
-                                p::InvocationStatus::Failed as i32,
+                            assert!(
+                                script_failure
+                                    || detail.status != p::InvocationStatus::Failed as i32,
                                 "unexpected trace fixture failure: {detail:?}"
                             );
-                            if detail.status == p::InvocationStatus::Succeeded as i32
+                            if detail.status == p::InvocationStatus::Failed as i32
+                                || detail.status == p::InvocationStatus::Succeeded as i32
                                 || detail.status == p::InvocationStatus::Uncertain as i32
                                 || detail.status == p::InvocationStatus::Interrupted as i32
                             {
@@ -314,6 +321,38 @@ async fn exercise_trace(
                     .unwrap();
                 assert_eq!(invocation.parent_span_id, rpc_id);
                 assert_eq!(host.parent_span_id, invocation.span_context.span_id());
+                assert!(
+                    invocation
+                        .attributes
+                        .iter()
+                        .any(|field| field.key.as_str() == "routine_name"
+                            && field.value.as_str() == "trace-probe")
+                );
+                assert!(invocation.attributes.iter().any(|field| field.key.as_str()
+                    == "invocation_id"
+                    && field.value.as_str() == id));
+                if script_failure {
+                    for (key, value) in [
+                        ("outcome", "failure"),
+                        ("failed_stage", "engine"),
+                        ("error_category", "script"),
+                    ] {
+                        assert!(
+                            invocation
+                                .attributes
+                                .iter()
+                                .any(|field| field.key.as_str() == key
+                                    && field.value.as_str() == value),
+                            "missing {key}={value}"
+                        );
+                    }
+                    assert!(
+                        host.attributes
+                            .iter()
+                            .any(|field| field.key.as_str() == "outcome"
+                                && field.value.as_str() == "success")
+                    );
+                }
                 for span in [invocation, host] {
                     assert_eq!(span.span_context.trace_id(), trace_id);
                     assert_eq!(span.span_context.trace_state().header(), "");
@@ -324,7 +363,7 @@ async fn exercise_trace(
                     "SECRET_TRACE_RESULT",
                     "SECRET_BAGGAGE",
                     "secret=value",
-                    "trace-probe",
+                    "SECRET_SCRIPT_ERROR",
                 ] {
                     assert!(!diagnostic.contains(secret), "trace leaked {secret}");
                 }
@@ -342,7 +381,7 @@ async fn exercise_trace(
                 revision: definition.revision.clone(),
                 entrypoint: "run".into(),
                 parameters: Some(p::StructuredValue {
-                    json: b"true".to_vec(),
+                    json: b"1".to_vec(),
                 }),
                 ..Default::default()
             }),

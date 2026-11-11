@@ -27,6 +27,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
   const [accessDiagnostic, setAccessDiagnostic] = createSignal<import("../platform/client").AccessDiagnostic>();
+  const [audioFailure, setAudioFailure] = createSignal<import("../platform/client").AudioFailure>();
   const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Extract<ClientCommand, { type: "beginAuth" }>["target"]>();
   const [presentedAuthAttemptId, setPresentedAuthAttemptId] = createSignal<string>();
   const [ignoredPresentedAttemptId, setIgnoredPresentedAttemptId] = createSignal<string>();
@@ -106,6 +107,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
       publishSnapshot(snapshot, setSnapshot, operationWaiters);
     });
     const unsubscribeDiagnostic = client.accessDiagnostic?.subscribe(setAccessDiagnostic);
+    const unsubscribeAudioFailure = client.audioFailure?.subscribe(setAudioFailure);
     let cancelled = false;
 
     void client.start().catch((error) => {
@@ -119,6 +121,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
       cancelled = true;
       unsubscribe();
       unsubscribeDiagnostic?.();
+      unsubscribeAudioFailure?.();
+      setAudioFailure(undefined);
       setAccessDiagnostic(undefined);
       void client.dispose();
     });
@@ -408,6 +412,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         dictationPreferenceScope: () => clientAdapter()?.dictationPreferenceScope,
         accessOperations: () => clientAdapter()?.access,
         accessDiagnostic,
+        audioFailure,
+        dismissAudioFailure: async (diagnosticId) => { await clientAdapter()?.audioFailure?.dismiss(diagnosticId); },
         openAuthorizationAttempt: () => clientAdapter()?.openAuthorizationAttempt,
         openExternalUrl: () => clientAdapter()?.openExternalUrl,
         dispatch,

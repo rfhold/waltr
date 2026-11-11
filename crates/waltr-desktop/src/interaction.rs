@@ -507,6 +507,21 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
     }
     Ok(output)
 }
+fn diagnostic_invocation(id: &str) -> Option<[u8; 36]> {
+    let bytes: [u8; 36] = id.as_bytes().try_into().ok()?;
+    bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+        .then_some(bytes)
+}
+
 fn acceptance_timeout(observer: &Observer) -> Error {
     observer.emit(Diagnostic::RpcFailure(RpcFailure::AcceptanceTimeout));
     Error::Interaction
@@ -546,8 +561,28 @@ async fn duplex(
     let receive = async {
         let mut accepted = Some(accepted);
         let mut invocation = None;
+        let mut selected_streams = std::collections::HashSet::new();
         while let Some(event) = session.output.next().await {
             let event = event.map_err(|error| rpc(observer, &error, RpcFailure::Output))?;
+            if let InteractionEvent::Accepted { invocation_id } = &event {
+                if let Some(id) = diagnostic_invocation(invocation_id) {
+                    observer.emit(Diagnostic::AcceptedInvocation(id));
+                }
+            }
+            match &event {
+                InteractionEvent::Open(open) if open.port == selection.output => {
+                    selected_streams.insert(open.stream_id.clone());
+                }
+                InteractionEvent::Chunk(chunk) if selected_streams.contains(&chunk.stream_id) => {
+                    let bytes = match &chunk.payload {
+                        Some(wire::stream_chunk::Payload::Audio(bytes)) => bytes.len(),
+                        Some(wire::stream_chunk::Payload::Text(revision)) => revision.text.len(),
+                        None => 0,
+                    };
+                    observer.emit(Diagnostic::OutputBytesReceived(bytes as u64));
+                }
+                _ => {}
+            }
             guard.check().map_err(|_| Error::Cancelled)?;
             if let InteractionEvent::Accepted { invocation_id } = &event {
                 invocation = Some(invocation_id.clone());

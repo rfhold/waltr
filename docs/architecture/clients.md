@@ -571,6 +571,16 @@ The literal v2 RPC catalog uses `routine.Interact` and the finite attachment ope
 Validated remote failure, interruption, and rejection remain distinct from invalid selected output; opaque stream errors retain their observed RPC boundary without parsing messages.
 Primary and cleanup categories remain separate, including when the same capture worker error supplies both. Cleanup-only failures do not become primary failures.
 Process-local numeric diagnostic identifiers never copy IPC or configuration identifiers.
+
+Native hold and chat-audio completion publish the latest bounded audio failure through the existing ordered bridge.
+The in-app alert shows a fixed message and the process-local diagnostic ID, with an explicit dismiss action.
+The alert survives ordinary state updates and cancellation; dismissal or a later successful audio operation clears it.
+Generation replacement clears the alert and rejects completions from the previous generation.
+This state remains separate from shared server snapshots, OS notifications, and the transient tray error indicator.
+No transcript, prompt, audio, credential, or raw backend error enters the alert.
+Native spans and finished logs include a validated Accepted UUID when available.
+`bytes_received` sums validated selected-output chunk payload bytes, including text revisions, before consumer effects.
+It excludes framing, unselected ports, and blob descriptors; it proves neither native effect completion nor physical playback.
 The desktop observer defaults to no-op and does not expand either exporter target allowlist.
 See [native audio diagnostics](../runbooks/telemetry-smoke.md#native-audio-diagnostics) for exact fields, milestone semantics, privacy limits, and artifact requirements.
 

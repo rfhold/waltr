@@ -557,6 +557,15 @@ async fn start_runtime(
 }
 
 #[tauri::command]
+fn dismiss_audio_failure(
+    generation: u64,
+    diagnostic_id: u64,
+    bridge: State<'_, Arc<RuntimeBridge>>,
+) -> Result<(), String> {
+    bridge.dismiss_audio_failure(generation, diagnostic_id)
+}
+
+#[tauri::command]
 async fn client_dispatch(
     generation: u64,
     command: ClientCommand,
@@ -1167,6 +1176,7 @@ pub fn run() {
             start_access_login,
             logout_access,
             client_dispatch,
+            dismiss_audio_failure,
             client_state,
             dispose_runtime,
             open_external_url,

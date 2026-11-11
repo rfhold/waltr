@@ -5,6 +5,7 @@ import { acceptNativeAppsBootstrap } from "../mcp-apps/policy";
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 import type {
   AccessDiagnostic,
+  AudioFailure,
   ClientAdapter,
   ClientSnapshotListener,
 } from "./client";
@@ -30,7 +31,8 @@ type BridgeRecovery = {
 type BridgePayload =
   | { type: "state"; snapshot: ClientSnapshot }
   | { type: "platform"; startup: unknown }
-  | { type: "access"; diagnostic: AccessDiagnostic };
+  | { type: "access"; diagnostic: AccessDiagnostic }
+  | { type: "audioFailure"; failure: AudioFailure | null };
 
 type BridgeStartupState =
   | "starting"
@@ -71,6 +73,12 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   let eventQueue = Promise.resolve();
   const pendingEvents: BridgeEvent[] = [];
   const snapshotListeners = new Set<ClientSnapshotListener>();
+  let audioFailure: AudioFailure | undefined;
+  const audioFailureListeners = new Set<(failure: AudioFailure | undefined) => void>();
+  const publishAudioFailure = (failure: AudioFailure | undefined) => {
+    audioFailure = failure;
+    for (const listener of audioFailureListeners) listener(failure);
+  };
   let accessDiagnostic: AccessDiagnostic | undefined;
   const diagnosticListeners = new Set<(diagnostic: AccessDiagnostic | undefined) => void>();
   const publishDiagnostic = (diagnostic: AccessDiagnostic | undefined) => {
@@ -87,6 +95,10 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     sequence = event.sequence;
     if (event.payload.type === "state") {
       publishSnapshot(event.payload.snapshot);
+    } else if (event.payload.type === "audioFailure") {
+      const failure = event.payload.failure;
+      publishAudioFailure(failure && Number.isSafeInteger(failure.diagnosticId) && failure.diagnosticId > 0 && ["remote_failed", "permission", "login_required", "audio_failed"].includes(failure.category)
+        ? { diagnosticId: failure.diagnosticId, category: failure.category } : undefined);
     } else if (event.payload.type === "access") {
       publishDiagnostic({
         restoring: event.payload.diagnostic?.restoring === true,
@@ -126,6 +138,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
       if (!resumesFreshGeneration) return;
       dictation?.dispose();
       publishDiagnostic(undefined);
+      publishAudioFailure(undefined);
       generation = event.generation;
       media = mediaFor(generation);
       dictation = dictationSupported ? nativeDictation(api.invoke, generation) : undefined;
@@ -210,6 +223,8 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     snapshotListeners.clear();
     publishDiagnostic(undefined);
     diagnosticListeners.clear();
+    publishAudioFailure(undefined);
+    audioFailureListeners.clear();
     if (generation !== undefined) await api.invoke("dispose_runtime", { generation });
   };
 
@@ -239,6 +254,19 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         diagnosticListeners.add(listener);
         listener(accessDiagnostic);
         return () => diagnosticListeners.delete(listener);
+      },
+    },
+    audioFailure: {
+      subscribe: (listener) => {
+        audioFailureListeners.add(listener);
+        listener(audioFailure);
+        return () => audioFailureListeners.delete(listener);
+      },
+      dismiss: async (diagnosticId) => {
+        if (disposed || generation === undefined) return;
+        const requestedGeneration = generation;
+        await api.invoke("dismiss_audio_failure", { generation, diagnosticId });
+        if (!disposed && generation === requestedGeneration && audioFailure?.diagnosticId === diagnosticId) publishAudioFailure(undefined);
       },
     },
     access: serverId && serverId !== "local" ? {

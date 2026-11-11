@@ -53,6 +53,7 @@ impl waltr_desktop::typing::Factory for NeverTyping {
 fn host() -> Arc<Host> {
     let host = Arc::new(Host::default());
     host.bind(1);
+    host.audio.activity.bind(1);
     host.access(true);
     host.audio.observe(&support::snapshot("test"));
     host
@@ -146,7 +147,7 @@ fn native_audio_lifecycle_telemetry_uses_only_fixed_categories() {
             .unwrap()
             .block_on(async {
                 let (transport, _fake, stop, server) = fixture().await;
-                for case in 0..9 {
+                for case in 0..10 {
                     let host = host();
                     let backend: Arc<dyn PermissionBackend> = if case == 3 {
                         Arc::new(Deny)
@@ -163,10 +164,11 @@ fn native_audio_lifecycle_telemetry_uses_only_fixed_categories() {
                         5 => "remote-failed",
                         6 => "remote-interrupted",
                         7 => "remote-rejected",
+                        9 => "malicious-id",
                         _ => "SECRET_CONFIG_SENTINEL",
                     };
                     let operation = job(&host, 1, name);
-                    if case == 0 || case == 8 {
+                    if case == 0 || case == 8 || case == 9 {
                         host.control(1, 1, "finish").unwrap();
                     }
                     if case == 4 {
@@ -179,6 +181,16 @@ fn native_audio_lifecycle_telemetry_uses_only_fixed_categories() {
                             Arc::new(MockFactory(source.clone())),
                         )
                         .await;
+                    let failure = *host.audio.activity.failures().borrow();
+                    if case == 5 {
+                        assert_eq!(
+                            failure.expect("chat failure must be visible").category,
+                            "remote_failed"
+                        );
+                    }
+                    if matches!(case, 0 | 4 | 8 | 9) {
+                        assert_eq!(failure, None);
+                    }
                     assert!(host.audio.gate.reserve().is_ok());
                     if case < 3 {
                         assert!(source.joined.load(Ordering::SeqCst));
@@ -224,7 +236,18 @@ fn native_audio_lifecycle_telemetry_uses_only_fixed_categories() {
         .iter()
         .filter(|span| span.name == "native.audio.operation")
         .collect();
-    assert_eq!(operations.len(), 12);
+    assert_eq!(operations.len(), 13);
+    assert!(operations.iter().any(|span| {
+        span.attributes.iter().any(|field| {
+            field.key.as_str() == "bytes_received"
+                && field.value.to_string() == "SECRET_TRANSCRIPT_SENTINEL".len().to_string()
+        })
+    }));
+    assert!(operations.iter().any(|span| {
+        span.attributes
+            .iter()
+            .any(|field| field.key.as_str() == "bytes_received" && field.value.to_string() == "0")
+    }));
     for category in [
         "capture_callback_pool_exhausted",
         "capture_callback_queue_full",
@@ -279,6 +302,8 @@ fn native_audio_lifecycle_telemetry_uses_only_fixed_categories() {
             && child.span_context.trace_id() == parent.span_context.trace_id()));
     }
     let diagnostic = format!("{emitted:?} {exported:?}");
+    assert!(diagnostic.contains("01234567-89ab-4cde-8fab-0123456789ab"));
+    assert!(diagnostic.contains("bytes_received"));
     for expected in [
         "succeeded",
         "capture_host_overflow",
@@ -309,10 +334,47 @@ fn native_audio_lifecycle_telemetry_uses_only_fixed_categories() {
             .iter()
             .filter(|log| format!("{log:?}").contains("native.audio.finished"))
             .count(),
-        12
+        13
     );
     drop(logger.shutdown());
     drop(tracer.shutdown());
+}
+
+#[tokio::test]
+async fn chat_audio_failure_survives_cancellation_and_clears_after_success() {
+    let (transport, _fake, stop, server) = fixture().await;
+    let host = host();
+    let permissions = AudioPermissions::new(1, true, Arc::new(Grant));
+    for (operation, name, cancel) in [
+        (1, "remote-failed", false),
+        (2, "test", true),
+        (3, "test", false),
+    ] {
+        let task = job(&host, operation, name);
+        if operation > 1 {
+            host.control(1, operation, if cancel { "cancel" } else { "finish" })
+                .unwrap();
+        }
+        task.run(
+            &transport,
+            &permissions,
+            Arc::new(MockFactory(Arc::new(Mock::default()))),
+        )
+        .await;
+        let failure = *host.audio.activity.failures().borrow();
+        if operation < 3 {
+            assert_eq!(
+                failure
+                    .expect("latest chat failure must remain visible")
+                    .category,
+                "remote_failed"
+            );
+        } else {
+            assert_eq!(failure, None);
+        }
+    }
+    stop.cancel();
+    server.await.unwrap();
 }
 
 #[test]

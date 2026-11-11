@@ -214,10 +214,13 @@ impl Held {
         typing: &dyn waltr_desktop::typing::Factory,
     ) {
         let diagnostics = self.diagnostics.clone();
+        let activity = self.host.activity.clone();
+        let generation = self.generation;
         self.run_inner(transport, permissions, factory, typing)
             .instrument(diagnostics.span())
             .await;
         diagnostics.finish();
+        activity.complete(generation, diagnostics.completion());
     }
 
     async fn run_inner<T: RoutineInteractionTransport>(

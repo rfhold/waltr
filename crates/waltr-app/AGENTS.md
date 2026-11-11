@@ -92,6 +92,9 @@ Use `ActivityTracker::begin` for each admitted client hook operation.
 Retain its lease through permission, RPC, output actions, and complete cleanup.
 Mark failures explicitly; ordinary cancellation is not an error.
 Keep activity text-free and independent of server-wide Routine history or WebView state.
+Keep the latest bounded audio failure generation-scoped through the ordered bridge; expose only fixed categories and a process-local diagnostic ID.
+Preserve explicit dismissal, success clearing, and the existing transient tray behavior. Never export diagnostic IDs as metric labels.
+Publish only validated Accepted UUIDs and selected-stream payload receipt counts in native spans and finished logs, never metric labels.
 Keep the tray optional and its menu limited to status, Open Waltr, and Quit.
 Preserve normal window-close and exit behavior.
 See [external text](../../docs/architecture/clients.md#live-external-text) and [platform prerequisites](../../docs/deployment.md#desktop-tray-and-external-text) for canonical constraints.

@@ -63,6 +63,9 @@ pub enum BridgePayload {
     Access {
         diagnostic: AccessDiagnostic,
     },
+    AudioFailure {
+        failure: Option<crate::activity::AudioFailure>,
+    },
 }
 
 /// Adapter-only diagnostic flags; arbitrary provider and operating-system text stays native.
@@ -167,6 +170,7 @@ struct RecoveryState<T> {
     generation: u64,
     latest_state: Option<BridgeEvent<T>>,
     latest_access: Option<BridgeEvent<T>>,
+    latest_audio: Option<BridgeEvent<T>>,
     controls: VecDeque<BridgeEvent<T>>,
 }
 
@@ -176,6 +180,7 @@ impl<T> RecoveryState<T> {
             generation,
             latest_state: None,
             latest_access: None,
+            latest_audio: None,
             controls: VecDeque::with_capacity(CHANNEL_CAPACITY),
         }
     }
@@ -1134,6 +1139,13 @@ impl RuntimeBridge {
         ))
     }
 
+    pub(crate) fn dismiss_audio_failure(&self, generation: u64, diagnostic_id: u64) -> Result<(), String> {
+        self.with_current(generation, || {
+            self.audio.activity.dismiss(generation, diagnostic_id);
+            Ok(())
+        })
+    }
+
     /// Invalidate and synchronously dispose the active client generation.
     pub fn stop(&self) {
         let span = observability::operation_span("bridge.generation.stop", "native_thread");
@@ -1685,6 +1697,8 @@ async fn run_connected_generation(
         })
         .unwrap_or_default();
     audio.credentials(credentials.clone());
+    audio.audio.activity.bind(publisher.generation);
+    let mut audio_failures = audio.audio.activity.failures();
     audio.audio.observe(&stream.snapshot());
     audio_access(
         &audio,
@@ -1728,6 +1742,13 @@ async fn run_connected_generation(
         }
         tokio::select! {
             _ = stop.changed() => break ConnectedExit::Stopped,
+            changed = audio_failures.changed() => {
+                if changed.is_err() { break ConnectedExit::Stopped; }
+                let failure = *audio_failures.borrow_and_update();
+                if let Some(event) = publisher.publish_control(BridgePayload::AudioFailure { failure }).await {
+                    publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_audio = Some(event);
+                }
+            }
             _ = audio_tasks.join_next(), if !audio_tasks.is_empty() => {},
             _ = media_tasks.join_next(), if !media_tasks.is_empty() => {},
             changed = platform.changed() => {
@@ -2054,7 +2075,7 @@ fn recovery_after<T: Clone>(
         .filter(|event| after_sequence.is_none_or(|sequence| event.sequence > sequence))
         .cloned()
         .collect::<Vec<_>>();
-    for state in [&recovery.latest_state, &recovery.latest_access]
+    for state in [&recovery.latest_state, &recovery.latest_access, &recovery.latest_audio]
         .into_iter()
         .flatten()
     {
@@ -2079,6 +2100,39 @@ mod logout_tests;
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn audio_failure_same_generation_rebind_recovers_and_dismisses() {
+        use crate::{activity::{ActivityTracker, AudioFailure}, native_audio_telemetry::Completion};
+        let tracker = ActivityTracker::default();
+        tracker.bind(7);
+        let active = Arc::new(AtomicU64::new(7));
+        let recovery = Arc::new(RwLock::new(RecoveryState::new(7)));
+        let (mut publisher, _feed) = Publisher::new(active, 7, Arc::clone(&recovery));
+        publisher.publish_initial(BridgePayload::AudioFailure { failure: None }).await;
+        let mut receiver = tracker.failures();
+        let failure = AudioFailure { diagnostic_id: 42, category: "remote_failed" };
+        tracker.complete(7, Completion::Failed(failure));
+        receiver.changed().await.unwrap();
+        let event = publisher.publish_control(BridgePayload::AudioFailure { failure: *receiver.borrow_and_update() }).await.unwrap();
+        let failure_sequence = event.sequence;
+        recovery.write().unwrap().latest_audio = Some(event);
+        drop(receiver);
+        tracker.bind(7);
+        let mut receiver = tracker.failures();
+        assert_eq!(*receiver.borrow(), Some(failure));
+        assert!(!receiver.has_changed().unwrap());
+        recovery.write().unwrap().controls.clear();
+        let recovered = recovery_after(&recovery.read().unwrap(), 7, None);
+        assert!(recovered.events.iter().any(|event| matches!(&event.payload, BridgePayload::AudioFailure { failure: Some(current) } if *current == failure)));
+        tracker.dismiss(7, 42);
+        receiver.changed().await.unwrap();
+        let event = publisher.publish_control(BridgePayload::AudioFailure { failure: *receiver.borrow_and_update() }).await.unwrap();
+        recovery.write().unwrap().latest_audio = Some(event);
+        recovery.write().unwrap().controls.clear();
+        let recovered = recovery_after(&recovery.read().unwrap(), 7, Some(failure_sequence));
+        assert!(recovered.events.iter().any(|event| matches!(&event.payload, BridgePayload::AudioFailure { failure: None })));
+    }
 
     #[test]
     fn access_diagnostic_is_bounded_and_warning_survives_success() {
@@ -2191,6 +2245,7 @@ mod tests {
                 payload: "old",
             }),
             latest_access: None,
+            latest_audio: None,
             controls: VecDeque::new(),
         };
         let recovered = recovery_after(&recovery, 5, None);

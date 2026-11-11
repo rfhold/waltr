@@ -34,6 +34,86 @@ impl Operation {
     }
 }
 
+pub(crate) fn failure(stage: &'static str, category: &'static str) {
+    let span = tracing::Span::current();
+    span.record("failed_stage", stage);
+    span.record("error_category", category);
+    tracing::warn!(target: "waltr_server::routine::telemetry", failed_stage = stage, error_category = category, "Routine stage failed");
+}
+
+pub(crate) fn script_category(error: waltr_script::Error) -> &'static str {
+    use waltr_script::Error::*;
+    match error {
+        Invalid => "invalid",
+        Syntax => "syntax",
+        Script => "script",
+        Value => "value",
+        Limit => "limit",
+        Busy => "busy",
+        Cancelled => "cancelled",
+        Deadline => "deadline",
+        Fuel => "fuel",
+        Memory => "memory",
+        Denied => "denied",
+        Identity => "identity",
+        Protocol => "protocol",
+        Panic => "panic",
+        Cleanup => "cleanup",
+        Shutdown => "shutdown",
+    }
+}
+
+pub(crate) fn host_method(method: &str) -> &'static str {
+    match method {
+        "helper.run" => "helper.run",
+        "tools.execute" => "tools.execute",
+        "tools.schemas" => "tools.schemas",
+        "context.snapshot" => "context.snapshot",
+        "context.history" => "context.history",
+        "context.original" => "context.original",
+        "context.metadata" => "context.metadata",
+        "context.transact" => "context.transact",
+        "context.create" => "context.create",
+        "context.start" => "context.start",
+        "context.continue" => "context.continue",
+        "children.call" => "children.call",
+        "media.collect" => "media.collect",
+        "media.read" => "media.read",
+        "media.select" => "media.select",
+        "media.publish" => "media.publish",
+        "media.finish" => "media.finish",
+        "media.emit" => "media.emit",
+        "media.upload" => "media.upload",
+        "media.tee" => "media.tee",
+        "media.lease" => "media.lease",
+        "media.synthesize" => "media.synthesize",
+        "media.transcribe" => "media.transcribe",
+        "media.proposal.read" => "media.proposal.read",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn invocation_id(id: &str) -> &str {
+    if uuid::Uuid::parse_str(id).is_ok_and(|id_value| id_value.to_string() == id) {
+        id
+    } else {
+        "unknown"
+    }
+}
+
+pub(crate) fn routine_name(name: &str) -> &str {
+    if !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        name
+    } else {
+        "unknown"
+    }
+}
+
 /// Fixed, content-free stages shared by access authentication and interaction admission.
 #[derive(Clone, Copy)]
 pub(crate) enum AdmissionStage {
@@ -254,6 +334,105 @@ pub(crate) fn isolated_exporter_test(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_output_accounting_does_not_retain_invocation_span() {
+        if !isolated_exporter_test(
+            "routine::telemetry::tests::retained_output_accounting_does_not_retain_invocation_span",
+        ) {
+            return;
+        }
+        use crate::routine::media::stream::{Chunk, Direction, Format, Limits, Pool, Streams};
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    for bytes in [0, 2] {
+                        exporter.reset();
+                        let parent = tracing::info_span!("routine.invocation");
+                        let streams = parent.in_scope(|| {
+                            Streams::new(
+                                Limits::default(),
+                                Pool::new(8 * 1024 * 1024).unwrap(),
+                                Pool::new(8 * 1024 * 1024).unwrap(),
+                                tokio_util::sync::CancellationToken::new(),
+                            )
+                            .unwrap()
+                        });
+                        drop(parent);
+                        let spans = exporter.get_finished_spans().unwrap();
+                        let parent = spans
+                            .iter()
+                            .find(|span| span.name == "routine.invocation")
+                            .expect("retained resources must not retain invocation");
+                        let parent_id = parent.span_context.span_id();
+                        assert!(
+                            !spans
+                                .iter()
+                                .any(|span| span.name == "routine.output_accounting")
+                        );
+                        if bytes > 0 {
+                            let (mut writer, reader) = streams
+                                .open(
+                                    Direction::Output,
+                                    Format::Pcm16Le {
+                                        rate: 24000,
+                                        channels: 1,
+                                    },
+                                    false,
+                                )
+                                .unwrap();
+                            writer
+                                .write(writer.key(), Chunk::Audio(vec![0; bytes]))
+                                .await
+                                .unwrap();
+                            drop(reader);
+                            drop(writer);
+                        }
+                        drop(streams);
+                        let spans = exporter.get_finished_spans().unwrap();
+                        let accounting = spans
+                            .iter()
+                            .find(|span| span.name == "routine.output_accounting")
+                            .unwrap();
+                        assert_eq!(accounting.parent_span_id, parent_id);
+                        assert!(
+                            accounting
+                                .attributes
+                                .iter()
+                                .any(|field| field.key.as_str() == "output_bytes_admitted"
+                                    && field.value.as_str() == bytes.to_string())
+                        );
+                    }
+                });
+        });
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn diagnostics_identifiers_and_categories_are_bounded() {
+        assert_eq!(host_method("media.synthesize"), "media.synthesize");
+        assert_eq!(host_method("SECRET_METHOD"), "unknown");
+        assert_eq!(routine_name("audio-ask-and-speak"), "audio-ask-and-speak");
+        assert_eq!(routine_name("SECRET https://private.invalid"), "unknown");
+        assert_eq!(routine_name(&"x".repeat(129)), "unknown");
+        let id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(invocation_id(&id), id);
+        assert_eq!(invocation_id("SECRET_INVOCATION"), "unknown");
+        assert_eq!(script_category(waltr_script::Error::Script), "script");
+        assert_eq!(script_category(waltr_script::Error::Panic), "panic");
+    }
 
     #[test]
     fn admission_stage_exports_success_failure_and_dropped_wait() {

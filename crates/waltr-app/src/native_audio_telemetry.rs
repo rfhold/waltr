@@ -25,6 +25,8 @@ struct Inner {
     snapshot: Mutex<State>,
 }
 struct State {
+    invocation_id: Option<[u8; 36]>,
+    bytes_received: u64,
     seen: u16,
     stage: &'static str,
     primary: &'static str,
@@ -33,6 +35,12 @@ struct State {
     typing_cleanup: &'static str,
     rpc: Option<(&'static str, &'static str)>,
     terminal: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum Completion {
+    Failed(crate::activity::AudioFailure),
+    Succeeded,
+    Unchanged,
 }
 pub fn admission(entrypoint: &'static str, outcome: &'static str) {
     tracing::event!(target: TARGET, tracing::Level::INFO, { event.name = "native.audio.admission", entrypoint = entrypoint, outcome = outcome });
@@ -49,7 +57,7 @@ impl Operation {
             diagnostic_id = id, outcome = tracing::field::Empty, category = tracing::field::Empty,
             elapsed_ms = tracing::field::Empty, stage = tracing::field::Empty,
             capture_cleanup = tracing::field::Empty, typing_cleanup = tracing::field::Empty,
-            failure_stage = tracing::field::Empty);
+            failure_stage = tracing::field::Empty, invocation_id = tracing::field::Empty, bytes_received = 0_u64, bytes_received_scope = "selected_stream_payload");
         Self(Arc::new(Inner {
             span,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
@@ -57,6 +65,8 @@ impl Operation {
             entrypoint,
             id,
             snapshot: Mutex::new(State {
+                invocation_id: None,
+                bytes_received: 0,
                 seen: 0,
                 stage: "permission",
                 primary: "none",
@@ -124,6 +134,27 @@ impl Operation {
             return;
         }
         match event {
+            Diagnostic::AcceptedInvocation(id) => {
+                if id.iter().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+                    }
+                }) {
+                    snapshot.invocation_id = Some(id);
+                    self.0.span.record(
+                        "invocation_id",
+                        std::str::from_utf8(&id).unwrap_or("unavailable"),
+                    );
+                }
+            }
+            Diagnostic::OutputBytesReceived(bytes) => {
+                snapshot.bytes_received = snapshot.bytes_received.saturating_add(bytes);
+                self.0
+                    .span
+                    .record("bytes_received", snapshot.bytes_received);
+            }
             Diagnostic::Stage(stage) => {
                 let bit = 1 << stage as u16;
                 if snapshot.seen & bit != 0 {
@@ -216,6 +247,39 @@ impl Operation {
     pub fn finish(&self) {
         self.in_scope(|| self.finish_scoped());
     }
+    pub(crate) fn completion(&self) -> Completion {
+        let snapshot = self.lock();
+        let category = snapshot.primary;
+        let cleanup_failed = [snapshot.capture_cleanup, snapshot.typing_cleanup]
+            .iter()
+            .any(|value| {
+                !matches!(
+                    *value,
+                    "ok" | "not_needed" | "cancelled" | "typing_guard_or_cancelled"
+                )
+            });
+        if !cleanup_failed
+            && matches!(
+                category,
+                "cancelled" | "invalidated" | "typing_guard_or_cancelled" | "no_input"
+            )
+        {
+            Completion::Unchanged
+        } else if category == "none" && !cleanup_failed {
+            Completion::Succeeded
+        } else {
+            let category = match category {
+                "rpc_remote_failed" => "remote_failed",
+                "permission_denied" | "permission_unavailable" => "permission",
+                "rpc_login_required" => "login_required",
+                _ => "audio_failed",
+            };
+            Completion::Failed(crate::activity::AudioFailure {
+                diagnostic_id: self.0.id,
+                category,
+            })
+        }
+    }
     fn finish_scoped(&self) {
         let mut snapshot = self.lock();
         if snapshot.terminal {
@@ -227,6 +291,12 @@ impl Operation {
         let capture_cleanup = snapshot.capture_cleanup;
         let typing_cleanup = snapshot.typing_cleanup;
         let stage = snapshot.stage;
+        let invocation_id = snapshot.invocation_id;
+        let invocation_id = invocation_id
+            .as_ref()
+            .and_then(|id| std::str::from_utf8(id).ok())
+            .unwrap_or("unavailable");
+        let bytes_received = snapshot.bytes_received;
         drop(snapshot);
         let cleanup_failed = [capture_cleanup, typing_cleanup].iter().any(|value| {
             !matches!(
@@ -256,11 +326,11 @@ impl Operation {
         self.0.span.record("typing_cleanup", typing_cleanup);
         if outcome == "failed" || cleanup_failed {
             tracing::event!(target: TARGET, parent: &self.0.span, tracing::Level::WARN, { event.name = "native.audio.finished",
-                entrypoint = self.0.entrypoint, diagnostic_id = self.0.id, outcome = outcome, category = primary,
+                entrypoint = self.0.entrypoint, diagnostic_id = self.0.id, invocation_id, bytes_received, bytes_received_scope = "selected_stream_payload", outcome = outcome, category = primary,
                 capture_cleanup = capture_cleanup, typing_cleanup = typing_cleanup, stage = stage, failure_stage = failure_stage, elapsed_ms = elapsed_ms });
         } else {
             tracing::event!(target: TARGET, parent: &self.0.span, tracing::Level::INFO, { event.name = "native.audio.finished",
-                entrypoint = self.0.entrypoint, diagnostic_id = self.0.id, outcome = outcome, category = primary,
+                entrypoint = self.0.entrypoint, diagnostic_id = self.0.id, invocation_id, bytes_received, bytes_received_scope = "selected_stream_payload", outcome = outcome, category = primary,
                 capture_cleanup = capture_cleanup, typing_cleanup = typing_cleanup, stage = stage, failure_stage = failure_stage, elapsed_ms = elapsed_ms });
         }
     }
@@ -428,6 +498,43 @@ pub(crate) fn isolated_exporter_test(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_observer_validates_identity_and_saturates_receipt_bytes() {
+        let operation = Operation::new("hold");
+        let observer = operation.observer();
+        let id = *b"01234567-89ab-4cde-8fab-0123456789ab";
+        observer.emit(Diagnostic::AcceptedInvocation(id));
+        observer.emit(Diagnostic::AcceptedInvocation([b'x'; 36]));
+        observer.emit(Diagnostic::OutputBytesReceived(u64::MAX));
+        observer.emit(Diagnostic::OutputBytesReceived(1));
+        assert_eq!(operation.lock().invocation_id, Some(id));
+        assert_eq!(operation.lock().bytes_received, u64::MAX);
+    }
+
+    #[test]
+    fn audio_completion_feedback_is_fixed_and_cancellation_preserves_failure() {
+        let operation = Operation::new("hold");
+        assert!(matches!(operation.completion(), Completion::Succeeded));
+        operation.fail("cancelled");
+        assert!(matches!(operation.completion(), Completion::Unchanged));
+        operation.capture_cleanup(Err(capture::Error::Backend));
+        assert!(matches!(operation.completion(), Completion::Failed(_)));
+        let operation = Operation::new("hold");
+        operation.fail("rpc_remote_failed");
+        let Completion::Failed(failure) = operation.completion() else {
+            panic!("missing failure")
+        };
+        assert_eq!(failure.category, "remote_failed");
+        assert!(failure.diagnostic_id > 0);
+        let operation = Operation::new("hold");
+        operation.fail("SECRET_BACKEND_ERROR");
+        let Completion::Failed(failure) = operation.completion() else {
+            panic!("missing failure")
+        };
+        assert_eq!(failure.category, "audio_failed");
+        assert!(!serde_json::to_string(&failure).unwrap().contains("SECRET"));
+    }
 
     #[test]
     fn isolated_exporter_child_failure_reaches_parent() {

@@ -381,10 +381,13 @@ impl Job {
         factory: Arc<dyn capture::Factory>,
     ) {
         let diagnostics = self.diagnostics.clone();
+        let activity = self.host.audio.activity.clone();
+        let generation = self.generation;
         self.run_inner(transport, permission, factory)
             .instrument(diagnostics.span())
             .await;
         diagnostics.finish();
+        activity.complete(generation, diagnostics.completion());
     }
     async fn run_inner<T: RoutineInteractionTransport>(
         mut self,

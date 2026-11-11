@@ -31,6 +31,10 @@ pub enum Stage {
 /// Content-free observer notifications. No raw errors or configuration cross this seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Diagnostic {
+    /// Canonical lowercase UUID received in the validated Accepted event.
+    AcceptedInvocation([u8; 36]),
+    /// Selected output payload bytes received, excluding protocol framing.
+    OutputBytesReceived(u64),
     /// Clean capture ended without a nonempty PCM frame; no interaction was opened.
     NoInput,
     /// A pipeline milestone.

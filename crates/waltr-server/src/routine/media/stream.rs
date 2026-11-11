@@ -260,6 +260,7 @@ struct Totals {
 }
 #[derive(Debug)]
 struct Shared {
+    trace: tracing::Span,
     id: Uuid,
     limits: Limits,
     totals: Mutex<Totals>,
@@ -309,9 +310,23 @@ impl Streams {
         cancel: CancellationToken,
     ) -> Result<Self, Error> {
         limits.validate()?;
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        // Copy context only: a tracing parent would retain the invocation.
+        let parent = tracing::Span::current()
+            .context()
+            .span()
+            .span_context()
+            .clone();
+        let trace = tracing::info_span!(target: "waltr_server::routine::telemetry", parent: None, "routine.output_accounting", output_bytes_admitted = 0_u64);
+        if parent.is_valid() {
+            let _ =
+                trace.set_parent(opentelemetry::Context::new().with_remote_span_context(parent));
+        }
         let retention = Pool::new(8 * 1024 * 1024)?;
         Ok(Self {
             shared: Arc::new(Shared {
+                trace,
                 id: Uuid::new_v4(),
                 limits,
                 totals: Mutex::new(Totals::default()),
@@ -631,6 +646,11 @@ impl Writer {
                 totals.audio_frames = candidate;
             }
             totals.bytes[index] = new;
+            if index == 1 {
+                self.shared
+                    .trace
+                    .record("output_bytes_admitted", new as u64);
+            }
         }
         let result = self
             .send(
@@ -843,6 +863,9 @@ impl OutputQuota {
             .checked_add(bytes)
             .filter(|n| *n <= self.0.limits.output_bytes)
             .ok_or(Error::Limit)?;
+        self.0
+            .trace
+            .record("output_bytes_admitted", totals.bytes[1] as u64);
         Ok(())
     }
 }
@@ -1127,6 +1150,7 @@ mod admission_tests {
             channels: 1,
         };
         let streams = streams();
+        assert_eq!(streams.shared.totals.lock().unwrap().bytes[1], 0);
         let (mut input, mut source) = streams.open(Direction::Input, format, false).unwrap();
         input
             .write(input.key(), Chunk::Audio(vec![0; 2]))
@@ -1144,6 +1168,7 @@ mod admission_tests {
         drop(pending);
         assert_eq!(streams.retained_bytes(), 4);
         assert_eq!(streams.shared.totals.lock().unwrap().bytes, [2, 4]);
+        // The abandoned copy was admitted, not delivered to the reader.
         assert!(matches!(reader.read().await, Err(Error::Cancelled)));
         drop(packet);
         drop(reader);

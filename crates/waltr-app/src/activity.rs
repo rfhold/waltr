@@ -14,19 +14,82 @@ pub(crate) enum Phase {
 
 #[derive(Default)]
 struct State {
+    generation: u64,
     active: usize,
     failed: bool,
     error_until: Option<Instant>,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ActivityTracker(Arc<Mutex<State>>);
+#[derive(Clone)]
+pub(crate) struct ActivityTracker(Arc<Inner>);
+struct Inner {
+    state: Mutex<State>,
+    failure: tokio::sync::watch::Sender<Option<AudioFailure>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioFailure {
+    pub diagnostic_id: u64,
+    pub category: &'static str,
+}
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self(Arc::new(Inner {
+            state: Mutex::new(State::default()),
+            failure: tokio::sync::watch::channel(None).0,
+        }))
+    }
+}
 
 impl ActivityTracker {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.0
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn bind(&self, generation: u64) {
+        let mut state = self.lock();
+        if state.generation == generation {
+            return;
+        }
+        state.generation = generation;
+        self.0.failure.send_replace(None);
+    }
+    pub(crate) fn failures(&self) -> tokio::sync::watch::Receiver<Option<AudioFailure>> {
+        self.0.failure.subscribe()
+    }
+    pub(crate) fn complete(
+        &self,
+        generation: u64,
+        completion: crate::native_audio_telemetry::Completion,
+    ) {
+        let state = self.lock();
+        if state.generation != generation {
+            return;
+        }
+        match completion {
+            crate::native_audio_telemetry::Completion::Failed(failure) => {
+                self.0.failure.send_replace(Some(failure));
+            }
+            crate::native_audio_telemetry::Completion::Succeeded => {
+                self.0.failure.send_replace(None);
+            }
+            crate::native_audio_telemetry::Completion::Unchanged => {}
+        }
+    }
+    pub(crate) fn dismiss(&self, generation: u64, diagnostic_id: u64) {
+        let state = self.lock();
+        if state.generation == generation
+            && self
+                .0
+                .failure
+                .borrow()
+                .is_some_and(|failure| failure.diagnostic_id == diagnostic_id)
+        {
+            self.0.failure.send_replace(None);
+        }
     }
 
     pub(crate) fn begin(&self) -> ActivityLease {
@@ -84,6 +147,85 @@ impl Drop for ActivityLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_failure_same_generation_rebind_preserves_failure_and_dismissal() {
+        use crate::native_audio_telemetry::Completion;
+        let tracker = ActivityTracker::default();
+        let mut receiver = tracker.failures();
+        tracker.bind(0);
+        assert!(!receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), None);
+        tracker.complete(
+            0,
+            Completion::Failed(AudioFailure {
+                diagnostic_id: 42,
+                category: "audio_failed",
+            }),
+        );
+        let failure = *receiver.borrow_and_update();
+        tracker.bind(0);
+        assert_eq!(*tracker.failures().borrow(), failure);
+        assert!(!receiver.has_changed().unwrap());
+        tracker.dismiss(0, 42);
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), None);
+    }
+
+    #[test]
+    fn audio_failure_new_generation_rejects_old_completions_and_lease_cleanup() {
+        use crate::native_audio_telemetry::Completion;
+        let tracker = ActivityTracker::default();
+        tracker.bind(7);
+        let mut old = tracker.begin();
+        tracker.complete(
+            7,
+            Completion::Failed(AudioFailure {
+                diagnostic_id: 41,
+                category: "audio_failed",
+            }),
+        );
+        tracker.bind(8);
+        assert_eq!(*tracker.failures().borrow(), None);
+        let failure = AudioFailure {
+            diagnostic_id: 42,
+            category: "remote_failed",
+        };
+        tracker.complete(8, Completion::Failed(failure));
+        old.fail();
+        drop(old);
+        tracker.complete(7, Completion::Succeeded);
+        tracker.dismiss(7, 42);
+        tracker.bind(8);
+        assert_eq!(*tracker.failures().borrow(), Some(failure));
+    }
+
+    #[test]
+    fn audio_failure_is_persistent_dismissible_and_generation_scoped() {
+        use crate::native_audio_telemetry::Completion;
+        let tracker = ActivityTracker::default();
+        tracker.bind(7);
+        let receiver = tracker.failures();
+        let failure = AudioFailure {
+            diagnostic_id: 42,
+            category: "audio_failed",
+        };
+        tracker.complete(7, Completion::Failed(failure));
+        assert_eq!(*receiver.borrow(), Some(failure));
+        tracker.complete(7, Completion::Unchanged);
+        tracker.dismiss(6, 42);
+        tracker.dismiss(7, 41);
+        assert_eq!(*receiver.borrow(), Some(failure));
+        tracker.dismiss(7, 42);
+        assert_eq!(*receiver.borrow(), None);
+        tracker.complete(7, Completion::Failed(failure));
+        tracker.complete(7, Completion::Succeeded);
+        assert_eq!(*receiver.borrow(), None);
+        tracker.complete(7, Completion::Failed(failure));
+        tracker.bind(8);
+        tracker.complete(7, Completion::Failed(failure));
+        assert_eq!(*receiver.borrow(), None);
+    }
 
     #[test]
     fn overlap_and_old_completion_cannot_clear_new_work() {

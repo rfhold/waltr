@@ -5,6 +5,42 @@ import { loadTauriClient } from "../../src/platform/tauri";
 import { emptyConfig, snapshotWithConfig } from "../support/snapshots";
 
 describe("Tauri client adapter", () => {
+  test("retains, dismisses and generation-fences bounded audio failures", async () => {
+    let emit!: (event: unknown) => void;
+    const invoke = vi.fn(async (command) => {
+      if (command === "start_runtime") return { generation: 3 };
+      if (command === "client_state") return { generation: 3, events: [
+        bridgeState(3, 0, namedSnapshot("initial")),
+        { generation: 3, sequence: 1, payload: { type: "audioFailure", failure: { diagnosticId: 42, category: "remote_failed", message: "SECRET" } } },
+      ] };
+      if (command === "dismiss_audio_failure" || command === "dispose_runtime") return;
+      throw new Error(`unexpected command ${command}`);
+    });
+    const adapter = await loadTauriClient({ invoke: invoke as never, listen: vi.fn(async (_name, handler) => { emit = payload => handler({ payload }); return vi.fn(); }) as never });
+    await adapter.start();
+    const listener = vi.fn();
+    adapter.audioFailure!.subscribe(listener);
+    expect(listener).toHaveBeenLastCalledWith({ diagnosticId: 42, category: "remote_failed" });
+    emit(bridgeState(3, 2, namedSnapshot("ordinary update")));
+    await vi.waitFor(() => expect(adapter.snapshot()?.config.current?.etag).toBe("ordinary update"));
+    expect(listener).toHaveBeenLastCalledWith({ diagnosticId: 42, category: "remote_failed" });
+    await adapter.audioFailure!.dismiss(42);
+    expect(invoke).toHaveBeenCalledWith("dismiss_audio_failure", { generation: 3, diagnosticId: 42 });
+    expect(listener).toHaveBeenLastCalledWith(undefined);
+    emit({ generation: 3, sequence: 3, payload: { type: "audioFailure", failure: { diagnosticId: 43, category: "audio_failed" } } });
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith({ diagnosticId: 43, category: "audio_failed" }));
+    emit({ generation: 3, sequence: 4, payload: { type: "audioFailure", failure: null } });
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith(undefined));
+    emit({ generation: 3, sequence: 5, payload: { type: "audioFailure", failure: { diagnosticId: 44, category: "permission" } } });
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith({ diagnosticId: 44, category: "permission" }));
+    emit(bridgeState(4, 0, namedSnapshot("replacement")));
+    await vi.waitFor(() => expect(listener).toHaveBeenLastCalledWith(undefined));
+    emit({ generation: 3, sequence: 6, payload: { type: "audioFailure", failure: { diagnosticId: 45, category: "audio_failed" } } });
+    await Promise.resolve();
+    expect(listener).toHaveBeenLastCalledWith(undefined);
+    expect(JSON.stringify(listener.mock.calls)).not.toContain("SECRET");
+    await adapter.dispose();
+  });
   test("interaction observation and typed responses use the generation-fenced shared Rust bridge", async () => {
     let emit!: (event: unknown) => void;
     const identity = { sessionId: "session", generation: "broker-generation", id: "interaction", operationId: "operation" };

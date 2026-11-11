@@ -7,6 +7,10 @@ export type AccessDiagnostic = {
   persistenceWarning: boolean;
   failed: boolean;
 };
+export type AudioFailure = {
+  diagnosticId: number;
+  category: "remote_failed" | "permission" | "login_required" | "audio_failed";
+};
 
 export type AccessOperations = {
   openLogin: (url: string) => void | Promise<void>;
@@ -25,6 +29,10 @@ export type ClientAdapter = {
   access?: AccessOperations;
   accessDiagnostic?: {
     subscribe: (listener: (diagnostic: AccessDiagnostic | undefined) => void) => () => void;
+  };
+  audioFailure?: {
+    subscribe: (listener: (failure: AudioFailure | undefined) => void) => () => void;
+    dismiss: (diagnosticId: number) => Promise<void>;
   };
   openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
   openExternalUrl?: (url: string) => Promise<void>;

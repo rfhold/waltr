@@ -80,25 +80,34 @@ impl Fake {
         }
         let accepted = || {
             event(Event::Accepted(wire::InteractionAccepted {
-                invocation_id: "invocation".into(),
+                invocation_id: if name == "malicious-id" {
+                    "SECRET_INVOCATION_SENTINEL"
+                } else {
+                    "01234567-89ab-4cde-8fab-0123456789ab"
+                }
+                .into(),
                 revision: "revision".into(),
                 limits: Some(support::limits()),
             }))
         };
         if matches!(name.as_str(), "remote-failed" | "remote-interrupted") {
-            return Ok(Response::new(Box::pin(stream::iter([
-                accepted(),
-                event(Event::Terminal(wire::InteractionTerminal {
-                    status: if name == "remote-failed" {
-                        wire::InvocationStatus::Failed as i32
-                    } else {
-                        wire::InvocationStatus::Interrupted as i32
-                    },
-                    cleanup_complete: true,
-                    text_results: vec![],
-                    result: None,
-                })),
-            ]))));
+            let admission = accepted();
+            let terminal = event(Event::Terminal(wire::InteractionTerminal {
+                status: if name == "remote-failed" {
+                    wire::InvocationStatus::Failed as i32
+                } else {
+                    wire::InvocationStatus::Interrupted as i32
+                },
+                cleanup_complete: true,
+                text_results: vec![],
+                result: None,
+            }));
+            return Ok(Response::new(Box::pin(stream::iter([admission]).chain(
+                stream::once(async move {
+                    let _result = input.message().await;
+                    terminal
+                }),
+            ))));
         }
         if name == "pending" {
             while input.message().await?.is_some() {}
