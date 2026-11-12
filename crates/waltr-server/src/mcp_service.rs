@@ -807,8 +807,6 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                     .as_ref()
                     .is_some_and(|runtime| runtime.code.public_enabled(&principal))
             });
-        let external = self.sessions.external_tools();
-        let admitted = self.origin(&context);
         Box::pin(async move {
             let mut list = mcp::McpToolList {
                 tools: vec![
@@ -828,10 +826,6 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
             if code {
                 list.tools.push(tool_definition("code", "Optional bounded JavaScript over the same Routine service and caller policy. Discover exact permitted names/descriptions without schemas; fetch selected schemas only. No ambient imports, shell, filesystem or network. Interrupted calls are never automatically replayed.", crate::routine::code_mode::CodeInput::schema()));
             }
-            if let Some(external) = external {
-                admitted?;
-                list.tools.extend(external.list().await?);
-            }
             Ok(list)
         })
     }
@@ -843,19 +837,6 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolResult>> {
         let server = self.clone();
         Box::pin(async move {
-            if call.name.starts_with("capability__") {
-                let principal = server.origin(&context)?;
-                return server
-                    .sessions
-                    .external_tools()
-                    .ok_or_else(|| {
-                        ServerError::invalid_params(
-                            "external workspace capabilities are not configured",
-                        )
-                    })?
-                    .call(call, context, principal)
-                    .await;
-            }
             if call.name == "code" {
                 let port = if let Some(port) = &server.code {
                     port.clone()
@@ -1430,16 +1411,10 @@ mod tests {
     };
 
     #[derive(Default)]
-    struct UnusedSessionHost {
-        external: Option<Arc<crate::agent_host::external::ExternalToolHost>>,
-    }
+    struct UnusedSessionHost {}
 
     #[tonic::async_trait]
     impl SessionHost for UnusedSessionHost {
-        fn external_tools(&self) -> Option<Arc<crate::agent_host::external::ExternalToolHost>> {
-            self.external.clone()
-        }
-
         async fn shutdown(&self) {}
 
         fn set_completion_admission_handler(
@@ -1579,54 +1554,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_capabilities_never_prepare_or_proxy_default_agent_mcp() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
+    async fn public_tools_exclude_capabilities_and_reject_stale_names() {
         let root = tempfile::tempdir().unwrap();
-        let sandbox = crate::sandbox::LocalSandbox::start(root.path().into())
-            .await
-            .unwrap();
         let persistence = crate::persistence::Persistence::initialize(
             crate::persistence::DatabaseConfig::for_tests().unwrap(),
         )
         .await
         .unwrap();
-        let catalog = crate::agent_host::AgentDefinitionCatalog::from_sources(vec![
-            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: default}\nspec:\n  features:\n    - filesystem: {root: '$(session.workspace.root)', profile: auto}\n    - shell: {root: '$(session.workspace.root)'}\n    - mcp: {skills: true}\n".into(),
-        ], "default").unwrap();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let resolver_attempts = attempts.clone();
-        let factory = crate::agent_host::runtime_factory::ServerAgentRuntimeFactory::new(
-            sandbox.handle(),
-            root.path().into(),
-            crate::auth::FileCredentialStore::new(root.path().join("auth.json")),
-            catalog.resolved("default").unwrap().clone(),
-        )
-        .with_mcp_connection_resolver(move |_| {
-            resolver_attempts.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Err(waltr_agent::AgentSessionRuntimeError::FailedPrecondition(
-                    "upstream MCP OAuth refresh token was rejected".into(),
-                ))
-            })
-        });
-        let external = crate::agent_host::external::ExternalToolHost::new(
-            factory,
-            crate::interaction::InteractionBroker::new(),
-        );
-        external
-            .install_journal(persistence.external_dispatch_store())
-            .unwrap();
         let state = AgentDefinitionState::load(root.path(), &[], "coding").unwrap();
-        let server = WaltrMcpServer::new(
-            Arc::new(UnusedSessionHost {
-                external: Some(external.clone()),
-            }),
-            state,
-        )
-        .unwrap()
-        .with_anonymous_disabled();
-        let router = mcp::server::streamable_http_router(Arc::new(server));
+        let server = Arc::new(
+            WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state)
+                .unwrap()
+                .with_anonymous_disabled(),
+        );
+        let router = mcp::server::streamable_http_router(server.clone());
         let listed = mcp_request(
             &router,
             json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
@@ -1638,13 +1579,13 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        let mut expected = vec![
-            "status",
-            "create",
-            "edit",
-            "destroy",
-            "execute",
-            "query",
+        let mut expected = vec!["status", "create", "edit", "destroy", "execute", "query"];
+        let mut actual = names.clone();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+
+        for name in [
             "capability__read",
             "capability__glob",
             "capability__grep",
@@ -1652,24 +1593,55 @@ mod tests {
             "capability__write",
             "capability__delete",
             "capability__apply_patch",
-        ];
-        if cfg!(feature = "shell") {
-            expected.push("capability__shell");
-        }
-        let mut actual = names.clone();
-        actual.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
-        assert_eq!(attempts.load(Ordering::SeqCst), 0);
-
-        for name in [
+            "capability__shell",
             "capability__axol__effect",
             "capability__waltr__status",
             "capability__read_mcp_resource",
+            "waltr__capability__read",
         ] {
             let rejected = mcp_request(&router, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":{}}})).await;
             assert_eq!(rejected["error"]["code"], -32020, "{rejected}");
             assert_eq!(rejected["error"]["data"]["bodyValue"], "known tool schema");
+        }
+        struct StaleDiscovery(Arc<WaltrMcpServer>);
+        impl mcp::server::ServerHandler for StaleDiscovery {
+            fn server_info(&self) -> mcp::server::ServerInfo {
+                mcp::server::ServerHandler::server_info(self.0.as_ref())
+            }
+            fn capabilities(&self) -> mcp::server::ServerCapabilities {
+                mcp::server::ServerCapabilities::new().tools()
+            }
+            fn list_tools(
+                &self,
+                _: Option<String>,
+                _: mcp::server::ServerContext,
+            ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolList>> {
+                Box::pin(async {
+                    Ok(mcp::McpToolList {
+                        tools: vec![mcp::progressive::tool_definition(
+                            "capability__write",
+                            "Stale discovery fixture",
+                            json!({"type":"object"}),
+                        )],
+                        next_cursor: None,
+                    })
+                })
+            }
+            fn call_tool(
+                &self,
+                call: mcp::McpToolCall,
+                context: mcp::server::ServerContext,
+            ) -> mcp::server::BoxFuture<ServerResult<mcp::McpToolResult>> {
+                mcp::server::ServerHandler::call_tool(self.0.as_ref(), call, context)
+            }
+        }
+        let stale = mcp::server::streamable_http_router(Arc::new(StaleDiscovery(server)));
+        for arguments in [
+            json!({"filePath":"own.txt","content":"must not write"}),
+            json!({"action":"session.send","input":{"id":"never","prompt":"never"}}),
+        ] {
+            let rejected = mcp_request(&stale, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capability__write","arguments":arguments}})).await;
+            assert!(rejected.get("error").is_some(), "{rejected}");
         }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM external_capability_dispatch")
             .fetch_one(persistence.sqlite_pool().unwrap())
@@ -1677,31 +1649,28 @@ mod tests {
             .unwrap();
         assert_eq!(
             count, 0,
-            "rejected upstream guesses never enter the dispatch journal"
+            "removed tools never enter the retained dispatch journal"
         );
-        let write = mcp_request(&router, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capability__write","arguments":{"filePath":"own.txt","content":"own capability"}}})).await;
-        assert!(write.get("error").is_none(), "{write}");
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("own.txt")).unwrap(),
-            "own capability"
-        );
-        #[cfg(feature = "shell")]
-        {
-            let shell = mcp_request(&router, json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"capability__shell","arguments":{"command":"cat own.txt","description":"Read fixture file"}}})).await;
-            assert!(shell.get("error").is_none(), "{shell}");
-            assert!(shell.to_string().contains("own capability"), "{shell}");
-        }
+        assert!(!root.path().join("own.txt").exists());
         let resources = mcp_request(
             &router,
             json!({"jsonrpc":"2.0","id":5,"method":"resources/list"}),
         )
         .await;
         assert!(resources.get("error").is_none(), "{resources}");
+        for uri in ["waltr://resources", "waltr://sessions"] {
+            assert!(
+                resources["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|resource| resource["uri"] == uri)
+            );
+        }
+        let status = mcp_request(&router, json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"status","arguments":{}}})).await;
+        assert!(status.get("error").is_none(), "{status}");
         let upstream = mcp_request(&router, json!({"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"upstream://private"}})).await;
         assert!(upstream.get("error").is_some(), "{upstream}");
-        assert_eq!(attempts.load(Ordering::SeqCst), 0);
-        external.shutdown().await;
-        sandbox.shutdown().await;
     }
 
     #[test]

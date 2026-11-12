@@ -51,10 +51,6 @@ pub(crate) fn pinned_inference_settings(
 pub trait SessionHost: Send + Sync {
     /// Install an opaque private self binding composed by the owning application.
     fn install_self_mcp(&self, _binding: crate::self_mcp::SelfMcpBinding) {}
-    /// Explicit server workspace and broker binding for authenticated sessionless callers.
-    fn external_tools(&self) -> Option<Arc<crate::agent_host::external::ExternalToolHost>> {
-        None
-    }
     /// Compose the application's single Routine runtime with this concrete normal coordinator.
     async fn compose_routines(
         &self,

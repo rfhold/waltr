@@ -64,8 +64,8 @@ Waltr and MCP use separate pools and retain separate schema and migration owners
 
 | Backend | Waltr objects | MCP objects |
 | --- | --- | --- |
-| SQLite | `waltr.sqlite3`: `_sqlx_migrations`, OIDC state, outbound OAuth, durable Routine invocation history, and external capability dispatch receipts | `mcp.sqlite3`: `_sqlx_migrations`, hosted OAuth tables, and inert historical Streamable HTTP session/event tables |
-| PostgreSQL | `waltr` schema and `waltr._sqlx_migrations`, including outbound OAuth, Routine history, and external capability dispatch receipts | `mcp` schema and `mcp._sqlx_migrations`, including hosted OAuth |
+| SQLite | `waltr.sqlite3`: `_sqlx_migrations`, OIDC state, outbound OAuth, durable Routine invocation history, and historical external capability dispatch receipts | `mcp.sqlite3`: `_sqlx_migrations`, hosted OAuth tables, and inert historical Streamable HTTP session/event tables |
+| PostgreSQL | `waltr` schema and `waltr._sqlx_migrations`, including outbound OAuth, Routine history, and historical external capability dispatch receipts | `mcp` schema and `mcp._sqlx_migrations`, including hosted OAuth |
 
 Each owning crate embeds its forward-only migration files with `sqlx::migrate!()`. SQLx owns the standard `_sqlx_migrations` history format, version/checksum validation, and migration coordination; Waltr adds no migration-history layer. PostgreSQL migration connections set the owning `waltr` or `mcp` search path so the standard history and owned objects are created in that schema. Runtime queries remain owner-qualified where required.
 
@@ -86,7 +86,7 @@ Waltr migrations are immutable and normalized identically across SQLite and Post
 | `0011_script_observation.sql` | Waltr | Add durable publication order and opaque observation cursors. |
 | `0013_code_dispatch.sql` | Waltr | Associate neutral agent dispatch fences with admitted code invocations. |
 | `0014_retire_routine_dsl.sql` | Waltr | Drop only the three legacy task-history tables; preserve current script and unrelated stores. |
-| `0015_external_capability_dispatch.sql` | Waltr | Add non-replayable sessionless capability associations and exact completion receipts. |
+| `0015_external_capability_dispatch.sql` | Waltr | Add non-replayable sessionless capability associations and exact completion receipts; retained historical storage after public capability removal. |
 | `0016_routine_object_references.sql` | Waltr | Require empty incompatible Routine state; replace active program/text body columns with immutable-object references. |
 
 The V2 access-authentication domain contains:
@@ -138,13 +138,13 @@ Preflight also refuses populated legacy `routine_invocations` before migration 0
 
 ## Sessionless External Dispatch
 
-Shared standalone and embedded composition installs the Waltr SQL `ExternalDispatchStore` before exposing external tools. A missing journal fails closed. Before entering the dispatcher, each call must acknowledge a new `external_capability_dispatch` row in `uncertain` state. Its serialized association contains the authenticated principal and scopes (not bearer credentials), server-generated operation ID, exact target identity, declaration revision and schema, and original call arguments. It creates no agent session.
+Public MCP no longer discovers or dispatches `capability__*` tools. No new public capability call enters `external_capability_dispatch`; its schema, migrations, and historical rows remain intact.
 
-A known handler result permits one exact compare-and-swap from that association's `uncertain` state to `complete`, storing ordered text/image content and `isError`. A known tool error result can therefore complete; dispatch failure, settlement failure, or crash leaves the caller with uncertainty. Neither state is a restart continuation or replay instruction. The server does not reconstruct or rerun these effects from SQL.
+Historical rows contain the admitted principal and scopes, operation ID, exact target identity, declaration revision and schema, and original call arguments. The principal snapshot excludes bearer credentials; the dispatch created no agent session. The former dispatch path acknowledged an `uncertain` association before dispatcher entry. A known result permitted an exact completion CAS with ordered text/image content and `isError`. Dispatch failure, settlement failure, or crash left uncertainty. Neither state grants a restart continuation or replay instruction. The server does not reconstruct or rerun these effects from SQL.
 
-Arguments and result bodies can contain sensitive user data, secrets supplied as tool input, or encoded images. This store serializes them as JSON text; it adds no payload encryption, automatic garbage collection, or expiry. Apply database and backup access/retention controls accordingly. Session deletion or namespace reset does not remove these SQL rows; any database reset or retention deletion needs separate explicit authorization. Migration 0015 is additive and requires no history or credential reset.
+Arguments and result bodies can contain sensitive user data, secrets from tool input, or encoded images. The store retains JSON text without payload encryption, automatic garbage collection, or expiry. Apply database and backup access/retention controls accordingly. Public capability removal, session deletion, and session namespace reset do not remove these SQL rows. Any database reset or retention deletion needs separate explicit authorization. Migration 0015 remains immutable; capability removal requires no migration, history reset, or credential reset.
 
-See [`external_journal.rs`](../../crates/waltr-server/src/agent_host/external_journal.rs), [`external.rs`](../../crates/waltr-server/src/agent_host/external.rs) (`dispatch_durable`), and the [SQL store](../../crates/waltr-server/src/persistence/external_dispatch.rs).
+See the retained [`external_journal.rs`](../../crates/waltr-server/src/agent_host/external_journal.rs) model and [SQL store](../../crates/waltr-server/src/persistence/external_dispatch.rs).
 
 ## Coordinated Capability Upgrade
 
@@ -172,7 +172,7 @@ The environment-owned `build_app(BuildAppOptions)` is therefore async and fallib
 - `crates/waltr-server/src/access_auth/store.rs` owns the OIDC V2 domain store and admission rules; handlers do not issue SQL directly.
 - `crates/waltr-server/src/persistence/outbound_oauth.rs` owns durable callbacks, unified outbound credentials, and refresh claims.
 - `crates/waltr-server/src/persistence/script_invocation/`, `script_text_result/`, and `script_code_dispatch.rs` own current Routine journals, observations, text, and code associations. The old task-history decoder/store is removed.
-- `crates/waltr-server/src/persistence/external_dispatch.rs` owns non-replayable sessionless capability associations and completion receipts in Waltr SQL, separate from session history and live interaction waiters.
+- `crates/waltr-server/src/persistence/external_dispatch.rs` retains historical non-replayable external capability associations and completion receipts, separate from session history and live interaction waiters.
 
 ## Tests
 

@@ -8,8 +8,9 @@ mod capability;
 mod context;
 pub mod definition;
 pub mod dispatcher;
-pub mod external;
 pub mod external_journal;
+#[cfg(test)]
+mod external_journal_tests;
 pub(crate) mod middleware;
 pub mod prompt;
 pub mod resource;

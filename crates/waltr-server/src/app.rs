@@ -1281,19 +1281,6 @@ where
     if let Some(private) = &private_self_mcp {
         session_host.install_self_mcp(private.binding());
     }
-    if let Some(external) = session_host.external_tools() {
-        if external
-            .install_journal(persistence.external_dispatch_store())
-            .is_err()
-        {
-            session_host.shutdown().await;
-            sandbox.shutdown().await;
-            return Err(ResourceError::unavailable(
-                "external capability journal could not initialize",
-            )
-            .into());
-        }
-    }
     let waltr_mcp = match WaltrMcpServer::new(session_host.clone(), agent_state.clone()) {
         Ok(server) => server,
         Err(_) => {

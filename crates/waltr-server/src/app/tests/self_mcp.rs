@@ -205,7 +205,7 @@ async fn public_call(endpoint: &str, name: &str, arguments: Value) -> Value {
 }
 
 #[tokio::test]
-async fn self_mcp_anonymous_disabled_production_dispatch_and_sessions() {
+async fn self_mcp_anonymous_disabled_rejects_capabilities_and_preserves_sessions() {
     let _serial = APP_SERIAL.lock().await;
     let fixture = Fixture::new().await;
     let public = fixture.public.clone();
@@ -220,43 +220,41 @@ async fn self_mcp_anonymous_disabled_production_dispatch_and_sessions() {
     );
     let discovery = payload(list(&public, None, false).await).await;
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|tool| tool["name"] == "capability__read"));
-    assert!(!tools.iter().any(|tool| tool["name"] == "code"));
-    let read = public_call(
-        &public,
-        "capability__read",
-        json!({"filePath":"fixture.txt"}),
-    )
-    .await;
-    assert!(read.get("error").is_none(), "{read}");
     assert!(
-        read.to_string().contains("harmless-self-mcp-fixture"),
-        "{read}"
-    );
-    let (association, state): (String, String) =
-        sqlx::query_as("SELECT association,state FROM external_capability_dispatch")
-            .fetch_one(persistence.sqlite_pool().unwrap())
-            .await
-            .unwrap();
-    let association: Value = serde_json::from_str(&association).unwrap();
-    assert_eq!(association["principal"]["method"], "AnonymousDisabled");
-    assert_eq!(association["principal"]["subject"], "shared-dev-domain");
-    assert_eq!(association["principal"]["scopes"], json!([]));
-    assert_eq!(association["call"]["name"], "read");
-    assert_eq!(state, "complete");
-    let unknown = public_call(&public, "capability__not_enabled", json!({})).await;
-    assert!(unknown.get("error").is_some(), "{unknown}");
-    assert!(
-        !tools
+        tools
             .iter()
-            .any(|tool| tool["name"] == "capability__question")
+            .all(|tool| !tool["name"].as_str().unwrap().starts_with("capability__"))
     );
-    let question = public_call(&public, "capability__question", json!({"questions":[{
-        "question":"No unrelated session may answer", "header":"fixture", "options":[], "multiple":false, "custom":true
-    }]})).await;
-    assert!(
-        question.get("error").is_some() || question["result"]["isError"] == true,
-        "{question}"
+    for name in ["status", "create", "edit", "destroy", "execute", "query"] {
+        assert!(
+            tools.iter().any(|tool| tool["name"] == name),
+            "missing {name}"
+        );
+    }
+    assert!(!tools.iter().any(|tool| tool["name"] == "code"));
+    for (name, arguments) in [
+        ("capability__read", json!({"filePath":"fixture.txt"})),
+        (
+            "capability__write",
+            json!({"filePath":"must-not-exist", "content":"effect"}),
+        ),
+        (
+            "capability__shell",
+            json!({"command":"touch must-not-exist", "description":"Rejected fixture"}),
+        ),
+        ("capability__not_enabled", json!({})),
+        ("capability__question", json!({})),
+    ] {
+        let rejected = public_call(&public, name, arguments).await;
+        assert!(rejected.get("error").is_some(), "{rejected}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM external_capability_dispatch")
+        .fetch_one(persistence.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "removed calls cannot create new legacy journal entries"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     let created = public_call(
@@ -310,7 +308,7 @@ async fn self_mcp_anonymous_disabled_production_dispatch_and_sessions() {
 }
 
 #[tokio::test]
-async fn self_mcp_bare_server_with_real_dispatcher_still_rejects_forged_origins() {
+async fn self_mcp_bare_server_discovery_preserves_prompt_origin_checks() {
     let _serial = APP_SERIAL.lock().await;
     let fixture = Fixture::build(false).await;
     assert!(fixture.app.self_mcp.is_none());
@@ -327,8 +325,14 @@ async fn self_mcp_bare_server_with_real_dispatcher_still_rejects_forged_origins(
         mcp::server::streamable_http_router(Arc::new(bare)),
         cancel.clone().cancelled_owned(),
     ));
-    let denied = payload(list(&endpoint, Some("forged-local-bearer"), true).await).await;
-    assert_eq!(denied["error"]["code"], -32602, "{denied}");
+    let listed = payload(list(&endpoint, Some("forged-local-bearer"), true).await).await;
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap().starts_with("capability__"))
+    );
     for (name, arguments) in [
         ("capability__read", json!({"filePath":"fixture.txt"})),
         (
@@ -362,7 +366,7 @@ async fn self_mcp_bare_server_with_real_dispatcher_still_rejects_forged_origins(
 }
 
 #[tokio::test]
-async fn self_mcp_standalone_coding_discovery_and_dispatch() {
+async fn self_mcp_standalone_coding_discovery_omits_capabilities_and_preserves_status() {
     let _serial = APP_SERIAL.lock().await;
     let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
@@ -372,39 +376,49 @@ async fn self_mcp_standalone_coding_discovery_and_dispatch() {
     let tools = response["result"]["tools"]
         .as_array()
         .expect(&format!("tool listing: {response}"));
-    assert!(tools.iter().any(|tool| tool["name"] == "capability__read"));
-    assert!(!tools.iter().any(|tool| tool["name"] == "code"));
-    assert!(!tools.iter().any(|tool| {
-        tool["name"]
-            .as_str()
-            .unwrap()
-            .contains("capability__capability__")
-    }));
-    let call = waltr_agent::ToolCall::new(
-        "self-read",
-        "capability__read",
-        json!({"filePath":"fixture.txt"}),
+    assert!(
+        tools
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap().starts_with("capability__"))
     );
+    assert!(!tools.iter().any(|tool| tool["name"] == "code"));
+    let agent_tools = runtime
+        .agent_tools(fixture.factory.capability_policy())
+        .await;
+    assert!(
+        agent_tools
+            .iter()
+            .any(|tool| tool.definition().name == "waltr__status")
+    );
+    assert!(
+        agent_tools
+            .iter()
+            .all(|tool| !tool.definition().name.starts_with("waltr__capability__"))
+    );
+    let call = waltr_agent::ToolCall::new("self-status", "status", json!({}));
     let (result, _) = tokio::time::timeout(
         Duration::from_secs(10),
-        runtime.call_app_tool(
-            "waltr",
-            "capability__read",
-            &call,
-            CancellationToken::new(),
-            None,
-        ),
+        runtime.call_app_tool("waltr", "status", &call, CancellationToken::new(), None),
     )
     .await
     .unwrap()
     .unwrap();
-    assert!(!result.is_error, "harmless read must succeed");
-    assert!(
-        result
-            .content
-            .as_str()
-            .contains("harmless-self-mcp-fixture")
-    );
+    assert!(!result.is_error, "ordinary self-MCP status must succeed");
+    for name in [
+        "capability__read",
+        "capability__write",
+        "capability__shell",
+        "waltr__capability__read",
+    ] {
+        let call = waltr_agent::ToolCall::new("stale", name, json!({"filePath":"fixture.txt"}));
+        let rejected = runtime
+            .call_app_tool("waltr", name, &call, CancellationToken::new(), None)
+            .await;
+        assert!(
+            rejected.is_err(),
+            "stale self-MCP tool must be rejected: {name}"
+        );
+    }
     runtime.shutdown().await.unwrap();
     fixture.app.shutdown().await;
 }

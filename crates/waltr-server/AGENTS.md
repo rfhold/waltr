@@ -52,7 +52,7 @@
 
 # Contracts
 
-Server owns concrete capabilities; `waltr-agent` remains the generic provider/model runner, neutral hooks, history/coordinator, and durable fences. All entry points share exact-identity `CapabilityDispatcher`, final middleware arguments/claims, worker Prepare/authorize/Execute, and live operation routes. Never detour through a model or fabricate a session for external `capability__*` calls. Those authenticated sessionless calls have full access over enabled capabilities, not a code grant or sandbox/upstream-auth bypass.
+Server owns concrete capabilities; `waltr-agent` remains the generic provider/model runner, neutral hooks, history/coordinator, and durable fences. Internal concrete tool entry points share exact-identity `CapabilityDispatcher`, final middleware arguments/claims, worker Prepare/authorize/Execute, and live operation routes. Never detour through a model to execute a concrete tool. Public MCP neither discovers nor dispatches `capability__*`, including through self-MCP. Preserve native agent tools, management tools, resources, served Apps, and separately granted code mode. Public code must not proxy upstream concrete MCP targets. Retain historical external dispatch SQL without replay or automatic cleanup; removal admits no new public capability calls.
 
 Private pending interactions and grants belong to `InteractionBroker`/`ServerPermissionPolicy`, not metadata, journal, or timeline. Responses bind session/generation/request/operation and resume the original live future. Cancel/drop removes pending state; observer release does not decide work. Restart discards requests/grants without replay. URL consent is not navigation or completion. Ordinary admitted MCP create/send prompts survive later token expiry; explicit Routine/helper/code leases remain separate.
 
@@ -129,7 +129,7 @@ Bind the host-owned self-MCP credential to the exact initialized resource URL. I
 
 For access-disabled non-hosted standalone self-MCP, keep the private transport separate from the public router and embedded callback credentials. Require the initialized logical self target, a generation bearer, proxy bypass, no redirects, and opt-in generic endpoint redaction. Keep resource YAML and durable OAuth credentials unchanged.
 
-Trusted standalone composition enables shared anonymous public MCP admission only with access auth disabled, no hosted OAuth, and no embedded local admission. Bare MCP construction remains fail-closed for capabilities and prompt admission. Represent anonymous access as `AnonymousDisabled`, never validated process identity. Preserve normal enabled-capability policy and operation ownership; no-auth grants no optional code/helper/media authority. Private self-MCP still requires its exact generation bearer.
+Trusted standalone composition enables shared anonymous public MCP admission only with access auth disabled, no hosted OAuth, and no embedded local admission. Bare MCP construction remains fail-closed for prompt admission. Represent anonymous access as `AnonymousDisabled`, never validated process identity. Preserve normal management/session policy and operation ownership; no-auth grants no native capability export or optional code/helper/media authority. Private self-MCP still requires its exact generation bearer.
 
 Keep Pyroscope behind the optional `profiling` feature, which remains enabled by default. The standalone binary must also compile and run without `profiling`; embedded consumers use `default-features = false`.
 

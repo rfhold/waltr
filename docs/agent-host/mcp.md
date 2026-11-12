@@ -6,7 +6,9 @@ The server host adapts tools, prompt templates, resource reads, resource templat
 
 ## Entry Points
 
-Waltr's ordinary public MCP catalog exposes Waltr-owned tools, enabled filesystem/shell capabilities, resources, and served Apps. It does not aggregate configured upstream MCP servers. Public `capability__*` discovery and calls do not resolve upstream connections, refresh credentials, or start MCP clients. Guessed `capability__<server>__<tool>` names are rejected before dispatch journaling. Internal agent MCP selection, authentication, resources, Skills, and session Apps retain their normal behavior. Separately granted public `code` requests retain JavaScript execution and named helpers, but omit all upstream concrete targets from discovery and deny their schemas and execution before upstream runtime assembly. Named helpers retain their own internal agent authority. Custom public code ports must enforce the same no-proxy boundary.
+Waltr's ordinary public MCP catalog exposes management and administration tools, resources, and served Apps. It neither exports native filesystem/shell tools nor aggregates configured upstream MCP servers. Public MCP omits `capability__*` tools from discovery and rejects their dispatch. Calls to those names fail as unknown tools before capability admission or dispatch journals. Internal agents retain native tools and definition-selected MCP access, authentication, resources, Skills, and session Apps. Self-MCP exposes no `waltr__capability__*` tools.
+
+Separately granted public `code` requests retain JavaScript execution and named helpers. Public code omits upstream concrete targets from discovery and denies their schemas and execution before upstream runtime assembly. Named helpers retain their own internal agent authority. Custom public code ports must enforce the same no-proxy boundary.
 
 | API | Purpose |
 | --- | --- |
@@ -71,7 +73,7 @@ Template search uses the same current resolution. It treats MCP preparation fail
 
 ### Standalone Self Connection
 
-The public standalone `/mcp` route is anonymous only when trusted composition selects disabled access authentication with neither hosted OAuth nor embedded local admission. Clients need no bearer or sign-in. Anonymous callers share the configured dev domain and ordinary enabled capabilities. They gain no optional code profiles, helper grants, or speech/model authority. Normal dispatch journaling, sandbox policy, consent/elicitation and cancellation ownership still apply. Missing interaction routes fail explicitly and never broadcast to another session. Bare MCP server construction does not enable anonymous capability or prompt admission. Do not expose a no-auth server to untrusted networks.
+The public standalone `/mcp` route is anonymous only when trusted composition disables access authentication and configures neither hosted OAuth nor embedded local admission. Clients need no bearer or sign-in. Anonymous callers share the configured dev domain and normal management/session tools, not native capability exports. They gain no optional code profiles, helper grants, or speech/model authority. Normal policy, consent/elicitation and cancellation ownership still apply. Missing interaction routes fail explicitly and never broadcast to another session. Bare MCP server construction does not enable anonymous prompt admission. Do not expose a no-auth server to untrusted networks.
 
 Access-disabled, non-hosted standalone composition binds the initial self resource to a private MCP-only loopback listener.
 The initial `waltr` key and logical URL must match the trusted public resource destination.
@@ -80,7 +82,7 @@ A name alone grants no authority; later destination edits use ordinary upstream 
 `McpServerConfig` retains the logical endpoint for source identity and declaration checks.
 Only its private transport destination changes, with a memory-only generation bearer and a distinct authority identifier.
 Every private bearer lookup checks the current logical connection and generation lifetime.
-The external capability catalog contains no upstream MCP tools, including tools from the logical self resource, so self discovery cannot recurse.
+The public catalog contains no native capability exports or upstream MCP tools, so self discovery cannot recurse through a capability proxy.
 
 The private client bypasses proxies, refuses all redirects, and enables generic endpoint redaction.
 The application never persists the private endpoint or bearer in resource YAML, OAuth credentials, or session metadata.
@@ -113,13 +115,13 @@ MCP tools are exposed directly. Tool names are generated as:
 <server>__<tool>
 ```
 
-Names are sanitized for provider visibility. Visible aliases are not authority: dispatch retains exact source-server/tool identities and declaration revisions. The bundled self server therefore exposes `waltr__*`. Old aliases in persisted resource overrides require deliberate replacement; there is no compatibility alias.
+Names are sanitized for provider visibility. Visible aliases are not authority: dispatch retains exact source-server/tool identities and declaration revisions. The bundled self server therefore exposes `waltr__*`, but no `waltr__capability__*` aliases. Old aliases in persisted resource overrides require deliberate replacement; there is no compatibility alias.
 
 ## Tool Calls
 
-Provider calls, templates, session Apps, and reviewed JavaScript use the server capability dispatcher for upstream MCP tools. Public external calls share the dispatcher implementation but receive only Waltr-owned filesystem/shell capabilities:
+Provider calls, templates, session Apps, and authorized reviewed JavaScript use the server capability dispatcher for upstream MCP tools:
 
-- Session-bound tool calls and results are recorded as generic timeline events and journal-backed session projection data. Sessionless external calls use the SQL journal described below instead.
+- Session-bound tool calls and results use generic timeline events and journal-backed session projection data.
 - Permission behavior can target the generated tool name through normal tool selectors.
 - The dispatcher validates exact target and policy before the MCP runtime sends `tools/call`.
 - The MCP request includes a progress token.
@@ -128,7 +130,7 @@ Provider calls, templates, session Apps, and reviewed JavaScript use the server 
 
 MCP result conversion preserves text order, represents unknown content with explicit unsupported-content markers, appends `structuredContent` as text, and preserves MCP `isError` as structured tool-result state. Image blocks must use canonical standard Base64, declare `image/png`, `image/jpeg`, or `image/webp`, and match that type's file signature. Waltr accepts at most four images and 4 MiB of decoded image data in one result. Invalid encoding, unsupported media, signature mismatches, and excess data become bounded MCP protocol errors; image data is never included in the error.
 
-Authenticated sessionless `capability__*` calls require a server-owned `ExternalDispatchStore`; production standalone and embedded composition install the Waltr SQL store. The exact principal, operation, target, declaration, and original input are durably associated as uncertain before dispatcher entry. A known result permits an exact completion CAS. Dispatch/settlement failure or crash never authorizes reconstruction or replay, and missing persistence fails closed. No synthetic session is created. Arguments and complete text/image results are sensitive retained SQL data, not merely transient interaction state; see [persistence and retention boundaries](../architecture/persistence.md#sessionless-external-dispatch). The journal supplies neither restart continuation nor automatic cleanup.
+Historical sessionless dispatch rows retain sensitive principal, input, and result data after public capability removal. No new public capability call enters that journal. Retained rows grant no replay, restart continuation, or automatic cleanup; see [persistence and retention boundaries](../architecture/persistence.md#sessionless-external-dispatch).
 
 Without Skills, Waltr opts into an 8 MiB MCP message and event-stream line limit.
 This limit fits one bounded 4 MiB decoded image plus Base64 and JSON framing.

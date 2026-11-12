@@ -76,7 +76,6 @@ where
     app_runtime: crate::agent_host::mcp::session_apps::ServerMcpApps<S>,
     runtime_factory: Arc<AgentSessionRuntimeFactory>,
     pub(super) interactions: crate::interaction::InteractionBroker,
-    external_tools: Arc<crate::agent_host::external::ExternalToolHost>,
     routines: tokio::sync::Mutex<Option<Arc<crate::routine::production::ProductionRuntime>>>,
     origin_runs: OriginRuns,
 }
@@ -204,13 +203,8 @@ where
             sessions.clone(),
             runtime_factory.clone(),
         );
-        let external_tools = crate::agent_host::external::ExternalToolHost::new(
-            runtime_factory.clone(),
-            interactions.clone(),
-        );
         Arc::new(Self {
             interactions,
-            external_tools,
             app_runtime,
             sessions,
             config,
@@ -264,10 +258,6 @@ where
         self.app_runtime = crate::agent_host::mcp::session_apps::ServerMcpApps::new(
             self.sessions.clone(),
             factory.clone(),
-        );
-        self.external_tools = crate::agent_host::external::ExternalToolHost::new(
-            factory.clone(),
-            self.interactions.clone(),
         );
         self.runtime_factory = Arc::new(factory);
         self
@@ -359,9 +349,6 @@ where
     fn install_self_mcp(&self, binding: crate::self_mcp::SelfMcpBinding) {
         self.runtime_factory.install_self_mcp(binding);
     }
-    fn external_tools(&self) -> Option<Arc<crate::agent_host::external::ExternalToolHost>> {
-        Some(self.external_tools.clone())
-    }
     async fn compose_routines(
         &self,
         input: crate::routine::production::ProductionInput,
@@ -381,7 +368,6 @@ where
         Ok(runtime)
     }
     async fn shutdown(&self) {
-        self.external_tools.shutdown().await;
         self.origin_runs.slots.close();
         self.apps.clear();
         self.sessions.shutdown().await;

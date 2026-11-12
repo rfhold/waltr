@@ -2,7 +2,7 @@
 
 Server `auth/` owns upstream MCP credentials and orchestration. Its `provider_store` adapter exposes only provider targets and compare-and-swap to agent inference auth. API access, hosted MCP OAuth, upstream OAuth, and provider inference auth remain separate domains.
 
-Private interaction responses require exact authorized session/generation/request/operation identity, not metadata or an upstream key. Authenticated public MCP `capability__*` calls use explicit sessionless full-access host policy over enabled capabilities and an operation route. They do not fabricate a session or invoke a model; full access does not bypass sandbox checks, upstream auth, or optional code grants. MRTR continuations bind the principal and exact original call. See [server interactions](agent.md#live-interactions) and [upgrade guidance](../runbooks/server-capability-cutover.md).
+Private interaction responses require exact authorized session/generation/request/operation identity, not metadata or an upstream key. Public MCP no longer discovers or dispatches `capability__*` tools, regardless of caller authentication. Native agent tools and internal capability policy remain separate from public management tools, resources, Apps, and optional code grants. MRTR continuations bind the principal and exact original call. See [server interactions](agent.md#live-interactions) and [upgrade guidance](../runbooks/server-capability-cutover.md).
 
 ## Purpose
 
@@ -75,14 +75,14 @@ This private connection does not use hosted OAuth or the embedded credential-sto
 
 Only an exact, current generation bearer establishes `ValidatedLocalOrigin` on the private listener.
 Loopback addresses, Host, Origin, headers, `_meta`, resource names, and disabled access authentication grant no process identity.
-Trusted standalone composition explicitly enables anonymous public `/mcp` admission only with disabled access authentication, no hosted OAuth, and no embedded local admission. Clients need no bearer or OAuth flow. Bare `WaltrMcpServer::new` instances remain fail-closed for capability and session-prompt admission unless the host enables this mode.
+Trusted standalone composition explicitly enables anonymous public `/mcp` admission only with disabled access authentication, no hosted OAuth, and no embedded local admission. Clients need no bearer or OAuth flow. Bare `WaltrMcpServer::new` instances remain fail-closed for session-prompt admission unless the host enables this mode.
 The legacy `AuthenticatedPrincipal` type represents this admission as `AnonymousDisabled`, not validated process or hosted identity. Anonymous calls share one configured dev access domain, without user/client isolation or credential expiry. Public headers, metadata, IP addresses, and client session IDs grant no additional authority. A private self-MCP bearer on this public route adds no privileges.
-Enabled capabilities and normal administration/session tools use ordinary server dispatch policy, durable dispatch association, sandbox, consent, and operation ownership. Disabled authentication grants no optional code, speech/model, or helper authority. Admitted durable session prompts outlive their HTTP request; external operation cancellation and non-replay rules remain unchanged. Keep no-auth development bound to loopback. Any reachable client can use the enabled tools. Do not expose this mode to untrusted networks.
+Normal administration/session tools retain their server policy, consent, and operation ownership. Disabled authentication grants no native capability exports or optional code, speech/model, or helper authority. Admitted durable session prompts outlive their HTTP request; explicit operation cancellation and non-replay rules remain unchanged. Keep no-auth development bound to loopback. Any reachable client can use the enabled public tools. Do not expose this mode to untrusted networks.
 Hosted OAuth and embedded composition retain their separate admission contracts.
 
 The private transport preserves the logical public resource identity, declarations, source checks, and Apps authority checks.
 A resource edit to another destination receives no generation bearer or self authority.
-Self discovery excludes the bound logical resource to prevent recursion.
+Self discovery exposes management tools, resources, and Apps, not native capability exports or an upstream MCP proxy.
 The private HTTP client bypasses environment proxies and refuses every redirect, even same-origin path redirects.
 
 The application retains the bearer and private endpoint only in memory.

@@ -428,45 +428,6 @@ impl ServerAgentRuntimeFactory {
         self.policy.clone()
     }
 
-    pub(crate) async fn external_dispatcher(
-        &self,
-        broker: crate::interaction::InteractionBroker,
-        destination: crate::interaction::InteractionDestination,
-    ) -> Result<super::dispatcher::CapabilityDispatcher, AgentSessionRuntimeError> {
-        let _root = self.sandbox_root()?;
-        let catalog = self.catalog_provider.as_ref().map(|provide| provide());
-        let definition = catalog
-            .as_ref()
-            .and_then(|catalog| catalog.resolved(catalog.default_agent_name()))
-            .unwrap_or(&self.definition);
-        let policy =
-            crate::permission::ServerPermissionPolicy::authenticated_external(broker, destination);
-        let mut capabilities = Vec::new();
-        if definition.features.filesystem.is_some() {
-            use super::filesystem::FilesystemToolKind::*;
-            for kind in [Read, Glob, Grep, Edit, Write, Delete, ApplyPatch] {
-                capabilities.push(super::tools::sandbox::agent_tool(
-                    kind.definition(),
-                    self.sandbox.clone(),
-                ));
-            }
-        }
-        #[cfg(feature = "shell")]
-        if definition.features.shell.is_some() {
-            capabilities
-                .push(ShellConfig::new(_root.clone()).into_agent_tool(self.sandbox.clone()));
-        }
-        // Public capabilities are host-owned only; upstream MCP belongs to session runtimes.
-        super::dispatcher::CapabilityDispatcher::new(capabilities, None, policy)
-            .map(|dispatcher| {
-                dispatcher.with_context(
-                    super::middleware::chain::MiddlewareChain::new(),
-                    PermissionPolicy::new(PermissionLevel::Allow),
-                )
-            })
-            .map_err(|error| AgentSessionRuntimeError::FailedPrecondition(error.to_string()))
-    }
-
     pub(crate) fn install_self_mcp(&self, binding: crate::self_mcp::SelfMcpBinding) {
         assert!(
             self.self_mcp.set(binding).is_ok(),
@@ -2555,6 +2516,8 @@ spec:
         }
         assert_eq!(names.contains("shell"), cfg!(feature = "shell"));
         assert!(names.contains("question"));
+        assert!(names.iter().all(|name| !name.starts_with("capability__")
+            && !name.starts_with("waltr__capability__")));
         assert!(!names.contains("task"));
         assert!(!names.contains("disabled_tool"));
     }

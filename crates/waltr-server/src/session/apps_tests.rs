@@ -456,10 +456,6 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
     let state = crate::test_support::resource_state_with_overrides(&[]);
     let service = Arc::new(SessionService {
         app_runtime,
-        external_tools: crate::agent_host::external::ExternalToolHost::new(
-            factory.clone(),
-            interactions.clone(),
-        ),
         interactions: interactions.clone(),
         runtime_factory: Arc::new(factory),
         routines: tokio::sync::Mutex::new(None),

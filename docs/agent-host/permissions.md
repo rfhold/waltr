@@ -1,6 +1,6 @@
 # Server Permissions
 
-The server owns policy evaluation and private approvals. The generic agent runs neutral tool callbacks; the worker prepares workspace claims without deciding policy. All entry points use the server's `CapabilityDispatcher`, not a second permission path.
+The server owns policy evaluation and private approvals. The generic agent runs neutral tool callbacks; the worker prepares workspace claims without deciding policy. Internal concrete tool entry points use the server's `CapabilityDispatcher`, not a second permission path.
 
 ## Policy
 
@@ -37,7 +37,7 @@ Approvals are private server memory, never session metadata, middleware state, j
 
 The broker exposes full-replacement snapshots with a process generation and revision. Responses bind the exact session, generation, request, and operation. Only one valid authorized response wins. Owner cancellation or drop removes pending requests; observer disconnect does not decide them. Restart discards pending requests and approvals, with no replay or compatibility resume API.
 
-Authenticated public MCP `capability__*` calls use explicit sessionless full-access host policy over enabled capabilities. This is not an ordinary agent definition and does not bypass sandbox enforcement, upstream authentication, or the need for an interaction route. Missing routes fail before dependent effects. Explicit code execution grants and leases remain separate.
+Public MCP no longer discovers or dispatches `capability__*` tools; no sessionless full-access capability policy applies. Internal agents retain native tools and normal definition permissions. Public management tools, resources, and Apps retain their own contracts. Explicit code execution grants and leases remain separate; public code cannot proxy upstream concrete MCP targets.
 
 ## Sources And Tests
 

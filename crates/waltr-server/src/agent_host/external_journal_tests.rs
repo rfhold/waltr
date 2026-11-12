@@ -1,14 +1,20 @@
-use super::*;
+use super::{
+    Capability,
+    dispatcher::{CapabilityDispatcher, CapabilityPolicy, PolicyFuture},
+    external_journal::{ExternalDispatch, ExternalDispatchStore, JournalError, JournalFuture},
+};
 use crate::{
-    agent_host::{
-        Capability,
-        dispatcher::{CapabilityDispatcher, CapabilityPolicy, PolicyFuture},
-        external_journal::{JournalError, JournalFuture},
-    },
     permission::{PermissionClaim, PermissionPolicy},
     persistence::{DatabaseConfig, Persistence},
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
 use waltr_agent::{ToolDefinition, ToolExecutionContext};
 
 struct Allow;
@@ -92,6 +98,50 @@ async fn row(persistence: &Persistence, id: &str) -> (String, String, Option<Str
 async fn close(persistence: Persistence) {
     persistence.sqlite_pool().unwrap().close().await;
     persistence.mcp_sqlite_pool().unwrap().close().await;
+}
+
+// Exercise retained journal invariants without restoring a public admission path.
+async fn dispatch_durable(
+    journal: &dyn ExternalDispatchStore,
+    dispatcher: &CapabilityDispatcher,
+    association: ExternalDispatch,
+    cancellation: CancellationToken,
+) -> Result<serde_json::Value, ()> {
+    let exact = dispatcher.capabilities().any(|capability| {
+        capability.identity() == association.identity
+            && capability.definition().name == association.call.name
+            && serde_json::to_value(capability.definition()).ok().as_ref()
+                == Some(&association.declaration)
+    });
+    if !exact
+        || association.source_revision != dispatcher.revision()
+        || association.operation_id != association.call.id
+    {
+        return Err(());
+    }
+    journal
+        .associate(association.clone())
+        .await
+        .map_err(|_| ())?;
+    let context = ToolExecutionContext::with_progress_and_cancellation(
+        association.call.clone(),
+        waltr_agent::ToolProgressSink::noop(),
+        cancellation,
+    )
+    .with_host_operation(waltr_agent::HostDispatchBinding {
+        invocation_id: association.operation_id.clone(),
+        source_revision: association.source_revision.clone(),
+    });
+    let result = dispatcher
+        .dispatch(&association.identity, &association.source_revision, context)
+        .await
+        .map_err(|_| ())?;
+    let outcome = serde_json::json!({"content":[{"type":"text","text":result.text_projection()}],"isError":result.is_error});
+    journal
+        .complete(association, outcome.clone())
+        .await
+        .map_err(|_| ())?;
+    Ok(outcome)
 }
 
 #[tokio::test]
@@ -215,20 +265,11 @@ async fn external_journal_failure_prevents_worker_prepare_and_write() {
     let sandbox = crate::sandbox::LocalSandbox::start(root.path().into())
         .await
         .unwrap();
-    let catalog = crate::agent_host::AgentDefinitionCatalog::from_sources(vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: default}\nspec:\n  features:\n    - filesystem: {root: '$(session.workspace.root)', profile: auto}\n".into()], "default").unwrap();
-    let factory = ServerAgentRuntimeFactory::new(
+    let tool = super::tools::sandbox::agent_tool(
+        super::filesystem::FilesystemToolKind::Write.definition(),
         sandbox.handle(),
-        root.path().into(),
-        crate::auth::FileCredentialStore::new(root.path().join("auth.json")),
-        catalog.resolved("default").unwrap().clone(),
     );
-    let dispatcher = factory
-        .external_dispatcher(
-            InteractionBroker::new(),
-            InteractionDestination::Unavailable,
-        )
-        .await
-        .unwrap();
+    let dispatcher = CapabilityDispatcher::new(vec![tool], None, Arc::new(Allow)).unwrap();
     let dispatch = association(
         &dispatcher,
         "worker",
@@ -425,108 +466,4 @@ async fn external_journal_unknown_handler_result_has_no_completion_receipt() {
     );
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     close(reopened).await;
-}
-
-#[tokio::test]
-async fn external_journal_reopened_host_never_reconstructs_or_rebinds_continuations() {
-    let root = tempfile::tempdir().unwrap();
-    let persistence = database(root.path()).await;
-    let catalog = crate::agent_host::AgentDefinitionCatalog::from_sources(
-        vec![
-            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: default}\nspec: {}\n"
-                .into(),
-        ],
-        "default",
-    )
-    .unwrap();
-    let factory = ServerAgentRuntimeFactory::new(
-        crate::agent_host::sandbox_gateway::SandboxGateway::new("external-test".into()).handle(),
-        root.path().into(),
-        crate::auth::FileCredentialStore::new(root.path().join("auth.json")),
-        catalog.resolved("default").unwrap().clone(),
-    );
-    let host = ExternalToolHost::new(factory.clone(), InteractionBroker::new());
-    host.install_journal(persistence.external_dispatch_store())
-        .unwrap();
-    let principal = AuthenticatedPrincipal::apps_test_principal("owner");
-    let call = mcp::McpToolCall {
-        name: "capability__effect".into(),
-        arguments: serde_json::json!({"input":"exact"}),
-        progress_token: None,
-    };
-    let durable = ExternalDispatch {
-        operation_id: "operation".into(),
-        principal: serde_json::json!({"issuer":principal.issuer(),"subject":principal.subject()}),
-        identity: "builtin:effect".into(),
-        source_revision: "exact-source".into(),
-        declaration: serde_json::to_value(ToolDefinition::new(
-            "effect",
-            "test",
-            serde_json::json!({}),
-        ))
-        .unwrap(),
-        call: waltr_agent::ToolCall::new("operation", "effect", call.arguments.clone()),
-    };
-    persistence
-        .external_dispatch_store()
-        .associate(durable.clone())
-        .await
-        .unwrap();
-    let (_, receive) = mpsc::channel(1);
-    host.operations.lock().await.insert(
-        "operation".into(),
-        Arc::new(Operation {
-            principal: principal.clone(),
-            call: call.clone(),
-            cancellation: CancellationToken::new(),
-            state: Mutex::new(OperationState {
-                events: receive,
-                pending: None,
-            }),
-        }),
-    );
-    assert!(
-        host.continuation("operation", &call, &principal)
-            .await
-            .is_ok()
-    );
-    assert!(
-        host.continuation(
-            "operation",
-            &call,
-            &AuthenticatedPrincipal::apps_test_principal("different")
-        )
-        .await
-        .is_err()
-    );
-    let mut changed = call.clone();
-    changed.arguments = serde_json::json!({"input":"changed"});
-    assert!(
-        host.continuation("operation", &changed, &principal)
-            .await
-            .is_err()
-    );
-    host.shutdown().await;
-    close(persistence).await;
-    let persistence = database(root.path()).await;
-    let (stored, state, outcome) = row(&persistence, "operation").await;
-    assert_eq!(
-        serde_json::from_str::<ExternalDispatch>(&stored).unwrap(),
-        durable
-    );
-    assert_eq!(state, "uncertain");
-    assert!(outcome.is_none());
-    let reopened = ExternalToolHost::new(factory, InteractionBroker::new());
-    reopened
-        .install_journal(persistence.external_dispatch_store())
-        .unwrap();
-    assert!(
-        reopened
-            .continuation("operation", &call, &principal)
-            .await
-            .is_err()
-    );
-    assert!(reopened.tasks.lock().await.is_empty());
-    reopened.shutdown().await;
-    close(persistence).await;
 }

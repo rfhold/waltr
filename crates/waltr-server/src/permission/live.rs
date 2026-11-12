@@ -30,7 +30,6 @@ struct Approvals {
 /// Admission never derives authority from session metadata or an upstream request key.
 pub struct ServerPermissionPolicy {
     broker: InteractionBroker,
-    external: Option<InteractionDestination>,
     approvals: Mutex<Approvals>,
 }
 
@@ -38,19 +37,6 @@ impl ServerPermissionPolicy {
     pub fn sessions(broker: InteractionBroker) -> Arc<Self> {
         Arc::new(Self {
             broker,
-            external: None,
-            approvals: Mutex::default(),
-        })
-    }
-    /// An authenticated external call uses enabled server capabilities by explicit host policy.
-    /// The dispatcher still enforces sandbox, declaration, guard and upstream authentication.
-    pub fn authenticated_external(
-        broker: InteractionBroker,
-        destination: InteractionDestination,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            broker,
-            external: Some(destination),
             approvals: Mutex::default(),
         })
     }
@@ -61,11 +47,12 @@ impl ServerPermissionPolicy {
         let operation = context
             .host_dispatch()
             .ok_or(InteractionError::Unavailable)?;
-        let destination = match (&self.external, context.session_id()) {
-            (None, Some(session)) => InteractionDestination::Session(session.clone()),
-            (Some(destination), None) => destination.clone(),
-            _ => return Err(InteractionError::Unavailable),
-        };
+        let destination = InteractionDestination::Session(
+            context
+                .session_id()
+                .ok_or(InteractionError::Unavailable)?
+                .clone(),
+        );
         Ok(OperationBinding {
             operation_id: operation.invocation_id.clone(),
             destination,
@@ -111,9 +98,6 @@ impl CapabilityPolicy for ServerPermissionPolicy {
             };
             if context.is_cancelled() {
                 return Ok(Some("permission operation cancelled".into()));
-            }
-            if self.external.is_some() {
-                return Ok(None);
             }
             let call = context.call();
             let input = policy.evaluate_input(&call.name, &call.arguments);
