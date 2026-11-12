@@ -129,6 +129,10 @@ pub trait Reservation: Send + Sync {
     fn abort(&self) -> PortFuture<()> {
         Box::pin(async { Ok(()) })
     }
+    /// Validate successful-root obligations after cleanup; errors fail only this invocation.
+    fn validate_success(&self) -> Result<(), PortError> {
+        Ok(())
+    }
     /// Verify owner/pause release after joined host cleanup.
     fn finalize(&self, interrupted: bool) -> PortFuture<()>;
 }
@@ -264,6 +268,10 @@ pub struct HelperResult {
 
 /// Independently substitutable helper lifecycle; implementations must join on cleanup.
 pub trait HelperRunner: Send + Sync {
+    /// Bind private invocation-local tool mailboxes without granting tool authority.
+    fn bind_tool_streams(&self, _streams: Arc<super::adapters::tool_streams::ToolStreams>) -> PortFuture<()> {
+        Box::pin(async { Err(PortError::UnsupportedCapability) })
+    }
     /// Resolve an invocation-local model selector before any helper or attachment effects.
     fn select_inference(&self, selector: &super::adapters::helper::InferenceSelector) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
         if selector.is_default() { Ok(None) } else { Err(PortError::UnsupportedCapability) }

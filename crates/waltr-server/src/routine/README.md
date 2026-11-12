@@ -126,6 +126,72 @@ The supplied adapter must validate that semantic selector against its own author
 
 ## Owner layer and integration points
 
+### Invocation-local helper tool streams
+
+`spec.toolStreams` declares private tool mailboxes for helpers launched by this invocation.
+Each declaration contains `selection`, `tool`, `description`, `contract`, `maxCalls`, and `maxBytes`.
+`contract` uses the same closed `waltr.value/v1` dialect as captures.
+The Routine declares `helper.run`, `helper.streams`, and its exact helper selection capability.
+The declaration grants no permission; the helper's normal policy controls the exact tool.
+Preflight rejects definite denial. Ask uses the original live permission request.
+Normal middleware, post-policy argument validation, durable tool fences, and helper history still apply.
+Stream tools and `_helper_capture` coexist; semantic completion callbacks retain their current contract.
+
+The first helper with the exact selection claims all streams once.
+A second producer fails, even after the first helper finishes.
+Tool names must be unique across declarations; underscore-prefixed reserved names fail validation.
+Runtime name or identity collisions fail before helper inference or stream effects.
+Each invocation has fresh state; stream names expose no other invocation's queue.
+Empty `toolStreams` declarations preserve current canonical revisions.
+
+`host.call('helper.next', {stream:'name'})` returns `{value: {callId, tool, arguments}}` or `{value: null}` at normal EOF.
+The non-media host also includes `status: 'completed'`.
+The queue preserves admission order.
+Read each event in sequence. Await each effect before the next read.
+Each stream permits one read that awaits an event.
+Tool success means **queued**, not consumed, delivered, or audible.
+The helper proceeds after bounded queue admission, independent of consumer effects.
+Full queues apply backpressure until a read releases count and byte credit.
+The byte limit includes encoded call identity, tool name, and arguments.
+Limits are 16 streams, 16 queued calls per stream, and 65536 bytes per stream.
+The declaration also reserves 64 bytes within the invocation value budget for the reply wrapper.
+
+Normal helper completion closes its producer; accepted calls remain available through EOF.
+Await both the helper and the consumer before the Routine returns.
+The invocation deadline also bounds the drain; the helper deadline does not restart it.
+Uncaught consumer failure fails the invocation and joins helper cleanup.
+Cancellation wakes blocked senders and readers, clears private queues, and joins current owners.
+An early successful root with undrained calls fails invocation completion validation; joined cleanup remains verified and does not quarantine capacity.
+No subscription, attachment to another chat, receipt state, restart replay, or client transport exists.
+
+### Internal text feed for synthesis
+
+`media.text.open` returns an opaque invocation-local text-feed handle.
+Pass that handle as the fifth argument to `media.synthesize`, with its output and speech options.
+Set `utterances: true` to finalize each committed text packet in a separate synthesis request,
+drain its audio, then start the next request on the same ordered output. This avoids
+provider lookahead holding the end of an update until later text arrives. Packets must
+be nonempty committed text without replacements. The option is accepted only with a
+text-feed handle; omission preserves continuous synthesis. Queue bounds, cancellation,
+and the invocation deadline still apply. Between utterances, the text feed waits under
+that deadline rather than the media idle timeout. Active provider responses retain their
+idle timeout. Synthesis completion is not a playback acknowledgment.
+`media.text.write` accepts `{text}` and the same handle; each write commits one ordered segment.
+`media.text.close` accepts `{}` and the handle; explicit close supplies successful EOF.
+Start synthesis concurrently with writes.
+Await both before `media.finish`.
+Each write permits at most 65500 UTF-8 bytes, subject to ordinary engine string and value limits.
+The current media streams enforce count, byte, segment, deadline, cancellation, and aggregate input/output budgets.
+Current media job ownership joins the speech producer and feed operations; there is no second speech pipeline.
+Feed handles authorize no external port or dynamic input name.
+`media.finish` rejects an unclosed or unused feed.
+
+The [speech Routine](../../../../examples/routines/streamed-speech.yaml) consumes helper events through one feed and one synthesis call.
+Its [named agent](../../../../examples/agents/routine-speaker.yaml) grants only `speak`.
+Install both example resources through the normal catalog.
+Configure inference/TTS defaults before use.
+The example does not alter the bundled catalog or grant caller authority.
+
 The server owns admission, immutable program identity, durable observations, and execution ownership.
 `InvocationService::new` accepts an engine, `InvocationStore`, `HostFactory`, `Clock`, and active-owner limit.
 `HostFactory::preflight` receives the service-issued `InvocationBinding` before admission.
@@ -147,7 +213,7 @@ The composition owner retains responsibility for engine shutdown because other c
 `JournalHost` commits intent before any supplied host effect, then commits a safe output projection before the guest response.
 Required journal or projection failures cancel the invocation and fence concurrent dispatch after policy and intent awaits.
 Unresolved intents force uncertain history; restart reconciliation never replays effects or starts a guest.
-Success requires engine join, verified host cleanup, required reservation finalization, and a durable terminal write.
+Success requires engine join, host completion validation, verified cleanup, required reservation finalization, and a durable terminal write.
 Unverified cleanup quarantines the reservation and consumes capacity.
 Service destruction preserves that quarantine for the process lifetime instead of an unsafe reservation Drop.
 
@@ -333,13 +399,14 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | `media.upload` | Sequential finite upload; no readable handle before integrity and fixed signature checks |
 | `media.select` | Entire committed capture or generic JSON-pointer selection, with helper provenance |
 | `media.read` / `media.proposal.read` | At most 64 KiB through an invocation-local resource reference |
+| `media.readText` | Complete UTF-8 string from the same resource/field, bounded by `max` bytes (default 32 KiB, maximum 64 KiB); rejects oversized text and any `offset` |
 | `media.publish` | Immutable selected UTF-8 object with SQL owner/quota/reference; descriptor-only reply |
 | `media.emit` | Committed text output after helper acceptance |
 | `media.lease` | Authenticated binary output transfer before teardown, with a declared output name |
 | `media.finish` | Seal dispatch and prove required transport completion |
 
 JS receives opaque, engine-bound resources, not payload-sized JSON or ownership grants.
-`media.read` returns response bytes from a helper handle; JavaScript can decode these bytes as UTF-8.
+`media.read` returns response bytes from a helper handle. Use `media.readText` to read bounded UTF-8 directly without per-byte JavaScript decoding. It preserves the complete string or fails; structured-value limits still apply.
 `media.synthesize` accepts arbitrary `text`, within the engine's string/value limits and the 1 MiB host text ceiling.
 Its text feeder and speech producer share bounded stream credit, cancellation and deadlines, and both join before completion.
 `ask-and-speak` uses a tool-free named helper, waits for its complete answer, retains and emits text, then streams audio.

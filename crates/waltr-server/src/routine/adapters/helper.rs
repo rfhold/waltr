@@ -163,6 +163,7 @@ pub struct CoordinatorHelperRunner<S: SessionStore + Clone + Send + Sync + 'stat
     restricted: BTreeMap<String, RestrictedHelperProfile>,
     captures: Arc<Mutex<BTreeMap<String, Contract>>>,
     capture_bindings: Arc<Mutex<Option<BTreeMap<String, HelperSelection>>>>,
+    tool_streams: Arc<Mutex<Option<Arc<super::tool_streams::ToolStreams>>>>,
     input_models: BTreeMap<(String, String), waltr_agent::TransientModelCapabilities>,
     source: Option<SessionCopy>,
     principal: String,
@@ -192,6 +193,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for CoordinatorHelpe
             restricted: self.restricted.clone(),
             captures: self.captures.clone(),
             capture_bindings: self.capture_bindings.clone(),
+            tool_streams: self.tool_streams.clone(),
             input_models: self.input_models.clone(),
             source: self.source.clone(),
             principal: self.principal.clone(),
@@ -248,6 +250,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             restricted,
             captures: Arc::new(Mutex::new(captures)),
             capture_bindings: Arc::new(Mutex::new(None)),
+            tool_streams: Arc::new(Mutex::new(None)),
             input_models: BTreeMap::new(),
             source,
             principal,
@@ -297,6 +300,31 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
 }
 
 impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for CoordinatorHelperRunner<S> {
+    fn bind_tool_streams(&self, streams: Arc<super::tool_streams::ToolStreams>) -> PortFuture<()> {
+        let this = self.clone();
+        Box::pin(async move {
+            // Named bundles have already been pinned by the host preflight.
+            for stream in streams.declarations() {
+                let policy = match &stream.selection {
+                    HelperSelection::Named { name } => {
+                        let bundle = this.named.lock().map_err(|_| PortError::Unavailable)?
+                            .as_ref().and_then(|named| named.get(name)).cloned().ok_or(PortError::Denied)?;
+                        this.factory.helper_host_tool_policy(&bundle, &stream.tool)
+                            .map_err(|_| PortError::Unavailable)?
+                    }
+                    HelperSelection::Restricted { profile } => this.restricted.get(profile).ok_or(PortError::Denied)?.runtime.helper_capture_policy(),
+                };
+                let policy = match &this.restriction { Some(r) => policy.intersection(r.clone()), None => policy };
+                if policy.evaluate_target_tool_effect(&format!("builtin:{}", stream.tool), &stream.tool).level == crate::permission::PermissionLevel::Deny {
+                    return Err(PortError::Denied);
+                }
+            }
+            let mut current = this.tool_streams.lock().map_err(|_| PortError::Unavailable)?;
+            if current.is_some() { return Err(PortError::Conflict); }
+            *current = Some(streams);
+            Ok(())
+        })
+    }
     fn select_inference(&self, selector: &InferenceSelector) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
         let Some(catalog) = &self.catalog else {
             return if selector.is_default() { Ok(None) } else { Err(PortError::UnsupportedCapability) };
@@ -589,6 +617,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             if owners.closed || owners.owners.len() >= 64 {
                 return Err(PortError::Denied);
             }
+            let mut producer = this.tool_streams.lock().map_err(|_| PortError::Unavailable)?
+                .as_ref().map(|streams| streams.claim(&request.selection)).transpose()?;
             let session = this
                 .sessions
                 .clone()
@@ -640,22 +670,38 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             if let Some(restriction) = &this.restriction {
                 factory = factory.with_permission_restriction(restriction.clone());
             }
-            if let Some(contract) = &capture {
-                let contract = contract.clone();
-                let schema = capture_schema(&contract.schema);
-                factory = factory.with_host_tool_provider(move |_, _, _| {
-                    let contract = contract.clone();
-                    Ok(vec![Capability::new(ToolDefinition::new(CAPTURE_TOOL,
-                        "Submit the declared structured capture before your final response. This is not semantic completion validation.", schema.clone()), move |context| {
-                        if !contract.accepts_host(&context.call().arguments, capture_bytes) {
-                            return Ok(context.result("capture does not match declared contract").with_error());
-                        }
-                        Ok(context.result(context.call().arguments.to_string()))
-                    })])
+            let stream_tools = producer.as_ref().map_or_else(Vec::new, |p| p.tools(cancellation.clone()));
+            if capture.is_some() || !stream_tools.is_empty() {
+                let capture = capture.clone();
+                let tools = stream_tools.clone();
+                factory = factory.with_host_tool_provider(move |_, _, dispatcher| {
+                    let mut tools = tools.clone();
+                    if let Some(contract) = &capture {
+                        let contract = contract.clone();
+                        let schema = capture_schema(&contract.schema);
+                        tools.push(Capability::new(ToolDefinition::new(CAPTURE_TOOL,
+                            "Submit the declared structured capture before your final response. This is not semantic completion validation.", schema), move |context| {
+                            if !contract.accepts_host(&context.call().arguments, capture_bytes) {
+                                return Ok(context.result("capture does not match declared contract").with_error());
+                            }
+                            Ok(context.result(context.call().arguments.to_string()))
+                        }));
+                    }
+                    if tools.iter().any(|tool| dispatcher.capabilities().any(|existing| existing.definition().name == tool.definition().name || existing.identity() == tool.identity())) {
+                        return Err(waltr_agent::AgentSessionRuntimeError::FailedPrecondition("helper tool stream name collision".into()));
+                    }
+                    Ok(tools)
                 });
             }
             let mut runtime = match runtime {
                 Some(mut builder) => {
+                    if !stream_tools.is_empty() {
+                        let (_, dispatcher) = builder.clone().build_with_dispatcher();
+                        if stream_tools.iter().any(|tool| dispatcher.capabilities().any(|existing| existing.definition().name == tool.definition().name || existing.identity() == tool.identity())) {
+                            return Err(PortError::Conflict);
+                        }
+                    }
+                    for tool in stream_tools { builder = builder.with_tool(tool); }
                     if let Some(contract) = &capture {
                         let contract = contract.clone();
                         builder = builder.with_tool(Capability::new(
@@ -910,6 +956,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             {
                 return Err(PortError::Invalid);
             }
+            if let Some(producer) = &mut producer { producer.complete(); }
             Ok(result)
         })
     }
@@ -1017,7 +1064,7 @@ impl CompletionObserver for ScriptCompletionObserver {
     }
 }
 
-fn capture_schema(schema: &Schema) -> Value {
+pub(crate) fn capture_schema(schema: &Schema) -> Value {
     match schema {
         Schema::Null => json!({"type":"null"}),
         Schema::Nullable { schema } => json!({"anyOf":[{"type":"null"},capture_schema(schema)]}),

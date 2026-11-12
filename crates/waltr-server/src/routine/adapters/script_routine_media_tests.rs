@@ -32,6 +32,8 @@ use std::{
 use waltr::grpc::waltr::config::v1 as proto;
 use waltr_agent::*;
 use waltr_script::{Engine, ScriptEngine};
+#[path = "tool_streams_speech_tests.rs"]
+mod tool_streams_speech_tests;
 
 #[allow(dead_code)]
 #[path = "../../../../waltr-audio/tests/support/compact_wire.rs"]
@@ -1640,4 +1642,19 @@ async fn real_js_cancel_joins_blocked_input_output_and_provider() {
             usize::from(program.contains("media-cancel-provider"))
         );
     }
+}
+#[test]
+fn bounded_text_read_preserves_utf8_and_rejects_truncation() {
+    let limits = waltr_script::Limits::default();
+    let text = "é".repeat(4096);
+    let HostReply::Value(value) = read_text_value(&text, None, Some(8192), &limits).unwrap() else {
+        panic!("expected text value");
+    };
+    assert_eq!(value.as_json(), &json!(text));
+    assert!(matches!(read_text_value(&text, None, Some(8191), &limits), Err(waltr_script::Error::Limit)));
+    for (offset, max) in [(Some(0), Some(8192)), (None, Some(0)), (None, Some(65537))] {
+        assert!(matches!(read_text_value(&text, offset, max, &limits), Err(waltr_script::Error::Invalid)));
+    }
+    let tiny = waltr_script::Limits { value_bytes: 16, ..limits };
+    assert!(read_text_value(&text, None, Some(8192), &tiny).is_err());
 }

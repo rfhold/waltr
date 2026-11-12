@@ -43,6 +43,8 @@ use scripted_provider::ScriptedProvider;
 mod configuration_tests;
 #[path = "context_tests.rs"]
 mod context_tests;
+#[path = "tool_streams_integration_tests.rs"]
+mod tool_streams_integration_tests;
 
 fn inference() -> InferenceSettings {
     InferenceSettings {

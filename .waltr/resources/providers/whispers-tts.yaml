@@ -1,0 +1,18 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata: {name: whispers-tts}
+spec:
+  transport: googleTextToSpeechV1
+  url: https://whispers.holdenitdown.net:443
+  models:
+    reader:
+      name: Kyutai Streaming Speech
+      type: 4
+      speech_capabilities: {unary: true, streaming: true}
+      synthesis:
+        voice: expresso-happy
+        model_name: kyutai-tts-1.6b-en-fr
+        language_code: en-US
+        sample_rate_hz: 24000
+        channels: 1
+        speaking_rate: 1.0

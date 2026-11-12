@@ -248,6 +248,7 @@ fn catalog_entries(
         [
             "helper.run",
             "helper.validate",
+            "helper.streams",
             "context.snapshot",
             "context.original",
             "context.history",

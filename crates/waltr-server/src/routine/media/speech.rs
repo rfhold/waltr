@@ -19,9 +19,18 @@ use waltr_audio::{audio::PcmS16Le, client::Client, config::Config, stt, tts};
 /// execution uses the input invocation's existing absolute deadline.
 pub trait SpeechBackend: Send + Sync {
     /// Resolve a call against the invocation's pinned catalog, without I/O.
-    fn select(&self, selection: &SpeechSelector, synthesis: bool, snapshot: bool) -> Result<Option<Arc<dyn SpeechBackend>>, Error> {
+    fn select(
+        &self,
+        selection: &SpeechSelector,
+        synthesis: bool,
+        snapshot: bool,
+    ) -> Result<Option<Arc<dyn SpeechBackend>>, Error> {
         let _ = (synthesis, snapshot);
-        if matches!(selection, SpeechSelector::Defaults(_)) { Ok(None) } else { Err(Error::Invalid) }
+        if matches!(selection, SpeechSelector::Defaults(_)) {
+            Ok(None)
+        } else {
+            Err(Error::Invalid)
+        }
     }
     /// Check pinned direction and format without opening a provider connection.
     fn preflight(&self, _input: Format, _snapshot: bool) -> Result<(), Error> {
@@ -38,6 +47,10 @@ pub trait SpeechBackend: Send + Sync {
     ) -> Result<(Producer, super::snapshot::SnapshotReader), Error>;
     /// Synthesize committed input text into raw 24 kHz mono PCM output.
     fn synthesize(&self, input: Reader, output: Writer) -> Result<Producer, Error>;
+    /// Finalize each committed text packet separately, preserving ordered PCM output.
+    fn synthesize_utterances(&self, _input: Reader, _output: Writer) -> Result<Producer, Error> {
+        Err(Error::Invalid)
+    }
 }
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(untagged)]
@@ -47,10 +60,14 @@ pub enum SpeechSelector {
 }
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DefaultSpeechSelection { pub from: DefaultSource }
+pub struct DefaultSpeechSelection {
+    pub from: DefaultSource,
+}
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum DefaultSource { Defaults }
+pub enum DefaultSource {
+    Defaults,
+}
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSpeechSelection {
@@ -61,29 +78,81 @@ pub struct ExactSpeechSelection {
     pub rate: Option<f64>,
 }
 impl Default for SpeechSelector {
-    fn default() -> Self { Self::Defaults(DefaultSpeechSelection { from: DefaultSource::Defaults }) }
+    fn default() -> Self {
+        Self::Defaults(DefaultSpeechSelection {
+            from: DefaultSource::Defaults,
+        })
+    }
 }
 
 /// Per-operation resolution retains the invocation revision across catalog reloads.
 pub struct CatalogSpeech(pub Arc<crate::resource_catalog::AgentDefinitionSnapshot>);
 impl SpeechBackend for CatalogSpeech {
-    fn select(&self, selection: &SpeechSelector, synthesis: bool, snapshot: bool) -> Result<Option<Arc<dyn SpeechBackend>>, Error> {
+    fn select(
+        &self,
+        selection: &SpeechSelector,
+        synthesis: bool,
+        snapshot: bool,
+    ) -> Result<Option<Arc<dyn SpeechBackend>>, Error> {
         use waltr::grpc::waltr::config::v1::{ModelType, SpeechSelection};
         let configuration = self.0.configuration();
         let selection = match selection {
             SpeechSelector::Defaults(_) => {
-                let defaults = configuration.speech_defaults.as_ref().ok_or(Error::Invalid)?;
-                (if synthesis { &defaults.tts } else if snapshot { &defaults.diarize } else { &defaults.stt }).clone().ok_or(Error::Invalid)?
+                let defaults = configuration
+                    .speech_defaults
+                    .as_ref()
+                    .ok_or(Error::Invalid)?;
+                (if synthesis {
+                    &defaults.tts
+                } else if snapshot {
+                    &defaults.diarize
+                } else {
+                    &defaults.stt
+                })
+                .clone()
+                .ok_or(Error::Invalid)?
             }
-            SpeechSelector::Exact(selection) => SpeechSelection { provider: selection.provider.clone(), model: selection.model.clone(), voice: selection.voice.clone(), language: selection.language.clone(), rate: selection.rate },
+            SpeechSelector::Exact(selection) => SpeechSelection {
+                provider: selection.provider.clone(),
+                model: selection.model.clone(),
+                voice: selection.voice.clone(),
+                language: selection.language.clone(),
+                rate: selection.rate,
+            },
         };
-        let resolved = crate::resource_catalog::speech::resolve_selection(configuration, &selection, if synthesis { ModelType::Tts } else { ModelType::Stt }, snapshot).map_err(|_| Error::Invalid)?;
-        let backend = if synthesis { GoogleSpeech::new(None, Some(resolved)) } else if snapshot { GoogleSpeech::with_recognition_selections(None, Some(resolved), None) } else { GoogleSpeech::new(Some(resolved), None) }?;
+        let resolved = crate::resource_catalog::speech::resolve_selection(
+            configuration,
+            &selection,
+            if synthesis {
+                ModelType::Tts
+            } else {
+                ModelType::Stt
+            },
+            snapshot,
+        )
+        .map_err(|_| Error::Invalid)?;
+        let backend = if synthesis {
+            GoogleSpeech::new(None, Some(resolved))
+        } else if snapshot {
+            GoogleSpeech::with_recognition_selections(None, Some(resolved), None)
+        } else {
+            GoogleSpeech::new(Some(resolved), None)
+        }?;
         Ok(Some(Arc::new(backend)))
     }
-    fn transcribe(&self, _: Reader, _: Writer) -> Result<Producer, Error> { Err(Error::Invalid) }
-    fn transcribe_snapshot(&self, _: Reader, _: super::snapshot::Workspace) -> Result<(Producer, super::snapshot::SnapshotReader), Error> { Err(Error::Invalid) }
-    fn synthesize(&self, _: Reader, _: Writer) -> Result<Producer, Error> { Err(Error::Invalid) }
+    fn transcribe(&self, _: Reader, _: Writer) -> Result<Producer, Error> {
+        Err(Error::Invalid)
+    }
+    fn transcribe_snapshot(
+        &self,
+        _: Reader,
+        _: super::snapshot::Workspace,
+    ) -> Result<(Producer, super::snapshot::SnapshotReader), Error> {
+        Err(Error::Invalid)
+    }
+    fn synthesize(&self, _: Reader, _: Writer) -> Result<Producer, Error> {
+        Err(Error::Invalid)
+    }
 }
 
 /// Bounded adapters with explicitly pinned endpoint and speech settings.
@@ -506,7 +575,21 @@ impl SpeechBackend for GoogleSpeech {
             result
         }))
     }
-    fn synthesize(&self, input: Reader, mut output: Writer) -> Result<Producer, Error> {
+    fn synthesize(&self, input: Reader, output: Writer) -> Result<Producer, Error> {
+        self.synthesize_mode(input, output, false)
+    }
+    fn synthesize_utterances(&self, input: Reader, output: Writer) -> Result<Producer, Error> {
+        self.synthesize_mode(input, output, true)
+    }
+}
+
+impl GoogleSpeech {
+    fn synthesize_mode(
+        &self,
+        input: Reader,
+        mut output: Writer,
+        utterances: bool,
+    ) -> Result<Producer, Error> {
         let resolved = self.synthesis.as_ref().ok_or(Error::Invalid)?;
         let SpeechSettings::Synthesis(options) = &resolved.settings else {
             return Err(Error::Invalid);
@@ -531,99 +614,162 @@ impl SpeechBackend for GoogleSpeech {
         let endpoint = resolved.endpoint.clone();
         let options = options.clone();
         let state = input.text_state();
+        let input = Arc::new(tokio::sync::Mutex::new(input));
         Ok(Producer::spawn(cancel.clone(), async move {
             let _workspace = workspace;
             let result = async {
                 let client = connect(endpoint, deadline, &cancel).await?;
-                let status = Arc::new(InputStatus::default());
-                let source = stream::try_unfold(
-                    (input, state, 0, status.clone()),
-                    |(mut input, mut state, mut next, status)| async move {
-                        loop {
-                            if let Some(text) = state.committed_at(next) {
-                                let message = tts::StreamingSynthesisInput {
-                                    input_source: Some(
-                                        tts::streaming_synthesis_input::InputSource::Text(
-                                            text.to_owned(),
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                };
-                                next += 1;
-                                return Ok(Some((message, (input, state, next, status))));
-                            }
-                            match input.read().await.map_err(|e| status.fail(e))? {
-                                Some(packet) => {
-                                    state.accept(packet.chunk()).map_err(|e| status.fail(e))?
-                                }
-                                None => {
-                                    state.close().map_err(|e| status.fail(e))?;
+                let mut state = Some(state);
+                loop {
+                    let status = Arc::new(InputStatus::default());
+                    let source: std::pin::Pin<
+                        Box<
+                            dyn futures_util::Stream<
+                                    Item = Result<
+                                        tts::StreamingSynthesisInput,
+                                        waltr_audio::error::Error,
+                                    >,
+                                > + Send,
+                        >,
+                    > = if utterances {
+                        let Some(packet) = input.lock().await.read_utterance().await? else {
+                            break;
+                        };
+                        let Chunk::Text(text) = packet.chunk() else {
+                            return Err(Error::Invalid);
+                        };
+                        if !text.committed || text.replace || text.text.trim().is_empty() {
+                            return Err(Error::Invalid);
+                        }
+                        let status = status.clone();
+                        Box::pin(stream::unfold(Some(packet), move |packet| {
+                            let status = status.clone();
+                            async move {
+                                let Some(packet) = packet else {
                                     status.closed.store(true, Ordering::Release);
-                                    return Ok(None);
+                                    return None;
+                                };
+                                let Chunk::Text(text) = packet.chunk() else {
+                                    unreachable!()
+                                };
+                                Some((
+                                    Ok(tts::StreamingSynthesisInput {
+                                        input_source: Some(
+                                            tts::streaming_synthesis_input::InputSource::Text(
+                                                text.text.clone(),
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    }),
+                                    None,
+                                ))
+                            }
+                        }))
+                    } else {
+                        Box::pin(stream::try_unfold(
+                            (
+                                input.clone(),
+                                state.take().ok_or(Error::Invalid)?,
+                                0,
+                                status.clone(),
+                            ),
+                            |(input, mut state, mut next, status)| async move {
+                                loop {
+                                    if let Some(text) = state.committed_at(next) {
+                                        let message = tts::StreamingSynthesisInput {
+                                            input_source: Some(
+                                                tts::streaming_synthesis_input::InputSource::Text(
+                                                    text.to_owned(),
+                                                ),
+                                            ),
+                                            ..Default::default()
+                                        };
+                                        next += 1;
+                                        return Ok(Some((message, (input, state, next, status))));
+                                    }
+                                    match input
+                                        .lock()
+                                        .await
+                                        .read()
+                                        .await
+                                        .map_err(|e| status.fail(e))?
+                                    {
+                                        Some(packet) => state
+                                            .accept(packet.chunk())
+                                            .map_err(|e| status.fail(e))?,
+                                        None => {
+                                            state.close().map_err(|e| status.fail(e))?;
+                                            status.closed.store(true, Ordering::Release);
+                                            return Ok(None);
+                                        }
+                                    }
+                                }
+                            },
+                        ))
+                    };
+                    let config = tts::StreamingSynthesizeConfig {
+                        voice: Some(tts::VoiceSelectionParams {
+                            name: options.voice.clone(),
+                            language_code: options.language_code.clone(),
+                            model_name: options.model_name.clone().unwrap_or_default(),
+                            ..Default::default()
+                        }),
+                        streaming_audio_config: Some(tts::StreamingAudioConfig {
+                            audio_encoding: tts::AudioEncoding::Pcm as i32,
+                            sample_rate_hertz: 24000,
+                            speaking_rate: options.speaking_rate.unwrap_or(1.0),
+                        }),
+                        ..Default::default()
+                    };
+                    let mut responses = client
+                        .streaming_synthesize(config, source, cancel.clone())
+                        .map_err(|e| status.error(e))?;
+                    let work = tokio::time::timeout_at(deadline, async {
+                        let mut odd = None;
+                        while let Some(response) = tokio::time::timeout(idle, responses.next())
+                            .await
+                            .map_err(|_| Error::Deadline)?
+                        {
+                            let bytes = response.map_err(|e| status.error(e))?.audio_content;
+                            let mut at = 0;
+                            if let Some(previous) = odd.take() {
+                                if let Some(first) = bytes.first() {
+                                    output
+                                        .write(output.key(), Chunk::Audio(vec![previous, *first]))
+                                        .await?;
+                                    at = 1;
+                                } else {
+                                    odd = Some(previous);
                                 }
                             }
-                        }
-                    },
-                );
-                let config = tts::StreamingSynthesizeConfig {
-                    voice: Some(tts::VoiceSelectionParams {
-                        name: options.voice,
-                        language_code: options.language_code,
-                        model_name: options.model_name.unwrap_or_default(),
-                        ..Default::default()
-                    }),
-                    streaming_audio_config: Some(tts::StreamingAudioConfig {
-                        audio_encoding: tts::AudioEncoding::Pcm as i32,
-                        sample_rate_hertz: 24000,
-                        speaking_rate: options.speaking_rate.unwrap_or(1.0),
-                    }),
-                    ..Default::default()
-                };
-                let mut responses = client
-                    .streaming_synthesize(config, source, cancel.clone())
-                    .map_err(|e| status.error(e))?;
-                let work = tokio::time::timeout_at(deadline, async {
-                    let mut odd = None;
-                    while let Some(response) = tokio::time::timeout(idle, responses.next())
-                        .await
-                        .map_err(|_| Error::Deadline)?
-                    {
-                        let bytes = response.map_err(|e| status.error(e))?.audio_content;
-                        let mut at = 0;
-                        if let Some(previous) = odd.take() {
-                            if let Some(first) = bytes.first() {
+                            let end = at + (bytes.len() - at) / 2 * 2;
+                            for chunk in bytes[at..end].chunks(65536) {
                                 output
-                                    .write(output.key(), Chunk::Audio(vec![previous, *first]))
+                                    .write(output.key(), Chunk::Audio(chunk.to_vec()))
                                     .await?;
-                                at = 1;
-                            } else {
-                                odd = Some(previous);
+                            }
+                            if end < bytes.len() {
+                                odd = Some(bytes[end]);
                             }
                         }
-                        let end = at + (bytes.len() - at) / 2 * 2;
-                        for chunk in bytes[at..end].chunks(65536) {
-                            output
-                                .write(output.key(), Chunk::Audio(chunk.to_vec()))
-                                .await?;
+                        if odd.is_some() {
+                            return Err(Error::Invalid);
                         }
-                        if end < bytes.len() {
-                            odd = Some(bytes[end]);
-                        }
+                        status.finish()
+                    })
+                    .await
+                    .unwrap_or(Err(Error::Deadline));
+                    let joined = if work.is_err() {
+                        responses.cancel_and_join().await
+                    } else {
+                        responses.finish().await
+                    };
+                    joined.map_err(|_| Error::Worker)?;
+                    work?;
+                    if !utterances {
+                        break;
                     }
-                    if odd.is_some() {
-                        return Err(Error::Invalid);
-                    }
-                    status.finish()
-                })
-                .await
-                .unwrap_or(Err(Error::Deadline));
-                let joined = if work.is_err() {
-                    responses.cancel_and_join().await
-                } else {
-                    responses.finish().await
-                };
-                joined.map_err(|_| Error::Worker)?;
-                work?;
+                }
                 output.close(output.key()).await
             }
             .await;

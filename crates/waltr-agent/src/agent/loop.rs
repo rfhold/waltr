@@ -1842,6 +1842,16 @@ where
         if !self.session_initialized {
             return Ok(());
         }
+        let operation = match &self.session_run_context {
+            Some(context) => Some(context.operation().await),
+            None => None,
+        };
+        if operation
+            .as_ref()
+            .is_some_and(|operation| Some(operation.incarnation()) != self.session_incarnation)
+        {
+            return Ok(());
+        }
         let record = self.session_runtime().interrupt(&self.session_id).await?;
         self.hydrate_from_record(&record)?;
         self.close_turn_span("interrupted");

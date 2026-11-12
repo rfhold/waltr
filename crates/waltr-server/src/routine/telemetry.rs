@@ -66,6 +66,7 @@ pub(crate) fn script_category(error: waltr_script::Error) -> &'static str {
 pub(crate) fn host_method(method: &str) -> &'static str {
     match method {
         "helper.run" => "helper.run",
+        "helper.next" => "helper.next",
         "tools.execute" => "tools.execute",
         "tools.schemas" => "tools.schemas",
         "context.snapshot" => "context.snapshot",
@@ -79,6 +80,7 @@ pub(crate) fn host_method(method: &str) -> &'static str {
         "children.call" => "children.call",
         "media.collect" => "media.collect",
         "media.read" => "media.read",
+        "media.readText" => "media.readText",
         "media.select" => "media.select",
         "media.publish" => "media.publish",
         "media.finish" => "media.finish",
@@ -87,6 +89,9 @@ pub(crate) fn host_method(method: &str) -> &'static str {
         "media.tee" => "media.tee",
         "media.lease" => "media.lease",
         "media.synthesize" => "media.synthesize",
+        "media.text.open" => "media.text.open",
+        "media.text.write" => "media.text.write",
+        "media.text.close" => "media.text.close",
         "media.transcribe" => "media.transcribe",
         "media.proposal.read" => "media.proposal.read",
         _ => "unknown",

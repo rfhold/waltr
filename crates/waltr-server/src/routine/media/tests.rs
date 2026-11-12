@@ -931,6 +931,160 @@ async fn synthetic_hour_notes_retention_is_bounded_and_collection_caps_fail_clos
 }
 
 #[tokio::test]
+async fn utterances_finalize_before_later_text_and_keep_one_ordered_output() {
+    let (_, server) = fixtures::start(fixtures::Mode::Ok, Duration::from_secs(10)).await;
+    let s = streams(Limits::default());
+    let (mut input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
+    let (output, mut reader) = s.open(Direction::Output, pcm(), false).unwrap();
+    let owner = backend(&server.endpoint, false)
+        .synthesize_utterances(source, output)
+        .unwrap();
+    for (id, sentence) in [("a", "First sentence."), ("b", "Second sentence.")] {
+        input
+            .write(input.key(), text(id, sentence, false, true))
+            .await
+            .unwrap();
+        for sample in [0, 1] {
+            let packet = tokio::time::timeout(Duration::from_secs(2), reader.read())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(packet.chunk(), Chunk::Audio(bytes) if bytes == &[sample, 0]));
+        }
+        // The tail requires request EOF; the next sentence has not been sent yet.
+        assert!(!s.cancellation().is_cancelled());
+    }
+    input.close(input.key()).await.unwrap();
+    assert!(reader.read().await.unwrap().is_none());
+    joined(owner).await.unwrap();
+    assert_eq!(server.synthesis_capture.lock().unwrap().len(), 2);
+    drop(input);
+    drop(reader);
+    assert_eq!(s.retained_bytes(), 0);
+}
+
+#[tokio::test]
+async fn utterances_allow_research_gaps_but_keep_the_absolute_deadline() {
+    let (_, server) = fixtures::start(fixtures::Mode::Ok, Duration::from_secs(10)).await;
+    let s = streams(Limits {
+        idle: Duration::from_millis(100),
+        input_duration: Duration::from_secs(5),
+        total_duration: Duration::from_secs(5),
+        ..Limits::default()
+    });
+    let (mut input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
+    let (output, mut reader) = s.open(Direction::Output, pcm(), false).unwrap();
+    let owner = backend(&server.endpoint, false)
+        .synthesize_utterances(source, output)
+        .unwrap();
+    for (id, sentence) in [("a", "First sentence."), ("b", "Final sentence.")] {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!s.cancellation().is_cancelled());
+        input
+            .write(input.key(), text(id, sentence, false, true))
+            .await
+            .unwrap();
+        for sample in [0, 1] {
+            let packet = reader.read().await.unwrap().unwrap();
+            assert!(matches!(packet.chunk(), Chunk::Audio(bytes) if bytes == &[sample, 0]));
+        }
+    }
+    input.close(input.key()).await.unwrap();
+    assert!(reader.read().await.unwrap().is_none());
+    joined(owner).await.unwrap();
+    assert_eq!(server.synthesis_capture.lock().unwrap().len(), 2);
+    drop(input);
+    drop(reader);
+    assert_eq!(s.retained_bytes(), 0);
+
+    let s = streams(Limits {
+        idle: Duration::from_millis(50),
+        input_duration: Duration::from_millis(200),
+        total_duration: Duration::from_millis(200),
+        ..Limits::default()
+    });
+    let (input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
+    let (output, reader) = s.open(Direction::Output, pcm(), false).unwrap();
+    let owner = backend(&server.endpoint, false)
+        .synthesize_utterances(source, output)
+        .unwrap();
+    assert_eq!(joined(owner).await, Err(Error::Deadline));
+    assert!(s.cancellation().is_cancelled());
+    drop(input);
+    drop(reader);
+    assert_eq!(s.retained_bytes(), 0);
+}
+
+#[tokio::test]
+async fn utterances_cancel_joins_with_backpressured_audio_without_starting_next_request() {
+    let (_, server) = fixtures::start(fixtures::Mode::Ok, Duration::from_secs(10)).await;
+    let s = streams(Limits {
+        edge_chunks: 1,
+        ..Limits::default()
+    });
+    let (mut input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
+    let (output, mut reader) = s.open(Direction::Output, pcm(), false).unwrap();
+    let owner = backend(&server.endpoint, false)
+        .synthesize_utterances(source, output)
+        .unwrap();
+    input
+        .write(input.key(), text("a", "First sentence.", false, true))
+        .await
+        .unwrap();
+    let packet = reader.read().await.unwrap().unwrap();
+    input
+        .write(input.key(), text("b", "Second sentence.", false, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), owner.cancel_and_join())
+            .await
+            .unwrap(),
+        Err(Error::Cancelled)
+    );
+    assert_eq!(server.synthesis_capture.lock().unwrap().len(), 1);
+    drop(packet);
+    drop(input);
+    drop(reader);
+    assert_eq!(s.retained_bytes(), 0);
+}
+
+#[tokio::test]
+async fn utterances_cancel_joins_between_updates_and_provider_failures_stop_output() {
+    for mode in [fixtures::Mode::Ok, fixtures::Mode::TerminalFail] {
+        let (_, server) = fixtures::start(mode, Duration::from_secs(10)).await;
+        let s = streams(Limits::default());
+        let (mut input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
+        let (output, mut reader) = s.open(Direction::Output, pcm(), false).unwrap();
+        let owner = backend(&server.endpoint, false)
+            .synthesize_utterances(source, output)
+            .unwrap();
+        input
+            .write(input.key(), text("a", "First sentence.", false, true))
+            .await
+            .unwrap();
+        let result = if matches!(mode, fixtures::Mode::Ok) {
+            for _ in 0..2 {
+                drop(reader.read().await.unwrap().unwrap());
+            }
+            tokio::time::timeout(Duration::from_secs(2), owner.cancel_and_join())
+                .await
+                .unwrap()
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), owner.join())
+                .await
+                .unwrap()
+        };
+        assert!(result.is_err());
+        assert!(s.cancellation().is_cancelled());
+        drop(input);
+        drop(reader);
+        assert_eq!(s.retained_bytes(), 0);
+    }
+}
+
+#[tokio::test]
 async fn genuine_audio_cancel_joins_while_output_credit_is_checked_out() {
     let (_, server) = fixtures::start(fixtures::Mode::Media, Duration::from_secs(10)).await;
     let s = streams(Limits {
@@ -1201,9 +1355,7 @@ async fn synthesis_model_name_reaches_wire_and_omission_preserves_default() {
         let s = streams(Limits::default());
         let (mut input, source) = s.open(Direction::Input, Format::Text, false).unwrap();
         let (output, mut reader) = s.open(Direction::Output, pcm(), false).unwrap();
-        let owner = speech
-            .synthesize(source, output)
-            .unwrap();
+        let owner = speech.synthesize(source, output).unwrap();
         input
             .write(input.key(), text("a", "hello", true, true))
             .await

@@ -1,0 +1,85 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: audio-ask-and-speak
+description: Search the web and stream spoken findings until the answer is verified or research limits are reached.
+spec:
+  source: |
+    export default async function () {
+      const transcript = await host.call('media.collect', {port: 'question', cap: 4096, speech: {provider: 'whispers', model: 'dictation'}});
+      const question = await host.call('media.readText', {max: 4096}, null, null, transcript);
+      if (!question.trim()) throw new Error('question required');
+      const feed = await host.call('media.text.open', {});
+      const speech = host.call('media.synthesize', {output: 'audio', utterances: true, speech: {provider: 'whispers-tts', model: 'reader'}}, null, null, feed);
+      const helper = host.call('helper.run', {
+        selection: {kind: 'named', name: 'routine-research-answer'},
+        inference: {from: 'defaults'}, task: question,
+        maxTurns: 40, deadlineMs: 180000, responseBytes: 8192, completionBytes: 2097152
+      });
+      const consume = (async () => {
+        while (true) {
+          const next = await host.call('helper.next', {stream: 'speech'});
+          if (next.value === null) break;
+          await host.call('media.text.write', {text: next.value.arguments.text}, null, null, feed);
+        }
+        await host.call('media.text.close', {}, null, null, feed);
+      })();
+      const completed = await Promise.all([helper, consume, speech]);
+      const result = completed[0];
+      const answer = await host.call('media.readText', {field: 'response', max: 8192}, null, null, result);
+      await host.call('media.publish', {name: 'answer'}, null, null, result);
+      await host.call('media.finish', {});
+      return {answer};
+    }
+  entrypoints:
+    ask:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties: {}
+      required: []
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        answer: {type: string, maxLength: 8192}
+      required: [answer]
+  capabilities:
+  - media.execute
+  - helper.run
+  - helper.named.routine-research-answer
+  - helper.streams
+  toolStreams:
+    speech:
+      selection: {kind: named, name: routine-research-answer}
+      tool: speak
+      description: Queue a brief research finding or final conclusion for speech; success means queued, not heard.
+      maxCalls: 4
+      maxBytes: 16384
+      contract:
+        schemaVersion: waltr.value/v1
+        schema:
+          type: object
+          properties: {text: {type: string, maxLength: 1024}}
+          required: [text]
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 256
+    inFlight: 16
+    deadlineMs: 300000
+  ports:
+    question:
+      direction: input
+      media: audio
+      required: true
+      maxBytes: 5760000
+      formats: [pcm16le-24000-mono]
+    audio:
+      direction: output
+      media: audio
+      required: true
+      maxBytes: 16777216
+      formats: [pcm16le-24000-mono]

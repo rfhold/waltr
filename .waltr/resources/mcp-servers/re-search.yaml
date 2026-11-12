@@ -1,0 +1,7 @@
+apiVersion: waltr.dev/v1alpha1
+kind: McpServer
+metadata:
+  name: re-search
+spec:
+  transport: streamableHttp
+  url: https://re-search.holdenitdown.net/mcp

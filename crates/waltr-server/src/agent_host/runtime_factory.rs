@@ -729,21 +729,32 @@ impl ServerAgentRuntimeFactory {
         builder
     }
 
-    /// Project a pinned helper's policy without building providers or connecting MCP.
-    /// Reserved host capture tools are not members of MCP feature tool sets.
     pub(crate) fn helper_capture_policy(
         &self,
         bundle: &AgentDefinitionBundle,
+    ) -> Result<PermissionPolicy, AgentSessionRuntimeError> {
+        self.helper_host_tool_policy(bundle, "_helper_capture")
+    }
+
+    /// Project one exact host tool without building providers or connecting MCP.
+    /// Invocation tools are not members of definition feature tool sets.
+    pub(crate) fn helper_host_tool_policy(
+        &self,
+        bundle: &AgentDefinitionBundle,
+        tool: &str,
     ) -> Result<PermissionPolicy, AgentSessionRuntimeError> {
         let definition = bundle.resolve().map_err(|_| {
             AgentSessionRuntimeError::FailedPrecondition("invalid pinned helper definition".into())
         })?;
         let mut policy = PermissionPolicy::new(PermissionLevel::Deny);
+        let target = format!("builtin:{tool}");
         for entry in &definition.permissions {
-            if !matches!(&entry.selector, AgentPermissionSelector::Name(name) if name == "_helper_capture") {
+            let AgentPermissionSelector::Name(name) = &entry.selector else {
                 continue;
+            };
+            if name == tool || name == &target {
+                policy = self.apply_definition_permission(policy, name.clone(), &entry.permission);
             }
-            policy = self.apply_definition_permission(policy, "_helper_capture".into(), &entry.permission);
         }
         Ok(match &self.restriction {
             Some(restriction) => policy.intersection(restriction.clone()),
@@ -1734,6 +1745,75 @@ mod tests {
                 let projected = factory.helper_capture_policy(&bundle).unwrap();
                 assert_eq!(projected.evaluate_tool("_helper_capture"), expected.evaluate_tool("_helper_capture"));
                 assert_eq!(projected.evaluate_tool("shell"), PermissionLevel::Deny);
+            }
+        }
+    }
+
+    #[test]
+    fn helper_host_tool_projection_includes_exact_target_and_factory_restrictions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let model = ModelRef::new(ProviderId::OpenAi, "test", ModelApi::OpenAiResponses);
+        for tool in ["_helper_capture", "speak"] {
+            let target = format!("builtin:{tool}");
+            for permissions in [
+                "[]".to_owned(),
+                format!("[{{name: {tool}, permission: allow}}]"),
+                format!("[{{name: {tool}, permission: ask}}]"),
+                format!("[{{name: {tool}, permission: deny}}]"),
+                format!(
+                    "[{{name: {tool}, permission: allow}}, {{name: '{target}', permission: deny}}]"
+                ),
+            ] {
+                let source = format!(
+                    "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: test}}\nspec:\n  permissions: {permissions}\n"
+                );
+                let bundle = AgentDefinitionBundle::new("test", vec![source]);
+                let definition = bundle.resolve().unwrap();
+                for restriction in [
+                    PermissionPolicy::new(PermissionLevel::Allow),
+                    PermissionPolicy::new(PermissionLevel::Ask),
+                    PermissionPolicy::new(PermissionLevel::Deny),
+                    PermissionPolicy::new(PermissionLevel::Allow).with_tool_rule(
+                        PermissionToolSelector::exact(tool),
+                        PermissionEffect::deny(),
+                    ),
+                    PermissionPolicy::new(PermissionLevel::Allow).with_tool_rule(
+                        PermissionToolSelector::exact(&target),
+                        PermissionEffect::deny(),
+                    ),
+                    PermissionPolicy::new(PermissionLevel::Allow).with_tool_rule(
+                        PermissionToolSelector::exact(&target),
+                        PermissionEffect::ask(),
+                    ),
+                ] {
+                    let factory = ServerAgentRuntimeFactory::new(
+                        crate::agent_host::sandbox_gateway::SandboxGateway::new("test".into())
+                            .handle(),
+                        root.clone(),
+                        FileCredentialStore::new(root.join("auth.json")),
+                        definition.clone(),
+                    )
+                    .with_permission_restriction(restriction.clone());
+                    let expected = factory
+                        .definition_permission_policy(&definition, &model, &[])
+                        .intersection(restriction);
+                    let projected = factory.helper_host_tool_policy(&bundle, tool).unwrap();
+                    assert_eq!(
+                        projected.evaluate_target_tool_effect(&target, tool),
+                        expected.evaluate_target_tool_effect(&target, tool)
+                    );
+                    assert_eq!(projected.evaluate_tool("unrelated"), PermissionLevel::Deny);
+                    if tool == "_helper_capture" {
+                        assert_eq!(
+                            factory
+                                .helper_capture_policy(&bundle)
+                                .unwrap()
+                                .evaluate_target_tool_effect(&target, tool),
+                            expected.evaluate_target_tool_effect(&target, tool)
+                        );
+                    }
+                }
             }
         }
     }

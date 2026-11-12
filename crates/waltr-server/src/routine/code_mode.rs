@@ -792,6 +792,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::Reservation
     fn finalize(&self, interrupted: bool) -> PortFuture<()> {
         self.inner.finalize(interrupted)
     }
+    fn validate_success(&self) -> Result<(), PortError> {
+        self.inner.validate_success()
+    }
 }
 struct CodePolicy<S: SessionStore + Clone + Send + Sync + 'static> {
     inner: Arc<dyn super::ports::OperationPolicy>,

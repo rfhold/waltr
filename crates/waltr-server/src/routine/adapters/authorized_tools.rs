@@ -201,6 +201,10 @@ impl HostFactory for RoutineAgentHostFactory {
             if !definition.envelope().spec.captures.is_empty() {
                 bound.helpers.preflight_captures().await?;
             }
+            let streams = super::tool_streams::ToolStreams::new(definition.envelope().spec.tool_streams.clone());
+            if !definition.envelope().spec.tool_streams.is_empty() {
+                bound.helpers.bind_tool_streams(streams.clone()).await?;
+            }
             let snapshot = context
                 .as_ref()
                 .and_then(|context| context.snapshot_identity())
@@ -214,6 +218,7 @@ impl HostFactory for RoutineAgentHostFactory {
                 invocation: std::sync::Mutex::new(None),
                 context,
                 children,
+                streams,
             });
             Ok(PreparedHost {
                 dispatcher: adapter.clone(),
@@ -229,6 +234,7 @@ fn known_capability(cap: &str) -> bool {
     matches!(
         cap,
         "helper.run"
+            | "helper.streams"
             | "helper.validate"
             | "tools.execute"
             | "tools.schemas"
@@ -252,6 +258,7 @@ fn known_capability(cap: &str) -> bool {
 }
 
 struct AgentHost {
+    streams: Arc<super::tool_streams::ToolStreams>,
     children: Option<Arc<dyn ChildPort>>,
     context: Option<Arc<dyn ContextPort>>,
     bindings: AdapterBindings,
@@ -332,6 +339,7 @@ struct ChildArguments {
 }
 
 enum Operation {
+    Next(super::tool_streams::Next),
     Children(ChildArguments),
     Context(ContextOperation),
     Helper(HelperArguments),
@@ -344,7 +352,7 @@ impl AgentHost {
         if self.cancellation.is_cancelled()
             || request.bytes.is_some()
             || request.handle.is_some()
-            || !self.capabilities.contains(&request.operation)
+            || !self.capabilities.contains(if request.operation == "helper.next" { "helper.streams" } else { &request.operation })
         {
             return Err(PortError::Denied);
         }
@@ -357,6 +365,12 @@ impl AgentHost {
             return Err(PortError::Invalid);
         }
         match request.operation.as_str() {
+            "helper.next" => {
+                if request.callback.is_some() { return Err(PortError::Invalid); }
+                let args: super::tool_streams::Next = serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
+                self.streams.check(&args.stream)?;
+                Ok(Operation::Next(args))
+            }
             "children.call" => {
                 if request.callback.is_some() {
                     return Err(PortError::Invalid);
@@ -455,6 +469,7 @@ impl OperationPolicy for AgentHost {
             // These are entry/capability checks. Complete contextual agent policy is applied
             // exactly once by the executor, after durable intent and before concrete effects.
             Ok(match self.parse(request)? {
+                Operation::Next(_) => json!({"operation":"helper.next"}),
                 Operation::Context(operation) => json!({"operation":request.operation,
                     "context":self.context.as_ref().ok_or(PortError::Denied)?.intent(&operation)?}),
                 Operation::Children(args) => {
@@ -471,7 +486,7 @@ impl OperationPolicy for AgentHost {
     fn project_result(&self, name: &str, reply: &HostReply) -> Result<Option<Value>, PortError> {
         if !(matches!(
             name,
-            "helper.run" | "tools.execute" | "tools.schemas" | "children.call"
+            "helper.run" | "helper.next" | "tools.execute" | "tools.schemas" | "children.call"
         ) || name.starts_with("context.") && known_capability(name))
         {
             return Err(PortError::Denied);
@@ -509,8 +524,13 @@ impl HostDispatcher for AgentHost {
         let limits = self.limits.clone();
         let context = self.context.clone();
         let children = self.children.clone();
+        let streams = self.streams.clone();
         Box::pin(async move {
             let value = match operation.map_err(|_| waltr_script::Error::Denied)? {
+                Operation::Next(args) => {
+                    let value = streams.next(&args.stream, cancellation).await.map_err(|_| waltr_script::Error::Cleanup)?;
+                    json!({"status":"completed", "value":value})
+                }
                 Operation::Children(args) => {
                     let results = children
                         .ok_or(waltr_script::Error::Denied)?
@@ -619,6 +639,7 @@ impl HostDispatcher for AgentHost {
     }
 
     fn cleanup(&self, _: InvocationId) -> CleanupFuture {
+        self.streams.cancel();
         self.cancellation.cancel();
         let helpers = self.bindings.helpers.clone();
         let tools = self.bindings.tools.clone();
@@ -663,6 +684,7 @@ impl Reservation for JoinedReservation {
     fn abort(&self) -> PortFuture<()> {
         let host = self.0.clone();
         Box::pin(async move {
+            host.streams.cancel();
             host.cancellation.cancel();
             let (helper, tool, context, children) = tokio::join!(
                 host.bindings.helpers.cleanup(),
@@ -687,6 +709,9 @@ impl Reservation for JoinedReservation {
             host.cleaned.store(true, Ordering::Release);
             Ok(())
         })
+    }
+    fn validate_success(&self) -> Result<(), PortError> {
+        if self.0.streams.was_drained() { Ok(()) } else { Err(PortError::Invalid) }
     }
     fn finalize(&self, _: bool) -> PortFuture<()> {
         // Finalization is reached only after the engine has joined HostDispatcher::cleanup.

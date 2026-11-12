@@ -116,6 +116,9 @@ impl Reservation for SourceReservation {
     fn finalize(&self, interrupted: bool) -> PortFuture<()> {
         self.inner.finalize(interrupted)
     }
+    fn validate_success(&self) -> Result<(), PortError> {
+        self.inner.validate_success()
+    }
 }
 impl HostFactory for SourceFactory {
     fn preflight(

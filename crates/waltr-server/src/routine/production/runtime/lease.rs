@@ -168,4 +168,7 @@ impl Reservation for LeaseReservation {
     fn finalize(&self, interrupted: bool) -> PortFuture<()> {
         self.inner.finalize(interrupted)
     }
+    fn validate_success(&self) -> Result<(), PortError> {
+        self.inner.validate_success()
+    }
 }

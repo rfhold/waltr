@@ -4970,6 +4970,58 @@ spec: {}"
     }
 
     #[tokio::test]
+    async fn active_run_interruption_waits_for_the_session_mutation_gate() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider)).await;
+        let session_id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        let submission = sessions
+            .submit_prompt(
+                session_id.clone(),
+                "active",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+
+        let operation = sessions
+            .control
+            .session(session_id.clone())
+            .operation()
+            .await;
+        sessions.interrupt_active_run(&session_id).await;
+        let outcome = submission.handle.wait();
+        tokio::pin!(outcome);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut outcome)
+                .await
+                .is_err()
+        );
+        let interrupted = AgentSessionRuntime::new(&sessions.store)
+            .interrupt(&session_id)
+            .await
+            .unwrap();
+        drop(operation);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), outcome)
+            .await
+            .expect("interruption must join after the mutation gate is released")
+            .unwrap();
+        assert_eq!(outcome.status, interrupted.snapshot().status);
+        let record = sessions.store.load(&session_id).await.unwrap();
+        assert_eq!(record.execution_sequence, interrupted.execution_sequence);
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn shutdown_waits_for_active_run_cleanup() {
         let provider = Arc::new(QueuedPromptProvider::new());
         let sessions = runtime_sessions(Arc::clone(&provider)).await;

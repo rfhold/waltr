@@ -155,7 +155,7 @@ fn fill<T: Copy>(
             continue;
         }
         if queue.packets.is_empty() && !queue.ended {
-            queue.failed = true;
+            queue.active = false;
             *sample = convert(0);
             continue;
         }
@@ -629,7 +629,7 @@ mod tests {
         }
     }
     #[test]
-    fn f4_priming_is_not_an_underrun_but_active_gaps_are_failure() {
+    fn f4_playback_repriming_preserves_order_across_progress_gaps() {
         let (fence, queue) = fixture();
         let mut samples = [9i16; 2];
         fill(&mut samples, &queue, &fence, |s| s);
@@ -640,7 +640,22 @@ mod tests {
         assert_eq!(samples, [1, 2]);
         assert!(!queue.lock().unwrap().failed);
         fill(&mut samples, &queue, &fence, |s| s);
-        assert!(queue.lock().unwrap().failed);
+        assert_eq!(samples, [0, 0]);
+        assert!(!queue.lock().unwrap().failed);
+        assert!(!queue.lock().unwrap().active);
+        queue.lock().unwrap().packets.push_back(packet(3));
+        fill(&mut samples, &queue, &fence, |s| s);
+        assert_eq!(samples, [0, 0]);
+        queue.lock().unwrap().packets.push_back(packet(4));
+        fill(&mut samples, &queue, &fence, |s| s);
+        assert_eq!(samples, [3, 4]);
+        fill(&mut samples, &queue, &fence, |s| s);
+        assert!(!queue.lock().unwrap().failed);
+        queue.lock().unwrap().packets.push_back(packet(5));
+        queue.lock().unwrap().ended = true;
+        fill(&mut samples, &queue, &fence, |s| s);
+        assert_eq!(samples, [5, 0]);
+        assert!(!queue.lock().unwrap().failed);
     }
     #[test]
     fn f4_completion_retains_the_stream_until_last_scheduled_device_buffer() {

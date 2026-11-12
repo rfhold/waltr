@@ -62,6 +62,9 @@ pub struct Program {
     /// Resource-owned capture contracts bound to exact helper selections.
     #[serde(default)]
     pub captures: BTreeMap<String, CaptureContract>,
+    /// Invocation-local helper tools; declarations grant no tool permission.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_streams: BTreeMap<String, ToolStream>,
     /// Captured per-invocation ceilings.
     #[serde(default)]
     pub budgets: Budgets,
@@ -203,6 +206,23 @@ pub struct CaptureContract {
     pub selection: super::ports::HelperSelection,
     /// Bounded supported value dialect.
     pub contract: Contract,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+/// One bounded mailbox with a single helper producer.
+pub struct ToolStream {
+    /// Exact helper selection allowed to claim this stream once.
+    pub selection: super::ports::HelperSelection,
+    /// Exact normal builtin tool name, subject to ordinary helper permissions.
+    pub tool: String,
+    /// Model-facing tool description.
+    pub description: String,
+    /// Complete post-policy argument contract.
+    pub contract: Contract,
+    /// Maximum queued calls, 1..=16.
+    pub max_calls: usize,
+    /// Maximum queued encoded call bytes, 1..=65536, within the value budget.
+    pub max_bytes: usize,
 }
 /// Closed, bounded value schema, not JSON Schema. Unsupported keywords are errors.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -445,6 +465,36 @@ impl Definition {
         }
         spec.parameters.validate()?;
         spec.result.validate()?;
+        if spec.tool_streams.len() > 16 {
+            return Err(DefinitionError("tool stream declaration budget exceeded"));
+        }
+        let mut tools = BTreeSet::new();
+        for (name, stream) in &spec.tool_streams {
+            let selection = match &stream.selection {
+                super::ports::HelperSelection::Named { name } if identifier(name) => {
+                    format!("helper.named.{name}")
+                }
+                super::ports::HelperSelection::Restricted { profile } if identifier(profile) => {
+                    format!("helper.restricted.{profile}")
+                }
+                _ => return Err(DefinitionError("invalid tool stream selection")),
+            };
+            if !identifier(name)
+                || !identifier(&stream.tool)
+                || stream.tool.starts_with('_')
+                || !tools.insert(&stream.tool)
+                || stream.description.len() > 4096
+                || !(1..=16).contains(&stream.max_calls)
+                || !(1..=65536).contains(&stream.max_bytes)
+                || stream.max_bytes.saturating_add(64) > spec.budgets.value_bytes
+                || !spec.capabilities.contains("helper.streams")
+                || !spec.capabilities.contains("helper.run")
+                || !spec.capabilities.contains(&selection)
+            {
+                return Err(DefinitionError("invalid tool stream declaration"));
+            }
+            stream.contract.validate_capture()?;
+        }
         if spec.captures.len() > 32 {
             return Err(DefinitionError("capture declaration budget exceeded"));
         }
@@ -545,6 +595,52 @@ mod nullable_tests {
 
     fn contract(schema: Value) -> Contract {
         serde_json::from_value(json!({"schemaVersion":SCHEMA_VERSION,"schema":schema})).unwrap()
+    }
+    #[test]
+    fn tool_streams_strict_declarations_and_empty_revision_compatibility() {
+        let engine = waltr_script::Engine::new(1).unwrap();
+        let mut envelope: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/routines/title.json")).unwrap();
+        let old = Definition::parse(&envelope.to_string(), &engine).unwrap();
+        envelope["spec"]["toolStreams"] = json!({});
+        assert_eq!(
+            old.revision(),
+            Definition::parse(&envelope.to_string(), &engine)
+                .unwrap()
+                .revision()
+        );
+        envelope["spec"]["capabilities"] =
+            json!(["helper.run", "helper.named.writer", "helper.streams"]);
+        envelope["spec"]["captures"] = json!({});
+        envelope["spec"]["toolStreams"] = json!({"output":{
+            "selection":{"kind":"named","name":"writer"},"tool":"speak","description":"Queue text",
+            "contract":{"schemaVersion":SCHEMA_VERSION,"schema":{"type":"object","properties":{"text":{"type":"string","maxLength":128}},"required":["text"]}},
+            "maxCalls":4,"maxBytes":4096
+        }});
+        Definition::parse(&envelope.to_string(), &engine).unwrap();
+        for (field, value) in [
+            ("maxCalls", json!(0)),
+            ("maxCalls", json!(17)),
+            ("maxBytes", json!(0)),
+            ("maxBytes", json!(65536)),
+            ("tool", json!("_helper_capture")),
+            ("tool", json!("invalid name")),
+            ("selection", json!({"kind":"named","name":"foreign"})),
+            ("unexpected", json!(true)),
+        ] {
+            let mut invalid = envelope.clone();
+            invalid["spec"]["toolStreams"]["output"][field] = value;
+            assert!(
+                Definition::parse(&invalid.to_string(), &engine).is_err(),
+                "{field}"
+            );
+        }
+        let mut duplicate = envelope.clone();
+        duplicate["spec"]["toolStreams"]["duplicate"] =
+            envelope["spec"]["toolStreams"]["output"].clone();
+        assert!(Definition::parse(&duplicate.to_string(), &engine).is_err());
+        envelope["spec"]["capabilities"] = json!(["helper.run", "helper.named.writer"]);
+        assert!(Definition::parse(&envelope.to_string(), &engine).is_err());
     }
     #[test]
     fn capture_contract_is_resource_data_bounded_before_admission() {

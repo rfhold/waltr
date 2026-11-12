@@ -504,7 +504,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 });
                 let mut capabilities =
-                    BTreeSet::from(["helper.run".into(), "helper.validate".into()]);
+                    BTreeSet::from(["helper.run".into(), "helper.validate".into(), "helper.streams".into()]);
                 if !options.targets.is_empty() {
                     capabilities.extend(["tools.execute".into(), "tools.schemas".into()]);
                     capabilities.extend(options.targets.keys().cloned());

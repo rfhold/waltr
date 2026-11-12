@@ -68,7 +68,7 @@ Native `Interact` and browser split-lane attachment RPCs use the same service, p
 
 Media adapters own readers, writers, helper input, blobs, text and speech work through cancellation and join. Speech resolves each operation's JavaScript selector or catalog default; an unconfigured required speech direction fails closed. Non-speech media does not select a cloud provider implicitly. JavaScript selects normal helpers through explicit `helper.run` arguments: selection, task, capture, source, turns, deadline and response/completion budgets.
 
-`media.synthesize` accepts exactly one source: a committed-text `port` or any JavaScript `text` string within host-call, string and text byte bounds. Source validation precedes speech effects. String synthesis uses a bounded text stream with a joined feeder and speech producer; cancellation stops both. The `ask-and-speak` Routine waits for one tool-free `routine-answer` completion from inference defaults, then publishes text and streams speech through speech defaults. It copies no source history. `media.read` exposes completed response bytes through the helper's opaque invocation resource; JavaScript decodes those bytes before synthesis.
+`media.synthesize` accepts exactly one source: a committed-text `port`, a bounded JavaScript `text` string, or an opaque internal text-feed handle. Source validation precedes speech effects. String synthesis uses a bounded text stream with a joined feeder and speech producer; cancellation stops both. The `ask-and-speak` Routine waits for one tool-free `routine-answer` completion from inference defaults, then publishes text and streams speech through speech defaults. It copies no source history. `media.read` exposes completed response bytes through the helper's opaque invocation resource; JavaScript decodes those bytes before synthesis.
 
 `audio-ask-and-speak` collects one completed question transcript through STT defaults, then uses the same tool-free helper and TTS defaults.
 It retains `answer` and returns it in the result. Its only output port requires PCM audio; it emits no text stream or token preview.
@@ -86,6 +86,30 @@ Each invocation pins one catalog snapshot. Speech calls accept `speech: {from: '
 Helpers accept `input: {text: true, maxBytes: 8388608}`. The server enforces this 8 MiB maximum and validates model implementation capabilities. JavaScript declarations grant no image or PDF support, tools, credentials, or capture permission. The host resolves credentials from the pinned catalog. Catalog reloads affect subsequent invocations.
 
 Capture, playback and codec conversion belong to clients. Opaque upload/read grants do not expose native paths. Supported image/document inputs remain PNG, JPEG, WebP, PDF and UTF-8; video is excluded. Output leases are bounded, non-renewable and do not authorize replay. Durable selected text uses the accepted separate text-result budget, not an unbounded protobuf result.
+
+### Invocation-Local Helper Tools
+
+`spec.toolStreams` binds schema-defined tools to exact Routine-launched helper selections, within one invocation.
+Each selection claims its declared streams once; another helper cannot reuse that producer ownership.
+Declarations grant no permission. Normal helper policy, live Ask consent, middleware, durable fences, and result history control each call.
+The host validates effective arguments before queue admission and composes stream tools with the capture tool.
+Semantic completion callbacks remain independent.
+
+Tool success means queue admission, not consumer completion or delivery.
+Host-owned queues enforce count and encoded-event byte bounds; full queues apply cancelable backpressure.
+`helper.next` exposes ordered `{callId, tool, arguments}` events to the invocation's JavaScript.
+Normal helper completion closes the producer, and accepted events drain through explicit EOF within the invocation deadline.
+JavaScript must await its consumer and helper before return.
+Uncaught consumer failure fails the invocation; cancellation wakes queue waits and joins current helper/media owners.
+An early successful root with undrained calls fails invocation completion validation and preserves verified cleanup without capacity quarantine.
+Queues have no persistent subscription, attachment to another chat, delivery receipt, or restart replay.
+
+`media.text.open`, `media.text.write`, and `media.text.close` supply bounded committed segments to current synthesis machinery.
+The opaque feed belongs to one invocation and grants no external input name.
+Current media cleanup owns every feed operation and speech producer.
+The [speech example](../../examples/routines/streamed-speech.yaml) uses one synthesis call and a sequential event consumer.
+Its fake-backend test proves incremental segment consumption before helper completion, without credentials or audio devices.
+See the [script API](../../crates/waltr-server/src/routine/README.md#invocation-local-helper-tool-streams) for limits and lifecycle details.
 
 ### Bounds And Durable State
 

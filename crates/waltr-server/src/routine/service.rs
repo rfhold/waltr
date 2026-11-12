@@ -949,6 +949,11 @@ async fn execute(
     if !entered_engine {
         cleanup = prepared.reservation.abort().await.is_ok();
     }
+    if cleanup && status == Status::Succeeded && prepared.reservation.validate_success().is_err() {
+        super::telemetry::failure("result_validation", "value");
+        status = Status::Failed;
+        result = None;
+    }
     if !cleanup || failed.load(Ordering::Acquire) {
         super::telemetry::failure("cleanup", "cleanup");
         status = Status::Uncertain;

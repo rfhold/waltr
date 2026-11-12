@@ -23,6 +23,7 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-audio/tests/adapter.rs` and `tests/tls.rs` | Loopback speech method, container, cancellation, deadline, capacity, TLS rejection, and no-plaintext-fallback contracts. |
 | `crates/waltr-server/src/resource_catalog/state/tests.rs` | Strict JS contracts, rejection of old task envelopes, all eleven bundled/example definitions, named helpers, and last-good publication. |
 | `crates/waltr-server/src/routine/service/tests.rs` and `rpc/tests.rs` | Owned JavaScript execution, journal/effect ordering, native/browser streams, cancellation, bounded resources and authentication lifetime. |
+| `crates/waltr-server/src/routine/adapters/tool_streams*_tests.rs` | Invocation-local helper queue bounds, permissions, capture coexistence, drain, cancellation, and incremental synthesis through a fake backend. |
 | `crates/waltr-server/src/persistence/cutover_tests.rs` | Populated SQLite 13-to-14 retirement with real new history, session masks, configuration, OAuth and MCP records; the guarded explicit PostgreSQL fixture runs the same preservation checks. |
 | `crates/waltr-server/src/routine/production/runtime/tests.rs` | Actual standalone and embedded constructors, real JWT/browser/local admission, shared JS lifecycle, normal named helpers, opt-in code authority, and native interactive ownership. |
 | `crates/waltr-server/src/routine/rpc/tests.rs` | Native and browser finite-stream RPC, attachment/blob/text ownership, cancellation, and current authentication leases. |

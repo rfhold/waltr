@@ -1,0 +1,55 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: streamed-speech
+description: Speak schema-defined helper tool calls before the helper completes.
+spec:
+  entrypoints:
+    run: {trigger: interactive}
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema: {type: object, properties: {task: {type: string, maxLength: 8192}}, required: [task]}
+  result:
+    schemaVersion: waltr.value/v1
+    schema: {type: boolean}
+  capabilities: [media.execute, helper.run, helper.named.routine-speaker, helper.streams]
+  ports:
+    audio:
+      direction: output
+      media: audio
+      required: true
+      maxBytes: 16777216
+      formats: [pcm16le-24000-mono]
+  toolStreams:
+    speech:
+      selection: {kind: named, name: routine-speaker}
+      tool: speak
+      description: Queue one complete sentence for speech. Success means queued, not audible delivery.
+      maxCalls: 4
+      maxBytes: 16384
+      contract:
+        schemaVersion: waltr.value/v1
+        schema:
+          type: object
+          properties: {text: {type: string, maxLength: 2048}}
+          required: [text]
+  budgets: {valueBytes: 65536, resultBytes: 65536, hostCalls: 256, inFlight: 16, deadlineMs: 120000}
+  source: |
+    export default async function(input) {
+      const feed = await host.call('media.text.open', {});
+      const speech = host.call('media.synthesize', {output:'audio', speech:{provider:'whispers-tts',model:'reader'}}, null, null, feed);
+      const helper = host.call('helper.run', {
+        selection:{kind:'named',name:'routine-speaker'}, task:input.task,
+        maxTurns:16, deadlineMs:90000, responseBytes:65536, completionBytes:65536
+      });
+      const consume = (async () => {
+        while (true) {
+          const next = await host.call('helper.next', {stream:'speech'});
+          if (next.value === null) break;
+          await host.call('media.text.write', {text:next.value.arguments.text}, null, null, feed);
+        }
+        await host.call('media.text.close', {}, null, null, feed);
+      })();
+      await Promise.all([helper, consume, speech]);
+      await host.call('media.finish', {});
+      return true;
+    }

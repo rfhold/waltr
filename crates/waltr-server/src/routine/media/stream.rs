@@ -805,6 +805,13 @@ impl Reader {
     pub async fn read(&mut self) -> Result<Option<Packet>, Error> {
         self.read_with_idle(true).await
     }
+    /// Utterance producers may wait for research under the absolute deadline.
+    pub(super) async fn read_utterance(&mut self) -> Result<Option<Packet>, Error> {
+        if self.key.direction != Direction::Input || self.format() != Format::Text {
+            return Err(Error::Invalid);
+        }
+        self.read_with_idle(false).await
+    }
     /// RPC output may be deferred until input and helper work finish.
     pub(in crate::routine) async fn read_rpc_output(&mut self) -> Result<Option<Packet>, Error> {
         if self.key.direction != Direction::Output {
