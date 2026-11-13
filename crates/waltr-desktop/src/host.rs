@@ -159,6 +159,7 @@ pub struct HoldControl {
     release: CancellationToken,
     cancel: CancellationToken,
     status: tokio::sync::watch::Sender<Status>,
+    repeated: Option<Arc<crate::interaction::RepeatedCaptures>>,
 }
 /// Finite status snapshot; no samples, output text, or command values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +176,31 @@ pub enum Status {
     Finished(Result<(), Error>),
 }
 impl HoldControl {
+    /// Whether this owner has the opt-in repeated-capture lane, even after admission seals.
+    #[must_use]
+    pub fn repeats_enabled(&self) -> bool {
+        self.repeated.is_some()
+    }
+    /// Whether this invocation has finished or been revoked; never authorizes a replacement
+    /// until its retained operation releases the shared audio admission permit.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.cancel.is_cancelled() || matches!(*self.status.borrow(), Status::Finished(_))
+    }
+    /// Admit another physical hold into this exact retained interaction, without a new RPC.
+    /// # Errors
+    /// Returns Busy for one-shot, still-held, sealed, cancelled, or exhausted lanes.
+    pub fn press_again(&self) -> Result<Self, Error> {
+        if self.is_finished() {
+            return Err(Error::Busy);
+        }
+        let lane = self.repeated.as_ref().ok_or(Error::Busy)?;
+        let release = lane.press()?;
+        Ok(Self {
+            release,
+            ..self.clone()
+        })
+    }
     /// Subscribe to the latest bounded status, without an event backlog.
     #[must_use]
     pub fn status(&self) -> tokio::sync::watch::Receiver<Status> {
@@ -220,6 +246,7 @@ impl Hold {
             release: CancellationToken::new(),
             cancel: CancellationToken::new(),
             status: tokio::sync::watch::channel(Status::Starting).0,
+            repeated: None,
         };
         Ok((
             Self {
@@ -229,6 +256,18 @@ impl Hold {
             },
             control,
         ))
+    }
+    /// Reserve one interaction with a bounded sequential capture lane. The caller must pin
+    /// the exact `media.inputs` capability and selected PCM output before enabling this path.
+    /// # Errors
+    /// Returns Busy while another audio operation owns admission.
+    pub fn press_repeated(gate: &AudioAdmission) -> Result<(Self, HoldControl), Error> {
+        let (mut hold, mut control) = Self::press(gate)?;
+        control.repeated = Some(Arc::new(crate::interaction::RepeatedCaptures::new(
+            control.release.clone(),
+        )));
+        hold.control = control.clone();
+        Ok((hold, control))
     }
     /// Execute against an already pinned transport and generation lease. No Send bound is imposed.
     /// The caller must cancel and await this future before host disposal; dropping it is not a join.
@@ -288,7 +327,13 @@ impl Hold {
         typing_factory: Option<&dyn crate::typing::Factory>,
     ) -> Result<(), Error> {
         self.run_guarded_with_outputs(
-            binding, transport, factory, generation, valid, typing_factory, None,
+            binding,
+            transport,
+            factory,
+            generation,
+            valid,
+            typing_factory,
+            None,
         )
         .await
     }
@@ -363,7 +408,13 @@ impl Hold {
         let selected = binding
             .resolved
             .as_ref()
-            .and_then(|i| i.limits.definition.ports.iter().find(|p| p.name == binding.routine.output))
+            .and_then(|i| {
+                i.limits
+                    .definition
+                    .ports
+                    .iter()
+                    .find(|p| p.name == binding.routine.output)
+            })
             .ok_or(Error::Unsupported)?;
         let expected = if binding.playback.is_some() {
             waltr_client::RoutineMedia::Audio
@@ -385,7 +436,7 @@ impl Hold {
             observer: &self.observer,
             typing: std::cell::RefCell::new((sink, crate::typing::Delivery::default(), false)),
         };
-        let output = crate::interaction::run(
+        let output = crate::interaction::run_hold(
             transport,
             factory,
             &binding.audio,
@@ -406,6 +457,7 @@ impl Hold {
             &guard,
             &self.observer,
             &consumer,
+            self.control.repeated.as_deref(),
         )
         .await?;
         let Some(crate::interaction::Output { text, invocation }) = output else {

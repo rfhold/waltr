@@ -50,6 +50,17 @@ The app supplies playback through its shared CPAL owner; the standalone Actor re
 Playback prefers the exact selected PCM format on the default device.
 The app permits one bounded adaptation: 24 kHz mono to supported 48 kHz stereo output.
 Release closes capture; the hold retains admission until the answer, playback tail, and cleanup finish.
+For repeated captures, the app uses `Hold::press_repeated` only after it pins the exact `media.inputs` capability and selected PCM output.
+`HoldControl::press_again` returns a fresh per-capture release control for the same interaction.
+The app admits only the same binding and ingress epoch under its generation, access, and credential fences.
+The controller permits 16 captures over one interaction lifetime, including the first, with at most 15 tokens pending.
+Capture workers run sequentially; the prior worker joins before the next microphone opens.
+Each capture uses a distinct stream ID and starts at sequence zero.
+Release closes only the current stream; the selected audio output close triggers global `InputFinish` and native EOF after server admission seals.
+An overlapping capture fails explicitly and never becomes a new interaction.
+The shared client preserves aggregate port byte limits across captures.
+`HoldControl::is_finished` distinguishes a retained invocation from a completed or revoked owner; audio admission still gates replacement operations.
+The standalone Actor remains one-shot.
 The driver calls `OutputSink::revoke` synchronously on operation or local cleanup failure, before the next cleanup await.
 Revocation stops queued effects; `finish` retains and joins their owners afterward.
 `interaction::run_with_inputs` has the same arguments plus `&mut [media::BinaryInput]` after `selection`.
@@ -58,7 +69,8 @@ The host waits for nonempty PCM before any RPC; empty capture produces no admiss
 One 20-second deadline covers the open and Accepted response.
 Accepted precedes every input event.
 Normal release requests stop and converter-tail flush, even before native startup completes.
-The capture and converter join precede stream close and input finish.
+The capture and converter join precede stream close.
+One-shot input finish follows that close; repeated-capture input finish follows the selected output close.
 An early output EOF fails while input remains active.
 
 The shared client applies narrowed Accepted limits.
@@ -142,6 +154,7 @@ No default directory, overwrite policy, arbitrary-path input, or native playback
 
 `tests/hold.rs` uses a native fake v2 service, not production routes.
 It covers hold release, acceptance deadlines, capture bounds, converter tails, cleanup, text safety, and the typed PCM sink interface.
+Its repeated-hold cases cover one RPC, concurrent output, distinct stream IDs, ordered frames, sequential microphone joins, startup release, deadlines, cancellation, disconnect, and seal races.
 `tests/parameters.rs` covers schema-derived structured defaults.
 `tests/media.rs` covers negotiated 7-byte uploads, empty files, size changes, file/image limits, fake quarantine rejection, no-input and mixed capture/file workflows, acceptance deadlines, upload/read failures, backpressure, generation and credential invalidation, source joins, and grant-based blob reader cleanup.
 The image fixture exercises protocol metadata and fake quarantine behavior; it does not validate an image decoder.

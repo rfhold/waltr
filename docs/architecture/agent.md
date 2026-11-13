@@ -427,6 +427,28 @@ Completion admission has two phases. Removing a durably finished active run firs
 
 Ordinary `QueueIfActive` submissions join the same FIFO queue while paused even though no provider run is active. Reject and replace policies return a typed paused error rather than breaking another owner's pause. A successful mask mutation can arm one continuation at its committed administrative cursor. Releasing the matching owner starts that continuation without rollback before queued user prompts; ordinary completion then drains and coalesces adjacent compatible prompts as before. Release is idempotent for its successfully released lease. A stale or competing lease cannot capture, mutate, arm, or release the live pause.
 
+`RunConflictPolicy::NextTurnIfActive` explicitly opts a text prompt into the current run's next safe model boundary.
+Ordinary queue-after-run defaults remain unchanged.
+The coordinator bounds this process-local handoff to 64 prompts, 16384 UTF-8 bytes each, and 1 MiB total per run.
+The run owner drains FIFO prompts only after the response and complete tool batch, before its next provider request or normal completion.
+It appends ordinary user journal and timeline events through current execution tokens and append receipts.
+It reuses normal resume-input and user-template policy within that same owner.
+Adjacent prompts share one model request; no concurrent writer, separate history format, effect replay, or extra run exists.
+Transport retries retain their canonical request and defer new prompts until the successful response boundary.
+The active run retains its runtime, provider-turn limit, completion validation, evidence bounds, and deadline.
+Prompt admission and the final empty-boundary check share one atomic gate.
+A prompt that wins admission extends the run; a late prompt receives an explicit error.
+The gate closes before completion validation and stays closed if validation requests another turn.
+All accepted handles resolve with the original run's outcome under their submission IDs.
+`Started` means immediate admission, also when the prompt joins the current run; the active run ID does not change.
+Canceled, failed, or suspended runs fail or suspend accepted handles rather than silently discard successful work.
+Undrained process-local prompts do not survive cancellation, suspension, or process death and never replay automatically.
+An idle session starts a normal run; a durable suspension or failure rejects this mode.
+Owned admission also checks the exact incarnation under the session operation.
+Paused, complete-gate, canceled, direct-tool, incompatible-host, full, or prior-queue states reject admission rather than queue.
+An active permission interaction retains its authority; prompts wait until its tool and the rest of the batch settle.
+Independently cancellable submissions reject this mode because all accepted prompts share the current run's lifetime.
+
 Session list publication retains the latest durable summary by incarnation and overlays coordination, progress, and capabilities as one process-local owner group. Every merge recomputes progress and capabilities from the selected durable status and exact coordination before publishing one full summary. Run, queue, barrier, pause, continuation, release, interruption, deletion, wipe, and shutdown transitions publish full summary upserts after the authoritative in-memory change; coordination-only upserts retain the durable revision and are not suppressed by same-revision merge rules. Queue depth counts logical queued submissions and becomes zero when compatible prompts are promoted and coalesced into one active run. `SessionCoordinator::list()` registers each durable baseline first, then reads coordination and reconciles the returned and retained summaries while the coordinator lock excludes transitions. A transition at either edge therefore appears in the reconciled snapshot or publishes against an already-retained summary, and an incarnation change suppresses stale reconciliation. Initial list, reconnect, and sequence-gap repair cannot replace a live pause with default `Ready` or publish mismatched derived fields. Storage awaits never occur while coordinator or synchronous publication locks are held.
 
 Delete, wipe, interrupt, and shutdown invalidate owned pauses, cancel exact queued/run ownership, and suppress conflicting admission. Wipe serializes with `SessionControl`, removes every raw session in the namespace, and publishes one cleared event; it requires explicit confirmation. Generic coordinator shutdown disables admission and drains run ownership. Server host retirement separately clears private policy state and drains/joins cached MCP runtimes, including generic stdio shutdown and child reaping. It adds no stronger termination bound than the MCP contract. No operation automatically wipes retained data during upgrade.

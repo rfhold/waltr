@@ -50,7 +50,7 @@ struct InputStream {
     bytes: u64,
 }
 enum Event {
-    Open,
+    Open(String, String, Format),
     Chunk(String, Chunk),
     Close(String),
     Blob(String, blob::CommittedBlob),
@@ -153,6 +153,9 @@ impl UploadSource for Source {
 }
 /// Pending authenticated request authority, created before invoke/preflight, never from a guest ID.
 pub struct PendingTransport {
+    captures: super::captures::Captures,
+    repeated: Option<String>,
+    repeated_format: Option<Format>,
     pub(super) principal: String,
     definition: Arc<Definition>,
     streams: Streams,
@@ -389,6 +392,12 @@ impl PendingTransport {
         for (name, (declaration, _)) in &logical.ports {
             match declaration {
                 Declaration::Stream(format) => {
+                    if definition.envelope().spec.capabilities.contains("media.inputs") {
+                        if logical.ports.len() != 1 || !matches!(format, Format::Pcm16Le { .. }) {
+                            return Err(Status::invalid_argument("repeated input requires one audio input"));
+                        }
+                        continue;
+                    }
                     let (writer, reader) =
                         streams
                             .open(stream::Direction::Input, *format, false)
@@ -443,6 +452,13 @@ impl PendingTransport {
         let (ingress, ingress_rx) = mpsc::channel(8);
         let (output, output_rx) = mpsc::channel(16);
         Ok(Arc::new(Self {
+            captures: super::captures::Captures::default(),
+            repeated_format: if definition.envelope().spec.capabilities.contains("media.inputs") {
+                logical.ports.values().next().and_then(|(declaration, _)| match declaration { Declaration::Stream(format) => Some(*format), _ => None })
+            } else { None },
+            repeated: if definition.envelope().spec.capabilities.contains("media.inputs") {
+                logical.ports.keys().next().cloned()
+            } else { None },
             principal,
             definition,
             streams,
@@ -576,10 +592,14 @@ impl PendingTransport {
         for event in events {
             admitted.push(self.validate(&mut next, event)?);
         }
-        next.batch = next
-            .batch
-            .checked_add(1)
-            .ok_or_else(|| Status::resource_exhausted("input batch count"))?;
+        next.batch = next.batch.checked_add(1).ok_or_else(|| Status::resource_exhausted("input batch count"))?;
+        let captures = admitted.iter().filter_map(|event| match event {
+            Event::Open(port, id, _) if self.repeated.as_ref() == Some(port) => Some(id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        if !captures.is_empty() {
+            self.captures.admit_many(&captures).map_err(|_| Status::failed_precondition("capture admission closed or full"))?;
+        }
         *logical = next;
         permit.send(Batch {
             events: admitted,
@@ -597,13 +617,15 @@ impl PendingTransport {
                 wire::id(&open.stream_id, 128)?;
                 wire::id(&open.port, 128)?;
                 if state.streams.contains_key(&open.stream_id)
-                    || state.streams.values().any(|s| s.port == open.port)
+                    || state.streams.values().any(|s| s.port == open.port && (!s.closed || self.repeated.as_ref() != Some(&open.port)))
+                    || state.streams.len() >= 16
                 {
                     return Err(invalid());
                 }
-                let Some((Declaration::Stream(format), false)) = state.ports.get(&open.port) else {
+                let Some((Declaration::Stream(format), closed)) = state.ports.get(&open.port) else {
                     return Err(invalid());
                 };
+                if *closed && self.repeated.as_ref() != Some(&open.port) { return Err(invalid()); }
                 let actual = match open.format {
                     Some(p::stream_open::Format::Text(_)) => Format::Text,
                     Some(p::stream_open::Format::Pcm16le(pcm)) => Format::Pcm16Le {
@@ -616,9 +638,9 @@ impl PendingTransport {
                     return Err(invalid());
                 }
                 state.streams.insert(
-                    open.stream_id,
+                    open.stream_id.clone(),
                     InputStream {
-                        port: open.port,
+                        port: open.port.clone(),
                         format: actual,
                         next: 0,
                         closed: false,
@@ -626,7 +648,8 @@ impl PendingTransport {
                         bytes: 0,
                     },
                 );
-                Ok(Event::Open)
+                state.ports.get_mut(&open.port).ok_or_else(invalid)?.1 = false;
+                Ok(Event::Open(open.port, open.stream_id, actual))
             }
             p::input_event::Event::Chunk(chunk) => {
                 let stream = state
@@ -692,7 +715,10 @@ impl PendingTransport {
                     return Err(invalid());
                 }
                 stream.next = stream.next.checked_add(1).ok_or_else(invalid)?;
-                Ok(Event::Chunk(stream.port.clone(), payload))
+                let port = stream.port.clone();
+                let key = if self.repeated.as_ref() == Some(&port) { chunk.stream_id } else { port.clone() };
+                if state.streams.values().filter(|s| s.port == port).map(|s| s.bytes).sum::<u64>() > u64::from(self.definition.envelope().spec.ports[&port].max_bytes) { return Err(invalid()); }
+                Ok(Event::Chunk(key, payload))
             }
             p::input_event::Event::Close(close) => {
                 let stream = state
@@ -707,7 +733,7 @@ impl PendingTransport {
                 }
                 stream.closed = true;
                 state.ports.get_mut(&stream.port).ok_or_else(invalid)?.1 = true;
-                Ok(Event::Close(stream.port.clone()))
+                Ok(Event::Close(if self.repeated.as_ref() == Some(&stream.port) { close.stream_id } else { stream.port.clone() }))
             }
             p::input_event::Event::Blob(input) => {
                 let Some((Declaration::Binary(_), closed)) = state.ports.get_mut(&input.port)
@@ -788,6 +814,28 @@ impl MediaBindingFactory for Bind {
 }
 struct Driver(Arc<PendingTransport>);
 impl MediaDriver for Driver {
+    fn repeated_input_format(&self, port: &str) -> Option<Format> {
+        if self.0.repeated.as_deref() != Some(port) { return None; }
+        self.0.repeated_format
+    }
+    fn next_capture(&self, port: String) -> PortFuture<Option<(String, Reader)>> {
+        let pending = self.0.clone();
+        Box::pin(async move {
+            if pending.repeated.as_ref() != Some(&port) { return Err(PortError::Denied); }
+            tokio::time::timeout_at(pending.deadline(), pending.captures.next(&pending.streams.cancellation())).await.map_err(|_| PortError::Unavailable)?
+        })
+    }
+    fn acknowledge_capture(&self, id: String) -> PortFuture<()> {
+        let pending = self.0.clone();
+        Box::pin(async move { pending.captures.acknowledge(&id) })
+    }
+    fn seal_captures(&self) -> PortFuture<bool> {
+        let pending = self.0.clone();
+        Box::pin(async move {
+            if pending.repeated.is_none() { return Err(PortError::Denied); }
+            pending.captures.seal()
+        })
+    }
     fn committed_input(&self, port: String) -> PortFuture<Option<blob::CommittedBlob>> {
         let pending = self.0.clone();
         Box::pin(async move {
@@ -882,8 +930,14 @@ impl MediaDriver for Driver {
                     let batch=tokio::select! { ()=input.streams.cancellation().cancelled_owned()=>return Err(PortError::Unavailable),()=input.input_finish.cancelled(),if rx.is_empty()=>continue,batch=rx.recv()=>batch.ok_or(PortError::Unavailable)? };
                     for event in batch.events {
                         match event {
-                            Event::Open=>{},Event::Chunk(port,chunk)=> { let writer=writers.get_mut(&port).ok_or(PortError::Invalid)?;writer.write(writer.key(),chunk).await.map_err(|_|PortError::Unavailable)?; },
-                            Event::Close(port)=> { let writer=writers.get_mut(&port).ok_or(PortError::Invalid)?;writer.close(writer.key()).await.map_err(|_|PortError::Unavailable)?; },
+                            Event::Open(port,id,format)=> {
+                                if input.repeated.as_ref() == Some(&port) {
+                                    let (writer,reader) = input.streams.open(stream::Direction::Input,format,false).map_err(|_|PortError::Unavailable)?;
+                                    writers.insert(id.clone(),writer);
+                                    input.captures.publish(id,reader)?;
+                                }
+                            },Event::Chunk(port,chunk)=> { let writer=writers.get_mut(&port).ok_or(PortError::Invalid)?;writer.write(writer.key(),chunk).await.map_err(|_|PortError::Unavailable)?; },
+                            Event::Close(port)=> { let mut writer=writers.remove(&port).ok_or(PortError::Invalid)?;if input.repeated.is_some() { input.captures.close(&port)?; }writer.close(writer.key()).await.map_err(|_|PortError::Unavailable)?; },
                             Event::Blob(port,blob)=> { let source=input.sources.get(&port).ok_or(PortError::Invalid)?;source.state.lock().await.blob=Some(blob);source.ready.notify_waiters(); },
                             Event::Finish=> { *input.input_done.lock().map_err(|_|PortError::Uncertain)?=true;return Ok(()); },
                         }
@@ -961,11 +1015,13 @@ impl MediaDriver for Driver {
     }
     fn cancel(&self) {
         self.0.streams.cancellation().cancel();
+        self.0.captures.cancel();
     }
     fn finish(&self) -> PortFuture<()> {
         let pending = self.0.clone();
         let join = self.join();
         Box::pin(async move {
+            if pending.repeated.is_some() && !pending.captures.seal()? { return Err(PortError::Conflict); }
             if pending
                 .native_required
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -1014,6 +1070,7 @@ impl MediaDriver for Driver {
                 drop(jobs.remove(0));
             }
             *pending.joined.lock().map_err(|_| PortError::Uncertain)? = Some(success);
+            pending.captures.cancel();
             pending
                 .owner
                 .lock()

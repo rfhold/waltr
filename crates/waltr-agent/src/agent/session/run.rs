@@ -566,6 +566,9 @@ pub enum RunConflictPolicy {
     RejectIfActive,
     /// Queue the submitted run until active work for the session finishes.
     QueueIfActive,
+    /// Add a normal user prompt at the active run's next safe model boundary.
+    /// Reject paused, completing, direct-tool, or full runs instead of queueing.
+    NextTurnIfActive,
 }
 
 /// Input that can start or resume a durable session run.
@@ -597,7 +600,7 @@ impl AgentSessionRunInput {
 /// How a submitted run was handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionRunDisposition {
-    /// The run started immediately.
+    /// Work was admitted immediately, including joining an active next-turn run.
     Started,
     /// A previously active run was canceled and replaced.
     ReplacedActive,

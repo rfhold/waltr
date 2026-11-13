@@ -104,6 +104,35 @@ Uncaught consumer failure fails the invocation; cancellation wakes queue waits a
 An early successful root with undrained calls fails invocation completion validation and preserves verified cleanup without capacity quarantine.
 Queues have no persistent subscription, attachment to another chat, delivery receipt, or restart replay.
 
+The media host also exposes an invocation-owned helper submission target.
+`helper.open` returns only after the initial ordinary run is admitted;
+`helper.submit` admits bounded text prompts into that exact durable incarnation
+through the generic coordinator's opt-in `NextTurnIfActive` policy.
+The active run adopts ordinary user messages after the complete response and tool
+batch, before its next model request or normal completion.
+Adjacent messages retain FIFO order and share that request, run limits, and deadline.
+Provider retries retain their original canonical request.
+An idle helper starts a normal run with its private runtime factory.
+That factory retains tools, permissions, origin guards, and completion validation.
+Paused, suspended, failed, canceled, full, or complete-gate runs reject admission;
+a competing host binding or prior ordinary queue also causes rejection.
+An active permission interaction remains authoritative until its tool settles.
+The target grants no guest session authority and adds no separate history scheduler.
+`helper.idle` joins an accepted prefix without closing speech. JavaScript then
+atomically seals repeated capture admission; a winning unresolved capture must be
+transcribed and admitted, or deliberately discarded when its successfully collected
+transcript is blank, before acknowledgment and another drain attempt. The audio
+resource skips blank follow-ups without canceling the existing answer or submitting
+empty history. Empty initial questions still fail before helper creation, and actual
+STT or submission failures still cancel and join invocation-owned work.
+`helper.seal` rejects later prompts, joins all accepted runs and closes the single
+producer. Cancellation and disconnect join active runs, accepted outcomes and STT.
+The text-only target has fixed submission/target bounds and one absolute deadline;
+one-shot helpers keep their existing behavior.
+Repeated input gets 20 lifetime typed edges per direction and one additional
+4 MiB speech workspace for overlapping STT/TTS, charged to the same shared
+principal/process pools. Payload and transport byte ceilings remain unchanged.
+
 `media.text.open`, `media.text.write`, and `media.text.close` supply bounded committed segments to current synthesis machinery.
 The opaque feed belongs to one invocation and grants no external input name.
 Current media cleanup owns every feed operation and speech producer.

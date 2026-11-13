@@ -14,6 +14,14 @@ Playback prefers the exact source format on the default device.
 For 24 kHz mono sources only, it can adapt to supported 48 kHz stereo output.
 The shared CPAL owner checks hold cancellation, generation, access, and credential revision before physical output.
 Release ends capture, then waits for the answer and verified playback-tail drain.
+For a playback binding with the exact pinned `media.inputs` capability and selected PCM output, another press after release captures into the same interaction.
+Capability-bearing text bindings retain one-shot typing or command behavior.
+The shortcut adapter requires the same keybind and ingress epoch under the current generation, access, catalog, and credential fences.
+Each capture receives a fresh stream ID and release token; native workers run sequentially with a 16-capture lifetime limit.
+Per-capture release does not finish the global input lane.
+The server seals admission before the selected output closes; that close triggers global input finish and native EOF.
+An overlapping capture fails explicitly; unrelated keybinds and chat microphones remain busy until the retained interaction and playback owner finish.
+Rejected opt-in capture presses publish a fixed diagnostic and the existing dismissible audio-failure notification, without replacing the active interaction.
 Cancellation joins capture, RPC cleanup, and playback before the hold releases its reservation.
 See the [audio question example](../../docs/examples/routines/audio-interactions.md#audio-question-shortcut).
 

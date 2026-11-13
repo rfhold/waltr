@@ -254,6 +254,7 @@ struct Queued {
 }
 #[derive(Default, Debug)]
 struct Totals {
+    repeated_inputs: bool,
     opened: [usize; 2],
     bytes: [usize; 2],
     audio_frames: [Option<(u32, u64)>; 4],
@@ -265,6 +266,7 @@ struct Shared {
     limits: Limits,
     totals: Mutex<Totals>,
     budget: Budget,
+    repeated_workspace: Budget,
     speech_workspace: super::snapshot::WorkspacePool,
     cancel: CancellationToken,
     started: tokio::time::Instant,
@@ -274,6 +276,7 @@ struct Shared {
 pub struct Streams {
     shared: Arc<Shared>,
     retention: Pool,
+    repeated_retention: Pool,
 }
 /// Invocation-bound resource ownership. Hosts bind their principal's shared pool
 /// before exposing this object; keys cannot be constructed or rebound by callers.
@@ -324,6 +327,7 @@ impl Streams {
                 trace.set_parent(opentelemetry::Context::new().with_remote_span_context(parent));
         }
         let retention = Pool::new(8 * 1024 * 1024)?;
+        let repeated_retention = Pool::new(4 * 1024 * 1024)?;
         Ok(Self {
             shared: Arc::new(Shared {
                 trace,
@@ -331,18 +335,22 @@ impl Streams {
                 limits,
                 totals: Mutex::new(Totals::default()),
                 budget: Budget {
-                    pools: vec![retention.clone(), principal, process],
+                    pools: vec![retention.clone(), principal.clone(), process.clone()],
+                },
+                repeated_workspace: Budget {
+                    pools: vec![repeated_retention.clone(), principal, process],
                 },
                 speech_workspace: super::snapshot::WorkspacePool::invocation(),
                 cancel,
                 started: tokio::time::Instant::now(),
             }),
             retention,
+            repeated_retention,
         })
     }
     /// Current charged invocation payload retention.
     pub fn retained_bytes(&self) -> usize {
-        self.retention.retained()
+        self.retention.retained() + self.repeated_retention.retained()
     }
     /// Clone the invocation's cancellation token.
     pub fn cancellation(&self) -> CancellationToken {
@@ -364,6 +372,16 @@ impl Streams {
     pub fn owns_writer(&self, writer: &Writer) -> bool {
         self.shared.id == writer.key.invocation
     }
+    /// Permit sixteen capture/STT pairs and one overlapping speech workspace.
+    /// Only the trusted media-input host opts in; payload and transport byte limits stay unchanged.
+    pub(crate) fn enable_repeated_inputs(&self) -> Result<(), Error> {
+        self.shared
+            .totals
+            .lock()
+            .map_err(|_| Error::Worker)?
+            .repeated_inputs = true;
+        Ok(())
+    }
     /// Open a typed edge; a detachable edge explicitly permits consumer abandonment.
     pub fn open(
         &self,
@@ -374,7 +392,12 @@ impl Streams {
         format.validate()?;
         let index = index(direction);
         let mut totals = self.shared.totals.lock().map_err(|_| Error::Worker)?;
-        if totals.opened[index] >= self.shared.limits.streams_per_direction {
+        let limit = if totals.repeated_inputs {
+            20
+        } else {
+            self.shared.limits.streams_per_direction
+        };
+        if totals.opened[index] >= limit {
             return Err(Error::Limit);
         }
         totals.opened[index] += 1;
@@ -757,7 +780,12 @@ impl Reader {
     }
     pub(super) fn snapshot_output(&self) -> Result<OutputQuota, Error> {
         let mut totals = self.shared.totals.lock().map_err(|_| Error::Worker)?;
-        if totals.opened[1] >= self.shared.limits.streams_per_direction {
+        let limit = if totals.repeated_inputs {
+            20
+        } else {
+            self.shared.limits.streams_per_direction
+        };
+        if totals.opened[1] >= limit {
             return Err(Error::Limit);
         }
         totals.opened[1] += 1;
@@ -796,7 +824,22 @@ impl Reader {
         )
     }
     pub(crate) fn workspace(&self) -> Result<impl Send + use<>, Error> {
-        self.shared.budget.reserve(4 * 1024 * 1024)
+        self.shared
+            .budget
+            .reserve(4 * 1024 * 1024)
+            .or_else(|error| {
+                if self
+                    .shared
+                    .totals
+                    .lock()
+                    .map_err(|_| Error::Worker)?
+                    .repeated_inputs
+                {
+                    self.shared.repeated_workspace.reserve(4 * 1024 * 1024)
+                } else {
+                    Err(error)
+                }
+            })
     }
     pub(crate) fn idle_timeout(&self) -> Duration {
         self.shared.limits.idle
@@ -1112,6 +1155,57 @@ mod admission_tests {
             replace: true,
             committed: true,
         })
+    }
+    #[test]
+    fn repeated_input_edges_and_overlap_workspace_are_opt_in_and_bounded() {
+        for repeated in [false, true] {
+            let streams = streams();
+            if repeated {
+                streams.enable_repeated_inputs().unwrap();
+            }
+            let limit = if repeated { 20 } else { 4 };
+            let mut edges = Vec::new();
+            for _ in 0..limit {
+                edges.push(streams.open(Direction::Input, Format::Text, false).unwrap());
+            }
+            assert!(matches!(
+                streams.open(Direction::Input, Format::Text, false),
+                Err(Error::Limit)
+            ));
+            drop(edges);
+            assert!(
+                matches!(
+                    streams.open(Direction::Input, Format::Text, false),
+                    Err(Error::Limit)
+                ),
+                "closed IDs must not reopen lifetime credit"
+            );
+            for _ in 0..limit {
+                drop(
+                    streams
+                        .open(Direction::Output, Format::Text, false)
+                        .unwrap(),
+                );
+            }
+            assert!(matches!(
+                streams.open(Direction::Output, Format::Text, false),
+                Err(Error::Limit)
+            ));
+        }
+        for repeated in [false, true] {
+            let streams = streams();
+            if repeated {
+                streams.enable_repeated_inputs().unwrap();
+            }
+            let (_writer, reader) = streams.open(Direction::Input, Format::Text, false).unwrap();
+            let payload = streams.shared.budget.reserve(1).unwrap();
+            let first = reader.workspace().unwrap();
+            let second = reader.workspace();
+            assert_eq!(second.is_ok(), repeated);
+            assert!(reader.workspace().is_err());
+            drop((first, second, payload));
+            assert_eq!(streams.retained_bytes(), 0);
+        }
     }
     #[tokio::test]
     async fn abandoned_committed_write_is_terminal_with_queued_or_checked_out_credit() {

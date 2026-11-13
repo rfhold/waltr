@@ -181,8 +181,28 @@ See [desktop configuration](config.md#desktop-client-configuration) for the sche
 
 A press reserves the single audio gate without a queue, then starts capture.
 The first nonempty audio frame admits `Interact`; release without input starts no RPC.
-Repeated presses for the current hold do nothing; other presses return busy.
-Release requests a normal capture flush and input completion, not cancellation.
+Without the exact pinned `media.inputs` capability, repeated presses for the current hold do nothing; other presses return busy.
+Release requests a normal capture flush and input completion for these one-shot holds, not cancellation.
+
+The native app permits repeated captures only for playback bindings with the exact pinned `media.inputs` capability and a selected PCM audio output.
+Capability-bearing text bindings retain their one-shot typing or command behavior.
+Each physical press after release targets the same active keybind and ingress epoch, through the current generation, access, and credential fences.
+The first press reserves one interaction and playback owner through terminal cleanup.
+Later presses enqueue fresh release tokens in a bounded lane, not new interactions or helper sessions.
+The lane permits at most 16 captures over the interaction lifetime, including the first capture, with at most 15 tokens pending.
+Each capture opens a distinct stream ID with sequence zero; each close follows the native source join.
+The next microphone starts only after the previous microphone joins.
+The shared client enforces aggregate input-port byte limits across all streams.
+Per-capture release closes only that stream; it never sends global `InputFinish`.
+The server seals capture admission before it closes the selected PCM output stream.
+That output close seals local admission and triggers global `InputFinish` plus native input EOF, then normal terminal and playback-tail cleanup.
+A capture that overlaps the seal fails explicitly; the client neither discards accepted capture silently nor starts a replacement interaction.
+Local opt-in admission rejections also publish a fixed diagnostic and the existing dismissible audio-failure notification; one-shot repeated presses remain no-ops.
+Successful completion preserves the rejection notification's current dismissal state; a distinct terminal failure still publishes its own diagnostic.
+After the old owner releases admission, the next press starts normally.
+Unrelated keybinds and chat microphone operations remain busy throughout the retained interaction.
+The server Routine controls helper-session selection and ordinary queued followup messages; the native client controls only capture and transport ownership.
+
 Command mode waits for clean EOF, successful final-text validation, capture cleanup, and current guards before one command execution.
 Typing mode delivers each current hypothesis while duplex input continues, even before provider commitment.
 Repeated hypotheses and identical final text add no duplicate output.
@@ -231,7 +251,8 @@ Cancellation, access loss, and shutdown still suppress output actions and take p
 Local limits do not guarantee one-hour provider acceptance, remote processing time, or live microphone and clipboard behavior.
 No timeout or failure automatically retries or replays dispatched remote work.
 RPC input remains empty until Accepted; all buffered PCM precedes subsequently captured samples.
-Normal release before Accepted stops capture, retains and drains its complete flush after acceptance, then closes and finishes input once.
+Normal release before Accepted stops capture and retains its complete flush for acceptance.
+One-shot holds then close and finish input once; repeated-capture holds close only the current stream.
 Cancellation discards queued PCM, cancels pending RPC work (including before response headers), and joins capture without submitting input completion.
 Byte-capacity exhaustion reports `Overflow`, fails the operation, and joins capture rather than silently discarding audio.
 The reserves tolerate only finite callback bursts or owner delays, not arbitrary scheduler stalls or sustained downstream backpressure.
@@ -575,6 +596,7 @@ Process-local numeric diagnostic identifiers never copy IPC or configuration ide
 Native hold and chat-audio completion publish the latest bounded audio failure through the existing ordered bridge.
 The in-app alert shows a fixed message and the process-local diagnostic ID, with an explicit dismiss action.
 The alert survives ordinary state updates and cancellation; dismissal or a later successful audio operation clears it.
+An invocation that reported a rejected capture preserves that alert's dismissal state on successful completion instead.
 Generation replacement clears the alert and rejects completions from the previous generation.
 This state remains separate from shared server snapshots, OS notifications, and the transient tray error indicator.
 No transcript, prompt, audio, credential, or raw backend error enters the alert.

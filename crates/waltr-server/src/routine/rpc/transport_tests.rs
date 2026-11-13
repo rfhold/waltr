@@ -38,6 +38,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(total: Duration) -> Self {
+        Self::with_repeated_input(total, false).await
+    }
+    async fn with_repeated_input(total: Duration, repeated: bool) -> Self {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -66,8 +69,10 @@ impl Fixture {
         .await
         .unwrap();
         let engine = waltr_script::Engine::new(1).unwrap();
+        let source = include_str!("../../../tests/fixtures/routines/dictate.yaml");
+        let source = if repeated { source.replace("[media.execute]", "[media.execute, media.inputs]") } else { source.into() };
         let definition = Definition::parse(
-            include_str!("../../../tests/fixtures/routines/dictate.yaml"),
+            &source,
             &engine,
         )
         .unwrap();
@@ -179,6 +184,38 @@ impl Fixture {
 }
 fn ack(mut frame: OutputFrame) {
     frame.consumed.take().unwrap().send(()).unwrap();
+}
+
+#[tokio::test]
+async fn repeated_capture_identity_order_and_completion_share_one_admission_gate() {
+    let mut fixture = Fixture::with_repeated_input(Duration::from_secs(5), true).await;
+    let driver = Driver(fixture.pending.clone());
+    ack(fixture.frame().await);
+    let (first_id, mut first) = driver.next_capture("audio".into()).await.unwrap().unwrap();
+    assert_eq!(first_id, "capture");
+    assert!(!driver.seal_captures().await.unwrap());
+    fixture.send(p::input_event::Event::Chunk(p::StreamChunk { stream_id: first_id.clone(), sequence: 0, payload: Some(p::stream_chunk::Payload::Audio(vec![1, 0])) })).await;
+    fixture.send(p::input_event::Event::Close(p::StreamClose { stream_id: first_id.clone(), next_sequence: 1 })).await;
+    assert!(matches!(first.read().await.unwrap().unwrap().chunk(), Chunk::Audio(bytes) if bytes == &[1, 0]));
+    assert!(first.read().await.unwrap().is_none());
+    assert!(!driver.seal_captures().await.unwrap());
+    driver.acknowledge_capture(first_id.clone()).await.unwrap();
+    assert!(driver.acknowledge_capture(first_id).await.is_err());
+    fixture.send(p::input_event::Event::Open(p::StreamOpen { port: "audio".into(), stream_id: "second".into(), format: Some(p::stream_open::Format::Pcm16le(p::Pcm16Le { sample_rate: 24000, channels: 1 })) })).await;
+    let (second_id, mut second) = driver.next_capture("audio".into()).await.unwrap().unwrap();
+    assert_eq!(second_id, "second");
+    fixture.send(p::input_event::Event::Close(p::StreamClose { stream_id: second_id.clone(), next_sequence: 0 })).await;
+    assert!(second.read().await.unwrap().is_none());
+    driver.acknowledge_capture(second_id).await.unwrap();
+    assert!(driver.seal_captures().await.unwrap());
+    assert!(driver.next_capture("audio".into()).await.unwrap().is_none());
+    let late = p::InputEvent { event: Some(p::input_event::Event::Open(p::StreamOpen { port: "audio".into(), stream_id: "late".into(), format: Some(p::stream_open::Format::Pcm16le(p::Pcm16Le { sample_rate: 24000, channels: 1 })) })) };
+    assert!(fixture.pending.send(fixture.pending.next_sequence().await, vec![late]).await.is_err());
+    fixture.send(p::input_event::Event::Finish(p::InputFinish {})).await;
+    fixture.pending.native_closed().await.unwrap();
+    fixture.output.close(fixture.output.key()).await.unwrap();
+    ack(fixture.frame().await);
+    driver.finish().await.unwrap();
 }
 
 #[tokio::test]

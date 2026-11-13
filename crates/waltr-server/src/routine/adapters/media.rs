@@ -24,7 +24,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -47,6 +50,22 @@ pub trait UploadSource: Send + Sync {
 }
 /// Cold authenticated transport owner; startup occurs only after SQL admission.
 pub trait MediaDriver: Send + Sync {
+    /// Cold declaration of a transport-owned repeated audio input, not ambient access.
+    fn repeated_input_format(&self, _port: &str) -> Option<Format> {
+        None
+    }
+    /// Take the next distinctly identified capture from an opt-in repeated input.
+    fn next_capture(&self, _port: String) -> PortFuture<Option<(String, Reader)>> {
+        Box::pin(async { Err(PortError::UnsupportedCapability) })
+    }
+    /// Resolve a consumed capture only after its derived prompt has been submitted.
+    fn acknowledge_capture(&self, _id: String) -> PortFuture<()> {
+        Box::pin(async { Err(PortError::UnsupportedCapability) })
+    }
+    /// Atomically stop admission, unless an accepted capture remains unresolved.
+    fn seal_captures(&self) -> PortFuture<bool> {
+        Box::pin(async { Err(PortError::UnsupportedCapability) })
+    }
     /// Bind transport uploads to the actual service-issued owner during preparation.
     fn bind_blobs(
         &self,
@@ -196,6 +215,17 @@ impl HostFactory for MediaHostFactory {
                 .bind(binding.clone(), definition.clone(), selected, caller)
                 .await?;
             validate_bindings(&bindings, &binding, &definition)?;
+            if definition
+                .envelope()
+                .spec
+                .capabilities
+                .contains("media.inputs")
+            {
+                bindings
+                    .streams
+                    .enable_repeated_inputs()
+                    .map_err(|_| PortError::Invalid)?;
+            }
             bindings
                 .helpers
                 .bind_captures(definition.envelope().spec.captures.clone())
@@ -215,9 +245,14 @@ impl HostFactory for MediaHostFactory {
             if !definition.envelope().spec.captures.is_empty() {
                 bindings.helpers.preflight_captures().await?;
             }
-            let tool_streams = super::tool_streams::ToolStreams::new(definition.envelope().spec.tool_streams.clone());
+            let tool_streams = super::tool_streams::ToolStreams::new(
+                definition.envelope().spec.tool_streams.clone(),
+            );
             if !definition.envelope().spec.tool_streams.is_empty() {
-                bindings.helpers.bind_tool_streams(tool_streams.clone()).await?;
+                bindings
+                    .helpers
+                    .bind_tool_streams(tool_streams.clone())
+                    .await?;
             }
             let cancel = bindings.streams.cancellation();
             let upload_owners: Vec<_> = std::mem::take(&mut bindings.uploads)
@@ -285,6 +320,7 @@ fn validate_bindings(
             .is_empty()
         || definition.envelope().spec.capabilities.iter().any(|c| {
             c != "media.execute"
+                && c != "media.inputs"
                 && c != "helper.run"
                 && c != "helper.validate"
                 && c != "helper.streams"
@@ -319,11 +355,18 @@ fn validate_bindings(
             return Err(PortError::UnsupportedCapability);
         }
         let present = match (port.direction, format) {
-            (Direction::Input, Some(format)) => b.inputs.get(name).is_some_and(|r| {
-                r.format() == format
-                    && r.direction() == stream::Direction::Input
-                    && b.streams.owns_reader(r)
-            }),
+            (Direction::Input, Some(format)) => {
+                b.inputs.get(name).is_some_and(|r| {
+                    r.format() == format
+                        && r.direction() == stream::Direction::Input
+                        && b.streams.owns_reader(r)
+                }) || definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .contains("media.inputs")
+                    && b.driver.repeated_input_format(name) == Some(format)
+            }
             (Direction::Output, Some(format)) => b.outputs.get(name).is_some_and(|w| {
                 w.format() == format
                     && w.direction() == stream::Direction::Output
@@ -398,6 +441,12 @@ struct State {
 }
 #[derive(Clone)]
 enum Resource {
+    Target {
+        target: Arc<dyn crate::routine::ports::HelperTarget>,
+        credit: Arc<Vec<OwnedSemaphorePermit>>,
+        completed: Arc<AtomicBool>,
+    },
+    Capture(Arc<Capture>),
     TextFeed(Arc<TextFeed>),
     Text {
         text: Arc<String>,
@@ -413,6 +462,12 @@ enum Resource {
 struct TextFeed {
     writer: tokio::sync::Mutex<Option<(Writer, u64)>>,
     reader: Mutex<Option<Reader>>,
+}
+struct Capture {
+    id: String,
+    format: Format,
+    reader: Mutex<Option<Reader>>,
+    collected: AtomicBool,
 }
 #[derive(Clone)]
 struct MediaHost {
@@ -488,6 +543,8 @@ impl MediaHost {
         resource: Resource,
     ) -> Result<HostReply, waltr_script::Error> {
         let kind = match resource {
+            Resource::Target { .. } => "helper.target",
+            Resource::Capture(_) => "media.capture",
             Resource::TextFeed(_) => "media.textFeed",
             Resource::Text { .. } => "media.text",
             Resource::Helper { .. } => "helper.result",
@@ -552,7 +609,7 @@ impl MediaHost {
                 context_operation: Some(operation),
                 ..Arguments::default()
             }
-        } else if request.operation == "helper.run" {
+        } else if matches!(request.operation.as_str(), "helper.run" | "helper.open") {
             let helper: super::authorized_tools::HelperArguments =
                 serde_json::from_value(request.arguments.clone().into_json())
                     .map_err(|_| waltr_script::Error::Invalid)?;
@@ -562,6 +619,14 @@ impl MediaHost {
                     request.callback.is_some(),
                 )
                 .map_err(|_| waltr_script::Error::Denied)?;
+            if request.operation == "helper.open"
+                && (request.handle.is_some()
+                    || helper.source.is_some()
+                    || helper.field.is_some()
+                    || request.callback.is_some())
+            {
+                return Err(waltr_script::Error::Invalid);
+            }
             if let Some(source) = &helper.source {
                 self.bindings
                     .context
@@ -571,7 +636,11 @@ impl MediaHost {
                     .map_err(|_| waltr_script::Error::Denied)?;
             }
             Arguments {
-                helper_runner: self.bindings.helpers.select_inference(&helper.inference).map_err(|_| waltr_script::Error::Invalid)?,
+                helper_runner: self
+                    .bindings
+                    .helpers
+                    .select_inference(&helper.inference)
+                    .map_err(|_| waltr_script::Error::Invalid)?,
                 helper: Some(helper),
                 ..Arguments::default()
             }
@@ -580,34 +649,134 @@ impl MediaHost {
                 .map_err(|_| waltr_script::Error::Invalid)?
         };
         match request.operation.as_str() {
+            "helper.submit" | "helper.idle" | "helper.seal" => {
+                if !self
+                    .definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .contains("helper.run")
+                    || request.callback.is_some()
+                    || !matches!(self.resource(request, context)?, Resource::Target { .. })
+                {
+                    return Err(waltr_script::Error::Denied);
+                }
+                let keys = request
+                    .arguments
+                    .as_json()
+                    .as_object()
+                    .ok_or(waltr_script::Error::Invalid)?;
+                if request.operation == "helper.submit" {
+                    if keys.len() != 1
+                        || args
+                            .task
+                            .as_ref()
+                            .is_none_or(|task| task.trim().is_empty() || task.len() > 16384)
+                    {
+                        return Err(waltr_script::Error::Invalid);
+                    }
+                } else if !keys.is_empty() {
+                    return Err(waltr_script::Error::Invalid);
+                }
+            }
+            "media.input.next" | "media.input.seal" | "media.input.acknowledge" => {
+                if !self
+                    .definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .contains("media.inputs")
+                    || request.callback.is_some()
+                {
+                    return Err(waltr_script::Error::Denied);
+                }
+                match request.operation.as_str() {
+                    "media.input.acknowledge" => {
+                        if !matches!(self.resource(request, context)?, Resource::Capture(_)) {
+                            return Err(waltr_script::Error::Identity);
+                        }
+                    }
+                    "media.input.next" => {
+                        if request.handle.is_some()
+                            || self
+                                .bindings
+                                .driver
+                                .repeated_input_format(required(&args.port)?)
+                                .is_none()
+                        {
+                            return Err(waltr_script::Error::Identity);
+                        }
+                    }
+                    _ => {
+                        if request.handle.is_some() {
+                            return Err(waltr_script::Error::Invalid);
+                        }
+                    }
+                }
+            }
+            "media.collect" if request.handle.is_some() => {
+                if args.port.is_some()
+                    || request.callback.is_some()
+                    || !matches!(self.resource(request, context)?, Resource::Capture(_))
+                {
+                    return Err(waltr_script::Error::Invalid);
+                }
+            }
             "helper.next" => {
-                if !self.definition.envelope().spec.capabilities.contains("helper.streams")
-                    || request.handle.is_some() || request.callback.is_some() { return Err(waltr_script::Error::Denied); }
-                self.tool_streams.check(required(&args.stream)?).map_err(|_| waltr_script::Error::Denied)?;
-                serde_json::from_value::<super::tool_streams::Next>(request.arguments.clone().into_json()).map_err(|_| waltr_script::Error::Invalid)?;
+                if !self
+                    .definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .contains("helper.streams")
+                    || request.handle.is_some()
+                    || request.callback.is_some()
+                {
+                    return Err(waltr_script::Error::Denied);
+                }
+                self.tool_streams
+                    .check(required(&args.stream)?)
+                    .map_err(|_| waltr_script::Error::Denied)?;
+                serde_json::from_value::<super::tool_streams::Next>(
+                    request.arguments.clone().into_json(),
+                )
+                .map_err(|_| waltr_script::Error::Invalid)?;
             }
             "media.synthesize" if request.handle.is_some() => {
-                if !matches!(self.resource(request, context)?, Resource::TextFeed(_)) || request.callback.is_some() {
+                if !matches!(self.resource(request, context)?, Resource::TextFeed(_))
+                    || request.callback.is_some()
+                {
                     return Err(waltr_script::Error::Identity);
                 }
             }
             "media.text.write" | "media.text.close" => {
-                if !matches!(self.resource(request, context)?, Resource::TextFeed(_)) || request.callback.is_some() {
+                if !matches!(self.resource(request, context)?, Resource::TextFeed(_))
+                    || request.callback.is_some()
+                {
                     return Err(waltr_script::Error::Identity);
                 }
-                if request.operation == "media.text.write" && args.text.as_ref().is_none_or(|s| s.len() > 65500) {
+                if request.operation == "media.text.write"
+                    && args.text.as_ref().is_none_or(|s| s.len() > 65500)
+                {
                     return Err(waltr_script::Error::Invalid);
                 }
                 let raw = request.arguments.as_json();
                 let keys = raw.as_object().ok_or(waltr_script::Error::Invalid)?;
                 if keys.len() != usize::from(request.operation == "media.text.write")
-                    || keys.keys().any(|key| key != "text") {
+                    || keys.keys().any(|key| key != "text")
+                {
                     return Err(waltr_script::Error::Invalid);
                 }
             }
             "media.text.open" => {
-                if request.handle.is_some() || request.callback.is_some()
-                    || !request.arguments.as_json().as_object().is_some_and(|args| args.is_empty()) {
+                if request.handle.is_some()
+                    || request.callback.is_some()
+                    || !request
+                        .arguments
+                        .as_json()
+                        .as_object()
+                        .is_some_and(|args| args.is_empty())
+                {
                     return Err(waltr_script::Error::Invalid);
                 }
             }
@@ -617,12 +786,13 @@ impl MediaHost {
                     return Err(waltr_script::Error::Invalid);
                 }
             }
-            "helper.run" => {
+            "helper.run" | "helper.open" => {
                 if request.handle.is_some() {
                     self.resource(request, context)?;
                 }
             }
-            "media.select" | "media.publish" | "media.emit" | "media.lease" | "media.read" | "media.readText" => {
+            "media.select" | "media.publish" | "media.emit" | "media.lease" | "media.read"
+            | "media.readText" => {
                 self.resource(request, context)?;
             }
             "media.proposal.read" => {
@@ -651,25 +821,67 @@ impl MediaHost {
                 (None, Some(Value::String(_))) => return Err(waltr_script::Error::Limit),
                 _ => return Err(waltr_script::Error::Invalid),
             }
-            let state = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?;
-            let output = state.outputs.get(required(&args.output)?).ok_or(waltr_script::Error::Identity)?;
-            if output.format() != (Format::Pcm16Le { rate: 24000, channels: 1 }) {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| waltr_script::Error::Cleanup)?;
+            let output = state
+                .outputs
+                .get(required(&args.output)?)
+                .ok_or(waltr_script::Error::Identity)?;
+            if output.format()
+                != (Format::Pcm16Le {
+                    rate: 24000,
+                    channels: 1,
+                })
+            {
                 return Err(waltr_script::Error::Invalid);
             }
-        } else if args.utterances.is_some() || args.text.is_some() && request.operation != "media.text.write" {
+        } else if args.utterances.is_some()
+            || args.text.is_some() && request.operation != "media.text.write"
+        {
             return Err(waltr_script::Error::Invalid);
         }
-        if matches!(request.operation.as_str(), "media.collect" | "media.transcribe" | "media.synthesize") {
-            let format = if args.text.is_some() || request.operation == "media.synthesize" && request.handle.is_some() {
+        if matches!(
+            request.operation.as_str(),
+            "media.collect" | "media.transcribe" | "media.synthesize"
+        ) {
+            let format = if request.operation == "media.collect" && request.handle.is_some() {
+                let Resource::Capture(capture) = self.resource(request, context)? else {
+                    return Err(waltr_script::Error::Identity);
+                };
+                capture.format
+            } else if args.text.is_some()
+                || request.operation == "media.synthesize" && request.handle.is_some()
+            {
                 Format::Text
             } else {
-                self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?.inputs.get(required(&args.port)?).ok_or(waltr_script::Error::Identity)?.format()
+                self.state
+                    .lock()
+                    .map_err(|_| waltr_script::Error::Cleanup)?
+                    .inputs
+                    .get(required(&args.port)?)
+                    .ok_or(waltr_script::Error::Identity)?
+                    .format()
             };
             if request.operation != "media.collect" || format != Format::Text {
-                let backend = self.bindings.speech.select(&args.speech.clone().unwrap_or_default(), request.operation == "media.synthesize", args.snapshot == Some(true)).map_err(|_| waltr_script::Error::Invalid)?.unwrap_or_else(|| self.bindings.speech.clone());
-                backend.preflight(format, args.snapshot == Some(true)).map_err(|_| waltr_script::Error::Invalid)?;
+                let backend = self
+                    .bindings
+                    .speech
+                    .select(
+                        &args.speech.clone().unwrap_or_default(),
+                        request.operation == "media.synthesize",
+                        args.snapshot == Some(true),
+                    )
+                    .map_err(|_| waltr_script::Error::Invalid)?
+                    .unwrap_or_else(|| self.bindings.speech.clone());
+                backend
+                    .preflight(format, args.snapshot == Some(true))
+                    .map_err(|_| waltr_script::Error::Invalid)?;
                 args.backend = Some(backend);
-            } else if args.speech.is_some() || args.snapshot == Some(true) { return Err(waltr_script::Error::Invalid); }
+            } else if args.speech.is_some() || args.snapshot == Some(true) {
+                return Err(waltr_script::Error::Invalid);
+            }
         } else if args.speech.is_some() {
             return Err(waltr_script::Error::Invalid);
         }
@@ -679,6 +891,7 @@ impl MediaHost {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Arguments {
+    task: Option<String>,
     stream: Option<String>,
     outputs: Option<Vec<String>>,
     port: Option<String>,
@@ -734,42 +947,168 @@ impl MediaHost {
         args: Arguments,
     ) -> Result<HostReply, waltr_script::Error> {
         let value = match request.operation.as_str() {
+            "helper.submit" | "helper.idle" | "helper.seal" => {
+                let Resource::Target {
+                    target,
+                    credit,
+                    completed,
+                } = self.resource(&request, &context)?
+                else {
+                    return Err(waltr_script::Error::Identity);
+                };
+                match request.operation.as_str() {
+                    "helper.submit" => target
+                        .submit(args.task.ok_or(waltr_script::Error::Invalid)?)
+                        .await
+                        .map_err(|_| waltr_script::Error::Protocol)?,
+                    "helper.idle" => target
+                        .idle()
+                        .await
+                        .map_err(|_| waltr_script::Error::Protocol)?,
+                    _ => {
+                        let result = target
+                            .seal()
+                            .await
+                            .map_err(|_| waltr_script::Error::Protocol)?;
+                        self.bindings
+                            .driver
+                            .record_helper(
+                                result.session_id.as_str().into(),
+                                result.definition_identity.clone(),
+                            )
+                            .await
+                            .map_err(|_| waltr_script::Error::Cleanup)?;
+                        completed.store(true, Ordering::Release);
+                        return self.issue(
+                            &context,
+                            Resource::Helper {
+                                result: Arc::new(result),
+                                _credit: credit,
+                            },
+                        );
+                    }
+                }
+                json!({"status":"accepted"})
+            }
+            "media.input.next" => {
+                let capture = self
+                    .bindings
+                    .driver
+                    .next_capture(required(&args.port)?.into())
+                    .await
+                    .map_err(|_| waltr_script::Error::Protocol)?;
+                if let Some((id, reader)) = capture {
+                    return self.issue(
+                        &context,
+                        Resource::Capture(Arc::new(Capture {
+                            id,
+                            format: reader.format(),
+                            reader: Mutex::new(Some(reader)),
+                            collected: AtomicBool::new(false),
+                        })),
+                    );
+                }
+                Value::Null
+            }
+            "media.input.acknowledge" => {
+                let Resource::Capture(capture) = self.resource(&request, &context)? else {
+                    return Err(waltr_script::Error::Identity);
+                };
+                if !capture.collected.load(Ordering::Acquire) {
+                    return Err(waltr_script::Error::Protocol);
+                }
+                self.bindings
+                    .driver
+                    .acknowledge_capture(capture.id.clone())
+                    .await
+                    .map_err(|_| waltr_script::Error::Protocol)?;
+                json!({"status":"completed"})
+            }
+            "media.input.seal" => {
+                json!(
+                    self.bindings
+                        .driver
+                        .seal_captures()
+                        .await
+                        .map_err(|_| waltr_script::Error::Protocol)?
+                )
+            }
             "media.text.open" => {
-                let (writer, reader) = self.bindings.streams.open(stream::Direction::Input, Format::Text, false).map_err(media_error)?;
-                return self.issue(&context, Resource::TextFeed(Arc::new(TextFeed {
-                    writer: tokio::sync::Mutex::new(Some((writer, 0))), reader: Mutex::new(Some(reader)),
-                })));
+                let (writer, reader) = self
+                    .bindings
+                    .streams
+                    .open(stream::Direction::Input, Format::Text, false)
+                    .map_err(media_error)?;
+                return self.issue(
+                    &context,
+                    Resource::TextFeed(Arc::new(TextFeed {
+                        writer: tokio::sync::Mutex::new(Some((writer, 0))),
+                        reader: Mutex::new(Some(reader)),
+                    })),
+                );
             }
             "media.text.write" | "media.text.close" => {
-                let Resource::TextFeed(feed) = self.resource(&request, &context)? else { return Err(waltr_script::Error::Identity); };
-                let mut slot = feed.writer.try_lock().map_err(|_| waltr_script::Error::Protocol)?;
+                let Resource::TextFeed(feed) = self.resource(&request, &context)? else {
+                    return Err(waltr_script::Error::Identity);
+                };
+                let mut slot = feed
+                    .writer
+                    .try_lock()
+                    .map_err(|_| waltr_script::Error::Protocol)?;
                 if request.operation == "media.text.close" {
                     let (mut writer, _) = slot.take().ok_or(waltr_script::Error::Identity)?;
                     writer.close(writer.key()).await.map_err(media_error)?;
                 } else {
                     let (writer, sequence) = slot.as_mut().ok_or(waltr_script::Error::Identity)?;
-                    writer.write(writer.key(), Chunk::Text(Text {
-                        segment: sequence.to_string(), text: args.text.ok_or(waltr_script::Error::Invalid)?, replace: false, committed: true,
-                    })).await.map_err(media_error)?;
+                    writer
+                        .write(
+                            writer.key(),
+                            Chunk::Text(Text {
+                                segment: sequence.to_string(),
+                                text: args.text.ok_or(waltr_script::Error::Invalid)?,
+                                replace: false,
+                                committed: true,
+                            }),
+                        )
+                        .await
+                        .map_err(media_error)?;
                     *sequence += 1;
                 }
                 json!({"status":"completed"})
             }
             "media.synthesize" if request.handle.is_some() => {
-                let Resource::TextFeed(feed) = self.resource(&request, &context)? else { return Err(waltr_script::Error::Identity); };
-                let input = feed.reader.lock().map_err(|_| waltr_script::Error::Cleanup)?.take().ok_or(waltr_script::Error::Identity)?;
-                let output = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?.outputs.remove(required(&args.output)?).ok_or(waltr_script::Error::Identity)?;
+                let Resource::TextFeed(feed) = self.resource(&request, &context)? else {
+                    return Err(waltr_script::Error::Identity);
+                };
+                let input = feed
+                    .reader
+                    .lock()
+                    .map_err(|_| waltr_script::Error::Cleanup)?
+                    .take()
+                    .ok_or(waltr_script::Error::Identity)?;
+                let output = self
+                    .state
+                    .lock()
+                    .map_err(|_| waltr_script::Error::Cleanup)?
+                    .outputs
+                    .remove(required(&args.output)?)
+                    .ok_or(waltr_script::Error::Identity)?;
                 let backend = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?;
                 let producer = if args.utterances == Some(true) {
                     backend.synthesize_utterances(input, output)
                 } else {
                     backend.synthesize(input, output)
-                }.map_err(media_error)?;
+                }
+                .map_err(media_error)?;
                 producer.join().await.map_err(media_error)?;
                 json!({"status":"completed"})
             }
             "helper.next" => {
-                let value = self.tool_streams.next(required(&args.stream)?, self.cancel.clone()).await.map_err(|_| waltr_script::Error::Protocol)?;
+                let value = self
+                    .tool_streams
+                    .next(required(&args.stream)?, self.cancel.clone())
+                    .await
+                    .map_err(|_| waltr_script::Error::Protocol)?;
                 json!({"value":value})
             }
             name if name.starts_with("context.") => {
@@ -821,22 +1160,37 @@ impl MediaHost {
             }
             "media.synthesize" if args.text.is_some() => {
                 let text = args.text.as_deref().ok_or(waltr_script::Error::Invalid)?;
-                let (writer, input) = self.bindings.streams
+                let (writer, input) = self
+                    .bindings
+                    .streams
                     .open(stream::Direction::Input, Format::Text, false)
                     .map_err(media_error)?;
-                let output = self.state.lock().map_err(|_| waltr_script::Error::Cleanup)?
-                    .outputs.remove(required(&args.output)?).ok_or(waltr_script::Error::Identity)?;
-                let producer = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?
-                    .synthesize(input, output).map_err(media_error)?;
+                let output = self
+                    .state
+                    .lock()
+                    .map_err(|_| waltr_script::Error::Cleanup)?
+                    .outputs
+                    .remove(required(&args.output)?)
+                    .ok_or(waltr_script::Error::Identity)?;
+                let producer = args
+                    .backend
+                    .as_ref()
+                    .ok_or(waltr_script::Error::Invalid)?
+                    .synthesize(input, output)
+                    .map_err(media_error)?;
                 let (fed, joined) = tokio::join!(
                     async {
                         let result = write_text(writer, text).await;
-                        if result.is_err() { self.cancel.cancel(); }
+                        if result.is_err() {
+                            self.cancel.cancel();
+                        }
                         result
                     },
                     async {
                         let result = producer.join().await;
-                        if result.is_err() { self.cancel.cancel(); }
+                        if result.is_err() {
+                            self.cancel.cancel();
+                        }
                         result.map_err(media_error)
                     }
                 );
@@ -845,13 +1199,25 @@ impl MediaHost {
                 json!({"status":"completed"})
             }
             "media.transcribe" | "media.collect" | "media.synthesize" => {
-                let input = self
-                    .state
-                    .lock()
-                    .map_err(|_| waltr_script::Error::Cleanup)?
-                    .inputs
-                    .remove(required(&args.port)?)
-                    .ok_or(waltr_script::Error::Identity)?;
+                let input = if request.operation == "media.collect" && request.handle.is_some() {
+                    let Resource::Capture(capture) = self.resource(&request, &context)? else {
+                        return Err(waltr_script::Error::Identity);
+                    };
+                    let reader = capture
+                        .reader
+                        .lock()
+                        .map_err(|_| waltr_script::Error::Cleanup)?
+                        .take()
+                        .ok_or(waltr_script::Error::Identity)?;
+                    reader
+                } else {
+                    self.state
+                        .lock()
+                        .map_err(|_| waltr_script::Error::Cleanup)?
+                        .inputs
+                        .remove(required(&args.port)?)
+                        .ok_or(waltr_script::Error::Identity)?
+                };
                 if request.operation == "media.collect" {
                     let cap = args
                         .cap
@@ -873,7 +1239,10 @@ impl MediaHost {
                             self.bindings.workspace_principal.clone(),
                             self.bindings.workspace_process.clone(),
                         );
-                        let (producer, reader) = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?
+                        let (producer, reader) = args
+                            .backend
+                            .as_ref()
+                            .ok_or(waltr_script::Error::Invalid)?
                             .transcribe_snapshot(input, workspace)
                             .map_err(media_error)?;
                         let (joined, collected) = tokio::join!(
@@ -900,7 +1269,10 @@ impl MediaHost {
                             .streams
                             .open(stream::Direction::Output, Format::Text, false)
                             .map_err(media_error)?;
-                        let producer = args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?
+                        let producer = args
+                            .backend
+                            .as_ref()
+                            .ok_or(waltr_script::Error::Invalid)?
                             .transcribe(input, output)
                             .map_err(media_error)?;
                         let (joined, collected) = tokio::join!(
@@ -925,14 +1297,21 @@ impl MediaHost {
                             .segments()
                             .collect::<String>()
                     };
-                    return self.issue(
+                    let reply = self.issue(
                         &context,
                         Resource::Text {
                             text: Arc::new(text),
                             helper_session: None,
                             _credit: credit,
                         },
-                    );
+                    )?;
+                    if request.handle.is_some() {
+                        let Resource::Capture(capture) = self.resource(&request, &context)? else {
+                            return Err(waltr_script::Error::Identity);
+                        };
+                        capture.collected.store(true, Ordering::Release);
+                    }
+                    return Ok(reply);
                 }
                 let output = self
                     .state
@@ -942,16 +1321,24 @@ impl MediaHost {
                     .remove(required(&args.output)?)
                     .ok_or(waltr_script::Error::Identity)?;
                 let producer = if request.operation == "media.transcribe" {
-                    args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?.transcribe(input, output)
+                    args.backend
+                        .as_ref()
+                        .ok_or(waltr_script::Error::Invalid)?
+                        .transcribe(input, output)
                 } else {
-                    args.backend.as_ref().ok_or(waltr_script::Error::Invalid)?.synthesize(input, output)
+                    args.backend
+                        .as_ref()
+                        .ok_or(waltr_script::Error::Invalid)?
+                        .synthesize(input, output)
                 }
                 .map_err(media_error)?;
                 producer.join().await.map_err(media_error)?;
                 json!({"status":"completed"})
             }
             "media.finish" => {
-                if !self.tool_streams.drained() { return Err(waltr_script::Error::Protocol); }
+                if !self.tool_streams.drained() {
+                    return Err(waltr_script::Error::Protocol);
+                }
                 {
                     let mut state = self
                         .state
@@ -961,9 +1348,23 @@ impl MediaHost {
                         return Err(waltr_script::Error::Protocol);
                     }
                     for (_, resource) in &state.resources {
+                        if let Resource::Target { completed, .. } = resource {
+                            if !completed.load(Ordering::Acquire) {
+                                return Err(waltr_script::Error::Protocol);
+                            }
+                        }
                         if let Resource::TextFeed(feed) = resource {
-                            if feed.writer.try_lock().map_err(|_| waltr_script::Error::Protocol)?.is_some()
-                                || feed.reader.lock().map_err(|_| waltr_script::Error::Cleanup)?.is_some() {
+                            if feed
+                                .writer
+                                .try_lock()
+                                .map_err(|_| waltr_script::Error::Protocol)?
+                                .is_some()
+                                || feed
+                                    .reader
+                                    .lock()
+                                    .map_err(|_| waltr_script::Error::Cleanup)?
+                                    .is_some()
+                            {
                                 return Err(waltr_script::Error::Protocol);
                             }
                         }
@@ -1081,14 +1482,16 @@ impl MediaHost {
                 retained.take();
                 return self.issue(&context, Resource::Blob(result?));
             }
-            "helper.run" => {
+            "helper.run" | "helper.open" => {
                 let resource = request
                     .handle
                     .as_ref()
                     .map(|_| self.resource(&request, &context))
                     .transpose()?;
                 let profile = args.helper.ok_or(waltr_script::Error::Invalid)?;
-                let helpers = args.helper_runner.unwrap_or_else(|| self.bindings.helpers.clone());
+                let helpers = args
+                    .helper_runner
+                    .unwrap_or_else(|| self.bindings.helpers.clone());
                 let mut capabilities = if resource.is_some() {
                     helpers
                         .input_capabilities(profile.selection.clone())
@@ -1181,7 +1584,9 @@ impl MediaHost {
                             return Err(waltr_script::Error::Denied);
                         }
                         let text = resource_text(resource, profile.field.as_deref())?;
-                        if text.len() > profile.input.max_bytes { return Err(waltr_script::Error::Limit); }
+                        if text.len() > profile.input.max_bytes {
+                            return Err(waltr_script::Error::Limit);
+                        }
                         Some(
                             self.bindings
                                 .attachments
@@ -1199,6 +1604,37 @@ impl MediaHost {
                         limits: self.definition.limits().clone(),
                     }) as Arc<dyn CompletionObserver>
                 });
+                if request.operation == "helper.open" {
+                    let target = helpers
+                        .open(
+                            HelperRequest {
+                                selection: profile.selection,
+                                task: profile.task,
+                                capture: profile.capture,
+                                max_turns: profile.max_turns,
+                                deadline: Duration::from_millis(profile.deadline_ms),
+                                observer,
+                            },
+                            HelperPayload {
+                                budget: self.bindings.attachments.clone(),
+                                attachments: Vec::new(),
+                                capabilities,
+                                completion_bytes: profile.completion_bytes,
+                                response_bytes: profile.response_bytes,
+                            },
+                            self.cancel.clone(),
+                        )
+                        .await
+                        .map_err(|_| waltr_script::Error::Protocol)?;
+                    return self.issue(
+                        &context,
+                        Resource::Target {
+                            target,
+                            credit,
+                            completed: Arc::new(AtomicBool::new(false)),
+                        },
+                    );
+                }
                 let result = helpers
                     .run_with_inputs(
                         HelperRequest {
@@ -1437,12 +1873,18 @@ async fn write_text(mut output: Writer, mut text: &str) -> Result<(), waltr_scri
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        output.write(output.key(), Chunk::Text(Text {
-            segment: format!("result-{index}"),
-            text: text[..end].into(),
-            replace: false,
-            committed: true,
-        })).await.map_err(media_error)?;
+        output
+            .write(
+                output.key(),
+                Chunk::Text(Text {
+                    segment: format!("result-{index}"),
+                    text: text[..end].into(),
+                    replace: false,
+                    committed: true,
+                }),
+            )
+            .await
+            .map_err(media_error)?;
         index += 1;
         text = &text[end..];
     }
@@ -1747,6 +2189,10 @@ impl Reservation for MediaReservation {
         Box::pin(async move { result })
     }
     fn validate_success(&self) -> Result<(), PortError> {
-        if self.0.tool_streams.was_drained() { Ok(()) } else { Err(PortError::Invalid) }
+        if self.0.tool_streams.was_drained() {
+            Ok(())
+        } else {
+            Err(PortError::Invalid)
+        }
     }
 }

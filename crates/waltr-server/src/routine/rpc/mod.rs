@@ -3,6 +3,7 @@ pub mod api;
 pub mod attachments;
 pub mod blobs;
 pub mod catalog;
+mod captures;
 pub(crate) mod cursor;
 pub mod service;
 pub mod transport;

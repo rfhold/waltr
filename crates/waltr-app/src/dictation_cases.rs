@@ -1064,7 +1064,16 @@ async fn foreground_pause_cancels_audio_without_retiring_authenticated_generatio
 async fn hold_keyup_during_permission_and_capture_start_finishes_the_pinned_command() {
     let (transport, fake, stop, server) = fixture().await;
     let host = host();
+    let mut snapshot = support::snapshot("test");
+    snapshot.routines.definitions.definitions[0]
+        .capabilities
+        .push("media.inputs".into());
+    host.audio.observe(&snapshot);
     let (held, control) = host.audio.hold(binding()).unwrap();
+    assert!(
+        !control.repeats_enabled(),
+        "capability-bearing text command remains one-shot"
+    );
     let status = control.status();
     let deferred = Arc::new(Deferred::default());
     let permission = AudioPermissions::new(1, true, deferred.clone());
@@ -1486,12 +1495,21 @@ async fn typing_hold_uses_guarded_factory_and_remains_active_through_owned_close
     let (transport, _fake, stop, server) = fixture().await;
     for revoke in [false, true] {
         let host = host();
+        let mut snapshot = support::snapshot("test");
+        snapshot.routines.definitions.definitions[0]
+            .capabilities
+            .push("media.inputs".into());
+        host.audio.observe(&snapshot);
         let provider = waltr_client::NativeCredentialProvider::new();
         host.credentials(provider.clone());
         let mut binding = Arc::try_unwrap(binding()).unwrap();
         binding.command = None;
         binding.typing = Some(waltr_desktop::config::TypingSpec {});
         let (held, control) = host.audio.hold(Arc::new(binding)).unwrap();
+        assert!(
+            !control.repeats_enabled(),
+            "capability-bearing text typing remains one-shot"
+        );
         control.release();
         let mock = Arc::new(Mock::default());
         let sink = Sink {
@@ -1537,7 +1555,7 @@ fn native_ipc_and_lifecycle_source_contracts() {
     let hold = include_str!("../../waltr-desktop/src/host.rs");
     let driver = include_str!("../../waltr-desktop/src/interaction.rs");
     assert!(chat.contains("waltr_desktop::interaction::run("));
-    assert!(hold.contains("crate::interaction::run("));
+    assert!(hold.contains("crate::interaction::run_hold("));
     for consumer in [chat, hold] {
         assert!(!consumer.contains("Event::InputChunk("));
         assert!(!consumer.contains("CaptureWorker::start_observed("));

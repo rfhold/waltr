@@ -45,6 +45,8 @@ mod configuration_tests;
 mod context_tests;
 #[path = "tool_streams_integration_tests.rs"]
 mod tool_streams_integration_tests;
+#[path = "helper_followup_tests.rs"]
+mod helper_followup_tests;
 
 fn inference() -> InferenceSettings {
     InferenceSettings {

@@ -352,6 +352,15 @@ where
                         self.phase = AgentLoopPhase::StartTurn;
                         continue;
                     }
+                    // Retries must retain their canonical request. Only a new
+                    // logical dispatch may adopt newly admitted user messages.
+                    if self.provider_attempt == 1 {
+                        match bounded!(self.adopt_next_turn_prompts(false)) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => return Some((Err(error), self)),
+                        }
+                    }
                     if self.provider_attempt == 1
                         && self
                             .max_provider_turns
@@ -546,6 +555,11 @@ where
                                     calls: streaming.tool_calls.into(),
                                 });
                                 continue;
+                            }
+                            match bounded!(self.adopt_next_turn_prompts(true)) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(error) => return Some((Err(error), self)),
                             }
                             match bounded!(self.validate_completion()) {
                                 Ok(true) => {}
@@ -1082,6 +1096,35 @@ where
         self.turn += 1;
         self.phase = AgentLoopPhase::StartTurn;
         Ok(())
+    }
+
+    async fn adopt_next_turn_prompts(&mut self, completing: bool) -> Result<bool> {
+        let prompts = self
+            .session_run_context
+            .as_ref()
+            .and_then(|context| context.next_turn.as_ref())
+            .map(|input| input.drain(completing))
+            .unwrap_or_default();
+        if prompts.is_empty() {
+            return Ok(false);
+        }
+        if completing {
+            self.append_journal_event(SessionJournalEvent::TurnFinished {
+                turn: self.turn as u64,
+            })
+            .await?;
+            self.close_turn_span("next_turn_input");
+            self.turn += 1;
+            self.assistant_item_id = None;
+            self.thinking_item_id = None;
+        }
+        self.synchronize_host_effects().await?;
+        let record = self.session_record.clone().expect("initialized session");
+        self.input = Some(ResumeInput::Prompts(prompts));
+        if self.apply_resume_input(record).await? {
+            self.phase = AgentLoopPhase::StartTurn;
+        }
+        Ok(true)
     }
 
     async fn validate_completion(&mut self) -> Result<bool> {
@@ -1720,10 +1763,14 @@ where
             .iter()
             .enumerate()
             .filter_map(|(index, event)| match event {
-                SessionJournalEvent::TurnFinished { turn } => {
-                    Some((self.session_journal_len.saturating_add(index as u64), super::event::SessionSemanticKind::TurnCompleted { turn: *turn }))
-                }
-                SessionJournalEvent::Finished => Some((self.session_journal_len.saturating_add(index as u64), super::event::SessionSemanticKind::RunFinished)),
+                SessionJournalEvent::TurnFinished { turn } => Some((
+                    self.session_journal_len.saturating_add(index as u64),
+                    super::event::SessionSemanticKind::TurnCompleted { turn: *turn },
+                )),
+                SessionJournalEvent::Finished => Some((
+                    self.session_journal_len.saturating_add(index as u64),
+                    super::event::SessionSemanticKind::RunFinished,
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1733,11 +1780,7 @@ where
         }
         self.publish_session_summary();
         for (index, kind) in committed_facts {
-            self.notify_semantic(
-                kind,
-                format!("j{index}"),
-                self.last_timeline_cursor,
-            );
+            self.notify_semantic(kind, format!("j{index}"), self.last_timeline_cursor);
         }
         Ok(())
     }
@@ -2345,7 +2388,10 @@ where
                         first_journal_index.saturating_add(offset.saturating_mul(2)),
                     ),
                     session_id: self.session_id.clone(),
-                    incarnation: self.session_record.as_ref().and_then(|record| record.metadata.incarnation.clone()),
+                    incarnation: self
+                        .session_record
+                        .as_ref()
+                        .and_then(|record| record.metadata.incarnation.clone()),
                     prompt_index,
                     user_message_count: prompt_index.saturating_add(1),
                     text: text.clone(),

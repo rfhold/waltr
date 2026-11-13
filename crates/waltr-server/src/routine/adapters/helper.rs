@@ -32,6 +32,7 @@ use waltr_agent::{
 use waltr_script::{CallbackRef, Limits, StructuredValue};
 
 const CAPTURE_TOOL: &str = "_helper_capture";
+mod followup;
 mod inference;
 pub use inference::{HelperInput, InferenceSelector};
 type OriginGuard = Arc<dyn Fn() -> PortFuture<()> + Send + Sync>;
@@ -172,6 +173,7 @@ pub struct CoordinatorHelperRunner<S: SessionStore + Clone + Send + Sync + 'stat
     runtime: tokio::runtime::Handle,
     restriction: Option<PermissionPolicy>,
     origin_guard: Option<OriginGuard>,
+    groups: Arc<tokio::sync::Mutex<Vec<followup::Group>>>,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> std::fmt::Debug
     for CoordinatorHelperRunner<S>
@@ -202,18 +204,37 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for CoordinatorHelpe
             runtime: self.runtime.clone(),
             restriction: self.restriction.clone(),
             origin_guard: self.origin_guard.clone(),
+            groups: self.groups.clone(),
         }
     }
 }
 
 impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S> {
-    fn capture_contract(&self, selection: &HelperSelection, name: Option<&str>) -> Result<Option<Contract>, PortError> {
-        let Some(name) = name else { return Ok(None); };
-        let bindings = self.capture_bindings.lock().map_err(|_| PortError::Unavailable)?;
-        if bindings.as_ref().is_some_and(|bindings| bindings.get(name) != Some(selection)) {
+    fn capture_contract(
+        &self,
+        selection: &HelperSelection,
+        name: Option<&str>,
+    ) -> Result<Option<Contract>, PortError> {
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let bindings = self
+            .capture_bindings
+            .lock()
+            .map_err(|_| PortError::Unavailable)?;
+        if bindings
+            .as_ref()
+            .is_some_and(|bindings| bindings.get(name) != Some(selection))
+        {
             return Err(PortError::Denied);
         }
-        self.captures.lock().map_err(|_| PortError::Unavailable)?.get(name).cloned().map(Some).ok_or(PortError::Denied)
+        self.captures
+            .lock()
+            .map_err(|_| PortError::Unavailable)?
+            .get(name)
+            .cloned()
+            .map(Some)
+            .ok_or(PortError::Denied)
     }
     /// Bind a private invocation to authenticated inputs. `source` is the agent-owned,
     /// rollback-effective completed-history projection, not a raw source record.
@@ -235,7 +256,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                 profile.prompt.len() > 16384 || !(1..=64).contains(&profile.max_turns)
             })
             || captures.values().any(|contract| {
-                contract.validate_capture().is_err() || contract.schema_version != SCHEMA_VERSION
+                contract.validate_capture().is_err()
+                    || contract.schema_version != SCHEMA_VERSION
                     || serde_json::to_vec(contract).map_or(true, |bytes| bytes.len() > 16384)
             })
         {
@@ -262,6 +284,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             runtime: tokio::runtime::Handle::current(),
             restriction: None,
             origin_guard: None,
+            groups: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -277,12 +300,19 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
     }
 
     #[cfg(test)]
-    pub(crate) fn with_input_models(mut self, models: BTreeMap<(String, String), waltr_agent::TransientModelCapabilities>) -> Self {
+    pub(crate) fn with_input_models(
+        mut self,
+        models: BTreeMap<(String, String), waltr_agent::TransientModelCapabilities>,
+    ) -> Self {
         self.input_models = models;
         self
     }
 
-    pub(crate) fn with_catalog(mut self, catalog: Arc<crate::resource_catalog::AgentDefinitionSnapshot>, source: Option<InferenceSettings>) -> Self {
+    pub(crate) fn with_catalog(
+        mut self,
+        catalog: Arc<crate::resource_catalog::AgentDefinitionSnapshot>,
+        source: Option<InferenceSettings>,
+    ) -> Self {
         self.catalog = Some(catalog);
         self.source_inference = source;
         self
@@ -300,6 +330,14 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
 }
 
 impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for CoordinatorHelperRunner<S> {
+    fn open(
+        &self,
+        request: HelperRequest,
+        payload: HelperPayload,
+        cancellation: CancellationToken,
+    ) -> PortFuture<Arc<dyn crate::routine::ports::HelperTarget>> {
+        followup::open(self.clone(), request, payload, cancellation)
+    }
     fn bind_tool_streams(&self, streams: Arc<super::tool_streams::ToolStreams>) -> PortFuture<()> {
         let this = self.clone();
         Box::pin(async move {
@@ -307,27 +345,58 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
             for stream in streams.declarations() {
                 let policy = match &stream.selection {
                     HelperSelection::Named { name } => {
-                        let bundle = this.named.lock().map_err(|_| PortError::Unavailable)?
-                            .as_ref().and_then(|named| named.get(name)).cloned().ok_or(PortError::Denied)?;
-                        this.factory.helper_host_tool_policy(&bundle, &stream.tool)
+                        let bundle = this
+                            .named
+                            .lock()
+                            .map_err(|_| PortError::Unavailable)?
+                            .as_ref()
+                            .and_then(|named| named.get(name))
+                            .cloned()
+                            .ok_or(PortError::Denied)?;
+                        this.factory
+                            .helper_host_tool_policy(&bundle, &stream.tool)
                             .map_err(|_| PortError::Unavailable)?
                     }
-                    HelperSelection::Restricted { profile } => this.restricted.get(profile).ok_or(PortError::Denied)?.runtime.helper_capture_policy(),
+                    HelperSelection::Restricted { profile } => this
+                        .restricted
+                        .get(profile)
+                        .ok_or(PortError::Denied)?
+                        .runtime
+                        .helper_capture_policy(),
                 };
-                let policy = match &this.restriction { Some(r) => policy.intersection(r.clone()), None => policy };
-                if policy.evaluate_target_tool_effect(&format!("builtin:{}", stream.tool), &stream.tool).level == crate::permission::PermissionLevel::Deny {
+                let policy = match &this.restriction {
+                    Some(r) => policy.intersection(r.clone()),
+                    None => policy,
+                };
+                if policy
+                    .evaluate_target_tool_effect(&format!("builtin:{}", stream.tool), &stream.tool)
+                    .level
+                    == crate::permission::PermissionLevel::Deny
+                {
                     return Err(PortError::Denied);
                 }
             }
-            let mut current = this.tool_streams.lock().map_err(|_| PortError::Unavailable)?;
-            if current.is_some() { return Err(PortError::Conflict); }
+            let mut current = this
+                .tool_streams
+                .lock()
+                .map_err(|_| PortError::Unavailable)?;
+            if current.is_some() {
+                return Err(PortError::Conflict);
+            }
             *current = Some(streams);
             Ok(())
         })
     }
-    fn select_inference(&self, selector: &InferenceSelector) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
+    fn select_inference(
+        &self,
+        selector: &InferenceSelector,
+    ) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
         let Some(catalog) = &self.catalog else {
-            return if selector.is_default() { Ok(None) } else { Err(PortError::UnsupportedCapability) };
+            return if selector.is_default() {
+                Ok(None)
+            } else {
+                Err(PortError::UnsupportedCapability)
+            };
         };
         let mut selected = self.clone();
         selected.inference = Some(selector.resolve(catalog, self.source_inference.as_ref())?);
@@ -336,14 +405,24 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
     fn preflight_captures(&self) -> PortFuture<()> {
         let this = self.clone();
         Box::pin(async move {
-            let bindings = this.capture_bindings.lock().map_err(|_| PortError::Unavailable)?
-                .clone().ok_or(PortError::Invalid)?;
+            let bindings = this
+                .capture_bindings
+                .lock()
+                .map_err(|_| PortError::Unavailable)?
+                .clone()
+                .ok_or(PortError::Invalid)?;
             for (capture, selection) in bindings {
                 this.capture_contract(&selection, Some(&capture))?;
                 let policy = match &selection {
                     HelperSelection::Named { name } => {
-                        let bundle = this.named.lock().map_err(|_| PortError::Unavailable)?
-                            .as_ref().and_then(|named| named.get(name)).cloned().ok_or(PortError::Denied)?;
+                        let bundle = this
+                            .named
+                            .lock()
+                            .map_err(|_| PortError::Unavailable)?
+                            .as_ref()
+                            .and_then(|named| named.get(name))
+                            .cloned()
+                            .ok_or(PortError::Denied)?;
                         this.factory
                             .helper_capture_policy(&bundle)
                             .map_err(|error| {
@@ -355,53 +434,117 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                                 )
                             })?
                     }
-                    HelperSelection::Restricted { profile } => this.restricted.get(profile)
-                        .ok_or(PortError::Denied)?.runtime.helper_capture_policy(),
+                    HelperSelection::Restricted { profile } => this
+                        .restricted
+                        .get(profile)
+                        .ok_or(PortError::Denied)?
+                        .runtime
+                        .helper_capture_policy(),
                 };
                 let policy = match &this.restriction {
                     Some(restriction) => policy.intersection(restriction.clone()),
                     None => policy,
                 };
-                if policy.evaluate_target_tool_effect(&format!("builtin:{CAPTURE_TOOL}"), CAPTURE_TOOL).level == crate::permission::PermissionLevel::Deny {
+                if policy
+                    .evaluate_target_tool_effect(&format!("builtin:{CAPTURE_TOOL}"), CAPTURE_TOOL)
+                    .level
+                    == crate::permission::PermissionLevel::Deny
+                {
                     return Err(PortError::Denied);
                 }
             }
             Ok(())
         })
     }
-    fn bind_captures(&self, captures: BTreeMap<String, crate::routine::definition::CaptureContract>) -> PortFuture<()> {
+    fn bind_captures(
+        &self,
+        captures: BTreeMap<String, crate::routine::definition::CaptureContract>,
+    ) -> PortFuture<()> {
         let this = self.clone();
         Box::pin(async move {
-            if captures.len() > 32 || captures.values().any(|capture| capture.contract.validate_capture().is_err()) {
+            if captures.len() > 32
+                || captures
+                    .values()
+                    .any(|capture| capture.contract.validate_capture().is_err())
+            {
                 return Err(PortError::Invalid);
             }
-            let mut bindings = this.capture_bindings.lock().map_err(|_| PortError::Unavailable)?;
-            if bindings.is_some() { return Err(PortError::Conflict); }
+            let mut bindings = this
+                .capture_bindings
+                .lock()
+                .map_err(|_| PortError::Unavailable)?;
+            if bindings.is_some() {
+                return Err(PortError::Conflict);
+            }
             let mut contracts = this.captures.lock().map_err(|_| PortError::Unavailable)?;
-            *bindings = Some(captures.iter().map(|(name, capture)| (name.clone(), capture.selection.clone())).collect());
-            *contracts = captures.into_iter().map(|(name, capture)| (name, capture.contract)).collect();
+            *bindings = Some(
+                captures
+                    .iter()
+                    .map(|(name, capture)| (name.clone(), capture.selection.clone()))
+                    .collect(),
+            );
+            *contracts = captures
+                .into_iter()
+                .map(|(name, capture)| (name, capture.contract))
+                .collect();
             Ok(())
         })
     }
-    fn input_capabilities(&self, selection: HelperSelection) -> PortFuture<waltr_agent::TransientModelCapabilities> {
+    fn input_capabilities(
+        &self,
+        selection: HelperSelection,
+    ) -> PortFuture<waltr_agent::TransientModelCapabilities> {
         let this = self.clone();
         Box::pin(async move {
             let inference = match &selection {
                 HelperSelection::Named { name } => {
-                    if !this.named.lock().map_err(|_| PortError::Unavailable)?.as_ref().is_some_and(|named| named.contains_key(name)) { return Err(PortError::Denied); }
+                    if !this
+                        .named
+                        .lock()
+                        .map_err(|_| PortError::Unavailable)?
+                        .as_ref()
+                        .is_some_and(|named| named.contains_key(name))
+                    {
+                        return Err(PortError::Denied);
+                    }
                     this.inference.as_ref().ok_or(PortError::Invalid)?
                 }
-                HelperSelection::Restricted { profile } => &this.restricted.get(profile).ok_or(PortError::Denied)?.inference,
+                HelperSelection::Restricted { profile } => {
+                    &this
+                        .restricted
+                        .get(profile)
+                        .ok_or(PortError::Denied)?
+                        .inference
+                }
             };
             if this.catalog.is_some() {
                 // Every supported inference encoder implements UTF-8; image/PDF model support is not catalogued.
-                Ok(waltr_agent::TransientModelCapabilities { png: false, jpeg: false, webp: false, pdf: false, text: true, max_body_bytes: 32 * 1024 * 1024 })
+                Ok(waltr_agent::TransientModelCapabilities {
+                    png: false,
+                    jpeg: false,
+                    webp: false,
+                    pdf: false,
+                    text: true,
+                    max_body_bytes: 32 * 1024 * 1024,
+                })
             } else {
-                this.input_models.get(&(inference.provider.key.clone(), inference.provider.model_id.clone())).copied().ok_or(PortError::UnsupportedCapability)
+                this.input_models
+                    .get(&(
+                        inference.provider.key.clone(),
+                        inference.provider.model_id.clone(),
+                    ))
+                    .copied()
+                    .ok_or(PortError::UnsupportedCapability)
             }
         })
     }
-    fn run_with_inputs(&self, request: HelperRequest, source: Option<SessionCopy>, payload: Option<HelperPayload>, cancellation: CancellationToken) -> PortFuture<HelperResult> {
+    fn run_with_inputs(
+        &self,
+        request: HelperRequest,
+        source: Option<SessionCopy>,
+        payload: Option<HelperPayload>,
+        cancellation: CancellationToken,
+    ) -> PortFuture<HelperResult> {
         let mut runner = self.clone();
         runner.source = source;
         runner.run_internal(request, payload, cancellation)
@@ -416,14 +559,16 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
         Box::pin(async move {
             this.capture_contract(&selection, capture.as_deref())?;
             let allowed = this.input_capabilities(selection.clone()).await?;
-            if capabilities.png && !allowed.png || capabilities.jpeg && !allowed.jpeg
-                || capabilities.webp && !allowed.webp || capabilities.pdf && !allowed.pdf
-                || capabilities.text && !allowed.text || capabilities.max_body_bytes > allowed.max_body_bytes {
+            if capabilities.png && !allowed.png
+                || capabilities.jpeg && !allowed.jpeg
+                || capabilities.webp && !allowed.webp
+                || capabilities.pdf && !allowed.pdf
+                || capabilities.text && !allowed.text
+                || capabilities.max_body_bytes > allowed.max_body_bytes
+            {
                 return Err(PortError::Denied);
             }
-            if capabilities.max_body_bytes == 0
-                || capabilities.max_body_bytes > 32 * 1024 * 1024
-            {
+            if capabilities.max_body_bytes == 0 || capabilities.max_body_bytes > 32 * 1024 * 1024 {
                 return Err(PortError::Invalid);
             }
             let api = match selection {
@@ -437,7 +582,11 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                     {
                         return Err(PortError::Denied);
                     }
-                    this.inference.as_ref().ok_or(PortError::Invalid)?.provider.api
+                    this.inference
+                        .as_ref()
+                        .ok_or(PortError::Invalid)?
+                        .provider
+                        .api
                 }
                 HelperSelection::Restricted { profile } => {
                     let profile = this.restricted.get(&profile).ok_or(PortError::Denied)?;
@@ -483,14 +632,16 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                 let bundle = if let Some(catalog) = &this.catalog {
                     catalog.catalog().resolved(&name).ok_or(PortError::Denied)?;
                     AgentDefinitionBundle::new(&name, catalog.sources().to_vec())
-                } else { this.factory.bundle_for_agent(&name).map_err(|error| {
-                    helper_failure(
-                        "pin_named",
-                        runtime_category(&error),
-                        None,
-                        PortError::Denied,
-                    )
-                })? };
+                } else {
+                    this.factory.bundle_for_agent(&name).map_err(|error| {
+                        helper_failure(
+                            "pin_named",
+                            runtime_category(&error),
+                            None,
+                            PortError::Denied,
+                        )
+                    })?
+                };
                 pinned.insert(name, bundle);
             }
             *named = Some(pinned);
@@ -515,6 +666,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
 
     fn cleanup(&self) -> PortFuture<()> {
         let owners = self.owners.clone();
+        let groups = self.groups.clone();
         Box::pin(async move {
             let owned = {
                 let mut state = owners.lock().await;
@@ -522,6 +674,13 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                 state.owners.clone()
             };
             let mut failed = false;
+            let mut groups = groups.lock().await;
+            for group in groups.iter() {
+                group.cancel.cancel();
+            }
+            for group in groups.drain(..) {
+                failed |= group.task.await.is_err();
+            }
             for owner in owned {
                 failed |= owner.close().await.is_err();
             }
@@ -541,12 +700,27 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
         payload: Option<HelperPayload>,
         cancellation: CancellationToken,
     ) -> PortFuture<HelperResult> {
+        self.run_internal_open(request, payload, cancellation, None)
+    }
+
+    fn run_internal_open(
+        &self,
+        request: HelperRequest,
+        payload: Option<HelperPayload>,
+        cancellation: CancellationToken,
+        opening: Option<followup::Opening>,
+    ) -> PortFuture<HelperResult> {
         let this = self.clone();
         Box::pin(async move {
             let completion_bytes = payload.as_ref().map_or(262144, |p| p.completion_bytes);
             if let Some(payload) = &payload {
                 if !payload.attachments.is_empty() {
-                    this.preflight_payload(request.selection.clone(), payload.capabilities, request.capture.clone()).await?;
+                    this.preflight_payload(
+                        request.selection.clone(),
+                        payload.capabilities,
+                        request.capture.clone(),
+                    )
+                    .await?;
                 }
             }
             if let Some(guard) = &this.origin_guard {
@@ -592,7 +766,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                     let identity = bundle.identity();
                     create.agent_definition =
                         Some(serde_json::to_value(bundle).map_err(|_| PortError::Invalid)?);
-                    create.inference_settings = Some(this.inference.clone().ok_or(PortError::Invalid)?);
+                    create.inference_settings =
+                        Some(this.inference.clone().ok_or(PortError::Invalid)?);
                     (None, identity, request.task)
                 }
                 HelperSelection::Restricted { profile } => {
@@ -617,12 +792,19 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             if owners.closed || owners.owners.len() >= 64 {
                 return Err(PortError::Denied);
             }
-            let mut producer = this.tool_streams.lock().map_err(|_| PortError::Unavailable)?
-                .as_ref().map(|streams| streams.claim(&request.selection)).transpose()?;
+            let mut producer = this
+                .tool_streams
+                .lock()
+                .map_err(|_| PortError::Unavailable)?
+                .as_ref()
+                .map(|streams| streams.claim(&request.selection))
+                .transpose()?;
             let session = this
                 .sessions
                 .clone()
-                .with_session_event_sink(Arc::new(crate::agent_host::session_roles::PrivateCreationEvents))
+                .with_session_event_sink(Arc::new(
+                    crate::agent_host::session_roles::PrivateCreationEvents,
+                ))
                 .create(create)
                 .await
                 .map_err(|error| {
@@ -670,7 +852,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             if let Some(restriction) = &this.restriction {
                 factory = factory.with_permission_restriction(restriction.clone());
             }
-            let stream_tools = producer.as_ref().map_or_else(Vec::new, |p| p.tools(cancellation.clone()));
+            let stream_tools = producer
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.tools(cancellation.clone()));
             if capture.is_some() || !stream_tools.is_empty() {
                 let capture = capture.clone();
                 let tools = stream_tools.clone();
@@ -697,11 +881,18 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                 Some(mut builder) => {
                     if !stream_tools.is_empty() {
                         let (_, dispatcher) = builder.clone().build_with_dispatcher();
-                        if stream_tools.iter().any(|tool| dispatcher.capabilities().any(|existing| existing.definition().name == tool.definition().name || existing.identity() == tool.identity())) {
+                        if stream_tools.iter().any(|tool| {
+                            dispatcher.capabilities().any(|existing| {
+                                existing.definition().name == tool.definition().name
+                                    || existing.identity() == tool.identity()
+                            })
+                        }) {
                             return Err(PortError::Conflict);
                         }
                     }
-                    for tool in stream_tools { builder = builder.with_tool(tool); }
+                    for tool in stream_tools {
+                        builder = builder.with_tool(tool);
+                    }
                     if let Some(contract) = &capture {
                         let contract = contract.clone();
                         builder = builder.with_tool(Capability::new(
@@ -803,6 +994,18 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             };
             let run_cancellation = cancellation.child_token();
             let outcome = async {
+                if let Some(opening) = opening {
+                    return followup::run(
+                        &this,
+                        &session.record,
+                        runtime.with_completion_validation(validation),
+                        limits,
+                        run_cancellation.clone(),
+                        started + request.deadline,
+                        opening,
+                    )
+                    .await;
+                }
                 match &payload {
                     Some(payload) if !payload.attachments.is_empty() => {
                         let record = this.sessions.store().load(&id).await.map_err(|_| {
@@ -956,7 +1159,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             {
                 return Err(PortError::Invalid);
             }
-            if let Some(producer) = &mut producer { producer.complete(); }
+            if let Some(producer) = &mut producer {
+                producer.complete();
+            }
             Ok(result)
         })
     }
@@ -993,7 +1198,8 @@ impl CompletionObserver for CapturingObserver {
                     if evidence.call.name == CAPTURE_TOOL
                         && evidence.result.name == CAPTURE_TOOL
                         && evidence.result.call_id == evidence.call.id
-                        && !evidence.result.is_error {
+                        && !evidence.result.is_error
+                    {
                         let value: Value = serde_json::from_str(&evidence.result.content)
                             .map_err(|_| CompletionObserverError::Invalid)?;
                         if !contract.accepts_host(&value, completion_bytes) {
@@ -1095,41 +1301,124 @@ mod capture_tests {
         use crate::agent_host::{AgentDefinitionCatalog, HostRuntimeBuilder};
         use crate::permission::{PermissionEffect, PermissionLevel, PermissionToolSelector};
         let root = crate::test_support::temp_root();
-        let sandbox = crate::sandbox::LocalSandbox::start(root.clone()).await.unwrap();
-        let model = waltr_agent::ModelRef::new(waltr_agent::ProviderId::OpenAi, "test", waltr_agent::ModelApi::OpenAiResponses);
-        let inference = InferenceSettings { provider:waltr_agent::InferenceProviderSettings {
-            key:"test".into(), api:waltr_agent::ModelApi::OpenAiResponses, url:"https://unused.invalid".into(), model_id:"test".into(),
-            model_cost:None, headers:Default::default(), oauth:None, reasoning_effort:None,
-        }};
-        for (permission, level) in [("deny",PermissionLevel::Deny),("ask",PermissionLevel::Ask),("allow",PermissionLevel::Allow)] {
-            let source = format!("apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: editor}}\nspec:\n  permissions: [{{name: _helper_capture, permission: {permission}}}]\n");
+        let sandbox = crate::sandbox::LocalSandbox::start(root.clone())
+            .await
+            .unwrap();
+        let model = waltr_agent::ModelRef::new(
+            waltr_agent::ProviderId::OpenAi,
+            "test",
+            waltr_agent::ModelApi::OpenAiResponses,
+        );
+        let inference = InferenceSettings {
+            provider: waltr_agent::InferenceProviderSettings {
+                key: "test".into(),
+                api: waltr_agent::ModelApi::OpenAiResponses,
+                url: "https://unused.invalid".into(),
+                model_id: "test".into(),
+                model_cost: None,
+                headers: Default::default(),
+                oauth: None,
+                reasoning_effort: None,
+            },
+        };
+        for (permission, level) in [
+            ("deny", PermissionLevel::Deny),
+            ("ask", PermissionLevel::Ask),
+            ("allow", PermissionLevel::Allow),
+        ] {
+            let source = format!(
+                "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: editor}}\nspec:\n  permissions: [{{name: _helper_capture, permission: {permission}}}]\n"
+            );
             let catalog = AgentDefinitionCatalog::from_sources(vec![source], "editor").unwrap();
-            for (ceiling, identity_denied) in [(PermissionLevel::Allow,false),(PermissionLevel::Ask,false),(PermissionLevel::Deny,false),(PermissionLevel::Allow,true)] {
-                for restricted in [false,true] {
+            for (ceiling, identity_denied) in [
+                (PermissionLevel::Allow, false),
+                (PermissionLevel::Ask, false),
+                (PermissionLevel::Deny, false),
+                (PermissionLevel::Allow, true),
+            ] {
+                for restricted in [false, true] {
                     let factory = Arc::new(AgentSessionRuntimeFactory::new(
                         sandbox.handle(), root.clone(), crate::auth::FileCredentialStore::new(root.join("unused-auth.json")),
                         catalog.resolved("editor").unwrap().clone(),
                     ).with_agent_catalog(catalog.clone()).with_runtime_provider(|_| {
                         panic!("capture admission must not construct providers, authenticate, or connect MCP")
                     }));
-                    let policy = PermissionPolicy::new(PermissionLevel::Deny).with_tool_rule(PermissionToolSelector::exact(CAPTURE_TOOL),PermissionEffect::new(level));
-                    let runtime = HostRuntimeBuilder::new(model.clone(),Arc::new(waltr_agent::provider::openai::OpenAiResponses::new("unused"))).with_permission_policy(policy);
-                    let selection = if restricted { HelperSelection::Restricted {profile:"isolated".into()} } else { HelperSelection::Named {name:"editor".into()} };
+                    let policy = PermissionPolicy::new(PermissionLevel::Deny).with_tool_rule(
+                        PermissionToolSelector::exact(CAPTURE_TOOL),
+                        PermissionEffect::new(level),
+                    );
+                    let runtime = HostRuntimeBuilder::new(
+                        model.clone(),
+                        Arc::new(waltr_agent::provider::openai::OpenAiResponses::new(
+                            "unused",
+                        )),
+                    )
+                    .with_permission_policy(policy);
+                    let selection = if restricted {
+                        HelperSelection::Restricted {
+                            profile: "isolated".into(),
+                        }
+                    } else {
+                        HelperSelection::Named {
+                            name: "editor".into(),
+                        }
+                    };
                     let sessions = SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
-                    let restriction = if identity_denied { PermissionPolicy::new(ceiling).with_tool_rule(PermissionToolSelector::exact("builtin:_helper_capture"),PermissionEffect::deny()) } else { PermissionPolicy::new(ceiling) };
-                    let runner = CoordinatorHelperRunner::new(sessions.clone(),factory,inference.clone(),BTreeMap::from([("isolated".into(),RestrictedHelperProfile {
-                        runtime,inference:inference.clone(),prompt:"explicit prefix".into(),max_turns:4,
-                    })]),BTreeMap::new(),None,"owner".into()).unwrap().with_permission_restriction(restriction);
-                    let contract: Contract = serde_json::from_value(json!({"schemaVersion":SCHEMA_VERSION,"schema":{"type":"boolean"}})).unwrap();
-                    runner.bind_captures(BTreeMap::from([("arbitrary-resource-capture".into(),crate::routine::definition::CaptureContract {selection,contract})])).await.unwrap();
+                    let restriction = if identity_denied {
+                        PermissionPolicy::new(ceiling).with_tool_rule(
+                            PermissionToolSelector::exact("builtin:_helper_capture"),
+                            PermissionEffect::deny(),
+                        )
+                    } else {
+                        PermissionPolicy::new(ceiling)
+                    };
+                    let runner = CoordinatorHelperRunner::new(
+                        sessions.clone(),
+                        factory,
+                        inference.clone(),
+                        BTreeMap::from([(
+                            "isolated".into(),
+                            RestrictedHelperProfile {
+                                runtime,
+                                inference: inference.clone(),
+                                prompt: "explicit prefix".into(),
+                                max_turns: 4,
+                            },
+                        )]),
+                        BTreeMap::new(),
+                        None,
+                        "owner".into(),
+                    )
+                    .unwrap()
+                    .with_permission_restriction(restriction);
+                    let contract: Contract = serde_json::from_value(
+                        json!({"schemaVersion":SCHEMA_VERSION,"schema":{"type":"boolean"}}),
+                    )
+                    .unwrap();
+                    runner
+                        .bind_captures(BTreeMap::from([(
+                            "arbitrary-resource-capture".into(),
+                            crate::routine::definition::CaptureContract {
+                                selection,
+                                contract,
+                            },
+                        )]))
+                        .await
+                        .unwrap();
                     runner.pin_named(vec!["editor".into()]).await.unwrap();
                     let result = runner.preflight_captures().await;
-                    if level == PermissionLevel::Deny || ceiling == PermissionLevel::Deny || identity_denied {
-                        assert_eq!(result,Err(PortError::Denied));
+                    if level == PermissionLevel::Deny
+                        || ceiling == PermissionLevel::Deny
+                        || identity_denied
+                    {
+                        assert_eq!(result, Err(PortError::Denied));
                     } else {
                         result.unwrap();
                     }
-                    assert!(sessions.store().list().await.unwrap().is_empty(),"admission must neither start a helper nor fabricate an approval session");
+                    assert!(
+                        sessions.store().list().await.unwrap().is_empty(),
+                        "admission must neither start a helper nor fabricate an approval session"
+                    );
                 }
             }
         }
@@ -1138,26 +1427,67 @@ mod capture_tests {
     async fn capture_requires_real_successful_exact_tool_evidence_not_a_schema_grant() {
         let contract: Contract = serde_json::from_value(json!({"schemaVersion":SCHEMA_VERSION,"schema":{"type":"object","properties":{"editable":{"type":"boolean"}},"required":["editable"]}})).unwrap();
         let evidence = waltr_agent::CompletionToolEvidence {
-            target:None,
-            call:waltr_agent::ToolCall::new("real-call",CAPTURE_TOOL,json!({"editable":true})),
-            result:waltr_agent::ToolResult::new("real-call",CAPTURE_TOOL,"{\"editable\":true}"),
-            item_id:serde_json::from_value(json!("i1")).unwrap(), turn:1,
+            target: None,
+            call: waltr_agent::ToolCall::new("real-call", CAPTURE_TOOL, json!({"editable":true})),
+            result: waltr_agent::ToolResult::new("real-call", CAPTURE_TOOL, "{\"editable\":true}"),
+            item_id: serde_json::from_value(json!("i1")).unwrap(),
+            turn: 1,
         };
-        let proposal = CompletionProposal { session_id:SessionId::generate(), proposal_id:"candidate".into(), turn:2, response:"done".into(), evidence:vec![evidence.clone()] };
+        let proposal = CompletionProposal {
+            session_id: SessionId::generate(),
+            proposal_id: "candidate".into(),
+            turn: 2,
+            response: "done".into(),
+            evidence: vec![evidence.clone()],
+        };
         let accepted = Arc::new(Mutex::new(None));
-        let observer = CapturingObserver {completion_bytes:65536,response_bytes:1024,semantic:None,capture:Some(contract),accepted:accepted.clone()};
+        let observer = CapturingObserver {
+            completion_bytes: 65536,
+            response_bytes: 1024,
+            semantic: None,
+            capture: Some(contract),
+            accepted: accepted.clone(),
+        };
         for invalid in [
-            waltr_agent::CompletionToolEvidence { result:evidence.result.clone().with_error(), ..evidence.clone() },
-            waltr_agent::CompletionToolEvidence { call:waltr_agent::ToolCall::new("real-call","foreign",json!({"editable":true})), ..evidence.clone() },
-            waltr_agent::CompletionToolEvidence { result:waltr_agent::ToolResult::new("foreign-call",CAPTURE_TOOL,"{\"editable\":true}"), ..evidence.clone() },
+            waltr_agent::CompletionToolEvidence {
+                result: evidence.result.clone().with_error(),
+                ..evidence.clone()
+            },
+            waltr_agent::CompletionToolEvidence {
+                call: waltr_agent::ToolCall::new("real-call", "foreign", json!({"editable":true})),
+                ..evidence.clone()
+            },
+            waltr_agent::CompletionToolEvidence {
+                result: waltr_agent::ToolResult::new(
+                    "foreign-call",
+                    CAPTURE_TOOL,
+                    "{\"editable\":true}",
+                ),
+                ..evidence.clone()
+            },
         ] {
-            let denied = CompletionProposal { evidence:vec![invalid], ..proposal.clone() };
-            assert!(matches!(observer.observe(denied,CancellationToken::new()).await.unwrap(),CompletionDecision::Reject {..}));
+            let denied = CompletionProposal {
+                evidence: vec![invalid],
+                ..proposal.clone()
+            };
+            assert!(matches!(
+                observer
+                    .observe(denied, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                CompletionDecision::Reject { .. }
+            ));
             assert!(accepted.lock().unwrap().is_none());
         }
-        assert!(matches!(observer.observe(proposal,CancellationToken::new()).await.unwrap(),CompletionDecision::Accept));
+        assert!(matches!(
+            observer
+                .observe(proposal, CancellationToken::new())
+                .await
+                .unwrap(),
+            CompletionDecision::Accept
+        ));
         let (_, captures) = accepted.lock().unwrap().take().unwrap();
-        assert_eq!(captures[0].call_id,"real-call");
-        assert_eq!(captures[0].value,json!({"editable":true}));
+        assert_eq!(captures[0].call_id, "real-call");
+        assert_eq!(captures[0].value, json!({"editable":true}));
     }
 }

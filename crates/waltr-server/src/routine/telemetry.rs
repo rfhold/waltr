@@ -66,6 +66,10 @@ pub(crate) fn script_category(error: waltr_script::Error) -> &'static str {
 pub(crate) fn host_method(method: &str) -> &'static str {
     match method {
         "helper.run" => "helper.run",
+        "helper.open" => "helper.open",
+        "helper.submit" => "helper.submit",
+        "helper.idle" => "helper.idle",
+        "helper.seal" => "helper.seal",
         "helper.next" => "helper.next",
         "tools.execute" => "tools.execute",
         "tools.schemas" => "tools.schemas",
@@ -79,6 +83,9 @@ pub(crate) fn host_method(method: &str) -> &'static str {
         "context.continue" => "context.continue",
         "children.call" => "children.call",
         "media.collect" => "media.collect",
+        "media.input.next" => "media.input.next",
+        "media.input.acknowledge" => "media.input.acknowledge",
+        "media.input.seal" => "media.input.seal",
         "media.read" => "media.read",
         "media.readText" => "media.readText",
         "media.select" => "media.select",
@@ -428,6 +435,17 @@ mod tests {
     #[test]
     fn diagnostics_identifiers_and_categories_are_bounded() {
         assert_eq!(host_method("media.synthesize"), "media.synthesize");
+        for method in [
+            "helper.open",
+            "helper.submit",
+            "helper.idle",
+            "helper.seal",
+            "media.input.next",
+            "media.input.acknowledge",
+            "media.input.seal",
+        ] {
+            assert_eq!(host_method(method), method);
+        }
         assert_eq!(host_method("SECRET_METHOD"), "unknown");
         assert_eq!(routine_name("audio-ask-and-speak"), "audio-ask-and-speak");
         assert_eq!(routine_name("SECRET https://private.invalid"), "unknown");

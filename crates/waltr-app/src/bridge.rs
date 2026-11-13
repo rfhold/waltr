@@ -81,7 +81,10 @@ impl AccessDiagnostic {
     fn observe(&mut self, progress: &waltr_client::NativeAccessProgress) {
         use waltr_client::NativeAccessProgress as Progress;
         match progress {
-            Progress::Restoring => { self.restoring = true; self.failed = false; }
+            Progress::Restoring => {
+                self.restoring = true;
+                self.failed = false;
+            }
             Progress::RestorationFinished => self.restoring = false,
             Progress::Warning { .. } => self.persistence_warning = true,
             Progress::Failed { .. } => self.failed = true,
@@ -893,6 +896,7 @@ impl RuntimeBridge {
     ) -> impl FnMut() -> Option<crate::native_audio::Held> {
         self.stop();
         self.bind_native_generation(generation);
+        self.audio.activity.bind(generation);
         self.audio
             .observe(&crate::native_media_test_support::snapshot("test"));
         audio_access(&self.dictation, &self.shortcut_epoch, generation, true);
@@ -916,6 +920,23 @@ impl RuntimeBridge {
     #[cfg(test)]
     pub fn synthetic_shortcut_access(&self, generation: u64, allowed: bool) {
         audio_access(&self.dictation, &self.shortcut_epoch, generation, allowed);
+    }
+    #[cfg(test)]
+    pub fn synthetic_shortcut_catalog(&self, snapshot: &waltr_client::ClientSnapshot) {
+        self.audio.observe(snapshot);
+    }
+    #[cfg(test)]
+    pub fn synthetic_shortcut_failures(
+        &self,
+    ) -> watch::Receiver<Option<crate::activity::AudioFailure>> {
+        self.audio.activity.failures()
+    }
+    #[cfg(test)]
+    pub fn synthetic_shortcut_complete(&self, result: Result<(), waltr_desktop::host::Error>) {
+        let state = self.audio.lock();
+        let feedback = state.hold_feedback.as_ref().unwrap();
+        feedback.primary(result);
+        feedback.complete(state.generation, &self.audio.activity);
     }
     pub(crate) fn shortcut_ingress(&self) -> waltr_desktop::shortcut::IngressEpoch {
         self.shortcut_epoch.clone()
@@ -945,6 +966,42 @@ impl RuntimeBridge {
             let token = held.token.clone();
             running.requests.try_send(HostRequest::Hold(held)).ok()?;
             Some((control, token))
+        })?
+    }
+    pub(crate) fn shortcut_repeat(
+        &self,
+        epoch: u64,
+        control: &waltr_desktop::host::HoldControl,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> Option<waltr_desktop::host::HoldControl> {
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running = running.as_ref()?;
+        self.shortcut_epoch.admit(epoch, || {
+            let state = self.audio.lock();
+            if token.is_cancelled()
+                || !state.allowed
+                || state.generation != running.generation
+                || state.credentials_changed()
+            {
+                return None;
+            }
+            if !control.repeats_enabled() {
+                return None;
+            }
+            match control.press_again() {
+                Ok(next) => Some(next),
+                Err(_) => {
+                    crate::native_audio_telemetry::admission("hold", "capture_rejected");
+                    state
+                        .hold_feedback
+                        .as_ref()?
+                        .reject(running.generation, &self.audio.activity);
+                    None
+                }
+            }
         })?
     }
     pub(crate) fn start_dictation(
@@ -1139,7 +1196,11 @@ impl RuntimeBridge {
         ))
     }
 
-    pub(crate) fn dismiss_audio_failure(&self, generation: u64, diagnostic_id: u64) -> Result<(), String> {
+    pub(crate) fn dismiss_audio_failure(
+        &self,
+        generation: u64,
+        diagnostic_id: u64,
+    ) -> Result<(), String> {
         self.with_current(generation, || {
             self.audio.activity.dismiss(generation, diagnostic_id);
             Ok(())
@@ -1674,10 +1735,22 @@ async fn run_connected_generation(
         .as_ref()
         .map(|binding| binding.spawn(credentials.clone()));
     let mut access_host = crate::native_auth::AccessHost::default();
-    let mut access_diagnostic = AccessDiagnostic { restoring: access.is_some(), ..AccessDiagnostic::default() };
+    let mut access_diagnostic = AccessDiagnostic {
+        restoring: access.is_some(),
+        ..AccessDiagnostic::default()
+    };
     if access_diagnostic.restoring {
-        if let Some(event) = publisher.publish_control(BridgePayload::Access { diagnostic: access_diagnostic }).await {
-            publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_access = Some(event);
+        if let Some(event) = publisher
+            .publish_control(BridgePayload::Access {
+                diagnostic: access_diagnostic,
+            })
+            .await
+        {
+            publisher
+                .recovery
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .latest_access = Some(event);
         }
     }
     let audio = target
@@ -2075,9 +2148,13 @@ fn recovery_after<T: Clone>(
         .filter(|event| after_sequence.is_none_or(|sequence| event.sequence > sequence))
         .cloned()
         .collect::<Vec<_>>();
-    for state in [&recovery.latest_state, &recovery.latest_access, &recovery.latest_audio]
-        .into_iter()
-        .flatten()
+    for state in [
+        &recovery.latest_state,
+        &recovery.latest_access,
+        &recovery.latest_audio,
+    ]
+    .into_iter()
+    .flatten()
     {
         if after_sequence.is_none_or(|sequence| state.sequence > sequence)
             && events.iter().all(|event| event.sequence != state.sequence)
@@ -2103,18 +2180,31 @@ mod tests {
 
     #[tokio::test]
     async fn audio_failure_same_generation_rebind_recovers_and_dismisses() {
-        use crate::{activity::{ActivityTracker, AudioFailure}, native_audio_telemetry::Completion};
+        use crate::{
+            activity::{ActivityTracker, AudioFailure},
+            native_audio_telemetry::Completion,
+        };
         let tracker = ActivityTracker::default();
         tracker.bind(7);
         let active = Arc::new(AtomicU64::new(7));
         let recovery = Arc::new(RwLock::new(RecoveryState::new(7)));
         let (mut publisher, _feed) = Publisher::new(active, 7, Arc::clone(&recovery));
-        publisher.publish_initial(BridgePayload::AudioFailure { failure: None }).await;
+        publisher
+            .publish_initial(BridgePayload::AudioFailure { failure: None })
+            .await;
         let mut receiver = tracker.failures();
-        let failure = AudioFailure { diagnostic_id: 42, category: "remote_failed" };
+        let failure = AudioFailure {
+            diagnostic_id: 42,
+            category: "remote_failed",
+        };
         tracker.complete(7, Completion::Failed(failure));
         receiver.changed().await.unwrap();
-        let event = publisher.publish_control(BridgePayload::AudioFailure { failure: *receiver.borrow_and_update() }).await.unwrap();
+        let event = publisher
+            .publish_control(BridgePayload::AudioFailure {
+                failure: *receiver.borrow_and_update(),
+            })
+            .await
+            .unwrap();
         let failure_sequence = event.sequence;
         recovery.write().unwrap().latest_audio = Some(event);
         drop(receiver);
@@ -2127,11 +2217,19 @@ mod tests {
         assert!(recovered.events.iter().any(|event| matches!(&event.payload, BridgePayload::AudioFailure { failure: Some(current) } if *current == failure)));
         tracker.dismiss(7, 42);
         receiver.changed().await.unwrap();
-        let event = publisher.publish_control(BridgePayload::AudioFailure { failure: *receiver.borrow_and_update() }).await.unwrap();
+        let event = publisher
+            .publish_control(BridgePayload::AudioFailure {
+                failure: *receiver.borrow_and_update(),
+            })
+            .await
+            .unwrap();
         recovery.write().unwrap().latest_audio = Some(event);
         recovery.write().unwrap().controls.clear();
         let recovered = recovery_after(&recovery.read().unwrap(), 7, Some(failure_sequence));
-        assert!(recovered.events.iter().any(|event| matches!(&event.payload, BridgePayload::AudioFailure { failure: None })));
+        assert!(recovered.events.iter().any(|event| matches!(
+            &event.payload,
+            BridgePayload::AudioFailure { failure: None }
+        )));
     }
 
     #[test]
@@ -2397,7 +2495,8 @@ mod tests {
         );
         assert!(!serialized.to_ascii_lowercase().contains("redacted"));
         assert_eq!(
-            payload_snapshot(&payload).pointer("/interactions/session/pending/0/identity/operationId"),
+            payload_snapshot(&payload)
+                .pointer("/interactions/session/pending/0/identity/operationId"),
             Some(&serde_json::Value::String("operation".into()))
         );
     }

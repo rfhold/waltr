@@ -49,6 +49,8 @@ struct Fake {
     completed: Arc<AtomicBool>,
     delay_waiting: Arc<AtomicBool>,
     pcm: Arc<Mutex<Vec<u8>>>,
+    repeated_input: Arc<Mutex<Vec<wire::InputEvent>>>,
+    repeated_closes: Arc<AtomicUsize>,
 }
 #[allow(
     clippy::unnecessary_wraps,
@@ -85,13 +87,115 @@ impl Fake {
             panic!("expected open")
         };
         let open = open.selection.unwrap();
+        if open.routine.starts_with("repeated") {
+            let fake = self.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                tx.send(accepted()).await.unwrap();
+                tx.send(event(Event::Open(wire::StreamOpen {
+                    stream_id: "speaker".into(),
+                    port: "speaker".into(),
+                    format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
+                        sample_rate: 24000,
+                        channels: 1,
+                    })),
+                })))
+                .await
+                .unwrap();
+                while let Ok(Some(message)) = input.message().await {
+                    let Some(wire::interact_request::Frame::Input(message)) = message.frame else {
+                        panic!("input")
+                    };
+                    fake.repeated_input.lock().unwrap().push(message.clone());
+                    match message.event.unwrap() {
+                        wire::input_event::Event::Open(_)
+                            if fake.repeated_closes.load(Ordering::SeqCst) >= 2 =>
+                        {
+                            let _result = tx
+                                .send(Err(RpcStatus::failed_precondition(
+                                    "input admission sealed",
+                                )))
+                                .await;
+                            return;
+                        }
+                        wire::input_event::Event::Close(_) => {
+                            let count = fake.repeated_closes.fetch_add(1, Ordering::SeqCst) + 1;
+                            if count == 1 {
+                                tx.send(event(Event::Chunk(wire::StreamChunk {
+                                    stream_id: "speaker".into(),
+                                    sequence: 0,
+                                    payload: Some(wire::stream_chunk::Payload::Audio(vec![
+                                        1, 0, 2, 0,
+                                    ])),
+                                })))
+                                .await
+                                .unwrap();
+                            }
+                            if count == 2 {
+                                tx.send(event(Event::Close(wire::StreamClose {
+                                    stream_id: "speaker".into(),
+                                    next_sequence: 1,
+                                })))
+                                .await
+                                .unwrap();
+                            }
+                        }
+                        wire::input_event::Event::Open(_)
+                            if open.routine == "repeated-disconnect"
+                                && fake.repeated_closes.load(Ordering::SeqCst) == 1 =>
+                        {
+                            let _result = tx
+                                .send(Err(RpcStatus::unavailable("synthetic disconnect")))
+                                .await;
+                            return;
+                        }
+                        wire::input_event::Event::Finish(_) => {
+                            assert_eq!(fake.repeated_closes.load(Ordering::SeqCst), 2);
+                            assert!(
+                                input.message().await.unwrap().is_none(),
+                                "native EOF follows global finish"
+                            );
+                            tx.send(event(Event::Terminal(wire::InteractionTerminal {
+                                status: wire::InvocationStatus::Succeeded as i32,
+                                cleanup_complete: true,
+                                ..Default::default()
+                            })))
+                            .await
+                            .unwrap();
+                            fake.completed.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            return Ok(Response::new(Box::pin(stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|event| (event, rx)) },
+            ))));
+        }
         if open.routine == "playback-failure" {
             let fake = self.clone();
             let events = stream::iter([
                 accepted(),
-                event(Event::Open(wire::StreamOpen {stream_id:"speaker".into(), port:"speaker".into(), format:Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {sample_rate:24000, channels:1}))})),
-                event(Event::Chunk(wire::StreamChunk {stream_id:"speaker".into(), sequence:0, payload:Some(wire::stream_chunk::Payload::Audio(vec![1,0,2,0]))})),
-                event(Event::Terminal(wire::InteractionTerminal {status:wire::InvocationStatus::Failed as i32, cleanup_complete:true, ..Default::default()})),
+                event(Event::Open(wire::StreamOpen {
+                    stream_id: "speaker".into(),
+                    port: "speaker".into(),
+                    format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
+                        sample_rate: 24000,
+                        channels: 1,
+                    })),
+                })),
+                event(Event::Chunk(wire::StreamChunk {
+                    stream_id: "speaker".into(),
+                    sequence: 0,
+                    payload: Some(wire::stream_chunk::Payload::Audio(vec![1, 0, 2, 0])),
+                })),
+                event(Event::Terminal(wire::InteractionTerminal {
+                    status: wire::InvocationStatus::Failed as i32,
+                    cleanup_complete: true,
+                    ..Default::default()
+                })),
             ]);
             let tail = stream::once(async move {
                 // A terminal closes input admission, but remote EOF remains deliberately blocked.
@@ -99,7 +203,8 @@ impl Fake {
                 fake.cleanup_release.notified().await;
                 drop(input);
                 stream::empty()
-            }).flatten();
+            })
+            .flatten();
             return Ok(Response::new(Box::pin(events.chain(tail))));
         }
         assert!(
@@ -202,7 +307,9 @@ impl Fake {
         }
         let fake = self.clone();
         let mut prefix = vec![accepted(), output_open()];
-        if open.routine == "audio-answer" { prefix = vec![accepted()]; }
+        if open.routine == "audio-answer" {
+            prefix = vec![accepted()];
+        }
         if open.routine == "pcm" {
             prefix.extend([
                 event(Event::Open(wire::StreamOpen {
@@ -276,10 +383,28 @@ impl Fake {
             tokio::time::sleep(Duration::from_millis(20)).await;
             if open.routine == "audio-answer" {
                 return Ok(vec![
-                    event(Event::Open(wire::StreamOpen { stream_id:"answer".into(), port:"speaker".into(), format:Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {sample_rate:24000,channels:1})) })),
-                    event(Event::Chunk(wire::StreamChunk {stream_id:"answer".into(), sequence:0, payload:Some(wire::stream_chunk::Payload::Audio(vec![1,0,2,0]))})),
-                    event(Event::Close(wire::StreamClose {stream_id:"answer".into(), next_sequence:1})),
-                    event(Event::Terminal(wire::InteractionTerminal {status:wire::InvocationStatus::Succeeded as i32, cleanup_complete:true, ..Default::default()})),
+                    event(Event::Open(wire::StreamOpen {
+                        stream_id: "answer".into(),
+                        port: "speaker".into(),
+                        format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
+                            sample_rate: 24000,
+                            channels: 1,
+                        })),
+                    })),
+                    event(Event::Chunk(wire::StreamChunk {
+                        stream_id: "answer".into(),
+                        sequence: 0,
+                        payload: Some(wire::stream_chunk::Payload::Audio(vec![1, 0, 2, 0])),
+                    })),
+                    event(Event::Close(wire::StreamClose {
+                        stream_id: "answer".into(),
+                        next_sequence: 1,
+                    })),
+                    event(Event::Terminal(wire::InteractionTerminal {
+                        status: wire::InvocationStatus::Succeeded as i32,
+                        cleanup_complete: true,
+                        ..Default::default()
+                    })),
                 ]);
             }
             if open.routine == "failed" || open.routine == "typing-failed" {
@@ -1271,7 +1396,9 @@ struct NativeConsumer {
     finished: std::cell::Cell<Option<bool>>,
 }
 impl waltr_desktop::media::OutputSink for NativeConsumer {
-    fn revoke(&self) { self.revoked.set(true); }
+    fn revoke(&self) {
+        self.revoked.set(true);
+    }
     fn supports(&self, port: &waltr_client::RoutinePort) -> bool {
         port.media == waltr_client::RoutineMedia::Audio && port.formats == ["pcm16le-24000-mono"]
     }
@@ -1287,7 +1414,9 @@ impl waltr_desktop::media::OutputSink for NativeConsumer {
                     waltr_client::interaction::InteractionEvent::Chunk(chunk) => {
                         if let Some(wire::stream_chunk::Payload::Audio(bytes)) = &chunk.payload {
                             assert!(bytes.len() <= 65536);
-                            if self.blocked { std::future::pending::<()>().await; }
+                            if self.blocked {
+                                std::future::pending::<()>().await;
+                            }
                             self.bytes.set(self.bytes.get() + bytes.len());
                         }
                     }
@@ -1309,7 +1438,11 @@ impl waltr_desktop::media::OutputSink for NativeConsumer {
     ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             assert!(self.finished.replace(Some(success)).is_none());
-            if self.fail_finish { Err(Error::Interaction) } else { Ok(()) }
+            if self.fail_finish {
+                Err(Error::Interaction)
+            } else {
+                Ok(())
+            }
         })
     }
 }
@@ -1327,6 +1460,242 @@ impl waltr_desktop::interaction::Consumer for NativeConsumer {
     ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+struct SequentialFactory {
+    sources: Vec<Arc<Mock>>,
+    opens: AtomicUsize,
+}
+impl Factory for SequentialFactory {
+    fn open(&self, config: waltr_audio_io::Config) -> Result<Box<dyn Source>, capture::Error> {
+        let index = self.opens.fetch_add(1, Ordering::SeqCst);
+        for source in &self.sources[..index] {
+            assert!(
+                source.joined.load(Ordering::SeqCst),
+                "previous microphone must be joined before opening the next"
+            );
+        }
+        MockFactory(self.sources[index].clone()).open(config)
+    }
+}
+
+fn repeated_binding() -> config::Keybind {
+    let mut binding = binding(std::path::Path::new("unused"), "repeated");
+    binding.command = None;
+    binding.playback = Some(config::PlaybackSpec {});
+    binding.routine.output = "speaker".into();
+    let mut invocation = support::invocation("pcm");
+    invocation.selection.routine = "repeated".into();
+    invocation.limits.definition.routine_name = "repeated".into();
+    invocation
+        .limits
+        .definition
+        .ports
+        .retain(|p| p.name != "clean-text");
+    invocation
+        .limits
+        .definition
+        .capabilities
+        .push("media.inputs".into());
+    binding.resolved = Some(invocation);
+    binding
+}
+
+#[tokio::test]
+async fn repeated_holds_share_rpc_playback_and_join_sequential_microphones() {
+    for case in [
+        "playback",
+        "startup-release",
+        "cancel",
+        "disconnect",
+        "seal-race",
+        "deadline",
+        "byte-limit",
+        "empty-initial",
+    ] {
+        let (transport, fake, stop, server) = fixture().await;
+        let mut binding = repeated_binding();
+        if case == "disconnect" {
+            binding.routine.name = "repeated-disconnect".into();
+            let invocation = binding.resolved.as_mut().unwrap();
+            invocation.selection.routine = "repeated-disconnect".into();
+            invocation.limits.definition.routine_name = "repeated-disconnect".into();
+        }
+        if case == "deadline" {
+            binding.max_capture_seconds = Some(1);
+        }
+        if case == "byte-limit" {
+            binding.resolved.as_mut().unwrap().limits.definition.ports[0].max_bytes =
+                waltr_client::RoutineRevision(150);
+        }
+        let (startup_tx, startup_rx) = std::sync::mpsc::channel();
+        let mut startup_rx = Some(startup_rx);
+        let sources: Vec<_> = (0..3)
+            .map(|index| {
+                Arc::new(Mock {
+                    empty: AtomicBool::new(case == "empty-initial" && index == 0),
+                    startup: Mutex::new(
+                        if index == 1 && matches!(case, "startup-release" | "cancel") {
+                            startup_rx.take()
+                        } else {
+                            None
+                        },
+                    ),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let factory = Arc::new(SequentialFactory {
+            sources: sources.clone(),
+            opens: AtomicUsize::new(0),
+        });
+        let sink = NativeConsumer::default();
+        let gate = AudioAdmission::default();
+        let (hold, control) = Hold::press_repeated(&gate).unwrap();
+        control.release(); // Also proves pending release for initial capture startup.
+        if case == "empty-initial" {
+            control.press_again().unwrap().release();
+        }
+        let generation = CancellationToken::new();
+        let drive = async {
+            while sink.bytes.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(fake.repeated_closes.load(Ordering::SeqCst), 1);
+            assert!(
+                !fake
+                    .repeated_input
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e.event, Some(wire::input_event::Event::Finish(_))))
+            );
+            assert!(
+                matches!(Hold::press(&gate), Err(Error::Busy)),
+                "unrelated operations remain busy through playback"
+            );
+            let second = control.press_again().unwrap();
+            assert!(
+                matches!(second.press_again(), Err(Error::Busy)),
+                "no duplicate press while still held"
+            );
+            if !matches!(case, "deadline" | "disconnect") {
+                second.release();
+            }
+            if case == "seal-race" {
+                let third = second.press_again().unwrap();
+                third.release();
+            }
+            if matches!(case, "startup-release" | "cancel") {
+                while !sources[1].started.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                if case == "cancel" {
+                    generation.cancel();
+                }
+                startup_tx.send(()).unwrap();
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                hold.run_guarded_with_outputs(
+                    &binding,
+                    &transport,
+                    factory.clone(),
+                    &generation,
+                    &|| true,
+                    None,
+                    Some(&sink)
+                ),
+                drive
+            )
+        })
+        .await
+        .unwrap();
+        if matches!(case, "cancel" | "disconnect" | "seal-race" | "byte-limit") {
+            assert!(result.is_err(), "{case}: {result:?}");
+            assert!(sink.revoked.get());
+        } else {
+            assert_eq!(result, Ok(()), "{case}");
+            assert_eq!(
+                factory.opens.load(Ordering::SeqCst),
+                if case == "empty-initial" { 3 } else { 2 }
+            );
+            assert_eq!(sink.closes.get(), 1);
+            assert_eq!(sink.finished.get(), Some(true));
+            let events = fake.repeated_input.lock().unwrap();
+            let kinds: Vec<_> = events
+                .iter()
+                .map(|e| match e.event.as_ref().unwrap() {
+                    wire::input_event::Event::Open(o) => format!("open:{}", o.stream_id),
+                    wire::input_event::Event::Chunk(c) => {
+                        assert_eq!(c.sequence, 0);
+                        format!("chunk:{}", c.stream_id)
+                    }
+                    wire::input_event::Event::Close(c) => {
+                        assert_eq!(c.next_sequence, 1);
+                        format!("close:{}", c.stream_id)
+                    }
+                    wire::input_event::Event::Finish(_) => "finish".into(),
+                    _ => panic!("unexpected input"),
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    "open:audio-0",
+                    "chunk:audio-0",
+                    "close:audio-0",
+                    "open:audio-1",
+                    "chunk:audio-1",
+                    "close:audio-1",
+                    "finish"
+                ]
+            );
+        }
+        assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+        for source in &sources[..factory.opens.load(Ordering::SeqCst)] {
+            assert!(
+                source.joined.load(Ordering::SeqCst),
+                "{case}: capture joined"
+            );
+        }
+        assert!(control.press_again().is_err());
+        let (_next, next_control) = Hold::press(&gate).unwrap();
+        assert_eq!(*next_control.status().borrow(), Status::Starting);
+        stop.cancel();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn repeated_initial_empty_capture_without_followup_opens_no_rpc() {
+    let (transport, fake, stop, server) = fixture().await;
+    let binding = repeated_binding();
+    let source = Arc::new(Mock {
+        empty: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let sink = NativeConsumer::default();
+    let (hold, control) = Hold::press_repeated(&AudioAdmission::default()).unwrap();
+    control.release();
+    let result = hold
+        .run_guarded_with_outputs(
+            &binding,
+            &transport,
+            Arc::new(MockFactory(source.clone())),
+            &CancellationToken::new(),
+            &|| true,
+            None,
+            Some(&sink),
+        )
+        .await;
+    assert_eq!(result, Ok(()));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 0);
+    assert!(control.press_again().is_err());
+    stop.cancel();
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -1394,31 +1763,75 @@ async fn rpc_input_failure_revokes_queued_pcm_before_blocked_remote_cleanup() {
     let (transport, fake, stop, server) = fixture().await;
     let mut invocation = support::invocation("playback-failure");
     let pcm = support::invocation("pcm");
-    invocation.limits.definition.ports.push(pcm.limits.definition.ports.iter().find(|p| p.name == "speaker").unwrap().clone());
+    invocation.limits.definition.ports.push(
+        pcm.limits
+            .definition
+            .ports
+            .iter()
+            .find(|p| p.name == "speaker")
+            .unwrap()
+            .clone(),
+    );
     let dir = tempfile::tempdir().unwrap();
     let binding = binding(&dir.path().join("never"), "playback-failure");
     let mock = Arc::new(Mock::default());
     let release = CancellationToken::new();
     let cancel = CancellationToken::new();
     let generation = CancellationToken::new();
-    let guard = Guard { cancel:&cancel, generation:&generation, valid:&|| true };
+    let guard = Guard {
+        cancel: &cancel,
+        generation: &generation,
+        valid: &|| true,
+    };
     let sink = NativeConsumer::default();
     let observer = Default::default();
-    let run = interaction::run(&transport, Arc::new(MockFactory(mock.clone())), &binding.audio,
-        interaction::Selection { invocation:&invocation, input:"audio", output:"clean-text", max_capture_seconds:None },
-        &release, &guard, &observer, &sink);
+    let run = interaction::run(
+        &transport,
+        Arc::new(MockFactory(mock.clone())),
+        &binding.audio,
+        interaction::Selection {
+            invocation: &invocation,
+            input: "audio",
+            output: "clean-text",
+            max_capture_seconds: None,
+        },
+        &release,
+        &guard,
+        &observer,
+        &sink,
+    );
     let inspect = async {
-        while !sink.revoked.get() { tokio::task::yield_now().await; }
-        assert_eq!(sink.bytes.get(), 4, "PCM reached the output owner before failure");
+        while !sink.revoked.get() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sink.bytes.get(),
+            4,
+            "PCM reached the output owner before failure"
+        );
         assert!(fake.cleanup_blocked.load(Ordering::SeqCst));
-        assert_eq!(sink.finished.get(), None, "revocation precedes the retained owner's join");
-        assert!(!cancel.is_cancelled(), "the driver does not own the caller's token");
+        assert_eq!(
+            sink.finished.get(),
+            None,
+            "revocation precedes the retained owner's join"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "the driver does not own the caller's token"
+        );
         assert!(!generation.is_cancelled());
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(sink.finished.get(), None, "remote EOF must still block cleanup");
+        assert_eq!(
+            sink.finished.get(),
+            None,
+            "remote EOF must still block cleanup"
+        );
         fake.cleanup_release.notify_one();
     };
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, inspect) }).await.unwrap();
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, inspect) })
+            .await
+            .unwrap();
     assert!(result.is_err());
     assert!(mock.joined.load(Ordering::SeqCst));
     assert_eq!(sink.finished.get(), Some(false));
@@ -1427,7 +1840,8 @@ async fn rpc_input_failure_revokes_queued_pcm_before_blocked_remote_cleanup() {
 }
 
 #[tokio::test]
-async fn audio_only_hold_release_joins_sink_and_rejects_cancel_revocation_source_and_drain_failures() {
+async fn audio_only_hold_release_joins_sink_and_rejects_cancel_revocation_source_and_drain_failures()
+ {
     let (transport, fake, stop, server) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
     for case in ["success", "cancel", "revoked", "source", "drain"] {
@@ -1438,9 +1852,12 @@ async fn audio_only_hold_release_joins_sink_and_rejects_cancel_revocation_source
         let ports = &mut binding.resolved.as_mut().unwrap().limits.definition.ports;
         ports.retain(|p| p.direction != waltr_client::RoutineDirection::Output);
         ports.push(waltr_client::RoutinePort {
-            name:"speaker".into(), direction:waltr_client::RoutineDirection::Output,
-            media:waltr_client::RoutineMedia::Audio, required:true,
-            max_bytes:waltr_client::RoutineRevision(65536), formats:vec!["pcm16le-24000-mono".into()],
+            name: "speaker".into(),
+            direction: waltr_client::RoutineDirection::Output,
+            media: waltr_client::RoutineMedia::Audio,
+            required: true,
+            max_bytes: waltr_client::RoutineRevision(65536),
+            formats: vec!["pcm16le-24000-mono".into()],
         });
         let gate = AudioAdmission::default();
         let (hold, control) = Hold::press(&gate).unwrap();
@@ -1448,23 +1865,46 @@ async fn audio_only_hold_release_joins_sink_and_rejects_cancel_revocation_source
         mock.fail_on_stop.store(case == "source", Ordering::SeqCst);
         let generation = CancellationToken::new();
         let valid = std::cell::Cell::new(true);
-        let sink = NativeConsumer { blocked:matches!(case,"cancel"|"revoked"), fail_finish:case == "drain", ..Default::default() };
+        let sink = NativeConsumer {
+            blocked: matches!(case, "cancel" | "revoked"),
+            fail_finish: case == "drain",
+            ..Default::default()
+        };
         let valid_fn = || valid.get();
-        let run = hold.run_guarded_with_outputs(&binding, &transport, Arc::new(MockFactory(mock.clone())), &generation, &valid_fn, None, Some(&sink));
+        let run = hold.run_guarded_with_outputs(
+            &binding,
+            &transport,
+            Arc::new(MockFactory(mock.clone())),
+            &generation,
+            &valid_fn,
+            None,
+            Some(&sink),
+        );
         let steer = async {
-            while !mock.started.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+            while !mock.started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             control.release();
-            if matches!(case,"cancel"|"revoked") {
+            if matches!(case, "cancel" | "revoked") {
                 tokio::time::sleep(Duration::from_millis(80)).await;
-                if case == "cancel" { control.cancel(); } else { valid.set(false); }
+                if case == "cancel" {
+                    control.cancel();
+                } else {
+                    valid.set(false);
+                }
             }
         };
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, steer) }).await.unwrap();
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, steer) })
+                .await
+                .unwrap();
         assert_eq!(result.is_ok(), case == "success", "{case}: {result:?}");
         assert!(mock.joined.load(Ordering::SeqCst), "{case}");
         assert!(gate.reserve().is_ok(), "{case}");
         assert!(sink.finished.get().is_some(), "{case}");
-        if case != "success" { assert!(sink.revoked.get(), "{case}"); }
+        if case != "success" {
+            assert!(sink.revoked.get(), "{case}");
+        }
         if case == "success" {
             assert_eq!(sink.bytes.get(), 4);
             assert_eq!(sink.finished.get(), Some(true));

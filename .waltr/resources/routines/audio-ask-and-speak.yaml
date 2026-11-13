@@ -5,16 +5,19 @@ description: Search the web and stream spoken findings until the answer is verif
 spec:
   source: |
     export default async function () {
-      const transcript = await host.call('media.collect', {port: 'question', cap: 4096, speech: {provider: 'whispers', model: 'dictation'}});
+      const first = await host.call('media.input.next', {port: 'question'});
+      if (first === null) throw new Error('question required');
+      const transcript = await host.call('media.collect', {cap: 4096, speech: {provider: 'whispers', model: 'dictation'}}, null, null, first);
       const question = await host.call('media.readText', {max: 4096}, null, null, transcript);
       if (!question.trim()) throw new Error('question required');
       const feed = await host.call('media.text.open', {});
       const speech = host.call('media.synthesize', {output: 'audio', utterances: true, speech: {provider: 'whispers-tts', model: 'reader'}}, null, null, feed);
-      const helper = host.call('helper.run', {
+      const helper = await host.call('helper.open', {
         selection: {kind: 'named', name: 'routine-research-answer'},
         inference: {from: 'defaults'}, task: question,
         maxTurns: 40, deadlineMs: 180000, responseBytes: 8192, completionBytes: 2097152
       });
+      await host.call('media.input.acknowledge', {}, null, null, first);
       const consume = (async () => {
         while (true) {
           const next = await host.call('helper.next', {stream: 'speech'});
@@ -23,7 +26,35 @@ spec:
         }
         await host.call('media.text.close', {}, null, null, feed);
       })();
-      const completed = await Promise.all([helper, consume, speech]);
+      const followups = (async () => {
+        let next = host.call('media.input.next', {port: 'question'});
+        let revision = 0;
+        const waitIdle = version => host.call('helper.idle', {}, null, null, helper).then(() => ({idle: version}));
+        let idle = waitIdle(revision);
+        while (true) {
+          let event = await Promise.race([
+            next.then(capture => ({capture})),
+            idle
+          ]);
+          if (event.idle !== undefined) {
+            if (event.idle !== revision) { idle = waitIdle(revision); continue; }
+            if (await host.call('media.input.seal', {})) break;
+            event = {capture: await next};
+          }
+          if (event.capture === null) break;
+          const text = await host.call('media.collect', {cap: 4096, speech: {provider: 'whispers', model: 'dictation'}}, null, null, event.capture);
+          const task = await host.call('media.readText', {max: 4096}, null, null, text);
+          if (task.trim()) {
+            await host.call('helper.submit', {task}, null, null, helper);
+            revision++;
+          }
+          await host.call('media.input.acknowledge', {}, null, null, event.capture);
+          next = host.call('media.input.next', {port: 'question'});
+        }
+        await next;
+        return await host.call('helper.seal', {}, null, null, helper);
+      })();
+      const completed = await Promise.all([followups, consume, speech]);
       const result = completed[0];
       const answer = await host.call('media.readText', {field: 'response', max: 8192}, null, null, result);
       await host.call('media.publish', {name: 'answer'}, null, null, result);
@@ -48,6 +79,7 @@ spec:
       required: [answer]
   capabilities:
   - media.execute
+  - media.inputs
   - helper.run
   - helper.named.routine-research-answer
   - helper.streams

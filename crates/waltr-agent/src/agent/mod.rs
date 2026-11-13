@@ -39,41 +39,41 @@ pub use session::{
     AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome,
     AgentSessionRunSubmission, AgentSessionRuntime, AgentSessionRuntimeError,
     AgentSessionRuntimeFactory, CancelReason, CompletedSessionCapture, ContextIdentity,
-    CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore, FileCredentialStore,
-    FilesystemSessionStore, IdleHostEffectError, InferenceProviderSettings, InferenceSettings,
-    MAX_ACTIVE_SESSION_MASKS, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
-    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, MAX_SESSION_MASK_KEY_BYTES,
-    MAX_SESSION_MASK_MUTATION_ITEMS, MAX_SESSION_MASK_REPLACEMENT_BYTES, MemorySessionStore,
-    MetadataSetCondition, MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION, OAuthCredential,
-    OAuthCredentialContext, OAuthCredentialRecord, OAuthCredentialStore,
-    OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
-    OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, ReplacementUserContent,
-    RequestId, RequestRecord, ResumeInput, Revision, ExecutionSequence, ExecutionToken,
-    SessionCommitReceipt, TimelineAppendReceipt, RunConflictPolicy, RuntimeResumeOutput,
-    S3SessionStore, S3SessionWriteMode, SandboxDispatch, ScyllaSessionStore, SessionCapabilities,
-    SessionCaptureError, SessionCaptureLimits, SessionCompletionCoordinationFuture,
+    CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore, ExecutionSequence,
+    ExecutionToken, FileCredentialStore, FilesystemSessionStore, IdleHostEffectError,
+    InferenceProviderSettings, InferenceSettings, ItemMetadata, MAX_ACTIVE_SESSION_MASKS,
+    MAX_METADATA_BYTES, MAX_METADATA_ITEMS, MAX_METADATA_KEY_BYTES, MAX_METADATA_KEYS,
+    MAX_METADATA_MUTATION_ENTRIES, MAX_METADATA_VALUE_BYTES,
+    MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES, MAX_SESSION_COORDINATION_REASON_CODE_BYTES,
+    MAX_SESSION_MASK_KEY_BYTES, MAX_SESSION_MASK_MUTATION_ITEMS,
+    MAX_SESSION_MASK_REPLACEMENT_BYTES, MAX_SESSION_MUTATION_BYTES, MemorySessionStore,
+    MetadataError, MetadataPredicate, MetadataSetCondition, MetadataSetOutcome, MetadataTarget,
+    MetadataUpdate, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
+    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
+    OAuthRefreshClaimResult, OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus,
+    RefreshMode, ReplacementUserContent, RequestId, RequestRecord, ResumeInput, Revision,
+    RunConflictPolicy, RuntimeResumeOutput, S3SessionStore, S3SessionWriteMode, SandboxDispatch,
+    ScyllaSessionStore, SessionCapabilities, SessionCaptureError, SessionCaptureLimits,
+    SessionCommitReceipt, SessionCompletionCoordinationFuture,
     SessionCompletionCoordinationHandler, SessionCompletionCoordinationPreparation,
     SessionContextCapture, SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
     SessionCoordinationReasonError, SessionCoordinationState, SessionCoordinator, SessionCopy,
     SessionCopyError, SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent,
     SessionListSubscription, SessionListUpdate, SessionMask, SessionMaskAddition, SessionMaskError,
     SessionMaskId, SessionMaskMutation, SessionMaskMutationOutcome, SessionMaskSubtraction,
-    SessionMaterializedContext, SessionMetrics, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
-    SessionOAuthProviderSettings, SessionOAuthTokenField, SessionOAuthTokenFieldTarget,
-    SessionOAuthTokenRequestStyle, SessionPauseError, SessionPauseId, SessionPauseLease,
-    SessionProgress, SessionProgressPhase, SessionPromptDisposition, SessionRecord,
-    SessionRunStage, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
-    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionSyntheticTimelineEvent, SessionTimelineEvent, SessionTimelineMode, SessionTimelinePage,
-    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionMaterializedContext, SessionMetrics, SessionMutation, SessionMutationOutcome,
+    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    SessionPauseError, SessionPauseId, SessionPauseLease, SessionProgress, SessionProgressPhase,
+    SessionPromptDisposition, SessionRecord, SessionRunStage, SessionSnapshot, SessionStart,
+    SessionStartMessage, SessionStartMessageError, SessionStatus, SessionStore, SessionStoreError,
+    SessionStoreResult, SessionSummary, SessionSyntheticTimelineEvent, SessionTimelineEvent,
+    SessionTimelineMode, SessionTimelinePage, SessionTimelinePresentation,
+    SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
     SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
     SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
-    StoredCredential, Suspension, ThroughCursor,
+    StoredCredential, Suspension, ThroughCursor, TimelineAppendReceipt,
     opendal_postgresql_session_store, run_postgresql_migrations,
-    ItemMetadata, MetadataError, MetadataTarget, MetadataPredicate, MetadataUpdate,
-    SessionMutation, SessionMutationOutcome, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES,
-    MAX_METADATA_KEYS, MAX_METADATA_ITEMS, MAX_METADATA_MUTATION_ENTRIES, MAX_METADATA_BYTES,
-    MAX_SESSION_MUTATION_BYTES,
 };
 pub use tool::{
     AgentTool, HostDispatchBinding, ToolExecutionContext, ToolFuture, ToolGuardFuture,
@@ -99,6 +99,21 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Retain consumer validation when this runtime is rebuilt for queued runs.
+    #[must_use]
+    pub fn with_completion_validation(
+        mut self,
+        validation: completion::CompletionValidation,
+    ) -> Self {
+        self.max_provider_turns = Some(
+            self.max_provider_turns
+                .map_or(validation.max_turns, |limit| {
+                    limit.min(validation.max_turns)
+                }),
+        );
+        self.completion_validation = Some(validation);
+        self
+    }
     /// Start building an agent runtime for a model.
     #[must_use]
     pub fn builder<P>(model: ModelRef, provider: Arc<P>) -> AgentRuntimeBuilder

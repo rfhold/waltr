@@ -302,6 +302,7 @@ pub(crate) struct SessionRunContext {
     timeline: SessionTimelineBroadcaster,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
     execution_token: Option<super::ExecutionToken>,
+    pub(crate) next_turn: Option<super::next_turn::NextTurnInput>,
 }
 
 impl std::fmt::Debug for SessionRunContext {
@@ -325,6 +326,7 @@ impl SessionRunContext {
             timeline,
             event_sink,
             execution_token: None,
+            next_turn: None,
         }
     }
 

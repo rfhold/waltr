@@ -12,6 +12,8 @@ use waltr_client::{
     RoutineInteractionTransport,
     interaction::{InteractionEvent, InteractionLimits, InteractionOutput, wire},
 };
+mod repeated;
+pub(crate) use repeated::RepeatedCaptures;
 
 /// Exact catalog selection pinned by the host for one access/profile generation.
 #[derive(Clone)]
@@ -141,7 +143,9 @@ fn validate_capture_ports(
         p.name == output
             && p.direction == D::Output
             && ((p.media == M::Text && p.formats.iter().any(|f| f == "utf8"))
-                || (p.media == M::Audio && p.formats.iter().all(|f| f == "pcm16le-24000-mono") && !p.formats.is_empty()))
+                || (p.media == M::Audio
+                    && p.formats.iter().all(|f| f == "pcm16le-24000-mono")
+                    && !p.formats.is_empty()))
     }) || ports.iter().any(|p| {
         p.required
             && p.direction == D::Input
@@ -317,11 +321,81 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
     observer: &Observer,
     consumer: &dyn Consumer,
 ) -> Result<Option<Output>, Error> {
+    run_owned(
+        transport, factory, audio, selection, inputs, release, guard, observer, consumer, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
+pub(crate) async fn run_hold<T: RoutineInteractionTransport>(
+    transport: &T,
+    factory: Arc<dyn capture::Factory>,
+    audio: &Audio,
+    selection: Selection<'_>,
+    release: &CancellationToken,
+    guard: &Guard<'_>,
+    observer: &Observer,
+    consumer: &dyn Consumer,
+    repeated: Option<&RepeatedCaptures>,
+) -> Result<Option<Output>, Error> {
+    run_owned(
+        transport,
+        factory,
+        audio,
+        selection,
+        &mut [],
+        release,
+        guard,
+        observer,
+        consumer,
+        repeated,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::future_not_send
+)]
+async fn run_owned<T: RoutineInteractionTransport>(
+    transport: &T,
+    factory: Arc<dyn capture::Factory>,
+    audio: &Audio,
+    selection: Selection<'_>,
+    inputs: &mut [crate::media::BinaryInput],
+    release: &CancellationToken,
+    guard: &Guard<'_>,
+    observer: &Observer,
+    consumer: &dyn Consumer,
+    repeated: Option<&RepeatedCaptures>,
+) -> Result<Option<Output>, Error> {
     let mut producer = crate::media::Producer::new(inputs);
     // Preflight failures still release every selected local source.
     let preflight = (|| {
         let binary = producer.declarations(selection.invocation)?;
         validate_capture_selection(&selection, &binary)?;
+        if repeated.is_some()
+            && (!selection
+                .invocation
+                .limits
+                .definition
+                .capabilities
+                .iter()
+                .any(|c| c == "media.inputs")
+                || !selection
+                    .invocation
+                    .limits
+                    .definition
+                    .ports
+                    .iter()
+                    .any(|p| {
+                        p.name == selection.output && p.media == waltr_client::RoutineMedia::Audio
+                    }))
+        {
+            return Err(Error::Unsupported);
+        }
         let open = wire::InteractionOpen {
             selection: Some(selection.invocation.selection.clone()),
             inputs: std::iter::once(wire::InputDeclaration {
@@ -369,7 +443,8 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
             return Err(error);
         }
     };
-    let mut capture = capture::CaptureWorker::start_observed(factory, config, observer.clone());
+    let mut capture =
+        capture::CaptureWorker::start_observed(factory.clone(), config.clone(), observer.clone());
     if release.is_cancelled() {
         capture.stop();
     }
@@ -378,7 +453,7 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
     let stop = capture.stop_lane();
     let failure = capture.failure_lane();
     let mut session_owner = None;
-    let result = {
+    let mut result = {
         let operation = async {
             let first = loop {
                 match capture.frames.recv().await {
@@ -386,6 +461,22 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
                     Some(_) => continue,
                     None => {
                         capture.join().await.map_err(Error::Capture)?;
+                        if let Some(lane) = repeated {
+                            lane.closed();
+                            if let Some(release) = lane.pending() {
+                                guard.check().map_err(|_| Error::Cancelled)?;
+                                capture = capture::CaptureWorker::start_observed(
+                                    factory.clone(),
+                                    config.clone(),
+                                    observer.clone(),
+                                );
+                                lane.watch(&capture, release.clone(), duration);
+                                if release.is_cancelled() {
+                                    capture.stop();
+                                }
+                                continue;
+                            }
+                        }
                         return Ok(None);
                     }
                 }
@@ -415,6 +506,10 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
                 deadline,
                 &mut producer,
                 &transport.media_transfers(),
+                repeated,
+                factory.clone(),
+                config.clone(),
+                duration,
             )
             .await;
             result.map(Some)
@@ -427,6 +522,7 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
                 result = &mut operation => break result,
                 () = tokio::time::sleep(std::time::Duration::from_millis(2)) => {
                     if guard.check().is_err() { break Err(Error::Cancelled); }
+                    if let Some(lane) = repeated && let Err(error) = lane.poll() { break Err(error); }
                     let failed = *failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(Err(error)) = failed { break Err(Error::Capture(error)); }
                     // A source that has not finished opening still receives a pending stop.
@@ -443,8 +539,16 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
             }
         }
     };
+    if let Some(lane) = repeated {
+        let clean = lane.seal();
+        if result.as_ref().is_ok_and(Option::is_none) && !clean {
+            result = Err(Error::Interaction);
+        }
+    }
     if result.is_err() {
-        if let Some(sink) = consumer.sink() { sink.revoke(); }
+        if let Some(sink) = consumer.sink() {
+            sink.revoke();
+        }
         capture.cancel();
         if let Some(session) = &session_owner {
             session.input.cancel();
@@ -456,7 +560,9 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
     observer.emit(Diagnostic::Stage(Stage::Cleanup));
     let cleanup = capture.join().await;
     if cleanup.is_err() || guard.check().is_err() {
-        if let Some(sink) = consumer.sink() { sink.revoke(); }
+        if let Some(sink) = consumer.sink() {
+            sink.revoke();
+        }
     }
     observer.emit(Diagnostic::CaptureCleanup(cleanup));
     let sources_cleanup = producer
@@ -464,7 +570,9 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
         .await;
     observer.emit(Diagnostic::SourceCleanup(sources_cleanup));
     if sources_cleanup.is_err() || guard.check().is_err() {
-        if let Some(sink) = consumer.sink() { sink.revoke(); }
+        if let Some(sink) = consumer.sink() {
+            sink.revoke();
+        }
     }
     if let Some(session) = &mut session_owner {
         let proof = if result.is_err() {
@@ -495,7 +603,9 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
         None => Ok(()),
     };
     if sink_cleanup.is_err() {
-        if let Some(sink) = consumer.sink() { sink.revoke(); }
+        if let Some(sink) = consumer.sink() {
+            sink.revoke();
+        }
     }
     let output = result?;
     cleanup.map_err(Error::Capture)?;
@@ -555,6 +665,10 @@ async fn duplex(
     deadline: tokio::time::Instant,
     producer: &mut crate::media::Producer<'_>,
     transfers: &waltr_client::interaction::MediaTransfers,
+    repeated: Option<&RepeatedCaptures>,
+    factory: Arc<dyn capture::Factory>,
+    config: waltr_audio_io::Config,
+    duration: Option<std::time::Duration>,
 ) -> Result<Output, Error> {
     let (accepted, ready) = tokio::sync::oneshot::channel();
     let input_finished = std::cell::Cell::new(false);
@@ -580,6 +694,17 @@ async fn duplex(
                         None => 0,
                     };
                     observer.emit(Diagnostic::OutputBytesReceived(bytes as u64));
+                }
+                InteractionEvent::Close(close)
+                    if selected_streams.contains(&close.stream_id) && repeated.is_some() =>
+                {
+                    // The server seals admission before closing the selected PCM output.
+                    // An overlapping locally admitted capture is an explicit race failure,
+                    // never silently discarded or moved to a replacement invocation.
+                    let clean = repeated.expect("matched repeated lane").seal();
+                    if !clean {
+                        return Err(Error::Interaction);
+                    }
                 }
                 _ => {}
             }
@@ -610,16 +735,22 @@ async fn duplex(
                 .output(&session.output, selection.output, None, guard)
                 .await?;
         }
-        let audio_output = selection.invocation.limits.definition.ports.iter().any(|p| {
-            p.name == selection.output && p.media == waltr_client::RoutineMedia::Audio
-        });
+        let audio_output = selection
+            .invocation
+            .limits
+            .definition
+            .ports
+            .iter()
+            .any(|p| p.name == selection.output && p.media == waltr_client::RoutineMedia::Audio);
         let text = if audio_output {
             if !session.output.succeeded() {
                 return Err(protocol(observer, &session.output));
             }
             String::new()
         } else {
-            session.output.final_text(selection.output)
+            session
+                .output
+                .final_text(selection.output)
                 .map_err(|_| protocol(observer, &session.output))?
         };
         if !input_finished.get() {
@@ -645,58 +776,92 @@ async fn duplex(
                 observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));
                 Error::Interaction
             })?;
-        session
-            .input
-            .send(wire::input_event::Event::Open(wire::StreamOpen {
-                port: selection.input.into(),
-                stream_id: "audio".into(),
-                format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
-                    sample_rate: audio.sample_rate_hz,
-                    channels: u32::from(audio.channels),
-                })),
-            }))
-            .await
-            .map_err(|error| rpc(observer, &error, RpcFailure::Input))?;
-        let mut pending = Some(first);
-        let mut sequence = 0;
+        let mut capture_index = 0;
+        let mut next_first = Some(first);
+        let mut capture_release = None;
         loop {
-            let frame = match pending.take() {
-                Some(frame) => frame,
-                None => match capture.frames.recv().await {
-                    Some(frame) => frame,
-                    None => break,
-                },
+            let stream_id = if repeated.is_some() {
+                format!("audio-{capture_index}")
+            } else {
+                "audio".into()
             };
-            if frame.is_empty() {
-                continue;
-            }
             session
                 .input
-                .send(wire::input_event::Event::Chunk(wire::StreamChunk {
-                    stream_id: "audio".into(),
-                    sequence,
-                    payload: Some(wire::stream_chunk::Payload::Audio(frame)),
+                .send(wire::input_event::Event::Open(wire::StreamOpen {
+                    port: selection.input.into(),
+                    stream_id: stream_id.clone(),
+                    format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
+                        sample_rate: audio.sample_rate_hz,
+                        channels: u32::from(audio.channels),
+                    })),
                 }))
                 .await
                 .map_err(|error| rpc(observer, &error, RpcFailure::Input))?;
-            sequence += 1;
+            let mut pending = next_first.take();
+            let mut sequence = 0;
+            loop {
+                let frame = if let Some(frame) = pending.take() {
+                    Some(frame)
+                } else if let (Some(release), Some(lane)) = (&capture_release, repeated) {
+                    repeated::frame(capture, release, duration, guard, lane).await?
+                } else {
+                    capture.frames.recv().await
+                };
+                let Some(frame) = frame else { break };
+                if frame.is_empty() {
+                    continue;
+                }
+                session
+                    .input
+                    .send(wire::input_event::Event::Chunk(wire::StreamChunk {
+                        stream_id: stream_id.clone(),
+                        sequence,
+                        payload: Some(wire::stream_chunk::Payload::Audio(frame)),
+                    }))
+                    .await
+                    .map_err(|error| rpc(observer, &error, RpcFailure::Input))?;
+                sequence += 1;
+            }
+            let cleanup = capture.join().await;
+            if let Err(error) = cleanup {
+                observer.emit(Diagnostic::Primary(Err(Error::Capture(error))));
+            }
+            observer.emit(Diagnostic::CaptureCleanup(cleanup));
+            cleanup.map_err(Error::Capture)?;
+            guard.check().map_err(|_| Error::Cancelled)?;
+            consumer.progress(Progress::InputClosed);
+            session
+                .input
+                .send(wire::input_event::Event::Close(wire::StreamClose {
+                    stream_id,
+                    next_sequence: sequence,
+                }))
+                .await
+                .map_err(|error| rpc(observer, &error, RpcFailure::Input))?;
+            let Some(lane) = repeated else { break };
+            lane.closed();
+            let Some(release) = lane.next().await else {
+                break;
+            };
+            guard.check().map_err(|_| Error::Cancelled)?;
+            observer.emit(Diagnostic::Stage(Stage::CaptureRequested));
+            *capture = capture::CaptureWorker::start_observed(
+                factory.clone(),
+                config.clone(),
+                observer.clone(),
+            );
+            lane.watch(capture, release.clone(), duration);
+            capture_index += 1;
+            // Retain this worker in the outer cleanup scope even when this future is cancelled.
+            next_first = repeated::frame(capture, &release, duration, guard, lane).await?;
+            capture_release = Some(release);
+            if next_first.is_none() {
+                capture.join().await.map_err(Error::Capture)?;
+                lane.closed();
+                // A physical capture that produced no PCM cannot be sent as an empty stream.
+                return Err(Error::Interaction);
+            }
         }
-        let cleanup = capture.join().await;
-        if let Err(error) = cleanup {
-            observer.emit(Diagnostic::Primary(Err(Error::Capture(error))));
-        }
-        observer.emit(Diagnostic::CaptureCleanup(cleanup));
-        cleanup.map_err(Error::Capture)?;
-        guard.check().map_err(|_| Error::Cancelled)?;
-        consumer.progress(Progress::InputClosed);
-        session
-            .input
-            .send(wire::input_event::Event::Close(wire::StreamClose {
-                stream_id: "audio".into(),
-                next_sequence: sequence,
-            }))
-            .await
-            .map_err(|error| rpc(observer, &error, RpcFailure::Input))?;
         producer.send(&mut session.input, transfers, guard).await?;
         session
             .input

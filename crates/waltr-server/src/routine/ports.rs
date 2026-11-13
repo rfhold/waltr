@@ -268,13 +268,32 @@ pub struct HelperResult {
 
 /// Independently substitutable helper lifecycle; implementations must join on cleanup.
 pub trait HelperRunner: Send + Sync {
+    /// Open one invocation-owned text helper; additional prompts use its ordinary queue.
+    fn open(
+        &self,
+        _request: HelperRequest,
+        _payload: HelperPayload,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> PortFuture<Arc<dyn HelperTarget>> {
+        Box::pin(async { Err(PortError::UnsupportedCapability) })
+    }
     /// Bind private invocation-local tool mailboxes without granting tool authority.
-    fn bind_tool_streams(&self, _streams: Arc<super::adapters::tool_streams::ToolStreams>) -> PortFuture<()> {
+    fn bind_tool_streams(
+        &self,
+        _streams: Arc<super::adapters::tool_streams::ToolStreams>,
+    ) -> PortFuture<()> {
         Box::pin(async { Err(PortError::UnsupportedCapability) })
     }
     /// Resolve an invocation-local model selector before any helper or attachment effects.
-    fn select_inference(&self, selector: &super::adapters::helper::InferenceSelector) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
-        if selector.is_default() { Ok(None) } else { Err(PortError::UnsupportedCapability) }
+    fn select_inference(
+        &self,
+        selector: &super::adapters::helper::InferenceSelector,
+    ) -> Result<Option<Arc<dyn HelperRunner>>, PortError> {
+        if selector.is_default() {
+            Ok(None)
+        } else {
+            Err(PortError::UnsupportedCapability)
+        }
     }
     /// Reject definitely denied declared captures before upstream effects. Ask remains live.
     /// Adapters without a policy projection must fail closed for declared captures.
@@ -282,17 +301,37 @@ pub trait HelperRunner: Send + Sync {
         Box::pin(async { Err(PortError::UnsupportedCapability) })
     }
     /// Bind the immutable resource's contracts before admission, never granting tools.
-    fn bind_captures(&self, captures: std::collections::BTreeMap<String, super::definition::CaptureContract>) -> PortFuture<()> {
-        Box::pin(async move { if captures.is_empty() { Ok(()) } else { Err(PortError::UnsupportedCapability) } })
+    fn bind_captures(
+        &self,
+        captures: std::collections::BTreeMap<String, super::definition::CaptureContract>,
+    ) -> PortFuture<()> {
+        Box::pin(async move {
+            if captures.is_empty() {
+                Ok(())
+            } else {
+                Err(PortError::UnsupportedCapability)
+            }
+        })
     }
     /// Pin native model capabilities for this exact selection before opening payloads.
-    fn input_capabilities(&self, _selection: HelperSelection) -> PortFuture<waltr_agent::TransientModelCapabilities> {
+    fn input_capabilities(
+        &self,
+        _selection: HelperSelection,
+    ) -> PortFuture<waltr_agent::TransientModelCapabilities> {
         Box::pin(async { Err(PortError::UnsupportedCapability) })
     }
     /// One normal helper with both an authorized source and invocation-local attachments.
-    fn run_with_inputs(&self, request: HelperRequest, source: Option<waltr_agent::SessionCopy>, payload: Option<HelperPayload>, cancellation: tokio_util::sync::CancellationToken) -> PortFuture<HelperResult> {
+    fn run_with_inputs(
+        &self,
+        request: HelperRequest,
+        source: Option<waltr_agent::SessionCopy>,
+        payload: Option<HelperPayload>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> PortFuture<HelperResult> {
         match payload {
-            Some(payload) if source.is_none() => self.run_with_payload(request, payload, cancellation),
+            Some(payload) if source.is_none() => {
+                self.run_with_payload(request, payload, cancellation)
+            }
             Some(_) => Box::pin(async { Err(PortError::UnsupportedCapability) }),
             None => self.run_with_source(request, source, cancellation),
         }
@@ -347,6 +386,16 @@ pub trait HelperRunner: Send + Sync {
     ) -> PortFuture<HelperResult>;
     /// Stop admission, cancel owned work and join actual helpers and validators.
     fn cleanup(&self) -> PortFuture<()>;
+}
+
+/// Private exact-session submission authority, never a guest-supplied session ID.
+pub trait HelperTarget: Send + Sync {
+    /// Return only after ordinary queue admission; at most sixteen follow-ups.
+    fn submit(&self, prompt: String) -> PortFuture<()>;
+    /// Join all work accepted before this call, without closing speech streams.
+    fn idle(&self) -> PortFuture<()>;
+    /// Reject later submissions, join accepted work, and return final accepted output.
+    fn seal(&self) -> PortFuture<HelperResult>;
 }
 
 /// Trusted media-consumer profile; never deserialized from script arguments.

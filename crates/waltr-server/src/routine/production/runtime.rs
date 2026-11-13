@@ -262,6 +262,7 @@ fn catalog_entries(
         .map(str::to_owned),
     );
     capabilities.insert("media.execute".into());
+    capabilities.insert("media.inputs".into());
     if !authority.targets.is_empty() {
         capabilities.extend(["tools.execute".into(), "tools.schemas".into()]);
         capabilities.extend(authority.targets.keys().cloned());

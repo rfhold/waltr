@@ -394,6 +394,13 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | --- | --- |
 | `media.transcribe` | Host-owned STT with ordered append/replace updates and explicit final commitment |
 | `media.collect` | One bounded collection after successful STT; optional diarized snapshot using the pinned catalog |
+| `media.input.next` | With `media.inputs`, take the next distinct capture from the declared audio input; returns a capture handle, or null after sealing |
+| `media.input.acknowledge` | Resolve a closed, consumed capture after derived work is admitted or an empty transcript is deliberately discarded |
+| `media.input.seal` | Atomically stop capture admission; returns false while an admitted capture remains unresolved |
+| `helper.open` | Media host only: the text-only `helper.run` arguments, without a source, payload, field, or callback; returns an opaque target after initial ordinary admission |
+| `helper.submit` | `{task}` and a target handle: admit an ordinary user prompt at that helper's next safe model boundary |
+| `helper.idle` | `{}` and a target handle: join the accepted prefix without closing its tool streams |
+| `helper.seal` | `{}` and a target handle: reject later submissions, join accepted work, close the producer, and return the final helper result handle |
 | `media.synthesize` | PCM16LE, 24 kHz, mono from exactly one `port` or JavaScript `text` string, with host-approved speech options |
 | `media.tee` | Host-owned fanout with required-consumer backpressure |
 | `media.upload` | Sequential finite upload; no readable handle before integrity and fixed signature checks |
@@ -407,6 +414,50 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 
 JS receives opaque, engine-bound resources, not payload-sized JSON or ownership grants.
 `media.read` returns response bytes from a helper handle. Use `media.readText` to read bounded UTF-8 directly without per-byte JavaScript decoding. It preserves the complete string or fails; structured-value limits still apply.
+
+`media.inputs` opts an interactive transport into repeated captures on one declared
+audio input. Each capture uses a fresh stream ID and explicit stream close; no
+closed stream is reopened. `media.collect` accepts its capture handle instead of
+`port`. Acknowledgment requires both stream close and collection. Sealing and
+admission share one lock: accepted captures block normal completion until resolved,
+and a later open is rejected. The invocation admits at most 16 captures, retains
+the port's aggregate byte ceiling, and uses its original absolute deadline.
+The trusted opt-in permits at most 20 lifetime edges per direction for sixteen
+capture/STT pairs and original internal edges. A separate 4 MiB speech workspace
+allows STT to overlap ongoing synthesis, still charged to principal/process pools.
+Payload retention and transport byte limits do not grow; total charged invocation
+retention is bounded by 12 MiB instead of the one-shot 8 MiB.
+`InputFinish` still ends all input; closing one capture does not finish the input
+lane. Existing one-shot definitions retain their original behavior.
+
+`helper.open` retains one helper session and one tool-stream producer. The target
+accepts at most 16 follow-ups, each at most 16384 UTF-8 bytes, and never accepts a
+guest session ID. Named and restricted helpers retain the initial runtime's tools,
+policy, origin guard, inference, completion validation, and absolute deadline.
+Follow-ups use `NextTurnIfActive` and ordinary coordinator history.
+The active run adopts FIFO prompts after the complete response and all tool results,
+before its next model request or normal completion. Adjacent prompts share that
+request; no extra run or budget reset occurs. Provider retries retain their canonical
+request. An idle helper starts a normal run with the same private runtime factory.
+Paused, suspended, failed, canceled, full, or complete-gate runs reject admission.
+Prior ordinary queued work or a different host binding also causes rejection.
+An active permission interaction still controls its tool; a prompt does not bypass it.
+`helper.idle` joins a snapshot of accepted submissions, not a
+reservation against later input. JavaScript must seal capture admission after idle,
+process and acknowledge any winning capture after prompt admission or deliberate
+empty-transcript disposal, then seal
+the helper. A losing capture open or helper submission is explicitly rejected.
+Cancellation joins active runs and all accepted outcomes before producer release. At most
+16 targets may be opened per invocation; existing `helper.run` remains one-shot.
+`media.finish` rejects any target whose accepted work has not completed through
+`helper.seal`, including targets without declared tool streams.
+The `audio-ask-and-speak` resource implements this handshake, sequential STT, and
+one ordered synthesis output while retaining the same helper conversation.
+It acknowledges and skips successfully collected blank follow-ups without submitting
+an empty prompt or canceling the current answer. Nonempty prompts retain their original
+text. An empty initial question still fails before helper creation; STT and submission
+errors still fail the invocation and join owned work.
+
 `media.synthesize` accepts arbitrary `text`, within the engine's string/value limits and the 1 MiB host text ceiling.
 Its text feeder and speech producer share bounded stream credit, cancellation and deadlines, and both join before completion.
 `ask-and-speak` uses a tool-free named helper, waits for its complete answer, retains and emits text, then streams audio.
