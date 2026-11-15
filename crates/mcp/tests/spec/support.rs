@@ -113,7 +113,7 @@ pub fn sse_messages(body: &str) -> mcp::Result<Vec<Value>> {
 fn request_name<'a>(method: &str, body: &'a Value) -> Option<&'a str> {
     let params = body.get("params")?;
     match method {
-        "tools/call" | "prompts/get" => params.get("name")?.as_str(),
+        "tools/call" | "prompts/get" | "events/stream" => params.get("name")?.as_str(),
         "resources/read" => params.get("uri")?.as_str(),
         _ => None,
     }

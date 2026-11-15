@@ -28,6 +28,13 @@ use crate::{
 };
 
 type PendingMap = BTreeMap<JsonRpcId, oneshot::Sender<Result<Value>>>;
+type EventRoutes = Arc<RwLock<BTreeMap<JsonRpcId, (EventNotifications, CancellationToken)>>>;
+
+#[derive(Clone)]
+struct EventNotifications {
+    sender: mpsc::Sender<Result<crate::McpEventMessage>>,
+    activity: Arc<RwLock<time::Instant>>,
+}
 
 /// Handler for client-side inbound MCP messages.
 pub trait McpConnectionHandler: Send + Sync {
@@ -47,6 +54,7 @@ pub trait McpConnectionHandler: Send + Sync {
 pub struct McpConnection {
     transport: McpTransport,
     pending: Arc<Mutex<PendingMap>>,
+    event_routes: EventRoutes,
     dispatch_cancellation: CancellationToken,
     dispatch_task: Mutex<Option<JoinHandle<()>>>,
     active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
@@ -83,15 +91,18 @@ impl McpConnection {
     ) -> Result<Arc<Self>> {
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         let dispatch_cancellation = CancellationToken::new();
+        let event_routes = Arc::new(RwLock::new(BTreeMap::new()));
         let connection = Arc::new(Self {
             transport,
             pending: Arc::clone(&pending),
+            event_routes: Arc::clone(&event_routes),
             dispatch_cancellation: dispatch_cancellation.clone(),
             dispatch_task: Mutex::new(None),
             active_subscriptions,
         });
         let task = tokio::spawn(dispatch_loop(
             pending,
+            event_routes,
             inbound_rx,
             handler,
             dispatch_cancellation,
@@ -124,8 +135,15 @@ impl McpConnection {
             rpc.jsonrpc.error_code = tracing::field::Empty,
         );
         async move {
-            self.request_inner(method, params, timeout, cancellation_token, http_headers)
-                .await
+            self.request_inner(
+                method,
+                params,
+                timeout,
+                cancellation_token,
+                http_headers,
+                None,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -139,6 +157,7 @@ impl McpConnection {
         timeout: Option<Duration>,
         cancellation_token: CancellationToken,
         http_headers: Vec<(String, String)>,
+        event_sender: Option<EventNotifications>,
     ) -> Result<Value> {
         let span = tracing::Span::current();
         if cancellation_token.is_cancelled() {
@@ -152,6 +171,16 @@ impl McpConnection {
         let request_cancellation = cancellation_token.child_token();
         let deadline = timeout.map(|timeout| time::Instant::now() + timeout);
         let id = next_id();
+        let _event_route = event_sender.map(|sender| {
+            self.event_routes
+                .write()
+                .expect("event routes lock poisoned")
+                .insert(id.clone(), (sender, request_cancellation.clone()));
+            EventRoute {
+                id: id.clone(),
+                routes: Arc::clone(&self.event_routes),
+            }
+        });
         let _subscription = (method == "subscriptions/listen").then(|| {
             self.active_subscriptions
                 .write()
@@ -164,6 +193,10 @@ impl McpConnection {
         });
         span.record("mcp.request_id", id.to_string());
         let (tx, rx) = oneshot::channel();
+        let mut event_cancellation = cancellation_params(&id, "Event stream canceled");
+        if let Some(meta) = params.as_ref().and_then(|v| v.get("_meta")) {
+            event_cancellation["_meta"] = meta.clone();
+        }
         self.pending.lock().await.insert(id.clone(), tx);
         let send_result = tokio::select! {
             result = self.send(
@@ -179,6 +212,15 @@ impl McpConnection {
         };
         if let Err(error) = send_result {
             self.pending.lock().await.remove(&id);
+            if method == "events/stream" && request_cancellation.is_cancelled() {
+                drop(
+                    time::timeout(
+                        Duration::from_secs(2),
+                        self.notify("notifications/cancelled", Some(event_cancellation)),
+                    )
+                    .await,
+                );
+            }
             span.record("mcp.outcome", "error");
             tracing::debug!(%error, mcp.outcome = "error", "MCP client request send failed");
             return Err(error);
@@ -188,7 +230,9 @@ impl McpConnection {
             biased;
             () = request_cancellation.cancelled() => {
                 self.pending.lock().await.remove(&id);
-                if self.transport.kind() == "stdio" {
+                if method == "events/stream" {
+                    drop(time::timeout(Duration::from_secs(2), self.notify("notifications/cancelled", Some(event_cancellation))).await);
+                } else if self.transport.kind() == "stdio" {
                     drop(self.notify("notifications/cancelled", Some(cancellation_params(&id, "Waltr request canceled"))).await);
                 }
                 span.record("mcp.outcome", "cancelled");
@@ -198,7 +242,7 @@ impl McpConnection {
             () = wait_for_deadline(deadline) => {
                 request_cancellation.cancel();
                 self.pending.lock().await.remove(&id);
-                if self.transport.kind() == "stdio" {
+                if self.transport.kind() == "stdio" || method == "events/stream" {
                     drop(self.notify("notifications/cancelled", Some(cancellation_params(&id, "Waltr request timed out"))).await);
                 }
                 span.record("mcp.outcome", "timeout");
@@ -223,6 +267,67 @@ impl McpConnection {
                     }
                 }
             },
+        }
+    }
+
+    /// Start a bounded event request with an independent idle deadline.
+    pub(crate) fn event_stream(
+        self: &Arc<Self>,
+        params: Value,
+        headers: Vec<(String, String)>,
+        cancellation: &CancellationToken,
+    ) -> crate::McpEventStream {
+        let cancellation = cancellation.child_token();
+        let (sender, receiver) = mpsc::channel(64);
+        let (completion_tx, completion) = oneshot::channel();
+        let connection = Arc::clone(self);
+        let token = cancellation.clone();
+        let cancellation_guard = token.clone().drop_guard();
+        let activity = Arc::new(RwLock::new(time::Instant::now()));
+        let task = tokio::spawn(async move {
+            let _cancellation_guard = cancellation_guard;
+            let request = connection.request_inner(
+                "events/stream",
+                Some(params),
+                None,
+                token.clone(),
+                headers,
+                Some(EventNotifications {
+                    sender,
+                    activity: Arc::clone(&activity),
+                }),
+            );
+            tokio::pin!(request);
+            let idle = async {
+                loop {
+                    let deadline = *activity.read().expect("event activity lock poisoned")
+                        + Duration::from_mins(1);
+                    time::sleep_until(deadline).await;
+                    if time::Instant::now()
+                        .duration_since(*activity.read().expect("event activity lock poisoned"))
+                        >= Duration::from_mins(1)
+                    {
+                        break;
+                    }
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                result = &mut request => result,
+                () = idle => {
+                    token.cancel();
+                    drop(request.await);
+                    Err(Error::protocol("MCP event stream idle for 60 seconds"))
+                }
+            };
+            drop(completion_tx.send(result.and_then(|value| event_completion(&value))));
+        });
+        crate::McpEventStream {
+            receiver,
+            cancellation,
+            task: Some(task),
+            completion: Some(completion),
+            finished: false,
         }
     }
 
@@ -264,9 +369,36 @@ impl McpConnection {
     }
 }
 
+fn event_completion(result: &Value) -> Result<()> {
+    if !result.is_object() {
+        return Err(Error::protocol("events/stream result must be an object"));
+    }
+    match result.get("resultType") {
+        None => Ok(()),
+        Some(Value::String(value)) if value == "complete" => Ok(()),
+        Some(Value::String(value)) => Err(Error::protocol(format!(
+            "unsupported events/stream resultType `{value}`"
+        ))),
+        Some(_) => Err(Error::protocol("events/stream resultType must be a string")),
+    }
+}
+
 struct ActiveSubscription {
     id: JsonRpcId,
     active: Arc<RwLock<HashSet<JsonRpcId>>>,
+}
+
+struct EventRoute {
+    id: JsonRpcId,
+    routes: EventRoutes,
+}
+impl Drop for EventRoute {
+    fn drop(&mut self) {
+        self.routes
+            .write()
+            .expect("event routes lock poisoned")
+            .remove(&self.id);
+    }
 }
 
 impl Drop for ActiveSubscription {
@@ -297,6 +429,7 @@ fn json_rpc_error_code(error: &Error) -> Option<i64> {
 
 async fn dispatch_loop(
     pending: Arc<Mutex<PendingMap>>,
+    event_routes: EventRoutes,
     mut inbound: mpsc::UnboundedReceiver<TransportInbound>,
     handler: Arc<dyn McpConnectionHandler>,
     cancellation: CancellationToken,
@@ -315,6 +448,32 @@ async fn dispatch_loop(
                 }
             }
             TransportInbound::Message(JsonRpcInbound::Notification(notification)) => {
+                if notification.method.starts_with("notifications/events/") {
+                    let params = notification.params.clone().unwrap_or(Value::Null);
+                    let id = params
+                        .get("_meta")
+                        .and_then(|v| v.get(crate::protocol::MCP_SUBSCRIPTION_ID_META_KEY))
+                        .and_then(|v| serde_json::from_value::<JsonRpcId>(v.clone()).ok());
+                    if let Some((sink, token)) = id.and_then(|id| {
+                        event_routes
+                            .read()
+                            .expect("event routes lock poisoned")
+                            .get(&id)
+                            .cloned()
+                    }) {
+                        *sink.activity.write().expect("event activity lock poisoned") =
+                            time::Instant::now();
+                        let message = crate::McpEventMessage::parse(&notification.method, params);
+                        let terminal = matches!(
+                            &message,
+                            Ok(crate::McpEventMessage::Terminated { .. }) | Err(_)
+                        );
+                        if sink.sender.try_send(message).is_err() || terminal {
+                            token.cancel();
+                        }
+                    }
+                    continue;
+                }
                 handler.notification(notification);
             }
             TransportInbound::Message(JsonRpcInbound::Request(request)) => {

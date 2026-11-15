@@ -5,9 +5,10 @@ pub mod apps;
 mod capabilities;
 /// MCP client connection and transport helpers.
 pub mod client;
-mod error;
 /// Typed MRTR form and URL elicitation contracts.
 pub mod elicitation;
+mod error;
+pub mod events;
 mod http_headers;
 mod log;
 /// MCP OAuth protected-resource discovery and bearer-token validation helpers.
@@ -24,6 +25,10 @@ pub mod server;
 mod server_telemetry;
 /// MCP Skills extension wire types, immutable catalogs, and integrity verification.
 pub mod skills;
+pub use events::{
+    McpEventDefinition, McpEventError, McpEventList, McpEventMessage, McpEventStream,
+    McpEventStreamRequest,
+};
 mod tool;
 mod trace;
 mod types;
@@ -35,11 +40,11 @@ pub use skills::{
 pub use capabilities::{
     McpPromptsCapability, McpResourcesCapability, McpServerCapabilities, McpToolsCapability,
 };
-pub use error::{Error, Result};
 pub use elicitation::{
-    McpElicitationAction, McpElicitationCapabilities, McpElicitationFuture,
-    McpElicitationRequest, McpElicitationResponse, McpElicitationSchema, McpElicitationValue,
+    McpElicitationAction, McpElicitationCapabilities, McpElicitationFuture, McpElicitationRequest,
+    McpElicitationResponse, McpElicitationSchema, McpElicitationValue,
 };
+pub use error::{Error, Result};
 pub use log::McpLogLevel;
 #[cfg(feature = "macros")]
 pub use mcp_macros::mcp_server;

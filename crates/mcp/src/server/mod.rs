@@ -117,6 +117,18 @@ pub struct ServerCapabilities {
 }
 
 impl ServerCapabilities {
+    /// Advertise experimental MCP Events (draft SEP-3415).
+    #[must_use]
+    pub fn events(mut self) -> Self {
+        let mut extensions = self
+            .extensions
+            .take()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        extensions.insert(crate::events::EVENTS_EXTENSION.into(), json!({}));
+        self.extensions = Some(Value::Object(extensions));
+        self
+    }
     /// Advertise the Skills extension and its required Resources primitive.
     #[must_use]
     pub fn skills(mut self) -> Self {
@@ -282,6 +294,19 @@ impl std::fmt::Debug for ServerContext {
 }
 
 impl ServerContext {
+    /// Emit a typed event on this request's response stream, with its subscription ID.
+    ///
+    /// # Errors
+    /// Fails outside a subscription context or after transport closure.
+    pub async fn event(&self, message: crate::McpEventMessage) -> Result<()> {
+        if self.subscription_id.is_none() {
+            return Err(Error::protocol(
+                "event notifications require an events/stream context",
+            ));
+        }
+        let (method, params) = message.notification()?;
+        self.notify(&method, Some(params)).await
+    }
     /// Return a typed extension installed by trusted HTTP host middleware, never request metadata.
     /// Stdio contexts contain no host extensions. This does not establish OAuth identity.
     #[must_use]
@@ -364,9 +389,12 @@ impl ServerContext {
         request_state: Option<&str>,
     ) -> ServerResult<Value> {
         if !self.elicitation_capabilities()?.supports(request) {
-            return Err(ServerError::invalid_params("MCP elicitation mode was not advertised"));
+            return Err(ServerError::invalid_params(
+                "MCP elicitation mode was not advertised",
+            ));
         }
-        let input = request.to_input_request()
+        let input = request
+            .to_input_request()
             .map_err(|error| ServerError::invalid_params(error.to_string()))?;
         let mut requests = serde_json::Map::new();
         requests.insert(key.to_owned(), input);
@@ -384,13 +412,21 @@ impl ServerContext {
         key: &str,
         request: &crate::McpElicitationRequest,
     ) -> ServerResult<Option<crate::McpElicitationResponse>> {
-        let Some(value) = self.input_responses.as_ref().and_then(|responses| responses.get(key)) else {
+        let Some(value) = self
+            .input_responses
+            .as_ref()
+            .and_then(|responses| responses.get(key))
+        else {
             return Ok(None);
         };
-        request.validate().map_err(|error| ServerError::invalid_params(error.to_string()))?;
-        let response = serde_json::from_value(value.clone())
-            .map_err(|error| ServerError::invalid_params(format!("invalid elicitation response: {error}")))?;
-        request.validate_response(&response)
+        request
+            .validate()
+            .map_err(|error| ServerError::invalid_params(error.to_string()))?;
+        let response = serde_json::from_value(value.clone()).map_err(|error| {
+            ServerError::invalid_params(format!("invalid elicitation response: {error}"))
+        })?;
+        request
+            .validate_response(&response)
             .map_err(|error| ServerError::invalid_params(error.to_string()))?;
         Ok(Some(response))
     }
@@ -527,6 +563,25 @@ impl NotificationSender {
 
 /// MCP server handler.
 pub trait ServerHandler: Send + Sync + 'static {
+    /// List one page of experimental event definitions.
+    fn list_events(
+        &self,
+        _cursor: Option<String>,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<crate::McpEventList>> {
+        Box::pin(async { Err(ServerError::method_not_found("events/list")) })
+    }
+
+    /// Produce a request-scoped stream. Emit Active first, then events and heartbeats
+    /// (at least every thirty seconds). Return to end with an empty result.
+    /// The handler owns argument validation, replay, cursor/gap semantics and access policy.
+    fn stream_events(
+        &self,
+        _request: crate::McpEventStreamRequest,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<()>> {
+        Box::pin(async { Err(ServerError::method_not_found("events/stream")) })
+    }
     /// Optional immutable embedded catalog. Custom handlers can override list/get instead.
     fn skill_catalog(&self) -> Option<std::sync::Arc<crate::SkillCatalog>> {
         None
@@ -1530,7 +1585,7 @@ fn mirrored_header(
 
 fn mirrored_request_name<'a>(method: &str, params: Option<&'a Value>) -> Option<&'a str> {
     match method {
-        "tools/call" | "prompts/get" => params?.get("name")?.as_str(),
+        "tools/call" | "prompts/get" | "events/stream" => params?.get("name")?.as_str(),
         "resources/read" => params?.get("uri")?.as_str(),
         _ => None,
     }
@@ -1624,6 +1679,11 @@ fn request_method_available(handler: &dyn ServerHandler, method: &str) -> bool {
     let capabilities = handler.capabilities();
     match method {
         "server/discover" | "subscriptions/listen" => true,
+        "events/list" | "events/stream" => capabilities
+            .extensions
+            .as_ref()
+            .and_then(|v| v.get(crate::events::EVENTS_EXTENSION))
+            .is_some_and(Value::is_object),
         "tools/list" | "tools/call" => capabilities.tools.is_some(),
         "prompts/list" | "prompts/get" => capabilities.prompts.is_some(),
         "skills/list" | "skills/get" => {
@@ -1988,6 +2048,57 @@ async fn handle_request(
     }
     let mut response = match request.method.as_str() {
         "server/discover" => json_rpc_success(request.id, discover_result(&handler)),
+        "events/list" | "events/stream"
+            if request_method_available(handler.as_ref(), &request.method) =>
+        {
+            if !context
+                .client_capabilities()
+                .and_then(|v| v.get("extensions"))
+                .and_then(|v| v.get(crate::events::EVENTS_EXTENSION))
+                .is_some_and(Value::is_object)
+            {
+                return json_rpc_error(
+                    request.id,
+                    -32602,
+                    "Events requires client extension opt-in",
+                );
+            }
+            let params = request.params.clone().unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return json_rpc_error(request.id, -32602, "event params must be an object");
+            }
+            if request.method == "events/list" {
+                let cursor = match params.get("cursor") {
+                    None => None,
+                    Some(Value::String(cursor)) => Some(cursor.clone()),
+                    _ => {
+                        return json_rpc_error(request.id, -32602, "event cursor must be a string");
+                    }
+                };
+                server_result(
+                    request.id,
+                    handler.list_events(cursor, context).await.and_then(|page| {
+                        serde_json::to_value(page).map_err(|e| ServerError::internal(e.to_string()))
+                    }),
+                )
+            } else {
+                let input: crate::McpEventStreamRequest = match serde_json::from_value(params) {
+                    Ok(input) => input,
+                    Err(error) => return json_rpc_error(request.id, -32602, error.to_string()),
+                };
+                if input.name.is_empty() {
+                    return json_rpc_error(request.id, -32602, "event name must not be empty");
+                }
+                context.subscription_id = Some(json!(request.id));
+                server_result(
+                    request.id,
+                    handler
+                        .stream_events(input, context)
+                        .await
+                        .map(|()| json!({})),
+                )
+            }
+        }
         "subscriptions/listen" => {
             let requested = request
                 .params

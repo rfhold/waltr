@@ -4,6 +4,7 @@ mod basic;
 mod client;
 mod common;
 mod elicitation;
+mod events;
 mod oauth_protocol;
 mod protocol;
 mod request_sse;

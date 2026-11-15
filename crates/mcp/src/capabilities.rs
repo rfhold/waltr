@@ -43,6 +43,14 @@ pub struct McpResourcesCapability {
 }
 
 impl McpServerCapabilities {
+    /// Whether the server advertises experimental MCP Events.
+    #[must_use]
+    pub fn supports_events(&self) -> bool {
+        self.extensions
+            .as_ref()
+            .and_then(|v| v.get(crate::events::EVENTS_EXTENSION))
+            .is_some_and(Value::is_object)
+    }
     /// Whether the server advertises Skills and its required Resources capability.
     #[must_use]
     pub fn supports_skills(&self) -> bool {

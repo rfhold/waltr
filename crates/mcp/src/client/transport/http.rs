@@ -262,7 +262,9 @@ impl StreamableHttpTransport {
 fn mirrored_name(method: &str, message: &Value) -> Option<String> {
     let params = message.get("params")?;
     match method {
-        "tools/call" | "prompts/get" => params.get("name")?.as_str().map(ToOwned::to_owned),
+        "tools/call" | "prompts/get" | "events/stream" => {
+            params.get("name")?.as_str().map(ToOwned::to_owned)
+        }
         "resources/read" => params.get("uri")?.as_str().map(ToOwned::to_owned),
         _ => None,
     }
@@ -298,8 +300,9 @@ async fn read_sse(
                 return;
             }
         };
-        match dispatch_frames(&inbound, frames) {
-            Ok(found_terminal) => terminal |= found_terminal,
+        match dispatch_frames(&inbound, frames, request_id.as_ref()) {
+            Ok(true) => return,
+            Ok(false) => {}
             Err(error) => {
                 report_request_stream_error(&inbound, request_id.as_ref(), &error);
                 return;
@@ -307,7 +310,7 @@ async fn read_sse(
         }
     }
     match decoder.finish() {
-        Ok(frames) => match dispatch_frames(&inbound, frames) {
+        Ok(frames) => match dispatch_frames(&inbound, frames, request_id.as_ref()) {
             Ok(found_terminal) => terminal |= found_terminal,
             Err(error) => {
                 report_request_stream_error(&inbound, request_id.as_ref(), &error);
@@ -327,15 +330,47 @@ async fn read_sse(
     }
 }
 
-fn dispatch_frames(inbound: &InboundSender, frames: Vec<super::sse::SseFrame>) -> Result<bool> {
+fn dispatch_frames(
+    inbound: &InboundSender,
+    frames: Vec<super::sse::SseFrame>,
+    request_id: Option<&JsonRpcId>,
+) -> Result<bool> {
     let mut terminal = false;
     for frame in frames {
         let Some(data) = frame.data else { continue };
         let message = crate::protocol::parse_json_rpc_str(&data)?;
+        match &message {
+            JsonRpcInbound::Response(response)
+                if request_id.is_some_and(|id| id != &response.id) =>
+            {
+                return Err(Error::protocol(
+                    "MCP SSE response ID does not match its request",
+                ));
+            }
+            JsonRpcInbound::Notification(notification)
+                if notification.method.starts_with("notifications/events/") =>
+            {
+                let subscription_id = notification
+                    .params
+                    .as_ref()
+                    .and_then(|v| v.get("_meta"))
+                    .and_then(|v| v.get(crate::protocol::MCP_SUBSCRIPTION_ID_META_KEY))
+                    .and_then(|v| serde_json::from_value::<JsonRpcId>(v.clone()).ok());
+                if subscription_id.as_ref() != request_id || subscription_id.is_none() {
+                    return Err(Error::protocol(
+                        "MCP event subscription ID does not match its HTTP request",
+                    ));
+                }
+            }
+            _ => {}
+        }
         terminal |= matches!(message, JsonRpcInbound::Response(_));
         inbound
             .send(TransportInbound::Message(message))
             .map_err(|_| Error::protocol("MCP connection closed"))?;
+        if terminal {
+            break;
+        }
     }
     Ok(terminal)
 }

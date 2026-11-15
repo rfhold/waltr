@@ -46,6 +46,10 @@ parameters use `-32602`.
 
 ## Features
 
+Experimental MCP Events (draft SEP-3415) adds opt-in `events/list` and request-scoped `events/stream` support.
+The crate preserves the core `2026-07-28` protocol and its per-request metadata.
+See [Events](events.md) for wire semantics, typed APIs, lifecycle, and application responsibilities.
+
 The typed surface supports tools, prompts, resources, resource templates, completion,
 pagination, progress, cancellation, annotations, icons, opaque metadata, and extension
 capability maps.

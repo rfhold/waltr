@@ -40,6 +40,8 @@ pub struct McpClientOptions {
     pub apps: bool,
     /// Opt in to the official Skills extension. Disabled by default.
     pub skills: bool,
+    /// Opt in to experimental MCP Events. Disabled by default.
+    pub events: bool,
     /// Client implementation name sent in request metadata.
     pub client_name: String,
     /// Client implementation version sent in request metadata.
@@ -53,6 +55,12 @@ pub struct McpClientOptions {
 }
 
 impl McpClientOptions {
+    /// Opt in to experimental MCP Events (draft SEP-3415).
+    #[must_use]
+    pub const fn with_events(mut self) -> Self {
+        self.events = true;
+        self
+    }
     /// Create client options.
     #[must_use]
     pub fn new(
@@ -64,6 +72,7 @@ impl McpClientOptions {
             elicitation: crate::McpElicitationCapabilities::default(),
             apps: false,
             skills: false,
+            events: false,
             client_name: client_name.into(),
             client_version: client_version.into(),
             timeout,
@@ -120,7 +129,11 @@ pub trait McpClientHandler: Send + Sync + 'static {
         _request: crate::McpElicitationRequest,
         _cancellation_token: CancellationToken,
     ) -> crate::McpElicitationFuture {
-        Box::pin(async { Err(crate::Error::protocol("MCP elicitation handler is not installed")) })
+        Box::pin(async {
+            Err(crate::Error::protocol(
+                "MCP elicitation handler is not installed",
+            ))
+        })
     }
 
     /// Return roots exposed to the connected server.
@@ -182,15 +195,81 @@ impl std::fmt::Debug for McpClient {
 }
 
 impl McpClient {
+    fn require_events(&self) -> Result<()> {
+        let opted_in = self
+            .request_meta
+            .get(MCP_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(|v| v.get("extensions"))
+            .and_then(|v| v.get(crate::events::EVENTS_EXTENSION))
+            .is_some_and(Value::is_object);
+        if !opted_in || !self.capabilities.supports_events() {
+            return Err(crate::Error::protocol(
+                "Events requires explicit client opt-in and server advertisement",
+            ));
+        }
+        Ok(())
+    }
+
+    /// List one page of experimental event definitions.
+    ///
+    /// # Errors
+    /// Fails on absent opt-in, transport errors, or malformed event definitions.
+    pub async fn list_events(
+        &self,
+        cursor: Option<&str>,
+        cancellation_token: CancellationToken,
+    ) -> Result<crate::McpEventList> {
+        self.require_events()?;
+        let mut params = json!({});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let result = self
+            .request("events/list", Some(params), cancellation_token)
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| crate::Error::protocol(format!("invalid events/list result: {e}")))
+    }
+
+    /// Open a bounded request-scoped event stream. Unary request timeout does not apply.
+    ///
+    /// # Errors
+    /// Fails on absent opt-in or malformed request parameters.
+    pub async fn stream_events(
+        &self,
+        request: crate::McpEventStreamRequest,
+        cancellation_token: CancellationToken,
+    ) -> Result<crate::McpEventStream> {
+        self.require_events()?;
+        if request.name.is_empty() {
+            return Err(crate::Error::protocol("event name must not be empty"));
+        }
+        let mut params =
+            serde_json::to_value(request).map_err(|e| crate::Error::protocol(e.to_string()))?;
+        params["_meta"] = Value::Object(self.request_meta.clone());
+        let headers = self.http_headers("events/stream", &params).await?;
+        let params = inject_request_context(Some(params), self.trace_propagation)
+            .ok_or_else(|| crate::Error::protocol("event request params missing"))?;
+        Ok(self
+            .connection
+            .event_stream(params, headers, &cancellation_token))
+    }
     /// Bind callbacks and advertised elicitation modes to this immutable request view.
     /// Clones share transport/catalog state, never a mutable current-operation slot.
     #[must_use]
-    pub fn for_operation(&self, handler: Arc<dyn McpClientHandler>,
-        modes: crate::McpElicitationCapabilities) -> Self {
+    pub fn for_operation(
+        &self,
+        handler: Arc<dyn McpClientHandler>,
+        modes: crate::McpElicitationCapabilities,
+    ) -> Self {
         let mut client = self.clone();
         client.operation_handler = Some(handler);
-        let capabilities = client.request_meta.get_mut(MCP_CLIENT_CAPABILITIES_META_KEY)
-            .expect("client capabilities").as_object_mut().expect("capabilities object");
+        let capabilities = client
+            .request_meta
+            .get_mut(MCP_CLIENT_CAPABILITIES_META_KEY)
+            .expect("client capabilities")
+            .as_object_mut()
+            .expect("capabilities object");
         capabilities.remove("elicitation");
         if let Some(value) = modes.to_value() {
             capabilities.insert("elicitation".into(), value);
@@ -868,13 +947,16 @@ impl McpClient {
         let cancellation_token = cancellation_token.child_token();
         let _cancel_on_drop = cancellation_token.clone().drop_guard();
         let modes = crate::McpElicitationCapabilities::parse(
-            self.request_meta.get(MCP_CLIENT_CAPABILITIES_META_KEY).expect("client capabilities"),
+            self.request_meta
+                .get(MCP_CLIENT_CAPABILITIES_META_KEY)
+                .expect("client capabilities"),
         )?;
         for _round in 0..32 {
             if cancellation_token.is_cancelled() {
                 return Err(crate::Error::protocol("MCP request canceled"));
             }
-            let remaining = deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 return Err(crate::Error::protocol("MCP request timed out"));
             }
@@ -916,8 +998,13 @@ impl McpClient {
                     "input_required result is not valid for `{method}`"
                 )));
             }
-            if result.get("requestState").is_some_and(|state| !state.is_string()) {
-                return Err(crate::Error::protocol("input_required requestState must be a string"));
+            if result
+                .get("requestState")
+                .is_some_and(|state| !state.is_string())
+            {
+                return Err(crate::Error::protocol(
+                    "input_required requestState must be a string",
+                ));
             }
             let mut responses = serde_json::Map::new();
             if let Some(requests) = result.get("inputRequests") {
@@ -925,7 +1012,9 @@ impl McpClient {
                     crate::Error::protocol("input_required inputRequests must be an object")
                 })?;
                 if requests.len() > 32 {
-                    return Err(crate::Error::protocol("too many MCP input requests in one round"));
+                    return Err(crate::Error::protocol(
+                        "too many MCP input requests in one round",
+                    ));
                 }
                 // Validate the whole batch before exposing any interaction to the host.
                 let mut elicitations = HashMap::new();
@@ -934,18 +1023,28 @@ impl McpClient {
                         Some("roots/list") => {}
                         Some("elicitation/create") => {
                             if !modes.form && !modes.url {
-                                return Err(crate::Error::protocol("unsupported MCP input request `elicitation/create`: capability not advertised"));
+                                return Err(crate::Error::protocol(
+                                    "unsupported MCP input request `elicitation/create`: capability not advertised",
+                                ));
                             }
                             let elicitation = crate::McpElicitationRequest::parse(
                                 request.get("params").unwrap_or(&Value::Null),
                             )?;
                             if !modes.supports(&elicitation) {
-                                return Err(crate::Error::protocol("MCP elicitation mode was not advertised"));
+                                return Err(crate::Error::protocol(
+                                    "MCP elicitation mode was not advertised",
+                                ));
                             }
                             elicitations.insert(key.clone(), elicitation);
                         }
-                        Some(method) => return Err(crate::Error::protocol(format!("unsupported MCP input request `{method}`"))),
-                        None => return Err(crate::Error::protocol("MCP input request omitted method")),
+                        Some(method) => {
+                            return Err(crate::Error::protocol(format!(
+                                "unsupported MCP input request `{method}`"
+                            )));
+                        }
+                        None => {
+                            return Err(crate::Error::protocol("MCP input request omitted method"));
+                        }
                     }
                 }
                 for (key, request) in requests {
@@ -964,7 +1063,8 @@ impl McpClient {
                             let callback_token = cancellation_token.child_token();
                             let _cancel_callback = callback_token.clone().drop_guard();
                             let handler = self.operation_handler.as_ref().unwrap_or(&self.handler);
-                            let callback = handler.elicit(key.clone(), request.clone(), callback_token);
+                            let callback =
+                                handler.elicit(key.clone(), request.clone(), callback_token);
                             let response = tokio::select! {
                                 biased;
                                 () = cancellation_token.cancelled() => return Err(crate::Error::protocol("MCP request canceled")),
@@ -973,8 +1073,11 @@ impl McpClient {
                                 response = callback => response?,
                             };
                             request.validate_response(&response)?;
-                            responses.insert(key.clone(), serde_json::to_value(response)
-                                .map_err(|error| crate::Error::protocol(error.to_string()))?);
+                            responses.insert(
+                                key.clone(),
+                                serde_json::to_value(response)
+                                    .map_err(|error| crate::Error::protocol(error.to_string()))?,
+                            );
                         }
                         Some(method) => {
                             return Err(crate::Error::protocol(format!(
@@ -1002,7 +1105,9 @@ impl McpClient {
                 params_object.insert("requestState".to_owned(), state.clone());
             }
         }
-        Err(crate::Error::protocol("MCP continuation round limit exceeded"))
+        Err(crate::Error::protocol(
+            "MCP continuation round limit exceeded",
+        ))
     }
 
     async fn http_headers(&self, method: &str, params: &Value) -> Result<Vec<(String, String)>> {
@@ -1036,15 +1141,19 @@ fn client_request_meta(options: &McpClientOptions) -> serde_json::Map<String, Va
         ),
     ]);
     if let Some(elicitation) = options.elicitation.to_value() {
-        meta.get_mut(MCP_CLIENT_CAPABILITIES_META_KEY).expect("client capabilities")["elicitation"] = elicitation;
+        meta.get_mut(MCP_CLIENT_CAPABILITIES_META_KEY)
+            .expect("client capabilities")["elicitation"] = elicitation;
     }
     if let Some(level) = options.log_level {
         meta.insert(MCP_LOG_LEVEL_META_KEY.to_owned(), json!(level.to_string()));
     }
-    if options.skills || options.apps {
+    if options.skills || options.apps || options.events {
         let mut extensions = serde_json::Map::new();
         if options.skills {
             extensions.insert(crate::skills::SKILLS_EXTENSION.to_owned(), json!({}));
+        }
+        if options.events {
+            extensions.insert(crate::events::EVENTS_EXTENSION.to_owned(), json!({}));
         }
         if options.apps {
             extensions.insert(
