@@ -47,6 +47,8 @@ struct Fake {
     admissions: Arc<AtomicUsize>,
     uploads: Arc<AtomicUsize>,
     completed: Arc<AtomicBool>,
+    input_closed: Arc<AtomicBool>,
+    early_audio_answer: Arc<AtomicBool>,
     delay_waiting: Arc<AtomicBool>,
     pcm: Arc<Mutex<Vec<u8>>>,
     repeated_input: Arc<Mutex<Vec<wire::InputEvent>>>,
@@ -67,6 +69,23 @@ fn accepted() -> Result<wire::InteractResponse, RpcStatus> {
         revision: "revision".into(),
         limits: Some(support::limits()),
     }))
+}
+fn audio_answer() -> [Result<wire::InteractResponse, RpcStatus>; 2] {
+    [
+        event(Event::Open(wire::StreamOpen {
+            stream_id: "answer".into(),
+            port: "speaker".into(),
+            format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
+                sample_rate: 24000,
+                channels: 1,
+            })),
+        })),
+        event(Event::Chunk(wire::StreamChunk {
+            stream_id: "answer".into(),
+            sequence: 0,
+            payload: Some(wire::stream_chunk::Payload::Audio(vec![1, 0, 2, 0])),
+        })),
+    ]
 }
 fn output_open() -> Result<wire::InteractResponse, RpcStatus> {
     event(Event::Open(wire::StreamOpen {
@@ -307,8 +326,12 @@ impl Fake {
         }
         let fake = self.clone();
         let mut prefix = vec![accepted(), output_open()];
+        let early_audio_answer = fake.early_audio_answer.load(Ordering::SeqCst);
         if open.routine == "audio-answer" {
             prefix = vec![accepted()];
+            if early_audio_answer {
+                prefix.extend(audio_answer());
+            }
         }
         if open.routine == "pcm" {
             prefix.extend([
@@ -364,6 +387,7 @@ impl Fake {
                     Some(wire::input_event::Event::Close(_value)) => {
                         assert!(!closed);
                         closed = true;
+                        fake.input_closed.store(true, Ordering::SeqCst);
                     }
                     Some(wire::input_event::Event::Finish(_)) => {
                         assert!(closed, "normal input close must precede completion");
@@ -382,20 +406,11 @@ impl Fake {
             fake.completed.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
             if open.routine == "audio-answer" {
-                return Ok(vec![
-                    event(Event::Open(wire::StreamOpen {
-                        stream_id: "answer".into(),
-                        port: "speaker".into(),
-                        format: Some(wire::stream_open::Format::Pcm16le(wire::Pcm16Le {
-                            sample_rate: 24000,
-                            channels: 1,
-                        })),
-                    })),
-                    event(Event::Chunk(wire::StreamChunk {
-                        stream_id: "answer".into(),
-                        sequence: 0,
-                        payload: Some(wire::stream_chunk::Payload::Audio(vec![1, 0, 2, 0])),
-                    })),
+                let mut events = Vec::new();
+                if !early_audio_answer {
+                    events.extend(audio_answer());
+                }
+                events.extend([
                     event(Event::Close(wire::StreamClose {
                         stream_id: "answer".into(),
                         next_sequence: 1,
@@ -406,6 +421,7 @@ impl Fake {
                         ..Default::default()
                     })),
                 ]);
+                return Ok(events);
             }
             if open.routine == "failed" || open.routine == "typing-failed" {
                 return Err(RpcStatus::data_loss("static failure"));
@@ -1499,6 +1515,408 @@ fn repeated_binding() -> config::Keybind {
         .push("media.inputs".into());
     binding.resolved = Some(invocation);
     binding
+}
+
+fn press_to_talk_binding() -> config::Keybind {
+    let mut binding = repeated_binding(); // Keep media.inputs advertised.
+    binding.mode = config::Mode::PressToTalk;
+    binding.routine.name = "audio-answer".into();
+    let invocation = binding.resolved.as_mut().unwrap();
+    invocation.selection.routine = "audio-answer".into();
+    invocation.limits.definition.routine_name = "audio-answer".into();
+    binding
+}
+
+#[test]
+fn standalone_actor_rejects_press_to_talk_before_device_access() {
+    use waltr_desktop::actor::{Actor, ActorError};
+    let mock = Arc::new(Mock::default());
+    let config = || config::Config {
+        version: 1,
+        keybinds: vec![press_to_talk_binding()],
+    };
+    let transport = NativeGrpcTransport::new("http://127.0.0.1:1");
+    assert!(matches!(
+        Actor::new(
+            config(),
+            transport.clone(),
+            Arc::new(MockFactory(mock.clone())),
+            AudioAdmission::default(),
+        ),
+        Err(ActorError::Unsupported)
+    ));
+    let (_hold, control) = Hold::press(&AudioAdmission::default()).unwrap();
+    assert!(matches!(
+        Actor::with_effects(
+            config(),
+            transport,
+            Arc::new(MockFactory(mock.clone())),
+            AudioAdmission::default(),
+            std::rc::Rc::new(TypingFactory {
+                state: std::rc::Rc::new(Typed::default()),
+                control,
+            }),
+            std::rc::Rc::new(|| true),
+        ),
+        Err(ActorError::Unsupported)
+    ));
+    assert!(!mock.started.load(Ordering::SeqCst));
+}
+
+#[derive(Default)]
+struct SpeechSource {
+    frames: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    consumed: AtomicUsize,
+    stopped: AtomicBool,
+    completed: AtomicBool,
+    joined: AtomicBool,
+}
+struct SpeechFactory(Arc<SpeechSource>);
+impl Factory for SpeechFactory {
+    fn open(&self, _: waltr_audio_io::Config) -> Result<Box<dyn Source>, capture::Error> {
+        Ok(Box::new(SpeechCapture {
+            source: self.0.clone(),
+            tail: Some(vec![3, 0]),
+        }))
+    }
+}
+struct SpeechCapture {
+    source: Arc<SpeechSource>,
+    tail: Option<Vec<u8>>,
+}
+impl Source for SpeechCapture {
+    fn frame(&mut self) -> Option<Vec<u8>> {
+        let frame = self.source.frames.lock().unwrap().pop_front();
+        if frame.is_some() {
+            self.source.consumed.fetch_add(1, Ordering::SeqCst);
+            frame
+        } else if self.source.stopped.load(Ordering::SeqCst) {
+            self.tail.take()
+        } else {
+            None
+        }
+    }
+    fn terminal(&self) -> Terminal {
+        if self.source.stopped.load(Ordering::SeqCst)
+            || self.source.completed.load(Ordering::SeqCst)
+        {
+            Terminal::Completed
+        } else {
+            Terminal::Running
+        }
+    }
+    fn stop(&self) {
+        self.source.stopped.store(true, Ordering::SeqCst);
+    }
+    fn shutdown(self: Box<Self>) {
+        self.source.joined.store(true, Ordering::SeqCst);
+    }
+}
+fn speech_window(sample: i16) -> Vec<u8> {
+    sample.to_le_bytes().repeat(480) // 20 ms at 24 kHz.
+}
+
+#[tokio::test]
+async fn press_to_talk_preserves_onset_and_flushes_before_playback_without_keyup() {
+    let (transport, fake, stop, server) = fixture().await;
+    let binding = press_to_talk_binding();
+    let gate = AudioAdmission::default();
+    let (hold, control) = Hold::press(&gate).unwrap();
+    control.release(); // Simulate key-up even before native startup.
+    let source = Arc::new(SpeechSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend([100, 100, 200, 200, 200, 200, 200].map(speech_window));
+    let generation = CancellationToken::new();
+    let sink = NativeConsumer::default();
+    let operation = hold.run_guarded_with_outputs(
+        &binding,
+        &transport,
+        Arc::new(SpeechFactory(source.clone())),
+        &generation,
+        &|| true,
+        None,
+        Some(&sink),
+    );
+    let drive = async {
+        while source.consumed.load(Ordering::SeqCst) != 7 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!source.stopped.load(Ordering::SeqCst));
+        assert_eq!(fake.admissions.load(Ordering::SeqCst), 0);
+        assert!(matches!(Hold::press(&gate), Err(Error::Busy)));
+        source.frames.lock().unwrap().extend(
+            std::iter::once(speech_window(1_000)).chain(std::iter::repeat_n(speech_window(0), 49)),
+        );
+        while source.consumed.load(Ordering::SeqCst) != 57
+            || fake.admissions.load(Ordering::SeqCst) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!source.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            sink.bytes.get(),
+            0,
+            "fake server responds after input finish"
+        );
+        source.frames.lock().unwrap().push_back(speech_window(0));
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(operation, drive)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(source.stopped.load(Ordering::SeqCst));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+    assert!(fake.completed.load(Ordering::SeqCst));
+    assert_eq!(
+        *fake.pcm.lock().unwrap(),
+        [
+            speech_window(200).repeat(5),
+            speech_window(1_000),
+            speech_window(0).repeat(50),
+            vec![3, 0],
+        ]
+        .concat()
+    );
+    assert_eq!(sink.bytes.get(), 4);
+    assert_eq!(sink.finished.get(), Some(true));
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn press_to_talk_silence_then_missing_frames_times_out_without_rpc() {
+    let (transport, fake, stop, server) = fixture().await;
+    let source = Arc::new(SpeechSource::default());
+    source.frames.lock().unwrap().push_back(speech_window(200));
+    let (hold, _) = Hold::press(&AudioAdmission::default()).unwrap();
+    let sink = NativeConsumer::default();
+    let now = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        hold.run_guarded_with_outputs(
+            &press_to_talk_binding(),
+            &transport,
+            Arc::new(SpeechFactory(source.clone())),
+            &CancellationToken::new(),
+            &|| true,
+            None,
+            Some(&sink),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(now.elapsed() >= Duration::from_secs(5));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.bytes.get(), 0);
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn toggle_ignores_keyup_and_silence_and_single_stop_flushes_to_playback() {
+    let (transport, fake, stop, server) = fixture().await;
+    let mut binding = press_to_talk_binding();
+    binding.mode = config::Mode::Toggle;
+    let (hold, control) = Hold::press_toggle(&AudioAdmission::default()).unwrap();
+    control.release(); // Key-up during startup.
+    let source = Arc::new(SpeechSource::default());
+    let silence = speech_window(0).repeat(51);
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(speech_window(0), 51));
+    let sink = NativeConsumer::default();
+    let generation = CancellationToken::new();
+    let operation = hold.run_guarded_with_outputs(
+        &binding,
+        &transport,
+        Arc::new(SpeechFactory(source.clone())),
+        &generation,
+        &|| true,
+        None,
+        Some(&sink),
+    );
+    let drive = async {
+        while fake.admissions.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(5_100)).await;
+        assert!(!source.stopped.load(Ordering::SeqCst));
+        assert!(!fake.completed.load(Ordering::SeqCst));
+        let mut frames = source.frames.lock().unwrap();
+        frames.push_back(speech_window(1_000));
+        frames.extend(std::iter::repeat_n(speech_window(0), 51));
+        drop(frames);
+        while source.consumed.load(Ordering::SeqCst) < 103 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!source.stopped.load(Ordering::SeqCst));
+        assert!(control.finish_toggle_capture());
+        assert!(!control.finish_toggle_capture());
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(9), async {
+        tokio::join!(operation, drive)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *fake.pcm.lock().unwrap(),
+        [silence.clone(), speech_window(1_000), silence, vec![3, 0]].concat()
+    );
+    assert_eq!(sink.finished.get(), Some(true));
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn toggle_flushes_capture_when_playback_has_already_started() {
+    let (transport, fake, stop, server) = fixture().await;
+    fake.early_audio_answer.store(true, Ordering::SeqCst);
+    let mut binding = press_to_talk_binding();
+    binding.mode = config::Mode::Toggle;
+    let (hold, control) = Hold::press_toggle(&AudioAdmission::default()).unwrap();
+    let source = Arc::new(SpeechSource::default());
+    source.frames.lock().unwrap().push_back(speech_window(200));
+    let sink = NativeConsumer::default();
+    let generation = CancellationToken::new();
+    let operation = hold.run_guarded_with_outputs(
+        &binding,
+        &transport,
+        Arc::new(SpeechFactory(source.clone())),
+        &generation,
+        &|| true,
+        None,
+        Some(&sink),
+    );
+    let drive = async {
+        while sink.bytes.get() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!fake.input_closed.load(Ordering::SeqCst));
+        assert!(!source.stopped.load(Ordering::SeqCst));
+        assert_eq!(sink.finished.get(), None);
+        assert!(control.finish_toggle_capture());
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(operation, drive)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert!(fake.completed.load(Ordering::SeqCst));
+    assert_eq!(
+        *fake.pcm.lock().unwrap(),
+        [speech_window(200), vec![3, 0]].concat()
+    );
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.bytes.get(), 4);
+    assert_eq!(sink.finished.get(), Some(true));
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn toggle_limit_disarms_stop_tap_before_capture_join() {
+    let (transport, fake, stop, server) = fixture().await;
+    let mut binding = press_to_talk_binding();
+    binding.mode = config::Mode::Toggle;
+    binding.max_capture_seconds = Some(1);
+    let (hold, control) = Hold::press_toggle(&AudioAdmission::default()).unwrap();
+    let source = Arc::new(SpeechSource::default());
+    source.frames.lock().unwrap().push_back(speech_window(200));
+    let sink = NativeConsumer::default();
+    let generation = CancellationToken::new();
+    let operation = hold.run_guarded_with_outputs(
+        &binding,
+        &transport,
+        Arc::new(SpeechFactory(source.clone())),
+        &generation,
+        &|| true,
+        None,
+        Some(&sink),
+    );
+    let drive = async {
+        while !source.stopped.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!control.finish_toggle_capture());
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(operation, drive)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert_eq!(
+        *fake.pcm.lock().unwrap(),
+        [speech_window(200), vec![3, 0]].concat()
+    );
+    assert_eq!(sink.finished.get(), Some(true));
+    stop.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn toggle_native_completion_disarms_stop_tap_while_admission_is_retained() {
+    let (transport, fake, stop, server) = fixture().await;
+    let mut binding = press_to_talk_binding();
+    binding.mode = config::Mode::Toggle;
+    let gate = AudioAdmission::default();
+    let (hold, control) = Hold::press_toggle(&gate).unwrap();
+    let source = Arc::new(SpeechSource::default());
+    source.frames.lock().unwrap().push_back(speech_window(200));
+    let checked = std::cell::Cell::new(false);
+    let sink = NativeConsumer::default();
+    let generation = CancellationToken::new();
+    let valid = || {
+        if source.joined.load(Ordering::SeqCst) {
+            assert!(matches!(Hold::press(&gate), Err(Error::Busy)));
+            assert!(!control.finish_toggle_capture());
+            checked.set(true);
+        }
+        true
+    };
+    let operation = hold.run_guarded_with_outputs(
+        &binding,
+        &transport,
+        Arc::new(SpeechFactory(source.clone())),
+        &generation,
+        &valid,
+        None,
+        Some(&sink),
+    );
+    let drive = async {
+        while fake.admissions.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        source.completed.store(true, Ordering::SeqCst);
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(operation, drive)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(checked.get());
+    assert!(!source.stopped.load(Ordering::SeqCst));
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.finished.get(), Some(true));
+    stop.cancel();
+    server.await.unwrap();
 }
 
 #[tokio::test]

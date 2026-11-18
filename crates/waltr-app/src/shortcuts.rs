@@ -110,37 +110,97 @@ async fn route(
     bridge: Weak<RuntimeBridge>,
     stop: &CancellationToken,
 ) {
-    let mut active: Option<(String, u64, HoldControl, CancellationToken)> = None;
+    let mut state = RouteState::default();
     loop {
         let edge = tokio::select! { biased;
             () = stop.cancelled() => break,
-            edge = receiver.next_epoch() => match edge { Ok(edge) => edge, Err(_) => break },
+            edge = receiver.next_stamped_epoch() => match edge { Ok(edge) => edge, Err(_) => break },
         };
-        dispatch_edge(bridge.upgrade().as_deref(), &bindings, &mut active, edge);
+        state.dispatch(bridge.upgrade().as_deref(), &bindings, edge);
     }
-    if let Some((_, _, control, token)) = active {
+    if let Some((_, _, control, token)) = state.active {
         token.cancel();
         control.cancel();
     }
 }
 
 type Active = Option<(String, u64, HoldControl, CancellationToken)>;
+
+#[derive(Default)]
+struct RouteState {
+    active: Active,
+    one_shot: Option<(config::Mode, shortcut::LifetimeStamp)>,
+    discard_through: Option<shortcut::LifetimeStamp>,
+}
+impl RouteState {
+    fn dispatch(
+        &mut self,
+        bridge: Option<&RuntimeBridge>,
+        bindings: &[Arc<config::Keybind>],
+        (edge, arrived_at): (shortcut::EpochEvent, shortcut::LifetimeStamp),
+    ) {
+        if edge.event.pressed {
+            if let Some((mode, opened_by)) = self.one_shot
+                && let Some((id, epoch, control, token)) = &self.active
+            {
+                let Some(released) = control.admission_released_at() else {
+                    if mode == config::Mode::Toggle
+                        && *id == edge.event.id
+                        && *epoch == edge.epoch
+                        && arrived_at > opened_by
+                        && let Some(bridge) = bridge
+                    {
+                        let _ = bridge.shortcut_ingress().admit(*epoch, || {
+                            !token.is_cancelled() && control.finish_toggle_capture()
+                        });
+                    }
+                    return;
+                };
+                // Keep the cutoff even when another binding replaces the owner.
+                self.discard_through = self.discard_through.max(Some(released));
+            }
+            if self
+                .discard_through
+                .is_some_and(|cutoff| arrived_at <= cutoff)
+            {
+                return;
+            }
+        }
+        if let Some(mode) = route_edge(bridge, bindings, &mut self.active, edge) {
+            self.one_shot = (mode != config::Mode::Hold).then_some((mode, arrived_at));
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn dispatch_edge(
     bridge: Option<&RuntimeBridge>,
     bindings: &[Arc<config::Keybind>],
     active: &mut Active,
     edge: shortcut::EpochEvent,
 ) {
+    let _ = route_edge(bridge, bindings, active, edge);
+}
+
+fn route_edge(
+    bridge: Option<&RuntimeBridge>,
+    bindings: &[Arc<config::Keybind>],
+    active: &mut Active,
+    edge: shortcut::EpochEvent,
+) -> Option<config::Mode> {
     let epoch = edge.epoch;
     let edge = edge.event;
     if !edge.pressed {
-        if let Some((id, pressed_epoch, control, _token)) = &active
+        if let Some((id, pressed_epoch, control, _)) = &active
             && id == &edge.id
             && *pressed_epoch == epoch
+            && bindings
+                .iter()
+                .any(|b| b.id == edge.id && b.mode == config::Mode::Hold)
         {
             control.release();
         }
-        return;
+        return None;
     }
     if let Some((id, pressed_epoch, control, token)) = active.as_mut()
         && id == &edge.id
@@ -148,18 +208,22 @@ pub fn dispatch_edge(
         && !token.is_cancelled()
         && !control.is_finished()
     {
-        if let Some(next) = bridge.and_then(|bridge| bridge.shortcut_repeat(epoch, control, token))
+        if control.repeats_enabled()
+            && let Some(next) =
+                bridge.and_then(|bridge| bridge.shortcut_repeat(epoch, control, token))
         {
             *control = next;
         }
         // A live invocation that sealed admission must never turn a late press into a new RPC.
-        return;
+        return None;
     }
     if let (Some(bridge), Some(binding)) = (bridge, bindings.iter().find(|b| b.id == edge.id))
         && let Some((control, token)) = bridge.shortcut_press(epoch, binding.clone())
     {
         *active = Some((edge.id, epoch, control, token));
+        return Some(binding.mode);
     }
+    None
 }
 
 #[cfg(test)]
@@ -167,6 +231,149 @@ mod tests {
     use super::*;
     use crate::{bridge::RuntimeBridge, server_controller::EmbeddedServerController};
     use shortcut::{Effective, EpochEvent, Event};
+
+    #[tokio::test]
+    async fn presses_queued_during_press_to_talk_do_not_replay_after_cleanup() {
+        one_shot_busy_presses_do_not_replay("press-to-talk").await;
+    }
+
+    #[tokio::test]
+    async fn toggle_routes_one_matching_stop_and_discards_busy_taps() {
+        one_shot_busy_presses_do_not_replay("toggle").await;
+    }
+
+    async fn one_shot_busy_presses_do_not_replay(mode: &str) {
+        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+        let mut receive = bridge.synthetic_shortcut_generation(1);
+        let mut snapshot = crate::native_media_test_support::snapshot("test");
+        let output = &mut snapshot.routines.definitions.definitions[0].ports[1];
+        output.media = waltr_client::RoutineMedia::Audio;
+        output.formats = vec!["pcm16le-24000-mono".into()];
+        bridge.synthetic_shortcut_catalog(&snapshot);
+        let yaml = r#"version: 1
+keybinds:
+ - id: talk
+   key: Ctrl+Alt+Space
+   mode: press-to-talk
+   routine: {name: test, trigger: dictate, input: audio, output: clean-text}
+   audio: {device: default, sampleRateHz: 24000, channels: 1}
+   playback: {}
+ - id: other
+   key: Ctrl+Alt+A
+   mode: hold
+   routine: {name: test, trigger: dictate, input: audio, output: clean-text}
+   audio: {device: default, sampleRateHz: 24000, channels: 1}
+   playback: {}
+"#;
+        let config = config::parse(yaml.replace("press-to-talk", mode).as_bytes()).unwrap();
+        let bindings: Vec<_> = config.keybinds.into_iter().map(Arc::new).collect();
+        let (router, mut receiver) = Router::channel_with_epoch(bridge.shortcut_ingress());
+        router
+            .effective(
+                bindings
+                    .iter()
+                    .map(|b| Effective {
+                        id: b.id.clone(),
+                        trigger: b.key.clone(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let mut route = RouteState::default();
+        router.edge("s", "s", "talk", true);
+        route.dispatch(
+            Some(&bridge),
+            &bindings,
+            receiver.next_stamped_epoch().await.unwrap(),
+        );
+        let held = receive().expect("initial press owns admission");
+        let epoch = route.active.as_ref().unwrap().1;
+        if mode == "toggle" {
+            let control = route.active.as_ref().unwrap().2.clone();
+            assert!(!control.repeats_enabled());
+            for (id, pressed) in [
+                ("talk", false),
+                ("other", true),
+                ("other", false),
+                ("talk", true),
+            ] {
+                router.edge("s", "s", id, pressed);
+                let edge = receiver.next_stamped_epoch().await.unwrap();
+                if id == "talk" && pressed {
+                    let mut wrong = edge;
+                    wrong.0.epoch += 2;
+                    route.dispatch(Some(&bridge), &bindings, wrong);
+                } else {
+                    route.dispatch(Some(&bridge), &bindings, edge);
+                }
+            }
+            assert!(
+                control.finish_toggle_capture(),
+                "key-up, other binding, and wrong epoch must leave the stop latch open"
+            );
+            assert!(receive().is_none());
+        }
+        for (id, pressed) in [
+            ("talk", false),
+            ("talk", true),
+            ("talk", false),
+            ("other", true),
+            ("other", false),
+        ] {
+            router.edge("s", "s", id, pressed);
+        }
+        drop(held); // Real permit teardown, but no device work.
+        let mut delayed = None;
+        for _ in 0..5 {
+            let edge = receiver.next_stamped_epoch().await.unwrap();
+            assert_eq!(edge.0.epoch, epoch, "no access or generation change");
+            if edge.0.event.pressed && edge.0.event.id == "other" {
+                delayed = Some(edge.clone());
+            }
+            route.dispatch(Some(&bridge), &bindings, edge);
+            assert!(receive().is_none(), "a busy tap must not replay");
+        }
+        router.edge("s", "s", "other", true);
+        route.dispatch(
+            Some(&bridge),
+            &bindings,
+            receiver.next_stamped_epoch().await.unwrap(),
+        );
+        let fresh = receive().expect("fresh press after cleanup starts normally");
+        assert_eq!(route.active.as_ref().unwrap().0, "other");
+        drop(fresh);
+        // Also exercise a stale arrival dispatched after the speech owner has been replaced.
+        route.dispatch(Some(&bridge), &bindings, delayed.unwrap());
+        assert!(
+            receive().is_none(),
+            "replacement must not forget the cutoff"
+        );
+        router.edge("s", "s", "talk", true);
+        route.dispatch(
+            Some(&bridge),
+            &bindings,
+            receiver.next_stamped_epoch().await.unwrap(),
+        );
+        let fresh = receive().expect("fresh one-shot tap can also start again");
+        if mode == "toggle" {
+            let control = route.active.as_ref().unwrap().2.clone();
+            for pressed in [false, true] {
+                router.edge("s", "s", "talk", pressed);
+                route.dispatch(
+                    Some(&bridge),
+                    &bindings,
+                    receiver.next_stamped_epoch().await.unwrap(),
+                );
+            }
+            assert!(
+                !control.finish_toggle_capture(),
+                "matching tap latched stop"
+            );
+            assert!(receive().is_none(), "stop did not enqueue another capture");
+        }
+        drop(fresh);
+        bridge.stop();
+    }
 
     #[tokio::test]
     async fn exhausted_repeated_capture_surfaces_audio_failure_without_replacing_owner() {
@@ -286,8 +493,8 @@ keybinds:
     }
 
     #[tokio::test]
-    async fn repeated_shortcut_routes_only_matching_binding_epoch_and_opt_in() {
-        for opt_in in [false, true] {
+    async fn shortcut_routes_only_matching_binding_epoch_and_mode() {
+        for (opt_in, press_to_talk) in [(false, false), (true, false), (true, true)] {
             let bridge = RuntimeBridge::new(EmbeddedServerController::default());
             let mut receive = bridge.synthetic_shortcut_generation(1);
             let mut snapshot = crate::native_media_test_support::snapshot("test");
@@ -322,6 +529,9 @@ keybinds:
 "#,
             )
             .unwrap();
+            if press_to_talk {
+                config.keybinds[0].mode = config::Mode::PressToTalk;
+            }
             let bindings: Vec<_> = config.keybinds.drain(..).map(Arc::new).collect();
             let (router, mut receiver) = Router::channel_with_epoch(bridge.shortcut_ingress());
             router
@@ -342,6 +552,10 @@ keybinds:
             let epoch = first.epoch;
             dispatch_edge(Some(&bridge), &bindings, &mut active, first);
             let held = receive().expect("initial press enqueues one retained operation");
+            assert_eq!(
+                active.as_ref().unwrap().2.repeats_enabled(),
+                opt_in && !press_to_talk
+            );
             router.edge("s", "s", "test", false);
             dispatch_edge(
                 Some(&bridge),
@@ -399,8 +613,8 @@ keybinds:
             );
             assert_eq!(
                 control.press_again().is_ok(),
-                opt_in,
-                "only the pinned exact capability enables capture admission"
+                opt_in && !press_to_talk,
+                "only hold with the pinned exact capability enables repeated capture admission"
             );
             bridge.synthetic_shortcut_access(1, false);
             assert!(

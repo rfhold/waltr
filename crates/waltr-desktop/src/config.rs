@@ -183,6 +183,15 @@ impl Config {
                     ));
                 }
             }
+            if binding.playback.is_none() {
+                match binding.mode {
+                    Mode::Hold => (),
+                    Mode::PressToTalk => {
+                        return Err(ConfigError::Invalid("press-to-talk requires playback"));
+                    }
+                    Mode::Toggle => return Err(ConfigError::Invalid("toggle requires playback")),
+                }
+            }
         }
         Ok(())
     }
@@ -259,7 +268,7 @@ pub fn validate_chord(key: &str) -> Result<(), ConfigError> {
     Err(ConfigError::Invalid("invalid key chord"))
 }
 
-/// One local hold-to-invoke binding, not registered by this library.
+/// One local keyboard binding, not registered by this library.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Keybind {
@@ -308,11 +317,15 @@ pub struct TypingSpec {}
 #[serde(deny_unknown_fields)]
 pub struct PlaybackSpec {}
 /// Supported interaction modes.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum Mode {
     /// Begin on press and finalize on release.
     Hold,
+    /// Begin on press and finish automatically after speech.
+    PressToTalk,
+    /// Begin on press and finish capture on the next press.
+    Toggle,
 }
 /// User-selected Routine identifiers, independent of examples or server state.
 #[derive(Debug, Deserialize)]

@@ -1,6 +1,10 @@
 //! Local-future hold pipeline. Pin a transport/profile lease at press; cancel its generation
 //! token before any server/profile/access transition. Retain and await every `Hold::run` future.
-use crate::{capture, config::Keybind};
+use crate::{
+    capture,
+    config::{Keybind, Mode},
+    shortcut::{AdmissionRelease, LifetimeStamp},
+};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -160,6 +164,8 @@ pub struct HoldControl {
     cancel: CancellationToken,
     status: tokio::sync::watch::Sender<Status>,
     repeated: Option<Arc<crate::interaction::RepeatedCaptures>>,
+    toggle: Option<Arc<capture::ToggleCapture>>,
+    admission_released: Arc<AdmissionRelease>,
 }
 /// Finite status snapshot; no samples, output text, or command values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +192,15 @@ impl HoldControl {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.cancel.is_cancelled() || matches!(*self.status.borrow(), Status::Finished(_))
+    }
+    /// Monotonic cleanup cutoff, published only after releasing the shared admission permit.
+    #[must_use]
+    pub fn admission_released_at(&self) -> Option<LifetimeStamp> {
+        self.admission_released.stamp()
+    }
+    /// Request a normal flush if this toggle still owns an open capture.
+    pub fn finish_toggle_capture(&self) -> bool {
+        !self.is_finished() && self.toggle.as_ref().is_some_and(|capture| capture.finish())
     }
     /// Admit another physical hold into this exact retained interaction, without a new RPC.
     /// # Errors
@@ -218,7 +233,7 @@ impl HoldControl {
 /// One operation owns admission until capture, RPC, and command cleanup all finish.
 #[derive(Debug)]
 pub struct Hold {
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     control: HoldControl,
     observer: Observer,
 }
@@ -247,15 +262,26 @@ impl Hold {
             cancel: CancellationToken::new(),
             status: tokio::sync::watch::channel(Status::Starting).0,
             repeated: None,
+            toggle: None,
+            admission_released: Arc::new(AdmissionRelease::default()),
         };
         Ok((
             Self {
-                _permit: gate.reserve()?,
+                permit: Some(gate.reserve()?),
                 control: control.clone(),
                 observer: Observer::default(),
             },
             control,
         ))
+    }
+    /// Reserve a single toggle capture with a stop lane live through pending startup.
+    /// # Errors
+    /// Returns Busy without a queued capture.
+    pub fn press_toggle(gate: &AudioAdmission) -> Result<(Self, HoldControl), Error> {
+        let (mut hold, mut control) = Self::press(gate)?;
+        control.toggle = Some(Arc::new(capture::ToggleCapture::default()));
+        hold.control = control.clone();
+        Ok((hold, control))
     }
     /// Reserve one interaction with a bounded sequential capture lane. The caller must pin
     /// the exact `media.inputs` capability and selected PCM output before enabling this path.
@@ -352,6 +378,14 @@ impl Hold {
         playback: Option<&dyn crate::media::OutputSink>,
     ) -> Result<(), Error> {
         let setup = match (&binding.command, &binding.typing, &binding.playback) {
+            _ if binding.mode != Mode::Hold
+                && (binding.playback.is_none() || self.control.repeated.is_some()) =>
+            {
+                Err(Error::Unsupported)
+            }
+            _ if (binding.mode == Mode::Toggle) != self.control.toggle.is_some() => {
+                Err(Error::Unsupported)
+            }
             (Some(_), None, None) => Ok(None),
             (None, Some(_), None) => typing_factory
                 .ok_or(Error::Unsupported)
@@ -457,7 +491,15 @@ impl Hold {
             &guard,
             &self.observer,
             &consumer,
-            self.control.repeated.as_deref(),
+            match binding.mode {
+                Mode::Hold => {
+                    crate::interaction::CapturePolicy::Release(self.control.repeated.as_deref())
+                }
+                Mode::PressToTalk => crate::interaction::CapturePolicy::Speech,
+                Mode::Toggle => crate::interaction::CapturePolicy::Toggle(
+                    self.control.toggle.as_deref().ok_or(Error::Unsupported)?,
+                ),
+            },
         )
         .await?;
         let Some(crate::interaction::Output { text, invocation }) = output else {
@@ -486,6 +528,9 @@ impl Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         self.control.cancel();
+        if let Some(permit) = self.permit.take() {
+            self.control.admission_released.release(permit);
+        }
     }
 }
 

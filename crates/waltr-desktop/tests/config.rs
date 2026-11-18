@@ -23,15 +23,66 @@ fn documented_typing_example_uses_cleanup_routine() {
 
 #[test]
 fn playback_is_an_explicit_exclusive_action() {
-    let yaml = VALID.replace("command: { argv: [pbcopy], stdin: '{{ text }}', timeoutSeconds: 10 }", "playback: {}");
+    let yaml = VALID.replace(
+        "command: { argv: [pbcopy], stdin: '{{ text }}', timeoutSeconds: 10 }",
+        "playback: {}",
+    );
     let config = config::parse(yaml.as_bytes()).unwrap();
     assert!(config.keybinds[0].playback.is_some());
-    for action in ["typing: {}", "command: {argv: [/usr/bin/true], stdin: '{{ text }}', timeoutSeconds: 10}"] {
+    for action in [
+        "typing: {}",
+        "command: {argv: [/usr/bin/true], stdin: '{{ text }}', timeoutSeconds: 10}",
+    ] {
         assert!(config::parse(format!("{yaml}    {action}\n").as_bytes()).is_err());
     }
-    for invalid in ["playback: null", "playback: {device: default}", "playback: false"] {
+    for invalid in [
+        "playback: null",
+        "playback: {device: default}",
+        "playback: false",
+    ] {
         assert!(config::parse(yaml.replace("playback: {}", invalid).as_bytes()).is_err());
     }
+}
+
+#[test]
+fn press_to_talk_is_playback_only_and_uses_exact_spelling() {
+    let command = VALID.replace("mode: hold", "mode: press-to-talk");
+    assert!(matches!(
+        config::parse(command.as_bytes()),
+        Err(ConfigError::Invalid("press-to-talk requires playback"))
+    ));
+    let (prefix, _) = command.split_once("command:").unwrap();
+    assert!(config::parse(format!("{prefix}typing: {{}}\n").as_bytes()).is_err());
+    let playback = format!("{prefix}playback: {{}}\n");
+    assert_eq!(
+        config::parse(playback.as_bytes()).unwrap().keybinds[0].mode,
+        config::Mode::PressToTalk
+    );
+    for alias in [
+        "PressToTalk",
+        "presstotalk",
+        "press_to_talk",
+        "push-to-talk",
+    ] {
+        assert!(config::parse(playback.replace("press-to-talk", alias).as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn toggle_is_playback_only_and_uses_exact_spelling() {
+    let command = VALID.replace("mode: hold", "mode: toggle");
+    assert!(matches!(
+        config::parse(command.as_bytes()),
+        Err(ConfigError::Invalid("toggle requires playback"))
+    ));
+    let (prefix, _) = command.split_once("command:").unwrap();
+    assert!(config::parse(format!("{prefix}typing: {{}}\n").as_bytes()).is_err());
+    let playback = format!("{prefix}playback: {{}}\n");
+    assert_eq!(
+        config::parse(playback.as_bytes()).unwrap().keybinds[0].mode,
+        config::Mode::Toggle
+    );
+    assert!(config::parse(playback.replace("toggle", "Toggle").as_bytes()).is_err());
 }
 
 #[test]

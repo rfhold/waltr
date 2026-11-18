@@ -322,9 +322,24 @@ pub async fn run_with_inputs<T: RoutineInteractionTransport>(
     consumer: &dyn Consumer,
 ) -> Result<Option<Output>, Error> {
     run_owned(
-        transport, factory, audio, selection, inputs, release, guard, observer, consumer, None,
+        transport,
+        factory,
+        audio,
+        selection,
+        inputs,
+        release,
+        guard,
+        observer,
+        consumer,
+        CapturePolicy::Release(None),
     )
     .await
+}
+
+pub(crate) enum CapturePolicy<'a> {
+    Release(Option<&'a RepeatedCaptures>),
+    Speech,
+    Toggle(&'a capture::ToggleCapture),
 }
 
 #[allow(clippy::too_many_arguments, clippy::future_not_send)]
@@ -337,7 +352,7 @@ pub(crate) async fn run_hold<T: RoutineInteractionTransport>(
     guard: &Guard<'_>,
     observer: &Observer,
     consumer: &dyn Consumer,
-    repeated: Option<&RepeatedCaptures>,
+    policy: CapturePolicy<'_>,
 ) -> Result<Option<Output>, Error> {
     run_owned(
         transport,
@@ -349,7 +364,7 @@ pub(crate) async fn run_hold<T: RoutineInteractionTransport>(
         guard,
         observer,
         consumer,
-        repeated,
+        policy,
     )
     .await
 }
@@ -369,8 +384,13 @@ async fn run_owned<T: RoutineInteractionTransport>(
     guard: &Guard<'_>,
     observer: &Observer,
     consumer: &dyn Consumer,
-    repeated: Option<&RepeatedCaptures>,
+    policy: CapturePolicy<'_>,
 ) -> Result<Option<Output>, Error> {
+    let (release, repeated, detect_speech, toggle) = match policy {
+        CapturePolicy::Release(repeated) => (Some(release), repeated, false, None),
+        CapturePolicy::Speech => (None, None, true, None),
+        CapturePolicy::Toggle(toggle) => (None, None, false, Some(toggle)),
+    };
     let mut producer = crate::media::Producer::new(inputs);
     // Preflight failures still release every selected local source.
     let preflight = (|| {
@@ -443,9 +463,14 @@ async fn run_owned<T: RoutineInteractionTransport>(
             return Err(error);
         }
     };
-    let mut capture =
-        capture::CaptureWorker::start_observed(factory.clone(), config.clone(), observer.clone());
-    if release.is_cancelled() {
+    let mut capture = capture::CaptureWorker::start_with_policy(
+        factory.clone(),
+        config.clone(),
+        observer.clone(),
+        detect_speech,
+        toggle,
+    );
+    if release.is_some_and(CancellationToken::is_cancelled) {
         capture.stop();
     }
     let requested = std::time::Instant::now();
@@ -532,7 +557,7 @@ async fn run_owned<T: RoutineInteractionTransport>(
                             .unwrap_or(requested);
                         start.elapsed() >= duration
                     });
-                    if release.is_cancelled() || expired {
+                    if release.is_some_and(CancellationToken::is_cancelled) || expired {
                         let _result = stop.compare_exchange(0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
                     }
                 }

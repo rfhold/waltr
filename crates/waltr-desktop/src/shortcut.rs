@@ -3,11 +3,11 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "macos")]
@@ -45,6 +45,98 @@ pub struct EpochEvent {
     /// Normalized physical edge.
     pub event: Event,
 }
+
+/// Process-local ordering of physical ingress and completed shortcut ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LifetimeStamp(u64);
+static LIFETIME_SEQUENCE: Mutex<u64> = Mutex::new(0);
+
+fn lifetime_sequence() -> MutexGuard<'static, u64> {
+    LIFETIME_SEQUENCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl LifetimeStamp {
+    fn next() -> Self {
+        Self::advance(&mut lifetime_sequence())
+    }
+
+    fn advance(sequence: &mut u64) -> Self {
+        let stamp = Self(*sequence);
+        *sequence = sequence.saturating_add(1);
+        stamp
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AdmissionRelease(OnceLock<LifetimeStamp>);
+impl AdmissionRelease {
+    pub(crate) fn stamp(&self) -> Option<LifetimeStamp> {
+        self.0.get().copied()
+    }
+
+    pub(crate) fn release(&self, permit: OwnedSemaphorePermit) {
+        // Ingress cannot stamp between returning the permit and publishing its cutoff.
+        // Audio admission only uses try_acquire; there are no waiting audio tasks to wake here.
+        let mut sequence = lifetime_sequence();
+        drop(permit);
+        let _ = self.0.set(LifetimeStamp::advance(&mut sequence));
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::{TryLockError, atomic::AtomicBool},
+        task::{Context, Wake, Waker},
+    };
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn ingress_cannot_stamp_between_permit_release_and_cutoff_publication() {
+        struct ReleaseProbe {
+            completion: Arc<AdmissionRelease>,
+            called: AtomicBool,
+        }
+        impl Wake for ReleaseProbe {
+            fn wake(self: Arc<Self>) {
+                assert!(self.completion.stamp().is_none());
+                assert!(matches!(
+                    LIFETIME_SEQUENCE.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                self.called.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let busy = LifetimeStamp::next();
+        let probe = Arc::new(ReleaseProbe {
+            completion: Arc::new(AdmissionRelease::default()),
+            called: AtomicBool::new(false),
+        });
+        let gate = Arc::new(Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        // Production uses only try_acquire. A test-only queued waker observes the
+        // synchronous permit return before release() can publish completion.
+        let waker = Waker::from(probe.clone());
+        let mut waiter = std::pin::pin!(gate.acquire_owned());
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        probe.completion.release(permit);
+        assert!(probe.called.load(Ordering::Relaxed));
+        let cutoff = probe.completion.stamp().unwrap();
+        assert!(busy < cutoff);
+        assert!(cutoff < LifetimeStamp::next());
+    }
+}
+
 #[derive(Debug, Default)]
 struct EpochState {
     owner: u64,
@@ -128,7 +220,7 @@ struct State {
 #[derive(Clone, Debug)]
 pub struct Router {
     state: Arc<Mutex<State>>,
-    tx: mpsc::Sender<EpochEvent>,
+    tx: mpsc::Sender<(EpochEvent, LifetimeStamp)>,
     epoch: IngressEpoch,
     failed: CancellationToken,
 }
@@ -136,7 +228,7 @@ pub struct Router {
 #[derive(Debug)]
 pub struct Receiver {
     router: Router,
-    rx: mpsc::Receiver<EpochEvent>,
+    rx: mpsc::Receiver<(EpochEvent, LifetimeStamp)>,
 }
 impl Router {
     /// Create a fixed 64-edge queue and independent terminal lane.
@@ -194,10 +286,11 @@ impl Router {
         drop(state);
         Ok(())
     }
-    /// Route a signal only for the exact session and registered ID. Never block callbacks.
+    /// Route a signal only for the exact session and registered ID without waiting for queue space.
     pub fn edge(&self, expected_session: &str, session: &str, id: &str, pressed: bool) {
         // Linearize ingress before filtering or touching the bounded physical-down list.
         let ingress = self.epoch.0.published.load(Ordering::Acquire);
+        let arrived_at = LifetimeStamp::next();
         if expected_session != session {
             return;
         }
@@ -223,13 +316,16 @@ impl Router {
         };
         if self
             .tx
-            .try_send(EpochEvent {
-                epoch,
-                event: Event {
-                    id: id.into(),
-                    pressed,
+            .try_send((
+                EpochEvent {
+                    epoch,
+                    event: Event {
+                        id: id.into(),
+                        pressed,
+                    },
                 },
-            })
+                arrived_at,
+            ))
             .is_err()
         {
             state.failure = Some(Error::Overflow);
@@ -291,6 +387,12 @@ impl Receiver {
     /// # Errors
     /// Returns terminal failure before any queued event, just like `next`.
     pub async fn next_epoch(&mut self) -> Result<EpochEvent, Error> {
+        self.next_stamped_epoch().await.map(|(event, _)| event)
+    }
+    /// Await an edge with its monotonic lifetime stamp at backend ingress.
+    /// # Errors
+    /// Returns terminal failure before any queued event, just like `next`.
+    pub async fn next_stamped_epoch(&mut self) -> Result<(EpochEvent, LifetimeStamp), Error> {
         tokio::select! { biased;
             () = self.router.failed.cancelled() => Err(self.failure().unwrap_or(Error::Backend)),
             event = self.rx.recv() => event.ok_or(Error::Backend),

@@ -128,7 +128,7 @@ impl Host {
             resolved: Some(invocation),
             id: binding.id.clone(),
             key: binding.key.clone(),
-            mode: waltr_desktop::config::Mode::Hold,
+            mode: binding.mode,
             max_capture_seconds: binding.max_capture_seconds,
             routine: waltr_desktop::config::Routine {
                 name: binding.routine.name.clone(),
@@ -158,7 +158,8 @@ impl Host {
                 .as_ref()
                 .map(|_| waltr_desktop::config::PlaybackSpec {}),
         });
-        let repeated = binding.playback.is_some()
+        let repeated = binding.mode == waltr_desktop::config::Mode::Hold
+            && binding.playback.is_some()
             && binding.resolved.as_ref().is_some_and(|invocation| {
                 invocation
                     .limits
@@ -177,7 +178,9 @@ impl Host {
                                 .all(|format| format == "pcm16le-24000-mono")
                     })
             });
-        let (hold, control) = if repeated {
+        let (hold, control) = if binding.mode == waltr_desktop::config::Mode::Toggle {
+            waltr_desktop::host::Hold::press_toggle(&self.gate)
+        } else if repeated {
             waltr_desktop::host::Hold::press_repeated(&self.gate)
         } else {
             waltr_desktop::host::Hold::press(&self.gate)

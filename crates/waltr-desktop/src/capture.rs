@@ -8,11 +8,33 @@ use std::{collections::VecDeque, sync::Mutex};
 use tokio::sync::Notify;
 use waltr_audio_io::{Capture, CaptureOutput, Terminal};
 
+mod speech;
+
 /// Maximum queued PCM duration, independent of the RPC admission deadline.
 pub const BACKLOG_SECONDS: usize = 30;
+const TOGGLE_CAPTURE_ENDED: u8 = 3;
+
+/// Toggle shares the actual worker stop lane, including its pending startup state.
+#[derive(Debug, Default)]
+pub(crate) struct ToggleCapture(Arc<AtomicU8>);
+
+impl ToggleCapture {
+    pub(crate) fn finish(&self) -> bool {
+        self.0
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn close(state: &AtomicU8) {
+        // Disarm a still-open stop tap without overriding normal stop or cancellation.
+        let _ =
+            state.compare_exchange(0, TOGGLE_CAPTURE_ENDED, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
 
 struct Lane {
     bytes: VecDeque<u8>,
+    published: bool,
     closed: bool,
     receiver_closed: bool,
     cancelled: bool,
@@ -24,7 +46,8 @@ struct PcmQueue {
     chunk: usize,
 }
 impl PcmQueue {
-    fn send(&self, frame: &[u8]) -> Result<(), Error> {
+    // Before speech, retain pre-roll in the same bounded ring without waking the RPC reader.
+    fn send(&self, frame: &[u8], pre_roll: Option<usize>) -> Result<(), Error> {
         let mut lane = self
             .lane
             .lock()
@@ -35,19 +58,33 @@ impl PcmQueue {
         if lane.receiver_closed {
             return Err(Error::ReceiverClosed);
         }
+        if let Some(limit) = pre_roll {
+            let limit = limit.min(self.capacity);
+            let frame = &frame[frame.len().saturating_sub(limit)..];
+            let discard = (lane.bytes.len() + frame.len()).saturating_sub(limit);
+            lane.bytes.drain(..discard);
+            lane.bytes.extend(frame);
+            return Ok(());
+        }
         if frame.len() > self.capacity - lane.bytes.len() {
             return Err(Error::Overflow);
         }
         lane.bytes.extend(frame);
+        lane.published = true;
         drop(lane);
         self.ready.notify_one();
         Ok(())
     }
     fn close(&self) {
-        self.lane
+        let mut lane = self
+            .lane
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !lane.published {
+            lane.bytes.clear();
+        }
+        lane.closed = true;
+        drop(lane);
         self.ready.notify_one();
     }
 }
@@ -71,7 +108,7 @@ impl Frames {
                     .lane
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !lane.bytes.is_empty() {
+                if lane.published && !lane.bytes.is_empty() {
                     let count = lane.bytes.len().min(self.0.chunk);
                     return Some(lane.bytes.drain(..count).collect());
                 }
@@ -249,13 +286,24 @@ impl CaptureWorker {
         config: waltr_audio_io::Config,
         observer: crate::host::Observer,
     ) -> Self {
-        let control = Arc::new(AtomicU8::new(0));
+        Self::start_with_policy(factory, config, observer, false, None)
+    }
+    pub(crate) fn start_with_policy(
+        factory: Arc<dyn Factory>,
+        config: waltr_audio_io::Config,
+        observer: crate::host::Observer,
+        detect_speech: bool,
+        toggle: Option<&ToggleCapture>,
+    ) -> Self {
+        let control = toggle.map_or_else(|| Arc::new(AtomicU8::new(0)), |toggle| toggle.0.clone());
+        let is_toggle = toggle.is_some();
         let state = control.clone();
         // Bound setup even for configurations that the worker subsequently rejects.
         let bytes = (config.target_rate as usize).clamp(8_000, 48_000) * 2 * BACKLOG_SECONDS;
         let tx = Arc::new(PcmQueue {
             lane: Mutex::new(Lane {
                 bytes: VecDeque::with_capacity(bytes),
+                published: false,
                 closed: false,
                 receiver_closed: false,
                 cancelled: false,
@@ -273,22 +321,33 @@ impl CaptureWorker {
             let run = || {
                 config.validate().map_err(|_| Error::Unsupported)?;
                 let max_chunk = config.limits.max_chunk_bytes;
+                let mut speech = detect_speech.then(|| speech::Detector::new(config.target_rate));
                 let mut source = factory.open(config)?;
+                let opened = std::time::Instant::now();
                 *ready
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(std::time::Instant::now());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opened);
                 observer.emit(crate::host::Diagnostic::Stage(
                     crate::host::Stage::CaptureReady,
                 ));
-                let send = |frame: Vec<u8>| {
+                let send = |frame: Vec<u8>, speech: &mut Option<speech::Detector>| {
                     if frame.len() > max_chunk || !frame.len().is_multiple_of(2) {
                         return Err(Error::MalformedFrame);
                     }
                     if frame.is_empty() {
                         return Ok(());
                     }
-                    tx.send(&frame)
+                    let Some(detector) = speech else {
+                        return tx.send(&frame, None);
+                    };
+                    let quiet = detector.observe(&frame);
+                    tx.send(&frame, detector.pre_roll())?;
+                    if quiet {
+                        // A normal stop never overwrites cancellation or discards the native tail.
+                        let _result =
+                            state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+                    }
+                    Ok(())
                 };
                 let result = (|| {
                     loop {
@@ -303,18 +362,30 @@ impl CaptureWorker {
                                 1 => source.stop(),
                                 _ => {}
                             }
-                            send(frame)?;
+                            if speech::no_speech(&speech, opened.elapsed()) {
+                                return Ok(());
+                            }
+                            send(frame, &mut speech)?;
                         }
                         match source.terminal() {
                             Terminal::Running => {
+                                if speech::no_speech(&speech, opened.elapsed()) {
+                                    return Ok(());
+                                }
                                 std::thread::sleep(std::time::Duration::from_millis(2));
                             }
                             Terminal::Completed => {
+                                if is_toggle {
+                                    ToggleCapture::close(&state);
+                                }
                                 while let Some(frame) = source.frame() {
                                     if state.load(Ordering::Acquire) == 2 {
                                         return Err(Error::Cancelled);
                                     }
-                                    send(frame)?;
+                                    if speech::no_speech(&speech, opened.elapsed()) {
+                                        return Ok(());
+                                    }
+                                    send(frame, &mut speech)?;
                                 }
                                 return Ok(());
                             }
@@ -323,11 +394,17 @@ impl CaptureWorker {
                         }
                     }
                 })();
+                if is_toggle {
+                    ToggleCapture::close(&state);
+                }
                 source.shutdown();
                 result
             };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
                 .unwrap_or(Err(Error::Worker));
+            if is_toggle {
+                ToggleCapture::close(&state);
+            }
             *terminal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);

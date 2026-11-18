@@ -6,9 +6,9 @@ use crate::{
     host::{AudioAdmission, Error, Hold, Status},
     shortcut,
 };
-use waltr_client::RoutineInteractionTransport;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use waltr_client::RoutineInteractionTransport;
 
 /// Caller-driven actor; does not spawn an async task or own a global runtime.
 pub struct Actor<T> {
@@ -42,7 +42,7 @@ pub enum ActorError {
 impl<T: RoutineInteractionTransport> Actor<T> {
     /// Pin dependencies without device access. Share `gate` with future app-chat capture.
     /// # Errors
-    /// Rejects invalid config or typing bindings without an installed factory before device access.
+    /// Rejects invalid config, typing without a factory, and playback before device access.
     pub fn new(
         config: Config,
         transport: T,
@@ -74,7 +74,7 @@ impl<T: RoutineInteractionTransport> Actor<T> {
     /// Pin explicit typing capability and a synchronous identity/credential effect fence.
     /// The factory creates inert sessions; native backend authorization remains a runtime result.
     /// # Errors
-    /// Rejects invalid config before shortcut registration or microphone access.
+    /// Rejects invalid config or playback before shortcut registration or microphone access.
     pub fn with_effects(
         config: Config,
         transport: T,
@@ -84,7 +84,11 @@ impl<T: RoutineInteractionTransport> Actor<T> {
         valid: std::rc::Rc<dyn Fn() -> bool>,
     ) -> Result<(Self, tokio::sync::watch::Receiver<Status>), ActorError> {
         config.validate().map_err(|_| ActorError::Config)?;
-        if config.keybinds.iter().any(|binding| binding.playback.is_some()) {
+        if config
+            .keybinds
+            .iter()
+            .any(|binding| binding.playback.is_some())
+        {
             return Err(ActorError::Unsupported);
         }
         let (status, receiver) = tokio::sync::watch::channel(Status::Idle);
