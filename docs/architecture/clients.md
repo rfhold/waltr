@@ -179,7 +179,7 @@ The native app composes these libraries through its Rust runtime bridge.
 The libraries remain Tauri-independent; no standalone headless executable, button host, or wake-word host exists.
 See [desktop configuration](config.md#desktop-client-configuration) for the schema and command trust boundary.
 
-A press reserves the single audio gate without a queue, then starts capture.
+A press reserves the single audio gate without a queue, then starts capture. The capture mode is independent of whether the shortcut plays audio, types text, or runs a command.
 For `mode: hold`, the first nonempty audio frame admits `Interact`; release without input starts no RPC.
 Without the exact pinned `media.inputs` capability, repeated presses for the current hold do nothing; other presses return busy.
 Release requests a normal capture flush and input completion for these one-shot holds, not cancellation.
@@ -195,7 +195,7 @@ The next press of the same shortcut requests a normal stop and flush if capture 
 This also applies when a Routine starts playback before capture ends.
 The binding ignores key release. Silence does not end toggle capture.
 Toggle mode uses one capture even when the Routine declares `media.inputs`.
-Both tap modes retain the audio reservation through RPC completion, playback tail, and cleanup. Taps after capture ends do not start future captures while that reservation remains active.
+Both tap modes retain the audio reservation through RPC completion, output delivery, and cleanup. Taps after capture ends do not start future captures while that reservation remains active.
 
 The native app permits repeated captures only for hold-mode playback bindings with the exact pinned `media.inputs` capability and a selected PCM audio output.
 Capability-bearing text bindings retain their one-shot typing or command behavior.

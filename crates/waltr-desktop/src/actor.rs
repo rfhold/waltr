@@ -2,7 +2,7 @@
 //! and access generation. Cancel and await it before replacing any of those dependencies.
 use crate::{
     capture,
-    config::Config,
+    config::{Config, Mode},
     host::{AudioAdmission, Error, Hold, Status},
     shortcut,
 };
@@ -128,7 +128,11 @@ impl<T: RoutineInteractionTransport> Actor<T> {
             let Some(binding) = self.config.keybinds.iter().find(|b| b.id == edge.id) else {
                 continue;
             };
-            let (mut hold, control) = match Hold::press(&self.gate) {
+            let admission = match binding.mode {
+                Mode::Toggle => Hold::press_toggle(&self.gate),
+                Mode::Hold | Mode::PressToTalk => Hold::press(&self.gate),
+            };
+            let (mut hold, control) = match admission {
                 Ok(hold) => hold,
                 Err(Error::Busy) => {
                     self.status.send_replace(Status::Finished(Err(Error::Busy)));
@@ -156,7 +160,11 @@ impl<T: RoutineInteractionTransport> Actor<T> {
                     () = generation.cancelled() => { control.cancel(); let _result = operation.await; return Err(ActorError::Cancelled); }
                     event = events.next() => {
                         match event {
-                            Ok(event) if event.id == binding.id && !event.pressed => control.release(),
+                            Ok(event) if event.id == binding.id => match (binding.mode, event.pressed) {
+                                (Mode::Hold, false) => control.release(),
+                                (Mode::Toggle, true) => { let _ = control.finish_toggle_capture(); }
+                                _ => (),
+                            },
                             Ok(_) => (), // No queued captures, including other binding presses.
                             Err(error) => { control.cancel(); let _result = operation.await; return Err(ActorError::Shortcut(error)); }
                         }

@@ -289,13 +289,14 @@ It permits at most 64 keybinds and a 256 KiB YAML file.
 Each keybind requires `id`, `key`, `mode`, `routine`, `audio`, and exactly one output action: `command`, `typing`, or `playback`.
 Absent actions, explicit nulls, unknown action fields, and multiple actions are invalid.
 Version 1 retains the legacy `command: { argv, stdin, timeoutSeconds }` syntax without implicit defaults between actions.
+The capture mode applies to microphone input regardless of the output action.
 `mode: hold` records until key release.
-With `playback: {}`, `mode: press-to-talk` starts on a tap and stops after about one second of quiet after speech.
+`mode: press-to-talk` starts on a tap and stops after about one second of quiet after speech.
 If the mic detects no speech within five seconds, capture ends without a request.
 Additional taps do not stop or restart press-to-talk capture.
-With `playback: {}`, `mode: toggle` starts on one tap and stops on a second tap of the same shortcut.
+`mode: toggle` starts on one tap and stops on a second tap of the same shortcut.
 Silence does not end toggle capture.
-Both tap modes ignore key release. Once capture ends, they ignore taps until playback and cleanup finish.
+Both tap modes ignore key release. Once capture ends, they ignore taps until the Routine, its output action, and cleanup finish.
 An optional keybind-level `maxCaptureSeconds` accepts 1–3,600 seconds.
 At that deadline, capture stops normally: drain accepted audio, close input, and continue receiving any admitted Routine result.
 It does not cancel finalization or run the output action before successful completion.

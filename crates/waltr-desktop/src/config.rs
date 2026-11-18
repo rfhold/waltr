@@ -183,15 +183,6 @@ impl Config {
                     ));
                 }
             }
-            if binding.playback.is_none() {
-                match binding.mode {
-                    Mode::Hold => (),
-                    Mode::PressToTalk => {
-                        return Err(ConfigError::Invalid("press-to-talk requires playback"));
-                    }
-                    Mode::Toggle => return Err(ConfigError::Invalid("toggle requires playback")),
-                }
-            }
         }
         Ok(())
     }

@@ -87,7 +87,7 @@ On unverified logout cleanup, preserve access and credentials for retained owner
 
 Keep generic client-hook activity in the bridge, independent of the audio host.
 Keep microphone admission audio-only; do not gate unrelated hooks behind it.
-The shortcut adapter supports audio holds and one-shot press-to-talk playback, not arbitrary device context.
+The shortcut adapter supports hold, press-to-talk, and toggle for microphone input with any supported output action, not arbitrary device context.
 Use `ActivityTracker::begin` for each admitted client hook operation.
 Retain its lease through permission, RPC, output actions, and complete cleanup.
 Mark failures explicitly; ordinary cancellation is not an error.

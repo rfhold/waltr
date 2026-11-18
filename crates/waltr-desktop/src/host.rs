@@ -378,9 +378,7 @@ impl Hold {
         playback: Option<&dyn crate::media::OutputSink>,
     ) -> Result<(), Error> {
         let setup = match (&binding.command, &binding.typing, &binding.playback) {
-            _ if binding.mode != Mode::Hold
-                && (binding.playback.is_none() || self.control.repeated.is_some()) =>
-            {
+            _ if binding.mode != Mode::Hold && self.control.repeated.is_some() => {
                 Err(Error::Unsupported)
             }
             _ if (binding.mode == Mode::Toggle) != self.control.toggle.is_some() => {

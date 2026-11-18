@@ -1528,7 +1528,7 @@ fn press_to_talk_binding() -> config::Keybind {
 }
 
 #[test]
-fn standalone_actor_rejects_press_to_talk_before_device_access() {
+fn standalone_actor_rejects_playback_before_device_access() {
     use waltr_desktop::actor::{Actor, ActorError};
     let mock = Arc::new(Mock::default());
     let config = || config::Config {
@@ -2427,6 +2427,15 @@ async fn shared_chat_consumer_releases_or_cancels_with_small_frames_before_admis
 
 #[tokio::test]
 async fn actor_routes_release_ignores_repeat_and_busy_other_binding() {
+    actor_routes_command_capture(config::Mode::Hold).await;
+}
+
+#[tokio::test]
+async fn actor_routes_toggle_to_command_without_stopping_on_key_up() {
+    actor_routes_command_capture(config::Mode::Toggle).await;
+}
+
+async fn actor_routes_command_capture(mode: config::Mode) {
     use waltr_desktop::{
         actor::{Actor, ActorError},
         shortcut::{Effective, Router},
@@ -2434,7 +2443,8 @@ async fn actor_routes_release_ignores_repeat_and_busy_other_binding() {
     let (transport, _fake, stop, server) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("once");
-    let first = binding(&path, "test");
+    let mut first = binding(&path, "test");
+    first.mode = mode;
     let mut second = binding(&path, "test");
     second.id = "other".into();
     second.key = "Ctrl+B".into();
@@ -2473,6 +2483,18 @@ async fn actor_routes_release_ignores_repeat_and_busy_other_binding() {
         router.edge("s", "s", "other", true); // busy, never queued
         router.edge("s", "s", "other", false);
         router.edge("s", "s", "test", false);
+        if mode == config::Mode::Toggle {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    status.wait_for(|status| { matches!(status, Status::Finished(_)) })
+                )
+                .await
+                .is_err()
+            );
+            assert!(!mock.stopped.load(Ordering::SeqCst));
+            router.edge("s", "s", "test", true);
+        }
         while !matches!(*status.borrow(), Status::Finished(_)) {
             status.changed().await.unwrap();
         }
@@ -3017,6 +3039,47 @@ fn typing_binding(path: &std::path::Path, name: &str) -> config::Keybind {
     binding.command = None;
     binding.typing = Some(config::TypingSpec {});
     binding
+}
+
+#[tokio::test]
+async fn press_to_talk_finishes_on_quiet_and_delivers_typing() {
+    let (transport, rpc, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut binding = typing_binding(&dir.path().join("unused"), "typing");
+    binding.mode = config::Mode::PressToTalk;
+    let gate = AudioAdmission::default();
+    let (hold, control) = Hold::press(&gate).unwrap();
+    let state = std::rc::Rc::new(Typed::default());
+    let factory = TypingFactory {
+        state: state.clone(),
+        control,
+    };
+    let source = Arc::new(SpeechSource::default());
+    source.frames.lock().unwrap().extend(
+        std::iter::once(speech_window(1_000)).chain(std::iter::repeat_n(speech_window(0), 50)),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        hold.run_guarded_with_typing(
+            &binding,
+            &transport,
+            Arc::new(SpeechFactory(source.clone())),
+            &CancellationToken::new(),
+            &|| true,
+            Some(&factory),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(rpc.input_closed.load(Ordering::SeqCst));
+    assert!(source.stopped.load(Ordering::SeqCst));
+    assert!(source.joined.load(Ordering::SeqCst));
+    assert_eq!(*state.text.borrow(), "first second 界");
+    assert!(state.closed.get());
+    assert!(gate.reserve().is_ok());
+    stop.cancel();
+    server.await.unwrap();
 }
 
 #[tokio::test]

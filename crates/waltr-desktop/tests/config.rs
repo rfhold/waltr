@@ -45,44 +45,44 @@ fn playback_is_an_explicit_exclusive_action() {
 }
 
 #[test]
-fn press_to_talk_is_playback_only_and_uses_exact_spelling() {
-    let command = VALID.replace("mode: hold", "mode: press-to-talk");
-    assert!(matches!(
-        config::parse(command.as_bytes()),
-        Err(ConfigError::Invalid("press-to-talk requires playback"))
-    ));
-    let (prefix, _) = command.split_once("command:").unwrap();
-    assert!(config::parse(format!("{prefix}typing: {{}}\n").as_bytes()).is_err());
-    let playback = format!("{prefix}playback: {{}}\n");
-    assert_eq!(
-        config::parse(playback.as_bytes()).unwrap().keybinds[0].mode,
-        config::Mode::PressToTalk
-    );
-    for alias in [
-        "PressToTalk",
-        "presstotalk",
-        "press_to_talk",
-        "push-to-talk",
+fn capture_modes_are_independent_of_the_output_action() {
+    let (prefix, command) = VALID.split_once("command:").unwrap();
+    for (spelling, mode) in [
+        ("hold", config::Mode::Hold),
+        ("press-to-talk", config::Mode::PressToTalk),
+        ("toggle", config::Mode::Toggle),
     ] {
-        assert!(config::parse(playback.replace("press-to-talk", alias).as_bytes()).is_err());
+        let prefix = prefix.replace("mode: hold", &format!("mode: {spelling}"));
+        for action in [
+            format!("command:{command}"),
+            "typing: {}\n".into(),
+            "playback: {}\n".into(),
+        ] {
+            let config = config::parse(format!("{prefix}{action}").as_bytes()).unwrap();
+            assert_eq!(config.keybinds[0].mode, mode);
+        }
     }
 }
 
 #[test]
-fn toggle_is_playback_only_and_uses_exact_spelling() {
-    let command = VALID.replace("mode: hold", "mode: toggle");
-    assert!(matches!(
-        config::parse(command.as_bytes()),
-        Err(ConfigError::Invalid("toggle requires playback"))
-    ));
-    let (prefix, _) = command.split_once("command:").unwrap();
-    assert!(config::parse(format!("{prefix}typing: {{}}\n").as_bytes()).is_err());
-    let playback = format!("{prefix}playback: {{}}\n");
-    assert_eq!(
-        config::parse(playback.as_bytes()).unwrap().keybinds[0].mode,
-        config::Mode::Toggle
-    );
-    assert!(config::parse(playback.replace("toggle", "Toggle").as_bytes()).is_err());
+fn capture_modes_use_exact_spelling() {
+    for alias in [
+        "Hold",
+        "PressToTalk",
+        "presstotalk",
+        "press_to_talk",
+        "push-to-talk",
+        "Toggle",
+    ] {
+        assert!(
+            config::parse(
+                VALID
+                    .replace("mode: hold", &format!("mode: {alias}"))
+                    .as_bytes()
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn strict_schema() {
     for invalid in [
         VALID.replace("version: 1", "version: 2"),
         VALID.replace("version: 1", "version: 1\ncredentials: secret"),
-        VALID.replace("mode: hold", "mode: toggle"),
+        VALID.replace("mode: hold", "mode: unsupported"),
         VALID.replace("device: default", "device: microphone"),
         VALID.replace("device: default", "device: 'id:'"),
         VALID.replace("channels: 1", "channels: 0"),
