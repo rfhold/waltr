@@ -502,6 +502,7 @@ async fn setup_inference_configured_server() -> &'static TestServer {
         server,
         Configuration {
             session_dictation: None,
+            speech_defaults: None,
             etag: String::new(),
             providers: HashMap::from([
                 ("openai".to_owned(), provider("openai", "gpt4o").into()),

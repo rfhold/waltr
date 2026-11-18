@@ -276,25 +276,310 @@ fn waltr_login_required_routes_to_dedicated_access_screen() {
         AppAction::Continue
     );
     assert_eq!(app.screen(), AppScreen::Access);
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
     assert_eq!(
-        app.handle_event(&enter_press(), now),
-        AppAction::NativeAuth(waltr_tui::native_auth::NativeAuthAction::Start)
+        app.handle_event(
+            &AppEvent::NativeLogin(NativeLoginEvent::RestorationFinished),
+            now
+        ),
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Tick(now), now),
+        AppAction::Continue
     );
     insta::assert_snapshot!("waltr_access_login_required", render_app(&app));
+}
+
+fn access_attempt_snapshot() -> ClientSnapshot {
+    let mut snapshot = login_required_snapshot("login required");
+    snapshot.access.status = waltr_client::AccessStatus::LoginInProgress;
+    snapshot.access.active_attempt_id = Some("attempt-1".to_owned());
+    snapshot
+}
+
+fn cancel_access_attempt() -> AppAction {
+    AppAction::NativeAuth(NativeAuthAction::Cancel {
+        attempt_id: "attempt-1".to_owned(),
+    })
+}
+
+fn access_canceled(attempt_id: &str) -> AppEvent {
+    AppEvent::NativeLogin(NativeLoginEvent::Canceled {
+        attempt_id: attempt_id.to_owned(),
+    })
+}
+
+fn access_succeeded(attempt_id: &str) -> AppEvent {
+    AppEvent::NativeLogin(NativeLoginEvent::Succeeded {
+        attempt_id: attempt_id.to_owned(),
+    })
+}
+
+fn device_access(now: Instant) -> (App, AppEvent) {
+    let mut app = App::new();
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::NativeLogin(NativeLoginEvent::RestorationFinished),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(login_required_snapshot("login required"))),
+            now,
+        ),
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(access_attempt_snapshot())), now));
+    let prompt = AppEvent::NativeLogin(NativeLoginEvent::AwaitingDevice(DeviceLoginPrompt::new(
+        "https://id.example/device".to_owned(),
+        Some("https://id.example/device?user_code=ABCD-1234"),
+        "ABCD-1234".to_owned(),
+        now + Duration::from_secs(60),
+    )));
+    assert_eq!(app.handle_event(&prompt, now), AppAction::Continue);
+    (app, prompt)
+}
+
+#[test]
+fn access_device_screen_renders_qr_and_manual_fallback() {
+    let now = Instant::now();
+    let (mut app, prompt) = device_access(now);
+    let debug = format!("{prompt:?}");
+    assert!(!debug.contains("ABCD-1234"));
+    assert!(!debug.contains("id.example"));
+
+    let wide = render_app(&app);
+    assert!(wide.contains('▀'));
+    assert!(!wide.contains("user_code="));
+    let mut terminal = test_terminal();
+    terminal
+        .draw(|frame| app.draw(frame))
+        .expect("app should render");
+    let buffer = terminal.backend().buffer();
+    let light = Color::Rgb(255, 255, 255);
+    let dark = Color::Rgb(0, 0, 0);
+    let (left, top) = (0..24)
+        .find_map(|y| {
+            (0..80)
+                .find(|&x| buffer[(x, y)].bg == light)
+                .map(|x| (x, y))
+        })
+        .expect("QR quiet zone should be visible");
+    let qr = qrcodegen::QrCode::encode_text(
+        "https://id.example/device?user_code=ABCD-1234",
+        qrcodegen::QrCodeEcc::Medium,
+    )
+    .expect("QR should encode");
+    let side = u16::try_from(qr.size() + 8).expect("QR fits a u16");
+    for row in 0..side.div_ceil(2) {
+        for column in 0..side {
+            let x = i32::from(column) - 4;
+            let y = i32::from(row) * 2 - 4;
+            let fg = if qr.get_module(x, y) { dark } else { light };
+            let bg = if qr.get_module(x, y + 1) { dark } else { light };
+            let cell = &buffer[(left + column, top + row)];
+            assert_eq!((cell.fg, cell.bg), (fg, bg));
+            assert_eq!(cell.symbol(), if fg == bg { " " } else { "▀" });
+        }
+    }
+    let narrow = render_app_with_size(&app, 30, 9);
+    assert!(!narrow.contains('▀'));
+    for expected in [
+        "ABCD-1234",
+        "https://id.example/device",
+        "b browser",
+        "Esc cancel",
+    ] {
+        assert!(narrow.contains(expected), "{expected:?} missing:\n{narrow}");
+    }
+    assert_eq!(
+        app.handle_event(&char_press('c'), now),
+        AppAction::NativeAuth(NativeAuthAction::CopyUrl(
+            "https://id.example/device".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn access_device_switch_waits_for_cancel_acknowledgment_and_attempt_retirement() {
+    let now = Instant::now();
+    let (mut app, late_prompt) = device_access(now);
+    assert_eq!(
+        app.handle_event(&char_press('b'), now),
+        cancel_access_attempt()
+    );
+    assert!(app.native_login_url().is_none());
+    assert_eq!(
+        app.handle_event(&access_canceled("old-attempt"), now),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(&access_succeeded("old-attempt"), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.native_login_status(), "Canceling sign-in...");
+    assert_eq!(app.handle_event(&late_prompt, now), AppAction::Continue);
+    assert!(app.native_login_url().is_none());
+    assert_eq!(
+        app.handle_event(&access_canceled("attempt-1"), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(login_required_snapshot("canceled"))),
+            now
+        ),
+        AppAction::NativeAuth(NativeAuthAction::Start)
+    );
+    assert_eq!(app.handle_event(&char_press('b'), now), AppAction::Continue);
+}
+
+#[test]
+fn access_admitted_completion_beats_browser_switch_without_starting_a_replacement() {
+    let now = Instant::now();
+    let (mut app, _) = device_access(now);
+    assert_eq!(
+        app.handle_event(&char_press('b'), now),
+        cancel_access_attempt()
+    );
+    assert_eq!(
+        app.handle_event(&access_succeeded("attempt-1"), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.native_login_status(), "Signed in; reconnecting...");
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.screen(), AppScreen::Landing);
+    assert!(app.can_logout());
+}
+
+#[test]
+fn access_device_cancel_and_expiry_require_explicit_new_qr() {
+    let now = Instant::now();
+    let (mut app, _) = device_access(now);
+    assert_eq!(
+        app.handle_event(&char_press('b'), now),
+        cancel_access_attempt()
+    );
+    assert_eq!(app.handle_event(&escape_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(login_required_snapshot("canceled"))),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(&access_canceled("attempt-1"), now),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Tick(now), now),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(&char_press('r'), now),
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
+    );
+
+    let (mut app, _) = device_access(now);
+    let expired = now + Duration::from_secs(60);
+    assert_eq!(
+        app.handle_event(&AppEvent::Tick(expired), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.native_login_status(), "QR code expired");
+    assert!(app.native_login_url().is_none());
+    assert_eq!(
+        app.handle_event(&char_press('c'), expired),
+        AppAction::Continue
+    );
+    let error = "Waltr QR sign-in expired; start a new login";
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::NativeLogin(NativeLoginEvent::Failed {
+                error: error.to_owned()
+            }),
+            expired
+        ),
+        AppAction::Continue
+    );
+    let mut failed = login_required_snapshot(error);
+    failed.access.status = waltr_client::AccessStatus::LoginFailed;
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(failed)), expired),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(&char_press('r'), expired),
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
+    );
+}
+
+#[test]
+fn access_device_renewal_at_expiry_retires_old_attempt_before_starting() {
+    let now = Instant::now();
+    let (mut app, _) = device_access(now);
+    assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+    let expired = now + Duration::from_secs(60);
+    assert_eq!(
+        app.handle_event(&char_press('r'), expired),
+        cancel_access_attempt()
+    );
+    assert_eq!(
+        app.handle_event(&access_canceled("attempt-1"), expired),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(login_required_snapshot("canceled"))),
+            expired
+        ),
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
+    );
+}
+
+#[test]
+fn access_device_unsupported_offers_browser_without_restarting() {
+    let now = Instant::now();
+    let (mut app, _) = device_access(now);
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::NativeLogin(NativeLoginEvent::DeviceUnsupported),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(app.handle_event(&char_press('b'), now), AppAction::Continue);
+    let mut failed = login_required_snapshot("device grant unavailable");
+    failed.access.status = waltr_client::AccessStatus::LoginFailed;
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(failed)), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.native_login_status(), "QR sign-in unavailable");
+    assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('b'), now),
+        AppAction::NativeAuth(NativeAuthAction::Start)
+    );
 }
 
 #[test]
 fn access_screen_shows_copyable_url_timeout_and_cancel() {
     let mut app = App::new();
     let now = Instant::now();
-    drop(app.handle_event(
-        &AppEvent::Client(Box::new(login_required_snapshot("login required"))),
-        now,
-    ));
+    drop(app.handle_event(&AppEvent::Client(Box::new(access_attempt_snapshot())), now));
     drop(app.handle_event(
         &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::AwaitingBrowser {
-            authorization_url: "https://id.example/authorize?client_id=waltr-native&state=redacted"
-                .to_owned(),
+            authorization_url:
+                "https://id.example/authorize?client_id=waltr-native&state=redacted".to_owned(),
             expires_at: now + Duration::from_mins(5),
             browser_opened: true,
         }),
@@ -306,10 +591,6 @@ fn access_screen_shows_copyable_url_timeout_and_cancel() {
         AppAction::NativeAuth(waltr_tui::native_auth::NativeAuthAction::CopyUrl(
             "https://id.example/authorize?client_id=waltr-native&state=redacted".to_owned()
         ))
-    );
-    assert_eq!(
-        app.handle_event(&escape_press(), now),
-        AppAction::NativeAuth(waltr_tui::native_auth::NativeAuthAction::Cancel)
     );
     insta::assert_snapshot!("waltr_access_awaiting_callback", render_app(&app));
 
@@ -325,12 +606,20 @@ fn access_screen_shows_copyable_url_timeout_and_cancel() {
         app.native_login_status(),
         "Browser unavailable; open the URL manually"
     );
+    assert_eq!(
+        app.handle_event(&escape_press(), now),
+        cancel_access_attempt()
+    );
 }
 
 #[test]
 fn access_failure_is_retryable_and_success_waits_for_ready_reconnect() {
     let mut app = App::new();
     let now = Instant::now();
+    drop(app.handle_event(
+        &AppEvent::NativeLogin(NativeLoginEvent::RestorationFinished),
+        now,
+    ));
     drop(app.handle_event(
         &AppEvent::Client(Box::new(login_required_snapshot("session expired"))),
         now,
@@ -343,23 +632,17 @@ fn access_failure_is_retryable_and_success_waits_for_ready_reconnect() {
     ));
     assert_eq!(
         app.handle_event(&char_press('r'), now),
-        AppAction::NativeAuth(waltr_tui::native_auth::NativeAuthAction::Start)
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
     );
 
-    drop(app.handle_event(
-        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::Succeeded),
-        now,
-    ));
+    drop(app.handle_event(&access_succeeded("attempt-1"), now));
     let mut reconnecting = ready_snapshot();
     reconnecting.access.status = waltr_client::AccessStatus::UnknownChecking;
     reconnecting.status.ready = false;
     drop(app.handle_event(&AppEvent::Client(Box::new(reconnecting)), now));
     assert_eq!(app.screen(), AppScreen::Access);
 
-    drop(app.handle_event(
-        &AppEvent::Client(Box::new(ready_snapshot())),
-        now,
-    ));
+    drop(app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
     assert_eq!(app.screen(), AppScreen::Landing);
 }
 
@@ -371,10 +654,7 @@ fn access_success_cannot_restart_login_before_reconnect() {
         &AppEvent::Client(Box::new(login_required_snapshot("session expired"))),
         now,
     ));
-    drop(app.handle_event(
-        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::Succeeded),
-        now,
-    ));
+    drop(app.handle_event(&access_succeeded("attempt-1"), now));
 
     assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
@@ -667,10 +947,7 @@ fn current_401_disables_logout_and_uses_transient_reprobe() {
     let mut app = App::new();
     let now = Instant::now();
     drop(app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
-    drop(app.handle_event(
-        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::Succeeded),
-        now,
-    ));
+    drop(app.handle_event(&access_succeeded("attempt-1"), now));
     assert!(app.can_logout());
 
     assert_eq!(
@@ -699,14 +976,43 @@ fn current_401_disables_logout_and_uses_transient_reprobe() {
 }
 
 #[test]
+fn access_automatic_qr_waits_for_the_authoritative_anonymous_reprobe() {
+    let now = Instant::now();
+    let mut app = App::new();
+    drop(app.handle_event(
+        &AppEvent::NativeLogin(NativeLoginEvent::RestorationFinished),
+        now,
+    ));
+    drop(app.handle_event(&access_succeeded("attempt-1"), now));
+    drop(app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
+
+    let required = AppEvent::Client(Box::new(login_required_snapshot("credential rejected")));
+    assert_eq!(
+        app.handle_event(&required, now),
+        AppAction::ClientCommand(ClientCommand::ReprobeWaltrAccess)
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Tick(now), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.handle_event(&required, now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('b'), now), AppAction::Continue);
+    let mut checking = ready_snapshot();
+    checking.access.status = waltr_client::AccessStatus::UnknownChecking;
+    checking.status.ready = false;
+    drop(app.handle_event(&AppEvent::Client(Box::new(checking)), now));
+    assert_eq!(
+        app.handle_event(&required, now),
+        AppAction::NativeAuth(NativeAuthAction::StartDevice)
+    );
+}
+
+#[test]
 fn leader_l_logs_out_through_native_runtime() {
     let mut app = App::new();
     let now = Instant::now();
     drop(app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
-    drop(app.handle_event(
-        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::Succeeded),
-        now,
-    ));
+    drop(app.handle_event(&access_succeeded("attempt-1"), now));
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('l'), now),
@@ -735,7 +1041,13 @@ fn access_screen_ignores_release_and_repeat_keys() {
     ));
 
     for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
-        for code in [KeyCode::Enter, KeyCode::Char('r'), KeyCode::Char('c'), KeyCode::Esc] {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('r'),
+            KeyCode::Char('b'),
+            KeyCode::Char('c'),
+            KeyCode::Esc,
+        ] {
             assert_eq!(
                 app.handle_event(
                     &AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(

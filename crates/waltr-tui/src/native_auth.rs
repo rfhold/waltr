@@ -4,13 +4,13 @@ use std::{env, io, process::Stdio, time::Duration};
 
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
 use waltr_client::{
-    AccessAttemptId, NativeAccessAction, NativeAccessConfig, NativeAccessCoordinator,
-    NativeAccessOutput, NativeAccessProgress, NativeCallbackPolicy, NativeCredentialProvider,
-    NativeLoopbackPolicy,
+    AccessAttemptId, ClientCommand, NativeAccessAction, NativeAccessConfig,
+    NativeAccessCoordinator, NativeAccessOutput, NativeAccessProgress, NativeCallbackPolicy,
+    NativeCredentialProvider, NativeLoopbackPolicy,
 };
 
 use crate::{
-    event::{AppEvent, NativeLoginEvent},
+    event::{AppEvent, DeviceLoginPrompt, NativeLoginEvent},
     runtime::RuntimeClientCommand,
 };
 
@@ -22,10 +22,15 @@ const LOOPBACK_POLICY_ENV: &str = "WALTR_OIDC_NATIVE_LOOPBACK_POLICY";
 /// Native side effect requested by terminal input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeAuthAction {
-    /// Begin or retry Waltr login.
+    /// Begin Waltr login using the browser and loopback callback.
     Start,
-    /// Cancel the active login.
-    Cancel,
+    /// Begin Waltr login using the device authorization grant.
+    StartDevice,
+    /// Cancel the displayed reducer attempt if it has not completed.
+    Cancel {
+        /// Reducer-issued generation selected by the user.
+        attempt_id: AccessAttemptId,
+    },
     /// Copy the currently displayed authorization URL.
     CopyUrl(String),
     /// Remove in-memory Waltr credentials.
@@ -35,6 +40,90 @@ pub enum NativeAuthAction {
         /// Reducer-issued generation that must accompany terminal commands.
         attempt_id: AccessAttemptId,
     },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Decision {
+    Open,
+    Cancel,
+    Complete,
+}
+
+enum CommandAdmission {
+    Ignore,
+    Forward,
+    Complete(AccessAttemptId),
+}
+
+enum LoginAdmission {
+    Idle,
+    Waiting,
+    Attempt {
+        id: AccessAttemptId,
+        decision: Decision,
+    },
+}
+
+impl LoginAdmission {
+    fn register(&mut self, id: AccessAttemptId) -> bool {
+        if !matches!(self, Self::Waiting) {
+            return false;
+        }
+        *self = Self::Attempt {
+            id,
+            decision: Decision::Open,
+        };
+        true
+    }
+
+    fn decide(&mut self, id: &str, winner: Decision) -> bool {
+        match self {
+            Self::Attempt {
+                id: current,
+                decision,
+            } if current == id && *decision == Decision::Open => {
+                *decision = winner;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn cancel(&mut self, id: &str) -> Option<NativeAccessAction> {
+        // This adapter serializes starts and decisions, so the coordinator still owns this ID.
+        self.decide(id, Decision::Cancel)
+            .then_some(NativeAccessAction::Cancel)
+    }
+
+    fn admit_command(&mut self, command: &ClientCommand) -> CommandAdmission {
+        if let ClientCommand::CompleteWaltrLogin { attempt_id } = command {
+            return if self.decide(attempt_id, Decision::Complete) {
+                CommandAdmission::Complete(attempt_id.clone())
+            } else {
+                CommandAdmission::Ignore
+            };
+        }
+        match (self, command) {
+            (
+                Self::Attempt {
+                    id,
+                    decision: Decision::Cancel,
+                },
+                ClientCommand::CancelWaltrLogin { attempt_id },
+            )
+            | (
+                Self::Attempt {
+                    id,
+                    decision: Decision::Open | Decision::Cancel,
+                },
+                ClientCommand::FailWaltrLogin { attempt_id, .. },
+            ) if id == attempt_id => CommandAdmission::Forward,
+            (_, ClientCommand::CancelWaltrLogin { .. } | ClientCommand::FailWaltrLogin { .. }) => {
+                CommandAdmission::Ignore
+            }
+            _ => CommandAdmission::Forward,
+        }
+    }
 }
 
 /// Spawn the TUI adapter around the shared native access coordinator.
@@ -51,6 +140,7 @@ pub(crate) fn spawn(
         let mut coordinator = NativeAccessCoordinator::spawn(config, credentials, 8);
         let shared_actions = coordinator.action_sender();
         let mut browser_task = None;
+        let mut admission = LoginAdmission::Idle;
 
         loop {
             tokio::select! {
@@ -58,17 +148,25 @@ pub(crate) fn spawn(
                     let Some(action) = action else { break };
                     match action {
                         NativeAuthAction::Start => {
+                            admission = LoginAdmission::Waiting;
                             if shared_actions.send(NativeAccessAction::Start).await.is_err() { break; }
                         }
-                        NativeAuthAction::Cancel => {
+                        NativeAuthAction::StartDevice => {
+                            admission = LoginAdmission::Waiting;
+                            if shared_actions.send(NativeAccessAction::StartDevice).await.is_err() { break; }
+                        }
+                        NativeAuthAction::Cancel { attempt_id } => {
+                            let Some(cancel) = admission.cancel(&attempt_id) else { continue };
                             abort_task(&mut browser_task).await;
-                            if shared_actions.send(NativeAccessAction::Cancel).await.is_err() { break; }
+                            if shared_actions.send(cancel).await.is_err() { break; }
                         }
                         NativeAuthAction::Logout => {
+                            admission = LoginAdmission::Idle;
                             abort_task(&mut browser_task).await;
                             if shared_actions.send(NativeAccessAction::Logout).await.is_err() { break; }
                         }
                         NativeAuthAction::AttemptStarted { attempt_id } => {
+                            if !admission.register(attempt_id.clone()) { continue; }
                             if shared_actions.send(NativeAccessAction::AttemptStarted { attempt_id }).await.is_err() { break; }
                         }
                         NativeAuthAction::CopyUrl(url) => {
@@ -81,6 +179,14 @@ pub(crate) fn spawn(
                     let Some(output) = output else { break };
                     match output {
                         NativeAccessOutput::ClientCommand { command, logout_barrier } => {
+                            // Only this loop can admit a completion or issue its competing cancel.
+                            match admission.admit_command(&command) {
+                                CommandAdmission::Ignore => continue,
+                                CommandAdmission::Forward => {}
+                                CommandAdmission::Complete(attempt_id) => {
+                                    send_event(&events, NativeLoginEvent::Succeeded { attempt_id }).await;
+                                }
+                            }
                             let command = if logout_barrier {
                                 RuntimeClientCommand::logout()
                             } else {
@@ -90,6 +196,15 @@ pub(crate) fn spawn(
                         }
                         NativeAccessOutput::Progress(progress) => {
                             abort_task(&mut browser_task).await;
+                            if matches!(progress, NativeAccessProgress::Canceled) {
+                                if let LoginAdmission::Attempt { id, decision: Decision::Cancel } = &admission {
+                                    send_event(&events, NativeLoginEvent::Canceled { attempt_id: id.clone() }).await;
+                                }
+                                continue;
+                            }
+                            if matches!(admission, LoginAdmission::Attempt { decision: Decision::Cancel, .. }) {
+                                continue;
+                            }
                             browser_task = publish_progress(&events, progress, config_error.as_deref()).await;
                         }
                     }
@@ -162,8 +277,20 @@ async fn publish_progress(
 ) -> Option<JoinHandle<()>> {
     let mut browser_task = None;
     let event = match progress {
-        NativeAccessProgress::Restoring | NativeAccessProgress::RestorationFinished => return None,
-        NativeAccessProgress::Discovering => NativeLoginEvent::Discovering,
+        NativeAccessProgress::Restoring | NativeAccessProgress::Discovering => return None,
+        NativeAccessProgress::RestorationFinished => NativeLoginEvent::RestorationFinished,
+        NativeAccessProgress::AwaitingDevice {
+            verification_uri,
+            verification_uri_complete,
+            user_code,
+            timeout_millis,
+        } => NativeLoginEvent::AwaitingDevice(DeviceLoginPrompt::new(
+            verification_uri,
+            verification_uri_complete.as_deref(),
+            user_code,
+            std::time::Instant::now() + Duration::from_millis(timeout_millis),
+        )),
+        NativeAccessProgress::DeviceUnsupported => NativeLoginEvent::DeviceUnsupported,
         NativeAccessProgress::AwaitingBrowser {
             authorization_url,
             timeout_millis,
@@ -187,12 +314,12 @@ async fn publish_progress(
         NativeAccessProgress::Exchanging => NativeLoginEvent::Exchanging,
         NativeAccessProgress::Refreshing => NativeLoginEvent::Refreshing,
         NativeAccessProgress::RefreshSucceeded => NativeLoginEvent::RefreshSucceeded,
-        NativeAccessProgress::Warning { .. } => return None,
-        NativeAccessProgress::Succeeded => NativeLoginEvent::Succeeded,
+        NativeAccessProgress::Warning { .. }
+        | NativeAccessProgress::Succeeded
+        | NativeAccessProgress::Canceled => return None,
         NativeAccessProgress::Failed { error } => NativeLoginEvent::Failed {
             error: config_error.unwrap_or(&error).to_owned(),
         },
-        NativeAccessProgress::Canceled => NativeLoginEvent::Canceled,
     };
     send_event(events, event).await;
     browser_task
@@ -262,6 +389,68 @@ async fn send_event(events: &mpsc::Sender<io::Result<AppEvent>>, event: NativeLo
 mod tests {
     use super::*;
 
+    fn complete(id: &str) -> ClientCommand {
+        ClientCommand::CompleteWaltrLogin {
+            attempt_id: id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn cancel_wins_and_blocks_a_queued_complete() {
+        let mut admission = LoginAdmission::Waiting;
+        assert!(admission.register("first".to_owned()));
+        let (outputs, mut queued) = mpsc::channel(1);
+        outputs.try_send(complete("first")).unwrap();
+
+        assert!(matches!(
+            admission.cancel("first"),
+            Some(NativeAccessAction::Cancel)
+        ));
+        assert!(matches!(
+            admission.admit_command(&queued.try_recv().unwrap()),
+            CommandAdmission::Ignore
+        ));
+        let retirement = ClientCommand::CancelWaltrLogin {
+            attempt_id: "first".to_owned(),
+        };
+        assert!(matches!(
+            admission.admit_command(&retirement),
+            CommandAdmission::Forward
+        ));
+    }
+
+    #[test]
+    fn admitted_complete_wins_and_never_sends_a_late_coordinator_cancel() {
+        let mut admission = LoginAdmission::Waiting;
+        assert!(admission.register("first".to_owned()));
+        assert!(matches!(
+            admission.admit_command(&complete("first")),
+            CommandAdmission::Complete(id) if id == "first"
+        ));
+        assert!(admission.cancel("first").is_none());
+    }
+
+    #[test]
+    fn stale_cancel_and_complete_cannot_touch_the_replacement() {
+        let mut admission = LoginAdmission::Waiting;
+        assert!(admission.register("first".to_owned()));
+        assert!(admission.cancel("first").is_some());
+
+        admission = LoginAdmission::Waiting;
+        assert!(admission.cancel("first").is_none());
+        assert!(admission.register("replacement".to_owned()));
+        assert!(!admission.register("first".to_owned()));
+        assert!(admission.cancel("first").is_none());
+        assert!(matches!(
+            admission.admit_command(&complete("first")),
+            CommandAdmission::Ignore
+        ));
+        assert!(matches!(
+            admission.admit_command(&complete("replacement")),
+            CommandAdmission::Complete(id) if id == "replacement"
+        ));
+    }
+
     #[test]
     fn loopback_policy_accepts_only_fixed_ipv4_loopback_callbacks() {
         assert_eq!(
@@ -273,6 +462,35 @@ mod tests {
             Some("must use http://127.0.0.1:<port> without query or fragment")
         );
         assert_eq!(loopback_url_error("http://127.0.0.1:9000/callback"), None);
+    }
+
+    #[tokio::test]
+    async fn device_progress_presents_manual_url_without_launching_a_browser() {
+        let (events, mut event_receiver) = mpsc::channel(1);
+        let manual_url = "https://id.example/device";
+        let task = publish_progress(
+            &events,
+            NativeAccessProgress::AwaitingDevice {
+                verification_uri: manual_url.to_owned(),
+                verification_uri_complete: None,
+                user_code: "ABCD-1234".to_owned(),
+                timeout_millis: 60_000,
+            },
+            None,
+        )
+        .await;
+        assert!(task.is_none());
+        let Some(Ok(AppEvent::NativeLogin(NativeLoginEvent::AwaitingDevice(prompt)))) =
+            event_receiver.try_recv().ok()
+        else {
+            panic!("device presentation event should be available");
+        };
+        assert_eq!(prompt.verification_uri, manual_url);
+        assert_eq!(prompt.user_code, "ABCD-1234");
+        assert!(prompt.qr.is_some_and(|qr| {
+            qrcodegen::QrCode::encode_text(manual_url, qrcodegen::QrCodeEcc::Medium).ok()
+                == Some(qr)
+        }));
     }
 
     #[tokio::test]

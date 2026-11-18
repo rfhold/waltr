@@ -1008,6 +1008,7 @@ pub(crate) fn loaded_config_snapshot() -> ClientSnapshot {
     let mut snapshot = ready_snapshot();
     snapshot.config.current = Some(ConfigView {
         session_dictation: None,
+        speech_defaults: None,
         etag: "etag-1".to_owned(),
         providers: BTreeMap::from([(
             "anthropic".to_owned(),

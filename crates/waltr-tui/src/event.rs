@@ -1,7 +1,8 @@
 //! App-level events consumed by the TUI state machine.
 
-use std::time::Instant;
+use std::{fmt, time::Instant};
 
+use qrcodegen::{QrCode, QrCodeEcc};
 use waltr_client::ClientSnapshot;
 
 use crate::input::InputEvent;
@@ -38,11 +39,15 @@ impl AppEvent {
     }
 }
 
-/// Secret-free native Waltr login progress.
+/// Native Waltr login progress with private presentation data redacted from Debug.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeLoginEvent {
-    /// Metadata discovery is in progress.
-    Discovering,
+    /// Startup credential restoration has settled.
+    RestorationFinished,
+    /// A device authorization is waiting for approval.
+    AwaitingDevice(DeviceLoginPrompt),
+    /// The provider does not support QR sign-in for this client.
+    DeviceUnsupported,
     /// The authorization URL is ready and the callback listener is active.
     AwaitingBrowser {
         /// URL that may be copied when browser launching is unavailable.
@@ -60,15 +65,21 @@ pub enum NativeLoginEvent {
     Refreshing,
     /// Refresh completed and credentials were atomically replaced.
     RefreshSucceeded,
-    /// Credentials were installed before client reconnection.
-    Succeeded,
+    /// The exact attempt's installed credentials were accepted for reconnection.
+    Succeeded {
+        /// Reducer-issued generation admitted for completion.
+        attempt_id: waltr_client::AccessAttemptId,
+    },
     /// The flow failed with safe user-facing text.
     Failed {
         /// Safe failure text; never contains token response bodies.
         error: String,
     },
     /// The flow was canceled.
-    Canceled,
+    Canceled {
+        /// Reducer-issued generation whose cancellation won.
+        attempt_id: waltr_client::AccessAttemptId,
+    },
     /// In-memory credentials were removed.
     LoggedOut,
     /// Clipboard command completed.
@@ -76,6 +87,44 @@ pub enum NativeLoginEvent {
         /// Whether a supported platform clipboard command succeeded.
         copied: bool,
     },
+}
+
+/// Short-lived device authorization shown only on the access screen.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DeviceLoginPrompt {
+    pub(crate) verification_uri: String,
+    pub(crate) user_code: String,
+    pub(crate) expires_at: Instant,
+    pub(crate) qr: Option<QrCode>,
+}
+
+impl DeviceLoginPrompt {
+    /// Prepare a QR from the complete URL when available, otherwise from the manual URL.
+    #[must_use]
+    pub fn new(
+        verification_uri: String,
+        verification_uri_complete: Option<&str>,
+        user_code: String,
+        expires_at: Instant,
+    ) -> Self {
+        let qr = QrCode::encode_text(
+            verification_uri_complete.unwrap_or(&verification_uri),
+            QrCodeEcc::Medium,
+        )
+        .ok();
+        Self {
+            verification_uri,
+            user_code,
+            expires_at,
+            qr,
+        }
+    }
+}
+
+impl fmt::Debug for DeviceLoginPrompt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeviceLoginPrompt([REDACTED])")
+    }
 }
 
 /// Async stream update delivered to the app event loop.

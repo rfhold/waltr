@@ -2188,6 +2188,7 @@ fn inference_editor_snapshot() -> ClientSnapshot {
     let mut snapshot = watched_session_with_timeline(session, Vec::new());
     snapshot.config.current = Some(ConfigView {
         session_dictation: None,
+        speech_defaults: None,
         etag: "etag-1".to_owned(),
         providers: std::collections::BTreeMap::from([
             (

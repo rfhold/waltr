@@ -11,7 +11,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use waltr_client::{AccessStatus, ClientAuthTarget, ClientCommand, ClientSnapshot};
 
 use crate::{
-    event::{AppEvent, NativeLoginEvent},
+    event::{AppEvent, DeviceLoginPrompt, NativeLoginEvent},
     input::InputEvent,
     keys::{KeyCommand, LeaderCommand, key_command},
     native_auth::NativeAuthAction,
@@ -112,6 +112,9 @@ pub struct App {
     config_reset: ConfigResetState,
     client_snapshot: Option<ClientSnapshot>,
     native_login: NativeLoginState,
+    restoration_finished: bool,
+    auto_device_pending: bool,
+    access_reprobe_pending: bool,
     has_native_credential: bool,
     logout_snapshot_barrier: LogoutSnapshotBarrier,
     now: Option<Instant>,
@@ -154,6 +157,9 @@ impl App {
             config_reset: ConfigResetState::new(),
             client_snapshot: None,
             native_login: NativeLoginState::Idle,
+            restoration_finished: false,
+            auto_device_pending: false,
+            access_reprobe_pending: false,
             has_native_credential: false,
             logout_snapshot_barrier: LogoutSnapshotBarrier::None,
             now: None,
@@ -182,14 +188,20 @@ impl App {
                 }
                 AppAction::Continue
             }
-            AppEvent::Tick(_) | AppEvent::Stream(_) => AppAction::Continue,
+            AppEvent::Tick(_) => self.advance_access_login(),
+            AppEvent::Stream(_) => AppAction::Continue,
             AppEvent::Client(snapshot) => {
-                AppAction::from_commands(self.handle_client_snapshot(snapshot.as_ref().clone()))
+                let commands = self.handle_client_snapshot(snapshot.as_ref().clone());
+                if commands.is_empty() {
+                    self.advance_access_login()
+                } else {
+                    AppAction::from_commands(commands)
+                }
             }
             AppEvent::Input(input) => self.handle_input_event(*input, now),
             AppEvent::NativeLogin(event) => {
                 self.handle_native_login_event(event.clone(), now);
-                AppAction::Continue
+                self.advance_access_login()
             }
         }
     }
@@ -235,6 +247,11 @@ impl App {
     /// Update time-sensitive app state.
     pub fn update(&mut self, now: Instant) {
         self.now = Some(now);
+        if matches!(&self.native_login, NativeLoginState::AwaitingDevice(prompt) if now >= prompt.expires_at)
+        {
+            self.native_login = NativeLoginState::DeviceExpired;
+            self.notice = None;
+        }
         if self
             .armed_close
             .is_some_and(|armed_close| now >= armed_close.expires_at)
@@ -299,8 +316,12 @@ impl App {
     #[must_use]
     pub const fn native_login_status(&self) -> &'static str {
         match self.native_login {
+            NativeLoginState::Idle if !self.restoration_finished => "Checking for existing access",
             NativeLoginState::Idle | NativeLoginState::Canceled => "Signed out",
-            NativeLoginState::Discovering => "Discovering identity provider...",
+            NativeLoginState::Preparing(LoginMethod::Browser) => "Opening browser sign-in...",
+            NativeLoginState::Preparing(LoginMethod::Device) => "Preparing QR sign-in...",
+            NativeLoginState::AwaitingDevice(_) => "Scan to sign in",
+            NativeLoginState::DeviceExpired => "QR code expired",
             NativeLoginState::AwaitingBrowser {
                 browser_opened: true,
                 ..
@@ -311,8 +332,17 @@ impl App {
             } => "Browser unavailable; open the URL manually",
             NativeLoginState::Exchanging => "Exchanging authorization code...",
             NativeLoginState::Refreshing => "Refreshing access...",
+            NativeLoginState::Stopping { .. } => "Canceling sign-in...",
             NativeLoginState::Succeeded => "Signed in; reconnecting...",
             NativeLoginState::Failed { .. } => "Sign in failed",
+            NativeLoginState::DeviceUnsupported => "QR sign-in unavailable",
+        }
+    }
+
+    pub(crate) fn device_login_prompt(&self) -> Option<&DeviceLoginPrompt> {
+        match &self.native_login {
+            NativeLoginState::AwaitingDevice(prompt) => Some(prompt),
+            _ => None,
         }
     }
 
@@ -323,21 +353,21 @@ impl App {
             NativeLoginState::AwaitingBrowser {
                 authorization_url, ..
             } => Some(authorization_url),
-            _ => None,
+            _ => self
+                .device_login_prompt()
+                .map(|prompt| prompt.verification_uri.as_str()),
         }
     }
 
-    /// Seconds until the loopback callback expires.
+    /// Seconds until the displayed sign-in prompt expires.
     #[must_use]
     pub fn native_login_remaining(&self) -> Option<u64> {
-        match self.native_login {
-            NativeLoginState::AwaitingBrowser { expires_at, .. } => Some(
-                expires_at
-                    .saturating_duration_since(self.now.unwrap_or(expires_at))
-                    .as_secs(),
-            ),
-            _ => None,
-        }
+        let expires_at = match self.native_login {
+            NativeLoginState::AwaitingBrowser { expires_at, .. } => expires_at,
+            _ => self.device_login_prompt()?.expires_at,
+        };
+        let remaining = expires_at.saturating_duration_since(self.now.unwrap_or(expires_at));
+        Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0))
     }
 
     /// Safe native login failure text.
@@ -345,22 +375,40 @@ impl App {
     pub fn native_login_error(&self) -> Option<&str> {
         match &self.native_login {
             NativeLoginState::Failed { error } => Some(error),
+            NativeLoginState::DeviceUnsupported => {
+                Some("This provider does not support QR sign-in. Use a browser instead.")
+            }
             _ => None,
         }
     }
 
     /// Keyboard hints for the current access state.
     #[must_use]
-    pub const fn access_hint(&self) -> &'static str {
+    pub fn access_hint(&self) -> &'static str {
         match self.native_login {
-            NativeLoginState::AwaitingBrowser { .. } => "c copy URL    Esc cancel",
-            NativeLoginState::Discovering | NativeLoginState::Exchanging => "Esc cancel",
-            NativeLoginState::Succeeded | NativeLoginState::Refreshing => {
-                "Reconnecting to Waltr..."
+            NativeLoginState::AwaitingDevice(_) => "c copy URL  b browser  Esc cancel",
+            NativeLoginState::Preparing(LoginMethod::Device) if self.access_attempt_active() => {
+                "b browser  Esc cancel"
             }
+            NativeLoginState::DeviceExpired if self.access_attempt_active() => {
+                "r new QR  b browser  Esc cancel"
+            }
+            NativeLoginState::AwaitingBrowser { .. } => "c copy URL  Esc cancel",
+            NativeLoginState::Preparing(LoginMethod::Browser) | NativeLoginState::Exchanging
+                if self.access_attempt_active() =>
+            {
+                "Esc cancel"
+            }
+            NativeLoginState::DeviceUnsupported if self.can_start_access() => "b browser",
             NativeLoginState::Idle
             | NativeLoginState::Canceled
-            | NativeLoginState::Failed { .. } => "Enter sign in    r retry    Ctrl-C Ctrl-C quit",
+            | NativeLoginState::Failed { .. }
+                if self.can_start_access() =>
+            {
+                "r new QR  b browser"
+            }
+            NativeLoginState::Stopping { next: Some(_), .. } => "Esc stay signed out",
+            _ => "Ctrl-C twice to quit",
         }
     }
 
@@ -513,42 +561,156 @@ impl App {
         }
     }
 
-    fn handle_access_key(&self, key: KeyEvent) -> AppAction {
+    fn can_start_access(&self) -> bool {
+        self.screen == AppScreen::Access
+            && self.restoration_finished
+            && self.logout_snapshot_barrier == LogoutSnapshotBarrier::None
+            && !self.access_reprobe_pending
+            && self.client_snapshot.as_ref().is_some_and(|snapshot| {
+                matches!(
+                    snapshot.access.status,
+                    AccessStatus::LoginRequired | AccessStatus::LoginFailed
+                ) && snapshot.access.active_attempt_id.is_none()
+            })
+    }
+
+    fn access_attempt_active(&self) -> bool {
+        self.client_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.access.active_attempt_id.is_some())
+    }
+
+    fn start_access_login(&mut self, method: LoginMethod) -> AppAction {
+        self.auto_device_pending = false;
+        self.native_login = NativeLoginState::Preparing(method);
+        self.notice = None;
+        AppAction::NativeAuth(match method {
+            LoginMethod::Browser => NativeAuthAction::Start,
+            LoginMethod::Device => NativeAuthAction::StartDevice,
+        })
+    }
+
+    fn advance_access_login(&mut self) -> AppAction {
+        if !self.can_start_access() {
+            return AppAction::Continue;
+        }
+        if let NativeLoginState::Stopping {
+            next,
+            acknowledged: true,
+            ..
+        } = &self.native_login
+        {
+            let next = *next;
+            self.native_login = NativeLoginState::Canceled;
+            if let Some(method) = next {
+                return self.start_access_login(method);
+            }
+        }
+        if self.auto_device_pending && matches!(self.native_login, NativeLoginState::Idle) {
+            return self.start_access_login(LoginMethod::Device);
+        }
+        AppAction::Continue
+    }
+
+    fn handle_access_key(&mut self, key: KeyEvent) -> AppAction {
         if key.kind != KeyEventKind::Press {
             return AppAction::Continue;
         }
+        if key.code == KeyCode::Esc
+            && let NativeLoginState::Stopping { next, .. } = &mut self.native_login
+        {
+            *next = None;
+            return AppAction::Continue;
+        }
+        let requested = match key.code {
+            KeyCode::Enter | KeyCode::Char('r') => Some(LoginMethod::Device),
+            KeyCode::Char('b') => Some(LoginMethod::Browser),
+            _ => None,
+        };
         match key.code {
-            KeyCode::Enter | KeyCode::Char('r')
-                if matches!(
-                    self.native_login,
-                    NativeLoginState::Idle
-                        | NativeLoginState::Canceled
-                        | NativeLoginState::Failed { .. }
-                ) =>
-            {
-                AppAction::NativeAuth(NativeAuthAction::Start)
-            }
-            KeyCode::Esc
-                if matches!(
-                    self.native_login,
-                    NativeLoginState::Discovering
-                        | NativeLoginState::AwaitingBrowser { .. }
-                        | NativeLoginState::Exchanging
-                ) =>
-            {
-                AppAction::NativeAuth(NativeAuthAction::Cancel)
-            }
             KeyCode::Char('c') => self.native_login_url().map_or(AppAction::Continue, |url| {
                 AppAction::NativeAuth(NativeAuthAction::CopyUrl(url.to_owned()))
             }),
-            _ => AppAction::Continue,
+            _ => {
+                if let Some(method) = requested
+                    && self.can_start_access()
+                    && match self.native_login {
+                        NativeLoginState::Idle
+                        | NativeLoginState::Canceled
+                        | NativeLoginState::Failed { .. } => true,
+                        NativeLoginState::DeviceUnsupported => method == LoginMethod::Browser,
+                        _ => false,
+                    }
+                {
+                    return self.start_access_login(method);
+                }
+                if let Some(attempt_id) = self
+                    .client_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.access.active_attempt_id.clone())
+                    && match self.native_login {
+                        NativeLoginState::Preparing(LoginMethod::Device)
+                        | NativeLoginState::AwaitingDevice(_) => {
+                            key.code == KeyCode::Esc || requested == Some(LoginMethod::Browser)
+                        }
+                        NativeLoginState::DeviceExpired => {
+                            key.code == KeyCode::Esc || requested.is_some()
+                        }
+                        NativeLoginState::Preparing(LoginMethod::Browser)
+                        | NativeLoginState::AwaitingBrowser { .. }
+                        | NativeLoginState::Exchanging => key.code == KeyCode::Esc,
+                        _ => false,
+                    }
+                {
+                    // The coordinator cancels its current reducer-issued attempt. Keep
+                    // Start fenced until the canceled task and reducer attempt are gone.
+                    self.native_login = NativeLoginState::Stopping {
+                        attempt_id: attempt_id.clone(),
+                        next: requested,
+                        acknowledged: false,
+                    };
+                    self.notice = None;
+                    AppAction::NativeAuth(NativeAuthAction::Cancel { attempt_id })
+                } else {
+                    AppAction::Continue
+                }
+            }
         }
     }
 
     fn handle_native_login_event(&mut self, event: NativeLoginEvent, now: Instant) {
         self.now = Some(now);
+        if let NativeLoginState::Stopping {
+            attempt_id,
+            acknowledged,
+            ..
+        } = &mut self.native_login
+        {
+            match &event {
+                NativeLoginEvent::Canceled {
+                    attempt_id: canceled,
+                } if canceled == attempt_id => {
+                    *acknowledged = true;
+                    self.has_native_credential = false;
+                    return;
+                }
+                NativeLoginEvent::Succeeded {
+                    attempt_id: completed,
+                } if completed == attempt_id => {}
+                NativeLoginEvent::LoggedOut => {}
+                _ => return,
+            }
+        }
         self.native_login = match event {
-            NativeLoginEvent::Discovering => NativeLoginState::Discovering,
+            NativeLoginEvent::RestorationFinished => {
+                self.restoration_finished = true;
+                return;
+            }
+            NativeLoginEvent::AwaitingDevice(prompt) if now < prompt.expires_at => {
+                NativeLoginState::AwaitingDevice(prompt)
+            }
+            NativeLoginEvent::AwaitingDevice(_) => NativeLoginState::DeviceExpired,
+            NativeLoginEvent::DeviceUnsupported => NativeLoginState::DeviceUnsupported,
             NativeLoginEvent::AwaitingBrowser {
                 authorization_url,
                 expires_at,
@@ -576,7 +738,7 @@ impl App {
             }
             NativeLoginEvent::Exchanging => NativeLoginState::Exchanging,
             NativeLoginEvent::Refreshing => NativeLoginState::Refreshing,
-            NativeLoginEvent::RefreshSucceeded | NativeLoginEvent::Succeeded => {
+            NativeLoginEvent::RefreshSucceeded | NativeLoginEvent::Succeeded { .. } => {
                 self.has_native_credential = true;
                 NativeLoginState::Succeeded
             }
@@ -584,10 +746,7 @@ impl App {
                 self.has_native_credential = false;
                 NativeLoginState::Failed { error }
             }
-            NativeLoginEvent::Canceled => {
-                self.has_native_credential = false;
-                NativeLoginState::Canceled
-            }
+            NativeLoginEvent::Canceled { .. } => return,
             NativeLoginEvent::LoggedOut => {
                 self.clear_protected_ui_state();
                 self.logout_snapshot_barrier = LogoutSnapshotBarrier::AwaitingLogoutObservation;
@@ -1041,6 +1200,9 @@ impl App {
             }
             LogoutSnapshotBarrier::None | LogoutSnapshotBarrier::AwaitingAnonymousReprobe => {}
         }
+        if snapshot.access.status != AccessStatus::LoginRequired {
+            self.access_reprobe_pending = false;
+        }
 
         let previous_attempt_id = self
             .client_snapshot
@@ -1096,6 +1258,7 @@ impl App {
             self.routines_section.media = None;
             if snapshot.access.status == AccessStatus::LoginRequired && self.has_native_credential {
                 self.has_native_credential = false;
+                self.access_reprobe_pending = true;
                 commands.push(ClientCommand::ReprobeWaltrAccess);
             }
             if self.screen != AppScreen::Access {
@@ -1107,6 +1270,10 @@ impl App {
                     | AppScreen::SessionData => Some(self.screen),
                     AppScreen::Waiting | AppScreen::Access => None,
                 };
+                if snapshot.access.status == AccessStatus::LoginRequired {
+                    self.auto_device_pending = true;
+                    self.native_login = NativeLoginState::Idle;
+                }
             }
             self.screen = AppScreen::Access;
             if snapshot.access.status == AccessStatus::LoginRequired
@@ -1127,6 +1294,7 @@ impl App {
                     .unwrap_or(AppScreen::Landing);
             }
             self.native_login = NativeLoginState::Idle;
+            self.auto_device_pending = false;
         } else if snapshot.status.ready && self.screen == AppScreen::Waiting {
             self.screen = AppScreen::Landing;
         }
@@ -1234,6 +1402,8 @@ impl App {
         self.config_reset = ConfigResetState::new();
         self.client_snapshot = None;
         self.has_native_credential = false;
+        self.auto_device_pending = false;
+        self.access_reprobe_pending = false;
         self.logout_snapshot_barrier = LogoutSnapshotBarrier::None;
     }
 
@@ -1553,7 +1723,9 @@ struct TransientNotice {
 enum NativeLoginState {
     #[default]
     Idle,
-    Discovering,
+    Preparing(LoginMethod),
+    AwaitingDevice(DeviceLoginPrompt),
+    DeviceExpired,
     AwaitingBrowser {
         authorization_url: String,
         expires_at: Instant,
@@ -1566,6 +1738,18 @@ enum NativeLoginState {
         error: String,
     },
     Canceled,
+    DeviceUnsupported,
+    Stopping {
+        attempt_id: waltr_client::AccessAttemptId,
+        next: Option<LoginMethod>,
+        acknowledged: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoginMethod {
+    Device,
+    Browser,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

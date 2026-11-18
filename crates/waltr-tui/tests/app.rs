@@ -26,8 +26,9 @@ use waltr_client::{
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
-    event::AppEvent,
+    event::{AppEvent, DeviceLoginPrompt, NativeLoginEvent},
     input::InputEvent,
+    native_auth::NativeAuthAction,
     screens::{ConfigTab, SectionAction, SessionsSection, draw_sessions},
     theme::{StatusRole, THEME},
     ui,

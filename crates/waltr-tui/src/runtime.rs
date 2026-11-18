@@ -276,6 +276,7 @@ fn spawn_client_events(
     tokio::task::spawn_local(async move {
         let transport = NativeGrpcTransport::with_credential_provider(client_endpoint, credentials);
         let mut client = ClientRuntime::with_transport(transport).into_state_stream(sleep_millis);
+        let mut previous_attempt_id = None;
 
         loop {
             let logout_barrier = Rc::new(Cell::new(false));
@@ -290,8 +291,14 @@ fn spawn_client_events(
                 .await
             {
                 ClientStateStreamEvent::Snapshot(snapshot) => {
-                    if snapshot.access.status == AccessStatus::LoginInProgress
-                        && let Some(attempt_id) = snapshot.access.active_attempt_id.clone()
+                    let attempt_id = if snapshot.access.status == AccessStatus::LoginInProgress {
+                        snapshot.access.active_attempt_id.clone()
+                    } else {
+                        None
+                    };
+                    // Register the generation before keys from its snapshot can reach the adapter.
+                    if attempt_id != previous_attempt_id
+                        && let Some(attempt_id) = attempt_id.clone()
                         && native_auth
                             .send(NativeAuthAction::AttemptStarted { attempt_id })
                             .await
@@ -299,6 +306,7 @@ fn spawn_client_events(
                     {
                         return;
                     }
+                    previous_attempt_id = attempt_id;
                     if !publish_client_snapshot(&events, snapshot, logout_barrier.get()).await {
                         return;
                     }
