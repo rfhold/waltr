@@ -6,7 +6,7 @@ import type { AccessDiagnostic, AccessOperations, ClientAdapter } from "../../sr
 import { AppStateProvider } from "../../src/app/state";
 import { AppLayout } from "../../src/routes/layouts/AppLayout";
 import { ServerSelectionContext } from "../../src/app/serverSelection";
-import { AccessRoute, waltrLoginUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
+import { AccessRoute, waltrSignInUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
 import { ShellRouteWithChildren, testHistory } from "../support/routes";
 import { operationSnapshot, snapshotWithConfig } from "../support/snapshots";
@@ -100,11 +100,11 @@ describe("Waltr access", () => {
     });
 
     const login = screen.getByRole("link", { name: "Sign in" });
-    expect(login.getAttribute("href")).toBe("/oidc/login?return_to=%2Fsessions%2Fsession-a%3Fpanel%3Dactivity%23turn-3");
+    expect(login.getAttribute("href")).toBe("/oidc/sign-in?return_to=%2Fsessions%2Fsession-a%3Fpanel%3Dactivity%23turn-3");
     fireEvent.click(login);
 
     await waitFor(() => expect(commands).toEqual([{ type: "startWaltrLogin" }]));
-    expect(navigate).toHaveBeenCalledWith("/oidc/login?return_to=%2Fsessions%2Fsession-a%3Fpanel%3Dactivity%23turn-3");
+    expect(navigate).toHaveBeenCalledWith("/oidc/sign-in?return_to=%2Fsessions%2Fsession-a%3Fpanel%3Dactivity%23turn-3");
   });
 
   test("reports navigation failure against its own attempt", async () => {
@@ -244,7 +244,7 @@ describe("Waltr access", () => {
     });
 
     fireEvent.click(screen.getByRole("link", { name: "Sign in" }));
-    await waitFor(() => expect(accessOperations.openLogin).toHaveBeenCalledWith("/oidc/login?return_to=%2F"));
+    await waitFor(() => expect(accessOperations.openLogin).toHaveBeenCalledWith("/oidc/sign-in?return_to=%2F"));
     expect(commands).toContainEqual({ type: "startWaltrLogin" });
 
     view.unmount();
@@ -298,7 +298,9 @@ describe("Waltr access", () => {
     expect(safeLocalReturnPath(locationParts("/safe", "?bad=%zz"))).toBe("/");
     expect(safeLocalReturnPath(locationParts("/https:%2F%2Fevil.example"))).toBe("/");
     expect(safeLocalReturnPath(locationParts("/%2525252520"))).toBe("/");
-    expect(waltrLoginUrl(locationParts("//evil.example"))).toBe("/oidc/login?return_to=%2F");
+    for (const path of ["//evil.example", "/oidc/sign-in", "/oidc/login", "/%256fidc/sign-in", "/old/../oidc/sign-in", `/${"a".repeat(2048)}`]) {
+      expect(waltrSignInUrl(locationParts(path))).toBe("/oidc/sign-in?return_to=%2F");
+    }
   });
 
   test("session expiry replaces protected content and provider OAuth", async () => {
@@ -317,6 +319,143 @@ describe("Waltr access", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sign in to continue" })).toBeTruthy());
     expect(screen.queryByLabelText("Primary navigation")).toBeNull();
     expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Sign in" }).getAttribute("href")).toBe("/oidc/sign-in?return_to=%2F");
+  });
+
+  const noDiagnostic = { restoring: false, persistenceWarning: false, failed: false };
+  function nativeFixture(initial: ClientSnapshot, initialDiagnostic?: AccessDiagnostic) {
+    let snapshot = initial;
+    let publish!: (snapshot: ClientSnapshot) => void;
+    let publishDiagnostic!: (diagnostic: AccessDiagnostic | undefined) => void;
+    const setSnapshot = (next: ClientSnapshot) => { snapshot = next; publish(next); };
+    const start = vi.fn(async (_method) => {});
+    const openLogin = vi.fn();
+    const dispatch = vi.fn(async (_command: ClientCommand) => snapshot);
+    const adapter: ClientAdapter = {
+      snapshot: () => snapshot,
+      subscribe: (listener) => { publish = listener; return () => {}; },
+      start: async () => {},
+      dispose: () => {},
+      dispatch,
+      access: { openLogin, startNativeLogin: start, logout: async () => true },
+      accessDiagnostic: { subscribe: (listener) => {
+        publishDiagnostic = listener;
+        listener(initialDiagnostic);
+        return () => {};
+      } },
+    };
+    const view = render(() => <AppStateProvider loadClientAdapter={async () => adapter}>
+      <AppLayout><div>Authenticated shell</div></AppLayout>
+    </AppStateProvider>);
+    return { view, setSnapshot, start, openLogin, dispatch, diagnostic: (value: AccessDiagnostic | undefined) => publishDiagnostic(value) };
+  }
+
+  function deviceDiagnostic(attemptId: string, expiresAtMillis = Date.now() + 60_000): AccessDiagnostic {
+    return { ...noDiagnostic, device: {
+      attemptId, expiresAtMillis, verificationUri: "https://login.example/device", userCode: "1234-ABCD",
+      qr: { size: 37, path: "M4 4h7v1h-7z" },
+    } };
+  }
+
+  test("restores first, automatically starts one phone attempt, and renews only after exact cancellation", async () => {
+    const native = nativeFixture(accessSnapshot("loginRequired"), { ...noDiagnostic, restoring: true });
+    await screen.findByRole("heading", { name: "Restoring sign-in…" });
+    expect(native.start).not.toHaveBeenCalled();
+    native.setSnapshot(accessSnapshot("unknownChecking"));
+    native.diagnostic(noDiagnostic);
+    expect(native.start).not.toHaveBeenCalled();
+    native.setSnapshot(accessSnapshot("loginRequired"));
+    await waitFor(() => expect(native.start).toHaveBeenCalledExactlyOnceWith("device"));
+    expect(native.openLogin).not.toHaveBeenCalled();
+
+    native.setSnapshot(accessSnapshot("loginInProgress", "phone-1"));
+    native.diagnostic(deviceDiagnostic("stale"));
+    expect(screen.queryByText("1234-ABCD")).toBeNull();
+    native.diagnostic(deviceDiagnostic("phone-1"));
+    expect(screen.getByRole("img", { name: "QR code for Waltr sign-in" })).toBeTruthy();
+    expect(screen.getByText("https://login.example/device")).toBeTruthy();
+    expect(screen.getByText("1234-ABCD")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toContain("Waiting for you");
+
+    let retire!: (snapshot: ClientSnapshot) => void;
+    native.dispatch.mockReturnValueOnce(new Promise((resolve) => { retire = resolve; }));
+    fireEvent.click(screen.getByRole("button", { name: "Get a new code" }));
+    expect(native.start).toHaveBeenCalledTimes(1);
+    expect(native.dispatch).toHaveBeenCalledExactlyOnceWith({ type: "cancelWaltrLogin", attemptId: "phone-1" });
+    expect(screen.queryByRole("img", { name: "QR code for Waltr sign-in" })).toBeNull();
+    const retired = accessSnapshot("loginRequired");
+    native.setSnapshot(retired);
+    retire(retired);
+    await waitFor(() => expect(native.start.mock.calls).toEqual([["device"], ["device"]]));
+    native.setSnapshot(accessSnapshot("loginInProgress", "phone-2"));
+    expect(screen.queryByText("1234-ABCD")).toBeNull();
+    native.diagnostic(deviceDiagnostic("phone-2"));
+    expect(screen.getByText("1234-ABCD")).toBeTruthy();
+    native.setSnapshot(accessSnapshot("authenticated"));
+    expect(await screen.findByText("Authenticated shell")).toBeTruthy();
+    expect(screen.queryByText("1234-ABCD")).toBeNull();
+  });
+
+  test("keeps the same-device browser fallback explicit after unsupported or expired phone access", async () => {
+    const native = nativeFixture(accessSnapshot("authenticated"), noDiagnostic);
+    await screen.findByText("Authenticated shell");
+    expect(native.start).not.toHaveBeenCalled();
+    native.setSnapshot(accessSnapshot("loginRequired"));
+    await waitFor(() => expect(native.start).toHaveBeenCalledExactlyOnceWith("device"));
+    native.setSnapshot(accessSnapshot("loginInProgress", "phone"));
+    native.diagnostic(deviceDiagnostic("phone", Date.now() - 1));
+    expect(screen.queryByText("1234-ABCD")).toBeNull();
+    await screen.findByText("This code has expired.");
+    native.diagnostic({ ...noDiagnostic, deviceUnsupported: true });
+    native.setSnapshot(accessSnapshot("loginFailed", null, "Provider has no device support"));
+    expect(await screen.findByText(/QR sign-in is unavailable/)).toBeTruthy();
+    expect(native.start).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in on this device" }));
+    await waitFor(() => expect(native.start.mock.calls).toEqual([["device"], ["browser"]]));
+    expect(native.openLogin).not.toHaveBeenCalled();
+  });
+
+  test("switches an active phone attempt to the native browser only after retirement", async () => {
+    const native = nativeFixture(accessSnapshot("loginRequired"), noDiagnostic);
+    await waitFor(() => expect(native.start).toHaveBeenCalledExactlyOnceWith("device"));
+    native.setSnapshot(accessSnapshot("loginInProgress", "phone"));
+    const details = deviceDiagnostic("phone");
+    native.diagnostic({ ...details, device: { ...details.device!, qr: null } });
+    expect(screen.getByText("1234-ABCD")).toBeTruthy();
+    expect(screen.queryByRole("img")).toBeNull();
+
+    let retire!: (snapshot: ClientSnapshot) => void;
+    native.dispatch.mockReturnValueOnce(new Promise((resolve) => { retire = resolve; }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in on this device" }));
+    expect(native.dispatch).toHaveBeenCalledExactlyOnceWith({ type: "cancelWaltrLogin", attemptId: "phone" });
+    expect(screen.queryByText("1234-ABCD")).toBeNull();
+    expect(native.start).toHaveBeenCalledTimes(1);
+    const retired = accessSnapshot("loginRequired");
+    native.setSnapshot(retired);
+    retire(retired);
+    await waitFor(() => expect(native.start.mock.calls).toEqual([["device"], ["browser"]]));
+    expect(native.openLogin).not.toHaveBeenCalled();
+  });
+
+  test("cancel hides the phone code without auto-starting another attempt", async () => {
+    const native = nativeFixture(accessSnapshot("loginRequired"), noDiagnostic);
+    await waitFor(() => expect(native.start).toHaveBeenCalledExactlyOnceWith("device"));
+    native.setSnapshot(accessSnapshot("loginInProgress", "phone"));
+    native.diagnostic(deviceDiagnostic("phone"));
+    expect(screen.getByText("1234-ABCD")).toBeTruthy();
+    const retired = accessSnapshot("loginRequired");
+    native.dispatch.mockImplementationOnce(async () => {
+      native.setSnapshot(retired);
+      return retired;
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel login" }));
+    expect(native.dispatch).toHaveBeenCalledExactlyOnceWith({ type: "cancelWaltrLogin", attemptId: "phone" });
+    await waitFor(() => expect(screen.queryByText("1234-ABCD")).toBeNull());
+    native.setSnapshot(accessSnapshot("unknownChecking"));
+    native.setSnapshot(retired);
+    expect(native.start).toHaveBeenCalledTimes(1);
   });
 
   test.each([

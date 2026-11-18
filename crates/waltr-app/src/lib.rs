@@ -141,10 +141,24 @@ async fn remove_server(
 async fn start_access_login(
     bridge: State<'_, Arc<RuntimeBridge>>,
     generation: u64,
+    method: Option<AccessLoginMethod>,
 ) -> Result<(), String> {
     bridge
-        .access_action(generation, waltr_client::NativeAccessAction::Start)
+        .access_action(
+            generation,
+            match method.unwrap_or(AccessLoginMethod::Browser) {
+                AccessLoginMethod::Device => waltr_client::NativeAccessAction::StartDevice,
+                AccessLoginMethod::Browser => waltr_client::NativeAccessAction::Start,
+            },
+        )
         .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AccessLoginMethod {
+    Device,
+    Browser,
 }
 #[tauri::command]
 async fn logout_access(

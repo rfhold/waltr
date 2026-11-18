@@ -1,4 +1,4 @@
-import { Show, type ParentProps } from "solid-js";
+import { createEffect, Show, type ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
 import { AccessRoute, NativeAccessDiagnostic } from "../access/AccessRoute";
@@ -10,6 +10,15 @@ export function AppLayout(props: ParentProps) {
   const app = useAppState();
   const accessStatus = () => app.snapshot()?.access.status;
   const authenticated = () => accessStatus() === "authenticated";
+  let automaticLoginClaimed = false;
+  createEffect(() => {
+    if (authenticated()) automaticLoginClaimed = false;
+  });
+  const claimAutomaticNativeLogin = () => {
+    if (automaticLoginClaimed) return false;
+    automaticLoginClaimed = true;
+    return true;
+  };
   const loginScreen = () => (!authenticated() && app.accessDiagnostic?.()?.restoring === true) || accessStatus() === "loginRequired" || accessStatus() === "loginInProgress" || accessStatus() === "loginFailed";
   const showSplash = () => (
     (!authenticated() && !loginScreen())
@@ -24,7 +33,7 @@ export function AppLayout(props: ParentProps) {
         {props.children}
         <OAuthDialog />
       </Show>
-      {loginScreen() ? <AccessRoute /> : null}
+      {loginScreen() ? <AccessRoute claimAutomaticNativeLogin={claimAutomaticNativeLogin} /> : null}
       {showSplash() ? <SplashRoute /> : null}
     </div>
   );

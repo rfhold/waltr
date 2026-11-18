@@ -94,3 +94,30 @@
   justify-content: space-between;
   gap: var(--space-3);
 }
+
+.access__device {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-3);
+}
+
+.access__device p {
+  margin: 0;
+}
+
+.access__qr {
+  width: min(14rem, 100%);
+  aspect-ratio: 1;
+  display: block;
+}
+
+.access__verification-url {
+  overflow-wrap: anywhere;
+}
+
+.access__device strong {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  overflow-wrap: anywhere;
+}

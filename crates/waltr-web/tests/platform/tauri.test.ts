@@ -77,11 +77,18 @@ describe("Tauri client adapter", () => {
       emit = (payload) => handler({ payload });
       return vi.fn();
     });
-    const diagnostic = { restoring: false, persistenceWarning: true, failed: true };
+    const device = {
+      attemptId: "phone-attempt",
+      verificationUri: "https://login.example/device",
+      userCode: "ABCD-1234",
+      expiresAtMillis: Date.now() + 60_000,
+      qr: { size: 37, path: "M4 4h7v1h-7z" },
+    };
+    const diagnostic = { restoring: false, persistenceWarning: true, failed: false, device };
     const invoke = vi.fn(async (command) => {
       if (command === "start_runtime") return { generation: 3, dictation: true };
       if (command === "client_state") return { generation: 3, events: [
-        { generation: 3, sequence: 5, payload: { type: "access", diagnostic: { ...diagnostic, error: "SECRET https://secret.invalid" } } },
+        { generation: 3, sequence: 5, payload: { type: "access", diagnostic: { ...diagnostic, error: "SECRET https://secret.invalid", device: { ...device, deviceCode: "SECRET" } } } },
         bridgeState(3, 8, namedSnapshot("recovered")),
       ] };
       throw new Error(`unexpected command ${command}`);
@@ -369,14 +376,19 @@ describe("Tauri client adapter", () => {
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
     await adapter.start();
     await adapter.access!.openLogin("/oidc/login?return_to=SECRET");
+    await adapter.access!.startNativeLogin!("device");
+    await adapter.access!.startNativeLogin!("browser");
     await expect(adapter.access!.logout()).resolves.toBe(true);
     expect(invoke).toHaveBeenCalledWith("start_runtime", { serverId: "remote" });
     expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12 });
+    expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12, method: "device" });
+    expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12, method: "browser" });
     expect(invoke).toHaveBeenCalledWith("logout_access", { generation: 12 });
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("SECRET");
     await adapter.dispose();
     expect(invoke).toHaveBeenCalledWith("dispose_runtime", { generation: 12 });
     await expect(adapter.access!.logout()).rejects.toThrow("not ready");
+    await expect(adapter.access!.startNativeLogin!("device")).rejects.toThrow("not ready");
   });
 
   test("advertised native media stays generation-bound and failed logout remains an explicit failure", async () => {

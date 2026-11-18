@@ -6,7 +6,17 @@ export type AccessDiagnostic = {
   restoring: boolean;
   persistenceWarning: boolean;
   failed: boolean;
+  deviceUnsupported?: boolean;
+  device?: DeviceSignIn;
 };
+export type DeviceSignIn = {
+  attemptId: string;
+  verificationUri: string;
+  userCode: string;
+  expiresAtMillis: number;
+  qr: { size: number; path: string } | null;
+};
+export type NativeLoginMethod = "device" | "browser";
 export type AudioFailure = {
   diagnosticId: number;
   category: "remote_failed" | "permission" | "login_required" | "audio_failed";
@@ -14,6 +24,7 @@ export type AudioFailure = {
 
 export type AccessOperations = {
   openLogin: (url: string) => void | Promise<void>;
+  startNativeLogin?: (method: NativeLoginMethod) => Promise<void>;
   logout: () => Promise<boolean>;
 };
 

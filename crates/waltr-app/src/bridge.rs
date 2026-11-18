@@ -68,17 +68,125 @@ pub enum BridgePayload {
     },
 }
 
-/// Adapter-only diagnostic flags; arbitrary provider and operating-system text stays native.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+/// Adapter-only flags and public sign-in display. Provider errors stay native.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessDiagnostic {
     restoring: bool,
     persistence_warning: bool,
     failed: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    device_unsupported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<Arc<DeviceSignIn>>,
+}
+
+#[derive(Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceSignIn {
+    attempt_id: String,
+    verification_uri: String,
+    user_code: String,
+    expires_at_millis: u64,
+    qr: Option<DeviceQr>,
+}
+
+impl std::fmt::Debug for DeviceSignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSignIn").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct DeviceQr {
+    size: i32,
+    path: String,
+}
+
+impl DeviceSignIn {
+    fn from_progress(
+        attempt_id: &str,
+        verification_uri: &str,
+        verification_uri_complete: Option<&str>,
+        user_code: &str,
+        timeout_millis: u64,
+    ) -> Option<Self> {
+        let display_url = |input: &str| {
+            if input.len() > 2048 || input.chars().any(char::is_control) {
+                return None;
+            }
+            let url = crate::policy::external_https_url(input).ok()?;
+            (url.as_str().len() <= 2048
+                && !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+            .then_some(url)
+        };
+        let verification_uri = display_url(verification_uri)?;
+        if !(1..=64).contains(&user_code.len())
+            || user_code.trim() != user_code
+            || !user_code
+                .bytes()
+                .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+            || !(1..=300_000).contains(&timeout_millis)
+        {
+            return None;
+        }
+        let complete = verification_uri_complete
+            .and_then(display_url)
+            .filter(|complete| complete.origin() == verification_uri.origin());
+        let qr = DeviceQr::encode(complete.as_ref().unwrap_or(&verification_uri).as_str());
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis(),
+        )
+        .ok()?;
+        Some(Self {
+            attempt_id: attempt_id.to_owned(),
+            verification_uri: verification_uri.into(),
+            user_code: user_code.to_owned(),
+            expires_at_millis: now.saturating_add(timeout_millis),
+            qr,
+        })
+    }
+}
+
+impl DeviceQr {
+    fn encode(value: &str) -> Option<Self> {
+        use std::fmt::Write as _;
+        const QUIET_ZONE: i32 = 4;
+        let code = qrcodegen::QrCode::encode_text(value, qrcodegen::QrCodeEcc::Medium).ok()?;
+        let mut path = String::new();
+        for y in 0..code.size() {
+            let mut x = 0;
+            while x < code.size() {
+                if !code.get_module(x, y) {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < code.size() && code.get_module(x, y) {
+                    x += 1;
+                }
+                let width = x - start;
+                write!(
+                    path,
+                    "M{} {}h{width}v1h-{width}z",
+                    start + QUIET_ZONE,
+                    y + QUIET_ZONE
+                )
+                .ok()?;
+            }
+        }
+        Some(Self {
+            size: code.size() + 2 * QUIET_ZONE,
+            path,
+        })
+    }
 }
 
 impl AccessDiagnostic {
-    fn observe(&mut self, progress: &waltr_client::NativeAccessProgress) {
+    fn observe(&mut self, progress: &waltr_client::NativeAccessProgress, attempt_id: Option<&str>) {
         use waltr_client::NativeAccessProgress as Progress;
         match progress {
             Progress::Restoring => {
@@ -87,9 +195,40 @@ impl AccessDiagnostic {
             }
             Progress::RestorationFinished => self.restoring = false,
             Progress::Warning { .. } => self.persistence_warning = true,
-            Progress::Failed { .. } => self.failed = true,
-            Progress::Discovering | Progress::Succeeded | Progress::RefreshSucceeded => {
+            Progress::Failed { .. } => {
+                self.device = None;
+                self.failed = true;
+            }
+            Progress::Discovering
+            | Progress::Succeeded
+            | Progress::RefreshSucceeded
+            | Progress::Canceled => {
+                self.device = None;
+                self.device_unsupported = false;
                 self.failed = false;
+            }
+            Progress::AwaitingDevice {
+                verification_uri,
+                verification_uri_complete,
+                user_code,
+                timeout_millis,
+            } => {
+                self.device = attempt_id
+                    .and_then(|attempt_id| {
+                        DeviceSignIn::from_progress(
+                            attempt_id,
+                            verification_uri,
+                            verification_uri_complete.as_deref(),
+                            user_code,
+                            *timeout_millis,
+                        )
+                    })
+                    .map(Arc::new);
+                self.device_unsupported = attempt_id.is_some() && self.device.is_none();
+            }
+            Progress::DeviceUnsupported => {
+                self.device = None;
+                self.device_unsupported = attempt_id.is_some();
             }
             _ => {}
         }
@@ -271,6 +410,20 @@ impl<T: Clone + Send + Sync> Publisher<T> {
         Some(event)
     }
 
+    async fn publish_access(&mut self, payload: T) {
+        if !self.initial_sent || !self.is_current() {
+            return;
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        let event = self.event(payload);
+        // Recover only the current diagnostic, never superseded sign-in codes.
+        self.recovery
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest_access = Some(event.clone());
+        drop(self.controls.send(event).await);
+    }
+
     const fn event(&self, payload: T) -> BridgeEvent<T> {
         BridgeEvent {
             generation: self.generation,
@@ -297,6 +450,10 @@ enum HostRequest {
     Dictation(Box<crate::dictation::Job>),
     Hold(crate::native_audio::Held),
     Access(waltr_client::NativeAccessAction),
+    StartAccess {
+        action: waltr_client::NativeAccessAction,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     LogoutAccess {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -703,6 +860,17 @@ impl RuntimeBridge {
             let (reply, result) = oneshot::channel();
             requests
                 .send(HostRequest::LogoutAccess { reply })
+                .await
+                .map_err(|_| "Native access is unavailable")?;
+            return result.await.map_err(|_| "Native access is unavailable")?;
+        }
+        if matches!(
+            action,
+            waltr_client::NativeAccessAction::Start | waltr_client::NativeAccessAction::StartDevice
+        ) {
+            let (reply, result) = oneshot::channel();
+            requests
+                .send(HostRequest::StartAccess { action, reply })
                 .await
                 .map_err(|_| "Native access is unavailable")?;
             return result.await.map_err(|_| "Native access is unavailable")?;
@@ -1646,7 +1814,7 @@ async fn run_generation(
                 Some(HostRequest::Media(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::MediaRaw(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::Access(_) | HostRequest::Dictation(_) | HostRequest::Hold(_)) => {},
-                Some(HostRequest::LogoutAccess { reply }) => { drop(reply.send(Err("Native server is not ready".into()))); },
+                Some(HostRequest::LogoutAccess { reply } | HostRequest::StartAccess { reply, .. }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
                     drop(reply.send(Err("embedded server is not ready".to_owned())));
                 }
@@ -1739,19 +1907,14 @@ async fn run_connected_generation(
         restoring: access.is_some(),
         ..AccessDiagnostic::default()
     };
+    let mut access_start_reply: Option<oneshot::Sender<Result<(), String>>> = None;
+    let mut access_cancel_pending = false;
     if access_diagnostic.restoring {
-        if let Some(event) = publisher
-            .publish_control(BridgePayload::Access {
-                diagnostic: access_diagnostic,
+        publisher
+            .publish_access(BridgePayload::Access {
+                diagnostic: access_diagnostic.clone(),
             })
             .await
-        {
-            publisher
-                .recovery
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .latest_access = Some(event);
-        }
     }
     let audio = target
         .app
@@ -1839,21 +2002,42 @@ async fn run_connected_generation(
                 if !publisher.is_current() { break ConnectedExit::Stopped; }
                 match output {
                     waltr_client::NativeAccessOutput::ClientCommand { command, logout_barrier: _ } => {
+                        let start_reply = if matches!(*command, ClientCommand::StartWaltrLogin) { access_start_reply.take() } else { None };
                         audio_access(&audio, &shortcut_epoch, publisher.generation, false);
                         if complete_logout(&media, (&audio, &mut audio_tasks, publisher.generation), || publisher.is_current(), async || Ok(())).await.is_err() {
+                            if let Some(reply) = start_reply {
+                                drop(reply.send(Err("Native sign-in could not start".into())));
+                            }
                             continue;
                         }
                         let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
                         let result = tokio::select! { biased; _ = stop.changed() => break ConnectedExit::Stopped, result = dispatch_command(&mut stream, *command) => result };
+                        let mut started = false;
                         if let Ok(snapshot) = result {
                             reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
                             audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
                             access_host.observe(access.as_ref(), &credentials, &snapshot, started_probe).await;
-                            publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) });
+                            started = publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) }).is_some()
+                                && snapshot.access.active_attempt_id.is_some();
+                        }
+                        if let Some(reply) = start_reply {
+                            drop(reply.send(if started { Ok(()) } else { Err("Native sign-in could not start".into()) }));
                         }
                     }
                     waltr_client::NativeAccessOutput::Progress(progress) => {
+                        match &progress {
+                            waltr_client::NativeAccessProgress::Canceled => access_cancel_pending = false,
+                            waltr_client::NativeAccessProgress::Failed { .. } if !access_cancel_pending => {
+                                if let Some(reply) = access_start_reply.take() {
+                                    drop(reply.send(Err("Native sign-in could not start".into())));
+                                }
+                            }
+                            _ => {}
+                        }
+                        let snapshot = stream.snapshot();
+                        let attempt_id = snapshot.access.active_attempt_id.as_deref();
                         if let waltr_client::NativeAccessProgress::AwaitingBrowser { authorization_url, .. } = &progress
+                            && attempt_id.is_some()
                             && let (Some(app), Ok(url)) = (&target.app, crate::native_auth::browser_url(authorization_url))
                         {
                             use tauri_plugin_opener::OpenerExt as _;
@@ -1861,11 +2045,8 @@ async fn run_connected_generation(
                             let bridge = app.state::<Arc<RuntimeBridge>>();
                             drop(bridge.with_current(publisher.generation, || app.opener().open_url(url.to_string(), None::<&str>).map_err(|_| "Authorization browser could not be opened".to_owned())));
                         }
-                        access_diagnostic.observe(&progress);
-                        // Pin the cumulative diagnostic independently of the bounded control history.
-                        if let Some(event) = publisher.publish_control(BridgePayload::Access { diagnostic: access_diagnostic }).await {
-                            publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_access = Some(event);
-                        }
+                        access_diagnostic.observe(&progress, attempt_id);
+                        publisher.publish_access(BridgePayload::Access { diagnostic: access_diagnostic.clone() }).await;
                     }
                 }
             }
@@ -1897,6 +2078,13 @@ async fn run_connected_generation(
                     }
                 }
                 Some(HostRequest::LogoutAccess { reply }) => {
+                    if let Some(reply) = access_start_reply.take() {
+                        drop(reply.send(Err("Native sign-in was interrupted".into())));
+                    }
+                    access_cancel_pending = false;
+                    access_diagnostic.device = None;
+                    access_diagnostic.device_unsupported = false;
+                    publisher.publish_access(BridgePayload::Access { diagnostic: access_diagnostic.clone() }).await;
                     audio_access(&audio, &shortcut_epoch, publisher.generation, false);
                     let current = publisher.active_generation.clone();
                     let generation = publisher.generation;
@@ -1921,19 +2109,36 @@ async fn run_connected_generation(
                     ).await;
                     if access.is_none() {
                         access_diagnostic.restoring = false;
-                        if let Some(event) = publisher.publish_control(BridgePayload::Access { diagnostic: access_diagnostic }).await {
-                            publisher.recovery.write().unwrap_or_else(std::sync::PoisonError::into_inner).latest_access = Some(event);
-                        }
+                        publisher.publish_access(BridgePayload::Access { diagnostic: access_diagnostic.clone() }).await;
                     }
                     drop(reply.send(result));
                 }
                 Some(HostRequest::Access(action)) => {
                     if !publisher.is_current() { continue; }
-                    if access.is_none() && matches!(action, waltr_client::NativeAccessAction::Start)
-                        && let Some(binding) = &target.access
-                        && let Ok(binding) = binding.fresh().await
-                    { access = Some(binding.spawn(credentials.clone())); }
                     if let Some(access) = &access { drop(access.action_sender().send(action).await); }
+                }
+                Some(HostRequest::StartAccess { action, reply }) => {
+                    let result = async {
+                        if !publisher.is_current() { return Err("Native client generation was replaced"); }
+                        let snapshot = stream.snapshot();
+                        if access_start_reply.is_some() || access_diagnostic.restoring || snapshot.access.active_attempt_id.is_some()
+                            || !matches!(snapshot.access.status, waltr_client::AccessStatus::LoginRequired | waltr_client::AccessStatus::LoginFailed)
+                        {
+                            return Err("Native sign-in cannot start in the current access state");
+                        }
+                        if access.is_none() {
+                            let binding = target.access.as_ref().ok_or("Native access is unavailable")?;
+                            let binding = binding.fresh().await.map_err(|_| "Native access is unavailable")?;
+                            access = Some(binding.spawn(credentials.clone()));
+                        }
+                        if !publisher.is_current() { return Err("Native client generation was replaced"); }
+                        access.as_ref().ok_or("Native access is unavailable")?.action_sender().send(action).await.map_err(|_| "Native access is unavailable")?;
+                        Ok(())
+                    }.await;
+                    match result {
+                        Ok(()) => access_start_reply = Some(reply),
+                        Err(error) => drop(reply.send(Err(error.to_owned()))),
+                    }
                 }
                 Some(HostRequest::Dispatch { command, reply }) => {
                     if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
@@ -1943,6 +2148,13 @@ async fn run_connected_generation(
                             drop(reply.send(Err(error)));
                             continue;
                         }
+                    }
+                    if let ClientCommand::CancelWaltrLogin { attempt_id } = &*command
+                        && stream.snapshot().access.active_attempt_id.as_ref() == Some(attempt_id)
+                    {
+                        access_cancel_pending = access.is_some();
+                        access_diagnostic.device = None;
+                        publisher.publish_access(BridgePayload::Access { diagnostic: access_diagnostic.clone() }).await;
                     }
                     access_host.cancel_command(access.as_ref(), &credentials, &stream.snapshot(), &command).await;
                     let started_probe = crate::native_auth::AccessHost::starts_probe(&stream.snapshot(), &command);
@@ -2236,25 +2448,119 @@ mod tests {
     fn access_diagnostic_is_bounded_and_warning_survives_success() {
         use waltr_client::NativeAccessProgress as Progress;
         let mut diagnostic = AccessDiagnostic::default();
-        diagnostic.observe(&Progress::Warning {
-            warning: "SECRET https://secret.invalid/token".into(),
-        });
-        diagnostic.observe(&Progress::Failed {
-            error: "SECRET provider error".into(),
-        });
+        diagnostic.observe(
+            &Progress::Warning {
+                warning: "SECRET https://secret.invalid/token".into(),
+            },
+            None,
+        );
+        diagnostic.observe(
+            &Progress::Failed {
+                error: "SECRET provider error".into(),
+            },
+            None,
+        );
         assert!(diagnostic.failed);
-        diagnostic.observe(&Progress::Succeeded);
+        diagnostic.observe(&Progress::Succeeded, None);
         assert!(diagnostic.persistence_warning);
         assert!(!diagnostic.failed);
-        diagnostic.observe(&Progress::AwaitingBrowser {
-            authorization_url: "https://secret.invalid/SECRET".into(),
-            timeout_millis: 100,
-        });
+        diagnostic.observe(
+            &Progress::AwaitingBrowser {
+                authorization_url: "https://secret.invalid/SECRET".into(),
+                timeout_millis: 100,
+            },
+            Some("attempt"),
+        );
         let json = serde_json::to_string(&BridgePayload::Access { diagnostic }).unwrap();
         assert_eq!(
             json,
             r#"{"type":"access","diagnostic":{"restoring":false,"persistenceWarning":true,"failed":false}}"#
         );
+    }
+
+    #[test]
+    fn device_diagnostic_contains_only_display_material_and_retires_with_the_attempt() {
+        use waltr_client::NativeAccessProgress as Progress;
+        let mut diagnostic = AccessDiagnostic::default();
+        let progress = Progress::AwaitingDevice {
+            verification_uri: "https://login.example/device".into(),
+            verification_uri_complete: Some("https://login.example/device?user_code=A-B".into()),
+            user_code: "A-B".into(),
+            timeout_millis: 30_000,
+        };
+        diagnostic.observe(&progress, None);
+        assert!(diagnostic.device.is_none());
+
+        diagnostic.observe(&progress, Some("attempt"));
+        let device = diagnostic.device.as_ref().unwrap();
+        let qr = device.qr.as_ref().unwrap();
+        assert!(qr.size > 21);
+        assert!(qr.path.starts_with("M4 4h7v1h-7z"));
+        let wire = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(wire["device"]["attemptId"], "attempt");
+        assert_eq!(
+            wire["device"]["verificationUri"],
+            "https://login.example/device"
+        );
+        assert_eq!(wire["device"]["userCode"], "A-B");
+        assert!(!wire.to_string().contains("?user_code"));
+        assert!(!format!("{diagnostic:?}").contains("A-B"));
+
+        diagnostic.observe(&Progress::Canceled, None);
+        assert!(
+            serde_json::to_value(&diagnostic)
+                .unwrap()
+                .get("device")
+                .is_none()
+        );
+        diagnostic.observe(&Progress::DeviceUnsupported, Some("attempt-next"));
+        diagnostic.observe(
+            &Progress::Failed {
+                error: "private error".into(),
+            },
+            None,
+        );
+        assert!(diagnostic.device_unsupported);
+        diagnostic.observe(&Progress::Discovering, None);
+        assert!(!diagnostic.device_unsupported);
+    }
+
+    #[test]
+    fn device_qr_falls_back_to_the_validated_manual_uri() {
+        let manual = "https://login.example/device";
+        let expected = DeviceQr::encode(manual);
+        assert!(expected.is_some());
+        for complete in [
+            "https://login.example.evil.test/device",
+            "http://login.example/device",
+            "https://login.example/device#secret",
+            "https://login.example@evil.test/device",
+        ] {
+            let device =
+                DeviceSignIn::from_progress("attempt", manual, Some(complete), "A-B", 100).unwrap();
+            assert_eq!(device.qr, expected);
+        }
+        let valid = DeviceSignIn::from_progress(
+            "attempt",
+            manual,
+            Some("https://login.example/complete?code=A-B"),
+            "A-B",
+            100,
+        )
+        .unwrap();
+        assert_ne!(valid.qr, expected);
+        assert!(
+            DeviceSignIn::from_progress(
+                "attempt",
+                "http://localhost:3000/device",
+                None,
+                "A-B",
+                100
+            )
+            .is_none()
+        );
+        assert!(DeviceSignIn::from_progress("attempt", manual, None, "A\nB", 100).is_none());
+        assert!(DeviceSignIn::from_progress("attempt", manual, None, "A-B", 0).is_none());
     }
 
     #[test]
@@ -2312,6 +2618,29 @@ mod tests {
                 .map(|event| (event.sequence, event.payload))
                 .collect::<Vec<_>>(),
             [(1, "control"), (2, "state")]
+        );
+    }
+
+    #[tokio::test]
+    async fn access_recovery_omits_superseded_device_display() {
+        let active = Arc::new(AtomicU64::new(3));
+        let recovery = Arc::new(RwLock::new(RecoveryState::new(3)));
+        let (mut publisher, mut feed) = Publisher::new(active, 3, Arc::clone(&recovery));
+        publisher.publish_initial("starting").await;
+        feed.initial().await.unwrap();
+        publisher.publish_access("first code").await;
+        publisher.publish_access("retired").await;
+        publisher.publish_state("state").unwrap();
+        assert_eq!(feed.next_update().await.unwrap().payload, "first code");
+        assert_eq!(feed.next_update().await.unwrap().payload, "retired");
+        let recovered = recovery_after(&recovery.read().unwrap(), 3, Some(0));
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .map(|event| (event.sequence, event.payload))
+                .collect::<Vec<_>>(),
+            [(2, "retired"), (3, "state")]
         );
     }
 

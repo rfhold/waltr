@@ -100,10 +100,19 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
       publishAudioFailure(failure && Number.isSafeInteger(failure.diagnosticId) && failure.diagnosticId > 0 && ["remote_failed", "permission", "login_required", "audio_failed"].includes(failure.category)
         ? { diagnosticId: failure.diagnosticId, category: failure.category } : undefined);
     } else if (event.payload.type === "access") {
+      const device = event.payload.diagnostic?.device;
       publishDiagnostic({
         restoring: event.payload.diagnostic?.restoring === true,
         persistenceWarning: event.payload.diagnostic?.persistenceWarning === true,
         failed: event.payload.diagnostic?.failed === true,
+        ...(event.payload.diagnostic?.deviceUnsupported === true ? { deviceUnsupported: true } : {}),
+        ...(device ? { device: {
+          attemptId: device.attemptId,
+          verificationUri: device.verificationUri,
+          userCode: device.userCode,
+          expiresAtMillis: device.expiresAtMillis,
+          qr: device.qr ? { size: device.qr.size, path: device.qr.path } : null,
+        } } : {}),
       });
     } else if (event.payload.type === "platform" && event.payload.startup !== "ready") {
       dictation?.cancel();
@@ -274,6 +283,11 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         if (disposed || generation === undefined) throw new Error("Native client is not ready");
         dictation?.cancel();
         await api.invoke("start_access_login", { generation });
+      },
+      startNativeLogin: async (method) => {
+        if (disposed || generation === undefined || generation !== announcedGeneration) throw new Error("Native client is not ready");
+        dictation?.cancel();
+        await api.invoke("start_access_login", { generation, method });
       },
       logout: async () => {
         if (disposed || generation === undefined) throw new Error("Native client is not ready");
