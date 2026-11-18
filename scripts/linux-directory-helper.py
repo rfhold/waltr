@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ctypes
 import errno
+import fcntl
 import json
 import os
 import stat
@@ -40,6 +41,31 @@ def remove_if_identity(path, expected_device, expected_inode, directory_fd=None)
     os.rmdir(path, dir_fd=directory_fd)
 
 
+def promote_install(parent, source, destination, parent_identity, previous):
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        # Serialize only promotion, not builds. Every cooperating installer
+        # validates its original destination snapshot under this same lock.
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        directory = os.fstat(directory_fd)
+        if (directory.st_dev, directory.st_ino) != parent_identity or directory.st_uid != os.geteuid() or directory.st_mode & 0o022:
+            raise OSError(errno.ESTALE, "Linux install directory changed during install", parent)
+        if not previous:
+            rename_noreplace(source, destination, directory_fd)
+            return
+        try:
+            current = os.stat(destination, dir_fd=directory_fd, follow_symlinks=False)
+            identity = (current.st_dev, current.st_ino, current.st_ctime_ns, current.st_mtime_ns, current.st_size)
+        except FileNotFoundError:
+            identity = None
+        if identity != previous:
+            raise OSError(errno.ESTALE, "Destination changed during build; refusing replacement", destination)
+        # A process ignoring flock can still race this check and rename.
+        os.replace(source, destination, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def main():
     try:
         if len(sys.argv) == 4 and sys.argv[1] == "rename-noreplace":
@@ -50,6 +76,11 @@ def main():
             remove_if_identity(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
         elif len(sys.argv) == 5 and sys.argv[1] == "remove-if-identity-at":
             remove_if_identity(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), 3)
+        elif len(sys.argv) in (7, 12) and sys.argv[1] == "promote-install":
+            parent, source, destination = sys.argv[2:5]
+            parent_identity = tuple(map(int, sys.argv[5:7]))
+            previous = tuple(map(int, sys.argv[7:]))
+            promote_install(parent, source, destination, parent_identity, previous)
         else:
             raise OSError(errno.EINVAL, "invalid helper arguments")
     except (OSError, ValueError, AttributeError) as error:

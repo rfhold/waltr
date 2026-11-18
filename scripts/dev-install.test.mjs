@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
-import { cpSync, readFileSync, writeFileSync } from "node:fs";
+import { execFile, spawnSync } from "node:child_process";
+import { cpSync, existsSync, lstatSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { main } from "./dev-install.mjs";
 
 const tempRoot = path.join(tmpdir(), "opencode");
+const directoryHelper = fileURLToPath(new URL("linux-directory-helper.py", import.meta.url));
+const runFile = promisify(execFile);
 
 async function bundle(directory, marker = "new", identifier = "dev.waltr.app") {
   await fs.mkdir(path.join(directory, "Contents/MacOS"), { recursive: true });
@@ -343,7 +348,7 @@ test("rollback failure preserves backup for manual recovery", async (t) => {
 
 test("platform, architecture and unknown flags fail before subprocesses", async () => {
   const runner = () => assert.fail("unexpected subprocess");
-  await assert.rejects(main([], { platform: "linux", arch: "arm64", runner }), /Apple Silicon/);
+  await assert.rejects(main([], { platform: "linux", arch: "ia32", runner }), /Linux \(x64\/arm64\)/);
   await assert.rejects(main([], { platform: "darwin", arch: "x64", runner }), /Apple Silicon/);
   await assert.rejects(main(["--destination", "/tmp/elsewhere"], { runner }), /Usage/);
 });
@@ -468,4 +473,254 @@ test("cleanup failure retains signature failure and reports retained staged tran
   assert.equal(await f.marker(), "old");
   const transaction = (await fs.readdir(path.dirname(f.destination))).find((name) => name.startsWith(".waltr-install-"));
   assert.ok(await fs.stat(path.join(path.dirname(f.destination), transaction, "Waltr.app")));
+});
+
+function linuxElf(machine = 62, label = "new") {
+  const bytes = Buffer.alloc(128 + label.length);
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]).copy(bytes);
+  bytes.writeUInt16LE(3, 16);
+  bytes.writeUInt16LE(machine, 18);
+  bytes.writeUInt32LE(1, 20);
+  bytes.writeBigUInt64LE(0x80n, 24);
+  bytes.writeBigUInt64LE(64n, 32);
+  bytes.writeUInt16LE(64, 52);
+  bytes.writeUInt16LE(56, 54);
+  bytes.writeUInt16LE(1, 56);
+  bytes.writeUInt32LE(1, 64); // PT_LOAD
+  bytes.writeUInt32LE(5, 68); // PF_R | PF_X
+  bytes.writeBigUInt64LE(BigInt(bytes.length), 96);
+  bytes.writeBigUInt64LE(BigInt(bytes.length), 104);
+  bytes.write(label, 128);
+  return bytes;
+}
+
+async function linuxFixture(t, { arch = "x64", machine = 62, installed = false } = {}) {
+  await fs.mkdir(tempRoot, { recursive: true });
+  const directory = await fs.mkdtemp(path.join(await fs.realpath(tempRoot), "dev-install-linux-test-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const home = path.join(directory, "home with spaces");
+  const root = path.join(directory, "repo with spaces");
+  const local = path.join(home, ".local");
+  const parent = path.join(local, "bin");
+  const destination = path.join(parent, "waltr-desktop");
+  const host = `${arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`;
+  const target = path.join(root, "target/linux-default");
+  const source = path.join(target, host, "debug/waltr-app");
+  await fs.mkdir(home);
+  await fs.mkdir(path.dirname(source), { recursive: true });
+  await fs.writeFile(source, linuxElf(machine), { mode: 0o755 });
+  const calls = [];
+  const logs = [];
+  const attributes = new Map();
+  const options = {
+    platform: "linux", arch, home, root, env: { CARGO_TARGET_DIR: "/wrong", CARGO_BUILD_TARGET: "wasm32-unknown-unknown", WALTR_DEV_SIGNING_IDENTITY: "" },
+    log: (message) => logs.push(message),
+    runner: (command, args, options) => {
+      calls.push({ command, args, options });
+      if (command === "rustc") return `rustc x.y.z\nhost: ${host}\n`;
+      if (["pnpm", "node", "cargo"].includes(command)) return "";
+      assert.equal(command, "python3");
+      if (args[0] === "-c") {
+        const [, , op, file, value] = args;
+        const { dev, ino } = lstatSync(file, { bigint: true });
+        const key = `${dev}:${ino}`;
+        if (op === "get") return attributes.get(key) ?? "";
+        assert.equal(op, "set");
+        assert.ok(!attributes.has(key));
+        attributes.set(key, value);
+        return "";
+      }
+      assert.equal(args[1], "promote-install");
+      if (process.platform === "linux") {
+        const result = spawnSync(command, args, { encoding: "utf8" });
+        if (result.error) throw result.error;
+        if (result.status !== 0) {
+          const { code, message } = JSON.parse(result.stderr);
+          throw new Error(`${code}: ${message}`);
+        }
+        return result.stdout;
+      }
+      const [, , dir, staged, name, , , ...previous] = args;
+      const file = path.join(dir, name);
+      if (previous.length) {
+        const stat = existsSync(file) ? lstatSync(file, { bigint: true }) : null;
+        if (destinationIdentity(stat).join() !== previous.join()) throw new Error("Destination changed during build");
+      } else if (existsSync(file)) throw new Error("EEXIST");
+      renameSync(path.join(dir, staged), file);
+      return "";
+    },
+  };
+  if (installed) {
+    await fs.writeFile(source, linuxElf(machine, "old"));
+    await main([], options);
+    await fs.writeFile(source, linuxElf(machine));
+    calls.length = 0;
+  }
+  const clean = async () => assert.deepEqual(await fs.readdir(parent), ["waltr-desktop"]);
+  return { home, local, parent, destination, host, target, source, root, calls, logs, options, clean };
+}
+
+function destinationIdentity(stat) {
+  return stat ? [stat.dev, stat.ino, stat.ctimeNs, stat.mtimeNs, stat.size].map(String) : [];
+}
+
+for (const [arch, machine] of [["x64", 62], ["arm64", 183]]) {
+  test(`Linux ${arch} dry-run is inert; first install uses a native locked debug build and identical executable`, async (t) => {
+    const f = await linuxFixture(t, { arch, machine });
+    const fail = () => assert.fail("unexpected dry-run side effect");
+    await main(["--dry-run"], { ...f.options, runner: fail, io: new Proxy({}, { get: fail }) });
+    assert.match(f.logs.at(-1), /WALTR_WASM_BUILD_LOCKED=1 pnpm/);
+    assert.match(f.logs.at(-1), /cargo build --locked.*tauri\/custom-protocol --target <host-triple>/);
+    assert.ok(f.logs.at(-1).includes(f.destination));
+    await assert.rejects(fs.lstat(f.local), { code: "ENOENT" });
+    await main([], f.options);
+    assert.deepEqual(f.calls.slice(0, 4).map(({ command, args, options }) => [command, args, options.cwd]), [
+      ["rustc", ["-vV"], f.root],
+      ["pnpm", ["--filter", "@rfhold/waltr-web", "build:tauri"], f.root],
+      ["node", ["scripts/stage-web.mjs"], path.join(f.root, "crates/waltr-app")],
+      ["cargo", ["build", "--locked", "-p", "waltr-app", "--bin", "waltr-app", "--features", "tauri/custom-protocol", "--target", f.host], f.root],
+    ]);
+    assert.equal(f.calls[3].options.env.CARGO_TARGET_DIR, f.target);
+    assert.equal(f.calls[3].options.stdio, "inherit");
+    assert.equal(f.calls[1].options.env.WALTR_WASM_BUILD_LOCKED, "1");
+    assert.ok(f.calls.filter(({ command }) => command !== "pnpm").every(({ options }) => !("WALTR_WASM_BUILD_LOCKED" in options.env)));
+    assert.equal(f.calls.at(-1).args[1], "promote-install");
+    assert.equal(f.calls.at(-1).args.length, 7);
+    assert.deepEqual(await fs.readFile(f.destination), linuxElf(machine));
+    assert.equal((await fs.stat(f.destination)).mode & 0o777, 0o755);
+    assert.match(f.logs.at(-1), /Waltr was not launched/);
+    await f.clean();
+  });
+}
+
+test("Linux repeats install via one atomic replacement of the marked previous executable", async (t) => {
+  const f = await linuxFixture(t, { installed: true });
+  let promotions = 0;
+  const runner = f.options.runner;
+  f.options.runner = (command, args, options) => {
+    if (args[1] === "promote-install") {
+      promotions++;
+      assert.equal(args[2], f.parent);
+      assert.equal(args[4], "waltr-desktop");
+      assert.deepEqual(readFileSync(f.destination), linuxElf(62, "old"));
+      assert.deepEqual(args.slice(7), destinationIdentity(lstatSync(f.destination, { bigint: true })));
+    }
+    return runner(command, args, options);
+  };
+  await main([], f.options);
+  assert.equal(promotions, 1);
+  assert.deepEqual(await fs.readFile(f.destination), linuxElf());
+  assert.ok(f.logs.at(-1).includes(createHash("sha256").update(linuxElf()).digest("hex")));
+  await f.clean();
+});
+
+for (const failure of ["pnpm", "node", "cargo", "source", "source mode", "source symlink", "staged bytes", "marker", "rename"]) {
+  test(`Linux ${failure} failure preserves the previous install`, async (t) => {
+    const f = await linuxFixture(t, { installed: true });
+    const runner = f.options.runner;
+    f.options.runner = (command, args, options) => {
+      if (command === failure || (failure === "marker" && command === "python3" && args[2] === "set") ||
+          (failure === "rename" && args[1] === "promote-install")) throw new Error("fake failure");
+      return runner(command, args, options);
+    };
+    if (failure === "source") await fs.writeFile(f.source, linuxElf(183));
+    if (failure === "source mode") await fs.chmod(f.source, 0o644);
+    if (failure === "source symlink") {
+      await fs.rename(f.source, `${f.source}.real`);
+      await fs.symlink(`${f.source}.real`, f.source);
+    }
+    f.options.io = { ...fs,
+      copyFile: async (...args) => {
+        await fs.copyFile(...args);
+        if (failure === "staged bytes") await fs.writeFile(args[1], linuxElf(62, "different"));
+      },
+      rename: async () => assert.fail("expected promotion through the helper"),
+    };
+    await assert.rejects(main([], f.options), /fake failure|invalid native Linux ELF|Staged executable differs/);
+    assert.deepEqual(await fs.readFile(f.destination), linuxElf(62, "old"));
+    await f.clean();
+  });
+}
+
+for (const unsafe of ["home symlink", "local symlink", "bin symlink", "writable bin", "destination symlink", "destination directory", "unmarked executable", "hardlink", "in-place edit"]) {
+  test(`Linux refuses ${unsafe} before any build`, async (t) => {
+    const f = await linuxFixture(t, { installed: ["hardlink", "in-place edit"].includes(unsafe) });
+    if (["home symlink", "local symlink", "bin symlink"].includes(unsafe)) {
+      const dir = f[unsafe.split(" ")[0] === "bin" ? "parent" : unsafe.split(" ")[0]];
+      await fs.mkdir(dir, { recursive: true });
+      await fs.rename(dir, `${dir}.real`);
+      await fs.symlink(`${dir}.real`, dir);
+    } else {
+      await fs.mkdir(f.parent, { recursive: true });
+      if (unsafe === "writable bin") await fs.chmod(f.parent, 0o777);
+      if (unsafe === "destination symlink") await fs.symlink(f.source, f.destination);
+      if (unsafe === "destination directory") await fs.mkdir(f.destination);
+      if (unsafe === "unmarked executable") await fs.writeFile(f.destination, linuxElf(), { mode: 0o755 });
+      if (unsafe === "hardlink") await fs.link(f.destination, `${f.destination}.alias`);
+      if (unsafe === "in-place edit") await fs.writeFile(f.destination, linuxElf(62, "unrelated"));
+    }
+    await assert.rejects(main([], f.options), /Refusing unsafe|unrecognized or modified/);
+    assert.ok(!f.calls.some(({ command }) => ["pnpm", "node", "cargo"].includes(command)));
+  });
+}
+
+test("Linux detects incompatible Rust host before any build", async (t) => {
+  const f = await linuxFixture(t, { arch: "arm64", machine: 183 });
+  f.options.runner = (command) => {
+    assert.equal(command, "rustc");
+    return "host: x86_64-unknown-linux-gnu\n";
+  };
+  await assert.rejects(main([], f.options), /not native Linux arm64/);
+});
+
+for (const change of ["new destination", "different inode", "same-inode rewrite", "different bin"]) {
+  test(`Linux refuses to overwrite following ${change} during the build`, async (t) => {
+    const f = await linuxFixture(t, { installed: change !== "new destination" });
+    await fs.mkdir(f.parent, { recursive: true });
+    const runner = f.options.runner;
+    f.options.runner = (command, ...args) => {
+      if (command === "cargo") {
+        if (change === "different inode") renameSync(f.destination, `${f.destination}.saved`);
+        if (change === "different bin") {
+          renameSync(f.parent, `${f.parent}.saved`);
+        } else {
+          writeFileSync(f.destination, linuxElf(62, "external"), { mode: 0o755 });
+        }
+      }
+      return runner(command, ...args);
+    };
+    await assert.rejects(main([], f.options), /Destination changed|directory changed|EEXIST/);
+    const checked = change === "different bin" ? path.join(`${f.parent}.saved`, "waltr-desktop") : f.destination;
+    assert.deepEqual(await fs.readFile(checked), linuxElf(62, change === "different bin" ? "old" : "external"));
+  });
+}
+
+test("Linux first promotion atomically refuses a destination appearing after the final check", async (t) => {
+  const f = await linuxFixture(t);
+  const runner = f.options.runner;
+  f.options.runner = (command, args, options) => {
+    if (command === "python3" && args[1] === "promote-install") writeFileSync(f.destination, "unrelated");
+    return runner(command, args, options);
+  };
+  await assert.rejects(main([], f.options), /EEXIST/);
+  assert.equal(await fs.readFile(f.destination, "utf8"), "unrelated");
+  await f.clean();
+});
+
+test("Linux promotion helper lets only one competing reinstall replace the same snapshot", { skip: process.platform !== "linux" }, async (t) => {
+  const f = await linuxFixture(t, { installed: true });
+  const parent = await fs.lstat(f.parent, { bigint: true });
+  const snapshot = destinationIdentity(await fs.lstat(f.destination, { bigint: true }));
+  const candidates = ["candidate A", "candidate B"];
+  for (const candidate of candidates) await fs.writeFile(path.join(f.parent, candidate), candidate);
+  const results = await Promise.allSettled(candidates.map((candidate) => runFile("python3", [
+    directoryHelper, "promote-install", f.parent, candidate, "waltr-desktop", String(parent.dev), String(parent.ino), ...snapshot,
+  ])));
+  const winner = results.findIndex(({ status }) => status === "fulfilled");
+  assert.notEqual(winner, -1);
+  const loser = 1 - winner;
+  assert.equal(results[loser].status, "rejected");
+  assert.match(results[loser].reason.stderr, /ESTALE.*Destination changed/);
+  assert.equal(await fs.readFile(f.destination, "utf8"), candidates[winner]);
+  assert.deepEqual((await fs.readdir(f.parent)).sort(), [candidates[loser], "waltr-desktop"]);
 });

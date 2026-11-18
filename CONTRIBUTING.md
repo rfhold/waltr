@@ -77,7 +77,7 @@ The full `web` build and served-app builds remain independent of this override.
 See [Waltr-served Apps authoring](docs/mcp/apps-authoring.md) for the static source, resource, and ordinary tool addition path.
 See [MCP Apps deployment](docs/deployment.md#mcp-apps-assets-and-app-container) for prerequisites, bundled startup, and external host configuration.
 Normal Apple Silicon macOS builds enable Apps without a diagnostic feature, separate profile, or prior isolation report.
-Other native platforms remain unsupported; this support makes no Intel or universal-package promise.
+This Apps support makes no promise for other native platforms, Intel Macs, or universal macOS packages.
 See [macOS Apps verification](docs/testing.md#macos-native-apps-verification) for live acceptance and the optional diagnostic harness.
 
 From `crates/waltr-app`, build the normal unsigned Apple Silicon debug app:
@@ -94,14 +94,31 @@ open target/macos-default/aarch64-apple-darwin/debug/bundle/macos/Waltr.app
 
 These commands describe a procedure, not a successful build or live test.
 
-To build and install the local debug app at the stable `~/Applications/Waltr.app` path:
+To build and install the local debug app:
 
 ```sh
 pnpm dev:install
 ```
 
 Quit Waltr before each install, including any copy open from the build directory.
-The installer supports native Apple Silicon macOS only.
+
+## Linux development install
+
+The installer supports native x86-64 and ARM64 Linux, and installs `~/.local/bin/waltr-desktop`.
+It requires the web build prerequisites above, Python 3, and the native GTK 3, WebKitGTK 4.1, and ALSA development libraries.
+The destination filesystem must support user extended attributes and atomic no-replace rename.
+It uses `--locked` for both the web assets' Rust build and the native debug executable.
+It checks the native ELF format and the staged copy's SHA-256 before atomic replacement.
+A failed build or verification leaves the previous executable in place.
+Use a user-owned home and install directories without symlinks or group or world write access.
+The installer refuses unrecognized or modified executables and serializes replacement across installer processes.
+Do not modify the install path with other tools while the installer runs.
+It does not install system libraries, create a desktop menu entry, or launch Waltr.
+Open `~/.local/bin/waltr-desktop` manually after installation.
+
+## Apple Silicon macOS development install
+
+The installer uses the stable `~/Applications/Waltr.app` path.
 It requires the build prerequisites above, Xcode command-line tools, and the Cargo Tauri CLI.
 It uses the normal unsigned debug build, packaged web assets, and `--locked` Cargo dependencies.
 It sets `CARGO_TARGET_DIR` to the repository's `target/macos-default`, regardless of your shell's current directory or target-directory override.
@@ -129,11 +146,13 @@ The app keeps the `dev.waltr.app` identity and the same app data, profiles, and 
 This command creates no separate development profile and requires no Vite server or hot reload.
 Ad-hoc signatures cover one code version, so rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.
 A consistent certificate identity matters across rebuilds, but neither a stable path nor successful signature verification guarantees permission retention.
-`pnpm dev` continues to start the server, web client, and TUI; its behavior does not change.
 
-Use `pnpm dev:install --dry-run` to print paths and the build/sign/verify plan without filesystem changes or subprocesses.
+## Installer options and tests
+
+`pnpm dev` continues to start the server, web client, and TUI; its behavior does not change.
+Use `pnpm dev:install --dry-run` to print paths and the platform-specific plan without filesystem changes or subprocesses.
 Use `pnpm dev:install --help` for usage.
-Run deterministic installer tests with `node --test scripts/dev-install.test.mjs`; these tests use temporary bundles and fake subprocesses.
+Run deterministic installer tests with `node --test scripts/dev-install.test.mjs`; these tests use temporary directories and fake subprocesses.
 
 Build a Rust crate:
 

@@ -169,7 +169,8 @@ async function generateOutput(output) {
   }
   const targetDir = process.env.CARGO_TARGET_DIR ?? join(repoRoot, "target");
   const wasmPath = join(targetDir, "wasm32-unknown-unknown/debug/waltr_client.wasm");
-  await run("cargo", ["build", "-p", "waltr-client", "--lib", "--features", "wasm", "--target", "wasm32-unknown-unknown"]);
+  const locked = process.env.WALTR_WASM_BUILD_LOCKED === "1" ? ["--locked"] : [];
+  await run("cargo", ["build", ...locked, "-p", "waltr-client", "--lib", "--features", "wasm", "--target", "wasm32-unknown-unknown"]);
   await run("wasm-bindgen", ["--target", "web", "--out-dir", output, "--out-name", "waltr_client", wasmPath]);
 }
 

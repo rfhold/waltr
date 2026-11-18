@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { installLinux } from "./dev-install-linux.mjs";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const bundleIdentifier = "dev.waltr.app";
@@ -61,11 +62,14 @@ export async function main(args = process.argv.slice(2), {
   log = console.log,
 } = {}) {
   if (args.includes("--help") && args.length === 1) {
-    log("Usage: pnpm dev:install [--dry-run]\nBuild, sign and verify the Apple Silicon macOS debug app before installation at ~/Applications/Waltr.app.\nDefault: ad-hoc signature with identifier dev.waltr.app and crates/waltr-app/Entitlements.plist.\nSet WALTR_DEV_SIGNING_IDENTITY to an available stable codesign identity to opt in; no certificate discovery or creation.\nAd-hoc rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.\nQuit Waltr first. This command never launches or stops the app.\n--dry-run prints paths and the build/sign/verify plan without filesystem changes or subprocesses.");
+    log("Usage: pnpm dev:install [--dry-run]\nApple Silicon macOS: build, sign and verify the debug app before installation at ~/Applications/Waltr.app.\nDefault: ad-hoc signature with identifier dev.waltr.app and crates/waltr-app/Entitlements.plist.\nSet WALTR_DEV_SIGNING_IDENTITY to an available stable codesign identity to opt in; no certificate discovery or creation.\nAd-hoc rebuilds do not guarantee that macOS retains Accessibility or other TCC grants.\nLinux x64/arm64: build and verify the native debug executable before installation at ~/.local/bin/waltr-desktop.\nQuit Waltr first. This command never launches or stops the app.\n--dry-run prints the plan without filesystem changes or subprocesses.");
     return;
   }
   if (args.some((arg) => arg !== "--dry-run") || args.length > 1) throw new Error("Usage: pnpm dev:install [--dry-run]");
-  if (platform !== "darwin" || arch !== "arm64") throw new Error("dev:install supports only native Apple Silicon macOS (darwin/arm64).");
+  if (platform === "linux" && (arch === "x64" || arch === "arm64")) {
+    return installLinux({ dryRun: args.includes("--dry-run"), arch, home, root, env, io, runner, log });
+  }
+  if (platform !== "darwin" || arch !== "arm64") throw new Error("dev:install supports native Apple Silicon macOS (darwin/arm64) and Linux (x64/arm64).");
   const signingIdentity = env.WALTR_DEV_SIGNING_IDENTITY ?? "-";
   if (!signingIdentity.trim()) throw new Error("WALTR_DEV_SIGNING_IDENTITY must not be blank; unset it for ad-hoc signing.");
   const signingPlan = `Sign staged bundle: ${signingIdentity === "-" ? "ad-hoc (-)" : "supplied WALTR_DEV_SIGNING_IDENTITY"}; identifier ${bundleIdentifier}`;

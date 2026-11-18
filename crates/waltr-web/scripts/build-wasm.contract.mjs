@@ -30,6 +30,34 @@ test("successful generation removes obsolete legacy snippets", async (context) =
   await assert.rejects(lstat(join(fixture.generatedRoot, "wasm")), { code: "ENOENT" });
 });
 
+test("the actual WASM Cargo invocation is locked only by explicit opt-in", async (context) => {
+  const fixture = await createFixture(context);
+  const bin = join(fixture.root, "bin");
+  const cargoArgs = join(fixture.root, "cargo args");
+  await mkdir(bin);
+  await writeFile(join(bin, "cargo"), `#!/bin/sh
+printf '%s\\n' "$@" > "$WALTR_TEST_CARGO_ARGS"
+`, { mode: 0o755 });
+  await writeFile(join(bin, "wasm-bindgen"), `#!/bin/sh
+set -eu
+while [ "$1" != --out-dir ]; do shift; done
+for file in waltr_client.js waltr_client.d.ts waltr_client_bg.wasm waltr_client_bg.wasm.d.ts; do
+  printf 'generated' > "$2/$file"
+done
+`, { mode: 0o755 });
+  const env = {
+    PATH: `${bin}:${process.env.PATH}`,
+    WALTR_TEST_CARGO_ARGS: cargoArgs,
+    WALTR_WASM_BUILD_TEST_MODE: "",
+  };
+  for (const optIn of ["", "0", "1"]) {
+    await runBuild(fixture, { ...env, WALTR_WASM_BUILD_LOCKED: optIn });
+    const expected = ["build", ...(optIn === "1" ? ["--locked"] : []), "-p", "waltr-client", "--lib",
+      "--features", "wasm", "--target", "wasm32-unknown-unknown"];
+    assert.deepEqual((await readFile(cargoArgs, "utf8")).trimEnd().split("\n"), expected);
+  }
+});
+
 test("failed generation preserves the current complete version", async (context) => {
   const fixture = await createFixture(context);
   await runBuild(fixture, { WALTR_WASM_BUILD_TEST_MARKER: "previous" });
