@@ -11,6 +11,7 @@ interface ResourceRecord {
 }
 
 const resources: ResourceRecord[] = [];
+const brandLookups: Record<string, unknown>[] = [];
 const previousConfig = process.env.PULUMI_CONFIG;
 let program: typeof import("./index");
 
@@ -90,18 +91,30 @@ before(async () => {
         }
         return { id: `${args.name}-id`, state: outputs };
       },
-      call: (args) => ({
-        ...args.inputs,
-        id: "lookup-id",
-        propertyMappingProviderScopeId: "mapping-id",
-        data: {
-          BUCKET_NAME: "test-bucket",
-          username: Buffer.from("app").toString("base64"),
-          password: Buffer.from("password").toString("base64"),
-          AWS_ACCESS_KEY_ID: Buffer.from("access").toString("base64"),
-          AWS_SECRET_ACCESS_KEY: Buffer.from("secret").toString("base64"),
-        },
-      }),
+      call: (args) => {
+        if (args.token === "authentik:index/getBrand:getBrand") {
+          brandLookups.push(args.inputs);
+          return {
+            domain: args.inputs.domain,
+            flowDeviceCode:
+              args.inputs.domain === "auth.example.test"
+                ? "35a0731a-55f8-46bd-b0b1-34cfc135dd26"
+                : "",
+          };
+        }
+        return {
+          ...args.inputs,
+          id: "lookup-id",
+          propertyMappingProviderScopeId: "mapping-id",
+          data: {
+            BUCKET_NAME: "test-bucket",
+            username: Buffer.from("app").toString("base64"),
+            password: Buffer.from("password").toString("base64"),
+            AWS_ACCESS_KEY_ID: Buffer.from("access").toString("base64"),
+            AWS_SECRET_ACCESS_KEY: Buffer.from("secret").toString("base64"),
+          },
+        };
+      },
     },
     "waltr",
     "test",
@@ -206,6 +219,24 @@ describe("hosted MCP OAuth deployment", () => {
     assert.equal(appSecret.WALTR_API_OIDC_AUDIENCE, "waltr-api");
     assert.equal(appSecret.WALTR_API_OIDC_CLIENT_ID, "waltr-test-native");
     assert.equal(appSecret.WALTR_API_REQUIRED_SCOPES, "waltr:use");
+  });
+
+  test("checks the shared Authentik brand without creating a brand or flow", () => {
+    assert.deepEqual(brandLookups, [{ domain: "auth.example.test" }]);
+    assert.deepEqual(
+      resources.filter(({ type }) =>
+        /^authentik:index\/(?:brand|flow|flowStageBinding):/.test(type),
+      ),
+      [],
+    );
+  });
+
+  test("rejects an Authentik brand without a device code flow", async () => {
+    const { verifyDeviceCodeIssuer } = await import("./authentik");
+    await assert.rejects(
+      verifyDeviceCodeIssuer("https://no-device-flow.example.test"),
+      /The Authentik brand for no-device-flow\.example\.test must specify a device code flow/,
+    );
   });
 
   test("removes the Authentik MCP provider and direct verifier environment", () => {

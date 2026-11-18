@@ -4,7 +4,7 @@ import * as pulumi from "@pulumi/pulumi";
 import * as random from "@pulumi/random";
 import * as tls from "@pulumi/tls";
 import { createHash } from "node:crypto";
-import { OAuthApplication } from "./authentik";
+import { OAuthApplication, verifyDeviceCodeIssuer } from "./authentik";
 
 const config = new pulumi.Config();
 const namespaceName = config.require("namespace");
@@ -307,10 +307,12 @@ const nativeMappings = [
   apiAudienceMapping.propertyMappingProviderScopeId,
 ];
 
+// The homelab stack owns the Authentik brand and its shared device code flow.
+const issuerBaseUrl = verifyDeviceCodeIssuer(authentikBaseUrl);
 const browserApp = new OAuthApplication("waltr-browser", {
   displayName: `${displayName} Browser`,
   slug: `${slug}-browser`,
-  issuerBaseUrl: authentikBaseUrl,
+  issuerBaseUrl,
   clientType: "confidential",
   redirectUris: [{ matching_mode: "strict", url: browserCallback }],
   signingKeyId: signingKey.id,
@@ -320,7 +322,7 @@ const browserApp = new OAuthApplication("waltr-browser", {
 const nativeApp = new OAuthApplication("waltr-native", {
   displayName: `${displayName} Native API`,
   slug: `${slug}-native`,
-  issuerBaseUrl: authentikBaseUrl,
+  issuerBaseUrl,
   clientType: "public",
   redirectUris: nativeRedirectUris,
   signingKeyId: signingKey.id,

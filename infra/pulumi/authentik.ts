@@ -2,10 +2,23 @@ import * as authentik from "@pulumi/authentik";
 import * as pulumi from "@pulumi/pulumi";
 import * as random from "@pulumi/random";
 
+export async function verifyDeviceCodeIssuer(
+  issuerBaseUrl: string,
+): Promise<string> {
+  const domain = new URL(issuerBaseUrl).hostname;
+  const brand = await authentik.getBrand({ domain });
+  if (brand.domain !== domain || !brand.flowDeviceCode) {
+    throw new Error(
+      `The Authentik brand for ${domain} must specify a device code flow`,
+    );
+  }
+  return issuerBaseUrl;
+}
+
 export interface OAuthApplicationArgs {
   displayName: string;
   slug: string;
-  issuerBaseUrl: string;
+  issuerBaseUrl: pulumi.Input<string>;
   clientType: "confidential" | "public";
   redirectUris: Array<{ matching_mode: "strict" | "regex"; url: string }>;
   signingKeyId: pulumi.Input<string>;
@@ -41,6 +54,7 @@ export class OAuthApplication extends pulumi.ComponentResource {
             { parent: this },
           )
         : undefined;
+    // Authentik enables all grants by default; the SDK has no grant type field.
     const provider = new authentik.ProviderOauth2(
       `${name}-provider`,
       {
