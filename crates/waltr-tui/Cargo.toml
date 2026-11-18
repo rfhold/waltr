@@ -21,6 +21,7 @@ waltr-client = { workspace = true, features = ["native-access"] }
 waltr-server = { workspace = true, optional = true }
 futures-util.workspace = true
 pulldown-cmark.workspace = true
+qrcodegen.workspace = true
 ratatui = { workspace = true, features = ["palette", "scrolling-regions", "unstable-rendered-line-info"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

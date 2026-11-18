@@ -45,6 +45,7 @@ opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 pyroscope = { workspace = true, optional = true }
+qrcodegen.workspace = true
 rand.workspace = true
 prost-types.workspace = true
 prost.workspace = true

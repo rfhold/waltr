@@ -38,6 +38,7 @@ opentelemetry-appender-tracing.workspace = true
 opentelemetry-http = "0.32.0"
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+qrcodegen.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
 rand.workspace = true
 rustls.workspace = true
