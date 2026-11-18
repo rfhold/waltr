@@ -9,7 +9,7 @@
 | [docs/runbooks/server-capability-cutover.md](docs/runbooks/server-capability-cutover.md) | Coordinated server/client/history upgrade; exact separately authorized reset targets. |
 | [crates/waltr-audio/](crates/waltr-audio/) | Bounded Google speech adapters; no auth, devices, or codec conversion. |
 | [crates/waltr-audio-io/](crates/waltr-audio-io/) | Native capture and PCM conversion, independent of UI and network transports. |
-| [crates/waltr-desktop/](crates/waltr-desktop/) | Desktop configuration, hold lifecycle, shortcuts, commands, and live external-text actions. |
+| [crates/waltr-desktop/](crates/waltr-desktop/) | Desktop configuration, microphone shortcut lifecycle, commands, and live external-text actions. |
 | [crates/waltr-agent-sandbox/](crates/waltr-agent-sandbox/) | Workspace worker, private RPC, and standalone worker runtime; isolation depends on deployment. |
 | [crates/mcp/](crates/mcp/) | Generic Model Context Protocol primitives, client, server, transports, and spec tests. |
 | [crates/waltr-app/](crates/waltr-app/) | Tauri shell, native client hooks and activity, audio hold/chat consumers, security policy, and packaging. |

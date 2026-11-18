@@ -42,14 +42,17 @@ Add this binding to the `keybinds` list in `~/.config/waltr/client.yaml` (or `$X
 ```yaml
 - id: audio-question
   key: Ctrl+Alt+A
-  mode: hold
+  mode: press-to-talk
   maxCaptureSeconds: 120
   routine: {name: audio-ask-and-speak, trigger: ask, input: question, output: audio}
   audio: {device: default, sampleRateHz: 24000, channels: 1}
   playback: {}
 ```
 
-Hold Ctrl+Alt+A to record a question. Release the keys to finish capture and hear the completed answer.
+Tap Ctrl+Alt+A, ask a question, then pause for about one second to finish recording. Playback starts when the answer is ready.
+If the mic detects no speech within five seconds, the shortcut stops without sending a request.
+Use `mode: toggle` to tap once to start capture and tap again to finish it. Silence does not stop toggle capture.
+Use `mode: hold` instead if you prefer to release the keys to finish recording.
 The Routine collects one transcript through STT defaults, answers through inference defaults, and synthesizes the complete answer through TTS defaults.
 It retains the answer in Routine history without a required text stream.
 The transcript limit is 4096 bytes, the answer limit is 8192 bytes, and the invocation deadline is 240 seconds.

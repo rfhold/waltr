@@ -5,7 +5,7 @@
 | [README.md](README.md) | Native Routine consumers, opaque file IPC, playback ownership, and platform limits. |
 | [src/server_controller.rs](src/server_controller.rs) | Process-owned embedded server, app-private paths, ephemeral loopback endpoint, and generation bearer. |
 | [src/bridge.rs](src/bridge.rs) | Selected Local/remote client runtime, access coordinator, generation lifecycle, and bounded publication. |
-| [src/native_audio/](src/native_audio/) | Shared microphone admission, audio runtime fences, and desktop audio hold adapter. |
+| [src/native_audio/](src/native_audio/) | Shared microphone admission, audio runtime fences, and desktop audio shortcut adapter. |
 | [src/dictation.rs](src/dictation.rs) | Chat dictation identities, status, preview, IPC, and shared native interaction consumer. |
 | [src/native_media.rs](src/native_media.rs) | Shared-client media operations, Rust-owned file selection, bounded raw file IPC, and joined cleanup. |
 | [src/native_media/playback.rs](src/native_media/playback.rs) | Bounded CPAL playback and dedicated stream-owner thread. |
@@ -87,7 +87,7 @@ On unverified logout cleanup, preserve access and credentials for retained owner
 
 Keep generic client-hook activity in the bridge, independent of the audio host.
 Keep microphone admission audio-only; do not gate unrelated hooks behind it.
-The current shortcut adapter supports audio holds, not arbitrary device context.
+The shortcut adapter supports audio holds and one-shot press-to-talk playback, not arbitrary device context.
 Use `ActivityTracker::begin` for each admitted client hook operation.
 Retain its lease through permission, RPC, output actions, and complete cleanup.
 Mark failures explicitly; ordinary cancellation is not an error.

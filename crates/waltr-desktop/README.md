@@ -49,8 +49,10 @@ Startup bindings require exactly one `command`, `typing: {}`, or `playback: {}` 
 The app supplies playback through its shared CPAL owner; the standalone Actor rejects playback without device access.
 Playback prefers the exact selected PCM format on the default device.
 The app permits one bounded adaptation: 24 kHz mono to supported 48 kHz stereo output.
-Release closes capture; the hold retains admission until the answer, playback tail, and cleanup finish.
-For repeated captures, the app uses `Hold::press_repeated` only after it pins the exact `media.inputs` capability and selected PCM output.
+In hold mode, release closes capture.
+The [playback tap modes](../../docs/architecture/clients.md#desktop-host-and-shortcuts) stop on quiet after speech (`press-to-talk`) or on the next press (`toggle`).
+All modes retain admission until the answer, playback tail, and cleanup finish.
+For repeated captures in hold mode, the app uses `Hold::press_repeated` only after it pins the exact `media.inputs` capability and selected PCM output.
 `HoldControl::press_again` returns a fresh per-capture release control for the same interaction.
 The app admits only the same binding and ingress epoch under its generation, access, and credential fences.
 The controller permits 16 captures over one interaction lifetime, including the first, with at most 15 tokens pending.

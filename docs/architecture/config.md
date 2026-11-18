@@ -286,17 +286,23 @@ Desktop registration remains process-owned across runtime and credential changes
 
 The strict version-1 schema rejects unknown fields and duplicate IDs or chords.
 It permits at most 64 keybinds and a 256 KiB YAML file.
-Each keybind requires `id`, `key`, `mode`, `routine`, `audio`, and exactly one output action: `command` or `typing`.
-Absent actions, explicit nulls, unknown action fields, and both actions together are invalid.
+Each keybind requires `id`, `key`, `mode`, `routine`, `audio`, and exactly one output action: `command`, `typing`, or `playback`.
+Absent actions, explicit nulls, unknown action fields, and multiple actions are invalid.
 Version 1 retains the legacy `command: { argv, stdin, timeoutSeconds }` syntax without implicit defaults between actions.
-Only `mode: hold` exists.
+`mode: hold` records until key release.
+With `playback: {}`, `mode: press-to-talk` starts on a tap and stops after about one second of quiet after speech.
+If the mic detects no speech within five seconds, capture ends without a request.
+Additional taps do not stop or restart press-to-talk capture.
+With `playback: {}`, `mode: toggle` starts on one tap and stops on a second tap of the same shortcut.
+Silence does not end toggle capture.
+Both tap modes ignore key release. Once capture ends, they ignore taps until playback and cleanup finish.
 An optional keybind-level `maxCaptureSeconds` accepts 1–3,600 seconds.
-At that deadline, the hold uses normal release: stop capture, drain accepted audio, close input, and continue receiving the Routine result.
+At that deadline, capture stops normally: drain accepted audio, close input, and continue receiving any admitted Routine result.
 It does not cancel finalization or run the output action before successful completion.
-Earlier release still finishes normally; a later release causes no second output action.
-Without this option, native capture retains its existing five-minute safety limit.
+For `mode: hold`, earlier release still finishes normally; a later release causes no second output action.
+Without this option, native capture retains its five-minute safety limit.
 The [conversation-notes client example](../examples/client-conversation-notes.yaml) selects 3,600 seconds and copies only the final notes.
-This schema configures the current audio hold adapter, not arbitrary native hooks or device context.
+This schema configures desktop audio shortcuts, not arbitrary native hooks or device context.
 Chords use unique modifiers in `Ctrl`, `Alt`, `Shift`, `Super` order, followed by a supported key.
 Native registration still depends on platform capabilities and user approval.
 
@@ -327,6 +333,7 @@ Waltr never selects either command as a fallback for unavailable external typing
 | `audio` | `device`, `sampleRateHz`, and `channels`; version 1 uses S16LE PCM. |
 | `command` | Fixed `argv`, optional `stdin`, and optional `timeoutSeconds`; final successful text only. |
 | `typing` | Empty mapping `{}`; live hypotheses to current keyboard focus, with Backspace suffix replacement where supported. |
+| `playback` | Empty mapping `{}`; plays the selected Routine's PCM audio output on the default device. |
 
 ### External Text Action
 
@@ -373,7 +380,7 @@ Timeout and cancellation kill and wait for the direct child.
 The host must await that result; kill-on-drop does not acknowledge shutdown.
 No descendant-process containment or side-effect rollback guarantee exists.
 
-See [Clients](clients.md#desktop-host-and-shortcuts) for hold ownership and shortcut lifecycle.
+See [Clients](clients.md#desktop-host-and-shortcuts) for capture ownership and shortcut lifecycle, or [Audio Question Shortcut](../examples/routines/audio-interactions.md#audio-question-shortcut) for a playback example.
 See [Deployment](../deployment.md#client-audio-host-prerequisites) for platform prerequisites.
 
 ## References

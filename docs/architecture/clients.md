@@ -9,7 +9,7 @@ Waltr client architecture keeps server data coordination in `crates/waltr-client
 | `crates/waltr-server/` | Shared server state, RPC services, persistence, watches, validation, and concurrency checks. |
 | `crates/waltr-client/` | Shell-neutral reducer state, server-facing commands, effect intents, transport adapters, stable view models, runtime orchestration, and optional native access for remote hosts. |
 | `crates/waltr-audio-io/` | Native device capture and PCM conversion, independent of UI and network transports. |
-| `crates/waltr-desktop/` | Desktop startup configuration, hold lifecycle, global shortcuts, and trusted local commands. |
+| `crates/waltr-desktop/` | Desktop startup configuration, microphone shortcut lifecycle, global shortcuts, and trusted local commands. |
 | `crates/waltr-web/` | Shared Solid routes, forms, transitions, and DOM state; build-time platform selection between hosted browser WASM and Tauri IPC adapters. |
 | `crates/waltr-tui/` | Terminal routes, input handling, rendering, snapshots, environment configuration, and terminal effects around shared native access. |
 | `crates/waltr-app/` | Server profiles, lazy embedded server, native access and secure credentials, Rust client runtime, ordered IPC, navigation policy, and platform packaging. |
@@ -174,17 +174,30 @@ Callbacks copy into preallocated blocks without a wait for the owner; accepted b
 
 ### Desktop Host And Shortcuts
 
-[`waltr-desktop`](../../crates/waltr-desktop/src/lib.rs) supplies startup configuration, hold lifecycle, native shortcut backends, and local output actions.
+[`waltr-desktop`](../../crates/waltr-desktop/src/lib.rs) supplies startup configuration, microphone shortcut lifecycle, native shortcut backends, and local output actions.
 The native app composes these libraries through its Rust runtime bridge.
 The libraries remain Tauri-independent; no standalone headless executable, button host, or wake-word host exists.
 See [desktop configuration](config.md#desktop-client-configuration) for the schema and command trust boundary.
 
 A press reserves the single audio gate without a queue, then starts capture.
-The first nonempty audio frame admits `Interact`; release without input starts no RPC.
+For `mode: hold`, the first nonempty audio frame admits `Interact`; release without input starts no RPC.
 Without the exact pinned `media.inputs` capability, repeated presses for the current hold do nothing; other presses return busy.
 Release requests a normal capture flush and input completion for these one-shot holds, not cancellation.
 
-The native app permits repeated captures only for playback bindings with the exact pinned `media.inputs` capability and a selected PCM audio output.
+For `mode: press-to-talk`, the host checks mic energy against a fixed threshold before admitting `Interact`.
+If it detects no speech within five seconds of microphone readiness, capture ends without an RPC.
+The PCM ring retains up to 100 ms of audio before speech onset and releases it only if the detector triggers.
+After speech is detected, roughly one second of sustained low energy requests the same normal stop and flush as hold release.
+The binding ignores release and additional presses until the operation finishes. It uses one capture even when the Routine declares `media.inputs`.
+
+For `mode: toggle`, the first nonempty frame admits `Interact` without an energy check.
+The next press of the same shortcut requests a normal stop and flush if capture remains active.
+This also applies when a Routine starts playback before capture ends.
+The binding ignores key release. Silence does not end toggle capture.
+Toggle mode uses one capture even when the Routine declares `media.inputs`.
+Both tap modes retain the audio reservation through RPC completion, playback tail, and cleanup. Taps after capture ends do not start future captures while that reservation remains active.
+
+The native app permits repeated captures only for hold-mode playback bindings with the exact pinned `media.inputs` capability and a selected PCM audio output.
 Capability-bearing text bindings retain their one-shot typing or command behavior.
 Each physical press after release targets the same active keybind and ingress epoch, through the current generation, access, and credential fences.
 The first press reserves one interaction and playback owner through terminal cleanup.
@@ -301,7 +314,7 @@ No X11 fallback exists. Backend capability errors remain runtime results, not co
 
 The bridge composes native client hooks: shortcut signals, text-free activity, runtime fences, and owned cleanup.
 These boundaries do not define a device-context API or support arbitrary native input.
-The current shortcut adapter implements audio holds; chat dictation remains a separate audio consumer.
+The shortcut adapter supports hold, press-to-talk, and toggle. Chat dictation remains a separate audio consumer.
 
 [`native_audio::Host`](../../crates/waltr-app/src/native_audio/mod.rs) owns microphone admission and audio runtime fences.
 Its `Held` adapter composes desktop audio holds, permission, and output actions.

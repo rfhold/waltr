@@ -6,8 +6,8 @@ Architecture docs describe Waltr's layer boundaries, responsibilities, data flow
 | --- | --- |
 | [access-authentication.md](access-authentication.md) | Waltr access authentication, hosted MCP authorization, browser/native/MCP flows, security boundaries, and lifecycle. |
 | [agent.md](agent.md) | Generic runner, server-owned capabilities/MCP/policy/interactions, and private worker dispatch. |
-| [clients.md](clients.md) | Shared client, web, and TUI architecture boundaries. |
-| [config.md](config.md) | Unified YAML resource catalog, exact-path administration, snapshots, and validation. |
+| [clients.md](clients.md) | Shared client, web, TUI, and native app boundaries, including desktop microphone capture and playback. |
+| [config.md](config.md) | Unified YAML resource catalog, exact-path administration, snapshots, validation, and desktop shortcut configuration. |
 | [persistence.md](persistence.md) | Server database selection, schema ownership, durable OAuth/session state, migrations, and startup readiness. |
 | [routines.md](routines.md) | Routine definitions, durable invocation lifecycle, replay, restart policy, clients, and UI boundaries. |
 | [Script engine boundary](../../crates/waltr-script/README.md) | Isolated JavaScript engine contracts, ownership, and limits, used by server Routines. |
