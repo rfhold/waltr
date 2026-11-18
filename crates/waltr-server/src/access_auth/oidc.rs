@@ -36,6 +36,8 @@ const ID_TOKEN_CLOCK_SKEW_SECONDS: u64 = 60;
 const MAX_ID_TOKEN_AGE_SECONDS: u64 = 10 * 60;
 const DISCOVERY_RESPONSE_LIMIT: usize = 64 * 1024;
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
+const DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// Authentication style selected for the authorization-code token request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,7 @@ pub struct DiscoveredOidcProvider {
     client: AccessAuthHttpClient,
     authorization_endpoint: Url,
     token_endpoint: Url,
+    device_authorization_endpoint: Option<Url>,
     token_endpoint_auth_method: TokenEndpointAuthMethod,
     id_token_signing_algorithms: BTreeSet<String>,
     access_token_signing_algorithms: BTreeSet<String>,
@@ -155,6 +158,16 @@ impl DiscoveredOidcProvider {
         let authorization_endpoint =
             endpoint(&metadata.authorization_endpoint, config.transport_policy())?;
         let token_endpoint = endpoint(&metadata.token_endpoint, config.transport_policy())?;
+        let device_authorization_endpoint = metadata
+            .device_authorization_endpoint
+            .as_deref()
+            .filter(|_| {
+                metadata
+                    .grant_types_supported
+                    .as_ref()
+                    .is_none_or(|grants| grants.iter().any(|grant| grant == DEVICE_GRANT_TYPE))
+            })
+            .and_then(|value| device_endpoint(value, &config, &token_endpoint));
         let jwks_uri = endpoint(&metadata.jwks_uri, config.transport_policy())?;
         let id_token_signing_algorithms = metadata
             .id_token_signing_alg_values_supported
@@ -199,6 +212,7 @@ impl DiscoveredOidcProvider {
             client,
             authorization_endpoint,
             token_endpoint,
+            device_authorization_endpoint,
             token_endpoint_auth_method,
             id_token_signing_algorithms,
             access_token_signing_algorithms,
@@ -257,13 +271,31 @@ impl DiscoveredOidcProvider {
                 "authorization code and PKCE verifier are required",
             ));
         }
-        let mut form = vec![
+        let form = vec![
             ("grant_type", "authorization_code"),
             ("code", request.code),
             ("redirect_uri", self.config.redirect_uri().as_str()),
             ("code_verifier", request.pkce_verifier),
         ];
-        let mut builder = self.client.inner().post(self.token_endpoint.clone());
+        let response = self
+            .client_request(&self.token_endpoint, form)?
+            .send()
+            .await
+            .map_err(|_| OidcError::Provider("token endpoint request failed"))?;
+        if !response.status().is_success() {
+            return Err(OidcError::Provider(
+                "token endpoint rejected the authorization code",
+            ));
+        }
+        parse_token_response(&token_response_body(response).await?)
+    }
+
+    fn client_request<'a>(
+        &'a self,
+        endpoint: &Url,
+        mut form: Vec<(&'static str, &'a str)>,
+    ) -> Result<reqwest::RequestBuilder, OidcError> {
+        let mut builder = self.client.inner().post(endpoint.clone());
         match self.token_endpoint_auth_method {
             TokenEndpointAuthMethod::ClientSecretBasic => {
                 builder = builder.basic_auth(self.config.client_id(), self.config.client_secret());
@@ -279,34 +311,108 @@ impl DiscoveredOidcProvider {
             }
             TokenEndpointAuthMethod::None => form.push(("client_id", self.config.client_id())),
         }
-        let response = builder
-            .form(&form)
+        Ok(builder.form(&form))
+    }
+
+    pub(super) const fn supports_device_authorization(&self) -> bool {
+        self.device_authorization_endpoint.is_some()
+    }
+
+    pub(super) async fn request_device_authorization(
+        &self,
+    ) -> Result<DeviceAuthorization, OidcError> {
+        let endpoint =
+            self.device_authorization_endpoint
+                .as_ref()
+                .ok_or(OidcError::Configuration(
+                    "device authorization is unavailable",
+                ))?;
+        let scopes = self
+            .config
+            .requested_scopes()
+            .iter()
+            .filter(|scope| scope.as_str() != "offline_access")
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let response = self
+            .client_request(endpoint, vec![("scope", &scopes)])?
+            .timeout(DEVICE_REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|_| OidcError::Provider("token endpoint request failed"))?;
+            .map_err(|_| OidcError::Provider("device authorization request failed"))?;
         if !response.status().is_success() {
             return Err(OidcError::Provider(
-                "token endpoint rejected the authorization code",
+                "device authorization request was rejected",
             ));
         }
         let body = read_bounded_body(
             response,
             TOKEN_RESPONSE_LIMIT,
-            "token endpoint response read failed",
-            "token endpoint response exceeds the size limit",
+            "device authorization response read failed",
+            "device authorization response exceeds the size limit",
         )
         .await?;
-        let token = serde_json::from_slice::<OidcTokenResponse>(&body)
-            .map_err(|_| OidcError::Provider("token endpoint response is invalid"))?;
-        if token.access_token.is_empty()
-            || token.id_token.is_empty()
-            || !token.token_type.eq_ignore_ascii_case("bearer")
+        let device: DeviceAuthorization = serde_json::from_slice(&body)
+            .map_err(|_| OidcError::Provider("device authorization response is invalid"))?;
+        device.validate(self.config.transport_policy(), &self.authorization_endpoint)?;
+        Ok(device)
+    }
+
+    pub(super) async fn poll_device_tokens(
+        &self,
+        device_code: &str,
+    ) -> Result<DeviceTokenPoll, OidcError> {
+        match tokio::time::timeout(
+            DEVICE_REQUEST_TIMEOUT,
+            self.exchange_device_code(device_code),
+        )
+        .await
         {
-            return Err(OidcError::Provider(
-                "token endpoint response is missing required bearer tokens",
-            ));
+            Ok(result) => result,
+            Err(_) => Ok(DeviceTokenPoll::TimedOut),
         }
-        Ok(token)
+    }
+
+    async fn exchange_device_code(&self, device_code: &str) -> Result<DeviceTokenPoll, OidcError> {
+        let request = self.client_request(
+            &self.token_endpoint,
+            vec![
+                ("grant_type", DEVICE_GRANT_TYPE),
+                ("device_code", device_code),
+            ],
+        )?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => return Ok(DeviceTokenPoll::TimedOut),
+            Err(_) => return Err(OidcError::Provider("device token request failed")),
+        };
+        let status = response.status();
+        let body = token_response_body(response).await?;
+        if status.is_success() {
+            return parse_token_response(&body).map(DeviceTokenPoll::Authorized);
+        }
+        #[derive(Deserialize)]
+        struct DeviceError {
+            error: String,
+        }
+        let error = serde_json::from_slice::<DeviceError>(&body)
+            .map_err(|_| OidcError::Provider("device token request was rejected"))?;
+        match (status, error.error.as_str()) {
+            (reqwest::StatusCode::BAD_REQUEST, "authorization_pending") => {
+                Ok(DeviceTokenPoll::Pending)
+            }
+            (
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "slow_down",
+            ) => Ok(DeviceTokenPoll::SlowDown),
+            (
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::FORBIDDEN,
+                "access_denied",
+            ) => Ok(DeviceTokenPoll::Denied),
+            (reqwest::StatusCode::BAD_REQUEST, "expired_token") => Ok(DeviceTokenPoll::Expired),
+            _ => Err(OidcError::Provider("device token request was rejected")),
+        }
     }
 
     /// Create a verifier backed by this provider's rotating key cache.
@@ -328,6 +434,109 @@ impl DiscoveredOidcProvider {
     pub const fn token_endpoint_auth_method(&self) -> TokenEndpointAuthMethod {
         self.token_endpoint_auth_method
     }
+}
+
+async fn token_response_body(response: reqwest::Response) -> Result<Vec<u8>, OidcError> {
+    read_bounded_body(
+        response,
+        TOKEN_RESPONSE_LIMIT,
+        "token endpoint response read failed",
+        "token endpoint response exceeds the size limit",
+    )
+    .await
+}
+
+fn parse_token_response(body: &[u8]) -> Result<OidcTokenResponse, OidcError> {
+    let token = serde_json::from_slice::<OidcTokenResponse>(body)
+        .map_err(|_| OidcError::Provider("token endpoint response is invalid"))?;
+    if token.access_token.is_empty()
+        || token.id_token.is_empty()
+        || !token.token_type.eq_ignore_ascii_case("bearer")
+    {
+        return Err(OidcError::Provider(
+            "token endpoint response is missing required bearer tokens",
+        ));
+    }
+    Ok(token)
+}
+
+#[derive(Deserialize)]
+pub(super) struct DeviceAuthorization {
+    pub(super) device_code: String,
+    pub(super) user_code: String,
+    pub(super) verification_uri: String,
+    pub(super) verification_uri_complete: Option<String>,
+    pub(super) expires_in: u64,
+    pub(super) interval: Option<u64>,
+}
+
+impl DeviceAuthorization {
+    fn validate(&self, policy: OidcTransportPolicy, authority: &Url) -> Result<(), OidcError> {
+        let invalid = || OidcError::Provider("device authorization response is invalid");
+        if self.expires_in == 0
+            || self.interval == Some(0)
+            || self.device_code.is_empty()
+            || self.device_code.len() > 4096
+            || self.device_code.chars().any(char::is_control)
+            || self.user_code.is_empty()
+            || self.user_code.len() > 64
+            || !self
+                .user_code
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            || self.user_code.contains(&self.device_code)
+        {
+            return Err(invalid());
+        }
+        for uri in [
+            &self.verification_uri,
+            self.verification_uri_complete
+                .as_ref()
+                .unwrap_or(&self.verification_uri),
+        ] {
+            let url = device_url(uri, policy)?;
+            if url.origin() != authority.origin()
+                || uri.contains(&self.device_code)
+                // Check the original path, including segments normalized away by URL parsing.
+                || percent_decoded_contains(uri.split('?').next().unwrap_or(uri), &self.device_code)
+                || url.query_pairs().any(|(name, value)| {
+                    name.contains(&self.device_code) || value.contains(&self.device_code)
+                })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn percent_decoded_contains(value: &str, private_code: &str) -> bool {
+    let mut remaining = value.as_bytes();
+    let mut decoded = Vec::with_capacity(remaining.len());
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'%'
+            && let [high, low, tail @ ..] = rest
+            && let (Some(high), Some(low)) = (super::hex_digit(*high), super::hex_digit(*low))
+        {
+            decoded.push((high << 4) | low);
+            remaining = tail;
+        } else {
+            decoded.push(byte);
+            remaining = rest;
+        }
+    }
+    decoded
+        .windows(private_code.len())
+        .any(|window| window == private_code.as_bytes())
+}
+
+pub(super) enum DeviceTokenPoll {
+    Authorized(OidcTokenResponse),
+    Pending,
+    SlowDown,
+    TimedOut,
+    Denied,
+    Expired,
 }
 
 /// Inputs retained for an authorization-code token exchange.
@@ -500,6 +709,24 @@ impl OidcVerifier {
         expected_nonce: &str,
         access_token: Option<&str>,
     ) -> Result<AuthenticatedPrincipal, OidcError> {
+        self.validate_browser_id_token(token, Some(expected_nonce), access_token)
+            .await
+    }
+
+    pub(super) async fn validate_device_id_token(
+        &self,
+        tokens: &OidcTokenResponse,
+    ) -> Result<AuthenticatedPrincipal, OidcError> {
+        self.validate_browser_id_token(tokens.id_token(), None, Some(tokens.access_token()))
+            .await
+    }
+
+    async fn validate_browser_id_token(
+        &self,
+        token: &str,
+        expected_nonce: Option<&str>,
+        access_token: Option<&str>,
+    ) -> Result<AuthenticatedPrincipal, OidcError> {
         let (header, key) = self.header_and_key(token, TokenKind::Id).await?;
         let mut validation = token_validation(header.alg, &self.issuer, &self.client_id);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
@@ -522,7 +749,7 @@ impl OidcVerifier {
         }
         if claims.iss != self.issuer
             || claims.sub.is_empty()
-            || claims.nonce.as_deref() != Some(expected_nonce)
+            || claims.nonce.as_deref() != expected_nonce
         {
             return Err(OidcError::InvalidToken(
                 "ID token identity or nonce is invalid",
@@ -724,6 +951,7 @@ struct ProviderMetadata {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    device_authorization_endpoint: Option<String>,
     jwks_uri: String,
     response_types_supported: Vec<String>,
     grant_types_supported: Option<Vec<String>>,
@@ -848,6 +1076,27 @@ fn endpoint(value: &str, policy: OidcTransportPolicy) -> Result<Url, OidcError> 
         Url::parse(value).map_err(|_| OidcError::Discovery("provider endpoint URL is invalid"))?;
     enforce_secure_endpoint(&url, policy)?;
     Ok(url)
+}
+
+fn device_url(value: &str, policy: OidcTransportPolicy) -> Result<Url, OidcError> {
+    let invalid = || OidcError::Provider("device authorization URL is invalid");
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if value.len() > 2048
+        || value.chars().any(char::is_control)
+        || !policy.allows(&url)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+fn device_endpoint(value: &str, config: &OidcConfig, token_endpoint: &Url) -> Option<Url> {
+    let url = device_url(value, config.transport_policy()).ok()?;
+    // Device initiation must not extend the origins trusted with the client secret.
+    (config.client_secret().is_none() || url.origin() == token_endpoint.origin()).then_some(url)
 }
 
 fn discovery_urls(issuer: &Url) -> Result<Vec<Url>, OidcError> {
@@ -1247,11 +1496,408 @@ ZbAq2L8jXEetO4oBq+h/bLE=
             client: http_client(),
             authorization_endpoint: Url::parse("http://127.0.0.1:8080/authorize").unwrap(),
             token_endpoint,
+            device_authorization_endpoint: None,
             token_endpoint_auth_method: TokenEndpointAuthMethod::None,
             id_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
             access_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
             jwks: JwksCache::fixture(test_jwks("test-key")).unwrap(),
         }
+    }
+
+    #[test]
+    fn device_display_urls_are_safe_and_do_not_expose_the_private_code() {
+        let authority = Url::parse("https://id.example/oauth/authorize").unwrap();
+        let mut grant = DeviceAuthorization {
+            device_code: "private-code".to_owned(),
+            user_code: "ABCD-1234".to_owned(),
+            verification_uri: "https://id.example/activate".to_owned(),
+            verification_uri_complete: None,
+            expires_in: 60,
+            interval: None,
+        };
+        assert!(
+            grant
+                .validate(OidcTransportPolicy::HttpsOnly, &authority)
+                .is_ok()
+        );
+        for url in [
+            "https://other.example/activate?code=ABCD-1234",
+            "https://user@id.example/activate",
+            "https://id.example/activate#ABCD-1234",
+            "http://id.example/activate",
+            "https://id.example/activate?code=private%2Dcode",
+            "https://id.example/activate/priv%61te%2Dcode",
+            "https://id.example/priv%61te%2Dcode/../activate",
+        ] {
+            grant.verification_uri_complete = Some(url.to_owned());
+            assert!(
+                grant
+                    .validate(OidcTransportPolicy::HttpsOnly, &authority)
+                    .is_err(),
+                "{url}"
+            );
+        }
+        grant.verification_uri_complete =
+            Some("https://id.example/activate?code=ABCD-1234".to_owned());
+        assert!(
+            grant
+                .validate(OidcTransportPolicy::HttpsOnly, &authority)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn confidential_device_endpoint_does_not_expand_token_endpoint_origin() {
+        let config = OidcConfig::new(
+            "https://id.example",
+            "waltr-client",
+            Some("browser-secret".to_owned()),
+            "https://waltr.example/oidc/callback",
+            "waltr-api",
+            vec!["openid".to_owned()],
+            Duration::from_mins(1),
+            false,
+            false,
+        )
+        .unwrap();
+        let token = Url::parse("https://id.example/token").unwrap();
+        assert!(device_endpoint("https://id.example:443/device", &config, &token).is_some());
+        assert!(device_endpoint("https://other.example/device", &config, &token).is_none());
+        assert!(device_endpoint("https://id.example:8443/device", &config, &token).is_none());
+        assert!(device_endpoint("http://id.example/device", &config, &token).is_none());
+    }
+
+    #[tokio::test]
+    async fn device_id_token_policy_does_not_relax_the_code_callback_nonce_requirement() {
+        let verifier = verifier();
+        let mut claims = id_claims();
+        claims.as_object_mut().unwrap().remove("nonce");
+        claims["iat"] = json!(jsonwebtoken::get_current_timestamp());
+        let mut tokens = OidcTokenResponse {
+            access_token: "test-provider-access".to_owned(),
+            id_token: sign(claims.clone(), "JWT", "test-key"),
+            token_type: "Bearer".to_owned(),
+            expires_in: None,
+        };
+        assert!(verifier.validate_device_id_token(&tokens).await.is_ok());
+        assert!(
+            verifier
+                .validate_id_token(&tokens.id_token, "expected-nonce", None)
+                .await
+                .is_err()
+        );
+        tokens.id_token = sign(id_claims(), "JWT", "test-key");
+        assert!(verifier.validate_device_id_token(&tokens).await.is_err());
+        assert!(
+            verifier
+                .validate_id_token(&tokens.id_token, "expected-nonce", None)
+                .await
+                .is_ok()
+        );
+        claims["iat"] = json!(
+            jsonwebtoken::get_current_timestamp()
+                - MAX_ID_TOKEN_AGE_SECONDS
+                - ID_TOKEN_CLOCK_SKEW_SECONDS
+                - 5
+        );
+        tokens.id_token = sign(claims, "JWT", "test-key");
+        assert!(verifier.validate_device_id_token(&tokens).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn hosted_device_login_issues_one_browser_cookie_without_exposing_provider_tokens() {
+        use crate::{
+            access_auth::{AccessAuthConfig, AccessAuthenticator, require_browser_session},
+            persistence::{DatabaseConfig, Persistence},
+        };
+        use tower::ServiceExt as _;
+
+        const PUBLIC_ORIGIN: &str = "http://127.0.0.1:14333";
+        const PRIVATE_CODE: &str = "private-device-code";
+        async fn metadata(State(base): State<String>) -> Json<Value> {
+            Json(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "device_authorization_endpoint": format!("{base}/device"),
+                "token_endpoint": format!("{base}/token"),
+                "jwks_uri": format!("{base}/jwks"),
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", DEVICE_GRANT_TYPE],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                "id_token_signing_alg_values_supported": ["RS256"]
+            }))
+        }
+        fn assert_client_auth(headers: &axum::http::HeaderMap) {
+            assert_eq!(
+                headers[header::AUTHORIZATION],
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("waltr-client:browser-secret")
+                )
+            );
+        }
+        async fn device(
+            State(base): State<String>,
+            headers: axum::http::HeaderMap,
+            body: String,
+        ) -> Json<Value> {
+            assert_client_auth(&headers);
+            assert_eq!(body, "scope=openid");
+            Json(json!({
+                "device_code": PRIVATE_CODE,
+                "user_code": "ABCD-1234",
+                "verification_uri": format!("{base}/verify"),
+                "verification_uri_complete": format!("{base}/verify?code=ABCD-1234"),
+                "expires_in": 60,
+                "interval": 1
+            }))
+        }
+        fn cookie(headers: &axum::http::HeaderMap, name: &str) -> String {
+            let value = headers[header::SET_COOKIE].to_str().unwrap();
+            assert!(value.contains("HttpOnly"));
+            assert!(value.contains("SameSite=Lax"));
+            assert!(value.starts_with(name));
+            value.split(';').next().unwrap().to_owned()
+        }
+        async fn send(
+            router: &Router,
+            path: &str,
+            cookie: Option<&str>,
+            post: Option<(&str, Value)>,
+        ) -> Response {
+            let mut request = axum::http::Request::builder().uri(path);
+            if let Some(cookie) = cookie {
+                request = request.header(header::COOKIE, cookie);
+            }
+            let body = if let Some((origin, body)) = post {
+                request = request
+                    .method("POST")
+                    .header(header::ORIGIN, origin)
+                    .header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            } else {
+                Body::empty()
+            };
+            router
+                .clone()
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap()
+        }
+        async fn json_body(response: Response) -> Value {
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(PRIVATE_CODE));
+            assert!(!String::from_utf8_lossy(&body).contains("secret-provider-access"));
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let token_issuer = issuer.clone();
+        let provider_hits = Arc::new(AtomicUsize::new(0));
+        let token_hits = provider_hits.clone();
+        let provider = Router::new()
+            .route("/.well-known/openid-configuration", get(metadata))
+            .route("/device", post(device))
+            .route("/jwks", get(|| async { Json(test_jwks("device-key")) }))
+            .route("/token", post(move |headers: axum::http::HeaderMap, body: String| {
+                let token_issuer = token_issuer.clone();
+                let token_hits = token_hits.clone();
+                async move {
+                    token_hits.fetch_add(1, Ordering::SeqCst);
+                    assert_client_auth(&headers);
+                    let form: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes()).collect();
+                    assert_eq!(form.len(), 2, "no PKCE/nonce/redirect in device polling");
+                    assert_eq!(form["grant_type"], DEVICE_GRANT_TYPE);
+                    assert_eq!(form["device_code"], PRIVATE_CODE);
+                    Json(json!({
+                        "token_type": "Bearer",
+                        "access_token": "secret-provider-access",
+                        "id_token": sign(json!({
+                            "iss": token_issuer,
+                            "sub": "device-user",
+                            "aud": "waltr-client",
+                            "iat": jsonwebtoken::get_current_timestamp(),
+                            "at_hash": access_token_hash("secret-provider-access", Algorithm::RS256).unwrap(),
+                        }), "JWT", "device-key")
+                    }))
+                }
+            }))
+            .with_state(issuer.clone());
+        let provider_task =
+            tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let config = OidcConfig::new(
+            &issuer,
+            "waltr-client",
+            Some("browser-secret".to_owned()),
+            &format!("{PUBLIC_ORIGIN}/oidc/callback"),
+            "waltr-api",
+            vec!["openid".to_owned(), "offline_access".to_owned()],
+            Duration::from_mins(1),
+            true,
+            true,
+        )
+        .unwrap();
+        let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
+            .await
+            .unwrap();
+        let auth = AccessAuthenticator::initialize(
+            AccessAuthConfig::oidc(config),
+            &persistence,
+            http_client(),
+        )
+        .await
+        .unwrap();
+        let protected = Router::new()
+            .route("/sessions", get(|| async { "protected route" }))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                require_browser_session,
+            ));
+        let router = auth.router().merge(protected);
+
+        let response = send(&router, "/sessions?tab=one", None, None).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "/oidc/sign-in?return_to=%2Fsessions%3Ftab%3Done"
+        );
+        let path = response.headers()[header::LOCATION].to_str().unwrap();
+        let page = send(&router, path, None, None).await;
+        let other = send(&router, path, None, None).await;
+        let browser_cookie = cookie(page.headers(), "waltr-device-local=");
+        let other_cookie = cookie(other.headers(), "waltr-device-local=");
+        assert_ne!(browser_cookie, other_cookie);
+        assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(page.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert!(
+            page.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
+        let html = axum::body::to_bytes(page.into_body(), 4096).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&html)
+                .contains("/oidc/login?return_to=%2Fsessions%3Ftab%3Done")
+        );
+
+        let start = json!({"return_to": "/sessions?tab=one"});
+        assert_eq!(
+            send(
+                &router,
+                "/oidc/device/start",
+                Some(&browser_cookie),
+                Some(("https://other.example", start.clone()))
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                &router,
+                "/oidc/device/start",
+                None,
+                Some((PUBLIC_ORIGIN, start.clone()))
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = send(
+            &router,
+            "/oidc/device/start",
+            Some(&browser_cookie),
+            Some((PUBLIC_ORIGIN, start.clone())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let details = json_body(response).await;
+        assert_eq!(details["user_code"], "ABCD-1234");
+        assert_eq!(details["verification_uri"], format!("{issuer}/verify"));
+        assert!(
+            details["qr_image"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/svg+xml;base64,")
+        );
+        let resumed = json_body(
+            send(
+                &router,
+                "/oidc/device/start",
+                Some(&browser_cookie),
+                Some((PUBLIC_ORIGIN, start)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(details["attempt"], resumed["attempt"]);
+
+        let poll = json!({"attempt": details["attempt"]});
+        let response = send(
+            &router,
+            "/oidc/device/poll",
+            Some(&other_cookie),
+            Some((PUBLIC_ORIGIN, poll.clone())),
+        )
+        .await;
+        assert_eq!(json_body(response).await["status"], "expired");
+        let response = send(
+            &router,
+            "/oidc/device/poll",
+            Some(&browser_cookie),
+            Some((PUBLIC_ORIGIN, poll.clone())),
+        )
+        .await;
+        assert_eq!(json_body(response).await["status"], "pending");
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 0);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let response = send(
+            &router,
+            "/oidc/device/poll",
+            Some(&browser_cookie),
+            Some((PUBLIC_ORIGIN, poll.clone())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = cookie(response.headers(), "waltr-session-local=");
+        assert_eq!(
+            json_body(response).await,
+            json!({"status": "complete", "return_to": "/sessions?tab=one"})
+        );
+        assert_eq!(
+            send(&router, "/sessions?tab=one", Some(&session), None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let late_cancel = send(
+            &router,
+            "/oidc/device/cancel",
+            Some(&browser_cookie),
+            Some((PUBLIC_ORIGIN, poll.clone())),
+        )
+        .await;
+        assert_eq!(late_cancel.status(), StatusCode::CONFLICT);
+        assert!(!late_cancel.headers().contains_key(header::SET_COOKIE));
+
+        let response = send(
+            &router,
+            "/oidc/device/poll",
+            Some(&browser_cookie),
+            Some((PUBLIC_ORIGIN, poll)),
+        )
+        .await;
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(json_body(response).await["status"], "expired");
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 1);
+        provider_task.abort();
     }
 
     #[test]
@@ -1782,6 +2428,7 @@ ZbAq2L8jXEetO4oBq+h/bLE=
             client: http_client(),
             authorization_endpoint: Url::parse("http://127.0.0.1:8080/authorize").unwrap(),
             token_endpoint: Url::parse(&format!("{base}/token")).unwrap(),
+            device_authorization_endpoint: None,
             token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretBasic,
             id_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
             access_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),

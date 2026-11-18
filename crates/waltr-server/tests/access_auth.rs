@@ -163,6 +163,21 @@ async fn health_and_oidc_routes_are_public() -> Result<(), Box<dyn std::error::E
             .to_str()?
             .starts_with(&fixture.issuer)
     );
+    let sign_in = client
+        .get(
+            fixture
+                .server
+                .url("/oidc/sign-in?return_to=%2Fsessions%3Ftab%3Done"),
+        )
+        .send()
+        .await?;
+    assert_eq!(sign_in.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        sign_in.headers()[header::LOCATION],
+        "/oidc/login?return_to=%2Fsessions%3Ftab%3Done"
+    );
+    assert_eq!(sign_in.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(sign_in.headers()[header::REFERRER_POLICY], "no-referrer");
 
     Ok(())
 }

@@ -13,6 +13,7 @@ use super::{
     AccessAuthConfig, AccessAuthHttpClient, AccessAuthMode, AccessAuthStore, AccessAuthStoreError,
     AuthenticatedPrincipal, AuthenticationMethod, BrowserSessionTokenDigest,
     DiscoveredOidcProvider, OidcConfig, OidcError, OidcVerifier,
+    device::DeviceAttempts,
     lease::{RevocationRegistry, RevocationSignal},
 };
 use crate::persistence::Persistence;
@@ -55,6 +56,8 @@ pub(super) struct OidcAccessAuthenticator {
     provider: DiscoveredOidcProvider,
     api_verifier: OidcVerifier,
     login_rate_limiter: Mutex<LoginRateLimiter>,
+    device_login_rate_limiter: Mutex<LoginRateLimiter>,
+    pub(super) device_attempts: DeviceAttempts,
     revocations: RevocationRegistry,
 }
 
@@ -115,6 +118,8 @@ impl AccessAuthenticator {
                 provider,
                 api_verifier,
                 login_rate_limiter: Mutex::new(LoginRateLimiter::new(Instant::now())),
+                device_login_rate_limiter: Mutex::new(LoginRateLimiter::new(Instant::now())),
+                device_attempts: DeviceAttempts::default(),
                 revocations: RevocationRegistry::default(),
             })),
         })
@@ -292,6 +297,11 @@ impl AccessAuthenticator {
         }
     }
 
+    pub(super) fn supports_device_authorization(&self) -> bool {
+        self.oidc()
+            .is_some_and(|oidc| oidc.provider.supports_device_authorization())
+    }
+
     pub(super) fn session_cookie_name(&self) -> &'static str {
         if self
             .oidc()
@@ -360,6 +370,13 @@ impl OidcAccessAuthenticator {
 
     pub(super) fn admit_login(&self, source: Option<IpAddr>) -> bool {
         self.login_rate_limiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(source, Instant::now())
+    }
+
+    pub(super) fn admit_device_login(&self, source: Option<IpAddr>) -> bool {
+        self.device_login_rate_limiter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .admit(source, Instant::now())

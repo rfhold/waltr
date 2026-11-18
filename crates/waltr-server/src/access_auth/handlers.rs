@@ -24,7 +24,7 @@ use url::Url;
 use super::{
     AccessAuthError, AccessAuthStoreError, AccessAuthenticator, AuthorizationCode, BrowserSession,
     BrowserSessionTokenDigest, LoginAttempt, LoginCorrelationDigest, LoginStateDigest,
-    RequestAuthFailure,
+    RequestAuthFailure, device, service::OidcAccessAuthenticator,
 };
 
 const LOGIN_ATTEMPT_TTL: Duration = Duration::from_mins(10);
@@ -47,6 +47,7 @@ pub fn access_auth_router(authenticator: AccessAuthenticator) -> Router {
         router
     };
     router
+        .merge(device::router())
         .layer(middleware::from_fn(no_store_layer))
         .with_state(authenticator)
 }
@@ -59,9 +60,9 @@ impl AccessAuthenticator {
 }
 
 #[derive(Debug, Deserialize)]
-struct LoginQuery {
+pub(super) struct LoginQuery {
     #[serde(default = "default_return_path")]
-    return_to: String,
+    pub(super) return_to: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,6 +264,14 @@ async fn complete_callback(
         )
         .await
         .map_err(|error| HandlerError::Service(AccessAuthError::from_oidc(error)))?;
+    let token = persist_browser_session(oidc, principal.subject()).await?;
+    Ok((attempt.return_path, Some(token)))
+}
+
+pub(super) async fn persist_browser_session(
+    oidc: &OidcAccessAuthenticator,
+    subject: &str,
+) -> Result<String, HandlerError> {
     let token = random_secret();
     let now = SystemTime::now();
     let expires_at = now
@@ -273,7 +282,7 @@ async fn complete_callback(
             token_digest: BrowserSessionTokenDigest::from_token(&token),
             issuer: oidc.config().issuer().to_owned(),
             client_id: oidc.config().client_id().to_owned(),
-            subject: principal.subject().to_owned(),
+            subject: subject.to_owned(),
             created_at: now,
             expires_at,
             last_seen_at: now,
@@ -283,7 +292,7 @@ async fn complete_callback(
     oidc.store()
         .cleanup_best_effort(now, AUTH_CLEANUP_LIMIT)
         .await;
-    Ok((attempt.return_path, Some(token)))
+    Ok(token)
 }
 
 async fn logout(State(auth): State<AccessAuthenticator>, headers: HeaderMap) -> Response {
@@ -311,7 +320,10 @@ async fn logout(State(auth): State<AccessAuthenticator>, headers: HeaderMap) -> 
     no_store(response)
 }
 
-fn validate_logout_request(headers: &HeaderMap, public_url: &Url) -> Result<(), HandlerError> {
+pub(super) fn validate_logout_request(
+    headers: &HeaderMap,
+    public_url: &Url,
+) -> Result<(), HandlerError> {
     let origin = exactly_one_header(headers, header::ORIGIN)?;
     let origin = Url::parse(origin).map_err(|_| HandlerError::Forbidden)?;
     if !matches!(origin.scheme(), "http" | "https")
@@ -358,7 +370,7 @@ fn default_return_path() -> String {
     "/".to_owned()
 }
 
-fn validate_return_path(path: &str) -> Result<(), HandlerError> {
+pub(super) fn validate_return_path(path: &str) -> Result<(), HandlerError> {
     let mut candidate = path.as_bytes().to_vec();
     for _ in 0..4 {
         let text = std::str::from_utf8(&candidate).map_err(|_| HandlerError::BadRequest)?;
@@ -384,8 +396,8 @@ fn validate_return_path(path: &str) -> Result<(), HandlerError> {
             if index + 2 >= candidate.len() {
                 return Err(HandlerError::BadRequest);
             }
-            let high = hex(candidate[index + 1]).ok_or(HandlerError::BadRequest)?;
-            let low = hex(candidate[index + 2]).ok_or(HandlerError::BadRequest)?;
+            let high = super::hex_digit(candidate[index + 1]).ok_or(HandlerError::BadRequest)?;
+            let low = super::hex_digit(candidate[index + 2]).ok_or(HandlerError::BadRequest)?;
             decoded.push(high << 4 | low);
             index += 3;
         }
@@ -394,16 +406,7 @@ fn validate_return_path(path: &str) -> Result<(), HandlerError> {
     Err(HandlerError::BadRequest)
 }
 
-const fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn random_secret() -> String {
+pub(super) fn random_secret() -> String {
     URL_SAFE_NO_PAD.encode(random::<[u8; 32]>())
 }
 
@@ -411,7 +414,7 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn session_cookie(auth: &AccessAuthenticator, token: &str) -> Cookie<'static> {
+pub(super) fn session_cookie(auth: &AccessAuthenticator, token: &str) -> Cookie<'static> {
     let oidc = auth.oidc().expect("session cookies require OIDC mode");
     build_session_cookie(
         auth.session_cookie_name(),
@@ -431,7 +434,7 @@ fn login_cookie(auth: &AccessAuthenticator, correlation: &str) -> Cookie<'static
     )
 }
 
-fn build_session_cookie(
+pub(super) fn build_session_cookie(
     name: &'static str,
     token: &str,
     secure: bool,
@@ -471,7 +474,10 @@ fn clearing_login_cookie(auth: &AccessAuthenticator) -> Cookie<'static> {
     build_clearing_cookie(auth.login_cookie_name(), secure)
 }
 
-fn raw_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, HandlerError> {
+pub(super) fn raw_cookie<'a>(
+    headers: &'a HeaderMap,
+    name: &str,
+) -> Result<Option<&'a str>, HandlerError> {
     let mut found = None;
     for value in headers.get_all(header::COOKIE) {
         let value = value.to_str().map_err(|_| HandlerError::BadRequest)?;
@@ -488,7 +494,7 @@ fn raw_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>,
     Ok(found)
 }
 
-fn redirect(location: &str) -> Response {
+pub(super) fn redirect(location: &str) -> Response {
     HeaderValue::from_str(location).map_or_else(
         |_| handler_error(HandlerError::Internal),
         |location| {
@@ -499,7 +505,7 @@ fn redirect(location: &str) -> Response {
     )
 }
 
-fn set_cookie_header(response: &mut Response, cookie: &Cookie<'_>) {
+pub(super) fn set_cookie_header(response: &mut Response, cookie: &Cookie<'_>) {
     if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
@@ -517,7 +523,7 @@ async fn no_store_layer(request: Request<axum::body::Body>, next: Next) -> Respo
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandlerError {
+pub(super) enum HandlerError {
     BadRequest,
     Forbidden,
     Unauthenticated,
@@ -527,7 +533,7 @@ enum HandlerError {
     Service(AccessAuthError),
 }
 
-fn handler_error(error: HandlerError) -> Response {
+pub(super) fn handler_error(error: HandlerError) -> Response {
     let (status, message) = match error {
         HandlerError::BadRequest => (StatusCode::BAD_REQUEST, "invalid authentication request"),
         HandlerError::Forbidden => (StatusCode::FORBIDDEN, "same-origin request required"),

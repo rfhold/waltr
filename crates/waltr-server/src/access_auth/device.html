@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in to Waltr</title>
+    <link rel="stylesheet" href="/oidc/sign-in.css">
+    <script src="/oidc/sign-in.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Sign in to Waltr</h1>
+      <p id="status" role="status"></p>
+      <section id="device" hidden aria-label="Sign in with another device">
+        <p>Scan the QR code with your phone, then follow the prompts. Only approve if the code matches.</p>
+        <img id="qr" width="224" height="224" alt="QR code for signing in with another device">
+        <p>Or visit <a id="verification" target="_blank" rel="noreferrer"></a> and enter:</p>
+        <p><strong id="code"></strong></p>
+        <button type="button" id="cancel">Cancel code</button>
+      </section>
+      <button type="button" id="restart" hidden>Get a new code</button>
+      <p><a id="same-device" href="/oidc/login?fallback">Sign in on this device instead</a></p>
+    </main>
+  </body>
+</html>

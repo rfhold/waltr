@@ -338,9 +338,18 @@ pub async fn require_browser_session(
             let query = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("return_to", return_to)
                 .finish();
+            let entry = if authenticator.supports_device_authorization() {
+                "/oidc/sign-in"
+            } else {
+                "/oidc/login"
+            };
             (
                 StatusCode::SEE_OTHER,
-                [(header::LOCATION, format!("/oidc/login?{query}"))],
+                [
+                    (header::LOCATION, format!("{entry}?{query}")),
+                    (header::CACHE_CONTROL, "no-store".to_owned()),
+                    (header::REFERRER_POLICY, "no-referrer".to_owned()),
+                ],
             )
                 .into_response()
         }

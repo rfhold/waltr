@@ -1,6 +1,7 @@
 //! OIDC-backed authentication for access to the Waltr server.
 
 mod config;
+mod device;
 mod handlers;
 mod jwks;
 mod lease;
@@ -24,3 +25,12 @@ pub use store::{
     BrowserSessionTokenDigest, CleanupResult, ConsumedLoginAttempt, LoginAttempt,
     LoginCorrelationDigest, LoginStateDigest, MAX_ACTIVE_LOGIN_ATTEMPTS, McpOAuthLoginContinuation,
 };
+
+const fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
