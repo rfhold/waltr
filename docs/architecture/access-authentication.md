@@ -58,11 +58,12 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 
 | Public | Protected in OIDC mode |
 | --- | --- |
-| `GET /health` | Embedded web assets and SPA routes; unauthenticated navigation redirects to `/oidc/login`. |
+| `GET /health` | Embedded web assets and SPA routes; unauthenticated navigation offers device sign-in when the provider supports it. |
 | `GET /oidc/login` | All native gRPC services via bearer token. |
 | `GET /oidc/callback` | All gRPC-web services via the Waltr browser session cookie. |
 | `POST /oidc/logout` | `/mcp` POST via bearer token. |
 | `GET /oidc/session` | |
+| `GET /oidc/sign-in` and its assets; same-origin `POST /oidc/device/{start,poll,cancel}` | |
 | API-root RFC 9728 metadata, path-specific MCP metadata, local RFC 8414 metadata/JWKS, OAuth authorization/token/revocation/registration routes, and outbound callback/CIMD routes | |
 
 API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before each stateless MCP request dispatch.
@@ -135,6 +136,14 @@ Access tokens, refresh tokens, PKCE material, and callback state remain outside 
 
 ## Browser Flow
 
+When the identity provider advertises device authorization, protected browser navigation redirects to `/oidc/sign-in?return_to=<local-path>`. Waltr displays a QR code and a verification URL with a short code for manual entry. The browser can also choose **Sign in on this device** to use the existing `/oidc/login` flow. An expired session in an already-open browser tab offers a return to the sign-in page instead of starting a grant in the background.
+
+Waltr's server starts and polls the provider grant. Same-origin requests and an `HttpOnly` correlation cookie bind the attempt to the initiating browser. Pending attempts are capped at 256 per process and expire after at most ten minutes. The bundled deployment uses one replica: a restart loses pending attempts, not existing sessions. The server generates the QR code locally from the provider's validated verification URL. It keeps the private device code and provider tokens out of browser JavaScript.
+
+After phone approval, the server validates the provider's identity response and issues its normal browser session cookie. Device approval uses no authorization-code callback or PKCE nonce; the existing same-device callback retains its checks. Cancellation ends only the matching attempt, and cannot undo a completion that already claimed it. If QR sign-in expires or fails, the user can request a new code or sign in on the current device. If device authorization is not advertised, browser navigation keeps the existing redirect.
+
+### Sign In On This Device
+
 1. The browser navigates to `/oidc/login?return_to=<local-path>`. The return value must be a local absolute path; protocol-relative paths, backslashes, control characters, and encoded bypasses are rejected.
 2. The server rate-limits login admission, creates independent random state, browser correlation, nonce, and PKCE verifier values, and persists a ten-minute login attempt. Only state and correlation digests are stored for lookup; the PKCE verifier, nonce, and safe return path are persisted to complete the flow.
 3. A short-lived `HttpOnly`, `SameSite=Lax`, path `/` correlation cookie binds the callback to the initiating browser. The authorization request uses code flow and PKCE S256.
@@ -151,6 +160,8 @@ Logout is `POST /oidc/logout`. In OIDC mode it requires exactly one valid `Origi
 ## Remote Native Protocol And Host Adapters
 
 Native gRPC uses `Authorization: Bearer`, never the browser cookie. Under the `native-access` feature, `crates/waltr-client/src/native_access.rs` owns the public-client Authorization Code with PKCE protocol: protected-resource and authorization-server discovery, callback binding and validation, code exchange, refresh/expiry, cancellation, logout, redaction, generation-safe in-memory bearers, and the shell-neutral refresh-token store boundary. It emits shared reducer commands and secret-free progress. Native hosts supply configuration, secure-store adapters, and effects; they do not reimplement the protocol.
+
+The same coordinator supports [OAuth Device Authorization](https://www.rfc-editor.org/rfc/rfc8628) through the issuer's advertised `device_authorization_endpoint`. The phone flow does not bind a loopback listener or register a pending deep-link callback. The coordinator holds the private device code and polls at the provider's interval, backs off on `slow_down`, and stops at expiry or cancellation. Only the verification URLs, short code, and remaining lifetime reach presentation. After approval, native clients use the same credential lease and refresh-token paths as same-device sign-in.
 
 ### URL-Only Native Bootstrap
 
@@ -185,7 +196,7 @@ The shared native protocol fetches only `/.well-known/oauth-protected-resource` 
 
 The loopback callback policy binds the listener before it creates state, nonce, and PKCE values. It validates method, authority, path, state, and duplicate parameters.
 
-The TUI adapter opens a browser when available and always displays a copyable URL.
+On the TUI access screen, the phone sign-in option shows a terminal QR code when it fits and keeps the verification URL and short code available for manual entry. The same-device option opens a browser when available and displays a copyable authorization URL.
 
 A refresh token is used shortly before access-token expiry. Without one, the client expires access at the declared lifetime. The TUI keeps native tokens in process memory.
 
@@ -209,7 +220,7 @@ This remote native boundary does not change hosted browser access. Hosted browse
 
 [`waltr-app`](../../crates/waltr-app/src/lib.rs) discovers native configuration for each remote selection through the URL-only bootstrap helper. If discovery fails, a ten-second anonymous status probe distinguishes public access from an unusable native bootstrap. A successful status response permits the remote runtime without a native coordinator. Otherwise, startup returns a fixed public explanation with Retry connection and Switch server actions. Local selection skips discovery. Authenticated older servers require compatible bootstrap metadata; the app exposes no explicit client-configuration form.
 
-Desktop uses an ephemeral loopback callback. Android uses the exact redirect `dev.waltr.app:/oauth2redirect`. Rust opens the validated authorization URL through the operating system and retains the protocol state outside snapshots.
+The desktop and Android access screen starts phone sign-in after saved-session restoration finishes and sign-in is required. Rust encodes the QR locally and sends only bounded presentation data to the packaged WebView. The same-device option uses an ephemeral loopback callback on desktop and `dev.waltr.app:/oauth2redirect` on Android. Rust opens the validated authorization URL through the operating system and retains the protocol state outside snapshots.
 
 Android [`MainActivity`](../../crates/waltr-app/gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt) forwards bounded warm `ACTION_VIEW` intents from `onNewIntent` to the current Rust generation. The shared coordinator validates the exact redirect, state, and code/error parameters. Remote activity pause preserves that generation so browser return can complete the same attempt. Cold-start intents do not restore an attempt; initial intent data has no callback handoff. Process death loses pending state and requires a new login.
 

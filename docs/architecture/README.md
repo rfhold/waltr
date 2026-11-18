@@ -4,7 +4,7 @@ Architecture docs describe Waltr's layer boundaries, responsibilities, data flow
 
 | Document | Covers |
 | --- | --- |
-| [access-authentication.md](access-authentication.md) | Waltr access authentication, hosted MCP authorization, browser/native/MCP flows, security boundaries, and lifecycle. |
+| [access-authentication.md](access-authentication.md) | Waltr access authentication, QR and same-device sign-in, hosted MCP authorization, security boundaries, and lifecycle. |
 | [agent.md](agent.md) | Generic runner, server-owned capabilities/MCP/policy/interactions, and private worker dispatch. |
 | [clients.md](clients.md) | Shared client, web, TUI, and native app boundaries, including desktop microphone capture and playback. |
 | [config.md](config.md) | Unified YAML resource catalog, exact-path administration, snapshots, validation, and desktop shortcut configuration. |

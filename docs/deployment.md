@@ -800,8 +800,11 @@ The repository's supported infrastructure/workload definition is Pulumi under `i
 
 | Provider | Type | Use |
 | --- | --- | --- |
-| Browser | Confidential | Server-side browser Authorization Code flow and `/oidc/callback`. |
-| Native API | Public | Remote native clients such as the TUI; issues the API audience and scope. |
+| Browser | Confidential | Server-side Device Authorization and Authorization Code with `/oidc/callback`. |
+| Native API | Public | Device Authorization and Authorization Code for remote native clients; issues the API audience and scope. |
+
+Waltr's Pulumi stacks rely on Authentik's default OAuth grant settings for device authorization. They look up the brand for the configured Authentik hostname and require its device-code flow to be set. The shared Authentik stack owns that brand and its authenticated Stage Configuration flow. Do not create another brand or import the shared brand into a Waltr stack. The lookup checks the binding, not whether either client can complete a live grant.
+
 Authentik has no MCP provider, application, audience, scope mapping, callback, or token-issuance role. Waltr hosts MCP authorization, supports DCR and CIMD according to explicit stack policy, and retains `WALTR_MCP_REQUIRED_SCOPES` as local policy.
 
 Pulumi keeps one Waltr replica with one workspace worker sidecar in the same pod. A protected workspace PVC is mounted at `/workspace` in the worker, separately from the server's `/data` PVC and secret projections; the server does not mount the workspace PVC, and the worker does not mount `/data`, the PostgreSQL CA, or the OAuth keyring. An ephemeral volume shared only by these containers holds `/run/waltr-sandbox/gateway.sock`. Give both containers the socket path and their respective workspace-root variables from [Workspace Worker Deployment](#workspace-worker-deployment). The main Service/route exposes server port `14333`; the separate Apps Service/route exposes the same server process's asset-only port `14334`. Never create a sandbox Service, ingress, or published socket. The containers share one pod network namespace, so this layout separates mounts and processes, **not** network access. Restrict worker egress and runtime authority separately if stronger isolation is required; the pod NetworkPolicy by itself cannot isolate a sidecar from the server's network.

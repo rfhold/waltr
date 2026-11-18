@@ -32,7 +32,7 @@ Asset URLs are nonsecret and must never expose the private API endpoint or gener
 Older text-only calls do not acquire Open app retroactively; a fresh recorded call must carry linked Apps metadata.
 See [macOS Apps verification](../../docs/testing.md#macos-native-apps-verification) for live acceptance and optional sanitized diagnostics.
 
-Waltr access login navigates to server-owned `/oidc/login` with a safe local return path; the browser never handles provider tokens or the HttpOnly Waltr session cookie. Logout is same-origin POST before dispatching shared protected-state clearing. Keep this UI separate from provider/upstream-MCP `OAuthDialog`; server-callback MCP attempts poll shared lifecycle state and never expose token or PKCE material.
+Hosted Waltr access navigates to server-owned `/oidc/sign-in` with a safe local return path. `/oidc/login` remains the same-device fallback. Browser code never handles provider tokens or the HttpOnly Waltr session cookie. Logout is same-origin POST before dispatching shared protected-state clearing. Keep this UI separate from provider/upstream-MCP `OAuthDialog`; server-callback MCP attempts poll shared lifecycle state and never expose token or PKCE material.
 
 Route access and readiness only from authoritative shared snapshots; do not add an embedded or topology bypass. `ClientAdapter.access` is a generic optional capability. The browser supplies server login and same-origin logout; Tauri supplies native access operations only for an explicit non-`local` server ID. Without access operations, login-required snapshots show no sign-in action and authenticated shells show no sign-out action.
 
