@@ -1,4 +1,4 @@
-//! Native OIDC Authorization Code with PKCE runtime support.
+//! Native Waltr access via Device Authorization or Authorization Code with PKCE.
 
 use std::{
     collections::HashSet,
@@ -25,6 +25,7 @@ use url::{Position, Url};
 
 use crate::{AccessAttemptId, ClientCommand, NativeCredentialLease, NativeCredentialProvider};
 
+mod device;
 mod telemetry;
 use telemetry::{Outcome, Stage};
 
@@ -83,8 +84,10 @@ impl NativeRefreshTokenStore for NonPersistentNativeRefreshTokenStore {
 /// Action accepted by the native access coordinator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeAccessAction {
-    /// Begin or retry Waltr login.
+    /// Begin or retry Waltr login in this device's browser using PKCE.
     Start,
+    /// Begin or retry Waltr login using a device code.
+    StartDevice,
     /// Cancel the active login.
     Cancel,
     /// Remove in-memory Waltr credentials.
@@ -256,6 +259,19 @@ pub enum NativeAccessProgress {
         /// Remaining callback lifetime in milliseconds.
         timeout_millis: u64,
     },
+    /// Verification details the user can scan or enter on another device.
+    AwaitingDevice {
+        /// Validated verification URL to open for manual code entry.
+        verification_uri: String,
+        /// Validated URL for the QR code, when the provider supplies one.
+        verification_uri_complete: Option<String>,
+        /// User-facing code, distinct from the private polling credential.
+        user_code: String,
+        /// Remaining device authorization lifetime in milliseconds.
+        timeout_millis: u64,
+    },
+    /// The provider does not advertise or accept device authorization.
+    DeviceUnsupported,
     /// The authorization code is being exchanged.
     Exchanging,
     /// The access token is being refreshed.
@@ -289,6 +305,14 @@ impl fmt::Debug for NativeAccessProgress {
                 .field("authorization_url", &"[REDACTED]")
                 .field("timeout_millis", timeout_millis)
                 .finish(),
+            Self::AwaitingDevice { timeout_millis, .. } => formatter
+                .debug_struct("AwaitingDevice")
+                .field("verification_uri", &"[REDACTED]")
+                .field("verification_uri_complete", &"[REDACTED]")
+                .field("user_code", &"[REDACTED]")
+                .field("timeout_millis", timeout_millis)
+                .finish(),
+            Self::DeviceUnsupported => formatter.write_str("DeviceUnsupported"),
             Self::Exchanging => formatter.write_str("Exchanging"),
             Self::Refreshing => formatter.write_str("Refreshing"),
             Self::RefreshSucceeded => formatter.write_str("RefreshSucceeded"),
@@ -468,6 +492,7 @@ struct AuthorizationServerMetadata {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    device_authorization_endpoint: Option<serde_json::Value>,
     #[serde(default)]
     response_types_supported: Vec<String>,
     #[serde(default)]
@@ -499,6 +524,23 @@ struct AuthorizationRequest {
     redirect_uri: Url,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum LoginMethod {
+    Browser,
+    Device,
+}
+
+enum LoginFailure {
+    Failed(String),
+    DeviceUnsupported,
+}
+
+impl From<NativeAuthError> for LoginFailure {
+    fn from(error: NativeAuthError) -> Self {
+        Self::Failed(error.0)
+    }
+}
+
 enum CoordinatorResult {
     Restore {
         lease: NativeCredentialLease,
@@ -507,7 +549,7 @@ enum CoordinatorResult {
     Login {
         attempt_id: AccessAttemptId,
         lease: NativeCredentialLease,
-        result: Result<Box<LoginTokens>, NativeAuthError>,
+        result: Result<Box<LoginTokens>, LoginFailure>,
     },
     Lifecycle {
         lease: NativeCredentialLease,
@@ -610,7 +652,7 @@ async fn coordinate(
     ));
     let mut login_task: Option<OwnedTask<AccessAttemptId>> = None;
     let mut lifecycle_task: Option<OwnedTask<NativeCredentialLease>> = None;
-    let mut pending_lease = None;
+    let mut pending_login = None;
     let mut waiting_for_attempt = false;
     let mut cancel_pending = false;
     let mut active_attempt: Option<(AccessAttemptId, NativeCredentialLease)> = None;
@@ -625,7 +667,7 @@ async fn coordinate(
             action = actions.recv() => {
                 let Some(action) = action else { break };
                 match action {
-                    NativeAccessAction::Start => {
+                    NativeAccessAction::Start | NativeAccessAction::StartDevice => {
                         if login_start_in_progress(
                             waiting_for_attempt,
                             active_attempt.is_some(),
@@ -646,7 +688,12 @@ async fn coordinate(
                         }
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
-                        pending_lease = Some(credentials.begin_credential_lease());
+                        let method = if action == NativeAccessAction::StartDevice {
+                            LoginMethod::Device
+                        } else {
+                            LoginMethod::Browser
+                        };
+                        pending_login = Some((credentials.begin_credential_lease(), method));
                         waiting_for_attempt = true;
                         cancel_pending = false;
                         active_attempt = None;
@@ -663,7 +710,7 @@ async fn coordinate(
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
                         let _ = credentials.clear_bearer_token();
-                        pending_lease = None;
+                        pending_login = None;
                         active_callback = None;
                         let canceled_attempt = active_attempt.take().map(|(attempt_id, _)| attempt_id).or_else(|| completed_attempt.take());
                         if login_persistence.as_ref().is_some_and(|owned| Some(&owned.attempt_id) == canceled_attempt.as_ref()) {
@@ -685,7 +732,7 @@ async fn coordinate(
                         }
                         abort_owned(&mut login_task).await;
                         abort_owned(&mut lifecycle_task).await;
-                        pending_lease = None;
+                        pending_login = None;
                         active_callback = None;
                         let _ = credentials.clear_bearer_token();
                         if delete_refresh_token(refresh_store.as_ref()).await.is_err() {
@@ -726,13 +773,15 @@ async fn coordinate(
                             }
                             continue;
                         }
-                        let Some(lease) = pending_lease.take() else { continue };
+                        let Some((lease, method)) = pending_login.take() else { continue };
                         active_attempt = Some((attempt_id.clone(), lease));
                         let task_attempt = attempt_id.clone();
                         let outputs = outputs.clone();
                         let results = results.clone();
                         let config = config.clone();
-                        let callback_receiver = if matches!(config.callback, NativeCallbackPolicy::External) {
+                        let callback_receiver = if method == LoginMethod::Browser
+                            && matches!(config.callback, NativeCallbackPolicy::External)
+                        {
                             let (callback_sender, callback_receiver) = mpsc::channel(EXTERNAL_CALLBACK_CAPACITY);
                             active_callback = Some(callback_sender);
                             Some(callback_receiver)
@@ -741,7 +790,11 @@ async fn coordinate(
                             None
                         };
                         let task = tokio::spawn(async move {
-                                let result = login(config, outputs, callback_receiver).await.map(Box::new);
+                            let result = match method {
+                                LoginMethod::Browser => login(config, outputs, callback_receiver)
+                                    .await.map_err(LoginFailure::from),
+                                LoginMethod::Device => device::login(config, outputs).await,
+                            }.map(Box::new);
                             drop(results.send(CoordinatorResult::Login {
                                 attempt_id: task_attempt,
                                 lease,
@@ -857,7 +910,7 @@ async fn coordinate(
                                     Err(error) => {
                                         compensate_login(&outputs, refresh_store.as_ref(), &mut login_persistence).await;
                                         active_attempt = None;
-                                        fail_attempt(&outputs, &credentials, (attempt_id, lease), error.to_string()).await;
+                                        fail_attempt(&outputs, &credentials, (attempt_id, lease), LoginFailure::Failed(error.to_string())).await;
                                         continue;
                                     }
                                 }
@@ -875,7 +928,7 @@ async fn coordinate(
                             }
                             Err(error) => {
                                 active_attempt = None;
-                                fail_attempt(&outputs, &credentials, (attempt_id, lease), error.to_string()).await;
+                                fail_attempt(&outputs, &credentials, (attempt_id, lease), error).await;
                             }
                         }
                     }
@@ -1002,7 +1055,7 @@ async fn fail_attempt(
     outputs: &mpsc::Sender<NativeAccessOutput>,
     credentials: &NativeCredentialProvider,
     attempt: (AccessAttemptId, NativeCredentialLease),
-    error: String,
+    failure: LoginFailure,
 ) {
     let (attempt_id, lease) = attempt;
     let revision = credentials.credential_revision();
@@ -1010,13 +1063,19 @@ async fn fail_attempt(
         telemetry::emit(Stage::Result, Outcome::Stale, lease.generation());
         return;
     }
-    send_progress(
-        outputs,
-        NativeAccessProgress::Failed {
-            error: error.clone(),
-        },
-    )
-    .await;
+    let (progress, error) = match failure {
+        LoginFailure::DeviceUnsupported => (
+            NativeAccessProgress::DeviceUnsupported,
+            "The authorization server does not support QR sign-in for this client; use a browser instead".to_owned(),
+        ),
+        LoginFailure::Failed(error) => (
+            NativeAccessProgress::Failed {
+                error: error.clone(),
+            },
+            error,
+        ),
+    };
+    send_progress(outputs, progress).await;
     drop(
         send_command(
             outputs,
@@ -1246,6 +1305,7 @@ async fn login(
 struct DiscoveredProvider {
     authorization_endpoint: Url,
     token_endpoint: Url,
+    device_authorization_endpoint: Option<serde_json::Value>,
     resource: String,
     scopes_supported: Vec<String>,
 }
@@ -1311,6 +1371,7 @@ async fn discover_with_native(
                 "authorization endpoint",
             )?,
             token_endpoint: parse_secure_url(&metadata.token_endpoint, "token endpoint")?,
+            device_authorization_endpoint: metadata.device_authorization_endpoint,
             resource: protected.resource,
             scopes_supported: protected.scopes_supported,
         },
@@ -1475,6 +1536,36 @@ fn authorization_request(
     let nonce = random_urlsafe(32);
     let verifier = random_urlsafe(32);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let scopes = requested_scopes(provider, config)?;
+    let mut url = provider.authorization_endpoint.clone();
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &config.client_id)
+            .append_pair("redirect_uri", redirect_uri.as_str())
+            .append_pair("scope", &scopes.join(" "))
+            .append_pair("state", &state)
+            .append_pair("nonce", &nonce)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("resource", &provider.resource);
+        if let Some(audience) = &config.audience {
+            query.append_pair("audience", audience);
+        }
+    }
+    Ok(AuthorizationRequest {
+        url,
+        state,
+        verifier,
+        redirect_uri,
+    })
+}
+
+fn requested_scopes(
+    provider: &DiscoveredProvider,
+    config: &NativeAccessConfig,
+) -> Result<Vec<String>, NativeAuthError> {
     let scopes = if config.scopes.is_empty() {
         let mut scopes = vec!["openid".to_owned()];
         for scope in &provider.scopes_supported {
@@ -1500,29 +1591,7 @@ fn authorization_request(
             "configured scopes do not contain all required resource scopes".to_owned(),
         ));
     }
-    let mut url = provider.authorization_endpoint.clone();
-    {
-        let mut query = url.query_pairs_mut();
-        query
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &config.client_id)
-            .append_pair("redirect_uri", redirect_uri.as_str())
-            .append_pair("scope", &scopes.join(" "))
-            .append_pair("state", &state)
-            .append_pair("nonce", &nonce)
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("resource", &provider.resource);
-        if let Some(audience) = &config.audience {
-            query.append_pair("audience", audience);
-        }
-    }
-    Ok(AuthorizationRequest {
-        url,
-        state,
-        verifier,
-        redirect_uri,
-    })
+    Ok(scopes)
 }
 
 fn random_urlsafe(bytes: usize) -> String {
@@ -1824,13 +1893,21 @@ async fn exchange_code(
         .await
         .map_err(|_| NativeAuthError("token exchange request failed".to_owned()))?;
     let token = parse_token_response(response).await?;
+    login_tokens(token, request.token_endpoint, request.client_id)
+}
+
+fn login_tokens(
+    token: TokenResponse,
+    token_endpoint: &Url,
+    client_id: &str,
+) -> Result<LoginTokens, NativeAuthError> {
     let expires_in = token_lifetime(&token.access_token, token.expires_in)?;
     Ok(LoginTokens {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         expires_in,
-        token_endpoint: request.token_endpoint.clone(),
-        client_id: request.client_id.to_owned(),
+        token_endpoint: token_endpoint.clone(),
+        client_id: client_id.to_owned(),
     })
 }
 
@@ -1928,7 +2005,11 @@ async fn parse_token_response(response: Response) -> Result<TokenResponse, Nativ
             "token endpoint rejected the request ({status})"
         )));
     }
-    let token: TokenResponse = serde_json::from_slice(&bytes)
+    decode_token_response(&bytes)
+}
+
+fn decode_token_response(bytes: &[u8]) -> Result<TokenResponse, NativeAuthError> {
+    let token: TokenResponse = serde_json::from_slice(bytes)
         .map_err(|_| NativeAuthError("token endpoint returned an invalid response".to_owned()))?;
     validate_token_response(token)
 }
@@ -2013,25 +2094,34 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
         .map_err(|_| NativeAuthError("OIDC metadata response was invalid".to_owned()))
 }
 
-async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>, NativeAuthError> {
+enum ReadBodyError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+impl From<ReadBodyError> for NativeAuthError {
+    fn from(error: ReadBodyError) -> Self {
+        Self(
+            match error {
+                ReadBodyError::TooLarge => "OIDC response exceeded the size limit",
+                ReadBodyError::Transport(_) => "OIDC response could not be read",
+            }
+            .to_owned(),
+        )
+    }
+}
+
+async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>, ReadBodyError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(NativeAuthError(
-            "OIDC response exceeded the size limit".to_owned(),
-        ));
+        return Err(ReadBodyError::TooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| NativeAuthError("OIDC response could not be read".to_owned()))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(ReadBodyError::Transport)? {
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(NativeAuthError(
-                "OIDC response exceeded the size limit".to_owned(),
-            ));
+            return Err(ReadBodyError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -2041,7 +2131,7 @@ async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>, N
 fn parse_secure_url(value: &str, label: &str) -> Result<Url, NativeAuthError> {
     let url =
         Url::parse(value).map_err(|_| NativeAuthError(format!("{label} is not a valid URL")))?;
-    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     if url.scheme() != "https" && !(url.scheme() == "http" && local) {
         return Err(NativeAuthError(format!(
             "{label} must use HTTPS (HTTP is allowed only for local development)"
@@ -2439,6 +2529,7 @@ mod tests {
         let provider = DiscoveredProvider {
             authorization_endpoint: Url::parse("https://id.example/authorize").unwrap(),
             token_endpoint: Url::parse("https://id.example/token").unwrap(),
+            device_authorization_endpoint: None,
             resource: "https://waltr.example".to_owned(),
             scopes_supported: vec!["openid".to_owned()],
         };
@@ -2483,6 +2574,7 @@ mod tests {
         let provider = DiscoveredProvider {
             authorization_endpoint: Url::parse("https://id.example/authorize").unwrap(),
             token_endpoint: Url::parse("https://id.example/token").unwrap(),
+            device_authorization_endpoint: None,
             resource: "https://waltr.example".to_owned(),
             scopes_supported: vec!["waltr.read".to_owned(), "waltr.write".to_owned()],
         };
@@ -2536,6 +2628,7 @@ mod tests {
         let no_required_scopes = DiscoveredProvider {
             authorization_endpoint: provider.authorization_endpoint.clone(),
             token_endpoint: provider.token_endpoint.clone(),
+            device_authorization_endpoint: None,
             resource: provider.resource,
             scopes_supported: Vec::new(),
         };
@@ -3722,7 +3815,7 @@ mod tests {
             &outputs,
             &credentials,
             ("stale-login".to_owned(), stale),
-            "stale login failure".to_owned(),
+            LoginFailure::Failed("stale login failure".to_owned()),
         )
         .await;
         assert!(credentials.has_bearer_token());
@@ -4674,6 +4767,273 @@ mod tests {
             panic!("expected authorization URL");
         };
         Url::parse(&authorization_url).unwrap()
+    }
+
+    async fn begin_device_attempt(
+        coordinator: &mut NativeAccessCoordinator,
+        actions: &mpsc::Sender<NativeAccessAction>,
+        attempt_id: &str,
+    ) {
+        actions.send(NativeAccessAction::StartDevice).await.unwrap();
+        assert!(matches!(
+            next_login_output(coordinator).await,
+            NativeAccessOutput::ClientCommand { command, .. }
+                if *command == ClientCommand::StartWaltrLogin
+        ));
+        actions
+            .send(NativeAccessAction::AttemptStarted {
+                attempt_id: attempt_id.to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_login_output(coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Discovering)
+        );
+    }
+
+    #[tokio::test]
+    async fn device_pending_then_success_installs_credentials_after_persisting() {
+        let (endpoint, mut requests, server) = spawn_test_device_server(
+            1,
+            15,
+            &[
+                ("400 Bad Request", r#"{"error":"authorization_pending"}"#),
+                (
+                    "200 OK",
+                    r#"{"access_token":"test-access","refresh_token":"test-refresh","expires_in":3600,"token_type":"Bearer"}"#,
+                ),
+            ],
+        )
+        .await;
+        let credentials = NativeCredentialProvider::new();
+        let store = Arc::new(MockRefreshStore::default());
+        *store.credential_probe.lock().unwrap() = Some(credentials.clone());
+        let mut config = test_config();
+        config.endpoint.clone_from(&endpoint);
+        config.scopes = vec!["waltr:api".into(), "offline_access".into()];
+        config.audience = Some("waltr-api".into());
+        config.callback = NativeCallbackPolicy::External;
+        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
+            config,
+            credentials.clone(),
+            store.clone(),
+            8,
+        );
+        let actions = coordinator.action_sender();
+        begin_device_attempt(&mut coordinator, &actions, "qr").await;
+        let NativeAccessOutput::Progress(
+            progress @ NativeAccessProgress::AwaitingDevice { timeout_millis, .. },
+        ) = next_login_output(&mut coordinator).await
+        else {
+            panic!("expected device verification details");
+        };
+        assert!((1..=15_000).contains(&timeout_millis));
+        let json = serde_json::to_value(&progress).unwrap();
+        assert_eq!(json["AwaitingDevice"]["user_code"], "TEST-CODE");
+        assert_eq!(
+            json["AwaitingDevice"]["verification_uri"],
+            format!("{endpoint}/verify")
+        );
+        assert_eq!(
+            json["AwaitingDevice"]["verification_uri_complete"],
+            format!("{endpoint}/verify?code=TEST-CODE")
+        );
+        assert!(!json.to_string().contains("private-device-code"));
+        assert!(!format!("{progress:?}").contains("TEST-CODE"));
+
+        let request = next_device_request(&mut requests).await;
+        let form = request_form(&request);
+        assert_eq!(form["client_id"], "native");
+        assert_eq!(form["scope"], "openid waltr:api offline_access");
+        assert_eq!(form["resource"], endpoint);
+        assert_eq!(form["audience"], "waltr-api");
+        assert!(!form.contains_key("redirect_uri"));
+        assert!(!form.contains_key("code_challenge"));
+        for _ in 0..2 {
+            let request = next_device_request(&mut requests).await;
+            let form = request_form(&request);
+            assert_eq!(form["client_id"], "native");
+            assert_eq!(
+                form["grant_type"],
+                "urn:ietf:params:oauth:grant-type:device_code"
+            );
+            assert_eq!(form["device_code"], "private-device-code");
+        }
+        assert_eq!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Succeeded)
+        );
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::ClientCommand { command, .. }
+                if *command == ClientCommand::CompleteWaltrLogin { attempt_id: "qr".to_owned() }
+        ));
+        assert!(credentials.has_bearer_token());
+        assert_eq!(*store.bearer_seen_during_store.lock().unwrap(), Some(false));
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"test-refresh".as_slice())
+        );
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn device_expires_locally_without_polling_after_deadline() {
+        let (endpoint, mut requests, server) = spawn_test_device_server(5, 1, &[]).await;
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        let credentials = NativeCredentialProvider::new();
+        let mut coordinator = NativeAccessCoordinator::spawn(config, credentials.clone(), 8);
+        let actions = coordinator.action_sender();
+        begin_device_attempt(&mut coordinator, &actions, "qr").await;
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::AwaitingDevice { .. })
+        ));
+        assert!(
+            next_device_request(&mut requests)
+                .await
+                .starts_with("POST /device ")
+        );
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Failed { error })
+                if error.contains("expired")
+        ));
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::ClientCommand { command, .. }
+                if matches!(command.as_ref(), ClientCommand::FailWaltrLogin { attempt_id, .. } if attempt_id == "qr")
+        ));
+        assert!(requests.try_recv().is_err());
+        assert!(!credentials.has_bearer_token());
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn device_is_cancellable_without_waiting_for_the_next_poll() {
+        let (endpoint, mut requests, server) = spawn_test_device_server(30, 60, &[]).await;
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        let credentials = NativeCredentialProvider::new();
+        let mut coordinator = NativeAccessCoordinator::spawn(config, credentials.clone(), 8);
+        let actions = coordinator.action_sender();
+        begin_device_attempt(&mut coordinator, &actions, "qr").await;
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::AwaitingDevice { .. })
+        ));
+        assert!(
+            next_device_request(&mut requests)
+                .await
+                .starts_with("POST /device ")
+        );
+        actions.send(NativeAccessAction::Cancel).await.unwrap();
+        cancel_outputs(&mut coordinator, "qr").await;
+        assert!(requests.try_recv().is_err());
+        assert!(!credentials.has_bearer_token());
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_device_endpoint_allows_explicit_browser_pkce_fallback() {
+        let (endpoint, mut requests, server) = spawn_test_oauth_server().await;
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.callback = NativeCallbackPolicy::External;
+        let credentials = NativeCredentialProvider::new();
+        let mut coordinator = NativeAccessCoordinator::spawn(config, credentials.clone(), 8);
+        let actions = coordinator.action_sender();
+        begin_device_attempt(&mut coordinator, &actions, "qr").await;
+        assert_eq!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::DeviceUnsupported)
+        );
+        assert!(matches!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::ClientCommand { command, .. }
+                if matches!(command.as_ref(), ClientCommand::FailWaltrLogin { attempt_id, .. } if attempt_id == "qr")
+        ));
+        let url = begin_external_attempt(&mut coordinator, &actions, "pkce").await;
+        assert_eq!(query_value(&url, "code_challenge_method"), "S256");
+        callback(&actions, &query_value(&url, "state"), "test-code").await;
+        assert!(
+            next_device_request(&mut requests)
+                .await
+                .contains("grant_type=authorization_code")
+        );
+        assert_eq!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Exchanging)
+        );
+        assert_eq!(
+            next_login_output(&mut coordinator).await,
+            NativeAccessOutput::Progress(NativeAccessProgress::Succeeded)
+        );
+        assert!(credentials.has_bearer_token());
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    async fn next_device_request(requests: &mut mpsc::Receiver<String>) -> String {
+        time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn request_form(request: &str) -> std::collections::BTreeMap<String, String> {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect()
+    }
+
+    async fn spawn_test_device_server(
+        interval: u64,
+        expires_in: u64,
+        token_responses: &'static [(&'static str, &'static str)],
+    ) -> (String, mpsc::Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server_endpoint = endpoint.clone();
+        let (requests, receiver) = mpsc::channel(4);
+        let server = tokio::spawn(async move {
+            let mut token_responses = token_responses.iter();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let mut status = "200 OK";
+                let body = match path {
+                    "/.well-known/oauth-protected-resource" => format!(
+                        r#"{{"resource":"{server_endpoint}","authorization_servers":["{server_endpoint}"],"scopes_supported":["waltr:api"]}}"#
+                    ),
+                    "/.well-known/openid-configuration" => format!(
+                        r#"{{"issuer":"{server_endpoint}","authorization_endpoint":"{server_endpoint}/authorize","token_endpoint":"{server_endpoint}/token","device_authorization_endpoint":"{server_endpoint}/device","response_types_supported":["code"],"grant_types_supported":["authorization_code","urn:ietf:params:oauth:grant-type:device_code"],"code_challenge_methods_supported":["S256"]}}"#
+                    ),
+                    "/device" => {
+                        requests.send(request).await.unwrap();
+                        format!(
+                            r#"{{"device_code":"private-device-code","user_code":"TEST-CODE","verification_uri":"{server_endpoint}/verify","verification_uri_complete":"{server_endpoint}/verify?code=TEST-CODE","expires_in":{expires_in},"interval":{interval}}}"#
+                        )
+                    }
+                    "/token" => {
+                        requests.send(request).await.unwrap();
+                        let &(response_status, body) = token_responses.next().unwrap();
+                        status = response_status;
+                        body.to_owned()
+                    }
+                    _ => panic!("unexpected OAuth test request: {path}"),
+                };
+                write_json_response(&mut stream, status, &body).await;
+            }
+        });
+        (endpoint, receiver, server)
     }
 
     fn query_value(url: &Url, name: &str) -> String {
