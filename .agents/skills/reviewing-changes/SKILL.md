@@ -37,8 +37,10 @@ Do not use this skill to implement fixes unless the user asks for changes after 
 | Provider usage semantics | Provider adapters leaking provider-specific details into neutral types or misrepresenting stream events. | `references/provider-usage-semantics.md` |
 | Transport contracts | Proto, gRPC, gRPC-web, WASM, or Rust transport changes breaking status, ETag, or message semantics. | `references/transport-contracts.md` |
 | UI operation lifecycle | UI forms, dialogs, tabs, transitions, or operation feedback losing pending/success/error behavior. | `references/ui-operation-lifecycle.md` |
+| Unnecessary UI gating | Empty data or transient state hides a supported route, tab, or prerequisite. | [Unnecessary UI gating](references/unnecessary-ui-gating.md) |
 | UI parity | Web and TUI shared flows diverging in labels, empty states, errors, or available actions. | `references/ui-parity.md` |
 | Test layering | Tests asserted at the wrong layer, duplicate lower-layer coverage, or omit contract/lifecycle cases. | `references/test-layering.md` |
+| Unnecessary smoke stages | An extra validation stage repeats evidence or blocks progress without testing a distinct risk. | [Unnecessary smoke stages](references/unnecessary-smoke-stages.md) |
 | Obsessive checks | Locks, snapshots, trust checks, duplicate validation, session stops, or transactions impose stronger guarantees than callers need. | [Obsessive checks](references/obsessive-checks.md) |
 | Obsessive legacy migration handling | Flags, opt-ins, compatibility branches, or legacy wording protect no deployed consumer or supported rollout. | [Obsessive legacy migration handling](references/obsessive-legacy-migration-handling.md) |
 | Skill maintenance | A new invariant appears but is not captured as reusable review guidance. | `references/skill-maintenance.md` |
