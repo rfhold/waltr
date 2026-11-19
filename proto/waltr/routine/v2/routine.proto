@@ -230,6 +230,9 @@ message InvocationSelection {
   // Present must be nonempty and the entrypoint must currently offer SESSION;
   // absent requires GLOBAL. Published eligibility never replaces authorization.
   optional string source_session = 6;
+  // Invocation context, not business input. Admission must verify this ID
+  // against a live claim owned by the OAuth account before exposing it to the Routine.
+  optional string origin_machine_id = 7;
 }
 
 message StartInvocationRequest {

@@ -295,10 +295,20 @@ impl Client {
 
     /// Request that a new server-side session be created.
     pub fn create_session(&mut self, agent_name: impl Into<String>) -> ClientUpdate {
+        self.create_session_with_workspace(agent_name, None)
+    }
+
+    /// Create a session with an optional worker-local workspace selection.
+    pub fn create_session_with_workspace(
+        &mut self,
+        agent_name: impl Into<String>,
+        workspace: Option<crate::WorkspaceSelection>,
+    ) -> ClientUpdate {
         let operation_key = self.state.next_operation_key();
         self.apply(ClientEvent::Session(SessionEvent::CreateRequested {
             operation_key,
             agent_name: agent_name.into(),
+            workspace,
         }))
     }
 

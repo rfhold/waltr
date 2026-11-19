@@ -1,7 +1,7 @@
 # Filesystem Tools
 
-The server owns filesystem schemas and permission policy. `waltr-agent-sandbox` executes approved calls through the private worker.
-`HostRuntimeBuilder` installs configured tools; a bare generic agent has none. See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
+The server owns filesystem schemas and permission policy. The session's workspace worker executes approved calls.
+`HostRuntimeBuilder` installs configured tools; a bare generic agent has none. See [workspace worker selection and transport](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
 
@@ -75,7 +75,7 @@ These integrations update middleware state so the same discovered context is not
 - Binary, image, and PDF-specific read handling is not implemented.
 - Ordinary worker search applies standard ignore filters, with a separate pass for nested hidden `.agents/skills` trees. Snapshot walks exclude hidden and gitignored paths and never follow symlinks.
 - Filesystem tools do not support LSP diagnostics, formatting, or symbol operations.
-- The server installs these tools from agent definitions, but there is no separate public worker API or OS isolation.
+- The server installs these tools from agent definitions. The worker connection does not expose a client filesystem API or provide OS isolation.
 
 ## Tests
 

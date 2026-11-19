@@ -102,11 +102,25 @@ pub struct Transaction {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Create {
+    pub workspace: Option<WorkspaceSelection>,
     pub source: String,
     pub copy_history: bool,
     pub inherit_definition: bool,
     pub inherit_inference: bool,
     pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorkspaceSelection {
+    pub machine: String,
+    pub working_directory: Option<String>,
+}
+
+impl From<WorkspaceSelection> for waltr::grpc::waltr::session::v1::WorkspaceSelection {
+    fn from(selection: WorkspaceSelection) -> Self {
+        Self { machine_id: selection.machine, working_directory: selection.working_directory }
+    }
 }
 
 #[derive(Debug, Deserialize)]

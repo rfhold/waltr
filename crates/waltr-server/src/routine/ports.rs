@@ -219,6 +219,8 @@ pub enum HelperSelection {
 
 /// Fully bounded helper request after operation policy validation.
 pub struct HelperRequest {
+    /// Explicit worker and default directory for a named agent.
+    pub workspace: Option<waltr::grpc::waltr::session::v1::WorkspaceSelection>,
     /// Pinned selection, not raw provider configuration.
     pub selection: HelperSelection,
     /// Invocation-local task, at most 16384 bytes.

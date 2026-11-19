@@ -59,7 +59,7 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 | Public | Protected in OIDC mode |
 | --- | --- |
 | `GET /health` | Embedded web assets and SPA routes; unauthenticated navigation offers device sign-in when the provider supports it. |
-| `GET /oidc/login` | All native gRPC services via bearer token. |
+| `GET /oidc/login` | Native application gRPC services via API bearer token. |
 | `GET /oidc/callback` | All gRPC-web services via the Waltr browser session cookie. |
 | `POST /oidc/logout` | `/mcp` POST via bearer token. |
 | `GET /oidc/session` | |
@@ -67,6 +67,8 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 | API-root RFC 9728 metadata, path-specific MCP metadata, local RFC 8414 metadata/JWKS, OAuth authorization/token/revocation/registration routes, and outbound callback/CIMD routes | |
 
 API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before each stateless MCP request dispatch.
+
+An OIDC access-authenticated server serves `/waltr.sandbox.v1.SandboxService/Connect` on the main API listener. It accepts the native API OAuth bearer, not browser cookies or the private self-MCP credential. A `WorkspaceBinding` uses the destination's device authorization flow for that API. The exporting server keeps the grant; its worker receives only the expiring access token over the private worker connection. The destination binds the live machine claim to the verified issuer and subject, and the stream cannot outlive the bearer. If a Routine request claims an origin, the destination compares the caller's OAuth account with the live claim. A machine claim grants no tool permission. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
 
 ## Standalone Private Self-MCP Admission
 

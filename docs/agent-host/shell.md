@@ -1,8 +1,8 @@
 # Shell Tool
 
-The server owns shell schemas and policy; `waltr-agent-sandbox` executes commands through the private worker.
+The server owns shell schemas and policy; the session's workspace worker executes commands.
 Both crates require `shell`; `waltr-agent` has no shell feature. `HostRuntimeBuilder` installs the tool.
-See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
+See [workspace worker selection and transport](../architecture/agent.md#private-workspace-boundary).
 
 Standalone containers use a separate worker. Embedded desktop uses a process-local worker without OS isolation. Android has no shell feature.
 
@@ -53,7 +53,7 @@ Some shell constructs cannot be safely inferred. Dynamic paths containing shell 
 
 ## Safety Boundaries
 
-The worker is a local command runner, not an OS sandbox. Private RPC separates tool ownership but does not reduce operating-system authority.
+Commands run with the worker's operating-system authority. The worker RPC does not provide an OS sandbox.
 
 - There is no chroot, container, seccomp, or PTY sandbox.
 - The embedded desktop worker runs shell commands with the app process's operating-system authority.

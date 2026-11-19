@@ -4,6 +4,8 @@
 //! nor a caller of the public tool API can execute without a prepared ticket.
 
 mod patch;
+#[cfg(feature = "rpc")]
+pub mod peer_config;
 #[cfg(feature = "shell")]
 mod shell;
 mod tools;
@@ -12,6 +14,4 @@ mod wire;
 
 pub use tools::{Claim, Execution, Prepared, Sandbox, SandboxError, WorkspaceResult};
 #[cfg(feature = "rpc")]
-pub use wire::run_worker;
-#[cfg(feature = "rpc")]
-pub use wire::run_worker_with_shutdown;
+pub use wire::{run_worker, run_worker_with_authorization, run_worker_with_shutdown};

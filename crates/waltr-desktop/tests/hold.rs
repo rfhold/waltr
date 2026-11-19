@@ -42,6 +42,7 @@ support::fake_service!(Fake;
 type Responses = Pin<Box<dyn Stream<Item = Result<wire::InteractResponse, RpcStatus>> + Send>>;
 #[derive(Clone, Default)]
 struct Fake {
+    endpoint: String,
     cleanup_blocked: Arc<AtomicBool>,
     cleanup_release: Arc<tokio::sync::Notify>,
     admissions: Arc<AtomicUsize>,
@@ -100,12 +101,27 @@ impl Fake {
         request: Request<tonic::Streaming<wire::InteractRequest>>,
     ) -> Result<Response<Responses>, RpcStatus> {
         self.admissions.fetch_add(1, Ordering::SeqCst);
+        let peer = request
+            .metadata()
+            .get("x-waltr-workspace-authorization")
+            .cloned();
+        let auth = request.metadata().get("authorization").cloned();
         let mut input = request.into_inner();
         let first = input.message().await?.unwrap();
         let Some(wire::interact_request::Frame::Open(open)) = first.frame else {
             panic!("expected open")
         };
         let open = open.selection.unwrap();
+        if open.routine.starts_with("origin-") {
+            let matched = open.routine == "origin-matched";
+            assert_eq!(
+                open.origin_machine_id.as_deref(),
+                matched.then_some("laptop")
+            );
+            assert!(peer.is_none());
+            assert_eq!(auth.unwrap(), "Bearer fixture-access");
+            return Ok(Response::new(Box::pin(stream::iter([accepted()]))));
+        }
         if open.routine.starts_with("repeated") {
             let fake = self.clone();
             let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -451,7 +467,10 @@ async fn fixture() -> (
     let incoming = stream::unfold(listener, |listener| async {
         Some((listener.accept().await.map(|v| v.0), listener))
     });
-    let fake = Fake::default();
+    let fake = Fake {
+        endpoint: format!("http://{addr}"),
+        ..Fake::default()
+    };
     let service = RoutineServiceServer::new(fake.clone());
     let stop = CancellationToken::new();
     let stopped = stop.clone();
@@ -468,6 +487,39 @@ async fn fixture() -> (
         stop,
         server,
     )
+}
+
+#[tokio::test]
+async fn shortcut_origin_only_reaches_matching_interact_with_user_bearer() {
+    use waltr_client::RoutineInteractionTransport as _;
+    let (transport, fake, stop, server) = fixture().await;
+    transport.replace_bearer_token("fixture-access").unwrap();
+    for (name, destination) in [
+        ("origin-matched", Some(fake.endpoint.clone())),
+        ("origin-wrong-port", Some("http://127.0.0.1:1".into())),
+        ("origin-path", Some(format!("{}/other", fake.endpoint))),
+        ("origin-ordinary", None),
+    ] {
+        let tx = destination.map_or_else(
+            || transport.clone(),
+            |url| transport.for_workspace_shortcut(&url.parse().unwrap(), "laptop"),
+        );
+        let invocation = support::invocation(name);
+        let open = wire::InteractionOpen {
+            selection: Some(invocation.selection),
+            inputs: vec![wire::InputDeclaration {
+                port: "audio".into(),
+                format: Some(wire::input_declaration::Format::Pcm16le(wire::Pcm16Le {
+                    sample_rate: 24000,
+                    channels: 1,
+                })),
+            }],
+        };
+        drop(tx.interact(open, invocation.limits).await.unwrap());
+    }
+    assert_eq!(fake.admissions.load(Ordering::SeqCst), 4);
+    stop.cancel();
+    server.await.unwrap();
 }
 #[derive(Default)]
 struct Mock {

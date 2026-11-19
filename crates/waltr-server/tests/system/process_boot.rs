@@ -17,6 +17,9 @@ use std::{
     time::Duration,
 };
 use waltr::grpc::waltr::resource::v1::{InspectResourceRequest, ReplaceResourceRequest};
+use waltr::grpc::waltr::session::v1::{
+    CreateSessionRequest, session_service_client::SessionServiceClient,
+};
 use waltr_server::persistence::{DatabaseConfig, Persistence};
 
 const OIDC_ENVIRONMENT: &[&str] = &[
@@ -70,6 +73,64 @@ async fn server_process_boots_and_serves_health() -> Result<(), Box<dyn std::err
     assert_process_database_isolation(&waltr_database, &mcp_database).await?;
     fs::remove_dir_all(root)?;
     result
+}
+
+#[tokio::test]
+async fn server_process_starts_with_storage_inside_default_workspace()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (addr, root, _) = process_test_inputs()?;
+    let workspace = root.join("workspace");
+    let waltr_database = workspace.join("waltr.sqlite3");
+    let mcp_database = workspace.join("mcp.sqlite3");
+    let sessions = workspace.join("sessions");
+    let database_url = format!("sqlite://{}", waltr_database.display());
+    let mut server = isolated_server_command(addr, &root, &database_url)
+        .env("TMPDIR", &workspace)
+        .env_remove("WALTR_WORKSPACE_ROOT")
+        .env_remove("WALTR_SANDBOX_SOCKET")
+        .env("WALTR_SESSION_STORE", "filesystem")
+        .env("WALTR_SESSION_FILESYSTEM_ROOT", &sessions)
+        .env(
+            "WALTR_MODELS_DEV_CACHE_PATH",
+            workspace.join("cache/models.json"),
+        )
+        .env("WALTR_ROUTINE_OBJECT_STORE", "filesystem")
+        .env(
+            "WALTR_ROUTINE_OBJECT_ROOT",
+            workspace.join("routine-objects"),
+        )
+        .spawn()?;
+
+    let result = async {
+        wait_for_health(addr).await?;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))?
+            .timeout(Duration::from_secs(8))
+            .connect()
+            .await?;
+        let mut client = SessionServiceClient::new(channel);
+        let created = client
+            .create_session(CreateSessionRequest::default())
+            .await?
+            .into_inner();
+        let id = created.session.ok_or("missing created session")?.id;
+        if !sessions.join(format!("{id}.json")).is_file() {
+            return Err("session was not stored beneath the default workspace".into());
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    if server.try_wait()?.is_none() {
+        server.kill()?;
+        server.wait()?;
+    }
+    if let Err(error) = result {
+        return Err(format!("{error}\n{}", captured_output(&mut server)?).into());
+    }
+    assert!(waltr_database.is_file());
+    assert!(mcp_database.is_file());
+    fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 #[tokio::test]

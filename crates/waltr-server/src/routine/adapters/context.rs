@@ -88,6 +88,7 @@ struct State {
 }
 
 pub struct CoordinatorContext<S: SessionStore + Clone + Send + Sync + 'static> {
+    workspace_factory: Option<Arc<crate::agent_host::runtime_factory::ServerAgentRuntimeFactory>>,
     sessions: SessionCoordinator<S>,
     capture: SessionContextCapture,
     authority: String,
@@ -115,7 +116,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorContext<S> {
             sources.insert("original".into(), (SessionCopy::from_record(&record, capture.identity.boundary()).map_err(|_| PortError::Conflict)?, true));
         }
         let state = State { record, identity: capture.identity.clone(), sources, destinations: BTreeMap::new(), continuation: None, committed: false };
-        Ok(Self { sessions, capture, authority: authority.into(), original_allowed,
+        Ok(Self { workspace_factory: None, sessions, capture, authority: authority.into(), original_allowed,
             state: Arc::new(Mutex::new(state)), gate: Arc::new(tokio::sync::Mutex::new(())),
             compaction: false, automatic: None, pause: Arc::new(Mutex::new(None)), calls: owned::ContextCalls::new() })
     }
@@ -148,7 +149,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorContext<S> {
         Err(PortError::Conflict)
     }
     pub fn child_context(&self) -> Self {
-        Self { sessions: self.sessions.clone(), capture: self.capture.clone(), authority: self.authority.clone(),
+        Self { workspace_factory: self.workspace_factory.clone(), sessions: self.sessions.clone(), capture: self.capture.clone(), authority: self.authority.clone(),
             original_allowed: self.original_allowed, state: self.state.clone(), gate: self.gate.clone(),
             compaction: false, automatic: None, pause: Arc::new(Mutex::new(None)), calls: owned::ContextCalls::new() }
     }
@@ -172,9 +173,18 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorContext<S> {
             execution_id: outcome.id.clone(), revision: current.revision, note })
     }
     pub fn with_original_ceiling(&self, allowed: bool) -> Self {
-        Self { sessions: self.sessions.clone(), capture: self.capture.clone(), authority: self.authority.clone(),
+        Self { workspace_factory: self.workspace_factory.clone(), sessions: self.sessions.clone(), capture: self.capture.clone(), authority: self.authority.clone(),
             original_allowed: self.original_allowed && allowed, state: self.state.clone(), gate: self.gate.clone(),
             compaction: self.compaction, automatic: self.automatic, pause: self.pause.clone(), calls: self.calls.clone() }
+    }
+    pub(crate) fn with_workspace_factory(mut self, factory: Arc<crate::agent_host::runtime_factory::ServerAgentRuntimeFactory>) -> Self {
+        self.workspace_factory = Some(factory);
+        self
+    }
+
+    pub(crate) fn with_session_coordinator(mut self, sessions: SessionCoordinator<S>) -> Self {
+        self.sessions = sessions;
+        self
     }
     #[cfg(test)]
     pub(super) fn test_administrative_gate(&self) -> Arc<tokio::sync::Mutex<()>> { self.gate.clone() }
@@ -249,6 +259,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> ContextPort for Coordinato
         let sessions = self.sessions.clone();
         let state = self.state.clone();
         let gate = self.gate.clone();
+        let workspace_factory = self.workspace_factory.clone();
         let pause = self.pause.clone();
         let authority = self.authority.clone();
         let boundary = self.capture.identity.boundary();
@@ -334,7 +345,15 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> ContextPort for Coordinato
                     if args.inherit_inference { request.inference_settings = record.inference_settings.clone(); }
                     let messages = vec![SessionStartMessage::user(args.message).map_err(|_| PortError::Invalid)?];
                     request.start = if args.copy_history { SessionStart::Copy { copy, messages } } else { SessionStart::Fresh { messages } };
-                    sessions.create(request).await.map_err(|_| PortError::Uncertain)?;
+                    let workspace = args.workspace.map(Into::into);
+                    if let Some(factory) = workspace_factory {
+                        factory.create_with_workspace(&sessions, request, workspace.as_ref(), record.agent_definition.as_ref())
+                            .await.map_err(|_| PortError::Uncertain)?;
+                    } else if workspace.is_some() || record.agent_definition.as_ref().and_then(|v| v.get("workspace")).is_some_and(|v| !v.is_null()) {
+                        return Err(PortError::Unavailable);
+                    } else {
+                        sessions.create(request).await.map_err(|_| PortError::Uncertain)?;
+                    }
                     state.lock().map_err(|_| PortError::Uncertain)?.destinations.insert(destination.clone(), Some(id.clone()));
                     json!({"created":true,"destination":destination,"sessionId":id.as_str()})
                 }

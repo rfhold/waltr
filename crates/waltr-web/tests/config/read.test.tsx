@@ -23,6 +23,7 @@ describe("config read", () => {
         config: {
           current: null,
           resourceBaselines: {},
+          workspaceBindings: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),
@@ -54,6 +55,7 @@ describe("config read", () => {
         config: {
           current: null,
           resourceBaselines: {},
+          workspaceBindings: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),

@@ -38,7 +38,7 @@ pub mod status_service;
 pub mod test_support;
 #[cfg(feature = "web")]
 mod web_assets;
-mod workspace_paths;
+mod workspace_exports;
 
 pub use agent_definition::{
     AgentDefinitionLoadError, AgentDefinitionSnapshot, AgentDefinitionState,

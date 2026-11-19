@@ -45,6 +45,119 @@ async fn unified_state(directory: &TestDirectory) -> AgentDefinitionState {
 }
 
 #[tokio::test]
+async fn workspace_bindings_reload_atomically_and_reject_duplicate_claims() {
+    let directory = TestDirectory::new("workspace-bindings");
+    let source = |name, endpoint, machine_id| {
+        format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata:\n  name: {name}\nspec:\n  endpoint: {endpoint}\n  machineId: {machine_id}\n  exportRoot: ~/worker-only\n"
+        )
+    };
+    directory.resource(
+        "workspace-bindings/first.yaml",
+        &source("first", "https://HOST.example:443", "laptop"),
+    );
+    let state = unified_state(&directory).await;
+    let initial = state.snapshot();
+    let first = &initial.workspace_bindings()["first"];
+    assert_eq!(first.endpoint().as_str(), "https://host.example/");
+    assert_eq!(first.machine_id(), "laptop");
+    assert_eq!(first.export_root(), std::path::Path::new("~/worker-only"));
+
+    directory.resource(
+        "workspace-bindings/second.yaml",
+        &source("second", "https://host.example/", "laptop"),
+    );
+    state.reload_from_disk().await;
+    assert!(
+        state
+            .reload_error()
+            .unwrap()
+            .contains("already claimed by WorkspaceBinding `first`")
+    );
+    assert!(Arc::ptr_eq(&state.snapshot(), &initial));
+
+    directory.resource(
+        "workspace-bindings/second.yaml",
+        &source("second", "https://host.example/", "desktop"),
+    );
+    directory.resource(
+        "workspace-bindings/third.yaml",
+        &source("third", "https://host.example:8443/", "laptop"),
+    );
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none());
+    assert_eq!(state.snapshot().workspace_bindings().len(), 3);
+}
+
+#[tokio::test]
+async fn workspace_binding_incarnation_tracks_accepted_changes_per_key() {
+    let directory = TestDirectory::new("workspace-binding-incarnation");
+    let source = |name, endpoint| {
+        format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata:\n  name: {name}\nspec:\n  endpoint: {endpoint}\n  machineId: laptop\n  exportRoot: ~/worker-only\n"
+        )
+    };
+    let path = "workspace-bindings/first.yaml";
+    let a = source("first", "https://a.example/");
+    directory.resource(path, &a);
+    let state = unified_state(&directory).await;
+    let initial = state.snapshot();
+    assert_eq!(initial.workspace_binding_incarnation("first"), None);
+
+    directory.resource(path, &source("first", "https://b.example/"));
+    state.reload_from_disk().await;
+    let b = state.snapshot();
+    assert_eq!(
+        b.workspace_bindings()["first"].endpoint().as_str(),
+        "https://b.example/"
+    );
+    let b_id = b.workspace_binding_incarnation("first").unwrap();
+
+    directory.resource(
+        "workspace-bindings/other.yaml",
+        &source("other", "https://c.example/"),
+    );
+    state.reload_from_disk().await;
+    let unrelated = state.snapshot();
+    assert_eq!(unrelated.workspace_binding_incarnation("first"), Some(b_id));
+    let other_id = unrelated.workspace_binding_incarnation("other").unwrap();
+
+    directory.resource(path, &source("first", "https://c.example/"));
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_some());
+    assert!(Arc::ptr_eq(&state.snapshot(), &unrelated));
+
+    directory.resource(path, &a);
+    state.reload_from_disk().await;
+    let restored = state.snapshot();
+    let restored_id = restored.workspace_binding_incarnation("first").unwrap();
+    assert_ne!(restored_id, b_id);
+    assert_eq!(
+        restored.workspace_bindings()["first"],
+        initial.workspace_bindings()["first"]
+    );
+    assert_eq!(
+        restored.workspace_binding_incarnation("other"),
+        Some(other_id)
+    );
+
+    fs::remove_file(directory.0.join(".waltr/resources").join(path)).unwrap();
+    state.reload_from_disk().await;
+    assert!(!state.snapshot().workspace_bindings().contains_key("first"));
+    directory.resource(path, &a);
+    state.reload_from_disk().await;
+    let recreated = state.snapshot();
+    assert_ne!(
+        recreated.workspace_binding_incarnation("first").unwrap(),
+        restored_id
+    );
+    assert_eq!(
+        recreated.workspace_binding_incarnation("other"),
+        Some(other_id)
+    );
+}
+
+#[tokio::test]
 async fn bundled_configuration_agent_enforces_resource_only_hosted_permissions() {
     use crate::{
         agent_host::{AgentPermissionSelector, Capability, HostRuntimeBuilder, ResolvedPermission},

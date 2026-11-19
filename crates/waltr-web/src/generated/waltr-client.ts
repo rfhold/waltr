@@ -736,6 +736,10 @@ id: string,
  */
 agentName: string,
 /**
+ * Effective workspace returned by the server for a bound session.
+ */
+workspace: WorkspaceSelection | null,
+/**
  * Session revision.
  */
 revision: bigint,
@@ -787,6 +791,16 @@ associations: SessionAssociationsView,
  * Complete JSON session metadata object.
  */
 metadata: Record<string, unknown>, };
+
+export type WorkspaceSelection = {
+/**
+ * Stable ID of the exporting machine.
+ */
+machineId: string,
+/**
+ * Worker-local path on create; export-relative directory in a summary.
+ */
+workingDirectory: string | null, };
 
 export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "sessionStatusChanged" | "unknown";
 
@@ -968,7 +982,7 @@ activeAttemptId: string | null, };
 
 export type ClientAuthTarget = {
 /**
- * Target kind, currently `provider` or `mcpServer`.
+ * Target kind: `provider`, `mcpServer`, or `workspaceBinding`.
  */
 kind: string,
 /**
@@ -1396,6 +1410,10 @@ export type ConfigSnapshot = {
  */
 current: ConfigView | null,
 /**
+ * Active workspace bindings keyed by their catalog resource name.
+ */
+workspaceBindings: { [key in string]?: WorkspaceBindingView },
+/**
  * Resource-slot write baselines keyed by canonical path.
  */
 resourceBaselines: { [key in string]?: ResourceEditBaselineView },
@@ -1415,6 +1433,16 @@ reset: OperationSnapshot,
  * Configuration watch operation snapshot.
  */
 watch: OperationSnapshot, };
+
+export type WorkspaceBindingView = {
+/**
+ * Destination server API root.
+ */
+endpoint: string,
+/**
+ * Requested machine identifier at the destination.
+ */
+machineId: string, };
 
 export type StatusSnapshot = {
 /**
@@ -2016,7 +2044,15 @@ invocationId: string, } | { "type": "registerConfigWatchInterest" } | { "type": 
 /**
  * Exact selectable agent name.
  */
-agentName: string, } | { "type": "requestSessionAgents" } | { "type": "deleteSession",
+agentName: string, } | { "type": "createSessionWithWorkspace",
+/**
+ * Exact selectable agent name.
+ */
+agentName: string,
+/**
+ * Worker and optional starting directory.
+ */
+workspace: WorkspaceSelection, } | { "type": "requestSessionAgents" } | { "type": "deleteSession",
 /**
  * Session id to delete.
  */

@@ -171,48 +171,31 @@ pub struct OriginSubmission {
 ///
 /// # Errors
 ///
-/// Returns an error for invalid storage configuration or a workspace overlap.
+/// Returns an error for invalid storage configuration.
 pub fn add_service_from_env(
     routes: &mut RoutesBuilder,
     input: SessionRegistrationInput,
 ) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    add_storage_service(routes, SessionStorageConfig::from_env()?, input)
+    Ok(add_storage_service(
+        routes,
+        SessionStorageConfig::from_env()?,
+        input,
+    ))
 }
 
-pub(crate) fn validate_storage_workspace(
-    storage: &SessionStorageConfig,
-    workspace: &std::path::Path,
-) -> Result<(), SessionStorageConfigError> {
-    if let SessionStorageConfig::Filesystem { root } = storage {
-        let root = if root.is_absolute() {
-            root.clone()
-        } else {
-            workspace.join(root)
-        };
-        if !crate::workspace_paths::overlaps(workspace, &root).is_ok_and(|overlap| !overlap) {
-            return Err(SessionStorageConfigError::Invalid {
-                variable: "WALTR_SESSION_FILESYSTEM_ROOT",
-                requirement: "must not overlap the worker workspace and must be resolvable",
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Register the selected storage only after its workspace policy has been validated.
+/// Register the configured session store.
 pub(crate) fn add_storage_service(
     routes: &mut RoutesBuilder,
     storage: SessionStorageConfig,
     input: SessionRegistrationInput,
-) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    validate_storage_workspace(&storage, &input.workspace_root)?;
-    Ok(match storage {
+) -> Arc<dyn SessionHost> {
+    match storage {
         SessionStorageConfig::Memory => add_store_service(routes, MemorySessionStore::new(), input),
         SessionStorageConfig::Filesystem { root } => {
             add_store_service(routes, FilesystemSessionStore::new(root), input)
         }
         SessionStorageConfig::S3(config) => add_store_service(routes, config.into_store(), input),
-    })
+    }
 }
 
 /// Register a session service backed by an explicit store.
@@ -246,49 +229,6 @@ where
     service
 }
 
-#[cfg(test)]
-mod sandbox_root_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn session_storage_cannot_alias_the_worker_root() {
-        let workspace = crate::test_support::temp_root();
-        let check = |root| {
-            validate_storage_workspace(&SessionStorageConfig::Filesystem { root }, &workspace)
-        };
-        assert!(check(workspace.clone()).is_err());
-        assert!(check(PathBuf::from(".")).is_err());
-        assert!(check(workspace.join("sessions")).is_err());
-        assert!(check(workspace.parent().unwrap().to_path_buf()).is_err());
-        assert!(check(workspace.parent().unwrap().join("other-sessions")).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_parent_and_missing_nested_store_are_rejected() {
-        use std::os::unix::fs::symlink;
-        let root = crate::test_support::temp_root();
-        let workspace = root.join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        symlink(&workspace, root.join("alias")).unwrap();
-        let check = |root| {
-            validate_storage_workspace(&SessionStorageConfig::Filesystem { root }, &workspace)
-        };
-        assert!(check(root.join("alias/sessions/missing")).is_err());
-        assert!(check(root.join("alias")).is_err());
-        let session = root.join("sessions");
-        std::fs::create_dir(&session).unwrap();
-        symlink(&root, root.join("root-alias")).unwrap();
-        assert!(
-            validate_storage_workspace(
-                &SessionStorageConfig::Filesystem { root: session },
-                &root.join("root-alias"),
-            )
-            .is_err()
-        );
-    }
-}
 #[derive(Debug)]
 pub(crate) struct UnboundSessionEvents;
 

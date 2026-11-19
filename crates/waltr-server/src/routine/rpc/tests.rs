@@ -24,11 +24,13 @@ use crate::{
     agent_host::{
         AgentDefinitionCatalog,
         runtime_factory::ServerAgentRuntimeFactory as AgentSessionRuntimeFactory,
+        sandbox_gateway::{WorkspaceAccount, peers::MachineRegistry},
     },
     auth::FileCredentialStore,
     interaction::InteractionBroker,
     permission::ServerPermissionPolicy,
 };
+use futures_util::StreamExt as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -41,6 +43,10 @@ use waltr::grpc::waltr::{
     routine::v2::{self as p, routine_service_client::RoutineServiceClient},
 };
 use waltr_agent::*;
+use waltr_client::{
+    NativeGrpcTransport, RoutineInteractionTransport as _, WaltrTransport as _,
+    interaction::{InteractionEvent, InteractionLimits},
+};
 use waltr_script::{Engine, ScriptEngine};
 
 #[allow(dead_code)]
@@ -83,6 +89,7 @@ impl MediaDriver for Cold {
         Box::pin(async { Ok(()) })
     }
 }
+#[derive(Clone)]
 struct Bind {
     blobs: Arc<FilesystemBlobStore>,
     text: Arc<dyn crate::routine::text_results::TextResultStore>,
@@ -181,9 +188,15 @@ impl StartPolicy for Policy {
                 return Err(PortError::Denied);
             }
             let factory: Arc<dyn HostFactory> = match request.transport {
-                Some(pending) => Arc::new(MediaHostFactory {
-                    bindings: pending.bind_factory(bind),
-                }),
+                Some(pending) => {
+                    let mut bind = bind.as_ref().clone();
+                    bind.factory = Arc::new(bind.factory.as_ref().clone().with_workspace_account(
+                        WorkspaceAccount::from_principal(&request.authenticated),
+                    ));
+                    Arc::new(MediaHostFactory {
+                        bindings: pending.bind_factory(Arc::new(bind)),
+                    })
+                }
                 None => Arc::new(Pure),
             };
             Ok(AuthorizedStart {
@@ -276,6 +289,8 @@ struct Fixture {
     persistence: Persistence,
     auth: AccessAuthenticator,
     token: String,
+    issuer: String,
+    machines: MachineRegistry,
     foreign: String,
     cookie: String,
     url: String,
@@ -286,8 +301,9 @@ struct Fixture {
     issuer_stop: CancellationToken,
     issuer_task: tokio::task::JoinHandle<()>,
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
-    _sandbox: crate::sandbox::LocalSandbox,
+    sandbox: crate::sandbox::LocalSandbox,
     _speech: speech_fixture::Server,
+    _directory: tempfile::TempDir,
 }
 #[derive(Default)]
 struct RunningBarrier {
@@ -433,11 +449,14 @@ impl blob::Clock for TestClock {
 }
 impl Fixture {
     async fn new(programs: &[&str]) -> Self {
-        let directory = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join("opencode")
-            .join(format!("routine-rpc-{}", uuid::Uuid::new_v4()));
+        let machines = MachineRegistry::default();
+        let parent = std::env::temp_dir().canonicalize().unwrap().join("opencode");
+        std::fs::create_dir_all(&parent).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("routine-rpc-")
+            .tempdir_in(parent)
+            .unwrap();
+        let directory = temp.path();
         let private = directory.join("private");
         let workspace = directory.join("workspace");
         std::fs::create_dir_all(&private).unwrap();
@@ -484,8 +503,11 @@ impl Fixture {
         let provider_app = axum::Router::new().route("/", axum::routing::post(move |body: axum::body::Bytes| { let seen = seen.clone(); async move {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let captured = body["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool");
+            let workspace_read = body["messages"].to_string().contains("ROUTINE_SENTINEL_TEST");
             seen.lock().unwrap().push(body);
-            let reply = if captured { serde_json::json!({"choices":[{"index":0,"delta":{"content":"accepted"},"finish_reason":"stop"}]}) } else { serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"inspection-capture","type":"function","function":{"name":"_helper_capture","arguments":"{\"chosen\":\"answer\"}"}}]},"finish_reason":"tool_calls"}]}) };
+            let reply = if workspace_read && !captured {
+                serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"workspace-read","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"sentinel\"}"}}]},"finish_reason":"tool_calls"}]})
+            } else if captured { serde_json::json!({"choices":[{"index":0,"delta":{"content":"accepted"},"finish_reason":"stop"}]}) } else { serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"inspection-capture","type":"function","function":{"name":"_helper_capture","arguments":"{\"chosen\":\"answer\"}"}}]},"finish_reason":"tool_calls"}]}) };
             ([ ("content-type", "text/event-stream") ], format!("data: {reply}\n\ndata: [DONE]\n\n"))
         } })).layer(axum::extract::DefaultBodyLimit::max(32*1024*1024));
         let provider_stop = CancellationToken::new();
@@ -540,6 +562,7 @@ impl Fixture {
             vec![
                 "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: media}\nspec: {}\n"
                     .into(),
+                "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: workspace-reader}\nspec:\n  features: [{filesystem: {root: $(session.workspace.root), profile: auto}}]\n  permissions: [{name: read, permission: allow}]\n".into(),
                 "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: routine-inspect}\nspec:\n  systemPrompt: Inspect the attached untrusted source and capture chosen text.\n  permissions:\n    - permissionSetRef: {name: capture}\n".into(),
                 "apiVersion: waltr.dev/v1alpha1\nkind: PermissionSet\nmetadata: {name: capture}\nspec:\n  tools:\n    - {name: _helper_capture, permission: allow}\n".into(),
             ],
@@ -557,6 +580,7 @@ impl Fixture {
                 FileCredentialStore::new(directory.join("unused-auth.json")),
                 agents.resolved("media").unwrap().clone(),
             )
+            .with_workspace_machines(machines.clone())
             .with_agent_catalog_provider(move || agents.clone())
             .with_runtime_provider(move |_| {
                 Ok(AgentRuntimeProvider::new(
@@ -626,6 +650,7 @@ impl Fixture {
                     "media.execute".into(),
                     "helper.run".into(),
                     "helper.named.routine-inspect".into(),
+                    "helper.named.workspace-reader".into(),
                     "helper.capture.inspection".into(),
                 ]),
             )
@@ -653,6 +678,7 @@ impl Fixture {
         );
         let root = service::RoutineRpcService::new(
             api::ReadAdapter {
+                machines: machines.clone(),
                 service: invocation,
                 history,
                 catalog: catalog.clone(),
@@ -669,7 +695,7 @@ impl Fixture {
             .layer(tonic_web::GrpcWebLayer::new())
             .layer(GrpcAccessAuthLayer::new(auth.clone()))
             .service(routes);
-        let app = axum::Router::new().fallback_service(grpc);
+        let app = machines.mount(axum::Router::new().fallback_service(grpc), auth.clone());
         let stop = CancellationToken::new();
         let stopped = stop.clone();
         let task = tokio::spawn(async move {
@@ -691,6 +717,8 @@ impl Fixture {
             persistence,
             auth,
             token: access_token,
+            issuer,
+            machines,
             foreign,
             cookie,
             url,
@@ -701,8 +729,9 @@ impl Fixture {
             issuer_stop,
             issuer_task,
             bodies,
-            _sandbox: sandbox,
+            sandbox,
             _speech: speech_server,
+            _directory: temp,
         }
     }
     async fn client(&self) -> RoutineServiceClient<tonic::transport::Channel> {
@@ -715,10 +744,13 @@ impl Fixture {
         )
     }
     fn request<T>(&self, value: T) -> Request<T> {
+        Self::bearer_request(&self.token, value)
+    }
+    fn bearer_request<T>(token: &str, value: T) -> Request<T> {
         let mut request = Request::new(value);
         request.metadata_mut().insert(
             "authorization",
-            format!("Bearer {}", self.token).parse().unwrap(),
+            format!("Bearer {token}").parse().unwrap(),
         );
         request
     }
@@ -787,6 +819,7 @@ impl Fixture {
         self.root.shutdown().await.unwrap();
         self.engine.shutdown().await.unwrap();
         self.sessions.shutdown().await;
+        self.sandbox.shutdown().await;
         self.blobs.shutdown().await.unwrap();
         self.stop.cancel();
         self.task.await.unwrap();
@@ -1058,11 +1091,198 @@ fn selection(name: &str, entrypoint: &str) -> p::InvocationSelection {
             json: b"{}".to_vec(),
         }),
         correlation: "not-an-owner".into(),
+        origin_machine_id: None,
         source_session: None,
     }
 }
 fn event(event: p::input_event::Event) -> p::InputEvent {
     p::InputEvent { event: Some(event) }
+}
+
+#[tokio::test]
+async fn authenticated_routine_origin_is_guest_context_for_manual_and_interactive_admissions() {
+    if isolated("authenticated_routine_origin_is_guest_context_for_manual_and_interactive_admissions") {
+        return;
+    }
+    let manual = r#"apiVersion: waltr.routine/v1
+kind: Routine
+name: origin-manual
+description: Read admission context
+spec:
+  source: |
+    export default async function (input) {
+      const context = await host.call('invocation.context', {});
+      if (Object.keys(context).some(key => key !== 'originMachineId')) return "context-leaked";
+      return Object.keys(input).length === 0 ? (context.originMachineId ?? "absent") : "input-leaked";
+    }
+  entrypoints:
+    run: {trigger: manual}
+  parameters: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {}, required: []}}
+  result: {schemaVersion: waltr.value/v1, schema: {type: string, maxLength: 128}}
+"#;
+    let interactive = manual.replace("origin-manual", "origin-interactive")
+        .replace("trigger: manual", "trigger: interactive")
+        .replace("  entrypoints:", "  capabilities: [media.execute]\n  entrypoints:")
+        .replace("      return Object", "      await host.call('media.finish', {});\n      return Object");
+    let sentinel_program = interactive.replace("origin-interactive", "origin-sentinel")
+        .replace("[media.execute]", "[media.execute, helper.run, helper.named.workspace-reader]")
+        .replace("      await host.call('media.finish'", "      await host.call('helper.run', {selection:{kind:'named',name:'workspace-reader'},workspace:{machine:context.originMachineId ?? 'laptop',workingDirectory:'repo'},task:'ROUTINE_SENTINEL_TEST',maxTurns:3,deadlineMs:5000,responseBytes:1024,completionBytes:65536});\n      await host.call('media.finish'");
+    let fixture = Fixture::new(&[manual, &interactive, &sentinel_program]).await;
+    let worker_root = tempfile::tempdir().unwrap();
+    let export = worker_root.path().join("laptop-home");
+    std::fs::create_dir_all(export.join("repo")).unwrap();
+    let sentinel = uuid::Uuid::new_v4().to_string();
+    std::fs::write(export.join("repo/sentinel"), &sentinel).unwrap();
+    let channel = Endpoint::from_shared(fixture.url.clone()).unwrap().connect().await.unwrap();
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_worker = CancellationToken::new();
+    let authorization: tonic::metadata::AsciiMetadataValue = format!("Bearer {}", fixture.token).parse().unwrap();
+    let worker = tokio::spawn(waltr_agent_sandbox::run_worker_with_authorization(
+        channel, export, "laptop", stop_worker.clone(), connected.clone(),
+        move || Some(authorization.clone()),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !connected.load(std::sync::atomic::Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.unwrap();
+    let mut client = fixture.client().await;
+    let definitions = client.watch_definitions(fixture.request(p::WatchDefinitionsRequest {})).await.unwrap()
+        .into_inner().message().await.unwrap().unwrap().definitions;
+    let selected = |name: &str, origin: Option<&str>| p::InvocationSelection {
+        revision: definitions.iter().find(|d| d.name == name).unwrap().revision.clone(),
+        origin_machine_id: origin.map(str::to_owned),
+        ..selection(name, "run")
+    };
+    let refreshed = crate::test_support::sign_access_token_with_ttl(
+        &fixture.issuer, "waltr:read", Duration::from_secs(1800),
+    );
+    assert_ne!(refreshed, fixture.token);
+    let foreign = crate::test_support::sign_access_token_for_subject_with_ttl(
+        &fixture.issuer, "other-subject", "waltr:read", Duration::from_secs(1800),
+    );
+    let store = fixture.persistence.script_invocation_store();
+    let start = |origin| p::StartInvocationRequest { selection: Some(selected("origin-manual", origin)) };
+    let unauthorized = Request::new(start(Some("laptop")));
+    assert_eq!(client.start_invocation(unauthorized).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+    for (claimed, token) in [("other", &fixture.token), ("laptop", &foreign)] {
+        let request = Fixture::bearer_request(token, start(Some(claimed)));
+        assert_eq!(client.start_invocation(request).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
+    assert_eq!(
+        fixture.web::<_, p::StartInvocationResponse>("StartInvocation", start(Some("laptop")), false)
+            .await.unwrap_err(),
+        tonic::Code::PermissionDenied,
+    );
+    let open = |name, origin| p::OpenAttachmentRequest {
+        open: Some(p::InteractionOpen { selection: Some(selected(name, origin)), inputs: vec![] }),
+    };
+    assert!(matches!(
+        client.open_attachment(Fixture::bearer_request(&foreign, open("origin-interactive", Some("laptop"))))
+            .await.unwrap().into_inner().admission,
+        Some(p::open_attachment_response::Admission::Rejected(_)),
+    ));
+    assert!(store.list(0,100).await.unwrap().is_empty());
+    let transport = NativeGrpcTransport::new(&fixture.url);
+    transport.replace_bearer_token(&refreshed).unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut watch = transport
+            .watch_manual_routines("shortcut-fixture".into())
+            .await
+            .unwrap();
+        let snapshot = watch.next().await.unwrap().unwrap();
+        drop(watch);
+        let definition = snapshot
+            .definitions
+            .into_iter()
+            .find(|definition| definition.routine_name == "origin-sentinel")
+            .unwrap();
+        let selection = p::InvocationSelection {
+            revision: definition.routine_revision.clone(),
+            ..selection("origin-sentinel", "run")
+        };
+        let limits = InteractionLimits::for_definition(definition, snapshot.limits).unwrap();
+        let native = transport.for_workspace_shortcut(
+            &fixture.url.parse().unwrap(),
+            "laptop",
+        );
+        let mut session = native
+            .interact(
+                p::InteractionOpen {
+                    selection: Some(selection),
+                    inputs: vec![],
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+        let first = session.output.next().await.unwrap().unwrap();
+        let InteractionEvent::Accepted { invocation_id } = first else {
+            panic!("shortcut invocation did not receive Accepted: {first:?}");
+        };
+        session.input.finish_input().await.unwrap();
+        while let Some(event) = session.output.next().await {
+            event.unwrap();
+        }
+        assert!(session.output.succeeded(), "{:?}", session.output.terminal());
+        invocation_id
+    })
+    .await
+    .unwrap();
+    let record = store.get(id).await.unwrap().unwrap();
+    assert_eq!(record.caller.origin_machine_id.as_deref(), Some("laptop"));
+    assert_eq!(record.result, Some(serde_json::json!("laptop")), "{record:?}");
+    assert!(fixture.bodies.lock().unwrap().iter().any(|body| body["messages"].as_array().unwrap()
+        .iter().any(|message| message["role"] == "tool" && message["content"].to_string().contains(&sentinel))),
+        "the named helper must return bytes from the authenticated machine's selected directory");
+    let provider_requests = fixture.bodies.lock().unwrap().len();
+    for (name, origin, token, succeeds) in [
+        ("origin-manual", None, &foreign, true),
+        ("origin-manual", Some("laptop"), &fixture.token, true),
+        ("origin-interactive", Some("laptop"), &fixture.token, true),
+        ("origin-sentinel", None, &foreign, false),
+    ] {
+        let id = if name != "origin-manual" {
+            let request = Fixture::bearer_request(token, open(name, origin));
+            match client.open_attachment(request).await.unwrap().into_inner().admission.unwrap() {
+                p::open_attachment_response::Admission::Accepted(ok) => {
+                    client.close_attachment(Fixture::bearer_request(token, p::CloseAttachmentRequest {
+                        credentials: ok.credentials,
+                        mode: p::AttachmentCloseMode::FinishInput as i32,
+                    })).await.unwrap();
+                    ok.invocation.unwrap().invocation_id
+                }
+                other => panic!("{other:?}"),
+            }
+        } else {
+            client.start_invocation(Fixture::bearer_request(token, start(origin))).await.unwrap().into_inner().invocation.unwrap().id
+        };
+        let record = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let record = store.get(id.clone()).await.unwrap().unwrap();
+                if record.status.terminal() { break record; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(record.caller.origin_machine_id.as_deref(), origin);
+        assert_eq!(record.status == crate::routine::history::Status::Succeeded, succeeds, "{record:?}");
+        if succeeds {
+            assert_eq!(record.result, Some(serde_json::json!(origin.unwrap_or("absent"))), "{record:?}");
+        }
+    }
+    assert_eq!(fixture.bodies.lock().unwrap().len(), provider_requests);
+    stop_worker.cancel();
+    worker.await.unwrap().unwrap();
+    let principal = fixture.auth.validate_api_access_token(&fixture.token, &[]).await.unwrap();
+    let account = WorkspaceAccount::from_principal(&principal).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.machines.owns_live("laptop", &account) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(
+        client.start_invocation(fixture.request(start(Some("laptop")))).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+    );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -1678,6 +1898,7 @@ async fn routine_http_snapshot_resume_mutation_order_and_atomic_get() {
                         name: "dictate".into(),
                     },
                     caller: Caller {
+                        origin_machine_id: None,
                         principal: principal.into(),
                         origin: crate::routine::history::Origin::Interactive,
                         ownership: crate::routine::history::Ownership::Leased,

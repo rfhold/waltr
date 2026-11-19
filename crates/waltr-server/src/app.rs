@@ -7,6 +7,7 @@ use crate::{
         AccessAuthenticator, GrpcAccessAuthLayer, GrpcTransportLayer,
     },
     agent_definition::{AgentDefinitionState, AgentDefinitionWatcher, DefinitionWatcherHealth},
+    agent_host::sandbox_gateway::peers::MachineRegistry,
     auth::{
         AuthService, CredentialStore, OutboundOAuthConfig, TrustedPrivateOriginsError,
         trusted_private_origins_from_env,
@@ -26,6 +27,7 @@ use crate::{
     sandbox::SandboxHost,
     session,
     status_service::StatusService,
+    workspace_exports::WorkspaceExports,
 };
 use axum::middleware;
 use axum::{
@@ -80,7 +82,7 @@ pub struct BuildAppOptions {
     /// Finite interaction admission and transport bounds.
     /// Explicit operator roles and profiles; defaults grant none.
     pub routine_authority: RoutineAuthority,
-    /// Parent for fresh private ephemeral media storage, outside the workspace.
+    /// Parent for fresh private ephemeral media storage.
     pub routine_private_parent: Option<PathBuf>,
 }
 
@@ -113,6 +115,7 @@ pub(crate) fn routine_engine_ready(health: &tokio::sync::watch::Receiver<Runtime
 
 /// Waltr router and server-owned background work.
 pub struct ServerApplication {
+    machines: MachineRegistry,
     router: Router,
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
@@ -120,6 +123,7 @@ pub struct ServerApplication {
     session_host: Option<Arc<dyn session::SessionHost>>,
     readiness: Option<Readiness>,
     test_background: Option<TestBackgroundTask>,
+    workspace_exports: Option<WorkspaceExports>,
     sandbox: Option<SandboxHost>,
     app_container: Option<crate::app_container::SpawnedAppsContainer>,
     self_mcp: Option<crate::self_mcp::PrivateSelfMcp>,
@@ -145,12 +149,14 @@ impl ServerApplication {
     ) -> Self {
         Self {
             router,
+            machines: MachineRegistry::default(),
             definition_watcher: Some(definition_watcher),
             oauth_maintenance: oauth.map(McpOAuthMaintenanceTask::spawn),
             routine_engine: Some(routine_engine),
             session_host: Some(session_host),
             readiness: Some(readiness),
             test_background: None,
+            workspace_exports: None,
             sandbox: Some(sandbox),
             app_container: None,
             self_mcp: None,
@@ -193,17 +199,23 @@ impl ServerApplication {
     pub async fn shutdown(self) {
         let Self {
             router,
+            machines,
             definition_watcher,
             oauth_maintenance,
             routine_engine,
             session_host,
             readiness: _,
             test_background,
+            workspace_exports,
             sandbox,
             app_container,
             self_mcp,
         } = self;
+        machines.shutdown();
         drop(router);
+        if let Some(exports) = workspace_exports {
+            exports.shutdown().await;
+        }
         if let Some(private) = self_mcp {
             private.shutdown().await;
         }
@@ -240,11 +252,13 @@ impl ServerApplication {
         Self {
             router,
             definition_watcher: None,
+            machines: MachineRegistry::default(),
             oauth_maintenance: None,
             routine_engine: None,
             session_host: None,
             readiness: None,
             test_background: Some(TestBackgroundTask { cancellation, task }),
+            workspace_exports: None,
             sandbox: None,
             app_container: None,
             self_mcp: None,
@@ -379,12 +393,14 @@ impl ServerApplication {
     {
         let Self {
             router,
+            machines,
             definition_watcher,
             oauth_maintenance,
             routine_engine,
             session_host,
             readiness: _,
             test_background,
+            workspace_exports,
             sandbox,
             app_container,
             self_mcp,
@@ -392,6 +408,7 @@ impl ServerApplication {
         let apps_stopped = app_container.as_ref().map(|apps| apps.stopped());
         let child_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_child_failed = child_failed.clone();
+        let shutdown_machines = machines.clone();
         let owned_shutdown = async move {
             tokio::pin!(shutdown);
             tokio::select! {
@@ -404,9 +421,14 @@ impl ServerApplication {
                     }
                 } => { shutdown_child_failed.store(true, std::sync::atomic::Ordering::Release); },
             }
+            shutdown_machines.shutdown();
         };
         let result =
             crate::http_lifecycle::serve_owned_connections(listener, router, owned_shutdown).await;
+        machines.shutdown();
+        if let Some(exports) = workspace_exports {
+            exports.shutdown().await;
+        }
         if let Some(private) = self_mcp {
             private.shutdown().await;
         }
@@ -562,8 +584,6 @@ pub enum BuildAppError {
     Persistence(PersistenceError),
     /// Agent session storage configuration is invalid.
     SessionStorage(session::SessionStorageConfigError),
-    /// Host-owned files would be exposed to the worker workspace.
-    WorkspacePaths,
     /// Standalone worker socket and workspace paths are missing or invalid.
     SandboxConfig,
     /// Access-authentication environment configuration is invalid.
@@ -597,9 +617,6 @@ impl fmt::Display for BuildAppError {
             Self::Config(error) => write!(formatter, "failed to initialize server config: {error}"),
             Self::Persistence(error) => error.fmt(formatter),
             Self::SessionStorage(error) => error.fmt(formatter),
-            Self::WorkspacePaths => formatter.write_str(
-                "worker workspace overlaps host-owned server paths or paths cannot be resolved",
-            ),
             Self::SandboxConfig => formatter
                 .write_str("standalone sandbox socket and workspace must both be absolute paths"),
             Self::AccessAuthConfig(_) => {
@@ -630,7 +647,6 @@ impl Error for BuildAppError {
             Self::Config(error) => Some(error),
             Self::Persistence(error) => Some(error),
             Self::SessionStorage(error) => Some(error),
-            Self::WorkspacePaths => None,
             Self::SandboxConfig => None,
             Self::AccessAuthConfig(error) => Some(error),
             Self::AccessAuthClient(error) => Some(error),
@@ -700,18 +716,12 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
         crate::persistence::DatabaseConfig::from_env().map_err(BuildAppError::Persistence)?;
     let storage =
         session::SessionStorageConfig::from_env().map_err(BuildAppError::SessionStorage)?;
-    session::validate_storage_workspace(&storage, &workspace_root)
-        .map_err(BuildAppError::SessionStorage)?;
     let catalog_loader = CatalogLoader::from_env();
-    if workspace_paths_invalid(
-        &workspace_root,
-        &config_root,
-        &database,
-        catalog_loader.cache_path(),
-    ) {
-        return Err(BuildAppError::WorkspacePaths);
-    }
-    let objects = crate::routine_objects::from_env(&workspace_root).map_err(|_| {
+    let private_parent = options
+        .routine_private_parent
+        .unwrap_or_else(std::env::temp_dir);
+    let machines = MachineRegistry::default();
+    let objects = crate::routine_objects::from_env().map_err(|_| {
         BuildAppError::Persistence(crate::persistence::PersistenceError::Configuration(
             "invalid Routine object storage configuration",
         ))
@@ -746,7 +756,7 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
         outbound_private_origins.clone(),
         automatic_self_mcp_resource.as_ref(),
     );
-    let router = assemble_app_with_self_mcp(
+    assemble_app_with_peers(
         AppServices {
             config_service,
             persistence,
@@ -761,22 +771,20 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
             workspace_root,
             sandbox_socket,
             routine_authority: options.routine_authority,
-            routine_private_parent: options
-                .routine_private_parent
-                .unwrap_or_else(std::env::temp_dir),
+            routine_private_parent: private_parent,
         },
         |grpc_routes, mut input| {
             input.trusted_mcp_oauth_origins = session_private_origins;
-            session::add_storage_service(grpc_routes, storage, input)
+            Ok(session::add_storage_service(grpc_routes, storage, input))
         },
         crate::self_mcp::public_resource_from_env(),
+        machines,
     )
     .await
     .map_err(|error| match error {
         AppAssemblyError::Resource(error) => BuildAppError::Config(error),
         AppAssemblyError::SessionStorage(error) => BuildAppError::SessionStorage(error),
-    })?;
-    Ok(router)
+    })
 }
 
 fn standalone_sandbox_paths(
@@ -808,29 +816,12 @@ fn standalone_sandbox_paths(
     }
 }
 
-fn workspace_paths_invalid(
-    workspace: &std::path::Path,
-    config_root: &std::path::Path,
-    database: &crate::persistence::DatabaseConfig,
-    cache: &std::path::Path,
-) -> bool {
-    let paths = [
-        database.sqlite_path(),
-        database.mcp_sqlite_path(),
-        Some(cache),
-    ];
-    !crate::workspace_paths::inside_config(workspace, config_root).is_ok_and(|inside| !inside)
-        || paths.into_iter().flatten().any(|path| {
-            !crate::workspace_paths::contains_file(workspace, path).is_ok_and(|inside| !inside)
-        })
-}
-
 #[cfg(test)]
 mod workspace_path_tests {
     use super::*;
 
     #[test]
-    fn standalone_socket_requires_a_separate_absolute_workspace() {
+    fn standalone_socket_requires_an_absolute_workspace() {
         let root = std::path::Path::new("/data");
         assert!(
             matches!(standalone_sandbox_paths(root, None, None), Ok((path, None)) if path == root)
@@ -843,46 +834,6 @@ mod workspace_path_tests {
         assert!(standalone_sandbox_paths(root, socket.clone(), None).is_err());
         assert!(standalone_sandbox_paths(root, None, Some("/workspace".into())).is_err());
         assert!(standalone_sandbox_paths(root, socket, Some("../data".into())).is_err());
-    }
-
-    #[test]
-    fn repo_root_with_editable_config_is_allowed_but_database_and_cache_are_not() {
-        let root = crate::test_support::temp_root();
-        std::fs::create_dir_all(root.join(".waltr/resources")).unwrap();
-        let database = crate::persistence::DatabaseConfig::from_sqlite_paths(
-            root.join("../data/waltr.sqlite3"),
-            root.join("../data/mcp.sqlite3"),
-        )
-        .unwrap();
-        assert!(!workspace_paths_invalid(
-            &root,
-            &root,
-            &database,
-            &root.join("../cache/models.json")
-        ));
-        assert!(workspace_paths_invalid(
-            &root,
-            &root,
-            &database,
-            &root.join("cache/models.json")
-        ));
-        let database = crate::persistence::DatabaseConfig::from_sqlite_paths(
-            root.join("data/waltr.sqlite3"),
-            root.join("../data/mcp.sqlite3"),
-        )
-        .unwrap();
-        assert!(workspace_paths_invalid(
-            &root,
-            &root,
-            &database,
-            &root.join("../cache/models.json")
-        ));
-        assert!(workspace_paths_invalid(
-            &root.join(".waltr/resources"),
-            &root,
-            &database,
-            &root.join("../cache/models.json")
-        ));
     }
 }
 
@@ -1158,6 +1109,27 @@ where
         session::SessionRegistrationInput,
     ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
 {
+    assemble_app_with_peers(
+        services,
+        add_session_service,
+        standalone_self_resource,
+        MachineRegistry::default(),
+    )
+    .await
+}
+
+async fn assemble_app_with_peers<F>(
+    services: AppServices,
+    add_session_service: F,
+    standalone_self_resource: Option<url::Url>,
+    machines: MachineRegistry,
+) -> Result<ServerApplication, AppAssemblyError>
+where
+    F: FnOnce(
+        &mut RoutesBuilder,
+        session::SessionRegistrationInput,
+    ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
+{
     tracing::debug!("building app router");
     let AppServices {
         config_service,
@@ -1270,6 +1242,7 @@ where
             catalog: session::SessionCatalogSource::Dynamic(agent_state.clone()),
             event_sink: Arc::new(session::UnboundSessionEvents),
             sandbox: sandbox.handle(),
+            workspace_machines: machines.clone(),
         },
     ) {
         Ok(host) => host,
@@ -1301,7 +1274,7 @@ where
     };
     let routine_engine = match session_host
         .compose_routines(ProductionInput {
-            state: agent_state,
+            state: agent_state.clone(),
             persistence: persistence.clone(),
             workspace: routine_workspace,
             private_parent: routine_private_parent,
@@ -1349,7 +1322,7 @@ where
         mcp::server::streamable_http_router_with_options(waltr_mcp, mcp_options)
     };
     grpc_routes.add_service(ResourceServiceServer::from_arc(config_service));
-    grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
+    grpc_routes.add_service(AuthServiceServer::from_arc(auth_service.clone()));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
     grpc_routes.add_service(routine_engine.rpc.clone().into_server());
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
@@ -1377,6 +1350,7 @@ where
         .merge(outbound_oauth_router)
         .merge(access_authenticator.router())
         .merge(mcp_router);
+    let router = machines.mount(router, access_authenticator.clone());
     let router = if let Some(oauth) = &mcp_oauth {
         router.merge(oauth.router())
     } else {
@@ -1423,6 +1397,7 @@ where
         )),
         None => router,
     };
+    let export_control = sandbox.export_control();
     let mut app = ServerApplication::new(
         router,
         definition_watcher,
@@ -1433,6 +1408,12 @@ where
         sandbox,
     );
     app.self_mcp = private_self_mcp;
+    app.machines = machines;
+    app.workspace_exports = Some(WorkspaceExports::spawn(
+        agent_state,
+        auth_service,
+        export_control,
+    ));
     Ok(app)
 }
 
@@ -1465,6 +1446,8 @@ async fn service_unavailable() -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
+    mod workspace_binding;
+
     use std::{
         convert::Infallible,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1878,17 +1861,14 @@ mod tests {
                 workspace_root: root,
                 sandbox_socket: None,
             },
-            |routes, input| {
+            |_, input| {
                 assert!(matches!(
                     input.catalog,
                     session::SessionCatalogSource::Dynamic(_)
                 ));
-                let root = input.workspace_root.clone();
-                session::add_storage_service(
-                    routes,
-                    session::SessionStorageConfig::Filesystem { root },
-                    input,
-                )
+                Err(session::SessionStorageConfigError::UnknownStore(
+                    "unsupported-store".to_owned(),
+                ))
             },
         )
         .await

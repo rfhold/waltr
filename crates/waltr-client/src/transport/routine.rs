@@ -170,6 +170,7 @@ where
                 }),
                 correlation: args.request_id.clone(),
                 source_session: args.source_session_id.clone(),
+                ..Default::default()
             }),
         })
         .await

@@ -154,11 +154,11 @@ pub async fn build_embedded_server(
     config: EmbeddedServerConfig,
 ) -> Result<EmbeddedServer, EmbeddedBuildError> {
     build_embedded_server_with_registration(config, |routes, input, root| {
-        session::add_storage_service(
+        Ok(session::add_storage_service(
             routes,
             session::SessionStorageConfig::Filesystem { root },
             input,
-        )
+        ))
     })
     .await
 }
@@ -202,12 +202,15 @@ where
         config.mcp_database_path,
     )
     .map_err(|_| EmbeddedBuildError::Persistence)?;
-    let object_root = config.waltr_database_path.parent().ok_or(EmbeddedBuildError::Paths)?.join("routine-objects");
-    if crate::workspace_paths::overlaps(&config.workspace_root, &object_root).map_err(|_| EmbeddedBuildError::Paths)? {
-        return Err(EmbeddedBuildError::Paths);
-    }
-    let objects = Arc::new(crate::routine_objects::FilesystemObjects::new(object_root)
-        .map_err(|_| EmbeddedBuildError::Paths)?);
+    let object_root = config
+        .waltr_database_path
+        .parent()
+        .ok_or(EmbeddedBuildError::Paths)?
+        .join("routine-objects");
+    let objects = Arc::new(
+        crate::routine_objects::FilesystemObjects::new(object_root)
+            .map_err(|_| EmbeddedBuildError::Paths)?,
+    );
     let persistence = Persistence::initialize_with_objects(database, objects)
         .await
         .map_err(|_| EmbeddedBuildError::Persistence)?;
@@ -271,7 +274,6 @@ where
     )
     .await
     .map_err(|_| EmbeddedBuildError::Application)?;
-
     Ok(EmbeddedServer {
         application,
         listener,
@@ -299,23 +301,7 @@ fn validate_paths(config: &EmbeddedServerConfig) -> Result<(), EmbeddedBuildErro
         EmbeddedCatalogSource::Path(path) => path.is_absolute(),
         EmbeddedCatalogSource::Url(_) => true,
     };
-    if paths.iter().any(|path| !path.is_absolute())
-        || !catalog_path_absolute
-        || !crate::workspace_paths::overlaps(&config.workspace_root, &config.session_root)
-            .is_ok_and(|overlap| !overlap)
-        || !crate::workspace_paths::inside_config(&config.workspace_root, &config.resources_root)
-            .is_ok_and(|inside| !inside)
-        || [
-            &config.waltr_database_path,
-            &config.mcp_database_path,
-            &config.catalog_cache_path,
-        ]
-        .into_iter()
-        .any(|path| {
-            !crate::workspace_paths::contains_file(&config.workspace_root, path)
-                .is_ok_and(|inside| !inside)
-        })
-    {
+    if paths.iter().any(|path| !path.is_absolute()) || !catalog_path_absolute {
         return Err(EmbeddedBuildError::Paths);
     }
     Ok(())

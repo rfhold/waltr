@@ -130,6 +130,7 @@ export function renderWithAppState(
       const session: SessionView = {
         id: `session-${nextOperationId}`,
         agentName,
+        workspace: null,
         revision: 0n,
         status: { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null },
         coordination: { phase: "ready", reason: null, queuedCount: 0, continuationArmed: false },

@@ -8,10 +8,10 @@ use std::{
 };
 
 use hyper_util::rt::TokioIo;
-use waltr_agent_sandbox::{Sandbox, run_worker_with_shutdown};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
+use waltr_agent_sandbox::{Sandbox, run_worker_with_shutdown};
 
 const WORKSPACE_ID: &str = "local";
 

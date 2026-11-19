@@ -168,6 +168,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 definition,
                 entrypoint: entrypoint.into(),
                 caller: Caller {
+                    origin_machine_id: None,
                     principal: principal_id(&principal),
                     origin,
                     ownership: Ownership::Detached,

@@ -87,6 +87,7 @@ enum AuthCompletionMode {
   AUTH_COMPLETION_MODE_UNSPECIFIED = 0;
   AUTH_COMPLETION_MODE_MANUAL = 1;
   AUTH_COMPLETION_MODE_SERVER_CALLBACK = 2;
+  AUTH_COMPLETION_MODE_SERVER_DEVICE_POLL = 3;
 }
 
 enum McpOAuthRegistrationMethod {
@@ -122,6 +123,7 @@ message AuthTarget {
   oneof target {
     string provider_key = 1;
     string mcp_server_key = 2;
+    string workspace_binding_key = 3;
   }
 }
 

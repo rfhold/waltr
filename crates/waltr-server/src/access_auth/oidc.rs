@@ -55,6 +55,10 @@ pub enum TokenEndpointAuthMethod {
 pub struct AccessAuthHttpClient(Client);
 
 impl AccessAuthHttpClient {
+    pub(crate) const fn from_pinned_client(client: Client) -> Self {
+        Self(client)
+    }
+
     /// Build a client from caller-selected timeout and TLS settings while always disabling redirects.
     ///
     /// # Errors
@@ -651,22 +655,37 @@ impl OidcVerifier {
             .map_err(|_| OidcError::Discovery("OIDC discovery document is invalid"))?;
         validate_discovered_issuer(issuer, &metadata.issuer)?;
         let jwks_uri = endpoint(&metadata.jwks_uri, policy)?;
-        let access_token_signing_algorithms: BTreeSet<String> = metadata
-            .access_token_signing_alg_values_supported
-            .map_or_else(
-                || {
-                    ALLOWED_ALGORITHMS
-                        .iter()
-                        .map(|algorithm| algorithm_name(*algorithm).to_owned())
-                        .collect()
-                },
-                |values| {
-                    values
-                        .into_iter()
-                        .filter_map(|name| parse_allowed_algorithm(&name).map(|_| name))
-                        .collect()
-                },
-            );
+        Self::from_access_jwks(
+            client,
+            (jwks_uri, metadata.access_token_signing_alg_values_supported),
+            issuer,
+            audience,
+            api_client_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn from_access_jwks(
+        client: AccessAuthHttpClient,
+        (jwks_uri, algorithms): (Url, Option<Vec<String>>),
+        issuer: &str,
+        audience: &str,
+        api_client_id: Option<&str>,
+    ) -> Result<Self, OidcError> {
+        let access_token_signing_algorithms: BTreeSet<String> = algorithms.map_or_else(
+            || {
+                ALLOWED_ALGORITHMS
+                    .iter()
+                    .map(|algorithm| algorithm_name(*algorithm).to_owned())
+                    .collect()
+            },
+            |values| {
+                values
+                    .into_iter()
+                    .filter_map(|name| parse_allowed_algorithm(&name).map(|_| name))
+                    .collect()
+            },
+        );
         if access_token_signing_algorithms.is_empty() {
             return Err(OidcError::Discovery(
                 "provider has no allowed asymmetric access-token signing algorithm",

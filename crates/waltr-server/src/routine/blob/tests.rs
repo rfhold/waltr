@@ -6,7 +6,7 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -101,6 +101,9 @@ fn metadata(bytes: Option<u64>) -> UploadMetadata {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_workspace(|_| std::env::current_dir().unwrap())
+    }
+    fn with_workspace(workspace: impl FnOnce(&Path) -> PathBuf) -> Self {
         let serial = SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -119,7 +122,7 @@ impl Fixture {
         let clock = Arc::new(FakeClock::default());
         let store = FilesystemBlobStore::new(FilesystemConfig {
             private_root: root.clone(),
-            workspace_root: filesystem::WorkspaceRoot::Local(std::env::current_dir().unwrap()),
+            workspace_root: filesystem::WorkspaceRoot::Local(workspace(&parent)),
             clock: clock.clone(),
         })
         .unwrap();
@@ -165,8 +168,8 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn committed_file_digest_authentication_and_output_expiry() {
-    let f = Fixture::new();
+async fn committed_file_digest_authentication_and_output_expiry_inside_workspace() {
+    let f = Fixture::with_workspace(Path::to_path_buf);
     let s = scope("alice", "one");
     let owner = f.store.open_invocation(s.clone(), wait()).await.unwrap();
     let blob = f.blob(&s, &owner, b"hello").await;
@@ -1105,33 +1108,27 @@ async fn real_truncation_is_not_silently_returned_as_short_success() {
 }
 
 #[tokio::test]
-async fn unsafe_roots_symlinks_workspace_overlap_and_orphans_are_rejected() {
+async fn unsafe_roots_symlinks_and_orphans_are_rejected() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let f = Fixture::new();
     let candidate = f.root.join("candidate");
-    let workspace = f.root.join("worker");
     std::fs::create_dir(&candidate).unwrap();
-    std::fs::create_dir(&workspace).unwrap();
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
-        FilesystemBlobStore::check_root(&candidate, &workspace),
+        FilesystemBlobStore::check_root(&candidate, &f.root),
         Err(BlobError::Denied)
     );
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
     let link = f.root.join("symlink");
     symlink(&candidate, &link).unwrap();
-    assert!(FilesystemBlobStore::check_root(&link, &workspace).is_err());
-    assert_eq!(
-        FilesystemBlobStore::check_root(&candidate, &candidate),
-        Err(BlobError::Denied)
-    );
-    assert_eq!(
-        FilesystemBlobStore::check_root(&candidate, &f.root),
-        Err(BlobError::Denied)
-    );
+    assert!(FilesystemBlobStore::check_root(&link, &f.root).is_err());
+    std::fs::set_permissions(&f.root, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let unsafe_result = FilesystemBlobStore::check_root(&candidate, &f.root);
+    std::fs::set_permissions(&f.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(unsafe_result, Err(BlobError::Denied));
     std::fs::write(candidate.join("orphan"), b"preserve").unwrap();
     assert_eq!(
-        FilesystemBlobStore::check_root(&candidate, &workspace),
+        FilesystemBlobStore::check_root(&candidate, &f.root),
         Err(BlobError::Cleanup)
     );
     assert_eq!(
@@ -1139,50 +1136,29 @@ async fn unsafe_roots_symlinks_workspace_overlap_and_orphans_are_rejected() {
         b"preserve"
     );
     std::fs::remove_file(candidate.join("orphan")).unwrap();
-    FilesystemBlobStore::check_root(&candidate, &workspace).unwrap();
+    FilesystemBlobStore::check_root(&candidate, &f.root).unwrap();
     std::fs::remove_file(link).unwrap();
     std::fs::remove_dir(candidate).unwrap();
-    std::fs::remove_dir(workspace).unwrap();
     f.finish().await;
 }
 
 #[tokio::test]
-async fn socket_workspace_exclusion_and_private_safety_fail_closed() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+async fn blob_store_does_not_require_socket_workspace_on_host() {
+    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let candidate = f.root.join("candidate");
     std::fs::create_dir(&candidate).unwrap();
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let missing = f.root.join("absent/workspace");
+    let missing = candidate.join("absent/workspace");
     assert!(!missing.exists());
     FilesystemBlobStore::check_socket_root(&candidate, &missing).unwrap();
     assert!(!missing.exists());
     for invalid in [PathBuf::from("relative"), f.root.join("absent/../worker")] {
-        assert_eq!(FilesystemBlobStore::check_socket_root(&candidate, &invalid), Err(BlobError::Invalid));
+        assert_eq!(
+            FilesystemBlobStore::check_socket_root(&candidate, &invalid),
+            Err(BlobError::Invalid)
+        );
     }
-    for overlap in [&candidate, &f.root, &candidate.join("absent/workspace")] {
-        assert_eq!(FilesystemBlobStore::check_socket_root(&candidate, overlap), Err(BlobError::Denied));
-    }
-    let alias = f.root.join("alias");
-    symlink(&candidate, &alias).unwrap();
-    assert_eq!(FilesystemBlobStore::check_socket_root(&candidate, &alias.join("absent")), Err(BlobError::Denied));
-    assert!(FilesystemBlobStore::check_socket_root(&alias, &missing).is_err());
-    let dangling = f.root.join("dangling");
-    symlink(f.root.join("not-created"), &dangling).unwrap();
-    assert!(FilesystemBlobStore::check_socket_root(&candidate, &dangling.join("workspace")).is_err());
-    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(FilesystemBlobStore::check_socket_root(&candidate, &missing), Err(BlobError::Denied));
-    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&f.root, std::fs::Permissions::from_mode(0o770)).unwrap();
-    let unsafe_result = FilesystemBlobStore::check_socket_root(&candidate, &missing);
-    std::fs::set_permissions(&f.root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(unsafe_result, Err(BlobError::Denied));
-    std::fs::write(candidate.join("orphan"), b"preserve").unwrap();
-    assert_eq!(FilesystemBlobStore::check_socket_root(&candidate, &missing), Err(BlobError::Cleanup));
-    assert_eq!(std::fs::read(candidate.join("orphan")).unwrap(), b"preserve");
-    std::fs::remove_file(candidate.join("orphan")).unwrap();
-    std::fs::remove_file(alias).unwrap();
-    std::fs::remove_file(dangling).unwrap();
     std::fs::remove_dir(candidate).unwrap();
     f.finish().await;
 }

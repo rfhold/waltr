@@ -1207,20 +1207,57 @@ impl ClientState {
         self.next_auth_poll_generation = self.next_auth_poll_generation.saturating_add(1);
         let poll_generation = self.next_auth_poll_generation;
         let completion_mode = attempt.completion_mode;
+        let device = completion_mode
+            == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerDevicePoll as i32;
+        let workspace_binding = matches!(
+            target.target,
+            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(_))
+        );
+        let verification_url = if device {
+            safe_device_verification_url(&attempt.verification_url).unwrap_or_default()
+        } else {
+            safe_http_url(&attempt.verification_url).unwrap_or_default()
+        };
+        let user_code = if device {
+            safe_device_user_code(&attempt.user_code)
+        } else {
+            safe_text(&attempt.user_code, 256)
+        };
+        if workspace_binding != device
+            || (device
+                && (verification_url.is_empty()
+                    || user_code.is_empty()
+                    || attempt.attempt_id.is_empty()))
+        {
+            self.set_auth_begin_failed(
+                key,
+                target,
+                "Device authorization response was invalid.".to_owned(),
+            );
+            return None;
+        }
         let delay_ms = auth_poll_delay_ms(attempt.poll_interval_seconds);
         let attempt = AuthAttemptState {
             target: target.clone(),
             attempt_id: attempt.attempt_id,
-            auth_url: safe_http_url(&attempt.auth_url).unwrap_or_default(),
-            verification_url: safe_http_url(&attempt.verification_url).unwrap_or_default(),
-            user_code: safe_text(&attempt.user_code, 256),
+            auth_url: if device {
+                String::new()
+            } else {
+                safe_http_url(&attempt.auth_url).unwrap_or_default()
+            },
+            verification_url,
+            user_code,
             expires_at_ms: attempt.expires_at_ms,
             poll_interval_seconds: attempt.poll_interval_seconds,
-            messages: attempt
-                .messages
-                .into_iter()
-                .map(|message| safe_text(&message, 1_024))
-                .collect(),
+            messages: if device {
+                Vec::new()
+            } else {
+                attempt
+                    .messages
+                    .into_iter()
+                    .map(|message| safe_text(&message, 1_024))
+                    .collect()
+            },
             completion_mode,
             registration_method: attempt.registration_method,
             lifecycle: waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending as i32,
@@ -1243,7 +1280,10 @@ impl ClientState {
                 attempt: Some(attempt),
             },
         );
-        (completion_mode == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32)
+        self.auth
+            .active_attempt
+            .as_ref()
+            .is_some_and(auth_attempt_is_pollable)
             .then(|| {
                 (
                     self.auth
@@ -1305,11 +1345,16 @@ impl ClientState {
             waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(status.lifecycle)
                 .unwrap_or(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Unspecified);
         let attempt = self.auth.active_attempt.as_mut().expect("poll was current");
-        if status.completion_mode
-            != waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
-        {
+        if status.completion_mode != attempt.completion_mode {
             attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
-            "Authorization callback status was invalid.".clone_into(&mut attempt.failure_reason);
+            let message = if attempt.completion_mode
+                == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
+            {
+                "Authorization callback status was invalid."
+            } else {
+                "Device authorization status was invalid."
+            };
+            message.clone_into(&mut attempt.failure_reason);
             return None;
         }
         attempt.lifecycle = status.lifecycle;
@@ -2861,18 +2906,25 @@ pub fn auth_target_key(target: &AuthTarget) -> String {
         Some(waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(key)) => {
             format!("mcp:{key}")
         }
+        Some(waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(key)) => {
+            format!("workspaceBinding:{key}")
+        }
         None => "unknown:".to_owned(),
     }
 }
 
 fn auth_attempt_is_pollable(attempt: &AuthAttemptState) -> bool {
-    attempt.completion_mode
-        == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
-        && matches!(
-            waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(attempt.lifecycle),
-            Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending
-                | waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Completing)
+    matches!(
+        waltr::grpc::waltr::auth::v1::AuthCompletionMode::try_from(attempt.completion_mode),
+        Ok(
+            waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback
+                | waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerDevicePoll
         )
+    ) && matches!(
+        waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(attempt.lifecycle),
+        Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending
+            | waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Completing)
+    )
 }
 
 fn auth_poll_delay_ms(seconds: i32) -> u64 {
@@ -2906,6 +2958,31 @@ pub fn safe_http_url(value: &str) -> Option<String> {
     }
     parsed.set_fragment(None);
     Some(parsed.into())
+}
+
+pub(super) fn safe_device_verification_url(value: &str) -> Option<String> {
+    if value.len() > 4096 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let safe = safe_http_url(value)?;
+    let url = url::Url::parse(&safe).ok()?;
+    (safe.len() <= 4096
+        && (url.scheme() == "https"
+            || matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
+    .then_some(safe)
+}
+
+pub(super) fn safe_device_user_code(value: &str) -> String {
+    if (1..=64).contains(&value.len())
+        && value.trim() == value
+        && value
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+    {
+        value.to_owned()
+    } else {
+        String::new()
+    }
 }
 
 pub fn safe_text(value: &str, max_chars: usize) -> String {

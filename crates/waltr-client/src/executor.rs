@@ -648,7 +648,8 @@ impl GrpcEffectExecutor {
                 ClientEffect::Session(SessionEffect::Create {
                     operation_key,
                     agent_name,
-                }) => match self.transport.create_session(agent_name).await {
+                    workspace,
+                }) => match self.transport.create_session_with_workspace(agent_name, workspace).await {
                     Ok(session) => vec![ClientEvent::Session(SessionEvent::Created {
                         operation_key,
                         session,

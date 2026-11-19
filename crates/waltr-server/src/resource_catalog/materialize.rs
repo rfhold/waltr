@@ -41,6 +41,7 @@ pub(super) const fn proto_kind(kind: ResourceKind) -> resource_proto::ResourceKi
         ResourceKind::McpServer => resource_proto::ResourceKind::McpServer,
         ResourceKind::Defaults => resource_proto::ResourceKind::Defaults,
         ResourceKind::Routine => resource_proto::ResourceKind::Routine,
+        ResourceKind::WorkspaceBinding => resource_proto::ResourceKind::WorkspaceBinding,
     }
 }
 
@@ -77,7 +78,7 @@ fn json_prost_value(value: &serde_json::Value) -> resource_proto::ResourceValue 
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResourceMetadata {
+pub(super) struct ResourceMetadata {
     name: String,
 }
 
@@ -229,7 +230,7 @@ struct InferenceSpec {
     reasoning_effort: Option<String>,
 }
 
-fn parse_resource<T: for<'de> Deserialize<'de>>(
+pub(super) fn parse_resource<T: for<'de> Deserialize<'de>>(
     source: &str,
     path: &str,
 ) -> Result<T, AgentDefinitionLoadError> {
@@ -239,7 +240,7 @@ fn parse_resource<T: for<'de> Deserialize<'de>>(
     })
 }
 
-fn validate_envelope(
+pub(super) fn validate_envelope(
     api_version: &str,
     kind: &str,
     expected_kind: &str,

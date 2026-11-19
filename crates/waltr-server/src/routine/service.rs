@@ -824,7 +824,7 @@ async fn run(
     };
     drop(send.send(Ok(handle)));
     // Catch adapter/engine panics while retaining the admitted reservation.
-    let execution = execute(&shared, &id, &definition, input, &cancel, &prepared);
+    let execution = execute(&shared, &id, &definition, input, &cancel, &prepared, caller.origin_machine_id);
     let (outcome, release) = match AssertUnwindSafe(execution).catch_unwind().await {
         Ok(pair) => pair,
         Err(_) => {
@@ -862,6 +862,7 @@ async fn execute(
     input: StructuredValue,
     cancel: &CancellationToken,
     prepared: &PreparedHost,
+    origin_machine_id: Option<String>,
 ) -> (Outcome, bool) {
     let failed = Arc::new(AtomicBool::new(false));
     let mut status = Status::Failed;
@@ -879,6 +880,7 @@ async fn execute(
             status = Status::Interrupted;
         } else {
             let host = Arc::new(JournalHost {
+                origin_machine_id,
                 trace: tracing::Span::current(),
                 id: id.into(),
                 store: shared.store.clone(),
@@ -995,6 +997,7 @@ async fn execute(
 }
 
 struct JournalHost {
+    origin_machine_id: Option<String>,
     trace: tracing::Span,
     id: String,
     store: Arc<dyn InvocationStore>,
@@ -1006,6 +1009,21 @@ struct JournalHost {
 }
 impl HostDispatcher for JournalHost {
     fn dispatch(&self, request: HostRequest, context: HostContext) -> HostFuture {
+        // Pure admission context, outside the effect adapter and its public operation history.
+        if request.operation == "invocation.context" {
+            let origin = self.origin_machine_id.clone();
+            let cancelled = self.cancel.clone();
+            return Box::pin(async move {
+                if cancelled.is_cancelled() { return Err(waltr_script::Error::Cancelled); }
+                if request.bytes.is_some() || request.handle.is_some() || request.callback.is_some()
+                    || !request.arguments.as_json().as_object().is_some_and(|obj| obj.is_empty()) {
+                    return Err(waltr_script::Error::Invalid);
+                }
+                let mut value = serde_json::json!({});
+                if let Some(origin) = origin { value["originMachineId"] = origin.into(); }
+                StructuredValue::new(value, &Limits::default()).map(waltr_script::HostReply::Value)
+            });
+        }
         let store = self.store.clone();
         let clock = self.clock.clone();
         let inner = self.inner.clone();

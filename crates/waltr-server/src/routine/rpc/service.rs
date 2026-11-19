@@ -77,6 +77,7 @@ impl RoutineRpcService {
         let selection = open
             .selection
             .ok_or_else(|| Status::invalid_argument("missing interaction selection"))?;
+        let origin_machine_id = self.read.origin(selection.origin_machine_id.as_deref(), &principal)?;
         let (entry, input) = self
             .read
             .selection(&owner, &selection, Trigger::Interactive)?;
@@ -118,6 +119,7 @@ impl RoutineRpcService {
                 definition: entry.definition,
                 entrypoint: selection.entrypoint,
                 caller: Caller {
+                    origin_machine_id,
                     principal: owner,
                     origin: Origin::Interactive,
                     ownership: Ownership::Leased,

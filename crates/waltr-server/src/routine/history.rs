@@ -107,6 +107,9 @@ pub enum Ownership {
 #[serde(deny_unknown_fields)]
 /// Bounded provenance only; never grants capabilities or pause authority.
 pub struct Caller {
+    /// Peer-authenticated desktop origin; independent of principal and business input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_machine_id: Option<String>,
     /// Adapter-supplied opaque authenticated principal identity.
     pub principal: String,
     /// Entry adapter family.

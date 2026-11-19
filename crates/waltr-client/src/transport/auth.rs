@@ -1,8 +1,9 @@
+use tonic::codegen::{Body, Bytes, StdError};
 use waltr::grpc::waltr::auth::v1::{
     AuthMethod, AuthTarget, BeginAuthRequest, CancelAuthRequest, CompleteAuthRequest,
     GetAuthAttemptStatusRequest, ListAuthStatusesRequest, LogoutRequest, RefreshAuthRequest,
+    auth_target,
 };
-use tonic::codegen::{Body, Bytes, StdError};
 
 use crate::{ClientError, transport::RemoteTransport};
 
@@ -79,10 +80,18 @@ where
 {
     let credentials = transport.request_credentials();
     let mut client = transport.auth_client(&credentials).await?;
+    let method = if matches!(
+        target.target,
+        Some(auth_target::Target::WorkspaceBindingKey(_))
+    ) {
+        AuthMethod::OauthDevice
+    } else {
+        AuthMethod::OauthManual
+    };
     let response = client
         .begin_auth(BeginAuthRequest {
             target: Some(target),
-            method: AuthMethod::OauthManual as i32,
+            method: method as i32,
         })
         .await
         .map_err(|error| super::status_error(&error, &credentials))?;

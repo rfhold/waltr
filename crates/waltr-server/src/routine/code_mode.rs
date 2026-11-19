@@ -20,6 +20,7 @@ use crate::{
         },
         dispatcher::CapabilityDispatcher,
         runtime_factory::ServerAgentRuntimeFactory as AgentSessionRuntimeFactory,
+        sandbox_gateway::WorkspaceAccount,
     },
     permission::PermissionPolicy,
 };
@@ -371,15 +372,17 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeHost<S> {
         principal: AuthenticatedPrincipal,
     ) -> AgentSessionRuntimeFactory {
         let host = self.clone();
-        factory.with_code_tool_provider(move |record, runtime, dispatcher| {
-            host.bind(&principal, record, runtime, dispatcher)
-                .map(|adapter| adapter.agent_tool())
-                .map_err(|_| {
-                    AgentSessionRuntimeError::FailedPrecondition(
-                        "code mode has no current host authority for this session".into(),
-                    )
-                })
-        })
+        factory
+            .with_workspace_account(WorkspaceAccount::from_principal(&principal))
+            .with_code_tool_provider(move |record, runtime, dispatcher| {
+                host.bind(&principal, record, runtime, dispatcher)
+                    .map(|adapter| adapter.agent_tool())
+                    .map_err(|_| {
+                        AgentSessionRuntimeError::FailedPrecondition(
+                            "code mode has no current host authority for this session".into(),
+                        )
+                    })
+            })
     }
 }
 
@@ -565,7 +568,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                         bindings: Arc::new(CodeBindings {
                             live: self.live(),
                             sessions: self.host.sessions.clone(),
-                            helpers: self.host.helpers.clone(),
+                            helpers: Arc::new(self.workspace_helpers()),
                             runtime: self.runtime.clone(),
                             record: current,
                             grant: self.grant.clone(),
@@ -579,6 +582,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                         definition,
                         entrypoint: "run".into(),
                         caller: Caller {
+                            origin_machine_id: None,
                             principal: dispatch.principal.clone(),
                             origin,
                             ownership: if origin == Origin::Mcp {
@@ -616,32 +620,34 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
             }
         }
     }
+    fn workspace_helpers(&self) -> AgentSessionRuntimeFactory {
+        self.host
+            .helpers
+            .as_ref()
+            .clone()
+            .with_workspace_account(WorkspaceAccount::from_principal(&self.request_principal))
+    }
+
     async fn executor(&self) -> Result<Arc<dyn AuthorizedToolExecutor>, PortError> {
         let mut request = SessionCreateRequest::new(SessionId::generate());
         request.inference_settings = self.record.inference_settings.clone();
         request.agent_definition = self.record.agent_definition.clone();
-        let id = self
-            .host
-            .sessions
-            .create(request)
-            .await
-            .map_err(|_| PortError::Unavailable)?
-            .id()
-            .clone();
-        let record = self
-            .host
-            .sessions
-            .load(&id)
+        let factory = self
+            .workspace_helpers()
+            .for_concrete_calls()
+            .with_permission_restriction(self.grant.profile.restriction.clone());
+        let record = factory
+            .create_with_workspace(
+                &self.host.sessions,
+                request,
+                None,
+                self.record.agent_definition.as_ref(),
+            )
             .await
             .map_err(|_| PortError::Unavailable)?
             .record;
-        let (runtime, dispatcher) = self
-            .host
-            .helpers
-            .as_ref()
-            .clone()
-            .for_concrete_calls()
-            .with_permission_restriction(self.grant.profile.restriction.clone())
+        let id = record.id.clone();
+        let (runtime, dispatcher) = factory
             .runtime_for_record(&record, self.host.sessions.clone())
             .await
             .map_err(|_| PortError::Unavailable)?;
@@ -898,8 +904,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 let mut request = SessionCreateRequest::new(SessionId::generate());
                 request.inference_settings = Some(inference.clone());
                 request.agent_definition = record.agent_definition.clone();
-                let id = sessions
-                    .create(request)
+                let id = helpers
+                    .create_with_workspace(&sessions, request, None, record.agent_definition.as_ref())
                     .await
                     .map_err(|_| PortError::Unavailable)?
                     .id()
@@ -933,6 +939,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 None,
                 caller.principal.clone(),
             )?
+            .with_source_definition(if public_only { None } else { record.agent_definition.clone() })
             .with_permission_restriction(grant.profile.restriction.clone())
             .with_origin_guard(move || {
                 let live = live.clone();

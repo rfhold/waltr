@@ -89,3 +89,4 @@ reqwest = { workspace = true, features = ["json", "http2"] }
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tonic = { workspace = true, features = ["transport"] }
+waltr-client.workspace = true

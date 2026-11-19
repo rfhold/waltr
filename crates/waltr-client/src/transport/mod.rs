@@ -154,6 +154,20 @@ pub trait WaltrTransport {
         agent_name: String,
     ) -> impl Future<Output = Result<SessionSummary, ClientError>>;
 
+    /// Create a session on the requested workspace or the server default.
+    fn create_session_with_workspace(
+        &self,
+        agent_name: String,
+        workspace: Option<crate::WorkspaceSelection>,
+    ) -> impl Future<Output = Result<SessionSummary, ClientError>> {
+        async move {
+            if workspace.is_some() {
+                return Err(ClientError::new("Transport does not support workspace selection"));
+            }
+            self.create_session(agent_name).await
+        }
+    }
+
     /// List selectable session agents.
     fn list_agents(&self) -> impl Future<Output = Result<ListAgentsResponse, ClientError>>;
 
@@ -491,7 +505,15 @@ where
     }
 
     async fn create_session(&self, agent_name: String) -> Result<SessionSummary, ClientError> {
-        session::create_session(self, agent_name).await
+        self.create_session_with_workspace(agent_name, None).await
+    }
+
+    async fn create_session_with_workspace(
+        &self,
+        agent_name: String,
+        workspace: Option<crate::WorkspaceSelection>,
+    ) -> Result<SessionSummary, ClientError> {
+        session::create_session(self, agent_name, workspace).await
     }
 
     async fn list_agents(&self) -> Result<ListAgentsResponse, ClientError> {
@@ -686,6 +708,7 @@ where
 pub struct NativeGrpcTransport {
     endpoint: String,
     credentials: NativeCredentialProvider,
+    shortcut_machine: Option<String>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
@@ -775,9 +798,7 @@ impl NativeCredentialProvider {
         &self,
         token: impl AsRef<str>,
     ) -> Result<NativeCredentialLease, ClientError> {
-        let authorization = format!("Bearer {}", token.as_ref())
-            .parse::<AsciiMetadataValue>()
-            .map_err(|_| ClientError::new("invalid bearer token metadata"))?;
+        let authorization = Self::bearer_metadata(token.as_ref())?;
         let mut state = self.write_state();
         state.lease_generation = state.lease_generation.saturating_add(1);
         state.credential_revision = state.credential_revision.saturating_add(1);
@@ -820,9 +841,7 @@ impl NativeCredentialProvider {
         lease: NativeCredentialLease,
         token: impl AsRef<str>,
     ) -> Result<bool, ClientError> {
-        let authorization = format!("Bearer {}", token.as_ref())
-            .parse::<AsciiMetadataValue>()
-            .map_err(|_| ClientError::new("invalid bearer token metadata"))?;
+        let authorization = Self::bearer_metadata(token.as_ref())?;
         let mut state = self.write_state();
         if state.lease_generation != lease.lease_generation {
             return Ok(false);
@@ -831,6 +850,14 @@ impl NativeCredentialProvider {
         state.authorization = Some(authorization);
         drop(state);
         Ok(true)
+    }
+
+    fn bearer_metadata(token: &str) -> Result<AsciiMetadataValue, ClientError> {
+        let mut authorization = format!("Bearer {token}")
+            .parse::<AsciiMetadataValue>()
+            .map_err(|_| ClientError::new("invalid bearer token metadata"))?;
+        authorization.set_sensitive(true);
+        Ok(authorization)
     }
 
     /// Clear the bearer token used by subsequently sent requests.
@@ -911,6 +938,23 @@ impl NativeCredentialProvider {
         self.read_state().authorization.is_some()
     }
 
+    /// Snapshot the latest sensitive bearer header only for this provider's current lease.
+    ///
+    /// Refresh within the lease is visible. The caller still owns verification and
+    /// teardown; an already returned header is not revoked when the lease changes.
+    #[must_use]
+    pub fn workspace_authorization_if_current(
+        &self,
+        lease: NativeCredentialLease,
+    ) -> Option<AsciiMetadataValue> {
+        let state = self.read_state();
+        if state.lease_generation == lease.lease_generation {
+            state.authorization.clone()
+        } else {
+            None
+        }
+    }
+
     fn read_state(&self) -> std::sync::RwLockReadGuard<'_, NativeCredentialState> {
         self.state
             .read()
@@ -974,6 +1018,7 @@ impl NativeGrpcTransport {
         Self {
             endpoint: endpoint.into(),
             credentials: NativeCredentialProvider::new(),
+            shortcut_machine: None,
         }
     }
 
@@ -986,7 +1031,25 @@ impl NativeGrpcTransport {
         Self {
             endpoint: endpoint.into(),
             credentials,
+            shortcut_machine: None,
         }
+    }
+
+    /// Bind a shortcut-only transport to a checked export at the same exact origin.
+    #[must_use]
+    pub fn for_workspace_shortcut(&self, destination: &url::Url, machine: &str) -> Self {
+        let mut transport = self.clone();
+        transport.shortcut_machine = None;
+        if destination.path() == "/"
+            && destination.query().is_none()
+            && destination.fragment().is_none()
+            && destination.username().is_empty()
+            && destination.password().is_none()
+            && url::Url::parse(&self.endpoint).as_ref() == Ok(destination)
+        {
+            transport.shortcut_machine = Some(machine.to_owned());
+        }
+        transport
     }
 
     /// Return a clone of the shared in-memory credential provider.
@@ -1624,6 +1687,86 @@ mod tests {
             streaming.metadata().get("authorization").unwrap(),
             "Bearer stream-token"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn workspace_authorization_tracks_refresh_and_rejects_a_stale_lease() {
+        let credentials = NativeCredentialProvider::new();
+        let lease = credentials.begin_credential_lease();
+        assert!(
+            credentials
+                .workspace_authorization_if_current(lease)
+                .is_none()
+        );
+        assert!(
+            credentials
+                .replace_bearer_token_if_current(lease, "workspace-token")
+                .unwrap()
+        );
+
+        let bearer = credentials.workspace_authorization_if_current(lease).unwrap();
+        assert_eq!(bearer, "Bearer workspace-token");
+        assert!(bearer.is_sensitive());
+        assert!(!format!("{bearer:?}").contains("workspace-token"));
+
+        assert!(
+            credentials
+                .replace_bearer_token_if_current(lease, "refreshed-token")
+                .unwrap()
+        );
+        let refreshed = credentials
+            .workspace_authorization_if_current(lease)
+            .unwrap();
+        assert_eq!(refreshed, "Bearer refreshed-token");
+        assert!(refreshed.is_sensitive());
+
+        let replacement = credentials.replace_bearer_token("other-login").unwrap();
+        assert!(
+            credentials
+                .workspace_authorization_if_current(lease)
+                .is_none()
+        );
+        assert_eq!(
+            credentials
+                .workspace_authorization_if_current(replacement)
+                .unwrap(),
+            "Bearer other-login"
+        );
+        let _ = credentials.clear_bearer_token();
+        assert!(
+            credentials
+                .workspace_authorization_if_current(replacement)
+                .is_none()
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn workspace_shortcut_binds_machine_only_at_exact_origin() {
+        let transport = NativeGrpcTransport::new("https://host.example");
+        let destination = url::Url::parse("https://host.example/").unwrap();
+        let bound = transport.for_workspace_shortcut(&destination, "machine");
+        assert_eq!(bound.shortcut_machine.as_deref(), Some("machine"));
+        assert!(transport.shortcut_machine.is_none());
+
+        for destination in [
+            "http://host.example/",
+            "https://other.example/",
+            "https://host.example:8443/",
+            "https://host.example/subpath",
+            "https://host.example/?query",
+            "https://host.example/#fragment",
+            "https://user:pass@host.example/",
+        ] {
+            let destination = url::Url::parse(destination).unwrap();
+            assert!(
+                bound
+                    .for_workspace_shortcut(&destination, "other-machine")
+                    .shortcut_machine
+                    .is_none()
+            );
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

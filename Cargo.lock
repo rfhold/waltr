@@ -10412,6 +10412,7 @@ dependencies = [
  "tower",
  "tree-sitter",
  "tree-sitter-bash",
+ "url",
  "uuid",
  "waltr",
 ]
@@ -10453,6 +10454,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tonic",
@@ -10460,6 +10462,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "waltr",
  "waltr-audio-io",
  "waltr-client",
  "waltr-desktop",
@@ -10642,6 +10645,7 @@ dependencies = [
  "waltr-agent",
  "waltr-agent-sandbox",
  "waltr-audio",
+ "waltr-client",
  "waltr-script",
  "webpki-roots 1.0.7",
 ]

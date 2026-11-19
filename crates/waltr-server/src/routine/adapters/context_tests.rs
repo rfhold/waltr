@@ -15,10 +15,14 @@ fn bundle() -> AgentDefinitionBundle {
 }
 
 async fn completed() -> (SessionCoordinator<MemorySessionStore>, SessionId) {
+    completed_with_definition(bundle()).await
+}
+
+async fn completed_with_definition(definition: AgentDefinitionBundle) -> (SessionCoordinator<MemorySessionStore>, SessionId) {
     let sessions = SessionCoordinator::new(MemorySessionStore::new());
     let id = SessionId::generate();
     let mut request = SessionCreateRequest::new(id.clone());
-    request.agent_definition = Some(serde_json::to_value(bundle()).unwrap());
+    request.agent_definition = Some(serde_json::to_value(definition).unwrap());
     request.inference_settings = Some(inference());
     sessions.create(request).await.unwrap();
     let runtime = AgentRuntime::builder(
@@ -42,6 +46,93 @@ async fn completed() -> (SessionCoordinator<MemorySessionStore>, SessionId) {
             .all(Result::is_ok)
     );
     (sessions, id)
+}
+
+#[tokio::test]
+async fn routine_context_create_inherits_and_overrides_the_source_working_directory() {
+    use crate::agent_host::sandbox_gateway::{WorkspaceAccount, peers::MachineRegistry};
+
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("export");
+    for dir in ["a", "b"] { std::fs::create_dir_all(remote.join(dir)).unwrap(); }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let persistence = crate::persistence::Persistence::initialize(
+        crate::persistence::DatabaseConfig::for_tests().unwrap(),
+    ).await.unwrap();
+    let (auth, token, issuer, issuer_stop, issuer_task) =
+        crate::test_support::composition_auth(&persistence, address).await;
+    let principal = auth.validate_api_access_token(&token, &[]).await.unwrap();
+    let account = WorkspaceAccount::from_principal(&principal).unwrap();
+    let foreign_token = crate::test_support::sign_access_token_for_subject_with_ttl(
+        &issuer, "other-subject", "waltr:read", std::time::Duration::from_secs(1800),
+    );
+    let foreign = auth.validate_api_access_token(&foreign_token, &[]).await.unwrap();
+    let foreign_account = WorkspaceAccount::from_principal(&foreign).unwrap();
+    let machines = MachineRegistry::default();
+    let router = machines.mount(axum::Router::new(), auth);
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, router).with_graceful_shutdown(shutdown.cancelled_owned()).await.unwrap() });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap().connect().await.unwrap();
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let authorization: tonic::metadata::AsciiMetadataValue = format!("Bearer {token}").parse().unwrap();
+    let worker = tokio::spawn(waltr_agent_sandbox::run_worker_with_authorization(
+        channel, remote, "laptop", stop.clone(), connected.clone(), move || Some(authorization.clone()),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !connected.load(std::sync::atomic::Ordering::Acquire) { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+    }).await.unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let local = root.join("local");
+    std::fs::create_dir(&local).unwrap();
+    let sandbox = crate::sandbox::LocalSandbox::start(local.clone()).await.unwrap();
+    let catalog = AgentDefinitionCatalog::from_sources(vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: source}\nspec: {systemPrompt: SOURCE}\n".into()], "source").unwrap();
+    let factory = Arc::new(AgentSessionRuntimeFactory::new(
+        sandbox.handle(), local, FileCredentialStore::new(root.join("unused-auth")),
+        catalog.resolved("source").unwrap().clone(),
+    ).with_workspace_machines(machines.clone()));
+    let mut definition = bundle();
+    definition.workspace = machines.resolve("laptop", Some("a"), &account).await.unwrap().scope().cloned();
+    let (sessions, id) = completed_with_definition(definition).await;
+    let context = CoordinatorContext::pin(sessions.clone(), &id, "owner", false).await.unwrap()
+        .with_workspace_factory(Arc::new(factory.as_ref().clone().with_workspace_account(Some(account.clone()))));
+    for (workspace, expect) in [(None, "a"), (Some("b"), "b"), (Some("missing"), "")] {
+        let mut args = json!({"source":"effective","copyHistory":false,"inheritDefinition":true,"inheritInference":true,"message":"fork"});
+        if let Some(dir) = workspace { args["workspace"] = json!({"machine":"laptop","workingDirectory":dir}); }
+        let result = context.execute(operation("context.create", args), CancellationToken::new()).await;
+        if expect.is_empty() {
+            assert!(result.is_err());
+        } else {
+            let id = SessionId::new(result.unwrap()["sessionId"].as_str().unwrap());
+            let definition: AgentDefinitionBundle = serde_json::from_value(sessions.store().load(&id).await.unwrap().agent_definition.unwrap()).unwrap();
+            let scope = definition.workspace.unwrap();
+            assert_eq!(scope.machine_id, "laptop");
+            assert_eq!(scope.working_directory, expect);
+            assert_eq!(scope.account.as_ref(), Some(&account));
+        }
+    }
+    for caller in [Some(foreign_account), None] {
+        let denied = CoordinatorContext::pin(sessions.clone(), &id, "owner", false).await.unwrap()
+            .with_workspace_factory(Arc::new(factory.as_ref().clone().with_workspace_account(caller)));
+        for inherit in [true, false] {
+            for workspace in [None, Some(json!({"machine":"laptop","workingDirectory":"b"}))] {
+                let mut args = json!({"source":"effective","copyHistory":false,"inheritDefinition":inherit,"inheritInference":true,"message":"fork"});
+                if let Some(workspace) = workspace { args["workspace"] = workspace; }
+                assert!(denied.execute(operation("context.create", args), CancellationToken::new()).await.is_err());
+            }
+        }
+        denied.cleanup().await.unwrap();
+    }
+    assert_eq!(sessions.list().await.unwrap().len(), 3);
+    context.cleanup().await.unwrap();
+    sessions.shutdown().await;
+    stop.cancel();
+    worker.await.unwrap().unwrap();
+    server.await.unwrap();
+    issuer_stop.cancel();
+    issuer_task.await.unwrap();
+    sandbox.shutdown().await;
 }
 
 fn operation(name: &str, args: Value) -> ContextOperation {

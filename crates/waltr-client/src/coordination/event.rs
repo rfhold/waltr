@@ -545,6 +545,8 @@ pub enum SessionEvent {
         operation_key: OperationKey,
         /// Exact selectable agent name.
         agent_name: String,
+        /// Requested workspace; absence selects the server default.
+        workspace: Option<crate::WorkspaceSelection>,
     },
     /// A session was created successfully.
     Created {
@@ -1126,6 +1128,8 @@ pub enum SessionEffect {
         operation_key: OperationKey,
         /// Exact selectable agent name.
         agent_name: String,
+        /// Requested workspace; absence selects the server default.
+        workspace: Option<crate::WorkspaceSelection>,
     },
     /// Delete a server-side session.
     Delete {

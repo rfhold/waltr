@@ -48,7 +48,7 @@ pub enum AppAction {
     ClientCommands(Vec<ClientCommand>),
     /// Ask the platform runtime to perform a native authentication side effect.
     NativeAuth(NativeAuthAction),
-    /// Copy a provider or upstream MCP authorization URL.
+    /// Copy an outbound OAuth authorization or verification URL.
     CopyAuthUrl(String),
     /// Start one explicitly selected private terminal media operation.
     Media(crate::media::MediaRequest),
@@ -100,6 +100,7 @@ pub struct App {
     active_config_tab: ConfigTab,
     provider_section: ProviderSection,
     mcp_section: McpSection,
+    workspace_binding_selection: usize,
     inference_defaults_section: InferenceDefaultsSection,
     sessions_section: SessionsSection,
     routines_section: RoutinesSection,
@@ -145,6 +146,7 @@ impl App {
             active_config_tab: ConfigTab::Providers,
             provider_section: ProviderSection::new(),
             mcp_section: McpSection::new(),
+            workspace_binding_selection: 0,
             inference_defaults_section: InferenceDefaultsSection::new(),
             sessions_section: SessionsSection::new(),
             routines_section: RoutinesSection::new(),
@@ -541,14 +543,9 @@ impl App {
                     AppAction::Continue
                 }
             }
-            KeyCode::Char('C')
-                if attempt
-                    .as_ref()
-                    .and_then(|attempt| safe_auth_url(&attempt.auth_url))
-                    .is_some() =>
-            {
-                AppAction::CopyAuthUrl(attempt.as_ref().expect("safe URL attempt").auth_url.clone())
-            }
+            KeyCode::Char('C') => self
+                .outbound_auth_url()
+                .map_or(AppAction::Continue, |url| AppAction::CopyAuthUrl(url.to_owned())),
             KeyCode::Backspace if manual_input => {
                 self.config_auth.input_mut().pop();
                 AppAction::Continue
@@ -805,7 +802,7 @@ impl App {
             .and_then(|target| self.config_auth.error_for(target))
     }
 
-    /// Validated provider or upstream MCP authorization URL for presentation.
+    /// Validated outbound OAuth authorization or verification URL for presentation.
     #[must_use]
     pub fn outbound_auth_url(&self) -> Option<&str> {
         let target = self.outbound_auth_target()?;
@@ -815,7 +812,28 @@ impl App {
             .active_attempt
             .as_ref()
             .filter(|attempt| targets_match(&attempt.target, target))?;
-        safe_auth_url(&attempt.auth_url)
+        if attempt.completion_mode == "serverDevicePoll" {
+            if !matches!(attempt.lifecycle.as_str(), "pending" | "completing") {
+                return None;
+            }
+            let value = safe_auth_url(&attempt.verification_url)?;
+            let parsed = url::Url::parse(value).ok()?;
+            (parsed.scheme() == "https"
+                || matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+                .then_some(value)
+        } else {
+            safe_auth_url(&attempt.auth_url)
+        }
+    }
+
+    pub(crate) const fn workspace_binding_selection(&self) -> usize {
+        self.workspace_binding_selection
+    }
+
+    pub(crate) fn has_workspace_bindings(&self) -> bool {
+        self.client_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.config.workspace_bindings.is_empty())
     }
 
     #[allow(
@@ -939,6 +957,7 @@ impl App {
                         ConfigTab::InferenceDefaults => {
                             self.inference_defaults_section.open_create_form();
                         }
+                        ConfigTab::WorkspaceBindings => {}
                     }
                     return AppAction::Continue;
                 }
@@ -1329,6 +1348,9 @@ impl App {
             if let Some(config) = snapshot.config.current.as_ref() {
                 self.provider_section.sync_selection(config.providers.len());
                 self.mcp_section.sync_selection(config.mcp_servers.len());
+                self.workspace_binding_selection = self
+                    .workspace_binding_selection
+                    .min(snapshot.config.workspace_bindings.len().saturating_sub(1));
                 self.inference_defaults_section.sync_selection(Some(config));
             }
 
@@ -1390,6 +1412,7 @@ impl App {
         self.active_config_tab = ConfigTab::Providers;
         self.provider_section = ProviderSection::new();
         self.mcp_section = McpSection::new();
+        self.workspace_binding_selection = 0;
         self.inference_defaults_section = InferenceDefaultsSection::new();
         self.sessions_section = SessionsSection::new();
         self.routines_section = RoutinesSection::new();
@@ -1418,6 +1441,7 @@ impl App {
             ConfigTab::Providers => self.provider_section.has_overlay(),
             ConfigTab::Mcp => self.mcp_section.has_overlay(),
             ConfigTab::InferenceDefaults => self.inference_defaults_section.has_overlay(),
+            ConfigTab::WorkspaceBindings => false,
         }
     }
 
@@ -1432,6 +1456,7 @@ impl App {
             ConfigTab::Providers => self.provider_section.dismiss_overlay(),
             ConfigTab::Mcp => self.mcp_section.dismiss_overlay(),
             ConfigTab::InferenceDefaults => self.inference_defaults_section.dismiss_overlay(),
+            ConfigTab::WorkspaceBindings => false,
         }
     }
 
@@ -1447,7 +1472,13 @@ impl App {
         // Tab switches the active config section only while no section overlay
         // is active (overlays consume Tab for their own field navigation).
         if key.code == KeyCode::Tab && !self.active_section_has_overlay() {
-            self.active_config_tab = self.active_config_tab.next();
+            let next = self.active_config_tab.next();
+            self.active_config_tab =
+                if next == ConfigTab::WorkspaceBindings && !self.has_workspace_bindings() {
+                    next.next()
+                } else {
+                    next
+                };
             return AppAction::Continue;
         }
 
@@ -1474,6 +1505,17 @@ impl App {
             ConfigTab::Providers => self.provider_section.selected_auth_target(config.as_ref()),
             ConfigTab::Mcp => self.mcp_section.selected_auth_target(config.as_ref()),
             ConfigTab::InferenceDefaults => None,
+            ConfigTab::WorkspaceBindings => self.client_snapshot.as_ref().and_then(|snapshot| {
+                snapshot
+                    .config
+                    .workspace_bindings
+                    .keys()
+                    .nth(self.workspace_binding_selection)
+                    .map(|key| ClientAuthTarget {
+                        kind: "workspaceBinding".to_owned(),
+                        key: key.clone(),
+                    })
+            }),
         };
         if !self.active_section_has_content_overlay() {
             match self.config_auth.handle_key(key, auth_target, &statuses) {
@@ -1493,6 +1535,28 @@ impl App {
             ConfigTab::InferenceDefaults => self
                 .inference_defaults_section
                 .handle_key(key, config.as_ref()),
+            ConfigTab::WorkspaceBindings => {
+                let Some(snapshot) = self.client_snapshot.as_ref() else {
+                    return AppAction::Continue;
+                };
+                match key.code {
+                    KeyCode::Up => {
+                        self.workspace_binding_selection =
+                            self.workspace_binding_selection.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        self.workspace_binding_selection = self
+                            .workspace_binding_selection
+                            .saturating_add(1)
+                            .min(snapshot.config.workspace_bindings.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('s') if snapshot.auth.list.status != "loading" => {
+                        return AppAction::ClientCommand(ClientCommand::RequestAuthStatuses);
+                    }
+                    _ => {}
+                }
+                SectionAction::Continue
+            }
         };
         match action {
             SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),

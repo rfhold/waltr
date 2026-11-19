@@ -109,7 +109,7 @@ impl OutboundHttpPolicy {
         self.client_for(value).await.map(|(url, _)| url)
     }
 
-    fn validate_url(&self, value: &str) -> Result<Url, Status> {
+    pub(super) fn validate_url(&self, value: &str) -> Result<Url, Status> {
         let url = Url::parse(value)
             .map_err(|_| Status::failed_precondition("OAuth endpoint URL is invalid"))?;
         if url.fragment().is_some()

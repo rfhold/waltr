@@ -75,10 +75,13 @@ pub struct WorkspaceResult {
     pub path_kind: String,
     /// Worker-local canonical workspace root.
     pub canonical_root: String,
+    /// Canonical export-relative directory returned by directory resolution.
+    pub working_directory: Option<String>,
 }
 
 #[derive(Debug)]
 struct Invocation {
+    cwd: PathBuf,
     created: Instant,
     id: String,
     tool: String,
@@ -171,6 +174,20 @@ impl Sandbox {
         arguments_json: &str,
         shell_defaults: Option<ShellDefaults>,
     ) -> Result<Prepared> {
+        self.prepare_in(id, tool, arguments_json, shell_defaults, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[cfg_attr(not(feature = "shell"), allow(clippy::needless_pass_by_value))]
+    pub(crate) fn prepare_in(
+        &self,
+        id: &str,
+        tool: &str,
+        arguments_json: &str,
+        shell_defaults: Option<ShellDefaults>,
+        working_directory: Option<&str>,
+    ) -> Result<Prepared> {
+        let cwd = request_directory(&self.root, working_directory)?;
         if tool != "shell" && shell_defaults.is_some() {
             return Err(SandboxError("shell defaults on non-shell tool".into()));
         }
@@ -184,7 +201,7 @@ impl Sandbox {
         }
         let (operation, resource_kind, resource) = match tool {
             "read" | "edit" | "write" | "delete" => {
-                let path = resolved(&self.root, str_arg(&args, "filePath")?, tool == "write")?;
+                let path = resolved(&cwd, str_arg(&args, "filePath")?, tool == "write")?;
                 if tool == "read" {
                     optional_integer(&args, "offset", 1)?;
                     optional_integer(&args, "limit", 0)?;
@@ -225,7 +242,7 @@ impl Sandbox {
                     glob_pattern(include)?;
                 }
                 let path = resolved(
-                    &self.root,
+                    &cwd,
                     args.get("path").and_then(Value::as_str).unwrap_or("."),
                     false,
                 )?;
@@ -233,17 +250,17 @@ impl Sandbox {
             }
             "skill" => {
                 let name = str_arg(&args, "name")?;
-                if !skill_catalog(&self.root)
+                if !skill_catalog(&self.root, &cwd)
                     .iter()
                     .any(|(dir, _, _)| dir == name)
                 {
                     return Err(SandboxError("skill is not visible".into()));
                 }
-                let path = self.scoped(&skill_path(name)?, false)?;
+                let path = scoped(&self.root, &cwd, &skill_path(name)?, false)?;
                 ("read", "filesystem_path", path.display().to_string())
             }
             "apply_patch" => {
-                let claims = crate::patch::claims(&self.root, str_arg(&args, "patchText")?)?
+                let claims = crate::patch::claims(&cwd, str_arg(&args, "patchText")?)?
                     .into_iter()
                     .map(|(operation, resource)| Claim {
                         operation,
@@ -251,7 +268,7 @@ impl Sandbox {
                         resource,
                     })
                     .collect();
-                return self.store_prepared(id, tool, args, claims, None);
+                return self.store_prepared(id, tool, args, claims, None, cwd);
             }
             #[cfg(feature = "shell")]
             "shell" => {
@@ -259,12 +276,14 @@ impl Sandbox {
                 str_arg(&args, "description")?;
                 optional_string(&args, "workdir")?;
                 optional_integer(&args, "timeout", 1)?;
-                let shell_defaults =
-                    shell_defaults.unwrap_or_else(|| ShellDefaults::for_root(&self.root));
-                let workdir =
-                    crate::shell::workdir(&self.root, &shell_defaults.default_workdir, &args);
+                let mut shell_defaults =
+                    shell_defaults.unwrap_or_else(|| ShellDefaults::for_root(&cwd));
+                if working_directory.is_some() {
+                    shell_defaults.default_workdir.clone_from(&cwd);
+                }
+                let workdir = crate::shell::workdir(&cwd, &shell_defaults.default_workdir, &args);
                 let claims = crate::shell::claims(command, &self.root, &workdir)?;
-                return self.store_prepared(id, tool, args, claims, Some(shell_defaults));
+                return self.store_prepared(id, tool, args, claims, Some(shell_defaults), cwd);
             }
             _ => return Err(SandboxError(format!("unsupported tool: {tool}"))),
         };
@@ -273,7 +292,7 @@ impl Sandbox {
             resource_kind: resource_kind.into(),
             resource,
         }];
-        self.store_prepared(id, tool, args, claims, None)
+        self.store_prepared(id, tool, args, claims, None, cwd)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -284,6 +303,7 @@ impl Sandbox {
         args: Value,
         claims: Vec<Claim>,
         shell_defaults: Option<ShellDefaults>,
+        cwd: PathBuf,
     ) -> Result<Prepared> {
         let mut tickets = self
             .tickets
@@ -300,6 +320,7 @@ impl Sandbox {
         tickets.insert(
             ticket.clone(),
             Invocation {
+                cwd,
                 created: Instant::now(),
                 id: id.into(),
                 tool: tool.into(),
@@ -353,12 +374,16 @@ impl Sandbox {
         if invocation.tool == "shell" {
             #[cfg(feature = "shell")]
             {
+                verify_directory(&self.root, &invocation.cwd)?;
                 let defaults = invocation
                     .shell_defaults
                     .as_ref()
                     .expect("shell ticket has defaults");
-                let workdir =
-                    crate::shell::workdir(&self.root, &defaults.default_workdir, &invocation.args);
+                let workdir = crate::shell::workdir(
+                    &invocation.cwd,
+                    &defaults.default_workdir,
+                    &invocation.args,
+                );
                 let claims = crate::shell::claims(
                     str_arg(&invocation.args, "command")?,
                     &self.root,
@@ -367,20 +392,15 @@ impl Sandbox {
                 if claims != invocation.claims {
                     return Err(SandboxError("path changed since preparation".into()));
                 }
-            }
-            #[cfg(feature = "shell")]
-            return Box::pin(
-                self.shell(
+                return Box::pin(crate::shell::execute(
+                    &workdir,
+                    defaults,
                     &invocation.args,
-                    invocation
-                        .shell_defaults
-                        .as_ref()
-                        .expect("shell ticket has defaults"),
                     cancel,
                     progress,
-                ),
-            )
-            .await;
+                ))
+                .await;
+            }
             #[cfg(not(feature = "shell"))]
             {
                 drop(progress);
@@ -393,13 +413,22 @@ impl Sandbox {
             if cancel.is_cancelled() {
                 return Err(SandboxError("canceled".into()));
             }
+            verify_directory(&root, &invocation.cwd)?;
             Self::validate_claims(
                 &root,
+                &invocation.cwd,
                 &invocation.tool,
                 &invocation.args,
                 &invocation.claims,
             )?;
-            Self::filesystem(&root, &invocation.tool, &invocation.args, false, &cancel)
+            Self::filesystem(
+                &root,
+                &invocation.cwd,
+                &invocation.tool,
+                &invocation.args,
+                false,
+                &cancel,
+            )
         });
         // A synchronous filesystem operation cannot be interrupted safely. Wait
         // for it to finish before reporting cancellation to the host.
@@ -425,15 +454,49 @@ impl Sandbox {
     /// # Errors
     /// Returns an error if input is invalid or workspace I/O fails.
     pub async fn workspace(&self, operation: &str, args: &Value) -> Result<WorkspaceResult> {
+        self.workspace_in(operation, args, None).await
+    }
+
+    pub(crate) async fn workspace_in(
+        &self,
+        operation: &str,
+        args: &Value,
+        working_directory: Option<&str>,
+    ) -> Result<WorkspaceResult> {
         let root = self.root.clone();
+        let directory = working_directory.map(str::to_owned);
         let operation = operation.to_owned();
         let args = args.clone();
         tokio::task::spawn_blocking(move || {
+            if operation == "resolve_working_directory" {
+                if directory.is_some() {
+                    return Err(SandboxError(
+                        "unexpected working_directory during resolution".into(),
+                    ));
+                }
+                let path =
+                    resolve_directory(&root, str_arg(&args, "filePath")?, std::env::home_dir)?;
+                let relative = path.strip_prefix(&root).expect("validated directory");
+                let relative = relative
+                    .to_str()
+                    .ok_or_else(|| SandboxError("working directory is not UTF-8".into()))?;
+                return Ok(WorkspaceResult {
+                    canonical_path: path.to_string_lossy().into_owned(),
+                    path_kind: "directory".into(),
+                    canonical_root: root.to_string_lossy().into_owned(),
+                    working_directory: Some(
+                        if relative.is_empty() { "." } else { relative }.into(),
+                    ),
+                    entries: Vec::new(),
+                    content: String::new(),
+                });
+            }
+            let cwd = request_directory(&root, directory.as_deref())?;
             if operation == "info" || operation == "resolve" {
                 let path = if operation == "info" {
-                    root.clone()
+                    cwd.clone()
                 } else {
-                    resolved(&root, str_arg(&args, "filePath")?, false)?
+                    resolved(&cwd, str_arg(&args, "filePath")?, false)?
                 };
                 let metadata = fs::metadata(&path)?;
                 let path_kind = if metadata.is_file() {
@@ -449,6 +512,7 @@ impl Sandbox {
                     canonical_path: path.to_string_lossy().into_owned(),
                     path_kind: path_kind.into(),
                     canonical_root: root.to_string_lossy().into_owned(),
+                    working_directory: None,
                 });
             }
             let tool = match operation.as_str() {
@@ -461,13 +525,13 @@ impl Sandbox {
                 _ => return Err(SandboxError("unsupported workspace operation".into())),
             };
             let content = if operation == "read" {
-                let path = scoped(&root, str_arg(&args, "filePath")?, false)?;
+                let path = scoped(&root, &cwd, str_arg(&args, "filePath")?, false)?;
                 fs::read_to_string(path)?
             } else {
-                Self::filesystem(&root, tool, &args, true, &CancellationToken::new())?
+                Self::filesystem(&root, &cwd, tool, &args, true, &CancellationToken::new())?
             };
             let entries = if tool == "skills" {
-                skill_catalog(&root)
+                skill_catalog(&root, &cwd)
                     .into_iter()
                     .map(|(directory, _, _)| directory)
                     .collect()
@@ -486,6 +550,7 @@ impl Sandbox {
                 canonical_path: String::new(),
                 path_kind: String::new(),
                 canonical_root: root.to_string_lossy().into_owned(),
+                working_directory: None,
             })
         })
         .await
@@ -504,10 +569,29 @@ impl Sandbox {
         max_depth: usize,
         max_bytes: usize,
     ) -> Result<WorkspaceResult> {
+        self.snapshot_in(path, max_entries, max_depth, max_bytes, None)
+            .await
+    }
+
+    pub(crate) async fn snapshot_in(
+        &self,
+        path: &str,
+        max_entries: usize,
+        max_depth: usize,
+        max_bytes: usize,
+        working_directory: Option<&str>,
+    ) -> Result<WorkspaceResult> {
         let root = self.root.clone();
+        let directory = working_directory.map(str::to_owned);
         let path = path.to_owned();
         tokio::task::spawn_blocking(move || {
-            let base = scoped(&root, if path.is_empty() { "." } else { &path }, false)?;
+            let cwd = request_directory(&root, directory.as_deref())?;
+            let base = scoped(
+                &root,
+                &cwd,
+                if path.is_empty() { "." } else { &path },
+                false,
+            )?;
             if !base.is_dir() {
                 return Err(SandboxError("snapshot path is not a directory".into()));
             }
@@ -567,28 +651,36 @@ impl Sandbox {
                 canonical_path: String::new(),
                 path_kind: String::new(),
                 canonical_root: root.to_string_lossy().into_owned(),
+                working_directory: None,
             })
         })
         .await
         .map_err(|e| SandboxError(e.to_string()))?
     }
 
-    fn scoped(&self, path: &str, writable: bool) -> Result<PathBuf> {
-        scoped(&self.root, path, writable)
-    }
-
-    fn validate_claims(root: &Path, tool: &str, args: &Value, claims: &[Claim]) -> Result<()> {
+    fn validate_claims(
+        root: &Path,
+        cwd: &Path,
+        tool: &str,
+        args: &Value,
+        claims: &[Claim],
+    ) -> Result<()> {
         let paths = match tool {
             "read" | "edit" | "write" | "delete" => {
-                vec![resolved(root, str_arg(args, "filePath")?, tool == "write")?]
+                vec![resolved(cwd, str_arg(args, "filePath")?, tool == "write")?]
             }
             "glob" | "grep" => vec![resolved(
-                root,
+                cwd,
                 args.get("path").and_then(Value::as_str).unwrap_or("."),
                 false,
             )?],
-            "skill" => vec![scoped(root, &skill_path(str_arg(args, "name")?)?, false)?],
-            "apply_patch" => crate::patch::claims(root, str_arg(args, "patchText")?)?
+            "skill" => vec![scoped(
+                root,
+                cwd,
+                &skill_path(str_arg(args, "name")?)?,
+                false,
+            )?],
+            "apply_patch" => crate::patch::claims(cwd, str_arg(args, "patchText")?)?
                 .into_iter()
                 .map(|(_, path)| PathBuf::from(path))
                 .collect(),
@@ -607,6 +699,7 @@ impl Sandbox {
     #[allow(clippy::too_many_lines)]
     fn filesystem(
         root: &Path,
+        cwd: &Path,
         tool: &str,
         args: &Value,
         restricted: bool,
@@ -614,18 +707,18 @@ impl Sandbox {
     ) -> Result<String> {
         let path_for = |raw: &str, writable| {
             if restricted {
-                scoped(root, raw, writable)
+                scoped(root, cwd, raw, writable)
             } else {
-                resolved(root, raw, writable)
+                resolved(cwd, raw, writable)
             }
         };
         match tool {
-            "apply_patch" => crate::patch::apply(root, str_arg(args, "patchText")?, cancel),
+            "apply_patch" => crate::patch::apply(cwd, str_arg(args, "patchText")?, cancel),
             "skill" => {
-                let path = scoped(root, &skill_path(str_arg(args, "name")?)?, false)?;
+                let path = scoped(root, cwd, &skill_path(str_arg(args, "name")?)?, false)?;
                 Ok(fs::read_to_string(path)?)
             }
-            "skills" => Ok(skill_catalog(root)
+            "skills" => Ok(skill_catalog(root, cwd)
                 .into_iter()
                 .map(|(_, name, description)| format!("{name}: {description}"))
                 .collect::<Vec<_>>()
@@ -892,17 +985,6 @@ impl Sandbox {
             _ => Err(SandboxError("unsupported tool".into())),
         }
     }
-
-    #[cfg(feature = "shell")]
-    async fn shell(
-        &self,
-        args: &Value,
-        defaults: &ShellDefaults,
-        cancel: CancellationToken,
-        progress: Option<tokio::sync::mpsc::Sender<(String, String)>>,
-    ) -> Result<Execution> {
-        crate::shell::execute(&self.root, defaults, args, cancel, progress).await
-    }
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -987,8 +1069,63 @@ fn skill_path(name: &str) -> Result<String> {
     Ok(format!(".agents/skills/{name}/SKILL.md"))
 }
 
-pub fn scoped(root: &Path, raw: &str, writable: bool) -> Result<PathBuf> {
-    let path = resolved(root, raw, writable)?;
+fn resolve_directory(
+    root: &Path,
+    raw: &str,
+    home: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf> {
+    let path = Path::new(raw);
+    let path = if let Ok(rest) = path.strip_prefix("~") {
+        home()
+            .ok_or_else(|| SandboxError("worker home directory is unavailable".into()))?
+            .join(rest)
+    } else {
+        root.join(path)
+    };
+    let path = path
+        .canonicalize()
+        .map_err(|e| SandboxError(format!("cannot resolve working directory: {e}")))?;
+    if !path.starts_with(root) {
+        return Err(SandboxError("working directory is outside export".into()));
+    }
+    if !path.is_dir() {
+        return Err(SandboxError("working directory is not a directory".into()));
+    }
+    Ok(path)
+}
+
+fn verify_directory(root: &Path, path: &Path) -> Result<()> {
+    if path.canonicalize()? != path || !path.starts_with(root) || !path.is_dir() {
+        return Err(SandboxError(
+            "working directory changed since resolution".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn request_directory(root: &Path, directory: Option<&str>) -> Result<PathBuf> {
+    let directory = Path::new(directory.unwrap_or("."));
+    if directory != Path::new(".")
+        && (directory.as_os_str().is_empty()
+            || !directory
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))))
+    {
+        return Err(SandboxError(
+            "expected resolved export-relative working directory".into(),
+        ));
+    }
+    let cwd = if directory == Path::new(".") {
+        root.to_owned()
+    } else {
+        root.join(directory)
+    };
+    verify_directory(root, &cwd)?;
+    Ok(cwd)
+}
+
+fn scoped(root: &Path, cwd: &Path, raw: &str, writable: bool) -> Result<PathBuf> {
+    let path = resolved(cwd, raw, writable)?;
     if !path.starts_with(root) {
         return Err(SandboxError("path escapes workspace root".into()));
     }
@@ -1102,8 +1239,11 @@ fn skill_metadata(content: &str) -> Option<(String, String)> {
     Some((name?, description?))
 }
 
-fn skill_catalog(root: &Path) -> Vec<(String, String, String)> {
-    let Ok(entries) = fs::read_dir(root.join(".agents/skills")) else {
+fn skill_catalog(root: &Path, cwd: &Path) -> Vec<(String, String, String)> {
+    let Ok(skills) = scoped(root, cwd, ".agents/skills", false) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(skills) else {
         return Vec::new();
     };
     let mut catalog = Vec::new();
@@ -1112,10 +1252,8 @@ fn skill_catalog(root: &Path) -> Vec<(String, String, String)> {
             continue;
         }
         let skill = entry.path().join("SKILL.md");
-        if scoped(root, &skill.display().to_string(), false).is_err() {
-            continue;
-        }
-        if let Ok(text) = fs::read_to_string(skill)
+        if let Ok(skill) = scoped(root, cwd, &skill.display().to_string(), false)
+            && let Ok(text) = fs::read_to_string(skill)
             && let Some((name, description)) = skill_metadata(&text)
         {
             catalog.push((
@@ -1133,6 +1271,158 @@ fn skill_catalog(root: &Path) -> Vec<(String, String, String)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn resolved_directories_bind_context_and_tickets_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        let root = sandbox.root();
+        for repo in ["a", "b"] {
+            fs::create_dir(root.join(repo)).unwrap();
+            fs::write(root.join(repo).join("AGENTS.md"), repo).unwrap();
+        }
+        for (raw, expected) in [
+            ("", "."),
+            ("a", "a"),
+            (root.join("a").to_str().unwrap(), "a"),
+        ] {
+            let result = sandbox
+                .workspace("resolve_working_directory", &json!({"filePath": raw}))
+                .await
+                .unwrap();
+            assert_eq!(result.working_directory.as_deref(), Some(expected));
+            assert_eq!(result.canonical_root, root.to_str().unwrap());
+        }
+        assert_eq!(
+            resolve_directory(root, "~/b", || Some(root.into())).unwrap(),
+            root.join("b")
+        );
+        assert!(
+            resolve_directory(root, "..", || None)
+                .unwrap_err()
+                .0
+                .contains("outside export")
+        );
+        assert!(
+            resolve_directory(root, "missing", || None)
+                .unwrap_err()
+                .0
+                .contains("cannot resolve")
+        );
+        assert!(
+            resolve_directory(root, "a/AGENTS.md", || None)
+                .unwrap_err()
+                .0
+                .contains("not a directory")
+        );
+        let write = sandbox
+            .prepare_in(
+                "w",
+                "edit",
+                &json!({"filePath":"AGENTS.md","oldString":"b","newString":"edited"}).to_string(),
+                None,
+                Some("b"),
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&write.claims[0].resource),
+            root.join("b/AGENTS.md")
+        );
+        let args = json!({"filePath":"AGENTS.md"});
+        let (a, b) = tokio::join!(
+            sandbox.workspace_in("read", &args, Some("a")),
+            sandbox.workspace_in("read", &args, Some("b"))
+        );
+        assert_eq!(
+            (a.unwrap().content, b.unwrap().content),
+            ("a".into(), "b".into())
+        );
+        sandbox
+            .execute("w", &write.ticket, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(root.join("a/AGENTS.md")).unwrap(), "a");
+        assert_eq!(
+            fs::read_to_string(root.join("b/AGENTS.md")).unwrap(),
+            "edited"
+        );
+        assert_eq!(
+            sandbox
+                .workspace_in("read", &json!({"filePath":"../b/AGENTS.md"}), Some("a"))
+                .await
+                .unwrap()
+                .content,
+            "edited"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_directory_cannot_redirect_prepared_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        let project = dir.path().join("repo");
+        fs::create_dir(&project).unwrap();
+        let write = sandbox
+            .prepare_in(
+                "w",
+                "write",
+                r#"{"filePath":"new","content":"no"}"#,
+                None,
+                Some("repo"),
+            )
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::remove_dir(&project).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &project).unwrap();
+        assert!(
+            sandbox
+                .execute("w", &write.ticket, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(!outside.path().join("new").exists());
+        assert!(
+            sandbox
+                .workspace("resolve_working_directory", &json!({"filePath":"repo"}))
+                .await
+                .unwrap_err()
+                .0
+                .contains("outside export")
+        );
+    }
+
+    #[cfg(feature = "shell")]
+    #[tokio::test]
+    async fn bound_shell_uses_session_directory_and_relative_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("repo/nested")).unwrap();
+        for (workdir, expected) in [(None, "repo"), (Some("nested"), "repo/nested")] {
+            let mut args = json!({"command": "pwd", "description": "show directory"});
+            if let Some(path) = workdir {
+                args["workdir"] = path.into();
+            }
+            let prepared = sandbox
+                .prepare_in(
+                    "pwd",
+                    "shell",
+                    &args.to_string(),
+                    Some(ShellDefaults::for_root(sandbox.root())),
+                    Some("repo"),
+                )
+                .unwrap();
+            let result = sandbox
+                .execute("pwd", &prepared.ticket, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(
+                result
+                    .content
+                    .contains(sandbox.root().join(expected).to_str().unwrap())
+            );
+        }
+    }
 
     #[tokio::test]
     async fn ticket_is_bound_single_use_and_prepare_is_pure() {
@@ -1468,6 +1758,7 @@ mod tests {
         token.cancel();
         assert!(
             Sandbox::filesystem(
+                dir.path(),
                 dir.path(),
                 "write",
                 &json!({"filePath":"nested/note", "content":"x"}),

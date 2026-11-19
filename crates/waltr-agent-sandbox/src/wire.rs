@@ -10,10 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use waltr::grpc::waltr::sandbox::v1::{
-    self as proto, connect_request::Body as WorkerBody, connect_response::Body as HostBody,
-    sandbox_service_client::SandboxServiceClient,
-};
 use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinSet,
@@ -21,9 +17,13 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
+use tonic::{metadata::AsciiMetadataValue, transport::Channel};
+use waltr::grpc::waltr::sandbox::v1::{
+    self as proto, connect_request::Body as WorkerBody, connect_response::Body as HostBody,
+    sandbox_service_client::SandboxServiceClient,
+};
 
-use crate::{Sandbox, SandboxError, tools::ShellDefaults};
+use crate::{Sandbox, SandboxError, peer_config::StreamExports, tools::ShellDefaults};
 
 fn shell_defaults(request: &proto::Prepare) -> Result<Option<ShellDefaults>, SandboxError> {
     if request.tool_name != "shell" {
@@ -208,6 +208,7 @@ fn bound_reply(reply: proto::ConnectRequest) -> proto::ConnectRequest {
                 + value.canonical_path.len()
                 + value.path_kind.len()
                 + value.canonical_root.len()
+                + value.working_directory.as_ref().map_or(0, String::len)
                 + value.entries.iter().map(String::len).sum::<usize>()
                 > MAX_REPLY_BYTES =>
         {
@@ -363,13 +364,101 @@ pub async fn run_worker(
 ///
 /// # Errors
 /// Returns an error if the workspace root is invalid.
-#[allow(clippy::too_many_lines)]
 pub async fn run_worker_with_shutdown(
     channel: Channel,
     root: impl AsRef<Path>,
     workspace_id: impl Into<String>,
     stop: CancellationToken,
     connected: Arc<AtomicBool>,
+) -> Result<(), SandboxError> {
+    worker_loop(
+        channel,
+        root,
+        workspace_id,
+        stop,
+        connected,
+        WorkerPeer::Private,
+    )
+    .await
+}
+
+/// Run an outbound worker with a fresh Authorization header on each connection.
+/// Skip the dial if the credential provider has no current header.
+///
+/// # Errors
+/// Returns an error if the workspace root is invalid.
+pub async fn run_worker_with_authorization(
+    channel: Channel,
+    root: impl AsRef<Path>,
+    workspace_id: impl Into<String>,
+    stop: CancellationToken,
+    connected: Arc<AtomicBool>,
+    authorization: impl Fn() -> Option<AsciiMetadataValue> + Send + Sync + 'static,
+) -> Result<(), SandboxError> {
+    run_worker_with_dial_authorization(
+        channel,
+        root.as_ref().to_path_buf(),
+        workspace_id.into(),
+        stop,
+        connected,
+        move || {
+            authorization().map(|header| DialAuthorization {
+                header,
+                expires: None,
+            })
+        },
+    )
+    .await
+}
+
+#[derive(Clone)]
+pub(crate) struct DialAuthorization {
+    pub(crate) header: AsciiMetadataValue,
+    pub(crate) expires: Option<time::Instant>,
+}
+
+enum WorkerPeer<'a> {
+    Private,
+    Outbound(&'a (dyn Fn() -> Option<DialAuthorization> + Sync)),
+}
+
+pub(crate) fn run_worker_with_dial_authorization(
+    channel: Channel,
+    root: PathBuf,
+    workspace_id: String,
+    stop: CancellationToken,
+    connected: Arc<AtomicBool>,
+    authorization: impl Fn() -> Option<DialAuthorization> + Send + Sync + 'static,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), SandboxError>> + Send>> {
+    Box::pin(async move {
+        worker_loop(
+            channel,
+            root,
+            workspace_id,
+            stop,
+            connected,
+            WorkerPeer::Outbound(&authorization),
+        )
+        .await
+    })
+}
+
+async fn wait_for_expiry(expires: Option<time::Instant>) {
+    if let Some(expires) = expires {
+        time::sleep_until(expires).await;
+    } else {
+        std::future::pending().await
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn worker_loop(
+    channel: Channel,
+    root: impl AsRef<Path>,
+    workspace_id: impl Into<String>,
+    stop: CancellationToken,
+    connected: Arc<AtomicBool>,
+    peer: WorkerPeer<'_>,
 ) -> Result<(), SandboxError> {
     let sandbox = Arc::new(Sandbox::new(root)?);
     let hello = message(WorkerBody::Hello(proto::Hello {
@@ -400,6 +489,8 @@ pub async fn run_worker_with_shutdown(
     let permits = Arc::new(Semaphore::new(16));
     let mut sender = None;
     let mut stream: Option<tonic::Streaming<proto::ConnectResponse>> = None;
+    let mut stream_expiry = None;
+    let mut exports = StreamExports::default();
     let mut delay = Duration::from_millis(50);
     let mut retry_at = time::Instant::now();
     let mut cleanup = time::interval(Duration::from_millis(100));
@@ -418,29 +509,71 @@ pub async fn run_worker_with_shutdown(
                 if let Some(sender) = &sender { flush_outstanding(&mut outstanding, sender); }
             }
             incoming = async {
-                if let Some(stream) = stream.as_mut() { stream.message().await } else { Ok(None) }
+                tokio::select! {
+                    biased;
+                    () = wait_for_expiry(stream_expiry) => None,
+                    incoming = stream.as_mut().expect("live stream").message() => incoming.ok().flatten(),
+                }
             }, if stream.is_some() => {
-                if let Ok(Some(proto::ConnectResponse { body: Some(body) })) = incoming {
-                    handle_request(body, &sandbox, &mut outstanding, sender.as_ref(), &mut active, &permits, &mut tasks);
-                } else {
-                    connected.store(false, Ordering::Release);
-                    sender = None;
-                    stream = None;
-                    retry_at = time::Instant::now() + delay;
-                    delay = (delay * 2).min(Duration::from_secs(1));
+                match incoming.and_then(|message| message.body) {
+                    Some(HostBody::WorkspaceExportControl(control)) => {
+                        if matches!(peer, WorkerPeer::Private) {
+                            let request_id = control.request_id.clone();
+                            let applied = exports.change(control).await;
+                            let reply = message(WorkerBody::WorkspaceExportAck(proto::WorkspaceExportAck { request_id, applied }));
+                            tokio::select! {
+                                biased;
+                                () = stop.cancelled() => break,
+                                // Control acknowledgements aren't retained or replayed.
+                                _ = sender.as_ref().expect("live sender").send(reply) => {}
+                            }
+                        }
+                    }
+                    Some(body) => handle_request(body, &sandbox, &mut outstanding, sender.as_ref(), &mut active, &permits, &mut tasks),
+                    None => {
+                        connected.store(false, Ordering::Release);
+                        sender = None;
+                        stream = None;
+                        exports.shutdown().await;
+                        retry_at = time::Instant::now() + delay;
+                        delay = (delay * 2).min(Duration::from_secs(1));
+                    }
                 }
             }
             () = time::sleep_until(retry_at), if stream.is_none() => {
+                let access = if let WorkerPeer::Outbound(current_authorization) = peer {
+                    let Some(mut value) = current_authorization() else {
+                        retry_at = time::Instant::now() + delay;
+                        delay = (delay * 2).min(Duration::from_secs(1));
+                        continue;
+                    };
+                    value.header.set_sensitive(true);
+                    Some(value)
+                } else {
+                    None
+                };
                 let (tx, rx) = mpsc::channel(256);
                 if tx.send(hello.clone()).await.is_err() { continue; }
-                let result = time::timeout(Duration::from_secs(3), SandboxServiceClient::new(channel.clone()).connect(ReceiverStream::new(rx))).await;
-                if let Ok(Ok(response)) = result {
+                let mut request = tonic::Request::new(ReceiverStream::new(rx));
+                let expires = access.as_ref().and_then(|value| value.expires);
+                if let Some(value) = access {
+                    request.metadata_mut().insert("authorization", value.header);
+                }
+                let mut client = SandboxServiceClient::new(channel.clone());
+                let result = tokio::select! {
+                    biased;
+                    () = stop.cancelled() => break,
+                    () = wait_for_expiry(expires) => None,
+                    result = time::timeout(Duration::from_secs(3), client.connect(request)) => result.ok().and_then(Result::ok),
+                };
+                if let Some(response) = result {
                     let next = response.into_inner();
                     // Hello is always first. Retained replies need no status query.
                     for entry in outstanding.values_mut() { entry.sent = false; }
                     flush_outstanding(&mut outstanding, &tx);
                     sender = Some(tx);
                     stream = Some(next);
+                    stream_expiry = expires;
                     connected.store(true, Ordering::Release);
                     delay = Duration::from_millis(50);
                 } else {
@@ -451,9 +584,15 @@ pub async fn run_worker_with_shutdown(
         }
     }
     connected.store(false, Ordering::Release);
+    drop(sender);
+    drop(stream);
     for token in active.values() {
         token.cancel();
     }
+    for entry in outstanding.values() {
+        entry.cancel.cancel();
+    }
+    exports.shutdown().await;
     drop(
         time::timeout(Duration::from_secs(2), async {
             while tasks.join_next().await.is_some() {}
@@ -475,6 +614,9 @@ fn handle_request(
     tasks: &mut JoinSet<(ReplyKey, proto::ConnectRequest)>,
 ) {
     match body {
+        HostBody::WorkspaceExportControl(_) => {
+            unreachable!("controls are handled by the private stream")
+        }
         HostBody::Prepare(request) => {
             let id = request.invocation_id.clone();
             let reply_key = key(ReplyKind::Prepared, id.clone());
@@ -492,11 +634,12 @@ fn handle_request(
                 let deadline = Instant::now() + timeout;
                 let blocking = tokio::task::spawn_blocking(move || {
                     let result = shell_defaults(&request).and_then(|defaults| {
-                        blocking_sandbox.prepare_with_shell_defaults(
+                        blocking_sandbox.prepare_in(
                             &prepared_id,
                             &request.tool_name,
                             &request.arguments_json,
                             defaults,
+                            request.working_directory.as_deref(),
                         )
                     });
                     if Instant::now() >= deadline || canceled.is_cancelled() {
@@ -629,9 +772,9 @@ fn handle_request(
                     if cancel.is_cancelled() { return Err(SandboxError("worker workspace request canceled".into())); }
                     if time::Instant::now() >= deadline { return Err(SandboxError("worker workspace request timed out".into())); }
                     if request.operation == "snapshot" {
-                        sandbox.snapshot(&request.path, request.max_entries as usize, request.max_depth as usize, request.max_bytes as usize).await
+                        sandbox.snapshot_in(&request.path, request.max_entries as usize, request.max_depth as usize, request.max_bytes as usize, request.working_directory.as_deref()).await
                     } else {
-                        sandbox.workspace(&request.operation, &workspace_args(&request)).await
+                        sandbox.workspace_in(&request.operation, &workspace_args(&request), request.working_directory.as_deref()).await
                     }
                 };
                 let result = tokio::select! {
@@ -647,6 +790,7 @@ fn handle_request(
                         canonical_path: result.canonical_path,
                         path_kind: result.path_kind,
                         canonical_root: result.canonical_root,
+                        working_directory: result.working_directory,
                         ..Default::default()
                     },
                     Err(error) => proto::WorkspaceResponse {
@@ -686,6 +830,8 @@ mod tests {
     #[tokio::test]
     async fn losing_stream_does_not_cancel_an_active_shell() {
         let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
         let mut outstanding = HashMap::new();
         let mut active = HashMap::new();
@@ -702,7 +848,7 @@ mod tests {
         handle_request(HostBody::Prepare(proto::Prepare {
             invocation_id: "shell".into(), tool_name: "shell".into(),
             arguments_json: json!({"command":"touch started; sleep 0.2; printf done > finished", "description":"test"}).to_string(),
-            shell_defaults: Some(defaults), timeout_millis: 1000,
+            shell_defaults: Some(defaults), timeout_millis: 1000, working_directory: Some("repo".into()),
         }), &sandbox, &mut outstanding, sender.as_ref(), &mut active, &permits, &mut tasks);
         finish(&mut tasks, &mut outstanding, sender.as_ref()).await;
         let ticket = match &outstanding[&key(ReplyKind::Prepared, "shell".into())]
@@ -731,7 +877,7 @@ mod tests {
             &mut tasks,
         );
         time::timeout(Duration::from_secs(2), async {
-            while !dir.path().join("started").exists() {
+            while !repo.join("started").exists() {
                 time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -747,7 +893,7 @@ mod tests {
         active.remove(&reply_key.id);
         publish(&mut outstanding, sender.as_ref(), &reply_key, reply);
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("finished")).unwrap(),
+            std::fs::read_to_string(repo.join("finished")).unwrap(),
             "done"
         );
         let Some(WorkerBody::Completed(reply)) = &outstanding

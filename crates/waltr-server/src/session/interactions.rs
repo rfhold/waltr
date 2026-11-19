@@ -29,11 +29,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InteractionService<S> {
             .extensions()
             .get::<crate::access_auth::AuthenticatedPrincipal>()
             .cloned();
-        let sessions = self.sessions.request_sessions(principal, &id).await?;
-        sessions
-            .load(&id)
-            .await
-            .map_err(super::error::agent_error_to_status)?;
+        self.sessions.request_sessions(principal, &id).await?;
         Ok(id)
     }
 }

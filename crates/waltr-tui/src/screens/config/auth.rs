@@ -2,12 +2,23 @@
 
 use std::collections::BTreeMap;
 
+use ratatui::{
+    Frame,
+    crossterm::event::{KeyCode, KeyEvent},
+    layout::{Constraint, Layout, Rect},
+    text::Line,
+    widgets::{Clear, List, ListState, Paragraph, Wrap},
+};
 use waltr_client::{
     AuthStatusSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::screens::{OperationResult, OperationTracker, SectionAction};
+use crate::{
+    app::App,
+    screens::{OperationResult, OperationTracker, SectionAction},
+    theme::THEME,
+    ui,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthOperationKind {
@@ -118,7 +129,7 @@ impl TrackedAuthOperation {
     }
 }
 
-/// Config-owned state for provider and upstream MCP authentication actions.
+/// Config-owned state for outbound authentication actions.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConfigAuthState {
     input: String,
@@ -250,7 +261,10 @@ impl ConfigAuthState {
                 self.explicit_target = Some(target.clone());
                 SectionAction::ClientCommand(ClientCommand::BeginAuth { target })
             }
-            KeyCode::Char('f') if status.is_some_and(|status| status.can_refresh) => {
+            KeyCode::Char('f')
+                if target.kind != "workspaceBinding"
+                    && status.is_some_and(|status| status.can_refresh) =>
+            {
                 self.track(AuthOperationKind::Refresh, target.clone());
                 SectionAction::ClientCommand(ClientCommand::RefreshAuth { target })
             }
@@ -314,10 +328,10 @@ pub(super) fn status_for<'a>(
     statuses: &'a BTreeMap<String, AuthStatusSnapshot>,
     target: &ClientAuthTarget,
 ) -> Option<&'a AuthStatusSnapshot> {
-    let prefix = if target.kind == "mcpServer" {
-        "mcp"
-    } else {
-        "provider"
+    let prefix = match target.kind.as_str() {
+        "mcpServer" => "mcp",
+        "workspaceBinding" => "workspaceBinding",
+        _ => "provider",
     };
     statuses.get(&format!("{prefix}:{}", target.key))
 }
@@ -330,6 +344,13 @@ pub(super) fn status_can_reset(status: &AuthStatusSnapshot) -> bool {
 }
 
 pub(super) fn status_can_authorize(status: &AuthStatusSnapshot) -> bool {
+    if status.target.kind == "workspaceBinding" {
+        return status.kind != "oauthConfigured"
+            && status
+                .supported_methods
+                .iter()
+                .any(|method| method == "oauthDevice");
+    }
     status.kind != "apiKeyConfigured"
         && status
             .supported_methods
@@ -345,11 +366,111 @@ fn target_exists(snapshot: &ClientSnapshot, target: &ClientAuthTarget) -> bool {
     let Some(config) = snapshot.config.current.as_ref() else {
         return true;
     };
-    if target.kind == "mcpServer" {
-        config.mcp_servers.contains_key(&target.key)
-    } else {
-        config.providers.contains_key(&target.key)
+    match target.kind.as_str() {
+        "mcpServer" => config.mcp_servers.contains_key(&target.key),
+        "workspaceBinding" => snapshot.config.workspace_bindings.contains_key(&target.key),
+        _ => config.providers.contains_key(&target.key),
     }
+}
+
+pub(super) fn render_workspace_bindings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    snapshot: &ClientSnapshot,
+) {
+    let bindings = &snapshot.config.workspace_bindings;
+    let Some((key, binding)) = bindings.iter().nth(app.workspace_binding_selection()) else {
+        frame.render_widget(
+            Paragraph::new("No workspace bindings configured.").style(THEME.panel_style()),
+            area,
+        );
+        return;
+    };
+    let target = ClientAuthTarget {
+        kind: "workspaceBinding".to_owned(),
+        key: key.clone(),
+    };
+    let auth = app.config_auth_state();
+    let status = status_for(&snapshot.auth.statuses, &target);
+    let label = match status.map(|status| status.kind.as_str()) {
+        Some("oauthConfigured") => "Connected",
+        Some("notConfigured") => "Not connected",
+        Some("authorizationRequired") => "Authorization required",
+        Some("expired") => "Expired",
+        Some("unsupported") => "Unsupported",
+        _ => "Status unavailable",
+    };
+    let mut details = vec![
+        Line::from(format!(
+            "{} · {}",
+            clean(&binding.machine_id),
+            clean(&binding.endpoint)
+        )),
+        Line::from(format!("Authentication: {label}")),
+    ];
+    if let Some(status) = status.filter(|status| !status.message.is_empty()) {
+        details.push(Line::from(clean(&status.message)));
+    }
+    if auth.pending_for(&target) {
+        details.push(ui::loading_line("Authentication action in progress..."));
+    }
+    if let Some(error) = auth
+        .error_for(&target)
+        .or(snapshot.auth.list.error.as_deref())
+    {
+        details.push(ui::error_line(&clean(error)));
+    }
+    let detail_height =
+        (u16::try_from(details.len()).unwrap_or(4) + 1).min(area.height.saturating_sub(1));
+    let [list_area, detail_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(detail_height)]).areas(area);
+    let mut selection = ListState::default().with_selected(Some(app.workspace_binding_selection()));
+    frame.render_stateful_widget(
+        List::new(bindings.keys().map(|key| clean(key)))
+            .highlight_style(THEME.focus_style())
+            .highlight_symbol("> "),
+        list_area,
+        &mut selection,
+    );
+    frame.render_widget(
+        Paragraph::new(details).wrap(Wrap { trim: false }),
+        detail_area,
+    );
+
+    if let Some(target) = auth
+        .reset_target
+        .as_ref()
+        .filter(|target| target.kind == "workspaceBinding")
+    {
+        let overlay = ui::centered_percent_rect(area, 85, 8);
+        frame.render_widget(Clear, overlay);
+        let body = ui::render_modal_frame(
+            frame,
+            overlay,
+            "Reset authentication",
+            "Enter/y confirm  n/Esc cancel",
+        );
+        let mut lines = vec![Line::from(format!(
+            "Remove credential for {}?",
+            clean(&target.key)
+        ))];
+        if auth.pending_for(target) {
+            lines.push(ui::loading_line("Resetting authentication..."));
+        }
+        if let Some(error) = auth.error_for(target) {
+            lines.push(ui::error_line(&clean(error)));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    }
+}
+
+fn clean(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(500)
+        .collect()
 }
 
 fn operation_result(

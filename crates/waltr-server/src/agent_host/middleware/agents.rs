@@ -199,7 +199,7 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
                 })?;
         for root in &self.read_roots {
             let model_path = model_path(&input.file_path);
-            let target = if model_path.is_absolute() {
+            let target = if model_path.is_absolute() || sandbox.scope().is_some() {
                 model_path
             } else {
                 root.join(model_path)

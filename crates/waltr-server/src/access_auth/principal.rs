@@ -266,6 +266,12 @@ impl AuthenticatedPrincipal {
         self.method
     }
 
+    pub(crate) const fn is_native_bearer(&self) -> bool {
+        matches!(self.method, AuthenticationMethod::BearerAccessToken)
+            && self.hosted_mcp.is_none()
+            && self.bearer_expires_at().is_some()
+    }
+
     /// Return whether the authentication evidence contains a scope.
     #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {

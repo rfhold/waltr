@@ -230,6 +230,10 @@ pub struct InvocationSelection {
     /// absent requires GLOBAL. Published eligibility never replaces authorization.
     #[prost(string, optional, tag="6")]
     pub source_session: ::core::option::Option<::prost::alloc::string::String>,
+    /// Invocation context, not business input. Admission must verify this ID
+    /// against a live claim owned by the OAuth account before exposing it to the Routine.
+    #[prost(string, optional, tag="7")]
+    pub origin_machine_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartInvocationRequest {

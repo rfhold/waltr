@@ -161,6 +161,7 @@ pub struct CoordinatorHelperRunner<S: SessionStore + Clone + Send + Sync + 'stat
     inference: Option<InferenceSettings>,
     catalog: Option<Arc<crate::resource_catalog::AgentDefinitionSnapshot>>,
     source_inference: Option<InferenceSettings>,
+    source_definition: Option<serde_json::Value>,
     restricted: BTreeMap<String, RestrictedHelperProfile>,
     captures: Arc<Mutex<BTreeMap<String, Contract>>>,
     capture_bindings: Arc<Mutex<Option<BTreeMap<String, HelperSelection>>>>,
@@ -192,6 +193,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for CoordinatorHelpe
             inference: self.inference.clone(),
             catalog: self.catalog.clone(),
             source_inference: self.source_inference.clone(),
+            source_definition: self.source_definition.clone(),
             restricted: self.restricted.clone(),
             captures: self.captures.clone(),
             capture_bindings: self.capture_bindings.clone(),
@@ -269,6 +271,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             inference: inference.into(),
             catalog: None,
             source_inference: None,
+            source_definition: None,
             restricted,
             captures: Arc::new(Mutex::new(captures)),
             capture_bindings: Arc::new(Mutex::new(None)),
@@ -315,6 +318,11 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
     ) -> Self {
         self.catalog = Some(catalog);
         self.source_inference = source;
+        self
+    }
+
+    pub(crate) fn with_source_definition(mut self, definition: Option<serde_json::Value>) -> Self {
+        self.source_definition = definition;
         self
     }
 
@@ -799,22 +807,20 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                 .as_ref()
                 .map(|streams| streams.claim(&request.selection))
                 .transpose()?;
-            let session = this
+            let sessions = this
                 .sessions
                 .clone()
                 .with_session_event_sink(Arc::new(
                     crate::agent_host::session_roles::PrivateCreationEvents,
-                ))
-                .create(create)
-                .await
-                .map_err(|error| {
-                    helper_failure(
-                        "session_create",
-                        llm_category(&error),
-                        None,
-                        PortError::Unavailable,
-                    )
-                })?;
+                ));
+            let session = match request.selection {
+                HelperSelection::Named { .. } => this.factory.create_with_workspace(
+                    &sessions, create, request.workspace.as_ref(), this.source_definition.as_ref()
+                ).await.map_err(|_| helper_failure("session_create", "workspace_or_storage", None, PortError::Unavailable))?,
+                HelperSelection::Restricted { .. } if request.workspace.is_none() => sessions.create(create).await
+                    .map_err(|error| helper_failure("session_create", llm_category(&error), None, PortError::Unavailable))?,
+                HelperSelection::Restricted { .. } => return Err(PortError::Invalid),
+            };
             let id = session.id().clone();
             this.factory
                 .session_roles

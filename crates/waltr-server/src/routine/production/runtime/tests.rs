@@ -201,6 +201,7 @@ async fn exercise(address: std::net::SocketAddr, bearer: Option<&str>) {
         let invocation = client
             .start_invocation(p::StartInvocationRequest {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: name.into(),
                     revision: definition.revision.clone(),
                     entrypoint: "run".into(),
@@ -261,6 +262,7 @@ async fn exercise(address: std::net::SocketAddr, bearer: Option<&str>) {
         p::InteractRequest {
             frame: Some(p::interact_request::Frame::Open(p::InteractionOpen {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: media.name.clone(),
                     revision: media.revision.clone(),
                     entrypoint: "run".into(),
@@ -390,6 +392,7 @@ async fn browser_routes(address: std::net::SocketAddr) {
             "RoutineService/StartInvocation",
             p::StartInvocationRequest {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: name.into(),
                     revision: definition.revision.clone(),
                     entrypoint: "run".into(),
@@ -570,6 +573,7 @@ async fn lifecycle_routes(address: std::net::SocketAddr, bearer: &str, provider:
         .start_invocation(request(
             p::StartInvocationRequest {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: "fork".into(),
                     revision: fork.revision.clone(),
                     entrypoint: "manual".into(),
@@ -663,6 +667,7 @@ async fn lifecycle_routes(address: std::net::SocketAddr, bearer: &str, provider:
         .start_invocation(request(
             p::StartInvocationRequest {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: compact.name.clone(),
                     revision: compact.revision.clone(),
                     entrypoint: "manual".into(),

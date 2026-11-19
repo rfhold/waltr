@@ -44,6 +44,7 @@ impl Semantic {
             .ok_or(PortError::Unavailable)?
             .invocation_coalescer
             .clone();
+        let workspace_account = WorkspaceAccount::from_principal(&principal);
         let task = tokio::spawn(async move {
             let result = async {
             loop {
@@ -88,7 +89,9 @@ impl Semantic {
                     .filter(|(_, entry)| matches!(entry.trigger, crate::routine::definition::Trigger::Event) && entry.selector.as_deref() == Some(selector))
                     .map(move |(entrypoint, _)| (name.clone(), entrypoint.clone(), definition.clone()))).collect::<Vec<_>>();
                 if selected.is_empty() { continue; }
-                let policy = match owner.factory.runtime_for_record(&record, sessions.clone()).await {
+                let policy = match owner.factory.as_ref().clone()
+                    .with_workspace_account(workspace_account.clone())
+                    .runtime_for_record(&record, sessions.clone()).await {
                     Ok((_, dispatcher)) => dispatcher.permission_policy(), Err(_) => continue,
                 };
                 for (name, entrypoint, definition) in selected {

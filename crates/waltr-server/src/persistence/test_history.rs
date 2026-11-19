@@ -21,6 +21,7 @@ pub(super) async fn seed(pool: PersistencePool, id: &str) -> String {
                 name: definition.envelope().name.clone(),
             },
             caller: Caller {
+                origin_machine_id: None,
                 principal: "preserved-owner".into(),
                 origin: Origin::Manual,
                 ownership: Ownership::Detached,

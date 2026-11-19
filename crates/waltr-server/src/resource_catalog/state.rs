@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::catalog::CatalogMaterializer;
+use uuid::Uuid;
 use waltr::grpc::waltr::config::v1 as config_proto;
 use waltr::grpc::waltr::resource::v1 as resource_proto;
 
@@ -28,6 +29,7 @@ use super::{
         discover_persisted_for, load_external_sources, resource_disk_path, slot_etag, source_etag,
         tree_fingerprint, validate_resource_path, validate_resource_source,
     },
+    workspace_binding::{WorkspaceBinding, materialize_workspace_binding},
 };
 
 const DEFAULT_AGENT: &str = "coding";
@@ -218,6 +220,8 @@ pub enum ResourceKind {
     Defaults,
     /// Server-owned executable routine definition.
     Routine,
+    /// Outbound workspace binding.
+    WorkspaceBinding,
 }
 
 impl fmt::Display for ResourceKind {
@@ -230,6 +234,7 @@ impl fmt::Display for ResourceKind {
             Self::McpServer => "McpServer",
             Self::Defaults => "Defaults",
             Self::Routine => "Routine",
+            Self::WorkspaceBinding => "WorkspaceBinding",
         })
     }
 }
@@ -309,6 +314,8 @@ pub struct AgentDefinitionSnapshot {
     persisted_fingerprint: String,
     configuration: config_proto::Configuration,
     scripts: BTreeMap<String, Arc<crate::routine::definition::Definition>>,
+    workspace_bindings: BTreeMap<String, WorkspaceBinding>,
+    workspace_binding_incarnations: BTreeMap<String, Uuid>,
     etag: String,
 }
 
@@ -346,6 +353,18 @@ impl AgentDefinitionSnapshot {
     /// Validated JavaScript definitions pinned to this resource snapshot.
     pub fn scripts(&self) -> &BTreeMap<String, Arc<crate::routine::definition::Definition>> {
         &self.scripts
+    }
+
+    /// Validated outbound workspace bindings keyed by resource name.
+    #[must_use]
+    pub const fn workspace_bindings(&self) -> &BTreeMap<String, WorkspaceBinding> {
+        &self.workspace_bindings
+    }
+
+    /// Return the process-local identity of a binding added or changed after catalog load.
+    /// Read the binding from this same snapshot to distinguish an unchanged cold load from absence.
+    pub(crate) fn workspace_binding_incarnation(&self, key: &str) -> Option<Uuid> {
+        self.workspace_binding_incarnations.get(key).copied()
     }
 
     /// Return the materialized aggregate snapshot `ETag`.
@@ -458,7 +477,7 @@ impl AgentDefinitionState {
         })
     }
 
-    /// Load the complete seven-kind resource catalog.
+    /// Load the complete unified resource catalog.
     ///
     /// # Errors
     ///
@@ -622,7 +641,20 @@ impl AgentDefinitionState {
                 .published
                 .write()
                 .expect("agent-definition state lock poisoned");
-            if let Some(snapshot) = snapshot {
+            if let Some(mut snapshot) = snapshot {
+                let previous = &published.snapshot;
+                snapshot.workspace_binding_incarnations = snapshot
+                    .workspace_bindings
+                    .iter()
+                    .filter_map(|(key, binding)| {
+                        let incarnation = if previous.workspace_bindings.get(key) == Some(binding) {
+                            previous.workspace_binding_incarnation(key)
+                        } else {
+                            Some(Uuid::new_v4())
+                        };
+                        incarnation.map(|incarnation| (key.clone(), incarnation))
+                    })
+                    .collect();
                 published.snapshot = Arc::new(snapshot);
             }
             if let Some(persisted) = persisted {
@@ -1160,6 +1192,8 @@ fn build_snapshot(
     let mut sources = Vec::new();
     let mut configuration = config_proto::Configuration::default();
     let mut scripts = BTreeMap::new();
+    let mut workspace_bindings = BTreeMap::new();
+    let mut workspace_claims = BTreeMap::new();
     let script_engine = waltr_script::Engine::new(1)
         .map_err(|_| invalid_value("routines", "script validation engine unavailable".into()))?;
     for (path, source) in effective {
@@ -1179,6 +1213,21 @@ fn build_snapshot(
             ResourceKind::Agent | ResourceKind::FeatureSet | ResourceKind::PermissionSet => {
                 sources.push(source.clone());
                 yaml_json(&source, &path)?
+            }
+            ResourceKind::WorkspaceBinding => {
+                let binding = materialize_workspace_binding(&source, &path)?;
+                let claim = (binding.endpoint().clone(), binding.machine_id().to_owned());
+                if let Some(previous) = workspace_claims.insert(claim, key.name.clone()) {
+                    return Err(invalid_value(
+                        &path,
+                        format!(
+                            "endpoint and machineId already claimed by WorkspaceBinding `{previous}`"
+                        ),
+                    ));
+                }
+                let value = binding.effective_value();
+                workspace_bindings.insert(key.name.clone(), binding);
+                value
             }
             ResourceKind::Provider => {
                 let provider = materialize_provider(&source, &path, materializer)?;
@@ -1327,6 +1376,8 @@ fn build_snapshot(
         persisted_fingerprint,
         configuration,
         scripts,
+        workspace_bindings,
+        workspace_binding_incarnations: BTreeMap::new(),
         etag,
     })
 }

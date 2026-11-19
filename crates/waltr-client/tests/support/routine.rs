@@ -173,6 +173,7 @@ pub fn open(mode: &str) -> w::InteractionOpen {
             }),
             correlation: mode.into(),
             source_session: None,
+            ..Default::default()
         }),
         inputs: vec![w::InputDeclaration {
             port: "audio".into(),

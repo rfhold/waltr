@@ -161,6 +161,7 @@ async fn open(
     runner
         .open(
             HelperRequest {
+                workspace: None,
                 selection: selection(named),
                 task: "initial-question".into(),
                 capture: None,

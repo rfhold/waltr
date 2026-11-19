@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::agent_host::sandbox_gateway::{SandboxGateway, SandboxHandle};
+use crate::agent_host::sandbox_gateway::{SandboxGateway, SandboxHandle, WorkspaceExportControl};
 use hyper_util::rt::TokioIo;
 use tokio::{io::DuplexStream, net::UnixListener, sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
@@ -40,6 +40,13 @@ impl SandboxHost {
         match self {
             Self::Local(local) => local.handle(),
             Self::Socket(socket) => socket.gateway.handle(),
+        }
+    }
+
+    pub(crate) fn export_control(&self) -> WorkspaceExportControl {
+        match self {
+            Self::Local(local) => local.gateway.export_control(),
+            Self::Socket(socket) => socket.gateway.export_control(),
         }
     }
 
@@ -108,7 +115,9 @@ impl SocketSandbox {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let metadata = path.metadata()?;
         let inode = (metadata.dev(), metadata.ino());
-        let gateway = SandboxGateway::new(WORKSPACE_ID.to_owned()).with_expected_root(root);
+        let gateway = SandboxGateway::new(WORKSPACE_ID.to_owned())
+            .with_expected_root(root)
+            .with_export_control();
         let stop = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(false));
         let mut ready = gateway.readiness();
@@ -244,7 +253,7 @@ impl std::fmt::Debug for LocalSandbox {
 
 impl LocalSandbox {
     pub(crate) async fn start(root: PathBuf) -> io::Result<Self> {
-        let gateway = SandboxGateway::new(WORKSPACE_ID.to_owned());
+        let gateway = SandboxGateway::new(WORKSPACE_ID.to_owned()).with_export_control();
         let stop = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let (incoming, receiver) = mpsc::channel::<Result<DuplexStream, io::Error>>(1);
@@ -529,6 +538,7 @@ mod tests {
                     default_timeout_seconds: 5, default_timeout_nanos: 0, max_output_bytes: 1024,
                 }),
                 timeout_millis: 2000,
+                working_directory: None,
             })).await;
             let WorkerBody::Prepared(prepared) = recv(&mut first).await else {
                 panic!("expected prepared");

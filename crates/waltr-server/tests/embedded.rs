@@ -3,6 +3,9 @@
 use waltr::grpc::waltr::resource::v1::{
     InspectResourceRequest, ReplaceResourceRequest, resource_service_client::ResourceServiceClient,
 };
+use waltr::grpc::waltr::session::v1::{
+    CreateSessionRequest, session_service_client::SessionServiceClient,
+};
 use waltr_server::{
     LocalBearer,
     embedded::{
@@ -44,94 +47,47 @@ async fn embedded_server_rejects_relative_workspace_root() {
 }
 
 #[tokio::test]
-async fn embedded_server_requires_a_workspace_distinct_from_session_storage() {
+async fn embedded_server_starts_with_storage_inside_default_workspace() {
+    if !waltr_server::test_support::isolated_process_test(
+        "embedded_server_starts_with_storage_inside_default_workspace",
+    ) {
+        return;
+    }
     let root = waltr_server::test_support::temp_root();
     let mut config = config(&root, "one-generation-secret");
-    config.workspace_root = config.session_root.clone();
-    assert!(matches!(
-        build_embedded_server(config).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
-}
+    config.workspace_root = root.clone();
+    let server = build_embedded_server(config.clone()).await.unwrap();
+    assert!(config.waltr_database_path.is_file());
+    assert!(config.mcp_database_path.is_file());
+    assert!(
+        config
+            .resources_root
+            .join(".waltr/resources/mcp-servers/waltr.yaml")
+            .is_file()
+    );
 
-#[tokio::test]
-async fn embedded_rejects_nested_storage_and_host_files_before_creating_resources() {
-    let root = waltr_server::test_support::temp_root();
-    let original = config(&root, "one-generation-secret");
-    let cases = [
-        (root.join("sessions/worker"), original.session_root.clone()),
-        (root.join("worker"), root.join("worker/sessions")),
-        (root.join("data"), original.session_root.clone()),
-        (root.join("cache"), original.session_root.clone()),
-        (
-            root.join("resources/.waltr/resources"),
-            original.session_root.clone(),
-        ),
-    ];
-    for (workspace, sessions) in cases {
-        let mut candidate = original.clone();
-        candidate.workspace_root = workspace;
-        candidate.session_root = sessions;
-        assert!(matches!(
-            build_embedded_server(candidate).await,
-            Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-        ));
-        assert!(!original.resources_root.exists());
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn embedded_rejects_configured_path_aliases_of_workspace_and_host_files() {
-    use std::os::unix::fs::symlink;
-    let root = waltr_server::test_support::temp_root();
-    let original = config(&root, "one-generation-secret");
-    std::fs::create_dir(root.join("workspace")).unwrap();
-    symlink(root.join("workspace"), root.join("alias")).unwrap();
-    let mut candidate = original.clone();
-    candidate.session_root = root.join("alias/future/sessions");
-    assert!(matches!(
-        build_embedded_server(candidate).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
-
-    let mut candidate = original.clone();
-    candidate.waltr_database_path = root.join("alias/future/waltr.sqlite3");
-    assert!(matches!(
-        build_embedded_server(candidate).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
-
-    let mut candidate = original.clone();
-    candidate.mcp_database_path = root.join("alias/future/mcp.sqlite3");
-    assert!(matches!(
-        build_embedded_server(candidate).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
-
-    let mut candidate = original.clone();
-    candidate.catalog_cache_path = root.join("alias/future/models.json");
-    assert!(matches!(
-        build_embedded_server(candidate).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
-
-    let mut candidate = original.clone();
-    candidate.workspace_root = root.join("alias");
-    candidate.session_root = root.join("workspace/sessions");
-    assert!(matches!(
-        build_embedded_server(candidate).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
-
-    let mut candidate = original.clone();
-    std::fs::create_dir_all(root.join("resources/.waltr")).unwrap();
-    symlink(root.join("resources/.waltr"), root.join("config-alias")).unwrap();
-    candidate.workspace_root = root.join("config-alias/workspace");
-    assert!(matches!(
-        build_embedded_server(candidate).await,
-        Err(waltr_server::embedded::EmbeddedBuildError::Paths)
-    ));
+    let endpoint = format!("http://{}", server.local_addr());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve_with_shutdown(async move {
+        drop(shutdown_rx.await);
+    }));
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut sessions = SessionServiceClient::new(channel);
+    let mut request = tonic::Request::new(CreateSessionRequest::default());
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer one-generation-secret".parse().unwrap(),
+    );
+    let created = sessions.create_session(request).await.unwrap().into_inner();
+    let id = created.session.unwrap().id;
+    assert!(config.session_root.join(format!("{id}.json")).is_file());
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]

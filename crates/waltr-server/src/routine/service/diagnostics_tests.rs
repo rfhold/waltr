@@ -47,6 +47,7 @@ fn diagnostics_host_early_returns_and_panics_are_classified() {
                         cancel.cancel();
                     }
                     let host = JournalHost {
+                        origin_machine_id: None,
                         trace: trace.clone(),
                         id: waiting.id.clone(),
                         store: f.store.clone(),

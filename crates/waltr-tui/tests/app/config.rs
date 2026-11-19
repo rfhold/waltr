@@ -1378,6 +1378,92 @@ fn config_explicit_oauth_attempt_renders_snapshot() {
 }
 
 #[test]
+fn config_workspace_binding_requires_explicit_authorize_and_uses_device_verification() {
+    let key = "remote";
+    let target = ClientAuthTarget {
+        kind: "workspaceBinding".to_owned(),
+        key: key.to_owned(),
+    };
+    let now = Instant::now();
+    let mut snapshot = watched_config_snapshot();
+    snapshot.config.workspace_bindings.insert(
+        key.to_owned(),
+        waltr_client::WorkspaceBindingView {
+            endpoint: "https://destination.example".to_owned(),
+            machine_id: "export-machine".to_owned(),
+        },
+    );
+    let mut status = auth_status("workspaceBinding", key, "notConfigured", false);
+    status.supported_methods = vec!["oauthDevice".to_owned()];
+    snapshot
+        .auth
+        .statuses
+        .insert("workspaceBinding:remote".to_owned(), status.clone());
+
+    let mut app = open_config_app_with(snapshot.clone());
+    for _ in 0..3 {
+        assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    }
+    assert_eq!(app.active_config_tab(), ConfigTab::WorkspaceBindings);
+    assert!(app.outbound_auth_target().is_none());
+    assert!(render_app(&app).contains("Not connected"));
+    assert_eq!(
+        app.handle_event(&char_press('a'), now),
+        AppAction::ClientCommand(ClientCommand::BeginAuth {
+            target: target.clone()
+        }),
+    );
+
+    set_auth_begin_operation_for(
+        &mut snapshot,
+        "binding-authorization",
+        "loading",
+        None,
+        target.clone(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(snapshot.clone())), now));
+    let mut attempt = test_auth_attempt("workspaceBinding", key, "pending");
+    attempt.completion_mode = "serverDevicePoll".to_owned();
+    attempt.auth_url = "https://example.invalid/not-for-display".to_owned();
+    attempt.verification_url = "https://issuer.example/verify".to_owned();
+    attempt.user_code = "ABCD-EFGH".to_owned();
+    snapshot.auth.active_attempt = Some(attempt);
+    set_auth_begin_operation_for(
+        &mut snapshot,
+        "binding-authorization",
+        "ready",
+        None,
+        target.clone(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(snapshot.clone())), now));
+    let rendered = render_app(&app);
+    assert!(rendered.contains("ABCD-EFGH"));
+    assert!(rendered.contains("updates automatically"));
+    assert!(!rendered.contains("not-for-display"));
+    assert_eq!(
+        app.handle_event(&char_press('C'), now),
+        AppAction::CopyAuthUrl("https://issuer.example/verify".to_owned()),
+    );
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+
+    snapshot.auth.active_attempt.as_mut().unwrap().lifecycle = "succeeded".to_owned();
+    status.kind = "oauthConfigured".to_owned();
+    snapshot
+        .auth
+        .statuses
+        .insert("workspaceBinding:remote".to_owned(), status);
+    drop(app.handle_event(&AppEvent::Client(Box::new(snapshot)), now));
+    assert!(render_app(&app).contains("Connected"));
+    assert!(!render_app(&app).contains("ABCD-EFGH"));
+    assert_eq!(app.handle_event(&char_press('a'), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::LogoutAuth { target }),
+    );
+}
+
+#[test]
 fn config_provider_oauth_fields_render_snapshot_without_secret_field() {
     let mut snapshot = watched_config_snapshot();
     let provider = snapshot

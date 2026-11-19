@@ -32,6 +32,7 @@ pub use coordination::event::{
     ConfigEffect, ConfigEvent, ProviderEditBaseline, ResourceWrite, RoutineEffect, RoutineEvent,
     SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
+pub use coordination::runtime::WorkspaceBindingView;
 pub use coordination::runtime::{
     AccessSnapshot, AuthAttemptSnapshot, AuthSnapshot, AuthStatusSnapshot,
     AuthenticationFailureSnapshot, CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot,
@@ -92,7 +93,7 @@ pub use view::{
     SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
     SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
     TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
-    TimelineStatusView, TimestampView,
+    TimelineStatusView, TimestampView, WorkspaceSelection,
 };
 pub use waltr::grpc::waltr::catalog::v1::{
     CatalogDefaultField, CatalogDriftField, CatalogDriftSeverity, CatalogMatch,

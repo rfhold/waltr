@@ -119,7 +119,7 @@ pub struct LogoutResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthTarget {
-    #[prost(oneof = "auth_target::Target", tags = "1, 2")]
+    #[prost(oneof = "auth_target::Target", tags = "1, 2, 3")]
     pub target: ::core::option::Option<auth_target::Target>,
 }
 /// Nested message and enum types in `AuthTarget`.
@@ -130,6 +130,8 @@ pub mod auth_target {
         ProviderKey(::prost::alloc::string::String),
         #[prost(string, tag = "2")]
         McpServerKey(::prost::alloc::string::String),
+        #[prost(string, tag = "3")]
+        WorkspaceBindingKey(::prost::alloc::string::String),
     }
 }
 /// Versioned machine-readable authentication failure carried in gRPC status details.
@@ -232,6 +234,7 @@ pub enum AuthCompletionMode {
     Unspecified = 0,
     Manual = 1,
     ServerCallback = 2,
+    ServerDevicePoll = 3,
 }
 impl AuthCompletionMode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -243,6 +246,7 @@ impl AuthCompletionMode {
             Self::Unspecified => "AUTH_COMPLETION_MODE_UNSPECIFIED",
             Self::Manual => "AUTH_COMPLETION_MODE_MANUAL",
             Self::ServerCallback => "AUTH_COMPLETION_MODE_SERVER_CALLBACK",
+            Self::ServerDevicePoll => "AUTH_COMPLETION_MODE_SERVER_DEVICE_POLL",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -251,6 +255,7 @@ impl AuthCompletionMode {
             "AUTH_COMPLETION_MODE_UNSPECIFIED" => Some(Self::Unspecified),
             "AUTH_COMPLETION_MODE_MANUAL" => Some(Self::Manual),
             "AUTH_COMPLETION_MODE_SERVER_CALLBACK" => Some(Self::ServerCallback),
+            "AUTH_COMPLETION_MODE_SERVER_DEVICE_POLL" => Some(Self::ServerDevicePoll),
             _ => None,
         }
     }

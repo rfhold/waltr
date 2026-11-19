@@ -33,6 +33,9 @@ pub struct AgentDefinitionBundle {
     pub agent_name: String,
     /// YAML sources loaded in order, with later sources replacing matching resources.
     pub sources: Vec<String>,
+    /// Worker-validated routing state, pinned independently of the selected agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<super::sandbox_gateway::WorkspaceScope>,
     /// Pending coalesced selection audit, consumed at the next runtime capture boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_switch_audit: Option<AgentSwitchAudit>,
@@ -45,6 +48,7 @@ impl AgentDefinitionBundle {
         Self {
             agent_name: agent_name.into(),
             sources,
+            workspace: None,
             pending_switch_audit: None,
         }
     }

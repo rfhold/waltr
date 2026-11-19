@@ -1,6 +1,6 @@
 # Boundaries
 
-This crate owns workspace file operations, patching, skill file access, and optional shell execution. `src/wire.rs` implements the private worker side of the streaming RPC. The agent owns the generic provider/session runner; the server owns prompt assembly, policy, worker-claim evaluation, and the private gateway. Standalone uses the worker executable/image over a local Unix domain socket; embedded hosts run the worker in-process over duplex. See [agent architecture](../../docs/architecture/agent.md#private-workspace-boundary) and [deployment](../../docs/deployment.md#workspace-worker-deployment).
+This crate owns workspace file operations, patching, skill file access, and optional shell execution. `src/wire.rs` implements the worker side of the streaming RPC. The agent owns the generic provider/session runner; the server owns prompt assembly, policy, worker-claim evaluation, and gateways. The default worker uses a private Unix socket or process-local duplex transport. An optional desktop export worker uses the current user OAuth bearer for its exact destination. Resolve per-session directories on the worker, inside its export. See [agent architecture](../../docs/architecture/agent.md#private-workspace-boundary) and [deployment](../../docs/deployment.md#workspace-worker-deployment).
 
 # Contracts
 

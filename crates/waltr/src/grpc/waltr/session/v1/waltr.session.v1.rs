@@ -285,6 +285,19 @@ pub struct CreateSessionRequest {
     /// Optional startup-catalog agent selection. Absence selects the server default.
     #[prost(message, optional, tag="2")]
     pub agent_selection: ::core::option::Option<AgentSelectionRequest>,
+    /// Absence selects the server's default local workspace.
+    #[prost(message, optional, tag="3")]
+    pub workspace: ::core::option::Option<WorkspaceSelection>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkspaceSelection {
+    #[prost(string, tag="1")]
+    pub machine_id: ::prost::alloc::string::String,
+    /// On create: worker-local ~, ~/..., export-relative, or absolute directory;
+    /// absence selects the export root. Summaries return the resolved directory
+    /// relative to the export ("." for the root).
+    #[prost(string, optional, tag="2")]
+    pub working_directory: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AgentSelectionRequest {
@@ -767,6 +780,9 @@ pub struct SessionSummary {
     pub progress: ::core::option::Option<SessionProgress>,
     #[prost(message, optional, tag="14")]
     pub capabilities: ::core::option::Option<SessionCapabilities>,
+    /// Effective explicit binding; absent for an unbound local session.
+    #[prost(message, optional, tag="15")]
+    pub workspace: ::core::option::Option<WorkspaceSelection>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionCoordinationState {

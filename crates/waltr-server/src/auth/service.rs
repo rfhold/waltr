@@ -48,7 +48,10 @@ use crate::{
 use super::outbound_http::{
     OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body, validate_response_peer,
 };
-use super::{AuthTarget, oauth};
+use super::{
+    AuthTarget, WorkspaceBindingCredentialLease, oauth,
+    workspace_binding::{WorkspaceBindingAuth, proto_target as proto_workspace_target},
+};
 
 const OAUTH_COMPLETION_LEASE_MS: i64 = 30_000;
 const CLIENT_METADATA_DNS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -117,6 +120,7 @@ pub struct AuthService {
     resources: AgentDefinitionState,
     credential_store: CredentialStore,
     outbound_store: Arc<OutboundOAuthStore>,
+    workspace_binding: Arc<WorkspaceBindingAuth>,
     attempts: Mutex<HashMap<String, PendingOAuthAttempt>>,
     outbound_policy: OutboundHttpPolicy,
     outbound_oauth: OutboundOAuthConfig,
@@ -138,9 +142,17 @@ pub(crate) struct OutboundOAuthConfig {
     environment: Arc<HashMap<std::ffi::OsString, std::ffi::OsString>>,
     allow_private_test_destinations: bool,
     durable_callback_marker: Option<String>,
+    #[cfg(test)]
+    workspace_binding_loopback: bool,
 }
 
 impl OutboundOAuthConfig {
+    #[cfg(test)]
+    pub(crate) fn with_workspace_binding_loopback(mut self) -> Self {
+        self.workspace_binding_loopback = true;
+        self
+    }
+
     pub(crate) fn durable_callback_marker(&self) -> Option<&str> {
         self.durable_callback_marker.as_deref()
     }
@@ -173,6 +185,8 @@ impl OutboundOAuthConfig {
             environment,
             allow_private_test_destinations,
             durable_callback_marker: None,
+            #[cfg(test)]
+            workspace_binding_loopback: false,
         }
     }
 
@@ -186,6 +200,8 @@ impl OutboundOAuthConfig {
                 "urn:waltr:outbound-oauth-callback:{}",
                 Uuid::new_v4()
             )),
+            #[cfg(test)]
+            workspace_binding_loopback: false,
         }
     }
 
@@ -359,21 +375,47 @@ impl AuthService {
         } else {
             CredentialOwnership::Durable
         };
+        let outbound_policy = OutboundHttpPolicy::production(
+            configured_private_origins,
+            automatic_self_resource,
+            outbound_oauth.allow_private_test_destinations,
+        );
+        let workspace_policy = outbound_policy.clone();
+        #[cfg(test)]
+        let workspace_policy = if outbound_oauth.workspace_binding_loopback {
+            OutboundHttpPolicy::loopback_test()
+        } else {
+            workspace_policy
+        };
+        let workspace_binding =
+            WorkspaceBindingAuth::new(resources.clone(), Arc::clone(&outbound_store), workspace_policy);
         Arc::new(Self {
             resources,
             credential_store,
             outbound_store,
+            workspace_binding,
             attempts: Mutex::new(HashMap::new()),
-            outbound_policy: OutboundHttpPolicy::production(
-                configured_private_origins,
-                automatic_self_resource,
-                outbound_oauth.allow_private_test_destinations,
-            ),
+            outbound_policy,
             outbound_oauth,
             self_mcp_credential_ownership,
             #[cfg(test)]
             refresh_outcomes: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_workspace_binding(
+        resources: AgentDefinitionState,
+        store: Arc<OutboundOAuthStore>,
+    ) -> Arc<Self> {
+        Self::new(
+            resources,
+            CredentialStore::shared(Arc::clone(&store)),
+            store,
+            Vec::new(),
+            None,
+            OutboundOAuthConfig::default().with_workspace_binding_loopback(),
+        )
     }
 
     pub(crate) fn router(self: &Arc<Self>) -> Router {
@@ -389,6 +431,19 @@ impl AuthService {
         &self.credential_store
     }
 
+    /// Resolve the active, expiring bearer for the exact current workspace binding endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized error for a failed refresh, storage failure, or changed binding.
+    pub async fn workspace_binding_credential_lease(
+        &self,
+        key: &str,
+        expected_endpoint: &url::Url,
+    ) -> Result<Option<WorkspaceBindingCredentialLease>, Status> {
+        self.workspace_binding.lease(key, expected_endpoint).await
+    }
+
     fn configuration(&self) -> waltr::grpc::waltr::config::v1::Configuration {
         self.resources.snapshot().configuration().clone()
     }
@@ -397,6 +452,7 @@ impl AuthService {
         match target {
             AuthTarget::Provider { key } => self.provider_status_for(&key).await,
             AuthTarget::McpServer { key } => self.mcp_status_for(&key).await,
+            AuthTarget::WorkspaceBinding { key } => self.workspace_binding.status(&key).await,
         }
     }
 
@@ -687,6 +743,7 @@ impl AuthService {
                         refresh_failure_status(target, &RefreshFailure::from(&error))
                     })?;
             }
+            AuthTarget::WorkspaceBinding { key } => self.workspace_binding.refresh(key).await?,
         }
         Ok(())
     }
@@ -1023,6 +1080,15 @@ impl GeneratedAuthService for AuthService {
         for server_key in config.mcp_servers.keys() {
             statuses.push(self.mcp_status_for(server_key).await?);
         }
+        let snapshot = self.resources.snapshot();
+        for key in snapshot.workspace_bindings().keys() {
+            match self.workspace_binding.status(key).await {
+                Ok(status) => statuses.push(status),
+                Err(status)
+                    if matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted) => {}
+                Err(status) => return Err(status),
+            }
+        }
         Ok(Response::new(ListAuthStatusesResponse { statuses }))
     }
 
@@ -1043,6 +1109,14 @@ impl GeneratedAuthService for AuthService {
     ) -> Result<Response<BeginAuthResponse>, Status> {
         let request = request.into_inner();
         let target = auth_target_from_proto(request.target)?;
+        if let AuthTarget::WorkspaceBinding { key } = target {
+            if AuthMethod::try_from(request.method).ok() != Some(AuthMethod::OauthDevice) {
+                return Err(Status::failed_precondition(
+                    "workspace binding authorization requires device OAuth",
+                ));
+            }
+            return self.workspace_binding.begin(key).await.map(Response::new);
+        }
         if AuthMethod::try_from(request.method).unwrap_or(AuthMethod::Unspecified)
             != AuthMethod::OauthManual
         {
@@ -1057,6 +1131,7 @@ impl GeneratedAuthService for AuthService {
                 0,
             ),
             AuthTarget::McpServer { key } => self.begin_mcp_auth(key).await?,
+            AuthTarget::WorkspaceBinding { .. } => unreachable!("handled above"),
         };
         Ok(Response::new(BeginAuthResponse {
             completion_mode: completion_mode as i32,
@@ -1070,6 +1145,16 @@ impl GeneratedAuthService for AuthService {
         request: Request<CompleteAuthRequest>,
     ) -> Result<Response<CompleteAuthResponse>, Status> {
         let request = request.into_inner();
+        if self
+            .workspace_binding
+            .attempt(&request.attempt_id)
+            .await
+            .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "workspace binding authorization is polled by the server",
+            ));
+        }
         let status = self
             .complete_attempt(&request.attempt_id, &request.input)
             .await?;
@@ -1083,6 +1168,20 @@ impl GeneratedAuthService for AuthService {
         request: Request<GetAuthAttemptStatusRequest>,
     ) -> Result<Response<GetAuthAttemptStatusResponse>, Status> {
         let attempt_id = request.into_inner().attempt_id;
+        if let Some(attempt) = self.workspace_binding.attempt(&attempt_id).await {
+            let status = if attempt.lifecycle == AuthAttemptLifecycle::Succeeded as i32 {
+                Some(
+                    self.status_for(auth_target_from_proto(attempt.target.clone())?)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            return Ok(Response::new(GetAuthAttemptStatusResponse {
+                attempt: Some(attempt),
+                status,
+            }));
+        }
         let record = self
             .outbound_store
             .attempt(&attempt_id)
@@ -1104,6 +1203,7 @@ impl GeneratedAuthService for AuthService {
                 target: Some(match &target {
                     AuthTarget::Provider { key } => proto_provider_target(key),
                     AuthTarget::McpServer { key } => proto_mcp_target(key),
+                    AuthTarget::WorkspaceBinding { key } => proto_workspace_target(key),
                 }),
                 lifecycle: lifecycle as i32,
                 completion_mode: parse_completion_mode(&record.completion_mode) as i32,
@@ -1121,6 +1221,9 @@ impl GeneratedAuthService for AuthService {
         request: Request<CancelAuthRequest>,
     ) -> Result<Response<CancelAuthResponse>, Status> {
         let attempt_id = request.into_inner().attempt_id;
+        if self.workspace_binding.cancel(&attempt_id).await {
+            return Ok(Response::new(CancelAuthResponse {}));
+        }
         self.attempts.lock().await.remove(&attempt_id);
         if let Some(record) = self
             .outbound_store
@@ -1143,6 +1246,13 @@ impl GeneratedAuthService for AuthService {
         request: Request<LogoutRequest>,
     ) -> Result<Response<LogoutResponse>, Status> {
         let target = auth_target_from_proto(request.into_inner().target)?;
+        if let AuthTarget::WorkspaceBinding { key } = target {
+            return self.workspace_binding.reset(&key).await.map(|status| {
+                Response::new(LogoutResponse {
+                    status: Some(status),
+                })
+            });
+        }
         if self.self_mcp_credential_ownership == CredentialOwnership::EmbeddedHost
             && matches!(&target, AuthTarget::McpServer { key } if key == "waltr")
         {
@@ -1390,11 +1500,14 @@ fn auth_target_from_proto(target: Option<ProtoAuthTarget>) -> Result<AuthTarget,
     match target.and_then(|target| target.target) {
         Some(auth_target::Target::ProviderKey(key)) => Ok(AuthTarget::provider(key)),
         Some(auth_target::Target::McpServerKey(key)) => Ok(AuthTarget::mcp_server(key)),
+        Some(auth_target::Target::WorkspaceBindingKey(key)) => {
+            Ok(AuthTarget::workspace_binding(key))
+        }
         None => Err(Status::invalid_argument("auth target is required")),
     }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -1439,6 +1552,7 @@ const fn completion_mode_name(mode: AuthCompletionMode) -> &'static str {
     match mode {
         AuthCompletionMode::ServerCallback => "server_callback",
         AuthCompletionMode::Manual => "manual",
+        AuthCompletionMode::ServerDevicePoll => "server_device_poll",
         AuthCompletionMode::Unspecified => "unspecified",
     }
 }
@@ -2010,6 +2124,7 @@ fn outbound_failure_status(
             proto_provider_target(key),
         ),
         AuthTarget::McpServer { key } => (AuthenticationDomain::OutboundMcp, proto_mcp_target(key)),
+        AuthTarget::WorkspaceBinding { .. } => return Status::new(code, message),
     };
     let failure = AuthenticationFailure {
         version: 1,
@@ -2727,6 +2842,11 @@ mod tests {
         let outbound_store = persistence.outbound_oauth_store();
         let credentials = CredentialStore::shared(outbound_store.clone());
         let service = Arc::new(AuthService {
+            workspace_binding: WorkspaceBindingAuth::new(
+                resources.clone(),
+                Arc::clone(&outbound_store),
+                OutboundHttpPolicy::loopback_test(),
+            ),
             resources,
             credential_store: credentials,
             outbound_store,
@@ -2770,6 +2890,11 @@ mod tests {
                 .map(ToOwned::to_owned),
         ));
         Arc::new(AuthService {
+            workspace_binding: WorkspaceBindingAuth::new(
+                resources.clone(),
+                Arc::clone(&outbound_store),
+                OutboundHttpPolicy::loopback_test(),
+            ),
             resources,
             credential_store,
             outbound_store,

@@ -30,6 +30,7 @@ fn yaml(source: &str) -> String {
 }
 fn caller(origin: Origin) -> Caller {
     Caller {
+        origin_machine_id: None,
         principal: "test-owner".into(),
         origin,
         ownership: match origin {
@@ -838,6 +839,7 @@ async fn script_concurrent_journal_failure_fences_policy_and_intent_waiters() {
         let gate = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let host = Arc::new(JournalHost {
+            origin_machine_id: None,
             id: id.clone(),
             trace: tracing::Span::none(),
             store: fixture.store.clone(),

@@ -37,7 +37,6 @@ The adapter never recursively deletes or adopts prior namespaces.
 
 The adapter walks each absolute path component with descriptor-relative `openat` and `NOFOLLOW`.
 It checks ancestor ownership and rejects group or other write permission.
-It rejects workspace overlap through directory device/inode identities.
 It creates one random private namespace and random UUID files with exclusive creation.
 Namespace permissions are `0700`; file permissions are `0600`.
 All later operations use retained directory or file descriptors, not revalidated path strings.
@@ -46,9 +45,6 @@ Cleanup unlinks only exact names that this instance created.
 These guarantees require local Unix filesystem semantics and functional advisory locks.
 The adapter rejects other platforms explicitly.
 It does not defend against a privileged actor or another hostile process with the same effective user.
-The host must exclude the root from worker mounts and MCP/shell filesystem capabilities.
-Workspace overlap checks alone do not restrict an unrestricted same-user shell.
-The host must preserve that isolation after construction.
 
 ## Budgets and cleanup
 

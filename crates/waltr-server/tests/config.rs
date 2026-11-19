@@ -5,7 +5,7 @@ mod support;
 use crate::support::grpc::{get_catalog, resource_client};
 use waltr::grpc::waltr::resource::v1::{
     InspectResourceRequest, ReplaceResourceRequest, ResetResourceRequest, ResourceKind,
-    WatchResourceCatalogRequest,
+    ResourceOrigin, WatchResourceCatalogRequest, resource_value,
 };
 use waltr_server::test_support::setup_server;
 
@@ -30,6 +30,92 @@ async fn read_returns_complete_seven_kind_catalog() -> Result<(), Box<dyn std::e
     assert_eq!(config.providers.len(), 4);
     assert!(config.mcp_servers.contains_key("waltr"));
     assert!(config.inference_defaults.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_binding_uses_normal_inspect_replace_watch_and_reset()
+-> Result<(), Box<dyn std::error::Error>> {
+    waltr_server::isolate_application_test!();
+    const PATH: &str = "workspace-bindings/office.yaml";
+    const SOURCE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata:\n  name: office\nspec:\n  endpoint: https://HOST.example:443\n  machineId: laptop\n  exportRoot: ~/worker-only\n";
+    let mut client = resource_client(setup_server()).await?;
+    let mut watch = client
+        .watch_resource_catalog(WatchResourceCatalogRequest {})
+        .await?
+        .into_inner();
+    let initial = watch.message().await?.unwrap().catalog.unwrap();
+    let absent = client
+        .inspect_resource(InspectResourceRequest {
+            path: Some(PATH.to_owned()),
+        })
+        .await?
+        .into_inner()
+        .resources
+        .remove(0);
+    assert_eq!(absent.kind, ResourceKind::WorkspaceBinding as i32);
+    assert!(!absent.persisted);
+    assert!(absent.active.is_none());
+
+    let wrong_name = client
+        .replace_resource(ReplaceResourceRequest {
+            path: PATH.to_owned(),
+            source: SOURCE.replace("name: office", "name: other"),
+            expected_etag: absent.persisted_etag.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_name.code(), tonic::Code::InvalidArgument);
+    let replaced = client
+        .replace_resource(ReplaceResourceRequest {
+            path: PATH.to_owned(),
+            source: SOURCE.to_owned(),
+            expected_etag: absent.persisted_etag,
+        })
+        .await?
+        .into_inner();
+    let inspection = replaced.resource.unwrap();
+    assert!(inspection.persisted);
+    assert_eq!(inspection.persisted_source.as_deref(), Some(SOURCE));
+    assert_eq!(inspection.active_source.as_deref(), Some(SOURCE));
+    let active = inspection.active.unwrap();
+    assert_eq!(active.origin, ResourceOrigin::Filesystem as i32);
+    let fields = &active.effective_value.as_ref().unwrap().fields;
+    for (key, value) in [
+        ("endpoint", "https://host.example/"),
+        ("machineId", "laptop"),
+        ("exportRoot", "~/worker-only"),
+    ] {
+        assert_eq!(
+            fields[key].kind,
+            Some(resource_value::Kind::StringValue(value.to_owned()))
+        );
+    }
+    let watched = watch.message().await?.unwrap().catalog.unwrap();
+    assert_ne!(watched.etag, initial.etag);
+    assert_eq!(watched.etag, replaced.catalog.unwrap().etag);
+    assert!(watched.resources.contains(&active));
+    let added_etag = watched.etag;
+
+    let reset = client
+        .reset_resource(ResetResourceRequest {
+            path: PATH.to_owned(),
+            expected_etag: inspection.persisted_etag,
+        })
+        .await?
+        .into_inner();
+    let inspection = reset.resource.unwrap();
+    assert!(!inspection.persisted);
+    assert!(inspection.active.is_none());
+    let watched = watch.message().await?.unwrap().catalog.unwrap();
+    assert_ne!(watched.etag, added_etag);
+    assert_eq!(watched, reset.catalog.unwrap());
+    assert!(
+        !watched
+            .resources
+            .iter()
+            .any(|resource| resource.path == PATH)
+    );
     Ok(())
 }
 

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package waltr.sandbox.v1;
 
-// Private worker-to-agent connection. This service is not client-facing.
+// Worker-to-host connection, local or through an authenticated outbound binding.
 service SandboxService {
   rpc Connect(stream ConnectRequest) returns (stream ConnectResponse);
 }
@@ -14,6 +14,7 @@ message ConnectRequest {
     Progress progress = 3;
     Completed completed = 4;
     WorkspaceResponse workspace_response = 5;
+    WorkspaceExportAck workspace_export_ack = 6;
   }
 }
 
@@ -23,11 +24,46 @@ message ConnectResponse {
     Execute execute = 2;
     Cancel cancel = 3;
     WorkspaceRequest workspace_request = 4;
+    WorkspaceExportControl workspace_export_control = 5;
   }
 }
 
+// Only sent by the exporting server on its private worker stream.
+message WorkspaceExportControl {
+  string request_id = 1;
+  string binding = 2;
+  oneof change {
+    WorkspaceExportApply apply = 3;
+    WorkspaceExportAccess rotate = 4;
+    WorkspaceExportRemove remove = 5;
+  }
+}
+
+message WorkspaceExportApply {
+  string endpoint = 1;
+  string machine_id = 2;
+  // Resolved on the exporting worker, not the controlling server.
+  string export_root = 3;
+  WorkspaceExportAccess access = 4;
+}
+
+message WorkspaceExportAccess {
+  string access_token = 1;
+  uint64 expires_at_unix = 2;
+}
+
+message WorkspaceExportRemove {}
+
+// Correlated on the same private stream only. Rejections carry no input data.
+message WorkspaceExportAck {
+  string request_id = 1;
+  bool applied = 2;
+}
+
 message Hello {
+
   string worker_id = 1;
+  // The machine ID claimed by an outbound worker.
   string workspace_id = 2;
   uint64 generation = 3;
   repeated string tools = 4;
@@ -43,6 +79,8 @@ message Prepare {
   ShellExecutionDefaults shell_defaults = 4;
   // Worker execution budget in milliseconds; zero uses the worker default.
   uint64 timeout_millis = 5;
+  // Resolved export-relative session directory; absence uses the worker root.
+  optional string working_directory = 6;
 }
 
 message ShellExecutionDefaults {
@@ -96,7 +134,8 @@ message Completed {
 
 message WorkspaceRequest {
   string request_id = 1;
-  // Read-only operation, including info, resolve, and bounded snapshot.
+  // resolve_working_directory validates path as an existing directory within
+  // the export, expanding ~ on the worker. An empty path selects the export.
   string operation = 2;
   string path = 3;
   string pattern = 4;
@@ -107,6 +146,8 @@ message WorkspaceRequest {
   uint32 max_bytes = 8;
   // Worker execution budget in milliseconds; zero uses the worker default.
   uint64 timeout_millis = 9;
+  // Resolved export-relative base for read-only operations; absent at resolution.
+  optional string working_directory = 10;
 }
 
 message WorkspaceResponse {
@@ -119,4 +160,7 @@ message WorkspaceResponse {
   // file, directory, or other.
   string path_kind = 6;
   string canonical_root = 7;
+  // resolve_working_directory returns the canonical export root and this
+  // directory relative to it ("." for the root), both in worker path syntax.
+  optional string working_directory = 8;
 }

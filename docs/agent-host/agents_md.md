@@ -1,7 +1,7 @@
 # AGENTS.md
 
-The server adds repository instructions through concrete host middleware. The private workspace worker performs instruction file I/O.
-See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
+The server adds repository instructions through concrete host middleware. The session's workspace worker reads the instruction files.
+See [workspace worker selection and transport](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
 

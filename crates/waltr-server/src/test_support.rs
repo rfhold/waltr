@@ -1297,6 +1297,7 @@ END
                         catalog: session::SessionCatalogSource::Dynamic(state.clone()),
                         event_sink: Arc::new(crate::session::UnboundSessionEvents),
                         sandbox: sandbox.handle(),
+                        workspace_machines: Default::default(),
                     },
                 );
                 let server = Arc::new(crate::mcp_service::WaltrMcpServer::new(sessions.clone(), state)
@@ -1495,7 +1496,7 @@ async fn discovery(State(state): State<Arc<FakeIssuerState>>) -> Json<Value> {
     }))
 }
 
-async fn jwks() -> Json<Value> {
+pub(crate) async fn jwks() -> Json<Value> {
     Json(json!({"keys": [{
         "kty": "RSA",
         "kid": TEST_KEY_ID,
@@ -1601,7 +1602,7 @@ pub(crate) fn sign_access_token_with_ttl(issuer: &str, scope: &str, ttl: Duratio
     sign_access_token_for_subject_with_ttl(issuer, "api-subject", scope, ttl)
 }
 
-fn sign_access_token_for_subject_with_ttl(
+pub(crate) fn sign_access_token_for_subject_with_ttl(
     issuer: &str,
     subject: &str,
     scope: &str,

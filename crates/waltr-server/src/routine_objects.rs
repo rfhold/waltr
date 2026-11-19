@@ -51,7 +51,7 @@ pub trait ImmutableObjects: Send + Sync {
 #[derive(Clone)]
 pub struct FilesystemObjects { root: PathBuf }
 impl FilesystemObjects {
-    /// Root must be durable host-private storage outside the sandbox workspace.
+    /// Root must be an absolute path for durable storage.
     pub fn new(root: PathBuf) -> Result<Self, ObjectError> {
         if !root.is_absolute() { return Err(ObjectError::Invalid); }
         Ok(Self { root })
@@ -137,7 +137,7 @@ impl ImmutableObjects for S3Objects {
 }
 
 /// Standalone environment adapter; embedded callers construct a filesystem store explicitly.
-pub fn from_env(workspace: &std::path::Path) -> Result<Arc<dyn ImmutableObjects>, ObjectError> {
+pub fn from_env() -> Result<Arc<dyn ImmutableObjects>, ObjectError> {
     let get = |name: &str| std::env::var(name).map_err(|_| ObjectError::Invalid);
     let backend = match std::env::var("WALTR_ROUTINE_OBJECT_STORE") {
         Ok(value) => value,
@@ -149,7 +149,6 @@ pub fn from_env(workspace: &std::path::Path) -> Result<Arc<dyn ImmutableObjects>
             let root = if let Some(root) = std::env::var_os("WALTR_ROUTINE_OBJECT_ROOT") { PathBuf::from(root) } else {
                 crate::persistence::standalone_data_directory().map_err(|_| ObjectError::Invalid)?.join("routine-objects")
             };
-            if crate::workspace_paths::overlaps(workspace, &root).map_err(|_| ObjectError::Invalid)? { return Err(ObjectError::Invalid); }
             Ok(Arc::new(FilesystemObjects::new(root)?))
         },
         "s3" => {

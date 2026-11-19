@@ -36,6 +36,34 @@ impl From<crate::SelectableAgent> for SelectableAgentView {
     }
 }
 
+/// Worker selection for a session. The server resolves the requested directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSelection {
+    /// Stable ID of the exporting machine.
+    pub machine_id: String,
+    /// Worker-local path on create; export-relative directory in a summary.
+    pub working_directory: Option<String>,
+}
+
+impl From<WorkspaceSelection> for waltr::grpc::waltr::session::v1::WorkspaceSelection {
+    fn from(selection: WorkspaceSelection) -> Self {
+        Self {
+            machine_id: selection.machine_id,
+            working_directory: selection.working_directory,
+        }
+    }
+}
+
+impl From<waltr::grpc::waltr::session::v1::WorkspaceSelection> for WorkspaceSelection {
+    fn from(selection: waltr::grpc::waltr::session::v1::WorkspaceSelection) -> Self {
+        Self {
+            machine_id: selection.machine_id,
+            working_directory: selection.working_directory,
+        }
+    }
+}
+
 /// Stable session summary view shared by Waltr shells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +72,8 @@ pub struct SessionView {
     pub id: String,
     /// Exact selectable agent currently assigned to the session.
     pub agent_name: String,
+    /// Effective workspace returned by the server for a bound session.
+    pub workspace: Option<WorkspaceSelection>,
     /// Session revision.
     pub revision: u64,
     /// Current session status.
@@ -565,6 +595,7 @@ impl From<SessionSummary> for SessionView {
         Self {
             id: session.id,
             agent_name: session.agent_name,
+            workspace: session.workspace.map(Into::into),
             revision: session.revision,
             status: session
                 .status
@@ -973,6 +1004,23 @@ mod tests {
     use super::*;
     use waltr::grpc::waltr::session::v1::{SessionSummary, Suspension};
     use prost_types::value::Kind;
+
+    #[test]
+    fn session_view_exposes_the_effective_workspace_when_returned() {
+        let summary = SessionSummary {
+            workspace: Some(waltr::grpc::waltr::session::v1::WorkspaceSelection {
+                machine_id: "laptop".into(),
+                working_directory: Some("repos/rfhold/waltr".into()),
+            }),
+            ..Default::default()
+        };
+        let view = serde_json::to_value(SessionView::from(summary)).unwrap();
+        assert_eq!(view["workspace"], serde_json::json!({
+            "machineId": "laptop",
+            "workingDirectory": "repos/rfhold/waltr",
+        }));
+        assert!(SessionView::from(SessionSummary::default()).workspace.is_none());
+    }
 
     #[test]
     fn session_view_preserves_metadata_and_uses_only_nonempty_string_titles() {

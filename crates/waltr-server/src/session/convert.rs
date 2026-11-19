@@ -34,6 +34,11 @@ pub(super) fn session_summary_to_proto(
         .inference_settings
         .map(|settings| inference_settings_to_proto(settings, config));
     let metadata = metadata_to_proto(summary.metadata_values)?;
+    let bundle = summary
+        .host_configuration
+        .map(serde_json::from_value::<crate::agent_host::AgentDefinitionBundle>)
+        .transpose()
+        .map_err(|_| tonic::Status::failed_precondition("invalid stored agent configuration"))?;
     Ok(ProtoSessionSummary {
         id: summary.id.as_str().to_owned(),
         revision: summary.revision.get(),
@@ -44,11 +49,16 @@ pub(super) fn session_summary_to_proto(
         last_activity_at: Some(timestamp_to_proto(summary.last_activity_at)),
         inference_settings,
         metrics: Some(session_metrics_to_proto(summary.metrics)),
-        agent_name: summary
-            .host_configuration
-            .map(serde_json::from_value::<crate::agent_host::AgentDefinitionBundle>)
-            .transpose()
-            .map_err(|_| tonic::Status::failed_precondition("invalid stored agent configuration"))?
+        workspace: bundle
+            .as_ref()
+            .and_then(|bundle| bundle.workspace.as_ref())
+            .map(
+                |scope| waltr::grpc::waltr::session::v1::WorkspaceSelection {
+                    machine_id: scope.machine_id.clone(),
+                    working_directory: Some(scope.working_directory.clone()),
+                },
+            ),
+        agent_name: bundle
             .map_or_else(|| default_agent_name.to_owned(), |bundle| bundle.agent_name),
         metadata: Some(metadata),
         coordination: Some(session_coordination_to_proto(summary.coordination)),

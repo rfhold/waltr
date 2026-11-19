@@ -132,13 +132,36 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
                 THEME.muted_text_style(),
             )));
         }
-        lines.push(Line::from(vec![
-            Span::styled("URL: ", THEME.muted_text_style()),
-            Span::styled(
-                app.outbound_auth_url().unwrap_or("unavailable").to_owned(),
-                THEME.text_style(),
-            ),
-        ]));
+        let device = attempt.completion_mode == "serverDevicePoll";
+        if !device || matches!(attempt.lifecycle.as_str(), "pending" | "completing") {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if device {
+                        "Verification URL: "
+                    } else {
+                        "URL: "
+                    },
+                    THEME.muted_text_style(),
+                ),
+                Span::styled(
+                    app.outbound_auth_url().unwrap_or("unavailable").to_owned(),
+                    THEME.text_style(),
+                ),
+            ]));
+            let code = &attempt.user_code;
+            if device
+                && (1..=64).contains(&code.len())
+                && code.trim() == code
+                && code
+                    .bytes()
+                    .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("Verification code: ", THEME.muted_text_style()),
+                    Span::styled(code.clone(), THEME.text_style()),
+                ]));
+            }
+        }
         if attempt.completion_mode == "manual" && attempt.lifecycle == "pending" {
             lines.push(Line::from(vec![
                 Span::styled("Input: ", THEME.muted_text_style()),
@@ -172,6 +195,9 @@ fn auth_footer(attempt: Option<&waltr_client::AuthAttemptSnapshot>) -> &'static 
         attempt.lifecycle.as_str(),
         "succeeded" | "failed" | "expired" | "canceled"
     ) {
+        if attempt.completion_mode == "serverDevicePoll" {
+            return "Esc dismiss";
+        }
         return "C copy URL · Esc dismiss";
     }
     if attempt.completion_mode == "manual" && attempt.lifecycle == "pending" {
@@ -184,6 +210,7 @@ fn auth_footer(attempt: Option<&waltr_client::AuthAttemptSnapshot>) -> &'static 
 fn completion_mode_label(mode: &str) -> &'static str {
     match mode {
         "serverCallback" => "Server callback",
+        "serverDevicePoll" => "Device sign-in",
         "manual" => "Manual",
         _ => "Unknown",
     }
@@ -211,6 +238,9 @@ fn lifecycle_message(attempt: &waltr_client::AuthAttemptSnapshot) -> &'static st
         "pending" if attempt.completion_mode == "serverCallback" => {
             "Waiting for the server callback. This dialog updates automatically."
         }
+        "pending" if attempt.completion_mode == "serverDevicePoll" => {
+            "Open the verification URL and enter the code. Status updates automatically."
+        }
         "pending" => "Waiting for the final redirect URL or authorization code.",
         "completing" => "Completing authorization.",
         "succeeded" => "Authorization succeeded.",
@@ -237,10 +267,10 @@ fn display_text(value: &str) -> String {
 }
 
 fn auth_target_label(target: &waltr_client::ClientAuthTarget) -> String {
-    if target.kind == "mcpServer" {
-        format!("MCP server {}", target.key)
-    } else {
-        format!("provider {}", target.key)
+    match target.kind.as_str() {
+        "mcpServer" => format!("MCP server {}", target.key),
+        "workspaceBinding" => format!("workspace binding {}", display_text(&target.key)),
+        _ => format!("provider {}", target.key),
     }
 }
 

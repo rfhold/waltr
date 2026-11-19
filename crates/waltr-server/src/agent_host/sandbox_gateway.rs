@@ -20,14 +20,22 @@ use waltr::grpc::waltr::sandbox::v1::{
     connect_request::Body as WorkerBody,
     connect_response::Body as HostBody,
     sandbox_service_server::{SandboxService, SandboxServiceServer},
+    workspace_export_control::Change as ExportChange,
+};
+use waltr_agent_sandbox::peer_config::WorkspaceExport;
+
+use crate::{
+    access_auth::AuthenticatedPrincipal,
+    agent_host::{LlmError, Result, ToolProgressSink},
 };
 
-use crate::agent_host::{LlmError, Result, ToolProgressSink};
+pub(crate) mod peers;
 
 const MAX_PENDING: usize = 128;
 const OUTBOUND_CAPACITY: usize = 128;
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKSPACE_TIMEOUT: Duration = Duration::from_secs(30);
+const EXPORT_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(60);
 const DELIVERY_GRACE: Duration = Duration::from_secs(15);
 const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -107,6 +115,8 @@ pub struct WorkspaceData {
     pub path_kind: String,
     /// Canonical worker-local workspace root.
     pub canonical_root: String,
+    /// Export-relative directory returned by directory resolution.
+    pub working_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +129,7 @@ struct SnapshotBounds {
 #[derive(Debug, Clone, Copy)]
 enum WorkspaceOperation<'a> {
     Info,
+    Directory(&'a str),
     Resolve {
         path: &'a str,
     },
@@ -149,6 +160,10 @@ impl WorkspaceOperation<'_> {
             ..Default::default()
         };
         match self {
+            Self::Directory(path) => {
+                request.operation = "resolve_working_directory".into();
+                request.path = path.into();
+            }
             Self::Info => {
                 request.operation = "info".into();
             }
@@ -234,11 +249,31 @@ enum Pending {
     Workspace(oneshot::Sender<proto::WorkspaceResponse>),
 }
 
+type Outbound = mpsc::Sender<std::result::Result<proto::ConnectResponse, Status>>;
+type OutboundStream = ReceiverStream<std::result::Result<proto::ConnectResponse, Status>>;
+type AdmittedConnection = (ConnectionGuard, Outbound, OutboundStream);
+
 struct Connection {
     id: u64,
     worker: WorkerId,
     root: PathBuf,
-    outbound: mpsc::Sender<std::result::Result<proto::ConnectResponse, Status>>,
+    tools: Vec<String>,
+    outbound: Outbound,
+    expires: Option<Instant>,
+    retired: CancellationToken,
+    export_reply: Option<(String, oneshot::Sender<bool>)>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.retired.cancel();
+    }
+}
+
+impl Connection {
+    fn live(&self) -> bool {
+        self.expires.is_none_or(|expires| Instant::now() < expires)
+    }
 }
 
 struct PendingRequest {
@@ -257,6 +292,8 @@ struct State {
 
 struct Inner {
     workspace_id: String,
+    account: Option<WorkspaceAccount>,
+    export_control: bool,
     expected_generation: Option<u64>,
     expected_root: Option<PathBuf>,
     state: Mutex<State>,
@@ -274,6 +311,173 @@ pub struct SandboxGateway {
 #[derive(Clone)]
 pub struct SandboxHandle {
     inner: Arc<Inner>,
+    scope: Option<Arc<WorkspaceScope>>,
+}
+
+/// Observe the trusted private worker without owning its transport.
+#[derive(Clone)]
+pub(crate) struct WorkspaceExportControl(SandboxGateway);
+
+impl WorkspaceExportControl {
+    pub(crate) fn connection(&self) -> Option<WorkspaceExportConnection> {
+        self.0.export_connection()
+    }
+
+    pub(crate) fn readiness(&self) -> watch::Receiver<bool> {
+        self.0.readiness()
+    }
+}
+
+/// Control authority for one admitted private stream, never carried across reconnects.
+/// Serialize mutations; abandoning an unacknowledged command retires the stream.
+/// Only reuse a binding for the same verified identity; remove it before replacing the identity.
+#[derive(Clone)]
+pub(crate) struct WorkspaceExportConnection {
+    inner: Arc<Inner>,
+    epoch: u64,
+    retired: CancellationToken,
+}
+
+impl WorkspaceExportConnection {
+    pub(crate) async fn retired(&self) {
+        self.retired.cancelled().await;
+    }
+
+    pub(crate) async fn apply(
+        &self,
+        binding: &str,
+        export: WorkspaceExport,
+        access_token: String,
+        expires_at_unix: u64,
+    ) -> Result<()> {
+        let export_root = export
+            .export_root
+            .into_os_string()
+            .into_string()
+            .map_err(|_| error("workspace export root must be UTF-8"))?;
+        self.change(
+            binding,
+            ExportChange::Apply(proto::WorkspaceExportApply {
+                endpoint: export.endpoint,
+                machine_id: export.machine_id,
+                export_root,
+                access: Some(proto::WorkspaceExportAccess {
+                    access_token,
+                    expires_at_unix,
+                }),
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn rotate(
+        &self,
+        binding: &str,
+        access_token: String,
+        expires_at_unix: u64,
+    ) -> Result<()> {
+        self.change(
+            binding,
+            ExportChange::Rotate(proto::WorkspaceExportAccess {
+                access_token,
+                expires_at_unix,
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn remove(&self, binding: &str) -> Result<()> {
+        self.change(
+            binding,
+            ExportChange::Remove(proto::WorkspaceExportRemove {}),
+        )
+        .await
+    }
+
+    async fn change(&self, binding: &str, change: ExportChange) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let request_id = Uuid::now_v7().to_string();
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            let connection = state
+                .connection
+                .as_mut()
+                .filter(|connection| connection.id == self.epoch && connection.live())
+                .ok_or_else(|| error("private sandbox connection retired"))?;
+            if connection.export_reply.is_some() {
+                return Err(error("workspace export control already pending"));
+            }
+            connection
+                .outbound
+                .try_send(Ok(message(HostBody::WorkspaceExportControl(
+                    proto::WorkspaceExportControl {
+                        request_id: request_id.clone(),
+                        binding: binding.into(),
+                        change: Some(change),
+                    },
+                ))))
+                .map_err(|_| error("private sandbox connection unavailable for export control"))?;
+            connection.export_reply = Some((request_id, tx));
+        }
+        let mut uncertain = UncertainExportControl(Some(self));
+        let applied = within(Instant::now() + EXPORT_CONTROL_TIMEOUT, async {
+            rx.await
+                .map_err(|_| error("private sandbox connection retired during export control"))
+        })
+        .await?;
+        if self.retired.is_cancelled() {
+            return Err(error(
+                "private sandbox connection retired during export control",
+            ));
+        }
+        uncertain.0 = None;
+        if applied {
+            Ok(())
+        } else {
+            Err(error("workspace export control rejected"))
+        }
+    }
+}
+
+struct UncertainExportControl<'a>(Option<&'a WorkspaceExportConnection>);
+
+impl Drop for UncertainExportControl<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0 {
+            connection.inner.disconnect(connection.epoch);
+        }
+    }
+}
+
+/// Stable owner of a hosted workspace, independent of the access token lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceAccount {
+    issuer: String,
+    subject: String,
+}
+
+impl WorkspaceAccount {
+    /// Derive workspace ownership only from verified native API bearer evidence.
+    pub fn from_principal(principal: &AuthenticatedPrincipal) -> Option<Self> {
+        principal.is_native_bearer().then(|| Self {
+            issuer: principal.issuer().to_owned(),
+            subject: principal.subject().to_owned(),
+        })
+    }
+}
+
+/// Worker-resolved binding suitable for durable session state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceScope {
+    /// The peer identity for this destination.
+    pub machine_id: String,
+    /// Canonical worker-local export path at binding time.
+    pub canonical_root: PathBuf,
+    /// Canonical export-relative directory, or `.` for the export root.
+    pub working_directory: String,
+    /// Verified owner for a hosted workspace. Local workspaces have no owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<WorkspaceAccount>,
 }
 
 impl fmt::Debug for SandboxGateway {
@@ -293,10 +497,16 @@ impl fmt::Debug for SandboxHandle {
 impl SandboxGateway {
     /// Create a gateway bound to one workspace (any worker generation by default).
     pub fn new(workspace_id: String) -> Self {
+        Self::for_account(workspace_id, None)
+    }
+
+    fn for_account(workspace_id: String, account: Option<WorkspaceAccount>) -> Self {
         let (ready, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 workspace_id,
+                account,
+                export_control: false,
                 expected_generation: None,
                 expected_root: None,
                 state: Mutex::new(State::default()),
@@ -320,6 +530,38 @@ impl SandboxGateway {
             .expect("configure root before cloning")
             .expected_root = Some(root);
         self
+    }
+
+    /// Enable export control only on the explicitly trusted private listener.
+    pub(crate) fn with_export_control(mut self) -> Self {
+        assert!(
+            self.inner.account.is_none(),
+            "hosted gateway cannot control exports"
+        );
+        Arc::get_mut(&mut self.inner)
+            .expect("configure export control before cloning")
+            .export_control = true;
+        self
+    }
+
+    pub(crate) fn export_connection(&self) -> Option<WorkspaceExportConnection> {
+        if !self.inner.export_control {
+            return None;
+        }
+        let state = self.inner.state.lock().unwrap();
+        let connection = state
+            .connection
+            .as_ref()
+            .filter(|connection| connection.live())?;
+        Some(WorkspaceExportConnection {
+            inner: self.inner.clone(),
+            epoch: connection.id,
+            retired: connection.retired.clone(),
+        })
+    }
+
+    pub(crate) fn export_control(&self) -> WorkspaceExportControl {
+        WorkspaceExportControl(self.clone())
     }
 
     /// Observe live worker connectivity, including reconnects and shutdown.
@@ -353,6 +595,7 @@ impl SandboxGateway {
     pub fn handle(&self) -> SandboxHandle {
         SandboxHandle {
             inner: self.inner.clone(),
+            scope: None,
         }
     }
 
@@ -377,11 +620,16 @@ struct PendingGuard {
 struct ConnectionGuard {
     inner: Arc<Inner>,
     epoch: u64,
+    retired: CancellationToken,
+    on_disconnect: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.inner.disconnect(self.epoch);
+        if let Some(cleanup) = self.on_disconnect.take() {
+            cleanup();
+        }
     }
 }
 
@@ -396,6 +644,7 @@ impl Drop for PendingGuard {
             drop(state);
             SandboxHandle {
                 inner: self.inner.clone(),
+                scope: None,
             }
             .cancel(&self.id, worker);
         }
@@ -403,6 +652,50 @@ impl Drop for PendingGuard {
 }
 
 impl SandboxHandle {
+    /// The durable worker binding, absent for the unbound local legacy handle.
+    pub fn scope(&self) -> Option<&WorkspaceScope> {
+        self.scope.as_deref()
+    }
+
+    /// Resolve a working directory on the peer and pin all requests to that export.
+    pub async fn bind_directory(&self, path: &str) -> Result<Self> {
+        let root = self
+            .canonical_root()
+            .ok_or_else(|| error("workspace machine offline"))?;
+        self.bind_at(path, root).await
+    }
+
+    async fn bind_at(&self, path: &str, root: PathBuf) -> Result<Self> {
+        let mut handle = self.clone();
+        let scope = WorkspaceScope {
+            machine_id: self.inner.workspace_id.clone(),
+            canonical_root: root,
+            working_directory: ".".into(),
+            account: self.inner.account.clone(),
+        };
+        handle.scope = Some(Arc::new(scope.clone()));
+        let reply = handle
+            .workspace_request(WorkspaceOperation::Directory(path))
+            .await?;
+        let cwd = reply
+            .working_directory
+            .ok_or_else(|| error("missing resolved working directory"))?;
+        if scope.canonical_root != std::path::Path::new(&reply.canonical_root)
+            || cwd.is_empty()
+            || (cwd != "."
+                && std::path::Path::new(&cwd)
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_))))
+        {
+            return Err(error("invalid resolved workspace directory"));
+        }
+        handle.scope = Some(Arc::new(WorkspaceScope {
+            working_directory: cwd,
+            ..scope
+        }));
+        Ok(handle)
+    }
+
     /// Worker-reported canonical root for the current connection, if available.
     pub fn canonical_root(&self) -> Option<PathBuf> {
         self.inner
@@ -411,6 +704,11 @@ impl SandboxHandle {
             .unwrap()
             .connection
             .as_ref()
+            .filter(|c| c.live())
+            .filter(|c| {
+                self.scope()
+                    .is_none_or(|scope| scope.canonical_root == c.root)
+            })
             .map(|c| c.root.clone())
     }
 
@@ -456,6 +754,21 @@ impl SandboxHandle {
                 if state.shutdown {
                     return Err(error("gateway shut down"));
                 }
+                if let Some(scope) = &self.scope {
+                    let c = state
+                        .connection
+                        .as_ref()
+                        .filter(|c| c.live())
+                        .ok_or_else(|| error("workspace machine offline"))?;
+                    if c.root != scope.canonical_root {
+                        return Err(error("workspace export root changed"));
+                    }
+                    if let HostBody::Prepare(p) = &body
+                        && !c.tools.contains(&p.tool_name)
+                    {
+                        return Err(error("tool unavailable on workspace worker"));
+                    }
+                }
                 state
                     .connection
                     .as_ref()
@@ -478,7 +791,11 @@ impl SandboxHandle {
                     if state.shutdown {
                         return Err(error("gateway shut down"));
                     }
-                    if state.connection.as_ref().is_some_and(|c| c.id == epoch) {
+                    if state
+                        .connection
+                        .as_ref()
+                        .is_some_and(|c| c.id == epoch && c.live())
+                    {
                         let request = state
                             .pending
                             .get_mut(&id)
@@ -500,7 +817,7 @@ impl SandboxHandle {
     fn cancel(&self, id: &str, worker: WorkerId) {
         {
             let state = self.inner.state.lock().unwrap();
-            if let Some(connection) = &state.connection {
+            if let Some(connection) = state.connection.as_ref().filter(|c| c.live()) {
                 if connection.worker != worker {
                     return;
                 }
@@ -543,7 +860,11 @@ impl SandboxHandle {
                             };
                             if let Ok(permit) = reserved {
                                 let state = handle.inner.state.lock().unwrap();
-                                if state.connection.as_ref().is_some_and(|c| c.id == epoch) {
+                                if state
+                                    .connection
+                                    .as_ref()
+                                    .is_some_and(|c| c.id == epoch && c.live())
+                                {
                                     permit.send(Ok(message(HostBody::Cancel(proto::Cancel {
                                         invocation_id: id,
                                     }))));
@@ -592,6 +913,7 @@ impl SandboxHandle {
                 id.clone(),
                 Pending::Prepare(tx),
                 HostBody::Prepare(proto::Prepare {
+                    working_directory: self.scope().map(|scope| scope.working_directory.clone()),
                     invocation_id: id.clone(),
                     tool_name: tool_name.to_owned(),
                     arguments_json: serde_json::to_string(arguments)?,
@@ -630,6 +952,11 @@ impl SandboxHandle {
     ) -> Result<SandboxOutput> {
         if cancellation.is_cancelled() {
             return Err(error("sandbox invocation cancelled"));
+        }
+        if !prepared.cancel_on_drop.as_ref().is_some_and(|handle| {
+            Arc::ptr_eq(&handle.inner, &self.inner) && handle.scope == self.scope
+        }) {
+            return Err(error("sandbox ticket belongs to another workspace"));
         }
         let deadline = Instant::now() + prepared.execution_timeout;
         let (tx, mut rx) = oneshot::channel();
@@ -732,6 +1059,9 @@ impl SandboxHandle {
         let deadline = Instant::now() + WORKSPACE_TIMEOUT;
         let (tx, rx) = oneshot::channel();
         let mut request = operation.to_proto(id.clone());
+        if !matches!(operation, WorkspaceOperation::Directory(_)) {
+            request.working_directory = self.scope().map(|scope| scope.working_directory.clone());
+        }
         request.timeout_millis = millis(WORKSPACE_TIMEOUT - DELIVERY_GRACE);
         let (_, _guard) = within(
             deadline,
@@ -758,11 +1088,23 @@ impl SandboxHandle {
             canonical_path: result.canonical_path,
             path_kind: result.path_kind,
             canonical_root: result.canonical_root,
+            working_directory: result.working_directory,
         })
     }
 }
 
 impl Inner {
+    fn retire_inactive_connection(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.connection.as_ref().is_some_and(Connection::live) {
+            return false;
+        }
+        if state.connection.take().is_some() {
+            self.ready.send_replace(false);
+        }
+        true
+    }
+
     fn disconnect(&self, epoch: u64) {
         let mut state = self.state.lock().unwrap();
         if state.connection.as_ref().is_some_and(|c| c.id == epoch) {
@@ -773,7 +1115,11 @@ impl Inner {
 
     fn dispatch(&self, epoch: u64, body: WorkerBody) -> std::result::Result<(), Status> {
         let mut state = self.state.lock().unwrap();
-        if state.connection.as_ref().is_none_or(|c| c.id != epoch) {
+        if state
+            .connection
+            .as_ref()
+            .is_none_or(|c| c.id != epoch || !c.live())
+        {
             return Err(Status::unavailable("worker disconnected"));
         }
         match body {
@@ -853,29 +1199,67 @@ impl Inner {
                 }
                 return Ok(());
             }
+            WorkerBody::WorkspaceExportAck(reply) => {
+                if !self.export_control {
+                    return Err(Status::permission_denied(
+                        "workspace export control is private",
+                    ));
+                }
+                let connection = state.connection.as_mut().expect("active connection");
+                if connection
+                    .export_reply
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == reply.request_id)
+                    && let Some((_, tx)) = connection.export_reply.take()
+                {
+                    drop(tx.send(reply.applied));
+                }
+            }
             WorkerBody::Hello(_) => return Err(Status::invalid_argument("unexpected hello")),
         }
         Ok(())
     }
 }
 
-#[tonic::async_trait]
-impl SandboxService for SandboxGateway {
-    type ConnectStream =
-        Pin<Box<dyn Stream<Item = std::result::Result<proto::ConnectResponse, Status>> + Send>>;
+type ConnectStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<proto::ConnectResponse, Status>> + Send>>;
 
-    async fn connect(
+async fn read_hello(
+    incoming: &mut tonic::Streaming<proto::ConnectRequest>,
+    stopped: &CancellationToken,
+    expires: Option<Instant>,
+) -> std::result::Result<proto::Hello, Status> {
+    let first = tokio::select! {
+        biased;
+        () = wait_for_expiry(expires) => return Err(expired_bearer()),
+        () = stopped.cancelled() => return Err(Status::unavailable("gateway shut down")),
+        message = incoming.message() => message?,
+    }
+    .ok_or_else(|| Status::invalid_argument("missing hello"))?;
+    match first.body {
+        Some(WorkerBody::Hello(hello)) => Ok(hello),
+        _ => Err(Status::invalid_argument("first message must be hello")),
+    }
+}
+
+async fn wait_for_expiry(expires: Option<Instant>) {
+    match expires {
+        Some(deadline) if deadline > Instant::now() => tokio::time::sleep_until(deadline).await,
+        Some(_) => {}
+        None => std::future::pending().await,
+    }
+}
+
+fn expired_bearer() -> Status {
+    Status::unauthenticated("workspace access token expired")
+}
+
+impl SandboxGateway {
+    fn admit(
         &self,
-        request: Request<tonic::Streaming<proto::ConnectRequest>>,
-    ) -> std::result::Result<Response<Self::ConnectStream>, Status> {
-        let mut incoming = request.into_inner();
-        let first = tokio::select! {
-            message = incoming.message() => message?,
-            () = self.inner.stopped.cancelled() => return Err(Status::unavailable("gateway shut down")),
-        }.ok_or_else(|| Status::invalid_argument("missing hello"))?;
-        let Some(WorkerBody::Hello(hello)) = first.body else {
-            return Err(Status::invalid_argument("first message must be hello"));
-        };
+        hello: proto::Hello,
+        expires: Option<Instant>,
+    ) -> std::result::Result<AdmittedConnection, Status> {
         if hello.worker_id.is_empty()
             || hello.workspace_id != self.inner.workspace_id
             || self
@@ -899,8 +1283,12 @@ impl SandboxService for SandboxGateway {
             return Err(Status::permission_denied("sandbox worker root mismatch"));
         }
         let (outbound, receiver) = mpsc::channel(OUTBOUND_CAPACITY);
+        let retired = CancellationToken::new();
         let epoch = {
             let mut state = self.inner.state.lock().unwrap();
+            if expires.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(expired_bearer());
+            }
             if state.shutdown {
                 return Err(Status::unavailable("gateway shut down"));
             }
@@ -916,26 +1304,49 @@ impl SandboxService for SandboxGateway {
                     generation: hello.generation,
                 },
                 root: PathBuf::from(hello.canonical_root),
+                tools: hello.tools,
                 outbound: outbound.clone(),
+                expires,
+                retired: retired.clone(),
+                export_reply: None,
             });
             self.inner.ready.send_replace(true);
             epoch
         };
-        let inner = self.inner.clone();
+        let guard = ConnectionGuard {
+            inner: self.inner.clone(),
+            epoch,
+            retired,
+            on_disconnect: None,
+        };
+        Ok((guard, outbound, ReceiverStream::new(receiver)))
+    }
+
+    fn drive_connection(
+        mut incoming: tonic::Streaming<proto::ConnectRequest>,
+        guard: ConnectionGuard,
+        outbound: Outbound,
+        receiver: OutboundStream,
+        expires: Option<Instant>,
+    ) -> ConnectStream {
+        let expired = wait_for_expiry(expires);
+        let retired = guard.retired.clone();
+        let driver_retired = retired.clone();
         tokio::spawn(async move {
-            let _connection_guard = ConnectionGuard {
-                inner: inner.clone(),
-                epoch,
-            };
+            let guard = guard;
+            tokio::pin!(expired);
             loop {
                 let received = tokio::select! {
-                    () = inner.stopped.cancelled() => break,
+                    biased;
+                    () = &mut expired => break,
+                    () = driver_retired.cancelled() => break,
+                    () = guard.inner.stopped.cancelled() => break,
                     () = outbound.closed() => break,
                     message = incoming.message() => message,
                 };
                 match received {
                     Ok(Some(proto::ConnectRequest { body: Some(body) })) => {
-                        if inner.dispatch(epoch, body).is_err() {
+                        if guard.inner.dispatch(guard.epoch, body).is_err() {
                             break;
                         }
                     }
@@ -943,7 +1354,53 @@ impl SandboxService for SandboxGateway {
                 }
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        if let Some(deadline) = expires {
+            // Do not flush buffered work to a peer after its authorization ends.
+            Box::pin(futures_util::stream::unfold(
+                Some(receiver),
+                move |receiver| async move {
+                    let mut receiver = receiver?;
+                    tokio::select! {
+                        biased;
+                        () = wait_for_expiry(Some(deadline)) => Some((Err(expired_bearer()), None)),
+                        message = tokio_stream::StreamExt::next(&mut receiver) => {
+                            message.map(|message| (message, Some(receiver)))
+                        }
+                    }
+                },
+            ))
+        } else {
+            Box::pin(futures_util::stream::unfold(
+                Some((receiver, retired)),
+                |state| async move {
+                    let (mut receiver, retired) = state?;
+                    tokio::select! {
+                        biased;
+                        () = retired.cancelled() => None,
+                        message = tokio_stream::StreamExt::next(&mut receiver) => {
+                            message.map(|message| (message, Some((receiver, retired))))
+                        }
+                    }
+                },
+            ))
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxService for SandboxGateway {
+    type ConnectStream = ConnectStream;
+
+    async fn connect(
+        &self,
+        request: Request<tonic::Streaming<proto::ConnectRequest>>,
+    ) -> std::result::Result<Response<Self::ConnectStream>, Status> {
+        let mut incoming = request.into_inner();
+        let hello = read_hello(&mut incoming, &self.inner.stopped, None).await?;
+        let (guard, outbound, receiver) = self.admit(hello, None)?;
+        Ok(Response::new(Self::drive_connection(
+            incoming, guard, outbound, receiver, None,
+        )))
     }
 }
 
@@ -1008,6 +1465,115 @@ mod tests {
             .unwrap()
             .into_inner();
         (tx, stream)
+    }
+
+    #[tokio::test]
+    async fn export_control_acknowledgement_is_bound_to_one_private_stream() {
+        let gateway = SandboxGateway::new("workspace".into()).with_export_control();
+        let (mut client, server) = server(gateway.clone()).await;
+        let (tx, mut stream) = connected(&mut client).await;
+        let first = gateway.export_connection().unwrap();
+        let pending = tokio::spawn({
+            let first = first.clone();
+            async move { first.remove("binding").await }
+        });
+        let request = |msg: proto::ConnectResponse| {
+            let Some(HostBody::WorkspaceExportControl(control)) = msg.body else {
+                panic!("expected workspace export control");
+            };
+            assert_eq!(control.binding, "binding");
+            assert!(matches!(control.change, Some(ExportChange::Remove(_))));
+            control.request_id
+        };
+        let first_id = request(
+            timeout(Duration::from_secs(1), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        let ack = |request_id, applied| proto::ConnectRequest {
+            body: Some(WorkerBody::WorkspaceExportAck(proto::WorkspaceExportAck {
+                request_id,
+                applied,
+            })),
+        };
+        tx.send(ack("unrelated".into(), true)).await.unwrap();
+        drop(tx);
+        drop(stream);
+        timeout(Duration::from_secs(1), first.retired())
+            .await
+            .unwrap();
+        assert!(pending.await.unwrap().is_err());
+
+        let (tx, mut stream) = connected(&mut client).await;
+        let next = gateway.export_connection().unwrap();
+        assert_ne!(first.epoch, next.epoch);
+        assert!(first.remove("binding").await.is_err());
+        let pending = tokio::spawn({
+            let next = next.clone();
+            async move { next.remove("binding").await }
+        });
+        let next_id = request(
+            timeout(Duration::from_secs(1), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        tx.send(ack(first_id, false)).await.unwrap();
+        tx.send(ack(next_id, true)).await.unwrap();
+        assert!(pending.await.unwrap().is_ok());
+
+        let abandoned = tokio::spawn({
+            let next = next.clone();
+            async move { next.remove("binding").await }
+        });
+        request(
+            timeout(Duration::from_secs(1), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        abandoned.abort();
+        drop(abandoned.await);
+        timeout(Duration::from_secs(1), next.retired())
+            .await
+            .unwrap();
+        assert!(gateway.export_connection().is_none());
+        gateway.shutdown();
+        server.abort();
+        drop(server.await);
+    }
+
+    #[test]
+    fn hosted_gateway_never_has_private_export_control_authority() {
+        let gateway = SandboxGateway::for_account(
+            "workspace".into(),
+            Some(WorkspaceAccount {
+                issuer: "issuer".into(),
+                subject: "subject".into(),
+            }),
+        );
+        let Some(WorkerBody::Hello(hello)) = hello("workspace", 3).body else {
+            panic!("expected hello");
+        };
+        let (guard, _outbound, _stream) = gateway
+            .admit(hello, Some(Instant::now() + Duration::from_secs(30)))
+            .unwrap();
+        assert!(gateway.export_connection().is_none());
+        let err = gateway
+            .inner
+            .dispatch(
+                guard.epoch,
+                WorkerBody::WorkspaceExportAck(proto::WorkspaceExportAck {
+                    request_id: "unexpected".into(),
+                    applied: true,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -1285,6 +1851,7 @@ mod tests {
                 canonical_path: String::new(),
                 path_kind: String::new(),
                 canonical_root: String::new(),
+                working_directory: None,
             }
         );
         gateway.shutdown();
@@ -1629,10 +2196,14 @@ mod tests {
             generation: 3,
         };
         gateway.inner.state.lock().unwrap().connection = Some(Connection {
+            tools: vec![],
             id: 42,
             worker,
             root: PathBuf::new(),
             outbound,
+            expires: None,
+            retired: CancellationToken::new(),
+            export_reply: None,
         });
         let handle = gateway.handle();
         let sending = tokio::spawn(async move {

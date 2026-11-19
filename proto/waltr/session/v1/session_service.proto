@@ -64,6 +64,16 @@ message CreateSessionRequest {
   InferenceSettingsRequest inference_settings = 1;
   // Optional startup-catalog agent selection. Absence selects the server default.
   AgentSelectionRequest agent_selection = 2;
+  // Absence selects the server's default local workspace.
+  WorkspaceSelection workspace = 3;
+}
+
+message WorkspaceSelection {
+  string machine_id = 1;
+  // On create: worker-local ~, ~/..., export-relative, or absolute directory;
+  // absence selects the export root. Summaries return the resolved directory
+  // relative to the export ("." for the root).
+  optional string working_directory = 2;
 }
 
 message AgentSelectionRequest {
@@ -446,6 +456,8 @@ message SessionSummary {
   SessionCoordinationState coordination = 12;
   SessionProgress progress = 13;
   SessionCapabilities capabilities = 14;
+  // Effective explicit binding; absent for an unbound local session.
+  WorkspaceSelection workspace = 15;
 }
 
 message SessionCoordinationState {

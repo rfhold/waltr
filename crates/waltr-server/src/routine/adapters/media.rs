@@ -1608,6 +1608,7 @@ impl MediaHost {
                     let target = helpers
                         .open(
                             HelperRequest {
+                                workspace: profile.workspace.map(Into::into),
                                 selection: profile.selection,
                                 task: profile.task,
                                 capture: profile.capture,
@@ -1638,6 +1639,7 @@ impl MediaHost {
                 let result = helpers
                     .run_with_inputs(
                         HelperRequest {
+                            workspace: profile.workspace.map(Into::into),
                             selection: profile.selection.clone(),
                             task: profile.task.clone(),
                             capture: profile.capture.clone(),

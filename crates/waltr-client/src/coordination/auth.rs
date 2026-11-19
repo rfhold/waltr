@@ -242,6 +242,107 @@ mod tests {
     }
 
     #[test]
+    fn workspace_device_authorization_follows_explicit_begin_and_polls_to_connected() {
+        let mut client = Client::new();
+        let binding = AuthTarget {
+            target: Some(auth_target::Target::WorkspaceBindingKey(
+                "remote".to_owned(),
+            )),
+        };
+        let listed = client.apply(ClientEvent::Auth(AuthEvent::Listed(vec![
+            crate::AuthStatus {
+                target: Some(binding.clone()),
+                supported_methods: vec![
+                    waltr::grpc::waltr::auth::v1::AuthMethod::OauthDevice as i32,
+                ],
+                ..Default::default()
+            },
+        ])));
+        assert!(listed.effects().is_empty());
+        assert!(client.state().auth.active_attempt.is_none());
+
+        let start = client.begin_auth(binding.clone());
+        let [
+            ClientEffect::Auth(AuthEffect::Begin {
+                operation_key,
+                target,
+            }),
+        ] = start.effects()
+        else {
+            panic!("explicit begin");
+        };
+        assert_eq!(target, &binding);
+
+        let begun = |verification_url: &str, user_code: &str| {
+            ClientEvent::Auth(AuthEvent::Begun {
+                operation_key: operation_key.clone(),
+                target: binding.clone(),
+                attempt: BeginAuthResponse {
+                    attempt_id: "attempt-1".to_owned(),
+                    auth_url: "https://issuer.example/device?private=not-for-display".to_owned(),
+                    verification_url: verification_url.to_owned(),
+                    user_code: user_code.to_owned(),
+                    messages: vec!["not for display".to_owned()],
+                    poll_interval_seconds: 2,
+                    completion_mode: AuthCompletionMode::ServerDevicePoll as i32,
+                    ..Default::default()
+                },
+            })
+        };
+        assert!(
+            client
+                .apply(begun("javascript:alert(1)", "safe-code"))
+                .effects()
+                .is_empty()
+        );
+        assert!(client.state().auth.active_attempt.is_none());
+        assert!(
+            client
+                .apply(begun("https://issuer.example/device", "A\u{1b}B"))
+                .effects()
+                .is_empty()
+        );
+        assert!(client.state().auth.active_attempt.is_none());
+
+        let update = client.apply(begun("https://issuer.example/device#private", "ABCD-EFGH"));
+        let [
+            ClientEffect::Auth(AuthEffect::Poll {
+                attempt_id,
+                poll_generation,
+                delay_ms,
+            }),
+        ] = update.effects()
+        else {
+            panic!("poll effect");
+        };
+        assert_eq!(*delay_ms, 2_000);
+        let attempt = client.state().auth.active_attempt.as_ref().unwrap();
+        assert_eq!(attempt.verification_url, "https://issuer.example/device");
+        assert_eq!(attempt.user_code, "ABCD-EFGH");
+        assert!(attempt.auth_url.is_empty());
+        assert!(attempt.messages.is_empty());
+
+        let mut response = status(AuthAttemptLifecycle::Succeeded, binding.clone());
+        response.attempt.as_mut().unwrap().completion_mode =
+            AuthCompletionMode::ServerDevicePoll as i32;
+        response.status = Some(crate::AuthStatus {
+            target: Some(binding),
+            kind: waltr::grpc::waltr::auth::v1::AuthStatusKind::OauthConfigured as i32,
+            ..Default::default()
+        });
+        let completed = client.apply(ClientEvent::Auth(AuthEvent::Polled {
+            attempt_id: attempt_id.clone(),
+            poll_generation: *poll_generation,
+            response,
+        }));
+        assert!(completed.effects().is_empty());
+        assert_eq!(
+            client.state().auth.statuses["workspaceBinding:remote"].kind,
+            waltr::grpc::waltr::auth::v1::AuthStatusKind::OauthConfigured as i32
+        );
+    }
+
+    #[test]
     fn callback_begin_polls_until_terminal_and_ignores_duplicate_terminal_events() {
         let mut client = Client::new();
         let (attempt_id, poll_generation) = begin_callback(&mut client);

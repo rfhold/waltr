@@ -294,6 +294,14 @@ pub enum ClientCommand {
         #[serde(rename = "agentName")]
         agent_name: String,
     },
+    /// Create a session on an explicitly selected workspace.
+    CreateSessionWithWorkspace {
+        /// Exact selectable agent name.
+        #[serde(rename = "agentName")]
+        agent_name: String,
+        /// Worker and optional starting directory.
+        workspace: crate::WorkspaceSelection,
+    },
     /// Retry loading selectable session agents.
     RequestSessionAgents,
     /// Delete a server-side session by id.
@@ -484,7 +492,7 @@ pub enum ClientCommand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientAuthTarget {
-    /// Target kind, currently `provider` or `mcpServer`.
+    /// Target kind: `provider`, `mcpServer`, or `workspaceBinding`.
     pub kind: String,
     /// Config key for the target.
     pub key: String,
@@ -1043,6 +1051,8 @@ impl From<&RollbackTarget> for RollbackTargetView {
 pub struct ConfigSnapshot {
     /// Last known configuration snapshot.
     pub current: Option<ConfigView>,
+    /// Active workspace bindings keyed by their catalog resource name.
+    pub workspace_bindings: BTreeMap<String, WorkspaceBindingView>,
     /// Resource-slot write baselines keyed by canonical path.
     pub resource_baselines: BTreeMap<String, ResourceEditBaselineView>,
     /// Configuration load operation snapshot.
@@ -1053,6 +1063,36 @@ pub struct ConfigSnapshot {
     pub reset: OperationSnapshot,
     /// Configuration watch operation snapshot.
     pub watch: OperationSnapshot,
+}
+
+/// Public configuration for an outbound workspace binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceBindingView {
+    /// Destination server API root.
+    pub endpoint: String,
+    /// Requested machine identifier at the destination.
+    pub machine_id: String,
+}
+
+impl TryFrom<&waltr::grpc::waltr::resource::v1::Resource> for WorkspaceBindingView {
+    type Error = ();
+
+    fn try_from(resource: &waltr::grpc::waltr::resource::v1::Resource) -> Result<Self, Self::Error> {
+        use waltr::grpc::waltr::resource::v1::{ResourceKind, resource_value::Kind};
+        if resource.kind != ResourceKind::WorkspaceBinding as i32 || resource.name.is_empty() {
+            return Err(());
+        }
+        let fields = &resource.effective_value.as_ref().ok_or(())?.fields;
+        let string = |key| match fields.get(key).and_then(|value| value.kind.as_ref()) {
+            Some(Kind::StringValue(value)) if !value.is_empty() => Ok(value.clone()),
+            _ => Err(()),
+        };
+        Ok(Self {
+            endpoint: string("endpoint")?,
+            machine_id: string("machineId")?,
+        })
+    }
 }
 
 /// Exact resource-slot baseline captured by an edit form.
@@ -2120,6 +2160,7 @@ impl ClientStateStream {
                 self.begin_routine_command(command)
             }
             ClientCommand::CreateSession { .. }
+            | ClientCommand::CreateSessionWithWorkspace { .. }
             | ClientCommand::OpenSessionMcpApp { .. }
             | ClientCommand::CallSessionMcpAppTool { .. }
             | ClientCommand::CloseSessionMcpApp { .. }
@@ -2460,6 +2501,10 @@ impl ClientStateStream {
             ClientCommand::CreateSession { agent_name } => {
                 self.runtime.reducer.create_session(agent_name)
             }
+            ClientCommand::CreateSessionWithWorkspace { agent_name, workspace } => self
+                .runtime
+                .reducer
+                .create_session_with_workspace(agent_name, Some(workspace)),
             ClientCommand::RequestSessionAgents => self.runtime.reducer.request_session_agents(),
             ClientCommand::DeleteSession { id } => self.runtime.reducer.delete_session(id),
             ClientCommand::WipeSessions => self.runtime.reducer.wipe_sessions(),
@@ -3362,6 +3407,18 @@ impl ClientSnapshot {
             },
             config: ConfigSnapshot {
                 current: state.config.current.clone().map(ConfigView::from),
+                workspace_bindings: state
+                    .config
+                    .catalog
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|catalog| &catalog.resources)
+                    .filter_map(|resource| {
+                        WorkspaceBindingView::try_from(resource)
+                            .ok()
+                            .map(|binding| (resource.name.clone(), binding))
+                    })
+                    .collect(),
                 resource_baselines: state
                     .config
                     .catalog
@@ -3657,6 +3714,9 @@ impl ClientAuthTarget {
             "mcpServer" | "mcp_server" => {
                 waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(self.key)
             }
+            "workspaceBinding" => {
+                waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(self.key)
+            }
             _ => waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(self.key),
         };
 
@@ -3676,6 +3736,7 @@ fn pending_auth_attempt_state(attempt: AuthAttemptSnapshot) -> Option<AuthAttemp
     }
     let completion_mode = match attempt.completion_mode.as_str() {
         "serverCallback" => AuthCompletionMode::ServerCallback,
+        "serverDevicePoll" => AuthCompletionMode::ServerDevicePoll,
         "manual" => AuthCompletionMode::Manual,
         _ => return None,
     };
@@ -3686,26 +3747,51 @@ fn pending_auth_attempt_state(attempt: AuthAttemptSnapshot) -> Option<AuthAttemp
         "" | "unknown" => McpOAuthRegistrationMethod::Unspecified,
         _ => return None,
     };
-    if !matches!(attempt.target.kind.as_str(), "provider" | "mcpServer")
+    let device = completion_mode == AuthCompletionMode::ServerDevicePoll;
+    if !matches!(
+        attempt.target.kind.as_str(),
+        "provider" | "mcpServer" | "workspaceBinding"
+    ) || (attempt.target.kind == "workspaceBinding") != device
         || attempt.target.key.is_empty()
     {
         return None;
     }
+    let verification_url = if device {
+        crate::coordination::state::safe_device_verification_url(&attempt.verification_url)?
+    } else {
+        crate::coordination::state::safe_http_url(&attempt.verification_url).unwrap_or_default()
+    };
+    let user_code = if device {
+        let code = crate::coordination::state::safe_device_user_code(&attempt.user_code);
+        if code.is_empty() {
+            return None;
+        }
+        code
+    } else {
+        crate::coordination::state::safe_text(&attempt.user_code, 256)
+    };
 
     Some(AuthAttemptState {
         target: attempt.target.into_auth_target(),
         attempt_id: attempt.attempt_id,
-        auth_url: crate::coordination::state::safe_http_url(&attempt.auth_url).unwrap_or_default(),
-        verification_url: crate::coordination::state::safe_http_url(&attempt.verification_url)
-            .unwrap_or_default(),
-        user_code: crate::coordination::state::safe_text(&attempt.user_code, 256),
+        auth_url: if device {
+            String::new()
+        } else {
+            crate::coordination::state::safe_http_url(&attempt.auth_url).unwrap_or_default()
+        },
+        verification_url,
+        user_code,
         expires_at_ms: attempt.expires_at_ms,
         poll_interval_seconds: attempt.poll_interval_seconds,
-        messages: attempt
-            .messages
-            .into_iter()
-            .map(|message| crate::coordination::state::safe_text(&message, 1_024))
-            .collect(),
+        messages: if device {
+            Vec::new()
+        } else {
+            attempt
+                .messages
+                .into_iter()
+                .map(|message| crate::coordination::state::safe_text(&message, 1_024))
+                .collect()
+        },
         completion_mode: completion_mode as i32,
         registration_method: registration_method as i32,
         lifecycle: AuthAttemptLifecycle::Pending as i32,
@@ -3727,6 +3813,12 @@ impl From<AuthTarget> for ClientAuthTarget {
                 kind: "mcpServer".to_owned(),
                 key,
             },
+            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(key)) => {
+                Self {
+                    kind: "workspaceBinding".to_owned(),
+                    key,
+                }
+            }
             None => Self {
                 kind: "unknown".to_owned(),
                 key: String::new(),
@@ -3818,6 +3910,7 @@ fn auth_status_metadata_is_safe(
             "registration_method" => value.len() <= 64,
             _ => false,
         },
+        waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(_) => false,
     }
 }
 
@@ -3889,6 +3982,9 @@ impl From<AuthAttemptState> for AuthAttemptSnapshot {
             ) {
                 Ok(waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback) => {
                     "serverCallback"
+                }
+                Ok(waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerDevicePoll) => {
+                    "serverDevicePoll"
                 }
                 Ok(waltr::grpc::waltr::auth::v1::AuthCompletionMode::Manual) => "manual",
                 _ => "unknown",
@@ -4151,7 +4247,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_pending_attempt_seeds_snapshot_and_only_callback_mode_resumes_polling() {
+    fn restored_pending_attempt_seeds_snapshot_and_resumes_server_polling() {
         let manual = ClientRuntime::with_transport_and_pending_auth_attempt(
             crate::NativeGrpcTransport::new("http://127.0.0.1:0"),
             pending_attempt("manual"),
@@ -4180,6 +4276,27 @@ mod tests {
                 ..
             }] if attempt_id == "attempt-restored"
         ));
+
+        let mut pending_device = pending_attempt("serverDevicePoll");
+        pending_device.target.kind = "workspaceBinding".to_owned();
+        pending_device.verification_url = "https://issuer.example/verify".to_owned();
+        pending_device.user_code = "ABCD-EFGH".to_owned();
+        let device = ClientRuntime::with_transport_and_pending_auth_attempt(
+            crate::NativeGrpcTransport::new("http://127.0.0.1:0"),
+            pending_device,
+        )
+        .into_state_stream(|_| std::future::ready(()));
+        assert!(matches!(
+            device.effects.as_slice(),
+            [QueuedEffect {
+                effect: ClientEffect::Auth(crate::AuthEffect::Poll { attempt_id, .. }),
+                ..
+            }] if attempt_id == "attempt-restored"
+        ));
+        let attempt = device.snapshot().auth.active_attempt.unwrap();
+        assert!(attempt.auth_url.is_empty());
+        assert!(attempt.messages.is_empty());
+        assert_eq!(attempt.user_code, "ABCD-EFGH");
     }
 
     #[test]
@@ -4894,6 +5011,34 @@ mod tests {
 
         assert_eq!(json, serde_json::json!({ "type": "wipeSessions" }));
         assert!(ClientCommand::decl().contains("wipeSessions"));
+    }
+
+    #[test]
+    fn bound_creates_keep_each_agents_requested_directory() {
+        let mut stream = ready_state_stream();
+        for (agent, directory) in [
+            ("coding", Some("~/repos/rfhold/waltr")),
+            ("research", Some("repos/notes")),
+            ("review", None),
+        ] {
+            let command = serde_json::from_value(serde_json::json!({
+                "type": "createSessionWithWorkspace",
+                "agentName": agent,
+                "workspace": {"machineId": "laptop", "workingDirectory": directory},
+            }))
+            .unwrap();
+            let update = stream.begin_session_command(command);
+            let [ClientEffect::Session(SessionEffect::Create {
+                agent_name,
+                workspace: Some(selection),
+                ..
+            })] = update.effects() else {
+                panic!("expected bound session create");
+            };
+            assert_eq!(agent_name, agent);
+            assert_eq!(selection.machine_id, "laptop");
+            assert_eq!(selection.working_directory.as_deref(), directory);
+        }
     }
 
     #[test]

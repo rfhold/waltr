@@ -24,7 +24,7 @@ pub use session::{
     SessionProgressPhaseView, SessionProgressView, SessionPromptDispositionView,
     SessionRunStageView, SessionStatusView, SessionSuspensionKindView, SessionTimelineView,
     SessionView, SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView,
+    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView, WorkspaceSelection,
 };
 
 #[cfg(test)]
@@ -282,6 +282,7 @@ mod tests {
             SelectableAgentView::decl(),
             SessionAssociationsView::decl(),
             SessionView::decl(),
+            crate::WorkspaceSelection::decl(),
             TimelineEventKindView::decl(),
             TimelineStatusView::decl(),
             crate::InteractionIdentity::decl(),
@@ -318,6 +319,7 @@ mod tests {
             OperationSnapshot::decl(),
             ResourceEditBaselineView::decl(),
             ConfigSnapshot::decl(),
+            crate::coordination::runtime::WorkspaceBindingView::decl(),
             StatusSnapshot::decl(),
             SessionAgentCatalogSnapshot::decl(),
             SessionSnapshot::decl(),

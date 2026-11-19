@@ -1,11 +1,12 @@
 //! Implementation of the generated `SessionService`.
+use crate::access_auth::AuthenticatedPrincipal;
 use crate::agent_host::{
     definition::AgentDefinitionCatalog,
     runtime_factory::{
         McpConnectionKind, McpConnectionResolveRequest, McpResolvedConnection,
         ServerAgentRuntimeFactory as AgentSessionRuntimeFactory,
     },
-    sandbox_gateway::SandboxHandle,
+    sandbox_gateway::{SandboxHandle, WorkspaceAccount},
 };
 use crate::auth::CredentialStore;
 
@@ -129,6 +130,8 @@ pub struct SessionRegistrationInput {
     pub event_sink: Arc<dyn waltr_agent::SessionEventSink>,
     /// Live private worker handle (never a local fallback).
     pub sandbox: SandboxHandle,
+    /// Registry serving the optional configured peer connections.
+    pub(crate) workspace_machines: crate::agent_host::sandbox_gateway::peers::MachineRegistry,
 }
 
 impl std::fmt::Debug for SessionRegistrationInput {
@@ -163,6 +166,7 @@ where
             catalog: agent_catalog,
             event_sink,
             sandbox,
+            workspace_machines,
         } = input;
         let current_catalog = agent_catalog.catalog();
         let interactions = crate::interaction::InteractionBroker::default();
@@ -177,6 +181,7 @@ where
             credential_store,
             default_agent_definition,
         )
+        .with_workspace_machines(workspace_machines)
         .with_capability_policy(policy);
         let runtime_factory = match &agent_catalog {
             SessionCatalogSource::Static(catalog) => {
@@ -265,26 +270,42 @@ where
 
     pub(super) async fn request_sessions(
         &self,
-        principal: Option<crate::access_auth::AuthenticatedPrincipal>,
+        principal: Option<AuthenticatedPrincipal>,
         id: &SessionId,
     ) -> Result<SessionCoordinator<S>, Status> {
-        let Some(routines) = self.routines.lock().await.clone() else {
-            return Ok(self.sessions.clone());
-        };
+        let routines = self.routines.lock().await.clone();
         let record = self
             .sessions
             .load(id)
             .await
             .map_err(agent_error_to_status)?
             .record;
-        let principal = principal.ok_or_else(|| {
-            Status::unauthenticated("session runs require current authentication")
-        })?;
-        let factory = routines
-            .code
-            .factory(principal, &record)
-            .await
-            .map_err(|_| Status::permission_denied("session run has no current host authority"))?;
+        let account = principal
+            .as_ref()
+            .and_then(WorkspaceAccount::from_principal);
+        let workspace_factory = (*self.runtime_factory)
+            .clone()
+            .with_workspace_account(account.clone());
+        let remote_workspace = workspace_factory
+            .authorize_session_workspace(&record)
+            .await?;
+        let factory = if let Some(routines) = routines {
+            let principal = principal.ok_or_else(|| {
+                Status::unauthenticated("session runs require current authentication")
+            })?;
+            routines
+                .code
+                .factory(principal, &record)
+                .await
+                .map_err(|_| {
+                    Status::permission_denied("session run has no current host authority")
+                })?
+                .with_workspace_account(account)
+        } else if remote_workspace {
+            workspace_factory
+        } else {
+            return Ok(self.sessions.clone());
+        };
         Ok(self
             .sessions
             .clone()
@@ -315,6 +336,8 @@ where
         &self,
         inference_settings: Option<waltr::grpc::waltr::session::v1::InferenceSettingsRequest>,
         agent_name: Option<&str>,
+        workspace: Option<&waltr::grpc::waltr::session::v1::WorkspaceSelection>,
+        account: Option<WorkspaceAccount>,
     ) -> Result<(AgentSession, Configuration, String), Status> {
         let config = self.load_config().await;
         let inference_settings =
@@ -332,11 +355,11 @@ where
                 .map_err(|_| Status::internal("invalid agent configuration"))?,
         );
         request.metadata_values = BTreeMap::default();
-        let session = self
-            .sessions
-            .create(request)
-            .await
-            .map_err(agent_error_to_status)?;
+        let session = (*self.runtime_factory)
+            .clone()
+            .with_workspace_account(account)
+            .create_with_workspace(&self.sessions, request, workspace, None)
+            .await?;
         Ok((session, config, default_agent_name))
     }
 }
@@ -394,7 +417,7 @@ where
     }
 
     async fn create(&self, agent_name: Option<String>) -> Result<AgentSession, Status> {
-        self.create_session_internal(None, agent_name.as_deref())
+        self.create_session_internal(None, agent_name.as_deref(), None, None)
             .await
             .map(|(session, _, _)| session)
     }
@@ -490,6 +513,15 @@ where
         id: SessionId,
         prompt: String,
     ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        let record = self.sessions.load(&id).await?.record;
+        self.runtime_factory
+            .authorize_session_workspace(&record)
+            .await
+            .map_err(|error| {
+                AgentSessionRunError::Runtime(AgentSessionRuntimeError::FailedPrecondition(
+                    error.message().to_owned(),
+                ))
+            })?;
         self.sessions
             .submit_prompt(id, prompt, RunConflictPolicy::QueueIfActive)
             .await
@@ -709,6 +741,10 @@ where
         &self,
         request: Request<CreateSessionRequest>,
     ) -> Result<Response<CreateSessionResponse>, Status> {
+        let account = request
+            .extensions()
+            .get::<AuthenticatedPrincipal>()
+            .and_then(WorkspaceAccount::from_principal);
         let request = request.into_inner();
         tracing::info!("session create accepted");
         let agent_name = request
@@ -716,7 +752,12 @@ where
             .as_ref()
             .map(|selection| selection.agent_name.as_str());
         let (session, config, default_agent_name) = self
-            .create_session_internal(request.inference_settings, agent_name)
+            .create_session_internal(
+                request.inference_settings,
+                agent_name,
+                request.workspace.as_ref(),
+                account,
+            )
             .await?;
         tracing::Span::current().record("session_id", session.record.id.as_str());
         tracing::info!(session_id = %session.record.id.as_str(), "session create completed");
@@ -1139,10 +1180,6 @@ where
         }
         tracing::Span::current().record("session_id", session_id.as_str());
         tracing::info!("session prompt accepted");
-        self.sessions
-            .load(&session_id)
-            .await
-            .map_err(agent_error_to_status)?;
         self.request_sessions(principal, &session_id)
             .await?
             .submit_prompt(session_id, request.text, RunConflictPolicy::QueueIfActive)
@@ -1601,6 +1638,8 @@ pub(crate) fn resolve_mcp_connections(
 
 #[cfg(test)]
 mod tests {
+    #[path = "workspace_sessions.rs"]
+    mod workspace_sessions;
     use std::{
         collections::{BTreeSet, HashMap},
         fs,
@@ -1649,6 +1688,7 @@ mod tests {
                 catalog,
                 event_sink: Arc::new(crate::session::UnboundSessionEvents),
                 sandbox: sandbox.handle(),
+                workspace_machines: Default::default(),
             },
             sandbox,
         )

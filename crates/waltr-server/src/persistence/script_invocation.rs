@@ -377,6 +377,7 @@ mod tests {
                 name: "test".into(),
             },
             caller: Caller {
+                origin_machine_id: None,
                 principal: "test".into(),
                 origin: Origin::Manual,
                 ownership: Ownership::Detached,

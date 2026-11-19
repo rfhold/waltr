@@ -272,6 +272,7 @@ struct AgentHost {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct HelperArguments {
+    pub workspace: Option<crate::routine::context::WorkspaceSelection>,
     #[serde(default)]
     pub inference: super::helper::InferenceSelector,
     #[serde(default)]
@@ -293,6 +294,9 @@ impl HelperArguments {
         callback: bool,
     ) -> Result<(), PortError> {
         self.input.validate()?;
+        if self.workspace.is_some() && matches!(self.selection, HelperSelection::Restricted { .. }) {
+            return Err(PortError::Invalid);
+        }
         let selection = match &self.selection {
             HelperSelection::Named { name } => format!("helper.named.{name}"),
             HelperSelection::Restricted { profile } => format!("helper.restricted.{profile}"),
@@ -575,6 +579,7 @@ impl HostDispatcher for AgentHost {
                     let result = helpers
                         .run_with_inputs(
                             HelperRequest {
+                                workspace: args.workspace.map(Into::into),
                                 selection: args.selection,
                                 task: args.task,
                                 capture: args.capture,

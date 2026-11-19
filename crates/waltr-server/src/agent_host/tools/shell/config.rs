@@ -65,7 +65,8 @@ impl ShellConfig {
         RootHintsMiddleware::new(
             vec![SHELL_TOOL_NAME.to_owned()],
             format!(
-                " Relative workdirs and path-like command arguments resolve from root: {}.",
+                " Default working directory: {}. Workspace export root: {}.",
+                self.default_workdir.display(),
                 root.display()
             ),
         )
@@ -100,7 +101,7 @@ impl ShellConfig {
                     },
                     "workdir": {
                         "type": "string",
-                        "description": "Optional working directory. Relative paths resolve under the configured root."
+                        "description": "Optional working directory, absolute or relative to the session working directory."
                     }
                 },
                 "required": ["command", "description"],

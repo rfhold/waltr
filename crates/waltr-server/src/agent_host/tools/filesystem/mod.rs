@@ -29,7 +29,11 @@ impl FilesystemConfig {
             .collect()
     }
 
-    pub(crate) fn root_hints_middleware(&self, model: &ModelRef) -> RootHintsMiddleware {
+    pub(crate) fn root_hints_middleware(
+        &self,
+        model: &ModelRef,
+        cwd: Option<&std::path::Path>,
+    ) -> RootHintsMiddleware {
         let tool_names = self
             .exposed_tools(model)
             .all()
@@ -38,10 +42,10 @@ impl FilesystemConfig {
             .collect();
         RootHintsMiddleware::new(
             tool_names,
-            format!(
+            cwd.map_or_else(|| format!(
                 " Paths resolve relative to the filesystem root unless absolute. Filesystem root: {}. Use path '.' or omit optional path fields to search the root. You may use absolute paths or '..' when needed;",
                 self.root.display()
-            ),
+            ), |cwd| format!(" Filesystem root: {}. Relative paths start in {}.", self.root.display(), cwd.display())),
         )
     }
 }

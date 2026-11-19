@@ -286,6 +286,7 @@ async fn run_speech_example(undrained: bool) {
             definition,
             "run".into(),
             Caller {
+                origin_machine_id: None,
                 principal: "owner".into(),
                 origin: Origin::Interactive,
                 ownership: Ownership::Leased,
@@ -507,7 +508,8 @@ async fn tool_streams_media_queue_termination_joins_and_preserves_reusable_capac
             .invoke(
                 definition,
                 "run".into(),
-                Caller {
+            Caller {
+                origin_machine_id: None,
                     principal: "owner".into(),
                     origin: Origin::Interactive,
                     ownership: Ownership::Leased,

@@ -89,6 +89,7 @@ async fn generic_program_through_assembled_production_constructor_commits_and_st
         let definitions = client.watch_definitions(p::WatchDefinitionsRequest {}).await.unwrap().into_inner().message().await.unwrap().unwrap();
         let definition = definitions.definitions.iter().find(|definition| definition.name == "primitive-program").unwrap();
         let invocation = client.start_invocation(p::StartInvocationRequest { selection:Some(p::InvocationSelection {
+            origin_machine_id: None,
             routine:"primitive-program".into(),revision:definition.revision.clone(),entrypoint:"run".into(),
             parameters:Some(p::StructuredValue { json:b"null".to_vec() }),correlation:"generic-primitives".into(),source_session:Some(source_id.as_str().into()),
         }) }).await.unwrap().into_inner().invocation.unwrap();

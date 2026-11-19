@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     access_auth::AuthenticatedPrincipal,
+    agent_host::sandbox_gateway::WorkspaceAccount,
     routine::{
         adapters::{
             authorized_tools::{
@@ -293,6 +294,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
             {
                 return Err(PortError::Denied);
             }
+            let factory = Arc::new(factory.as_ref().clone().with_workspace_account(
+                WorkspaceAccount::from_principal(&request.authenticated),
+            ));
             let snapshot = state.snapshot();
             let name = &request.definition.envelope().name;
             if !snapshot
@@ -317,6 +321,15 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     .await
                     .map_err(|_| PortError::Denied)?
                     .record;
+                if factory.session_roles.source_excluded(&record) {
+                    return Err(PortError::Denied);
+                }
+                if tool_admitted {
+                    factory
+                        .authorize_session_workspace(&record)
+                        .await
+                        .map_err(|_| PortError::Denied)?;
+                }
                 let approved_original = match approved_context {
                     Some(evidence) => {
                         restriction = evidence.consume(&request, &record)?;
@@ -334,9 +347,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                             .await?
                             .session_factory(sessions.clone()),
                     );
-                }
-                if factory.session_roles.source_excluded(&record) {
-                    return Err(PortError::Denied);
                 }
                 if !tool_admitted {
                     restriction = factory
@@ -362,14 +372,17 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         return Err(PortError::Denied);
                     }
                     let pinned = if let Some(pinned) = pinned_context {
-                        Ok(Arc::new(pinned.with_original_ceiling(original_allowed)))
+                        Ok(pinned
+                            .with_original_ceiling(original_allowed)
+                            .with_session_coordinator(sessions.clone()))
                     } else if caps.contains("context.continue") {
-                        CoordinatorContext::pin_paused(sessions.clone(), &id, &request.principal, original_allowed).await.map(Arc::new)
+                        CoordinatorContext::pin_paused(sessions.clone(), &id, &request.principal, original_allowed).await
                     } else {
-                        CoordinatorContext::pin(sessions.clone(), &id, &request.principal, original_allowed).await.map(Arc::new)
+                        CoordinatorContext::pin(sessions.clone(), &id, &request.principal, original_allowed).await
                     };
                     match pinned {
                         Ok(pinned) => {
+                            let pinned = Arc::new(pinned.with_workspace_factory(factory.clone()));
                             if !pinned.snapshot_identity().is_some_and(|identity| identity.matches(&record)) {
                                 return Err(PortError::Conflict);
                             }
@@ -406,6 +419,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 let helper_principal = request.principal.clone();
                 let helper_restriction = restriction.clone();
                 let helper_catalog = snapshot.clone();
+                let source_bundle = bundle.clone();
                 let helpers = Arc::new(move || {
                     Ok(Arc::new(
                         CoordinatorHelperRunner::new(
@@ -418,6 +432,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                             helper_principal.clone(),
                         )?
                         .with_catalog(helper_catalog.clone(), helper_inference.clone())
+                        .with_source_definition(source_bundle.clone())
                         .with_permission_restriction(helper_restriction.clone()),
                     ) as Arc<dyn HelperRunner>)
                 });
@@ -458,7 +473,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     copy,
                     request.principal.clone(),
                 )?
-                .with_catalog(snapshot.clone(), inference.clone());
+                .with_catalog(snapshot.clone(), inference.clone())
+                .with_source_definition(bundle.clone());
             let helpers = Arc::new(if !media || request.source_session.is_some() || tool_admitted {
                 helpers.with_permission_restriction(restriction.clone())
             } else { helpers });
@@ -615,9 +631,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> LazyTools<S> {
         let mut request = SessionCreateRequest::new(SessionId::generate());
         request.inference_settings = Some(match &self.inference { Some(inference) => inference.clone(), None => default_inference(&self.catalog)? });
         request.agent_definition = self.bundle.clone();
-        let created = self
-            .sessions
-            .create(request)
+        let created = self.factory
+            .create_with_workspace(&self.sessions, request, None, self.bundle.as_ref())
             .await
             .map_err(|_| PortError::Unavailable)?;
         let record = created.record;

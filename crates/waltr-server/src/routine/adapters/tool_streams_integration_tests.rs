@@ -451,6 +451,7 @@ async fn tool_streams_live_ask_denial_has_no_queue_effect_and_allow_resumes_orig
         let cancel = CancellationToken::new();
         let run = helpers.run(
             HelperRequest {
+                workspace: None,
                 selection: if named {
                     HelperSelection::Named {
                         name: "writer".into(),
@@ -606,6 +607,7 @@ async fn tool_streams_declarations_do_not_grant_permission_and_collisions_fail_c
         helpers
             .run(
                 HelperRequest {
+                    workspace: None,
                     selection: HelperSelection::Restricted {
                         profile: "writer".into()
                     },

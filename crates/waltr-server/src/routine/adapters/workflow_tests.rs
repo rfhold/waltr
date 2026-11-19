@@ -452,6 +452,7 @@ async fn fork_workflow_starts_exact_captured_destination_and_preserves_it_on_sta
         effective
             .run(
                 HelperRequest {
+                    workspace: None,
                     selection: HelperSelection::Restricted {
                         profile: "compaction".into(),
                     },

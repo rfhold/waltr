@@ -79,7 +79,7 @@ See the [speech provider contract](architecture/config.md#speech-provider-contra
 
 ## Workspace Worker Deployment
 
-Standalone Waltr uses one local worker for workspace filesystem, context, skills, patch, and optional shell operations. The server hosts the private sandbox gateway; the separate worker connects over a Unix domain socket (UDS). Configure both processes with absolute paths:
+Every installation requires a default worker named `local` for workspace filesystem, context, skills, patch, and optional shell operations. In a standalone sidecar deployment, the server hosts the private sandbox gateway; the worker connects over a Unix domain socket (UDS). Configure both processes with absolute paths:
 
 | Process | Setting | Standalone value | Purpose |
 | --- | --- | --- | --- |
@@ -88,9 +88,34 @@ Standalone Waltr uses one local worker for workspace filesystem, context, skills
 | Worker | `WALTR_SANDBOX_SOCKET` | `/run/waltr-sandbox/gateway.sock` | Connect to the server's gateway on the shared socket directory. |
 | Worker | `WALTR_SANDBOX_WORKSPACE_ROOT` | `/workspace` | Workspace tree visible to workspace tools in the worker. |
 
-Mount a writable socket directory at `/run/waltr-sandbox` in both processes with permissions allowing their runtime identities to connect; share the socket directory, not a TCP port. Mount the workspace at `/workspace` in the worker. Keep server persistence (`/data`), resource overrides, credentials, and projected secrets outside the worker mount. Server startup preflight checks known configured host-owned paths for overlap with the workspace, including canonicalized existing parents; it does not recursively audit arbitrary workspace content. The worker's canonical root must agree with the server's selected workspace root. Standalone deployments must set the socket to use the separate process; embedded Tauri hosts always use in-process duplex transport and explicit app-private workspace paths, ignoring these environment overrides.
+Mount a writable socket directory at `/run/waltr-sandbox` in both processes with permissions that let their runtime identities connect. Share the socket directory, not a TCP port. Mount the workspace at `/workspace` in the worker. The worker's canonical root must match the server's selected workspace root. Standalone deployments must set the socket to use the separate process. Embedded Tauri hosts use in-process duplex transport and explicit app-private workspace paths.
 
 Compose defines static `dev`, `test`, and `test-auth` profiles, not a dynamic worker-mode profile. The worker is an internal service in each profile; server/test health gates must wait for a working connection. The test fixtures keep `/data` and workspace state ephemeral. A lost UDS stream makes `/ready` fail until the same worker reconnects, while `/health` continues to report server liveness; a worker that cannot connect during startup fails startup rather than silently moving workspace operations into the server. See [Private Workspace Boundary](architecture/agent.md#private-workspace-boundary) for request deadlines, reconnect, and unknown-outcome handling.
+
+### Export a workspace to another Waltr server
+
+The exporting server's worker opens an outbound HTTP/2 connection. The destination sends workspace operations over that connection. Neither machine needs a public worker port.
+
+**Destination.** The [OIDC deployment](#oidc-access-domains) serves `/waltr.sandbox.v1.SandboxService/Connect` on the main API listener. Configure the HTTPS proxy to forward this bidirectional gRPC stream over HTTP/2 and preserve its `Authorization` header. The destination's advertised native OAuth client must support the device grant.
+
+**Exporter.** Add `.waltr/resources/workspace-bindings/laptop.yaml` to the exporting server's configuration:
+
+```yaml
+apiVersion: waltr.dev/v1alpha1
+kind: WorkspaceBinding
+metadata:
+  name: laptop
+spec:
+  endpoint: https://waltr.example
+  machineId: laptop
+  exportRoot: ~/repos
+```
+
+On the exporting server, select the binding in Config and choose **Authorize**. Follow the device sign-in instructions for the destination. The exporting server keeps and refreshes the grant outside YAML. Reset authorization or remove the binding to stop the export. Desktop profile switches do not stop a running server's exports.
+
+Use HTTPS without a path prefix, URL credentials, query, or fragment. A machine ID identifies one peer at that destination; use 1–128 ASCII letters, digits, periods, underscores, or hyphens. `local` is reserved. The worker resolves `exportRoot` in its own filesystem and expands `~` against its own home. The root sets the starting location, not a sandbox. The tool policy can allow paths outside it, and shell commands inherit the worker's operating-system permissions and mounts. For a sidecar, mount the directory in the worker.
+
+The hosted server rejects a second live connection for `laptop` and keeps the first. Another installation signed into the same account can claim the name after disconnect. The server does not redirect work to `local` or retry an uncertain execution. An offline optional peer does not affect hosted `/ready`; loss of the required default worker does.
 
 ## MCP Apps Assets And App Container
 
@@ -322,7 +347,7 @@ Routine program envelopes and selected text bodies use immutable storage, indepe
 | Variable | Contract |
 | --- | --- |
 | `WALTR_ROUTINE_OBJECT_STORE` | Optional exact `filesystem` or `s3`; default `filesystem`. |
-| `WALTR_ROUTINE_OBJECT_ROOT` | Optional absolute filesystem root outside the worker workspace. Default `$XDG_DATA_HOME/waltr/routine-objects` or `$HOME/.local/share/waltr/routine-objects`. |
+| `WALTR_ROUTINE_OBJECT_ROOT` | Optional absolute filesystem root. Default `$XDG_DATA_HOME/waltr/routine-objects` or `$HOME/.local/share/waltr/routine-objects`. |
 | `WALTR_ROUTINE_OBJECT_S3_ENDPOINT` | Required for S3: HTTPS origin; HTTP only on loopback. No credentials, path, query or fragment. |
 | `WALTR_ROUTINE_OBJECT_S3_REGION` | Required nonempty S3 region. |
 | `WALTR_ROUTINE_OBJECT_S3_BUCKET` | Required existing bucket name. |
@@ -737,8 +762,6 @@ A malformed or unreadable cache still fails startup; it does not select the buil
 
 Desktop and Android use the same ordinary bundled and persisted resource catalog. Both require the process-local workspace worker at startup. The embedded server runs the private Tonic service and worker in-process over `tokio::io::duplex`; it does not bind a worker socket or expose a public worker route. Workspace tools and context I/O have no host-side fallback. This separation does not provide operating-system isolation; desktop Bash commands have the app process's OS authority. See [agent architecture](architecture/agent.md#private-workspace-boundary).
 
-Workspace path preflight checks known configured host-owned paths against the worker root (including canonicalized existing parents of missing files). It does not recursively scan the workspace; ordinary repository files can remain in the workspace.
-
 Android is compiled without shell support. Shell-bearing definitions remain valid and inspectable, but runtime construction omits the shell tool and feature-derived shell tool permissions. Stdio MCP resources materialize and use the ordinary runtime path.
 
 These server-side capabilities differ from WebView capabilities. The WebView keeps its minimal local IPC grants on every platform.
@@ -882,7 +905,7 @@ Local source and mock-backed tests do not establish image contents or registry a
 
 The public `waltr_server::build_app(BuildAppOptions)` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and shared JavaScript invocation service, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
 
-V2 resource contracts and registries supply the accepted interaction bounds. The obsolete server `interaction_limits` fields are removed. `routine_private_parent` supplies an existing private-storage parent outside the workspace for standalone embedding hosts. Embedded composition derives this parent from its explicit Waltr database path. The owned temporary child is removed only after joined shutdown.
+V2 resource contracts and registries supply the accepted interaction bounds. The obsolete server `interaction_limits` fields are removed. For standalone embedding hosts, `routine_private_parent` supplies an existing private-storage parent. Embedded composition derives this parent from its explicit Waltr database path. The host removes the owned temporary child after joined shutdown.
 
 Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS` once as a boolean.
 

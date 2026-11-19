@@ -378,6 +378,7 @@ fn prepare(
                 json: parameters.into_bytes(),
             }),
             correlation: format!("tui-{}", editor::next_id()),
+            origin_machine_id: None,
         }),
         inputs: declarations,
     };

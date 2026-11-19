@@ -62,6 +62,79 @@ describe("config authentication status", () => {
 });
 
 describe("config authentication actions", () => {
+  test("workspace binding starts only from Authorize and follows device status without manual completion", async () => {
+    const target = { kind: "workspaceBinding", key: "export" };
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithConfig(claudeConfig());
+    snapshot.config.workspaceBindings.export = { endpoint: "https://destination.example", machineId: "worker" };
+    const status = authStatus("workspaceBinding", "export", "notConfigured", { supportedMethods: ["oauthDevice"] });
+    snapshot.auth.statuses["workspaceBinding:export"] = status;
+    let setSnapshot!: (snapshot: ClientSnapshot) => void;
+    let pending!: ClientSnapshot;
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      commands,
+      snapshot,
+      onSnapshotSetter: (setter) => { setSnapshot = setter; },
+      onDispatch: (command, current, update) => {
+        if (command.type !== "beginAuth") return current!;
+        pending = {
+          ...current!,
+          auth: {
+            ...current!.auth,
+            activeAttempt: {
+              target,
+              attemptId: "workspace-attempt",
+              authUrl: "https://example.invalid/not-for-display",
+              verificationUrl: "https://issuer.example/device",
+              userCode: "ABCD-EFGH",
+              expiresAtMs: 0n,
+              pollIntervalSeconds: 2,
+              messages: [],
+              completionMode: "serverDevicePoll",
+              registrationMethod: "unknown",
+              lifecycle: "pending",
+              failureReason: "",
+            },
+          },
+        };
+        update(pending);
+        return pending;
+      },
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Workspace Bindings" }));
+    expect(await screen.findByText("Not connected")).toBeTruthy();
+    expect(commands.some((command) => command.type === "beginAuth")).toBe(false);
+    expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Authorize" }));
+    await screen.findByRole("dialog", { name: "OAuth authorization" });
+    expect(commands.filter((command) => command.type === "beginAuth")).toEqual([{ type: "beginAuth", target }]);
+    expect(screen.getByText("ABCD-EFGH")).toBeTruthy();
+    expect(screen.getByText(/updates automatically/)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open verification URL" }).getAttribute("href")).toBe("https://issuer.example/device");
+    expect(screen.queryByText(/not-for-display/)).toBeNull();
+    expect(screen.queryByLabelText("Final redirect URL or code")).toBeNull();
+
+    setSnapshot({
+      ...pending,
+      auth: {
+        ...pending.auth,
+        activeAttempt: { ...pending.auth.activeAttempt!, lifecycle: "succeeded" },
+        statuses: { "workspaceBinding:export": { ...status, kind: "oauthConfigured" } },
+      },
+    });
+    expect(await screen.findByText("Connected")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Authorize|Reauthorize/ })).toBeNull();
+    expect(screen.queryByText("ABCD-EFGH")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(screen.getByRole<HTMLButtonElement>("button", { name: "Reset" }).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    expect(commands.some((command) => command.type === "logoutAuth")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm reset authentication for export" }));
+    expect(commands).toContainEqual({ type: "logoutAuth", target });
+  });
+
   test("restores a handed-off pending dialog and preserves its draft across dialog remount", async () => {
     const snapshot = providerAuthSnapshot(authStatus("provider", "claude", "notConfigured"));
     snapshot.auth.activeAttempt = {
@@ -345,7 +418,7 @@ function mcpAuthSnapshot(url: string): ClientSnapshot {
 }
 
 function authStatus(
-  targetKind: "provider" | "mcpServer",
+  targetKind: "provider" | "mcpServer" | "workspaceBinding",
   key: string,
   kind: string,
   overrides: Partial<AuthStatusSnapshot> = {},

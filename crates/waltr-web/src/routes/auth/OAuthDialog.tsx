@@ -5,6 +5,7 @@ import { Dialog, Field, InlineAlert } from "../../components/ui";
 import type { AuthAttemptSnapshot, ClientAuthTarget } from "../../generated/waltr-client";
 
 function targetLabel(target: ClientAuthTarget) {
+  if (target.kind === "workspaceBinding") return `workspace binding ${target.key}`;
   return target.kind === "mcpServer" ? `MCP server ${target.key}` : `provider ${target.key}`;
 }
 
@@ -23,12 +24,14 @@ function displayText(value: string) {
     : sanitized;
 }
 
-function safeAuthorizationUrl(value: string) {
+function safeAuthorizationUrl(value: string, device: boolean) {
   if (value.length > MAX_AUTH_URL_LENGTH) return undefined;
 
   try {
     const url = new URL(value);
-    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password
+    const httpAllowed = !device || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    return (url.protocol === "https:" || (httpAllowed && url.protocol === "http:"))
+      && !url.username && !url.password
       ? url.href
       : undefined;
   } catch {
@@ -37,6 +40,7 @@ function safeAuthorizationUrl(value: string) {
 }
 
 function completionModeLabel(mode: string) {
+  if (mode === "serverDevicePoll") return "Device sign-in";
   return mode === "serverCallback" ? "Server callback" : mode === "manual" ? "Manual" : "Unknown";
 }
 
@@ -56,6 +60,9 @@ function lifecycleLabel(lifecycle: string) {
 function lifecycleMessage(attempt: AuthAttemptSnapshot) {
   switch (attempt.lifecycle) {
     case "pending":
+      if (attempt.completionMode === "serverDevicePoll") {
+        return "Open the verification URL and enter the code. This dialog updates automatically.";
+      }
       return attempt.completionMode === "serverCallback"
         ? "Waiting for the server callback. This dialog updates automatically."
         : "Waiting for the final redirect URL or authorization code.";
@@ -87,9 +94,20 @@ export function OAuthDialog() {
   const terminal = createMemo(() => TERMINAL_LIFECYCLES.has(attempt()?.lifecycle ?? ""));
   const cancellable = createMemo(() => ["pending", "completing"].includes(attempt()?.lifecycle ?? ""));
   const manualInput = createMemo(() => attempt()?.completionMode === "manual" && attempt()?.lifecycle === "pending");
-  const authorizationUrl = createMemo(() => safeAuthorizationUrl(attempt()?.authUrl ?? ""));
+  const device = createMemo(() => attempt()?.completionMode === "serverDevicePoll");
+  const authorizationUrl = createMemo(() => {
+    if (device() && terminal()) return undefined;
+    return safeAuthorizationUrl(
+      (device() ? attempt()?.verificationUrl : attempt()?.authUrl) ?? "",
+      device(),
+    );
+  });
+  const userCode = createMemo(() => {
+    const code = attempt()?.userCode ?? "";
+    return device() && !terminal() && code === code.trim() && /^[ -~]{1,64}$/.test(code) ? code : undefined;
+  });
   const opaqueAuthorization = createMemo(() => (
-    Boolean(attemptId() && app.openAuthorizationAttempt()) && attempt()?.lifecycle === "pending" && !authorizationUrl()
+    !device() && Boolean(attemptId() && app.openAuthorizationAttempt()) && attempt()?.lifecycle === "pending" && !authorizationUrl()
   ));
   const busy = createMemo(() => {
     const auth = app.snapshot()?.auth;
@@ -205,11 +223,18 @@ export function OAuthDialog() {
                   </Show>
                   <Show
                     when={authorizationUrl()}
-                    fallback={opaqueAuthorization()
+                    fallback={opaqueAuthorization() || (device() && terminal())
                       ? null
                       : <InlineAlert tone="danger">Authorization URL unavailable.</InlineAlert>}
                   >
-                    {(url) => (
+                    {(url) => device() ? (
+                      <>
+                        <Show when={userCode()}>
+                          {(code) => <p>Verification code: <code>{code()}</code></p>}
+                        </Show>
+                        <code class="oauth-dialog__url">{url()}</code>
+                      </>
+                    ) : (
                       <code class="oauth-dialog__url">{url()}</code>
                     )}
                   </Show>
@@ -245,7 +270,7 @@ export function OAuthDialog() {
                   <button type="button" class="ui-button oauth-dialog__open" disabled={busy()} onClick={openOpaqueAuthorization}>Open authorization</button>
                 </Show>
               }>
-                {(url) => <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer" onClick={(event) => openAuthorization(url(), event)}>Open authorization URL</a>}
+                {(url) => <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer" onClick={(event) => openAuthorization(url(), event)}>{device() ? "Open verification URL" : "Open authorization URL"}</a>}
               </Show>
               <Show when={manualInput()}>
                 <button type="button" class="ui-button oauth-dialog__primary" disabled={busy()} onClick={complete}>Complete OAuth</button>

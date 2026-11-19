@@ -91,6 +91,7 @@ function promptFixtureSnapshot(): ClientSnapshot {
     config: {
       current: { etag: "fixture", providers: {}, mcpServers: {}, inferenceDefaults: null },
       resourceBaselines: {},
+      workspaceBindings: {},
       load: operationSnapshot("idle"),
       patch: operationSnapshot("idle"),
       reset: operationSnapshot("idle"),
@@ -145,6 +146,7 @@ function sessionView(id: string): SessionView {
   return {
     id,
     agentName: "default",
+    workspace: null,
     revision: 0n,
     status: { phase: "runningTool", suspensionKind: null, failedMessage: "", authenticationFailure: null },
     coordination: { phase: "running", reason: null, queuedCount: 0, continuationArmed: false },

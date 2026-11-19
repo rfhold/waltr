@@ -36,7 +36,8 @@
 | [src/routine/code_mode/README.md](src/routine/code_mode/README.md) | Optional principal-scoped agent/MCP code API, exact policy, durable outer association, and non-replay rules. |
 | [src/routine/rpc/](src/routine/rpc/) | Production Routine RPC adapter, principal-scoped observations, transport owners, and opaque blob grants. |
 | [src/routine_service.rs](src/routine_service.rs) | Production Routine RPC service export. |
-| [src/sandbox.rs](src/sandbox.rs) | Private gateway, standalone UDS worker connection, embedded duplex worker, readiness and shutdown; never mount it on public routes. |
+| [src/sandbox.rs](src/sandbox.rs) | Required default worker: private UDS or embedded duplex transport, readiness, and shutdown. |
+| [src/agent_host/sandbox_gateway/peers.rs](src/agent_host/sandbox_gateway/peers.rs) | Hosted OAuth `Connect` route, machine claims, and account-bound gateways. Keep the default gateway private. |
 | [src/workspace_paths.rs](src/workspace_paths.rs) | Startup checks keeping host-owned storage and config paths out of the workspace worker root. |
 | [../../docs/architecture/agent.md](../../docs/architecture/agent.md) | Canonical agent/worker private RPC and dispatch-fence contract. |
 | [../../docs/architecture/routines.md](../../docs/architecture/routines.md) | Canonical Routine lifecycle, persistence, replay, restart, and client boundary. |
@@ -147,7 +148,7 @@ Routine JavaScript owns category schemas, checkpoint keys, background excerpts, 
 
 Resources declare exact capture selections/contracts; declarations grant no helper tool permission. Preflight rejects definite capture denial before speech effects. Normal live Ask consent remains separate. JavaScript selects inference and speech models from the pinned catalog or operation defaults; verified host encoders bound attachment support.
 
-Persist and verify immutable payloads before SQL references. Keep owner/quota/state publication atomic and uncertainty non-replayable. Migration 0016 refuses populated incompatible Routine state; no converter, body fallback, automatic wipe or orphan collector exists. Embedded object roots remain explicit and outside the workspace. Preserve current namespaces unless exact deletion receives separate authorization.
+Persist and verify immutable payloads before SQL references. Keep owner/quota/state publication atomic and uncertainty non-replayable. Migration 0016 refuses populated incompatible Routine state; no converter, body fallback, automatic wipe or orphan collector exists. Embedded object roots remain explicit. Preserve current namespaces unless exact deletion receives separate authorization.
 
 `SessionCreateRequest` atomically persists a Routine destination and its exact validated first prompt. Successful creation is the prompt-durability boundary. After cancellation or start failure, retain the destination and its ID.
 

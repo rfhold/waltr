@@ -322,6 +322,7 @@ async fn named_configuration_normal_mcp_preview_commit_and_complete_candidate_gu
         let host = SessionService::from_sessions(
             sessions.clone(),
             SessionRegistrationInput {
+                workspace_machines: Default::default(),
                 workspace_root: root.clone(),
                 config: crate::config::ConfigHandle::from_resources(
                     crate::test_support::resource_state_with_overrides(&[]),

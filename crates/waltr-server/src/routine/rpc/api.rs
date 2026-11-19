@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     access_auth::AuthenticatedPrincipal,
+    agent_host::sandbox_gateway::WorkspaceAccount,
     routine::{
         definition::Trigger,
         history::{Caller, Origin, Ownership},
@@ -27,6 +28,7 @@ pub type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send
 /// Shared thin adapter; it owns no executor, provider loop or production route.
 #[derive(Clone)]
 pub struct ReadAdapter {
+    pub(crate) machines: crate::agent_host::sandbox_gateway::peers::MachineRegistry,
     /// The existing invocation owner, including its shared admission gate.
     pub service: InvocationService,
     /// Principal-scoped transactional observation reads.
@@ -51,6 +53,22 @@ pub(super) fn principal<T>(request: &Request<T>) -> Result<AuthenticatedPrincipa
         .ok_or_else(|| Status::unauthenticated("authentication required"))
 }
 impl ReadAdapter {
+    pub(super) fn origin(
+        &self,
+        requested: Option<&str>,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<String>, Status> {
+        let Some(machine) = requested else {
+            return Ok(None);
+        };
+        if WorkspaceAccount::from_principal(principal)
+            .is_some_and(|account| self.machines.owns_live(machine, &account))
+        {
+            Ok(Some(machine.to_owned()))
+        } else {
+            Err(Status::permission_denied("workspace origin unavailable"))
+        }
+    }
     /// Complete discovery snapshots under the caller's current catalog partition.
     pub async fn watch_definitions(
         &self,
@@ -134,6 +152,7 @@ impl ReadAdapter {
             .into_inner()
             .selection
             .ok_or_else(|| Status::invalid_argument("missing selection"))?;
+        let origin_machine_id = self.origin(selection.origin_machine_id.as_deref(), &principal)?;
         let (entry, input) = crate::routine::telemetry::admission_sync(
             crate::routine::telemetry::AdmissionStage::Prepare,
             || self.selection(&owner, &selection, Trigger::Manual),
@@ -163,6 +182,7 @@ impl ReadAdapter {
                 definition: entry.definition,
                 entrypoint: selection.entrypoint,
                 caller: Caller {
+                    origin_machine_id,
                     principal: owner.clone(),
                     origin: Origin::Manual,
                     ownership: Ownership::Detached,

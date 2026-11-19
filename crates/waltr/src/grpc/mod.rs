@@ -58,6 +58,54 @@ pub mod waltr {
     pub mod sandbox {
         pub mod v1 {
             include!("waltr/sandbox/v1/waltr.sandbox.v1.rs");
+
+            impl core::fmt::Debug for WorkspaceExportAccess {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.debug_struct("WorkspaceExportAccess")
+                        .finish_non_exhaustive()
+                }
+            }
+
+            impl core::fmt::Debug for WorkspaceExportApply {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.debug_struct("WorkspaceExportApply")
+                        .finish_non_exhaustive()
+                }
+            }
+
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+
+                #[test]
+                fn workspace_export_control_debug_omits_lease_and_root() {
+                    let access = WorkspaceExportAccess {
+                        access_token: "fixture-private-access".into(),
+                        expires_at_unix: 42,
+                    };
+                    for change in [
+                        workspace_export_control::Change::Apply(WorkspaceExportApply {
+                            export_root: "/fixture/private/root".into(),
+                            access: Some(access.clone()),
+                            ..Default::default()
+                        }),
+                        workspace_export_control::Change::Rotate(access),
+                    ] {
+                        let response = ConnectResponse {
+                            body: Some(connect_response::Body::WorkspaceExportControl(
+                                WorkspaceExportControl {
+                                    change: Some(change),
+                                    ..Default::default()
+                                },
+                            )),
+                        };
+                        for rendered in [format!("{response:?}"), format!("{response:#?}")] {
+                            assert!(!rendered.contains("fixture-private-access"));
+                            assert!(!rendered.contains("/fixture/private/root"));
+                        }
+                    }
+                }
+            }
         }
     }
     pub mod status {

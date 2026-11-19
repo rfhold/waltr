@@ -3,8 +3,8 @@
 This document covers workspace skills and the shared `load_skill` interface. Remote MCP Skills use separate opt-in, origin labels, and manifest-bound consent; see [MCP Skills](mcp.md#mcp-skills).
 
 Skills supply prompt/resource packages from `.agents/skills/` through a visible catalog and `load_skill`.
-Server middleware owns catalog state and presentation; the private worker owns workspace discovery and reads. Skills require opt-in.
-See [the private workspace boundary](../architecture/agent.md#private-workspace-boundary).
+Server middleware owns catalog state and presentation; the session's workspace worker discovers and reads skill files. Skills require opt-in.
+See [workspace worker selection and transport](../architecture/agent.md#private-workspace-boundary).
 
 ## Entry Points
 
@@ -85,7 +85,7 @@ Dynamic reveal depends on filesystem tools and is separate from static skills co
 - `load_skill` with `source: "local"` cannot load arbitrary paths; it can only load visible discovered skills.
 - Skill resource paths are listed, not read automatically.
 - Skill scripts are not executed by the skills implementation.
-- Server agent definitions can enable skills; there is no separate public worker route, TUI, web, or CLI skills API.
+- Server agent definitions can enable skills; there is no separate client-facing skills API.
 
 ## Tests
 

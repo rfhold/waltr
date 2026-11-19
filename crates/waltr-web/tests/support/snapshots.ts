@@ -26,6 +26,7 @@ export function snapshotWithConfig(
     catalog: emptyCatalogSnapshot(),
     config: {
       current: config,
+      workspaceBindings: {},
       resourceBaselines: resourceBaselines(config),
       load: operationSnapshot("idle"),
       patch: operationSnapshot("idle"),
@@ -188,6 +189,7 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
   return {
     id,
     agentName: "default",
+    workspace: null,
     revision: 0n,
     status: { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null },
     coordination: { phase: "ready", reason: null, queuedCount: 0, continuationArmed: false },

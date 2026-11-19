@@ -282,6 +282,7 @@ impl WaltrClient {
                 }),
                 correlation: meta.correlation,
                 source_session: meta.source_session,
+                ..Default::default()
             }),
             inputs: meta
                 .inputs

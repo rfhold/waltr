@@ -31,6 +31,7 @@ The persisted catalog root is `.waltr/resources`. It accepts these canonical pat
 | `mcp-servers/<name>.yaml` | `McpServer` |
 | `defaults/default.yaml` | `Defaults` |
 | `routines/<name>.yaml` | `Routine` |
+| `workspace-bindings/<name>.yaml` | `WorkspaceBinding` |
 
 Each file contains one strict YAML document. The category fixes `kind`. The filename stem must equal `metadata.name`.
 
@@ -44,7 +45,7 @@ Waltr does not merge resource fields. Waltr does not support aggregate patches, 
 
 ## Resource Schemas
 
-Agent, feature, permission, provider, MCP server and defaults resources use `apiVersion: waltr.dev/v1alpha1`. Production Routine resources use `apiVersion: waltr.routine/v1` with top-level `name` and `description`. The catalog rejects unknown fields and invalid path, kind, or name identities. Production rejects legacy Routine DSL overrides. Replace unsupported resources with reviewed current-schema definitions; no converter or fallback exists.
+Agent, feature, permission, provider, MCP server, defaults and workspace binding resources use `apiVersion: waltr.dev/v1alpha1`. Production Routine resources use `apiVersion: waltr.routine/v1` with top-level `name` and `description`. The catalog rejects unknown fields and invalid path, kind, or name identities. Production rejects legacy Routine DSL overrides. Replace unsupported resources with reviewed current-schema definitions; no converter or fallback exists.
 
 Agent, feature, and permission syntax is documented in [Agent Architecture](agent.md#agent-definitions).
 
@@ -53,6 +54,8 @@ Agent, feature, and permission syntax is documented in [Agent Architecture](agen
 A provider catalog selector names a models.dev provider and an `include` list. Optional `keyPrefix` and `aliases` alter materialized model keys. Waltr uses the materialized key as the session and upstream model identifier, so prefixes are functional routing identifiers rather than presentation-only namespaces.
 
 `McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command. Both forms belong to the ordinary catalog schema in every host build.
+
+`WorkspaceBinding` uses `spec.endpoint`, `spec.machineId`, and `spec.exportRoot`. The catalog rejects duplicate destination and machine pairs without accessing the worker filesystem. Start authorization explicitly from Config; credentials are not part of the resource. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
 
 `Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
 Optional `spec.sessionDictation` selects the session composer's default interaction Routine and ports:

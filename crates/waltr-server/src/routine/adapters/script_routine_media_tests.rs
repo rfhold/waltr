@@ -1436,6 +1436,7 @@ async fn vertical_with_recognition(
             definition.clone(),
             entrypoint,
             Caller {
+                origin_machine_id: None,
                 principal: "owner".into(),
                 origin: Origin::Interactive,
                 ownership: Ownership::Leased,
@@ -1522,6 +1523,7 @@ async fn vertical_with_recognition(
                     .unwrap()
                     .clone(),
                 Caller {
+                    origin_machine_id: None,
                     principal: "owner".into(),
                     origin: Origin::Interactive,
                     ownership: Ownership::Leased,

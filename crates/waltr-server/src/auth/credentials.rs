@@ -70,7 +70,7 @@ impl OAuthCredential {
     pub const fn provider_metadata(&self) -> Option<&BTreeMap<String, String>> {
         match &self.context {
             OAuthCredentialContext::Provider { metadata } => Some(metadata),
-            OAuthCredentialContext::Mcp(_) => None,
+            _ => None,
         }
     }
 
@@ -79,7 +79,7 @@ impl OAuthCredential {
     pub const fn provider_metadata_mut(&mut self) -> Option<&mut BTreeMap<String, String>> {
         match &mut self.context {
             OAuthCredentialContext::Provider { metadata } => Some(metadata),
-            OAuthCredentialContext::Mcp(_) => None,
+            _ => None,
         }
     }
 
@@ -87,8 +87,8 @@ impl OAuthCredential {
     #[must_use]
     pub fn mcp_context(&self) -> Option<&McpOAuthContext> {
         match &self.context {
-            OAuthCredentialContext::Provider { .. } => None,
             OAuthCredentialContext::Mcp(context) => Some(context.as_ref()),
+            _ => None,
         }
     }
 
@@ -96,8 +96,15 @@ impl OAuthCredential {
     #[must_use]
     pub fn mcp_context_mut(&mut self) -> Option<&mut McpOAuthContext> {
         match &mut self.context {
-            OAuthCredentialContext::Provider { .. } => None,
             OAuthCredentialContext::Mcp(context) => Some(context.as_mut()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn workspace_context(&self) -> Option<&WorkspaceBindingOAuthContext> {
+        match &self.context {
+            OAuthCredentialContext::WorkspaceBinding(context) => Some(context),
+            _ => None,
         }
     }
 }
@@ -193,6 +200,8 @@ pub enum OAuthCredentialContext {
     },
     /// MCP resource, registration, and endpoints.
     Mcp(Box<McpOAuthContext>),
+    /// Waltr native API authorization.
+    WorkspaceBinding(Box<WorkspaceBindingOAuthContext>),
 }
 
 impl std::fmt::Debug for OAuthCredentialContext {
@@ -203,7 +212,30 @@ impl std::fmt::Debug for OAuthCredentialContext {
                 .field("metadata_keys", &metadata.keys().collect::<Vec<_>>())
                 .finish(),
             Self::Mcp(context) => formatter.debug_tuple("Mcp").field(context).finish(),
+            Self::WorkspaceBinding(_) => formatter.write_str("WorkspaceBinding(<redacted>)"),
         }
+    }
+}
+
+/// Durable, account-pinned native API authorization context.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBindingOAuthContext {
+    pub(super) endpoint: url::Url,
+    pub(super) binding_fingerprint: String,
+    pub(super) publication_incarnation: Option<String>,
+    pub(super) issuer: String,
+    pub(super) subject: String,
+    pub(super) client_id: String,
+    pub(super) audience: String,
+    pub(super) required_scopes: Vec<String>,
+    pub(super) token_endpoint: url::Url,
+    pub(super) jwks_uri: url::Url,
+    pub(super) signing_algorithms: Option<Vec<String>>,
+}
+
+impl std::fmt::Debug for WorkspaceBindingOAuthContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WorkspaceBindingOAuthContext(<redacted>)")
     }
 }
 

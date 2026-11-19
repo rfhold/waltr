@@ -11,6 +11,7 @@ use crate::agent_host::{
     filesystem::FilesystemConfig,
     mcp::{McpClientRuntime, McpConfig, McpServerConfig},
     question::QuestionConfig,
+    sandbox_gateway::WorkspaceAccount,
     tools::task::TaskConfig,
 };
 #[cfg(feature = "shell")]
@@ -26,6 +27,7 @@ use waltr_agent::{
 #[cfg(test)]
 #[path = "runtime_factory/test_sandbox.rs"]
 pub(super) mod test_sandbox;
+mod workspaces;
 use std::time::{SystemTime, UNIX_EPOCH};
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -109,6 +111,11 @@ where
     fn build<'a>(&'a self, record: &'a SessionRecord) -> waltr_agent::HostRuntimeFuture<'a> {
         Box::pin(async move {
             let _lifecycle = self.lifecycle.read().await;
+            let factory = self
+                .factory
+                .for_session_workspace(record)
+                .await
+                .map_err(host_runtime_error)?;
             self.built
                 .lock()
                 .expect("host runtime lifecycle lock poisoned")
@@ -135,9 +142,10 @@ where
                     runtime_factory.with_run_coordination(events.clone(), completion.clone());
             }
             let sessions = self.sessions.clone().with_runtime_factory(runtime_factory);
-            self.factory
-                .runtime_for_session(record, sessions, mcp)
+            factory
+                .runtime_from_workspace(record, sessions, mcp)
                 .await
+                .map(|(runtime, _)| runtime)
                 .map_err(host_runtime_error)
         })
     }
@@ -157,6 +165,11 @@ where
                     message: "session changed during discovery preparation".into(),
                 });
             }
+            let factory = self
+                .factory
+                .for_session_workspace(record)
+                .await
+                .map_err(host_runtime_error)?;
             let mcp = self
                 .factory
                 .mcp_registry
@@ -164,8 +177,8 @@ where
                 .await
                 .ok()
                 .flatten();
-            self.factory
-                .runtime_with_dispatcher(record, self.sessions.clone(), mcp)
+            factory
+                .runtime_from_workspace(record, self.sessions.clone(), mcp)
                 .await
                 .map(|(runtime, _)| runtime)
                 .map_err(host_runtime_error)
@@ -310,6 +323,8 @@ pub struct ServerAgentRuntimeFactory {
     pub root: PathBuf,
     /// Required worker connection for workspace-dependent runtime behavior.
     pub sandbox: crate::agent_host::sandbox_gateway::SandboxHandle,
+    workspace_machines: super::sandbox_gateway::peers::MachineRegistry,
+    workspace_account: Option<WorkspaceAccount>,
     /// Credential store used for provider auth.
     pub credential_store: CredentialStore,
     outbound_oauth_loopback_test_mode: bool,
@@ -388,6 +403,7 @@ impl ServerAgentRuntimeFactory {
                 serde_json::from_value::<AgentDefinitionBundle>(configuration.clone())).transpose()?;
             let old = current.as_ref().map_or_else(|| self.default_agent_name().to_owned(),
                 |bundle| bundle.agent_name.clone());
+            next.workspace = current.as_ref().and_then(|bundle| bundle.workspace.clone());
             let pending = current.as_ref().and_then(|bundle| bundle.pending_switch_audit.as_ref());
             let emitted = pending.is_some_and(|audit| record.timeline_events().any(|event|
                 matches!(&event.content, waltr_agent::TimelineContent::Json { value }
@@ -520,6 +536,8 @@ impl ServerAgentRuntimeFactory {
             session_roles: super::session_roles::SessionRoles::default(),
             root,
             sandbox,
+            workspace_machines: Default::default(),
+            workspace_account: None,
             credential_store,
             outbound_oauth_loopback_test_mode: false,
             trusted_mcp_oauth_origins: Vec::new(),
@@ -679,9 +697,13 @@ impl ServerAgentRuntimeFactory {
         mut builder: HostRuntimeBuilder,
         definition: &ResolvedAgent,
     ) -> HostRuntimeBuilder {
+        let cwd = self
+            .sandbox
+            .scope()
+            .map_or_else(|| self.root.clone(), |scope| scope.cwd());
         builder = builder
             .with_sandbox(self.sandbox.clone())
-            .with_template_base_dir(self.root.clone())
+            .with_template_base_dir(cwd.clone())
             .without_file_templates();
         if let Some(prompt) = definition.system_prompt.as_ref() {
             builder = builder.with_system_prompt(prompt.clone());
@@ -697,8 +719,8 @@ impl ServerAgentRuntimeFactory {
             }
             builder = builder.with_filesystem_tools(config);
             if filesystem.system_prompt {
-                builder = builder
-                    .with_filesystem_system_prompt(FilesystemPromptConfig::new(self.root.clone()));
+                builder =
+                    builder.with_filesystem_system_prompt(FilesystemPromptConfig::new(cwd.clone()));
             }
         }
         if definition
@@ -707,10 +729,10 @@ impl ServerAgentRuntimeFactory {
             .as_ref()
             .is_some_and(|agents| agents.system_prompt)
         {
-            builder = builder.with_agents_system_prompt(AgentsPromptConfig::new(self.root.clone()));
+            builder = builder.with_agents_system_prompt(AgentsPromptConfig::new(cwd.clone()));
         }
         if definition.features.skills.is_some() {
-            builder = builder.with_skills(SkillsConfig::new(self.root.clone()));
+            builder = builder.with_skills(SkillsConfig::new(cwd.clone()));
         }
         if definition.permissions.iter().any(|entry| {
             matches!(&entry.selector, AgentPermissionSelector::Name(name) if name == "question")
@@ -720,10 +742,13 @@ impl ServerAgentRuntimeFactory {
 
         #[cfg(feature = "shell")]
         if let Some(shell) = definition.features.shell.as_ref() {
-            builder = builder.with_shell_tool(ShellConfig::new(self.root.clone()));
+            builder = builder.with_shell_tool(
+                ShellConfig::new(self.root.clone()).with_default_workdir(cwd.clone()),
+            );
             if shell.system_prompt {
-                builder =
-                    builder.with_shell_system_prompt(ShellPromptConfig::new(self.root.clone()));
+                builder = builder.with_shell_system_prompt(
+                    ShellPromptConfig::new(self.root.clone()).with_default_workdir(cwd),
+                );
             }
         }
         builder
@@ -831,42 +856,42 @@ impl ServerAgentRuntimeFactory {
         policy
     }
 
-    fn apply_definition_permission(&self, mut policy: PermissionPolicy, name: String, permission: &ResolvedPermission) -> PermissionPolicy {
-                let selector = PermissionToolSelector::exact(name);
-                match permission {
-                    ResolvedPermission::Tool(effect) => {
-                        policy = policy.with_tool_rule(selector, effect.clone());
-                    }
-                    ResolvedPermission::Resources(resources) => {
-                        for rule in &resources.paths {
-                            let pattern = match &rule.pattern {
-                                crate::agent_host::PermissionPathPattern::OutsideRoot(_) => {
-                                    crate::agent_host::PermissionPathPattern::OutsideRoot(
-                                        self.root.clone(),
-                                    )
-                                }
-                                pattern => pattern.clone(),
-                            };
-                            policy = policy.with_directory_rule(
-                                selector.clone(),
-                                pattern,
-                                rule.effect.clone(),
-                            );
+    fn apply_definition_permission(
+        &self,
+        mut policy: PermissionPolicy,
+        name: String,
+        permission: &ResolvedPermission,
+    ) -> PermissionPolicy {
+        let selector = PermissionToolSelector::exact(name);
+        match permission {
+            ResolvedPermission::Tool(effect) => {
+                policy = policy.with_tool_rule(selector, effect.clone());
+            }
+            ResolvedPermission::Resources(resources) => {
+                for rule in &resources.paths {
+                    let pattern = match &rule.pattern {
+                        crate::agent_host::PermissionPathPattern::OutsideRoot(_) => {
+                            crate::agent_host::PermissionPathPattern::OutsideRoot(self.root.clone())
                         }
-                        for rule in &resources.commands {
-                            policy = policy.with_command_rule(
-                                selector.clone(),
-                                rule.pattern.clone(),
-                                rule.effect.clone(),
-                            );
-                        }
-                    }
-                    ResolvedPermission::Inputs(rules) => {
-                        for rule in rules {
-                            policy = policy.with_input_rule(selector.clone(), rule.clone());
-                        }
-                    }
+                        pattern => pattern.clone(),
+                    };
+                    policy =
+                        policy.with_directory_rule(selector.clone(), pattern, rule.effect.clone());
                 }
+                for rule in &resources.commands {
+                    policy = policy.with_command_rule(
+                        selector.clone(),
+                        rule.pattern.clone(),
+                        rule.effect.clone(),
+                    );
+                }
+            }
+            ResolvedPermission::Inputs(rules) => {
+                for rule in rules {
+                    policy = policy.with_input_rule(selector.clone(), rule.clone());
+                }
+            }
+        }
         policy
     }
 
@@ -906,6 +931,7 @@ impl ServerAgentRuntimeFactory {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn runtime_for_session<S>(
         &self,
         record: &SessionRecord,
@@ -929,8 +955,9 @@ impl ServerAgentRuntimeFactory {
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
+        let factory = self.for_session_workspace(record).await?;
         let mcp = self.mcp_registry.runtime(self, record, &sessions).await?;
-        self.runtime_with_dispatcher(record, sessions, mcp).await
+        factory.runtime_from_workspace(record, sessions, mcp).await
     }
 
     pub(crate) async fn runtime_with_dispatcher<S>(
@@ -942,8 +969,22 @@ impl ServerAgentRuntimeFactory {
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        let mut factory = self.clone();
-        factory.root = self.sandbox_root()?;
+        self.for_session_workspace(record)
+            .await?
+            .runtime_from_workspace(record, sessions, mcp_runtime)
+            .await
+    }
+
+    async fn runtime_from_workspace<S>(
+        &self,
+        record: &SessionRecord,
+        sessions: SessionCoordinator<S>,
+        mcp_runtime: Option<Arc<McpClientRuntime>>,
+    ) -> Result<(AgentRuntime, super::dispatcher::CapabilityDispatcher), AgentSessionRuntimeError>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        let factory = self;
         let settings = record.inference_settings.as_ref().ok_or_else(|| {
             AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required before prompting".to_owned(),
@@ -1106,8 +1147,7 @@ impl ServerAgentRuntimeFactory {
         record: &SessionRecord,
         mcp_runtime: Option<&Arc<McpClientRuntime>>,
     ) -> Result<PermissionPolicy, AgentSessionRuntimeError> {
-        let mut factory = self.clone();
-        factory.root = self.sandbox_root()?;
+        let factory = self.for_session_workspace(record).await?;
         let settings = record.inference_settings.as_ref().ok_or_else(|| {
             AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required".into(),
@@ -1732,18 +1772,32 @@ mod tests {
             "[{name: _helper_capture, permission: deny}]",
             "[{name: _helper_capture, permission: allow}, {name: _helper_capture, permission: deny}]",
         ] {
-            let source = format!("apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: test}}\nspec:\n  features: [{{shell: {{root: $(session.workspace.root), defaultPermissions: true}}}}]\n  permissions: {permissions}\n");
+            let source = format!(
+                "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: test}}\nspec:\n  features: [{{shell: {{root: $(session.workspace.root), defaultPermissions: true}}}}]\n  permissions: {permissions}\n"
+            );
             let bundle = AgentDefinitionBundle::new("test", vec![source]);
             let definition = bundle.resolve().unwrap();
-            for restriction in [PermissionLevel::Allow, PermissionLevel::Ask, PermissionLevel::Deny] {
+            for restriction in [
+                PermissionLevel::Allow,
+                PermissionLevel::Ask,
+                PermissionLevel::Deny,
+            ] {
                 let restriction = PermissionPolicy::new(restriction);
                 let factory = ServerAgentRuntimeFactory::new(
                     crate::agent_host::sandbox_gateway::SandboxGateway::new("test".into()).handle(),
-                    root.clone(), FileCredentialStore::new(root.join("auth.json")), definition.clone(),
-                ).with_permission_restriction(restriction.clone());
-                let expected = factory.definition_permission_policy(&definition, &model, &[]).intersection(restriction);
+                    root.clone(),
+                    FileCredentialStore::new(root.join("auth.json")),
+                    definition.clone(),
+                )
+                .with_permission_restriction(restriction.clone());
+                let expected = factory
+                    .definition_permission_policy(&definition, &model, &[])
+                    .intersection(restriction);
                 let projected = factory.helper_capture_policy(&bundle).unwrap();
-                assert_eq!(projected.evaluate_tool("_helper_capture"), expected.evaluate_tool("_helper_capture"));
+                assert_eq!(
+                    projected.evaluate_tool("_helper_capture"),
+                    expected.evaluate_tool("_helper_capture")
+                );
                 assert_eq!(projected.evaluate_tool("shell"), PermissionLevel::Deny);
             }
         }
@@ -2596,8 +2650,10 @@ spec:
         }
         assert_eq!(names.contains("shell"), cfg!(feature = "shell"));
         assert!(names.contains("question"));
-        assert!(names.iter().all(|name| !name.starts_with("capability__")
-            && !name.starts_with("waltr__capability__")));
+        assert!(
+            names.iter().all(|name| !name.starts_with("capability__")
+                && !name.starts_with("waltr__capability__"))
+        );
         assert!(!names.contains("task"));
         assert!(!names.contains("disabled_tool"));
     }

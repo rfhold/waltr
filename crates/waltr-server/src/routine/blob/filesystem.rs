@@ -9,7 +9,7 @@ pub use unix::FilesystemBlobStore;
 /// Host topology, selected by application composition rather than path existence.
 #[derive(Debug, Clone)]
 pub enum WorkspaceRoot {
-    /// Workspace on this host; require directory-descriptor identity checks.
+    /// Workspace on this host; validate it by opening directory descriptors.
     Local(std::path::PathBuf),
     /// Absolute worker identity verified by the private socket handshake.
     SocketWorker(std::path::PathBuf),
@@ -17,9 +17,9 @@ pub enum WorkspaceRoot {
 
 /// Filesystem configuration is host-only, never part of the domain port.
 pub struct FilesystemConfig {
-    /// Existing empty 0700 directory, outside the worker workspace and its mounts.
+    /// Existing empty 0700 directory.
     pub private_root: std::path::PathBuf,
-    /// Workspace exclusion boundary and explicit host topology.
+    /// Workspace path and host topology for validating it.
     pub workspace_root: WorkspaceRoot,
     /// Process-monotonic lease clock.
     pub clock: Arc<dyn Clock>,

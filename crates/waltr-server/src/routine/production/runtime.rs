@@ -44,9 +44,9 @@ pub struct ProductionInput {
     pub state: AgentDefinitionState,
     /// Explicitly initialized application databases.
     pub persistence: Persistence,
-    /// Explicit sandbox topology and workspace exclusion boundary.
+    /// Workspace identity used to construct the worker handle.
     pub workspace: WorkspaceRoot,
-    /// Existing private-storage parent outside the workspace.
+    /// Existing private-storage parent.
     pub private_parent: PathBuf,
     /// Explicit operator grants; empty denies privileged operations.
     pub authority: RoutineAuthority,
@@ -137,6 +137,7 @@ impl ProductionRuntime {
         let blob_registry =
             BlobRegistry::new(blobs.clone(), clock, history.clone(), attachments.clone());
         let catalog_authority = input.authority.clone();
+        let machines = factory.workspace_machines().clone();
         let policy = bindings::Composition::new(
             input.state.clone(),
             input.authority,
@@ -149,6 +150,7 @@ impl ProductionRuntime {
         )?;
         let rpc = RoutineRpcService::new(
             ReadAdapter {
+                machines,
                 service: invocations.clone(),
                 history,
                 catalog: catalog.clone(),

@@ -411,6 +411,7 @@ async fn run_context_workflows(race: bool) {
         let denied = client
             .start_invocation(p::StartInvocationRequest {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: "configuration".into(),
                     revision: configuration.revision.clone(),
                     entrypoint: "manual".into(),
@@ -439,6 +440,7 @@ async fn run_context_workflows(race: bool) {
         let denied = client
             .start_invocation(p::StartInvocationRequest {
                 selection: Some(p::InvocationSelection {
+                    origin_machine_id: None,
                     routine: name.into(),
                     revision: definition.revision.clone(),
                     entrypoint: "run".into(),
@@ -544,6 +546,7 @@ async fn run_context_workflows(race: bool) {
             .find(|definition| definition.name == name)
             .unwrap();
         let selection = p::InvocationSelection {
+            origin_machine_id: None,
             routine: name.into(),
             revision: definition.revision.clone(),
             entrypoint: entry.into(),
@@ -670,6 +673,7 @@ async fn run_context_workflows(race: bool) {
     let direct = client
         .start_invocation(p::StartInvocationRequest {
             selection: Some(p::InvocationSelection {
+                origin_machine_id: None,
                 routine: "configuration".into(),
                 revision: configuration.revision.clone(),
                 entrypoint: "manual".into(),

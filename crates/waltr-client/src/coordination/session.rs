@@ -26,11 +26,13 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
         SessionEvent::CreateRequested {
             operation_key,
             agent_name,
+            workspace,
         } => {
             state.set_session_create_loading(operation_key.clone());
             ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Create {
                 operation_key,
                 agent_name,
+                workspace,
             }))
         }
         SessionEvent::Created {

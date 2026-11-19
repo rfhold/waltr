@@ -8,6 +8,7 @@ pub mod speech;
 mod state;
 mod store;
 mod watcher;
+mod workspace_binding;
 
 pub use state::{
     AgentDefinitionInspection, AgentDefinitionLoadError, AgentDefinitionSnapshot,
@@ -16,6 +17,7 @@ pub use state::{
     load_default_agent_from_env,
 };
 pub use watcher::{AgentDefinitionWatcher, DefinitionWatcherHealth};
+pub use workspace_binding::WorkspaceBinding;
 
 pub(crate) use state::PublishedState;
 pub(crate) use store::provision_persisted_resource;

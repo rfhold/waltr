@@ -122,7 +122,7 @@ The MCP database and every wrapping-key version still referenced by an encrypted
 
 `routine_objects::ImmutableObjects` owns immutable program and text payloads independently of session storage. SQL retains control records, descriptors, ownership, quota charges and journals. Ordinary bounded results and unrelated SQL JSON remain SQL data.
 
-Standalone selects filesystem storage by default through `WALTR_ROUTINE_OBJECT_STORE`; `s3` selects the explicit S3 adapter. See [deployment configuration](../deployment.md#routine-payload-storage). Embedded composition supplies the database parent's `routine-objects` directory explicitly and rejects workspace overlap. It does not read standalone object-store variables.
+Standalone selects filesystem storage by default through `WALTR_ROUTINE_OBJECT_STORE`; `s3` selects the explicit S3 adapter. See [deployment configuration](../deployment.md#routine-payload-storage). Embedded composition supplies the database parent's `routine-objects` directory explicitly. It does not read standalone object-store variables.
 
 Filesystem objects use `<root>/program/<sha256>` and `<root>/text/<sha256>`. New directories use mode 0700 and files use 0600 on Unix. Durable writes sync bytes and directory entries, publish without replacement, then verify readback. S3 uses `<prefix>/routine-objects/program/<sha256>` or `text/<sha256>`, conditional `If-None-Match: *` creation and verified readback. Session-store write modes do not apply.
 

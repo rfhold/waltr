@@ -24,7 +24,8 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
-tonic = { workspace = true, features = ["transport"] }
+tonic = { workspace = true, features = ["transport", "tls-ring", "tls-webpki-roots"] }
+url.workspace = true
 tower.workspace = true
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
@@ -32,6 +33,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

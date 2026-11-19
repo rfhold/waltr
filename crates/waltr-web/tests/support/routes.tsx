@@ -45,6 +45,7 @@ export function ConfigRouteWithChildren() {
         <Route path="/mcp/edit/:server" component={ConfigMcpEditRoute} />
         <Route path="/mcp" />
         <Route path="/defaults" />
+        <Route path="/workspace-bindings" />
       </Route>
     </MemoryRouter>
   );
@@ -76,6 +77,7 @@ export function ShellRouteWithChildren(props: { reload?: () => void } = {}) {
             <Route path="/mcp/edit/:server" component={ConfigMcpEditRoute} />
             <Route path="/mcp" />
             <Route path="/defaults" />
+            <Route path="/workspace-bindings" />
           </Route>
         </Route>
       </MemoryRouter>

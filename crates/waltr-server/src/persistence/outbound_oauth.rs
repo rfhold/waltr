@@ -53,6 +53,21 @@ impl std::fmt::Debug for DurableAttemptRecord {
 }
 
 impl OutboundOAuthStore {
+    pub(crate) async fn install_workspace_credential(
+        &self,
+        target_key: &str,
+        credential: &OAuthCredential,
+    ) -> Result<bool, String> {
+        let json = encode_credential(credential)?;
+        let affected = match &self.pool {
+            PersistencePool::Sqlite(pool) => sqlx::query("INSERT INTO outbound_oauth_credentials (target_key, credential_json, revision, updated_at_ms) VALUES (?, ?, 0, ?) ON CONFLICT(target_key) DO NOTHING")
+                .bind(target_key).bind(json).bind(now_ms()).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
+            PersistencePool::PostgreSql(pool) => sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, credential_json, revision, updated_at_ms) VALUES ($1, $2, 0, $3) ON CONFLICT(target_key) DO NOTHING")
+                .bind(target_key).bind(json).bind(now_ms()).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
+        };
+        Ok(affected == 1)
+    }
+
     pub(super) const fn new(pool: PersistencePool) -> Self {
         Self { pool }
     }

@@ -393,6 +393,7 @@ async fn run_batch(
             }
         };
         let caller = Caller {
+            origin_machine_id: None,
             principal: scope.principal.clone(),
             origin: Origin::Inline,
             ownership: Ownership::Tool,

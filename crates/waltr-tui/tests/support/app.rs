@@ -762,6 +762,7 @@ pub(crate) fn session_with_phase(
     SessionView {
         id: id.to_owned(),
         agent_name: "default".to_owned(),
+        workspace: None,
         revision: 1,
         status: SessionStatusView {
             phase,
@@ -856,6 +857,7 @@ pub(crate) fn ready_snapshot() -> ClientSnapshot {
         },
         config: ConfigSnapshot {
             current: None,
+            workspace_bindings: BTreeMap::new(),
             resource_baselines: BTreeMap::new(),
             load: OperationSnapshot {
                 status: "idle",

@@ -149,10 +149,12 @@ impl HostRuntimeBuilder {
     /// Opt into filesystem tools as generic host tools.
     #[must_use]
     pub fn with_filesystem_tools(mut self, mut config: FilesystemConfig) -> Self {
+        let scope = self.sandbox.as_ref().and_then(|sandbox| sandbox.scope());
+        let cwd = scope.map(|scope| scope.cwd());
         if let Some(root) = self
             .sandbox
             .as_ref()
-            .and_then(|sandbox| sandbox.canonical_root())
+            .and_then(|sandbox| sandbox.export_root())
         {
             config.root = root;
         }
@@ -169,7 +171,7 @@ impl HostRuntimeBuilder {
             self.skills_reveal_roots.push(config.root.clone());
         }
         self.middleware_chain
-            .push(config.root_hints_middleware(&self.model));
+            .push(config.root_hints_middleware(&self.model, cwd.as_deref()));
         let sandbox = self
             .sandbox
             .clone()
@@ -211,7 +213,10 @@ impl HostRuntimeBuilder {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_filesystem_system_prompt(mut self, config: FilesystemPromptConfig) -> Self {
-        self.system_prompt = self.system_prompt.with_fragment(config.system_prompt());
+        self.system_prompt = self.system_prompt.with_fragment(match self.sandbox.as_ref().and_then(|handle| handle.scope()) {
+            Some(scope) => format!("Filesystem export root: {}. Relative paths start in the session working directory: {}.", scope.canonical_root.display(), config.root.display()),
+            None => config.system_prompt(),
+        });
         if config.include_snapshot {
             let sandbox = self
                 .sandbox
@@ -274,7 +279,7 @@ impl HostRuntimeBuilder {
         if let Some(root) = self
             .sandbox
             .as_ref()
-            .and_then(|sandbox| sandbox.canonical_root())
+            .and_then(|sandbox| sandbox.export_root())
         {
             if config.default_workdir == config.root {
                 config.default_workdir = root.clone();
@@ -300,7 +305,10 @@ impl HostRuntimeBuilder {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_shell_system_prompt(mut self, config: ShellPromptConfig) -> Self {
-        self.system_prompt = self.system_prompt.with_fragment(config.system_prompt());
+        self.system_prompt = self.system_prompt.with_fragment(match self.sandbox.as_ref().and_then(|sandbox| sandbox.scope()) {
+            Some(scope) => format!("Shell commands execute on the selected worker. The default working directory is {}. The workspace export root is {}.", scope.cwd().display(), scope.canonical_root.display()),
+            None => config.system_prompt(),
+        });
         self
     }
 

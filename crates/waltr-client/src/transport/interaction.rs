@@ -146,6 +146,10 @@ impl RoutineInteractionTransport for super::DefaultGrpcTransport {
         open: wire::InteractionOpen,
         limits: InteractionLimits,
     ) -> Result<InteractionSession, ClientError> {
+        let mut open = open;
+        if let (Some(machine), Some(selection)) = (&self.shortcut_machine, &mut open.selection) {
+            selection.origin_machine_id = Some(machine.clone());
+        }
         limits.validate_open(&open)?;
         let credentials = self.request_credentials();
         let mut client = self

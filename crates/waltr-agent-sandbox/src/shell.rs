@@ -359,7 +359,7 @@ async fn read_output(
 
 #[allow(clippy::too_many_lines)]
 pub async fn execute(
-    root: &Path,
+    workdir: &Path,
     defaults: &ShellDefaults,
     args: &Value,
     cancel: CancellationToken,
@@ -368,7 +368,6 @@ pub async fn execute(
     if cancel.is_cancelled() {
         return Err(SandboxError("shell command canceled".into()));
     }
-    let workdir = workdir(root, &defaults.default_workdir, args);
     let command = args
         .get("command")
         .and_then(Value::as_str)

@@ -447,6 +447,7 @@ mod tests {
         SessionView {
             id: "session".to_owned(),
             agent_name: "coding".to_owned(),
+            workspace: None,
             revision: 1,
             status: SessionStatusView {
                 phase: SessionPhaseView::Idle,

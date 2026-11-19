@@ -152,6 +152,7 @@ pub enum SessionTimelineWatchEvent {
 pub(super) async fn create_session<T>(
     transport: &T,
     agent_name: String,
+    workspace: Option<crate::WorkspaceSelection>,
 ) -> Result<SessionSummary, ClientError>
 where
     T: RemoteTransport,
@@ -168,18 +169,20 @@ where
         .await?
         .create_session(CreateSessionRequest {
             agent_selection: Some(AgentSelectionRequest { agent_name }),
+            workspace: workspace.map(Into::into),
             ..CreateSessionRequest::default()
         })
         .await
         .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
-    response.session.ok_or_else(|| {
-        status_error(
-            &tonic::Status::data_loss("create session response missing session"),
-            &credentials,
-        )
-    })
+    required_create_session(response.session).map_err(|error| status_error(&error, &credentials))
+}
+
+fn required_create_session(
+    session: Option<SessionSummary>,
+) -> Result<SessionSummary, tonic::Status> {
+    session.ok_or_else(|| tonic::Status::data_loss("create session response missing session"))
 }
 
 #[allow(
@@ -705,4 +708,22 @@ fn timeline_watch_update(
         sequence: response.sequence,
         event,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionSummary, required_create_session};
+
+    #[test]
+    fn create_requires_session_summary() {
+        assert_eq!(
+            required_create_session(None).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        let session = SessionSummary::default();
+        assert_eq!(
+            required_create_session(Some(session.clone())).unwrap(),
+            session
+        );
+    }
 }

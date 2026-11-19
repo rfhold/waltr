@@ -15,7 +15,6 @@ pub use inference_defaults::InferenceDefaultsSection;
 pub use mcp::{McpForm, McpFormMode, McpSection};
 pub use providers::{ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection};
 
-use waltr_client::{ClientCommand, ClientOperationView, ClientSnapshot};
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent},
@@ -23,6 +22,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
 };
+use waltr_client::{ClientCommand, ClientOperationView, ClientSnapshot};
 
 use crate::{
     app::App,
@@ -128,11 +128,18 @@ pub enum ConfigTab {
     Mcp,
     /// Inference defaults configuration section.
     InferenceDefaults,
+    /// Outbound workspace binding authorization.
+    WorkspaceBindings,
 }
 
 impl ConfigTab {
     /// The ordered set of tabs presented in the strip.
-    pub const ALL: [Self; 3] = [Self::Providers, Self::Mcp, Self::InferenceDefaults];
+    pub const ALL: [Self; 4] = [
+        Self::Providers,
+        Self::Mcp,
+        Self::InferenceDefaults,
+        Self::WorkspaceBindings,
+    ];
 
     /// The tab's display label.
     #[must_use]
@@ -141,6 +148,7 @@ impl ConfigTab {
             Self::Providers => "Providers",
             Self::Mcp => "MCP Servers",
             Self::InferenceDefaults => "Inference",
+            Self::WorkspaceBindings => "Workspace Bindings",
         }
     }
 
@@ -150,7 +158,8 @@ impl ConfigTab {
         match self {
             Self::Providers => Self::Mcp,
             Self::Mcp => Self::InferenceDefaults,
-            Self::InferenceDefaults => Self::Providers,
+            Self::InferenceDefaults => Self::WorkspaceBindings,
+            Self::WorkspaceBindings => Self::Providers,
         }
     }
 }
@@ -178,7 +187,10 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     .areas(body_area);
 
     let config_loaded = snapshot.is_some_and(|snapshot| snapshot.config.current.is_some());
-    frame.render_widget(tab_strip(active_tab, config_loaded), tabs_area);
+    frame.render_widget(
+        tab_strip(active_tab, config_loaded, app.has_workspace_bindings()),
+        tabs_area,
+    );
     ui::render_panel_gap(frame, tabs_gap);
 
     // Pending = no config data available, and no load or watch error has
@@ -234,6 +246,11 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             section.render_overlay(frame, modal_area, config);
         }
+        ConfigTab::WorkspaceBindings => {
+            if !pending && let Some(snapshot) = snapshot {
+                auth::render_workspace_bindings(frame, content_area, app, snapshot);
+            }
+        }
     }
 
     render_reset_overlay(frame, modal_area, app);
@@ -246,6 +263,9 @@ const fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
         }
         ConfigTab::InferenceDefaults => {
             "Esc back  Tab switch  m model  r reason  Enter save  Del clear"
+        }
+        ConfigTab::WorkspaceBindings => {
+            "Esc back Tab switch ↑/↓ select a authorize r reset s retry status"
         }
     }
 }
@@ -314,15 +334,23 @@ fn status_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
 }
 
 /// Render the tab strip as labeled segments on the modal surface.
-fn tab_strip(active: ConfigTab, config_loaded: bool) -> Paragraph<'static> {
+fn tab_strip(active: ConfigTab, config_loaded: bool, has_bindings: bool) -> Paragraph<'static> {
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
     for tab in ConfigTab::ALL {
+        if tab == ConfigTab::WorkspaceBindings && !has_bindings && active != tab {
+            continue;
+        }
         spans.push(ui::tab_label(tab.label(), tab == active));
         spans.push(Span::raw(" "));
     }
     if config_loaded {
-        spans.push(Span::styled("R Reset configuration", THEME.focus_style()));
+        let reset = if has_bindings || active == ConfigTab::WorkspaceBindings {
+            "R Reset"
+        } else {
+            "R Reset configuration"
+        };
+        spans.push(Span::styled(reset, THEME.focus_style()));
     }
 
     Paragraph::new(Line::from(spans)).style(THEME.panel_style())

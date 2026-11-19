@@ -155,6 +155,7 @@ pub enum ResourceKind {
     McpServer = 5,
     Defaults = 6,
     Routine = 7,
+    WorkspaceBinding = 8,
 }
 impl ResourceKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -171,6 +172,7 @@ impl ResourceKind {
             Self::McpServer => "RESOURCE_KIND_MCP_SERVER",
             Self::Defaults => "RESOURCE_KIND_DEFAULTS",
             Self::Routine => "RESOURCE_KIND_ROUTINE",
+            Self::WorkspaceBinding => "RESOURCE_KIND_WORKSPACE_BINDING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -184,6 +186,7 @@ impl ResourceKind {
             "RESOURCE_KIND_MCP_SERVER" => Some(Self::McpServer),
             "RESOURCE_KIND_DEFAULTS" => Some(Self::Defaults),
             "RESOURCE_KIND_ROUTINE" => Some(Self::Routine),
+            "RESOURCE_KIND_WORKSPACE_BINDING" => Some(Self::WorkspaceBinding),
             _ => None,
         }
     }
