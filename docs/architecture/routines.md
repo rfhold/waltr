@@ -34,6 +34,28 @@ Successful manual admission detaches execution from the request. `WatchInvocatio
 
 One application-owned `InvocationService` serves public RPCs, semantic events, completion compaction and opt-in code calls. These paths do not create another JavaScript executor or bypass the normal MCP/tool pipeline.
 
+### Select the desktop shortcut's workspace
+
+A desktop shortcut runs on the connected server unless its `routine.destination` names a saved server profile. The destination uses that profile's saved login; the app does not switch its active connection or fall back to another server. The shortcut destination does not select a workspace.
+
+The Routine can select an exported machine explicitly. If an API caller supplies an origin machine, Waltr records it only when the [OAuth account](access-authentication.md#hosted-public-and-protected-surfaces) owns the live claim. `invocation.context` exposes that value as `originMachineId`. Without an authenticated origin, the property is absent.
+
+For example, copy the [audio question Routine](../../crates/waltr-server/resources/routines/audio-ask-and-speak.yaml) as `repository-question`. Keep its interactive `ask` entrypoint, audio ports, speech defaults, and result contract. Replace `helper.named.routine-answer` with `helper.named.coding` in `spec.capabilities`; retain `helper.run` and `media.execute`. In `spec.source`, replace the `const result = await host.call('helper.run', …)` statement with:
+
+```js
+const result = await host.call('helper.run', {
+  selection: {kind: 'named', name: 'coding'},
+  inference: {from: 'defaults'},
+  workspace: {machine: 'laptop', workingDirectory: 'rfhold/waltr'},
+  task: 'Read README.md and answer this question about the repository: ' + question,
+  maxTurns: 3, deadlineMs: 60000, responseBytes: 8192, completionBytes: 16384
+});
+```
+
+Point the [audio question shortcut](../examples/routines/audio-interactions.md#audio-question-shortcut) at `repository-question` on the destination server. This path needs no source session. The shortcut's OAuth account must own the `laptop` claim, and the `coding` agent needs permission to read `README.md` in `rfhold/waltr` under the [workspace export](../deployment.md#export-a-workspace-to-another-waltr-server).
+
+`context.create` accepts the same optional `workspace` object. It requires a pinned source, an invocation-local source handle, and the `context.create` capability. The desktop origin alone supplies none of these. Without an explicit selection, source-derived sessions and named helpers inherit the source workspace. Restricted helpers do not accept workspace selection.
+
 ## Automatic Completion Admission
 
 Normal gRPC session runs capture the actual originating principal and access lease in their runtime factory. Queued runs retain that factory; different host bindings do not batch together. First-user-message title and completion compaction use this origin, excluding helper/ephemeral sessions.
@@ -144,7 +166,7 @@ See the [script API](../../crates/waltr-server/src/routine/README.md#invocation-
 
 The accepted transport, stream, workspace, result and lease budgets remain enforced by their owning registries. The obsolete server `interaction_limits` constructor field is removed; v2 registries and typed resource contracts own these bounds.
 
-Routine blob storage receives an explicit workspace topology. Local and embedded workers require a canonical local workspace and reject directory identity overlap. The private worker handshake verifies the socket worker's absolute workspace identity. That directory need not exist on the server. Host-side exclusion resolves present path prefixes and rejects storage path overlap or aliases even when the workspace is absent. Private blob operations remain descriptor-rooted. Both modes enforce ownership, ancestor modes, no-follow opens, exclusive locks, empty-root checks and quotas.
+Routine blob operations use retained directory and file descriptors. The filesystem adapter enforces ownership, ancestor modes, no-follow opens, exclusive locks, empty-root checks, and quotas. The private worker handshake separately verifies the socket worker's absolute workspace identity. That directory need not exist on the server.
 
 ### Interaction Trace Ownership
 

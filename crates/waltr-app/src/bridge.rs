@@ -1,7 +1,7 @@
 //! Rust-owned native client runtime and bounded `WebView` publication bridge.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     sync::{
         Arc, Mutex, RwLock,
@@ -449,6 +449,10 @@ enum HostRequest {
     MediaRaw(crate::native_media::RawRequest),
     Dictation(Box<crate::dictation::Job>),
     Hold(crate::native_audio::Held),
+    RetireShortcutDestination {
+        id: String,
+        reply: oneshot::Sender<()>,
+    },
     Access(waltr_client::NativeAccessAction),
     StartAccess {
         action: waltr_client::NativeAccessAction,
@@ -751,6 +755,7 @@ pub struct RuntimeBridge {
     audio: Arc<crate::native_audio::Host>,
     activity: crate::activity::ActivityTracker,
     shortcut_epoch: waltr_desktop::shortcut::IngressEpoch,
+    shortcut_destinations: Mutex<BTreeSet<String>>,
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     mobile_start_ticket: AtomicU64,
 }
@@ -920,6 +925,7 @@ impl RuntimeBridge {
             audio,
             activity,
             shortcut_epoch: waltr_desktop::shortcut::IngressEpoch::default(),
+            shortcut_destinations: Mutex::new(BTreeSet::new()),
             mobile_start_ticket: AtomicU64::new(0),
         }
     }
@@ -1094,6 +1100,15 @@ impl RuntimeBridge {
         self.audio.observe(snapshot);
     }
     #[cfg(test)]
+    pub fn synthetic_shortcut_destination(
+        &self,
+        generation: u64,
+        id: &str,
+        observation: Option<(waltr_client::ClientRoutineDefinitionSnapshot, NativeGrpcTransport, u64)>,
+    ) {
+        self.audio.observe_shortcut(generation, id, observation);
+    }
+    #[cfg(test)]
     pub fn synthetic_shortcut_failures(
         &self,
     ) -> watch::Receiver<Option<crate::activity::AudioFailure>> {
@@ -1108,6 +1123,56 @@ impl RuntimeBridge {
     }
     pub(crate) fn shortcut_ingress(&self) -> waltr_desktop::shortcut::IngressEpoch {
         self.shortcut_epoch.clone()
+    }
+    pub(crate) fn set_shortcut_destinations(&self, destinations: BTreeSet<String>) {
+        *self
+            .shortcut_destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = destinations;
+    }
+
+    pub(crate) async fn retire_shortcut_destination(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if !self
+            .shortcut_destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(id)
+        {
+            return Ok(());
+        }
+        let (requests, retiring) = {
+            // Retirement publishes its barrier under this lock before detaching a generation.
+            let retiring = self
+                .retiring
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let requests = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|running| running.requests.clone());
+            (requests, retiring.clone())
+        };
+        if let Some(requests) = requests {
+            let (reply, result) = oneshot::channel();
+            let error = || "Shortcut destination cleanup could not be verified".to_owned();
+            requests
+                .send(HostRequest::RetireShortcutDestination { id: id.to_owned(), reply })
+                .await
+                .map_err(|_| error())?;
+            result.await.map_err(|_| error())?;
+        }
+        if retiring.is_empty()
+            || tokio::task::spawn_blocking(move || retiring.iter().all(|retirement| retirement.wait()))
+                .await
+                .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err("Shortcut destination cleanup could not be verified".into())
+        }
     }
     #[allow(
         clippy::significant_drop_tightening,
@@ -1814,6 +1879,7 @@ async fn run_generation(
                 Some(HostRequest::Media(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::MediaRaw(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::Access(_) | HostRequest::Dictation(_) | HostRequest::Hold(_)) => {},
+                Some(HostRequest::RetireShortcutDestination { reply, .. }) => { drop(reply.send(())); },
                 Some(HostRequest::LogoutAccess { reply } | HostRequest::StartAccess { reply, .. }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
                     drop(reply.send(Err("embedded server is not ready".to_owned())));
@@ -1835,6 +1901,43 @@ fn gated_connection<T>(startup: PlatformStartup, connection: Option<T>) -> Optio
 enum ConnectedExit {
     Stopped,
     PermissionRequired,
+}
+
+struct ShortcutDestinationTask {
+    stop: tokio_util::sync::CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
+    held: Option<oneshot::Receiver<()>>,
+}
+impl ShortcutDestinationTask {
+    async fn stop(self) {
+        self.stop.cancel();
+        let _joined = self.watcher.await;
+        if let Some(held) = self.held {
+            let _finished = held.await;
+        }
+    }
+}
+
+fn spawn_shortcut_destinations(
+    target: &RuntimeTarget,
+    audio: &Arc<crate::native_audio::Host>,
+    generation: u64,
+) -> BTreeMap<String, ShortcutDestinationTask> {
+    use tauri::Manager as _;
+    let (Some(app), Some(profiles)) = (&target.app, &target.profiles) else {
+        return BTreeMap::new();
+    };
+    let bridge = app.state::<Arc<RuntimeBridge>>();
+    let ids = bridge.shortcut_destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = &app.state::<crate::CredentialRoot>().0;
+    ids.iter().filter(|id| *id != &target.id).filter_map(|id| {
+        let profile = profiles.get(id).ok()?;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let watcher = tokio::task::spawn_local(crate::native_auth::watch_shortcut_destination(
+            profile, root.clone(), audio.clone(), generation, stop.clone(),
+        ));
+        Some((id.clone(), ShortcutDestinationTask { stop, watcher, held: None }))
+    }).collect()
 }
 
 #[allow(
@@ -1933,6 +2036,12 @@ async fn run_connected_generation(
         })
         .unwrap_or_default();
     audio.credentials(credentials.clone());
+    audio.audio.shortcut_active_profile(
+        publisher.generation,
+        target.access.as_ref().map(|_| target.id.clone()),
+    );
+    let mut shortcut_destinations =
+        spawn_shortcut_destinations(&target, &audio.audio, publisher.generation);
     audio.audio.activity.bind(publisher.generation);
     let mut audio_failures = audio.audio.activity.failures();
     audio.audio.observe(&stream.snapshot());
@@ -2061,12 +2170,28 @@ async fn run_connected_generation(
                 }
                 Some(HostRequest::Hold(held)) => {
                     if let Some(app) = target.app.clone() {
+                        let complete = if let Some(id) = held.alternate_destination() {
+                            let Some(destination) = shortcut_destinations.get_mut(id) else { continue; };
+                            let (complete, result) = oneshot::channel();
+                            destination.held = Some(result);
+                            Some(complete)
+                        } else {
+                            None
+                        };
                         let transport = audio_transport.clone();
                         audio_tasks.spawn_local(async move {
                             use tauri::Manager as _;
-                            held.run(&transport, &app.state::<crate::audio_permissions::AudioPermissions>(), Arc::new(waltr_desktop::capture::Native)).await;
+                            held.run_routed(&transport, &app.state::<crate::audio_permissions::AudioPermissions>(), Arc::new(waltr_desktop::capture::Native)).await;
+                            drop(complete);
                         });
                     }
+                }
+                Some(HostRequest::RetireShortcutDestination { id, reply }) => {
+                    audio.audio.observe_shortcut(publisher.generation, &id, None);
+                    if let Some(destination) = shortcut_destinations.remove(&id) {
+                        destination.stop().await;
+                    }
+                    drop(reply.send(()));
                 }
                 Some(HostRequest::Dictation(job)) => {
                     if let Some(app) = target.app.clone() {
@@ -2218,6 +2343,12 @@ async fn run_connected_generation(
     media.drain().await;
     while media_tasks.join_next().await.is_some() {}
     drain_generation_audio(&audio, &mut audio_tasks, publisher.generation).await;
+    for destination in shortcut_destinations.values() {
+        destination.stop.cancel();
+    }
+    for (_, destination) in shortcut_destinations {
+        destination.stop().await;
+    }
     media.join_downloads().await;
     monitor_stop.cancel();
     let _joined = credential_monitor.await;

@@ -24,6 +24,13 @@ impl Owner {
         let config = config::Config::default();
         #[cfg(not(target_os = "android"))]
         let config = config::load_ambient().map_err(|_| "Invalid desktop client configuration")?;
+        bridge.set_shortcut_destinations(
+            config
+                .keybinds
+                .iter()
+                .filter_map(|binding| binding.routine.destination.clone())
+                .collect(),
+        );
         if config.keybinds.is_empty() {
             return Ok(Self {
                 stop,
@@ -229,8 +236,209 @@ fn route_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_permissions::{
+        AudioPermissions, PermissionBackend, PermissionReply, PermissionResult,
+    };
     use crate::{bridge::RuntimeBridge, server_controller::EmbeddedServerController};
     use shortcut::{Effective, EpochEvent, Event};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use waltr_desktop::capture;
+
+    const DESTINATION: &str = "adef0123456789abcdef0123456789ab";
+
+    struct Grant;
+    impl PermissionBackend for Grant {
+        fn request(&self, _ticket: u64, reply: PermissionReply) {
+            reply.complete(PermissionResult::Granted);
+        }
+    }
+    #[derive(Default)]
+    struct CaptureProbe(AtomicBool);
+    impl capture::Factory for CaptureProbe {
+        fn open(
+            &self,
+            _config: waltr_audio_io::Config,
+        ) -> Result<Box<dyn capture::Source>, capture::Error> {
+            self.0.store(true, Ordering::Release);
+            Err(capture::Error::Backend)
+        }
+    }
+
+    #[tokio::test]
+    async fn shortcut_destination_pins_only_its_own_catalog_and_revokes_on_change() {
+        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+        let mut receive = bridge.synthetic_shortcut_generation(1);
+        let epoch = destination_epoch(&bridge).await;
+        let default = destination_binding(None);
+        let explicit = destination_binding(Some(DESTINATION));
+        let (control, _token) = bridge.shortcut_press(epoch, default).unwrap();
+        let held = receive().unwrap();
+        assert!(held.alternate_destination().is_none());
+        assert_eq!(held.invocation().selection.revision, "revision");
+        drop((held, control));
+        assert!(bridge.shortcut_press(epoch, explicit.clone()).is_none());
+        assert!(receive().is_none());
+
+        let transport = waltr_client::NativeGrpcTransport::new("http://127.0.0.1:1");
+        let credentials = transport.credential_provider();
+        credentials
+            .replace_bearer_token("test-destination")
+            .unwrap();
+        let revision = credentials.credential_revision();
+        let mut catalog = destination_catalog("destination-revision");
+        bridge.synthetic_shortcut_destination(
+            1,
+            DESTINATION,
+            Some((catalog.clone(), transport.clone(), revision)),
+        );
+        let (_control, token) = bridge.shortcut_press(epoch, explicit.clone()).unwrap();
+        let held = receive().unwrap();
+        assert_eq!(held.alternate_destination(), Some(DESTINATION));
+        assert_eq!(held.invocation().selection.revision, "destination-revision");
+        assert!(held.invocation().selection.source_session.is_none());
+        let mut active_catalog = crate::native_media_test_support::snapshot("test");
+        active_catalog.routines.definitions.definitions[0].routine_revision = "new-active".into();
+        bridge.synthetic_shortcut_catalog(&active_catalog);
+        assert!(!token.is_cancelled());
+        catalog.definitions[0].routine_revision = "new-destination".into();
+        bridge.synthetic_shortcut_destination(1, DESTINATION, Some((catalog, transport, revision)));
+        assert!(token.is_cancelled());
+        drop(held);
+        let _ = credentials.clear_bearer_token();
+        assert!(bridge.shortcut_press(epoch, explicit.clone()).is_none());
+        assert!(receive().is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_shortcut_checks_offline_destination_before_capture() {
+        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+        let mut receive = bridge.synthetic_shortcut_generation(1);
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = waltr_client::NativeGrpcTransport::new(format!(
+            "http://{}",
+            socket.local_addr().unwrap()
+        ));
+        drop(socket);
+        let credentials = transport.credential_provider();
+        credentials
+            .replace_bearer_token("test-destination")
+            .unwrap();
+        bridge.synthetic_shortcut_destination(
+            1,
+            DESTINATION,
+            Some((
+                destination_catalog("destination-revision"),
+                transport.clone(),
+                credentials.credential_revision(),
+            )),
+        );
+        let epoch = destination_epoch(&bridge).await;
+        bridge
+            .shortcut_press(epoch, destination_binding(Some(DESTINATION)))
+            .unwrap();
+        let factory = Arc::new(CaptureProbe::default());
+        let permissions = AudioPermissions::new(1, true, Arc::new(Grant));
+        let held = receive().unwrap();
+        let active = waltr_client::NativeGrpcTransport::new("http://127.0.0.1:1");
+        held.run_routed(&active, &permissions, factory.clone())
+            .await;
+        assert!(!factory.0.load(Ordering::Acquire));
+        assert!(bridge.synthetic_shortcut_failures().borrow().is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_shortcut_preflights_the_authorized_loopback_destination() {
+        use futures_util::StreamExt as _;
+        use waltr_client::{NativeGrpcTransport, WaltrTransport as _};
+
+        let fixture = waltr_server::test_support::setup_access_auth_server();
+        let transport = NativeGrpcTransport::new(fixture.server.base_url());
+        let credentials = transport.credential_provider();
+        credentials
+            .replace_bearer_token(&fixture.access_token)
+            .unwrap();
+        let mut watch = transport
+            .watch_manual_routines("shortcut-fixture".into())
+            .await
+            .unwrap();
+        let observation = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let name = "audio-transcribe-cleanup";
+        let revision = observation
+            .definitions
+            .iter()
+            .find(|definition| definition.routine_name == name)
+            .unwrap()
+            .routine_revision
+            .clone();
+        drop(watch);
+
+        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+        let mut receive = bridge.synthetic_shortcut_generation(1);
+        bridge.synthetic_shortcut_destination(
+            1,
+            DESTINATION,
+            Some((observation, transport, credentials.credential_revision())),
+        );
+        let mut binding = destination_binding(Some(DESTINATION));
+        Arc::get_mut(&mut binding).unwrap().routine.name = name.into();
+        let epoch = destination_epoch(&bridge).await;
+        let _control = bridge.shortcut_press(epoch, binding).unwrap();
+        let held = receive().unwrap();
+        assert_eq!(held.invocation().selection.revision, revision);
+        let factory = Arc::new(CaptureProbe::default());
+        let permissions = AudioPermissions::new(1, true, Arc::new(Grant));
+        let unreachable_active = NativeGrpcTransport::new("http://127.0.0.1:1");
+        held.run_routed(&unreachable_active, &permissions, factory.clone())
+            .await;
+        assert!(factory.0.load(Ordering::Acquire));
+    }
+
+    fn destination_binding(destination: Option<&str>) -> Arc<config::Keybind> {
+        let mut config = config::parse(
+            br#"version: 1
+keybinds:
+ - id: test
+   key: Ctrl+Alt+Space
+   mode: hold
+   routine: {name: test, trigger: dictate, input: audio, output: clean-text}
+   audio: {device: default, sampleRateHz: 24000, channels: 1}
+   typing: {}
+"#,
+        )
+        .unwrap();
+        let mut binding = config.keybinds.remove(0);
+        binding.routine.destination = destination.map(str::to_owned);
+        Arc::new(binding)
+    }
+
+    async fn destination_epoch(bridge: &RuntimeBridge) -> u64 {
+        let (router, mut edges) = Router::channel_with_epoch(bridge.shortcut_ingress());
+        router
+            .effective(vec![Effective {
+                id: "test".into(),
+                trigger: "Space".into(),
+            }])
+            .unwrap();
+        router.edge("s", "s", "test", true);
+        edges.next_epoch().await.unwrap().epoch
+    }
+
+    fn destination_catalog(revision: &str) -> waltr_client::ClientRoutineDefinitionSnapshot {
+        let mut catalog = crate::native_media_test_support::snapshot("test")
+            .routines
+            .definitions;
+        catalog.definitions[0].routine_revision = revision.into();
+        waltr_client::ClientRoutineDefinitionSnapshot {
+            digest: revision.into(),
+            definitions: catalog.definitions,
+            supported_capabilities: catalog.supported_capabilities,
+            limits: catalog.limits.unwrap().into(),
+        }
+    }
 
     #[tokio::test]
     async fn presses_queued_during_press_to_talk_do_not_replay_after_cleanup() {

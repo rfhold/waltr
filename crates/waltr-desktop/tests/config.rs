@@ -8,6 +8,25 @@ use waltr_desktop::{
 const VALID: &str = "version: 1\nkeybinds:\n  - id: dictate-copy\n    key: Ctrl+Alt+Space\n    mode: hold\n    routine: { name: audio-transcribe-cleanup, trigger: dictate, input: audio, output: clean-text }\n    audio: { device: default, sampleRateHz: 24000, channels: 1 }\n    command: { argv: [pbcopy], stdin: '{{ text }}', timeoutSeconds: 10 }\n";
 
 #[test]
+fn destination_is_an_optional_saved_remote_profile_id() {
+    let config = config::parse(VALID.as_bytes()).unwrap();
+    assert_eq!(config.keybinds[0].routine.destination, None);
+
+    let yaml = |value| {
+        VALID.replace(
+            "output: clean-text }",
+            &format!("output: clean-text, destination: {value} }}"),
+        )
+    };
+    let id = "adef0123456789abcdef0123456789ab";
+    let config = config::parse(yaml(id).as_bytes()).unwrap();
+    assert_eq!(config.keybinds[0].routine.destination.as_deref(), Some(id));
+    for value in ["local", "https://host.example", "null", "''", "short"] {
+        assert!(config::parse(yaml(value).as_bytes()).is_err(), "{value}");
+    }
+}
+
+#[test]
 fn documented_typing_example_uses_cleanup_routine() {
     let config =
         config::parse(include_str!("../../../docs/examples/client.yaml").as_bytes()).unwrap();

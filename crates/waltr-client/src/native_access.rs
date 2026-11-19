@@ -94,6 +94,8 @@ pub enum NativeAccessAction {
     Logout,
     /// The server terminally rejected the current Waltr bearer credential.
     CredentialRejected,
+    /// The server terminally rejected a bearer captured at this credential revision.
+    CredentialRevisionRejected(u64),
     /// Shared client accepted a login start and assigned its attempt ID.
     AttemptStarted {
         /// Reducer-issued generation that must accompany terminal commands.
@@ -377,6 +379,36 @@ impl NativeAccessCoordinator {
         refresh_store: Arc<dyn NativeRefreshTokenStore>,
         capacity: usize,
     ) -> Self {
+        Self::spawn_bound(config, None, credentials, refresh_store, capacity)
+    }
+
+    /// Restore only a saved grant bound to the exact verified bootstrap issuer.
+    ///
+    /// The host must bind the store to the bootstrap identity. The coordinator
+    /// rejects interactive starts and never exchanges a token after an issuer change.
+    #[must_use]
+    pub fn spawn_restore_only(
+        bootstrap: NativeAccessBootstrap,
+        credentials: NativeCredentialProvider,
+        refresh_store: Arc<dyn NativeRefreshTokenStore>,
+        capacity: usize,
+    ) -> Self {
+        Self::spawn_bound(
+            bootstrap.config,
+            Some(bootstrap.issuer),
+            credentials,
+            refresh_store,
+            capacity,
+        )
+    }
+
+    fn spawn_bound(
+        config: NativeAccessConfig,
+        restore_only_issuer: Option<String>,
+        credentials: NativeCredentialProvider,
+        refresh_store: Arc<dyn NativeRefreshTokenStore>,
+        capacity: usize,
+    ) -> Self {
         let capacity = capacity.max(1);
         let (actions, action_receiver) = mpsc::channel(capacity);
         let (outputs, output_receiver) = mpsc::channel(capacity);
@@ -387,6 +419,7 @@ impl NativeAccessCoordinator {
             CoordinatorContext {
                 outputs,
                 config,
+                restore_only_issuer,
                 credentials: credentials.clone(),
                 refresh_store,
                 results,
@@ -573,6 +606,7 @@ enum RestoreResult {
 struct CoordinatorContext {
     outputs: mpsc::Sender<NativeAccessOutput>,
     config: NativeAccessConfig,
+    restore_only_issuer: Option<String>,
     credentials: NativeCredentialProvider,
     refresh_store: Arc<dyn NativeRefreshTokenStore>,
     results: mpsc::Sender<CoordinatorResult>,
@@ -619,6 +653,7 @@ async fn coordinate(
     let CoordinatorContext {
         outputs,
         config,
+        restore_only_issuer,
         credentials,
         refresh_store,
         results,
@@ -630,6 +665,7 @@ async fn coordinate(
     let restore_config = config.clone();
     let restore_outputs = outputs.clone();
     let restore_store = Arc::clone(&refresh_store);
+    let restore_only = restore_only_issuer.is_some();
     let mut restore_task = Some(OwnedTask::new(
         restore_lease,
         tokio::spawn(async move {
@@ -638,6 +674,7 @@ async fn coordinate(
                 restore_outputs,
                 restore_store,
                 restore_lease,
+                restore_only_issuer,
             )
             .await;
             drop(
@@ -668,6 +705,9 @@ async fn coordinate(
                 let Some(action) = action else { break };
                 match action {
                     NativeAccessAction::Start | NativeAccessAction::StartDevice => {
+                        if restore_only {
+                            continue;
+                        }
                         if login_start_in_progress(
                             waiting_for_attempt,
                             active_attempt.is_some(),
@@ -747,7 +787,12 @@ async fn coordinate(
                             break;
                         }
                     }
-                    NativeAccessAction::CredentialRejected => {
+                    NativeAccessAction::CredentialRevisionRejected(revision)
+                        if revision != credentials.credential_revision() =>
+                    {
+                        continue;
+                    }
+                    NativeAccessAction::CredentialRejected | NativeAccessAction::CredentialRevisionRejected(_) => {
                         telemetry::emit(Stage::Credential, Outcome::Rejected, credentials.credential_lease().generation());
                         if restore_task.is_some() {
                             abort_owned(&mut restore_task).await;
@@ -1202,6 +1247,7 @@ async fn restore(
     outputs: mpsc::Sender<NativeAccessOutput>,
     store: Arc<dyn NativeRefreshTokenStore>,
     lease: NativeCredentialLease,
+    expected_issuer: Option<String>,
 ) -> RestoreResult {
     let bytes = match load_refresh_token(store.as_ref()).await {
         Ok(None) => return RestoreResult::None,
@@ -1225,10 +1271,13 @@ async fn restore(
         Ok(client) => client,
         Err(error) => return RestoreResult::Refreshed(Err(error)),
     };
-    let discovered = match discover(&client, &config.endpoint).await {
-        Ok(discovered) => discovered,
-        Err(error) => return RestoreResult::DiscoveryFailed(error),
-    };
+    let discovered =
+        match discover_with_expected_issuer(&client, &config.endpoint, expected_issuer.as_deref())
+            .await
+        {
+            Ok((discovered, _, _)) => discovered,
+            Err(error) => return RestoreResult::DiscoveryFailed(error),
+        };
     send_progress(&outputs, NativeAccessProgress::Refreshing).await;
     let tokens = LoginTokens {
         access_token: String::new(),
@@ -1320,6 +1369,14 @@ async fn discover_with_native(
     client: &Client,
     endpoint: &str,
 ) -> Result<(DiscoveredProvider, String, Option<serde_json::Value>), NativeAuthError> {
+    discover_with_expected_issuer(client, endpoint, None).await
+}
+
+async fn discover_with_expected_issuer(
+    client: &Client,
+    endpoint: &str,
+    expected_issuer: Option<&str>,
+) -> Result<(DiscoveredProvider, String, Option<serde_json::Value>), NativeAuthError> {
     let endpoint = parse_secure_url(endpoint, "Waltr server endpoint")?;
     if endpoint.query().is_some() {
         return Err(NativeAuthError(
@@ -1354,6 +1411,11 @@ async fn discover_with_native(
     if protected.authorization_servers.len() != 1 {
         return Err(NativeAuthError(
             "protected resource metadata must select exactly one authorization server".to_owned(),
+        ));
+    }
+    if expected_issuer.is_some_and(|expected| issuer != expected) {
+        return Err(NativeAuthError(
+            "authorization server issuer differs from the saved grant".to_owned(),
         ));
     }
     let issuer_url = parse_secure_url(issuer, "authorization server issuer")?;
@@ -2443,6 +2505,7 @@ mod tests {
                 let (outputs, _output_receiver) = mpsc::channel(8);
                 let task = tokio::spawn(coordinate(receiver, result_receiver, CoordinatorContext {
                     outputs, config: test_config(), credentials: credentials.clone(),
+                    restore_only_issuer: None,
                     refresh_store: Arc::new(MockRefreshStore::default()), results: results.clone(),
                 }));
                 for _ in 0..8 { tokio::task::yield_now().await; }
@@ -3989,20 +4052,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_restoration_rediscovers_rotates_and_stop_retains_durable_token() {
+    async fn restore_only_rejects_an_issuer_change_before_exchange() {
+        let (endpoint, mut token_requests, server) = spawn_test_oauth_server().await;
+        let store = Arc::new(MockRefreshStore::default());
+        *store.token.lock().unwrap() = Some(b"saved-refresh".to_vec());
+        let credentials = NativeCredentialProvider::new();
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        let mut coordinator = NativeAccessCoordinator::spawn_restore_only(
+            NativeAccessBootstrap {
+                config,
+                issuer: "http://127.0.0.1:1".to_owned(),
+            },
+            credentials.clone(),
+            store.clone(),
+            8,
+        );
+        let mut failed = false;
+        loop {
+            match time::timeout(Duration::from_secs(3), coordinator.next_output())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished) => break,
+                NativeAccessOutput::Progress(NativeAccessProgress::Failed { error }) => {
+                    assert_eq!(error, "authorization server issuer differs from the saved grant");
+                    failed = true;
+                }
+                NativeAccessOutput::Progress(
+                    NativeAccessProgress::Restoring | NativeAccessProgress::Discovering,
+                ) => {}
+                other => panic!("unexpected restore output: {other:?}"),
+            }
+        }
+        assert!(failed);
+        assert!(token_requests.try_recv().is_err());
+        assert!(!credentials.has_bearer_token());
+        assert_eq!(
+            store.token.lock().unwrap().as_deref(),
+            Some(b"saved-refresh".as_slice())
+        );
+        coordinator.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restore_only_rotates_the_saved_grant_and_ignores_interactive_starts() {
         let (endpoint, mut token_requests, server) = spawn_test_oauth_server().await;
         let store = Arc::new(MockRefreshStore::default());
         *store.token.lock().unwrap() = Some(b"stored-refresh".to_vec());
         let credentials = NativeCredentialProvider::new();
         *store.credential_probe.lock().unwrap() = Some(credentials.clone());
         let mut config = test_config();
-        config.endpoint = endpoint;
-        let mut coordinator = NativeAccessCoordinator::spawn_with_store(
-            config,
+        config.endpoint = endpoint.clone();
+        let mut coordinator = NativeAccessCoordinator::spawn_restore_only(
+            NativeAccessBootstrap {
+                config,
+                issuer: endpoint,
+            },
             credentials.clone(),
             store.clone(),
             8,
         );
+        // Neither kind of interactive start may interrupt a restore-only coordinator.
+        let actions = coordinator.action_sender();
+        actions.send(NativeAccessAction::Start).await.unwrap();
+        actions.send(NativeAccessAction::StartDevice).await.unwrap();
 
         assert_eq!(coordinator.next_output().await, Some(NativeAccessOutput::Progress(NativeAccessProgress::Restoring)));
         assert_eq!(
@@ -4040,6 +4156,11 @@ mod tests {
             Some(b"test-refresh".as_slice())
         );
 
+        let stale_revision = credentials.credential_revision() - 1;
+        actions
+            .send(NativeAccessAction::CredentialRevisionRejected(stale_revision))
+            .await
+            .unwrap();
         coordinator.stop().await;
         assert!(!credentials.has_bearer_token());
         assert_eq!(
@@ -4433,6 +4554,7 @@ mod tests {
             CoordinatorContext {
                 outputs,
                 config,
+                restore_only_issuer: None,
                 credentials: credentials.clone(),
                 refresh_store: store.clone(),
                 results: results.clone(),

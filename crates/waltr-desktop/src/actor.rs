@@ -42,7 +42,7 @@ pub enum ActorError {
 impl<T: RoutineInteractionTransport> Actor<T> {
     /// Pin dependencies without device access. Share `gate` with future app-chat capture.
     /// # Errors
-    /// Rejects invalid config, typing without a factory, and playback before device access.
+    /// Rejects invalid config, explicit destinations, typing without a factory, and playback.
     pub fn new(
         config: Config,
         transport: T,
@@ -50,11 +50,11 @@ impl<T: RoutineInteractionTransport> Actor<T> {
         gate: AudioAdmission,
     ) -> Result<(Self, tokio::sync::watch::Receiver<Status>), ActorError> {
         config.validate().map_err(|_| ActorError::Config)?;
-        if config
-            .keybinds
-            .iter()
-            .any(|binding| binding.typing.is_some() || binding.playback.is_some())
-        {
+        if config.keybinds.iter().any(|binding| {
+            binding.routine.destination.is_some()
+                || binding.typing.is_some()
+                || binding.playback.is_some()
+        }) {
             return Err(ActorError::Unsupported);
         }
         let (status, receiver) = tokio::sync::watch::channel(Status::Idle);
@@ -74,7 +74,7 @@ impl<T: RoutineInteractionTransport> Actor<T> {
     /// Pin explicit typing capability and a synchronous identity/credential effect fence.
     /// The factory creates inert sessions; native backend authorization remains a runtime result.
     /// # Errors
-    /// Rejects invalid config or playback before shortcut registration or microphone access.
+    /// Rejects invalid config, explicit destinations, and playback before microphone access.
     pub fn with_effects(
         config: Config,
         transport: T,
@@ -87,7 +87,7 @@ impl<T: RoutineInteractionTransport> Actor<T> {
         if config
             .keybinds
             .iter()
-            .any(|binding| binding.playback.is_some())
+            .any(|binding| binding.routine.destination.is_some() || binding.playback.is_some())
         {
             return Err(ActorError::Unsupported);
         }

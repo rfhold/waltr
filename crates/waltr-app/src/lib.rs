@@ -132,6 +132,7 @@ async fn remove_server(
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         retire_native_assets(&app, None).await;
     }
+    bridge.inner().retire_shortcut_destination(&server_id).await?;
     credential_store::CredentialStore::delete_server(app.state::<CredentialRoot>().0.clone(), &server_id)
         .await
         .map_err(|_| "Secure credentials could not be removed")?;
@@ -1101,12 +1102,7 @@ pub fn run() {
             #[cfg(target_os = "android")]
             let server = android_server().clone();
             #[cfg(not(target_os = "android"))]
-            let server = {
-                let data = app.path().app_data_dir().map_err(std::io::Error::other)?;
-                let config = app.path().app_config_dir().map_err(std::io::Error::other)?;
-                let _roots = AppPrivateRoots::new(data, config).map_err(std::io::Error::other)?;
-                EmbeddedServerController::default()
-            };
+            let server = EmbeddedServerController::default();
             let bridge = Arc::new(RuntimeBridge::new(server.clone()));
             app.manage(Arc::clone(&bridge));
             app.manage(server);

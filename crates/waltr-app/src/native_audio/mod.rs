@@ -2,7 +2,10 @@
 use crate::audio_permissions::{AudioPermissions, PermissionResult};
 use crate::native_audio_telemetry as telemetry;
 use crate::native_audio_telemetry::Operation;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use waltr_client::RoutineInteractionTransport;
@@ -21,6 +24,15 @@ pub(crate) struct State {
     pub credentials: Option<waltr_client::NativeCredentialProvider>,
     pub(super) catalog: Option<catalog::Catalog>,
     pub(super) pinned: Option<catalog::Pin>,
+    shortcut_active_profile: Option<String>,
+    shortcut_catalogs: BTreeMap<String, ShortcutRoute>,
+    shortcut_pin: Option<(String, catalog::Pin, CancellationToken)>,
+}
+
+struct ShortcutRoute {
+    catalog: catalog::Catalog,
+    transport: waltr_client::NativeGrpcTransport,
+    revision: u64,
 }
 impl State {
     pub(crate) fn bind(&mut self, generation: u64) {
@@ -113,10 +125,46 @@ impl Host {
             telemetry::admission("hold", "unavailable");
             return Err("Native audio is unavailable".into());
         }
-        let catalog = state
-            .catalog
-            .as_ref()
-            .ok_or("Routine discovery is not available")?;
+        let destination = binding.routine.destination.as_deref();
+        let target = match destination {
+            None => None,
+            Some(id) if state.shortcut_active_profile.as_deref() == Some(id) => {
+                if !state
+                    .credentials
+                    .as_ref()
+                    .is_some_and(waltr_client::NativeCredentialProvider::has_bearer_token)
+                {
+                    return Err("Shortcut destination is not authenticated".into());
+                }
+                None
+            }
+            Some(id) => Some(
+                state
+                    .shortcut_catalogs
+                    .get(id)
+                    .ok_or("Shortcut destination is unavailable")?,
+            ),
+        };
+        let (catalog, transport, target_credential) = if let Some(target) = target {
+            let provider = target.transport.credential_provider();
+            if provider.credential_revision() != target.revision || !provider.has_bearer_token() {
+                return Err("Shortcut destination is not authenticated".into());
+            }
+            (
+                &target.catalog,
+                Some(target.transport.clone()),
+                Some((provider, target.revision)),
+            )
+        } else {
+            (
+                state
+                    .catalog
+                    .as_ref()
+                    .ok_or("Routine discovery is not available")?,
+                None,
+                None,
+            )
+        };
         let invocation = catalog.resolve(
             &binding.routine.name,
             &binding.routine.trigger,
@@ -130,12 +178,7 @@ impl Host {
             key: binding.key.clone(),
             mode: binding.mode,
             max_capture_seconds: binding.max_capture_seconds,
-            routine: waltr_desktop::config::Routine {
-                name: binding.routine.name.clone(),
-                trigger: binding.routine.trigger.clone(),
-                input: binding.routine.input.clone(),
-                output: binding.routine.output.clone(),
-            },
+            routine: binding.routine.clone(),
             audio: waltr_desktop::config::Audio {
                 device: binding.audio.device.clone(),
                 sample_rate_hz: binding.audio.sample_rate_hz,
@@ -198,7 +241,17 @@ impl Host {
         state.hold_feedback = Some(feedback.clone());
         let token = CancellationToken::new();
         state.active = Some(token.clone());
-        state.pinned = Some(pinned);
+        if transport.is_some() {
+            state.shortcut_pin = binding
+                .routine
+                .destination
+                .clone()
+                .map(|id| (id, pinned, token.clone()));
+            state.pinned = None;
+        } else {
+            state.shortcut_pin = None;
+            state.pinned = Some(pinned);
+        }
         state.active_revision = state
             .credentials
             .as_ref()
@@ -213,15 +266,63 @@ impl Host {
                 binding,
                 token,
                 generation: state.generation,
-                credential: state
-                    .credentials
-                    .as_ref()
-                    .map(|provider| (provider.clone(), provider.credential_revision())),
+                transport,
+                credential: target_credential.or_else(|| {
+                    state
+                        .credentials
+                        .as_ref()
+                        .map(|provider| (provider.clone(), provider.credential_revision()))
+                }),
             },
             control,
         );
         drop(state);
         Ok(result)
+    }
+    pub(crate) fn shortcut_active_profile(&self, generation: u64, id: Option<String>) {
+        let mut state = self.lock();
+        if state.generation == generation {
+            state.shortcut_active_profile = id;
+        }
+    }
+
+    pub(crate) fn observe_shortcut(
+        &self,
+        generation: u64,
+        id: &str,
+        observation: Option<(
+            waltr_client::ClientRoutineDefinitionSnapshot,
+            waltr_client::NativeGrpcTransport,
+            u64,
+        )>,
+    ) {
+        let mut state = self.lock();
+        if state.generation != generation {
+            return;
+        }
+        let next = observation.map(|(snapshot, transport, revision)| ShortcutRoute {
+            catalog: catalog::Catalog::from_definitions(snapshot),
+            transport,
+            revision,
+        });
+        if let Some((destination, pin, token)) = &state.shortcut_pin
+            && destination == id
+            && next.as_ref().is_none_or(|next| {
+                state
+                    .shortcut_catalogs
+                    .get(id)
+                    .is_none_or(|previous| previous.revision != next.revision)
+                    || !next.catalog.current(pin)
+            })
+        {
+            token.cancel();
+            state.shortcut_pin = None;
+        }
+        if let Some(next) = next {
+            state.shortcut_catalogs.insert(id.to_owned(), next);
+        } else {
+            state.shortcut_catalogs.remove(id);
+        }
     }
     pub fn observe(&self, snapshot: &waltr_client::ClientSnapshot) -> bool {
         let generation = self.lock().generation;
@@ -257,6 +358,7 @@ pub struct Held {
     binding: Arc<waltr_desktop::config::Keybind>,
     pub token: CancellationToken,
     pub generation: u64,
+    transport: Option<waltr_client::NativeGrpcTransport>,
     credential: Option<(waltr_client::NativeCredentialProvider, u64)>,
     activity: crate::activity::ActivityLease,
 }
@@ -265,6 +367,71 @@ pub struct Held {
     reason = "native interaction transports are LocalSet-owned"
 )]
 impl Held {
+    pub(crate) fn destination(&self) -> Option<&str> {
+        self.binding.routine.destination.as_deref()
+    }
+
+    pub(crate) fn alternate_destination(&self) -> Option<&str> {
+        self.transport.as_ref()?;
+        self.destination()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invocation(&self) -> &waltr_desktop::interaction::Invocation {
+        self.binding.resolved.as_ref().unwrap()
+    }
+
+    async fn verify_destination(&self, transport: &waltr_client::NativeGrpcTransport) -> bool {
+        use futures_util::StreamExt as _;
+        use waltr_client::WaltrTransport as _;
+
+        let current = || {
+            !self.token.is_cancelled()
+                && self
+                    .credential
+                    .as_ref()
+                    .is_some_and(|(provider, revision)| {
+                        provider.credential_revision() == *revision && provider.has_bearer_token()
+                    })
+        };
+        let Some(invocation) = &self.binding.resolved else {
+            return false;
+        };
+        tokio::select! {
+            biased;
+            () = self.token.cancelled() => false,
+            result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                if !current() { return false; }
+                let Ok(mut stream) = transport.watch_manual_routines("native-shortcut-check".into()).await else { return false; };
+                let Some(Ok(snapshot)) = stream.next().await else { return false; };
+                let catalog = catalog::Catalog::from_definitions(snapshot);
+                current() && catalog.current(&catalog.pin(invocation.clone(), false))
+            }) => result.unwrap_or(false),
+        }
+    }
+
+    pub(crate) async fn run_routed(
+        self,
+        active_transport: &waltr_client::NativeGrpcTransport,
+        permissions: &AudioPermissions,
+        factory: Arc<dyn capture::Factory>,
+    ) {
+        let transport = self
+            .transport
+            .clone()
+            .unwrap_or_else(|| active_transport.clone());
+        let preflight = self.destination().map(|_| &transport);
+        self.run_with_checks(
+            &transport,
+            permissions,
+            factory,
+            &waltr_desktop::typing::NativeFactory,
+            preflight,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
     pub async fn run<T: RoutineInteractionTransport>(
         self,
         transport: &T,
@@ -280,6 +447,7 @@ impl Held {
         .await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_with_typing<T: RoutineInteractionTransport>(
         self,
         transport: &T,
@@ -287,11 +455,23 @@ impl Held {
         factory: Arc<dyn capture::Factory>,
         typing: &dyn waltr_desktop::typing::Factory,
     ) {
+        self.run_with_checks(transport, permissions, factory, typing, None)
+            .await;
+    }
+
+    async fn run_with_checks<T: RoutineInteractionTransport>(
+        self,
+        transport: &T,
+        permissions: &AudioPermissions,
+        factory: Arc<dyn capture::Factory>,
+        typing: &dyn waltr_desktop::typing::Factory,
+        preflight: Option<&waltr_client::NativeGrpcTransport>,
+    ) {
         let diagnostics = self.diagnostics.clone();
         let feedback = self.feedback.clone();
         let activity = self.host.activity.clone();
         let generation = self.generation;
-        self.run_inner(transport, permissions, factory, typing)
+        self.run_inner(transport, permissions, factory, typing, preflight)
             .instrument(diagnostics.span())
             .await;
         feedback.complete(generation, &activity);
@@ -303,6 +483,7 @@ impl Held {
         permissions: &AudioPermissions,
         factory: Arc<dyn capture::Factory>,
         typing: &dyn waltr_desktop::typing::Factory,
+        preflight: Option<&waltr_client::NativeGrpcTransport>,
     ) {
         let grant = tokio::select! { biased;
             () = self.token.cancelled() => PermissionResult::Cancelled,
@@ -320,6 +501,17 @@ impl Held {
                     .is_none_or(|(provider, revision)| provider.credential_revision() == *revision)
         };
         if grant == PermissionResult::Granted && valid() {
+            if let Some(transport) = preflight
+                && !self.verify_destination(transport).await
+            {
+                if valid() {
+                    self.diagnostics.fail("destination_unavailable");
+                    self.activity.fail();
+                } else {
+                    self.diagnostics.fail("invalidated");
+                }
+                return;
+            }
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             let playback = self.binding.playback.as_ref().map(|_| {
                 crate::native_media::hold_playback::Sink::new(

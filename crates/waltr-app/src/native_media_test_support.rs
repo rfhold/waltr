@@ -124,6 +124,7 @@ pub fn snapshot(name: &str) -> ClientSnapshot {
         s.sessions.current.push(SessionView {
             id: id.into(),
             agent_name: "test".into(),
+            workspace: None,
             revision: 1,
             status: Default::default(),
             coordination: Default::default(),

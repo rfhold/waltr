@@ -4,7 +4,8 @@ use waltr_desktop::interaction::Invocation;
 
 #[derive(Clone)]
 pub(crate) struct Catalog {
-    definitions: waltr_client::RoutineDefinitionSnapshot,
+    definitions: Vec<waltr_client::ClientManualRoutineDefinition>,
+    limits: Option<waltr_client::interaction::wire::ServerLimits>,
     dictation: Option<SessionDictationView>,
     sessions: Vec<String>,
 }
@@ -14,9 +15,18 @@ pub(crate) struct Pin {
     dictation: Option<SessionDictationView>,
 }
 impl Catalog {
+    pub fn from_definitions(snapshot: waltr_client::ClientRoutineDefinitionSnapshot) -> Self {
+        Self {
+            definitions: snapshot.definitions,
+            limits: Some(snapshot.limits),
+            dictation: None,
+            sessions: Vec::new(),
+        }
+    }
     pub fn new(snapshot: &ClientSnapshot) -> Self {
         Self {
-            definitions: snapshot.routines.definitions.clone(),
+            definitions: snapshot.routines.definitions.definitions.clone(),
+            limits: snapshot.routines.definitions.limits.clone().map(Into::into),
             dictation: snapshot
                 .config
                 .current
@@ -39,7 +49,6 @@ impl Catalog {
     ) -> Result<Invocation, String> {
         let definition = self
             .definitions
-            .definitions
             .iter()
             .find(|d| d.routine_name == routine)
             .ok_or("Routine definition is not available")?;
@@ -50,11 +59,9 @@ impl Catalog {
             .map_err(|_| "Routine parameters require explicit values")?;
         Invocation::new(
             definition.clone(),
-            self.definitions
-                .limits
+            self.limits
                 .clone()
-                .ok_or("Routine limits are not available")?
-                .into(),
+                .ok_or("Routine limits are not available")?,
             entrypoint.into(),
             parameters,
             correlation,
@@ -71,13 +78,9 @@ impl Catalog {
     pub fn current(&self, pin: &Pin) -> bool {
         let selection = &pin.invocation.selection;
         self.definitions
-            .definitions
             .iter()
             .any(|d| d == &pin.invocation.limits.definition)
-            && self.definitions.limits.clone().is_some_and(|l| {
-                waltr_client::interaction::wire::ServerLimits::from(l)
-                    == pin.invocation.limits.server
-            })
+            && self.limits.as_ref() == Some(&pin.invocation.limits.server)
             && selection
                 .source_session
                 .as_ref()

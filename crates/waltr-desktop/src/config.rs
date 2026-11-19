@@ -157,6 +157,11 @@ impl Config {
             ] {
                 field(value)?;
             }
+            if binding.routine.destination.as_ref().is_some_and(|id| {
+                id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(ConfigError::Invalid("invalid saved server profile ID"));
+            }
             if binding
                 .max_capture_seconds
                 .is_some_and(|seconds| !(1..=3600).contains(&seconds))
@@ -319,7 +324,7 @@ pub enum Mode {
     Toggle,
 }
 /// User-selected Routine identifiers, independent of examples or server state.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Routine {
     /// Routine resource name.
@@ -334,6 +339,15 @@ pub struct Routine {
     /// Final text output port identifier.
     #[serde(deserialize_with = "crate::bounded::string::<_, MAX_FIELD_BYTES>")]
     pub output: String,
+    /// Saved remote server profile ID; omission uses the connected generation.
+    #[serde(default, deserialize_with = "destination")]
+    pub destination: Option<String>,
+}
+
+fn destination<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    crate::bounded::string::<D, MAX_FIELD_BYTES>(deserializer).map(Some)
 }
 /// Unambiguous backend-independent device request, encoded as a YAML string.
 #[derive(Debug, Clone, PartialEq, Eq)]

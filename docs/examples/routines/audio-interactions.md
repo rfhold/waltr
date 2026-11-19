@@ -49,6 +49,8 @@ Add this binding to the `keybinds` list in `~/.config/waltr/client.yaml` (or `$X
   playback: {}
 ```
 
+The shortcut uses the connected server. To send it to another saved server profile, add `destination: preview` inside `routine`, using that profile's ID. Sign in to that profile first; the shortcut does not switch profiles or start a login.
+
 Tap Ctrl+Alt+A, ask a question, then pause for about one second to finish recording. Playback starts when the answer is ready.
 If the mic detects no speech within five seconds, the shortcut stops without sending a request.
 Use `mode: toggle` to tap once to start capture and tap again to finish it. Silence does not stop toggle capture.
