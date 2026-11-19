@@ -244,11 +244,9 @@ impl DeviceAuthorization {
             Ok(url)
         };
         let url = parse(&self.verification_uri)?;
-        if let Some(complete) = &self.verification_uri_complete {
-            parse(complete)?;
-        }
-        // The existing Config UI displays the user code separately.
-        Ok(url)
+        self.verification_uri_complete
+            .as_deref()
+            .map_or(Ok(url), parse)
     }
 }
 

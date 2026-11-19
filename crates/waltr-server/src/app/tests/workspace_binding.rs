@@ -319,7 +319,10 @@ async fn authorize(auth: &mut AuthServiceClient<Channel>, idp: &DeviceIssuer) ->
         begin.completion_mode,
         AuthCompletionMode::ServerDevicePoll as i32
     );
-    assert_eq!(begin.verification_url, format!("{}/verify", idp.url));
+    assert_eq!(
+        begin.verification_url,
+        format!("{}/verify?code={}", idp.url, begin.user_code)
+    );
     assert_eq!(begin.user_code, "TEST-CODE");
     idp.approved.store(true, Ordering::Release);
     let status = timeout(DEADLINE, async {
@@ -587,6 +590,7 @@ impl DeviceIssuer {
             "device_code": "private-fixture-device-code",
             "user_code": "TEST-CODE",
             "verification_uri": format!("{}/verify", issuer.url),
+            "verification_uri_complete": format!("{}/verify?code=TEST-CODE", issuer.url),
             "expires_in": 65,
             "interval": 1,
         }))
