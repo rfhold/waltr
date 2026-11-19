@@ -1243,7 +1243,7 @@ impl ClientState {
             auth_url: if device {
                 String::new()
             } else {
-                safe_http_url(&attempt.auth_url).unwrap_or_default()
+                safe_auth_url(&attempt.auth_url).unwrap_or_default()
             },
             verification_url,
             user_code,
@@ -2945,6 +2945,10 @@ const fn auth_lifecycle_failure(
 }
 
 pub fn safe_http_url(value: &str) -> Option<String> {
+    parsed_http_url(value).map(Into::into)
+}
+
+fn parsed_http_url(value: &str) -> Option<url::Url> {
     if value.is_empty() {
         return None;
     }
@@ -2957,19 +2961,25 @@ pub fn safe_http_url(value: &str) -> Option<String> {
         return None;
     }
     parsed.set_fragment(None);
-    Some(parsed.into())
+    Some(parsed)
 }
 
-pub(super) fn safe_device_verification_url(value: &str) -> Option<String> {
+pub(super) fn safe_auth_url(value: &str) -> Option<String> {
+    bounded_auth_url(value).map(Into::into)
+}
+
+fn bounded_auth_url(value: &str) -> Option<url::Url> {
     if value.len() > 4096 || value.chars().any(char::is_control) {
         return None;
     }
-    let safe = safe_http_url(value)?;
-    let url = url::Url::parse(&safe).ok()?;
-    (safe.len() <= 4096
-        && (url.scheme() == "https"
-            || matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
-    .then_some(safe)
+    let url = parsed_http_url(value)?;
+    (url.as_str().len() <= 4096).then_some(url)
+}
+
+pub(super) fn safe_device_verification_url(value: &str) -> Option<String> {
+    let url = bounded_auth_url(value)?;
+    (url.scheme() == "https" || matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+        .then(|| url.into())
 }
 
 pub(super) fn safe_device_user_code(value: &str) -> String {

@@ -812,18 +812,15 @@ impl App {
             .active_attempt
             .as_ref()
             .filter(|attempt| targets_match(&attempt.target, target))?;
-        if attempt.completion_mode == "serverDevicePoll" {
+        let value = if attempt.completion_mode == "serverDevicePoll" {
             if !matches!(attempt.lifecycle.as_str(), "pending" | "completing") {
                 return None;
             }
-            let value = safe_auth_url(&attempt.verification_url)?;
-            let parsed = url::Url::parse(value).ok()?;
-            (parsed.scheme() == "https"
-                || matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
-                .then_some(value)
+            &attempt.verification_url
         } else {
-            safe_auth_url(&attempt.auth_url)
-        }
+            &attempt.auth_url
+        };
+        (!value.is_empty()).then_some(value.as_str())
     }
 
     pub(crate) const fn workspace_binding_selection(&self) -> usize {
@@ -1738,20 +1735,6 @@ impl App {
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
     }
-}
-
-fn safe_auth_url(value: &str) -> Option<&str> {
-    if value.len() > 4096 {
-        return None;
-    }
-    let url = url::Url::parse(value).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return None;
-    }
-    Some(value)
 }
 
 fn sessions_body_area() -> Rect {

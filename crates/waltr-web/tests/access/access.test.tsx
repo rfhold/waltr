@@ -582,7 +582,7 @@ describe("Waltr access", () => {
     const failure = `line\u0000break${"x".repeat(600)}`;
     renderWithAppState(() => <ShellRouteWithChildren />, {
       snapshot: outboundAuthSnapshot({
-        lifecycle: "failed",
+        lifecycle: "pending",
         authUrl: "javascript:alert(document.domain)",
         failureReason: failure,
       }),

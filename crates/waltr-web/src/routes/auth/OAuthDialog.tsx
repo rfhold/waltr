@@ -15,28 +15,12 @@ function sameTarget(left: ClientAuthTarget | undefined, right: ClientAuthTarget 
 
 const TERMINAL_LIFECYCLES = new Set(["succeeded", "failed", "expired", "canceled"]);
 const MAX_MESSAGE_LENGTH = 500;
-const MAX_AUTH_URL_LENGTH = 4096;
 
 function displayText(value: string) {
   const sanitized = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, " ").trim();
   return sanitized.length > MAX_MESSAGE_LENGTH
     ? `${sanitized.slice(0, MAX_MESSAGE_LENGTH - 1)}…`
     : sanitized;
-}
-
-function safeAuthorizationUrl(value: string, device: boolean) {
-  if (value.length > MAX_AUTH_URL_LENGTH) return undefined;
-
-  try {
-    const url = new URL(value);
-    const httpAllowed = !device || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    return (url.protocol === "https:" || (httpAllowed && url.protocol === "http:"))
-      && !url.username && !url.password
-      ? url.href
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function completionModeLabel(mode: string) {
@@ -97,10 +81,9 @@ export function OAuthDialog() {
   const device = createMemo(() => attempt()?.completionMode === "serverDevicePoll");
   const authorizationUrl = createMemo(() => {
     if (device() && terminal()) return undefined;
-    return safeAuthorizationUrl(
-      (device() ? attempt()?.verificationUrl : attempt()?.authUrl) ?? "",
-      device(),
-    );
+    const url = device() ? attempt()?.verificationUrl : attempt()?.authUrl;
+    // Shared snapshots validate destinations; the DOM sink only admits web schemes.
+    return url && /^https?:\/\//.test(url) ? url : undefined;
   });
   const userCode = createMemo(() => {
     const code = attempt()?.userCode ?? "";

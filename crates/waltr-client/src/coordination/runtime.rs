@@ -3777,7 +3777,7 @@ fn pending_auth_attempt_state(attempt: AuthAttemptSnapshot) -> Option<AuthAttemp
         auth_url: if device {
             String::new()
         } else {
-            crate::coordination::state::safe_http_url(&attempt.auth_url).unwrap_or_default()
+            crate::coordination::state::safe_auth_url(&attempt.auth_url).unwrap_or_default()
         },
         verification_url,
         user_code,
@@ -4297,6 +4297,27 @@ mod tests {
         assert!(attempt.auth_url.is_empty());
         assert!(attempt.messages.is_empty());
         assert_eq!(attempt.user_code, "ABCD-EFGH");
+    }
+
+    #[test]
+    fn restored_authorization_urls_keep_only_bounded_web_links() {
+        for (value, expected) in [
+            (
+                "https://provider.example/authorize#fragment".to_owned(),
+                "https://provider.example/authorize",
+            ),
+            ("https://user@provider.example/authorize".to_owned(), ""),
+            ("https://provider.example/author\nize".to_owned(), ""),
+            ("javascript:alert(1)".to_owned(), ""),
+            (format!("https://provider.example/{}", "x".repeat(4096)), ""),
+        ] {
+            let mut attempt = pending_attempt("manual");
+            attempt.auth_url = value;
+            assert_eq!(
+                pending_auth_attempt_state(attempt).unwrap().auth_url,
+                expected
+            );
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_SKEW: Duration = Duration::from_mins(1);
 const MAX_METADATA_BYTES: usize = 64 * 1024;
+const MAX_METADATA_REDIRECTS: usize = 5;
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_CALLBACK_BYTES: usize = 8 * 1024;
 const EXTERNAL_REDIRECT_URI: &str = "dev.waltr.app:/oauth2redirect";
@@ -1474,13 +1475,14 @@ async fn discover_authorization_server(
     issuer: &Url,
 ) -> Result<AuthorizationServerMetadata, NativeAuthError> {
     let urls = oidc_discovery_urls(issuer)?;
-    let mut response = client.get(urls[0].clone()).send().await.map_err(|_| {
-        NativeAuthError("authorization server metadata discovery failed".to_owned())
-    })?;
+    let failed = |_| NativeAuthError("authorization server metadata discovery failed".to_owned());
+    let mut response = get_metadata(client, urls[0].clone())
+        .await
+        .map_err(failed)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND && urls.len() == 2 {
-        response = client.get(urls[1].clone()).send().await.map_err(|_| {
-            NativeAuthError("authorization server metadata discovery failed".to_owned())
-        })?;
+        response = get_metadata(client, urls[1].clone())
+            .await
+            .map_err(failed)?;
     }
     parse_json_response(response, MAX_METADATA_BYTES)
         .await
@@ -2134,12 +2136,52 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
     url: Url,
     limit: usize,
 ) -> Result<T, NativeAuthError> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| NativeAuthError("OIDC metadata request failed".to_owned()))?;
+    let response = get_metadata(client, url).await?;
     parse_json_response(response, limit).await
+}
+
+async fn get_metadata(client: &Client, mut url: Url) -> Result<Response, NativeAuthError> {
+    use reqwest::{StatusCode, header::LOCATION};
+
+    let failed = || NativeAuthError("OIDC metadata request failed".to_owned());
+    let origin = url.origin();
+    time::timeout(HTTP_TIMEOUT, async {
+        for hop in 0..=MAX_METADATA_REDIRECTS {
+            let response = client.get(url.clone()).send().await.map_err(|_| failed())?;
+            if !matches!(
+                response.status(),
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::SEE_OTHER
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            ) {
+                return Ok(response);
+            }
+            if hop == MAX_METADATA_REDIRECTS {
+                break;
+            }
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(failed)?;
+            let next = url.join(location).map_err(|_| failed())?;
+            // Only anonymous metadata GETs may follow redirects, within the original origin.
+            if next.scheme() != url.scheme()
+                || next.origin() != origin
+                || !next.username().is_empty()
+                || next.password().is_some()
+                || next.fragment().is_some()
+            {
+                return Err(failed());
+            }
+            url = next;
+        }
+        Err(failed())
+    })
+    .await
+    .map_err(|_| failed())?
 }
 
 async fn parse_json_response<T: for<'de> Deserialize<'de>>(
@@ -3108,6 +3150,135 @@ mod tests {
         assert_eq!(provider.resource, base);
         assert_eq!(provider.scopes_supported, ["waltr:api"]);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_discovery_follows_same_origin_redirects_without_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            for path in [
+                "/.well-known/oauth-protected-resource",
+                "/resource.json",
+                "/tenant/.well-known/openid-configuration",
+                "/tenant/metadata.json",
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                assert!(request.starts_with(&format!("GET {path} ")));
+                let headers = request.to_ascii_lowercase();
+                assert!(!headers.contains("\r\nauthorization:"));
+                assert!(!headers.contains("\r\ncookie:"));
+                assert!(!headers.contains("\r\nreferer:"));
+                match path {
+                    "/.well-known/oauth-protected-resource" => {
+                        write_redirect(&mut stream, "/resource.json").await;
+                    }
+                    "/resource.json" => {
+                        let body = format!(
+                            r#"{{"resource":"{server_base}","authorization_servers":["{server_base}/tenant"],"scopes_supported":["waltr:api"]}}"#
+                        );
+                        write_json_response(&mut stream, "200 OK", &body).await;
+                    }
+                    "/tenant/.well-known/openid-configuration" => {
+                        write_redirect(&mut stream, "../metadata.json").await;
+                    }
+                    _ => {
+                        let body = format!(
+                            r#"{{"issuer":"{server_base}/tenant","authorization_endpoint":"{server_base}/authorize","token_endpoint":"{server_base}/token","code_challenge_methods_supported":["S256"]}}"#
+                        );
+                        write_json_response(&mut stream, "200 OK", &body).await;
+                    }
+                }
+            }
+        });
+        let (provider, issuer, _) = discover_with_native(&http_client().unwrap(), &base)
+            .await
+            .unwrap();
+        assert_eq!(provider.resource, base);
+        assert_eq!(issuer, format!("{base}/tenant"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_redirects_are_origin_bound_and_limited() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/metadata", other.local_addr().unwrap());
+        let start = Url::parse(&format!(
+            "http://{}/metadata",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drop(read_http_request(&mut stream).await);
+            write_redirect(&mut stream, &location).await;
+            for _ in 0..=MAX_METADATA_REDIRECTS {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                drop(read_http_request(&mut stream).await);
+                write_redirect(&mut stream, "/metadata").await;
+            }
+            assert!(
+                time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = http_client().unwrap();
+        assert!(get_metadata(&client, start.clone()).await.is_err());
+        assert!(get_metadata(&client, start).await.is_err());
+        assert!(
+            time::timeout(Duration::from_millis(50), other.accept())
+                .await
+                .is_err()
+        );
+        time::timeout(HTTP_TIMEOUT, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorization_code_post_does_not_follow_same_origin_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            Url::parse(&format!("http://{}/token", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /token "));
+            assert!(request.contains("code_verifier=test-verifier"));
+            write_redirect(&mut stream, "/other").await;
+            assert!(
+                time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert!(
+            exchange_code(
+                &http_client().unwrap(),
+                TokenExchangeRequest {
+                    token_endpoint: &endpoint,
+                    client_id: "native-client",
+                    redirect_uri: &Url::parse("http://127.0.0.1:1234/callback").unwrap(),
+                    verifier: "test-verifier",
+                    code: "test-code",
+                },
+            )
+            .await
+            .is_err()
+        );
+        server.await.unwrap();
+    }
+
+    async fn write_redirect(stream: &mut TcpStream, location: &str) {
+        stream
+            .write_all(
+                format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

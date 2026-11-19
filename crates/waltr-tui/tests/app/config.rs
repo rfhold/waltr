@@ -1436,7 +1436,7 @@ fn config_workspace_binding_requires_explicit_authorize_and_uses_device_verifica
         target.clone(),
     );
     drop(app.handle_event(&AppEvent::Client(Box::new(snapshot.clone())), now));
-    let rendered = render_app(&app);
+    let rendered = render_app_with_size(&app, 100, 24);
     assert!(rendered.contains("ABCD-EFGH"));
     assert!(rendered.contains("updates automatically"));
     assert!(!rendered.contains("not-for-display"));

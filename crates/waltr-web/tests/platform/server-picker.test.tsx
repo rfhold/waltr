@@ -102,21 +102,21 @@ test("switch remains accessible when the server requires sign-in", async () => {
   await screen.findByRole("heading", { name: "Choose a server" });
 });
 
-test("validates URL, adds an optional name, removes saved server and reports errors", async () => {
+test("leaves URL validation to the native registry and reports fixed errors", async () => {
   const { registry } = setup();
   await screen.findByRole("button", { name: "Work" });
-  fireEvent.input(screen.getByLabelText("Server URL"), { target: { value: "https://user:password@waltr.example" } });
-  fireEvent.submit(screen.getByRole("button", { name: "Add server" }).closest("form")!);
-  expect((await screen.findByRole("alert")).textContent).toContain("without credentials");
-  expect(registry.save).not.toHaveBeenCalled();
-  fireEvent.input(screen.getByLabelText("Server URL"), { target: { value: "https://other.example" } });
-  fireEvent.input(screen.getByLabelText("Name (optional)"), { target: { value: "Personal" } });
+  const rawUrl = "http://127.1/";
   registry.save.mockRejectedValueOnce(new Error("private storage path"));
+  fireEvent.input(screen.getByLabelText("Server URL"), { target: { value: rawUrl } });
   fireEvent.submit(screen.getByRole("button", { name: "Add server" }).closest("form")!);
   expect((await screen.findByRole("alert")).textContent).toContain("Unable to save");
+  expect(registry.save).toHaveBeenCalledWith(rawUrl, undefined);
+  expect(screen.queryByText("private storage path")).toBeNull();
+  fireEvent.input(screen.getByLabelText("Server URL"), { target: { value: "https://other.example" } });
+  fireEvent.input(screen.getByLabelText("Name (optional)"), { target: { value: "Personal" } });
   fireEvent.submit(screen.getByRole("button", { name: "Add server" }).closest("form")!);
   await screen.findByRole("button", { name: "Personal" });
-  expect(registry.save).toHaveBeenCalledWith("https://other.example/", "Personal");
+  expect(registry.save).toHaveBeenCalledWith("https://other.example", "Personal");
   registry.remove.mockRejectedValueOnce(new Error("private path"));
   fireEvent.click(screen.getByRole("button", { name: "Remove Personal" }));
   expect((await screen.findByRole("alert")).textContent).toContain("Unable to remove");

@@ -51,21 +51,13 @@ export function ServerPicker(props: ServerPickerProps) {
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
     setError(undefined);
-    let parsed: URL;
-    try {
-      parsed = new URL(url().trim());
-      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error();
-    } catch {
-      setError("Enter an HTTP or HTTPS server URL without credentials, query, or fragment.");
-      return;
-    }
     if (name().trim().length > 100) {
       setError("Server name must be 100 characters or fewer.");
       return;
     }
     setBusy(true);
     try {
-      await props.registry.save(parsed.href, name().trim() || undefined);
+      await props.registry.save(url(), name().trim() || undefined);
       setUrl("");
       setName("");
       await refetch();
@@ -110,7 +102,7 @@ export function ServerPicker(props: ServerPickerProps) {
             )}</For>
             <form class="config__form" onSubmit={save}>
               <h2>Add server</h2>
-              <label>Server URL<input type="url" required placeholder="https://waltr.example.com" value={url()} onInput={(event) => setUrl(event.currentTarget.value)} /></label>
+              <label>Server URL<input inputmode="url" required placeholder="https://waltr.example.com" value={url()} onInput={(event) => setUrl(event.currentTarget.value)} /></label>
               <label>Name (optional)<input maxlength={100} value={name()} onInput={(event) => setName(event.currentTarget.value)} /></label>
               <button class="ui-button" type="submit" disabled={busy()}>Add server</button>
             </form>
