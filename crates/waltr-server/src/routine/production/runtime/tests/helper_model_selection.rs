@@ -75,7 +75,7 @@ async fn production_helpers_send_defaults_exact_source_and_disabled_reasoning() 
             &format!("sqlite://{}", root.join("mcp.sqlite3").display())).unwrap()).await.unwrap();
         let app = assemble_app(AppServices {
             config_service,persistence,catalog_loader:loader,access_authenticator:crate::access_auth::AccessAuthenticator::disabled(),mcp_oauth:None,
-            outbound_private_origins:vec![],outbound_oauth:Default::default(),automatic_self_mcp_resource:Some(format!("http://{address}/mcp").parse().unwrap()),
+            outbound_oauth:Default::default(),
             agent_state:Some(state),local_admission:None,workspace_root:workspace,sandbox_socket:None,routine_authority:RoutineAuthority::default(),routine_private_parent:root,
         }, move |routes,input| {
             let service = crate::session::SessionService::from_sessions(sessions,input);

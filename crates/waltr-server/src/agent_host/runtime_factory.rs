@@ -328,7 +328,6 @@ pub struct ServerAgentRuntimeFactory {
     /// Credential store used for provider auth.
     pub credential_store: CredentialStore,
     outbound_oauth_loopback_test_mode: bool,
-    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
     definition: ResolvedAgent,
     catalog: Option<AgentDefinitionCatalog>,
     catalog_provider: Option<AgentCatalogProvider>,
@@ -355,7 +354,6 @@ impl std::fmt::Debug for ServerAgentRuntimeFactory {
                 "outbound_oauth_loopback_test_mode",
                 &self.outbound_oauth_loopback_test_mode,
             )
-            .field("trusted_mcp_oauth_origins", &self.trusted_mcp_oauth_origins)
             .field("definition", &self.definition)
             .field("catalog", &self.catalog)
             .field(
@@ -540,7 +538,6 @@ impl ServerAgentRuntimeFactory {
             workspace_account: None,
             credential_store,
             outbound_oauth_loopback_test_mode: false,
-            trusted_mcp_oauth_origins: Vec::new(),
             definition,
             catalog: None,
             catalog_provider: None,
@@ -616,19 +613,6 @@ impl ServerAgentRuntimeFactory {
                 ))
             })?;
         Ok(bundle)
-    }
-
-    /// Permit private HTTPS peers for host-supplied MCP OAuth origins.
-    #[must_use]
-    pub fn with_trusted_mcp_oauth_origins(mut self, origins: Vec<reqwest::Url>) -> Self {
-        self.trusted_mcp_oauth_origins = origins;
-        self
-    }
-
-    /// Permit private HTTPS peers for one host-supplied MCP OAuth origin.
-    #[must_use]
-    pub fn with_trusted_mcp_oauth_origin(self, origin: reqwest::Url) -> Self {
-        self.with_trusted_mcp_oauth_origins(vec![origin])
     }
 
     #[cfg(test)]
@@ -1562,8 +1546,7 @@ impl ServerAgentRuntimeFactory {
     }
 
     fn refresh_coordinator(&self) -> CredentialRefreshCoordinator {
-        let coordinator = CredentialRefreshCoordinator::new(self.credential_store.clone())
-            .with_trusted_mcp_oauth_origins(self.trusted_mcp_oauth_origins.clone());
+        let coordinator = CredentialRefreshCoordinator::new(self.credential_store.clone());
         #[cfg(test)]
         let coordinator = if self.outbound_oauth_loopback_test_mode {
             coordinator.with_loopback_test_mode()
@@ -3939,7 +3922,6 @@ spec:
             &AuthTarget::mcp_server("remote"),
             &mcp_state(token_url),
             true,
-            &[],
         )
         .await
         .expect_err("redirect must fail");
@@ -3958,7 +3940,6 @@ spec:
             &AuthTarget::mcp_server("remote"),
             &mcp_state(token_url),
             true,
-            &[],
         )
         .await
         .expect_err("oversized response must fail");

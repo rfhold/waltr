@@ -119,9 +119,7 @@ test("all Waltr services have exact static environments", () => {
       WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: "2592000",
       WALTR_MCP_OAUTH_CODE_TTL: "300",
       WALTR_MCP_OAUTH_ALLOW_DCR: "false",
-      WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true",
       WALTR_MCP_OAUTH_ALLOW_CIMD: "true",
-      WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS: "true",
       WALTR_OIDC_AUDIENCE: "waltr-access-test",
       WALTR_OIDC_CLIENT_ID: "waltr-access-test",
       WALTR_OIDC_CLIENT_SECRET: "waltr-access-test-secret",
@@ -160,9 +158,6 @@ test("all Waltr services have exact static environments", () => {
   assert.equal(config.services.mcp.user, undefined);
   assert.match(config.services["mcp-auth"].command.join(" "), /update-ca-certificates >\/dev\/null && exec setpriv --reuid=65532 --regid=65532 --clear-groups waltr-server-test-mcp-server --http 0\.0\.0\.0:14666$/);
   assert.doesNotMatch(rawCompose, /WALTR_MCP_(?:OIDC|SELF|PROTECTED_OAUTH)/);
-  for (const serviceName of ["waltr", "waltr-test", "mcp", "k6", "mcp-auth", "k6-auth"]) {
-    assert.equal(config.services[serviceName].environment?.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
-  }
 });
 
 test("each profile keeps worker storage private and shares only its private socket", () => {

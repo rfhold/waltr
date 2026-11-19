@@ -221,11 +221,11 @@ Embedded resource coverage must prove that startup prebinds loopback, atomically
 
 Embedded fallback coverage must parse the packaged production seed, reject known synthetic fixture IDs, and materialize the complete ordinary bundled catalog including its default agent. General server tests retain their separate synthetic models.dev fixture for selector edge cases.
 
-Outbound OAuth unit coverage must verify explicit callback propagation and one-time standalone environment snapshots, including the private-test boolean.
+Outbound OAuth unit coverage must verify explicit callback propagation and one-time standalone environment snapshots.
 
 It must verify that embedded mode skips CIMD when upstream also offers DCR, then selects DCR.
 
-It must verify that embedded policy ignores the ambient private-test switch and honors only explicit trusted origins.
+HTTPS OAuth fixtures on private networks must use normal certificate verification. Redirect tests must verify that credential-bearing requests never reach a redirect target.
 
 Persistence assertions must prove that attempts and credentials contain a per-generation marker, not the callback endpoint.
 
@@ -454,7 +454,7 @@ Run the focused generated-CA trust contract:
 
 `pnpm test:web:trust`
 
-This starts the strict authenticated Compose stack. It generates an ephemeral CA and leaf certificate inside Compose volumes, exercises real certificate verification through `SSL_CERT_FILE` for k6 HTTP and NSS import for Chromium, and covers Waltr's reqwest OIDC and CIMD discovery during health-gated startup. The static `waltr-auth` fixture alone sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` so its HTTPS-only application policy can reach deterministic private Compose aliases; production deployments leave this test-only exception unset. The stack does not enable TLS bypass flags and commits no test private key.
+This starts the authenticated Compose stack. It generates an ephemeral CA and leaf certificate inside Compose volumes. k6 uses `SSL_CERT_FILE`, and Chromium uses an NSS CA import. The stack covers Waltr's OIDC and CIMD discovery over HTTPS on private Compose aliases. It uses normal TLS verification and commits no test private key.
 
 Run the older local server plus Vite development path for debugging and fixture-only prompt checks:
 

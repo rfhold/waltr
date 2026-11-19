@@ -57,7 +57,7 @@ impl LlmStream for SelfStatusProvider {
 async fn embedded_self_status_records_app_association_from_local_credential_snapshot() {
     use crate::auth::{AuthTarget, CredentialStore, FileCredentialStore};
     use crate::embedded::{
-        EmbeddedCatalogSource, EmbeddedOutboundPolicy, EmbeddedServerConfig, build_embedded_server,
+        EmbeddedCatalogSource, EmbeddedServerConfig, build_embedded_server,
     };
 
     let root = crate::test_support::temp_root();
@@ -77,7 +77,6 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
         catalog_fallback: None,
         default_agent: "coding".into(),
         local_bearer: bearer.clone(),
-        outbound_policy: EmbeddedOutboundPolicy::default(),
     })
     .await
     .unwrap();
@@ -134,7 +133,6 @@ async fn embedded_self_status_records_app_association_from_local_credential_snap
     .with_capability_policy(crate::permission::ServerPermissionPolicy::sessions(
         interactions.clone(),
     ))
-    .with_trusted_mcp_oauth_origins(vec![origin.parse().unwrap()])
     .with_mcp_connection_resolver(move |_| {
         let endpoint = endpoint.clone();
         Box::pin(async move {
@@ -402,7 +400,6 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
     .with_capability_policy(crate::permission::ServerPermissionPolicy::sessions(
         interactions.clone(),
     ))
-    .with_trusted_mcp_oauth_origins(vec![origin.parse().unwrap()])
     .with_mcp_connection_resolver(move |_| {
         let endpoint = endpoint.clone();
         Box::pin(async move {

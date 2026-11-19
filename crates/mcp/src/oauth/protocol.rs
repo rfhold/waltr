@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+use super::discovery::{McpOAuthEndpointPolicy, is_loopback_host, validate_endpoint};
 use crate::{Error, Result};
 
 /// A sensitive OAuth string whose debug representation is always redacted.
@@ -452,7 +453,6 @@ impl McpPublicClientRegistrationRequest {
     /// Returns a standards-shaped registration error for unsupported metadata.
     pub fn validate_and_normalize(
         mut self,
-        allow_loopback_http: bool,
         max_redirect_uris: usize,
         max_field_bytes: usize,
     ) -> std::result::Result<Self, McpClientRegistrationError> {
@@ -464,7 +464,7 @@ impl McpPublicClientRegistrationRequest {
             || self.redirect_uris.len() > max_redirect_uris
             || self.redirect_uris.iter().any(|redirect| {
                 redirect.len() > max_field_bytes
-                    || validate_public_redirect_uri(redirect, allow_loopback_http).is_err()
+                    || validate_public_redirect_uri(redirect).is_err()
                     || !application_type_matches_redirect(self.application_type, redirect)
             });
         if invalid_redirect {
@@ -698,6 +698,8 @@ impl McpClientMetadataDocument {
 
     /// Validate the metadata as an MCP public Authorization Code client.
     ///
+    /// The endpoint policy controls the metadata URL, not client callback URIs.
+    ///
     /// # Errors
     ///
     /// Returns an error when public-client, grant, response, or redirect
@@ -705,23 +707,13 @@ impl McpClientMetadataDocument {
     pub fn validate_public_client(
         &self,
         expected_client_id: &str,
-        allow_loopback_http: bool,
+        endpoint_policy: McpOAuthEndpointPolicy,
     ) -> std::result::Result<(), McpClientMetadataError> {
         self.validate_client_id(expected_client_id)?;
-        let client_id_url = Url::parse(&self.client_id)
-            .map_err(|_| McpClientMetadataError::UnsupportedClientMetadata)?;
-        let secure_client_id = client_id_url.scheme() == "https"
-            || (allow_loopback_http
-                && client_id_url.scheme() == "http"
-                && client_id_url.host_str().is_some_and(|host| {
-                    host.eq_ignore_ascii_case("localhost")
-                        || host
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|address| address.is_loopback())
-                }));
-        if !secure_client_id
-            || client_id_url.host_str().is_none()
-            || matches!(client_id_url.path(), "" | "/")
+        let client_id_url =
+            validate_endpoint("client metadata URL", &self.client_id, endpoint_policy)
+                .map_err(|_| McpClientMetadataError::UnsupportedClientMetadata)?;
+        if matches!(client_id_url.path(), "" | "/")
             || self
                 .client_name
                 .as_deref()
@@ -744,7 +736,7 @@ impl McpClientMetadataDocument {
             return Err(McpClientMetadataError::InvalidRedirectUri);
         }
         for redirect_uri in &self.redirect_uris {
-            validate_public_redirect_uri(redirect_uri, allow_loopback_http)?;
+            validate_public_redirect_uri(redirect_uri)?;
         }
         if self.token_endpoint_auth_method != McpTokenEndpointAuthMethod::None {
             return Err(McpClientMetadataError::UnsupportedClientMetadata);
@@ -796,15 +788,14 @@ impl std::error::Error for McpClientMetadataError {}
 
 /// Validate a public-client redirect URI.
 ///
-/// HTTPS redirects are accepted. Native loopback HTTP redirects require an
-/// explicit policy. Fragments, credentials, and wildcard hosts are rejected.
+/// HTTPS and native loopback HTTP redirects are accepted. Fragments,
+/// credentials, and wildcard hosts are rejected.
 ///
 /// # Errors
 ///
-/// Returns an error when the URI is malformed or violates the selected policy.
+/// Returns an error when the URI is malformed or unsafe.
 pub fn validate_public_redirect_uri(
     value: &str,
-    allow_loopback_http: bool,
 ) -> std::result::Result<(), McpClientMetadataError> {
     if value.trim() != value || value.contains('\\') {
         return Err(McpClientMetadataError::InvalidRedirectUri);
@@ -813,16 +804,13 @@ pub fn validate_public_redirect_uri(
     let host = url
         .host_str()
         .ok_or(McpClientMetadataError::InvalidRedirectUri)?;
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
     if url.cannot_be_a_base()
         || url.fragment().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
         || host.contains('*')
-        || !(url.scheme() == "https" || allow_loopback_http && url.scheme() == "http" && loopback)
+        || !(url.scheme() == "https"
+            || url.scheme() == "http" && url.host().is_some_and(is_loopback_host))
     {
         return Err(McpClientMetadataError::InvalidRedirectUri);
     }

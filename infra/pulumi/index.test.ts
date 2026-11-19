@@ -42,12 +42,7 @@ before(async () => {
     "waltr:mcpOAuthRefreshFamilyTtl": "2592000",
     "waltr:mcpOAuthCodeTtl": "300",
     "waltr:mcpOAuthAllowDcr": "true",
-    "waltr:mcpOAuthAllowLoopbackRedirects": "true",
     "waltr:mcpOAuthAllowCimd": "true",
-    "waltr:mcpOAuthCimdTrustedPrivateOrigins":
-      '["https://client-metadata.internal.example"]',
-    "waltr:mcpOutboundOAuthTrustedPrivateOrigins":
-      '["https://mcp.internal.example","https://oauth.internal.example:8443"]',
     "waltr:mcpOAuthWrappingKeyVersions": '["v1"]',
     "waltr:mcpOAuthActiveWrappingKeyVersion": "v1",
   });
@@ -259,20 +254,7 @@ describe("hosted MCP OAuth deployment", () => {
     );
     assert.equal(values.WALTR_MCP_REQUIRED_SCOPES, "mcp:use");
     assert.equal(values.WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL, "259200");
-    assert.equal(values.WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS, "true");
-    assert.equal(values.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
-  });
-
-  test("projects private OAuth origin lists through the application Secret", () => {
-    const values = environment();
-    assert.equal(
-      values.WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS,
-      "https://client-metadata.internal.example",
-    );
-    assert.equal(
-      values.WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS,
-      "https://mcp.internal.example,https://oauth.internal.example:8443",
-    );
+    assert.equal(values.WALTR_MCP_OAUTH_ALLOW_CIMD, "true");
   });
 
   test("projects versioned wrapping keys only through a read-only Secret", () => {
@@ -694,10 +676,6 @@ describe("hosted MCP OAuth deployment", () => {
     }
     const source = readFileSync(join(__dirname, "index.ts"), "utf8");
     assert.doesNotMatch(source, /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/);
-    assert.doesNotMatch(
-      source,
-      /WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS\s*:/,
-    );
     assert.deepEqual(Object.keys(program).sort(), [
       "mcpOAuthIssuer",
       "mcpOAuthJwksUrl",
@@ -723,7 +701,6 @@ describe("hosted MCP OAuth deployment", () => {
         stack,
         /(?:password|secret|privateKey|accessKeyId)\s*:/i,
       );
-      assert.doesNotMatch(stack, /WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS/);
     }
     assert.match(preview, /^\s*waltr:protectData: false$/m);
     assert.match(

@@ -70,8 +70,8 @@ impl Fixture {
         let app = assemble_app_with_self_mcp(AppServices {
             config_service, persistence, catalog_loader: loader,
             access_authenticator: AccessAuthenticator::disabled(), mcp_oauth: None,
-            outbound_private_origins: Vec::new(), outbound_oauth: OutboundOAuthConfig::default(),
-            automatic_self_mcp_resource: None, agent_state: None, local_admission: None,
+            outbound_oauth: OutboundOAuthConfig::default(),
+            agent_state: None, local_admission: None,
             workspace_root: root.clone(), sandbox_socket: None, routine_authority: RoutineAuthority::default(),
             routine_private_parent: crate::test_support::temp_root(),
         }, move |routes, input| {
@@ -931,8 +931,8 @@ async fn self_mcp_assembly_failure_revokes_prebound_generation() {
     let result = assemble_app_with_self_mcp(AppServices {
         config_service, persistence, catalog_loader:loader,
         access_authenticator:AccessAuthenticator::disabled(), mcp_oauth:None,
-        outbound_private_origins:Vec::new(), outbound_oauth:OutboundOAuthConfig::default(),
-        automatic_self_mcp_resource:None, agent_state:None, local_admission:None,
+        outbound_oauth:OutboundOAuthConfig::default(),
+        agent_state:None, local_admission:None,
         workspace_root:fixture.root.clone(), sandbox_socket:None, routine_authority:RoutineAuthority::default(),
         routine_private_parent:fixture.root.join("does-not-exist"),
     }, move |routes, input| {

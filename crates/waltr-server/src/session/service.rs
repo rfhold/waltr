@@ -123,7 +123,6 @@ pub struct SessionRegistrationInput {
     /// Host credential access.
     pub credential_store: CredentialStore,
     /// Origins permitted for outbound MCP OAuth.
-    pub trusted_mcp_oauth_origins: Vec<reqwest::Url>,
     /// Static or live agent definitions.
     pub catalog: SessionCatalogSource,
     /// Semantic session events for server coordination.
@@ -162,7 +161,6 @@ where
             workspace_root,
             config,
             credential_store,
-            trusted_mcp_oauth_origins,
             catalog: agent_catalog,
             event_sink,
             sandbox,
@@ -195,7 +193,6 @@ where
         };
         let resolver_config = config.clone();
         let runtime_factory = runtime_factory
-            .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins)
             .with_mcp_connection_resolver(move |request| {
                 let config = resolver_config.clone();
                 Box::pin(async move { resolve_mcp_connections(&config.load().await, request) })
@@ -1684,7 +1681,6 @@ mod tests {
                 workspace_root: root.to_path_buf(),
                 config: config_handle(),
                 credential_store: credential_store(root),
-                trusted_mcp_oauth_origins: Vec::new(),
                 catalog,
                 event_sink: Arc::new(crate::session::UnboundSessionEvents),
                 sandbox: sandbox.handle(),

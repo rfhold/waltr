@@ -459,7 +459,7 @@ async fn standalone_case(capture_allowed: bool, cleanup_mode: Option<&str>) {
     let (auth, token, _issuer, issuer_stop, issuer_task) =
         crate::test_support::composition_auth(&persistence, address).await;
     let configured = authority();
-    let app=assemble_app(AppServices{config_service,persistence,catalog_loader:loader,access_authenticator:auth,mcp_oauth:None,outbound_private_origins:vec![],outbound_oauth:Default::default(),automatic_self_mcp_resource:None,agent_state:Some(state),local_admission:None,workspace_root:workspace,sandbox_socket:None,routine_authority:configured,routine_private_parent:root.clone()},move|routes,input|{
+    let app=assemble_app(AppServices{config_service,persistence,catalog_loader:loader,access_authenticator:auth,mcp_oauth:None,outbound_oauth:Default::default(),agent_state:Some(state),local_admission:None,workspace_root:workspace,sandbox_socket:None,routine_authority:configured,routine_private_parent:root.clone()},move|routes,input|{
         let service=Arc::new(Arc::try_unwrap(crate::session::SessionService::from_sessions(waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new()),input)).ok().unwrap().with_test_provider(model));routes.add_service(waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer::from_arc(service.clone()));Ok(service)
     }).await.unwrap();
     let stop = CancellationToken::new();
@@ -749,7 +749,7 @@ async fn embedded_media_uses_generation_auth_native_and_browser_transports() {
     let token = "media-explicit-local-generation";
     let configured = authority();
     let embedded=crate::embedded::build_embedded_server_with_registration(crate::embedded::EmbeddedServerConfig{
-        resources_root:source,waltr_database_path:root.join("data/waltr.sqlite3"),mcp_database_path:root.join("data/mcp.sqlite3"),session_root:root.join("sessions"),workspace_root:root.join("workspace"),catalog_source:crate::embedded::EmbeddedCatalogSource::Path(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-dev-defaults.json")),catalog_cache_path:root.join("cache/models.json"),catalog_fallback:None,default_agent:"routine-title".into(),local_bearer:crate::LocalBearer::new(token).unwrap(),outbound_policy:Default::default(),routine_authority:configured,
+        resources_root:source,waltr_database_path:root.join("data/waltr.sqlite3"),mcp_database_path:root.join("data/mcp.sqlite3"),session_root:root.join("sessions"),workspace_root:root.join("workspace"),catalog_source:crate::embedded::EmbeddedCatalogSource::Path(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-dev-defaults.json")),catalog_cache_path:root.join("cache/models.json"),catalog_fallback:None,default_agent:"routine-title".into(),local_bearer:crate::LocalBearer::new(token).unwrap(),routine_authority:configured,
     },move|routes,input,path|{
         let sessions=waltr_agent::SessionCoordinator::new(waltr_agent::FilesystemSessionStore::new(path));let service=Arc::new(Arc::try_unwrap(crate::session::SessionService::from_sessions(sessions,input)).ok().unwrap().with_test_provider(model));routes.add_service(waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer::from_arc(service.clone()));Ok(service)
     }).await.unwrap();

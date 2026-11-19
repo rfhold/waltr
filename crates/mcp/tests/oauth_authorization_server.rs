@@ -58,21 +58,16 @@ async fn preregistration_accepts_only_secretless_public_clients() {
     };
     assert!(
         server
-            .preregister_public_client(client.clone(), false)
+            .preregister_public_client(client.clone())
             .await
             .is_err()
     );
     client.client_secret_digest = None;
     server
-        .preregister_public_client(client.clone(), false)
+        .preregister_public_client(client.clone())
         .await
         .unwrap();
-    assert!(
-        server
-            .preregister_public_client(client, false)
-            .await
-            .is_err()
-    );
+    assert!(server.preregister_public_client(client).await.is_err());
 }
 
 #[tokio::test]
@@ -380,7 +375,6 @@ async fn dcr_advertises_registers_and_completes_public_authorization_flow() {
     .unwrap()
     .with_client_registration(OAuthClientRegistrationOptions {
         dynamic_registration: true,
-        allow_loopback_redirects: true,
         ..OAuthClientRegistrationOptions::default()
     })
     .unwrap();
@@ -492,16 +486,7 @@ async fn preregistered_loopback_port_exception_preserves_other_components() {
         expires_at_ms: None,
         disabled_at_ms: None,
     };
-    assert!(
-        server
-            .preregister_public_client(native.clone(), false)
-            .await
-            .is_err()
-    );
-    server
-        .preregister_public_client(native, true)
-        .await
-        .unwrap();
+    server.preregister_public_client(native).await.unwrap();
     let (origin, task) = serve(server.router()).await;
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -539,13 +524,54 @@ async fn preregistered_loopback_port_exception_preserves_other_components() {
 }
 
 #[tokio::test]
-async fn hardened_cimd_fetcher_refuses_redirect_type_size_and_prohibited_destinations() {
+async fn cimd_fetcher_preserves_original_client_identity_on_redirect() {
+    let (origin, task) = serve(
+        axum::Router::new()
+            .route(
+                "/client.json",
+                axum::routing::get(|| async { axum::response::Redirect::temporary("/document") }),
+            )
+            .route(
+                "/different-client.json",
+                axum::routing::get(|| async { axum::response::Redirect::temporary("/document") }),
+            )
+            .route(
+                "/document",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    let host = headers["host"].to_str().unwrap();
+                    axum::Json(serde_json::json!({
+                        "client_id": format!("http://{host}/client.json"),
+                        "client_name": "Redirected client",
+                        "redirect_uris": ["http://[::1]/callback"],
+                        "grant_types": ["authorization_code", "refresh_token"],
+                        "response_types": ["code"],
+                        "token_endpoint_auth_method": "none"
+                    }))
+                }),
+            ),
+    )
+    .await;
+    let fetcher = HardenedOAuthClientMetadataFetcher::loopback_for_tests();
+    let client_id = format!("{origin}/client.json");
+    let result = fetcher.fetch(client_id.clone()).await.unwrap();
+    assert_eq!(result.document.client_id, client_id);
+    assert!(
+        fetcher
+            .fetch(format!("{origin}/different-client.json"))
+            .await
+            .is_err()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn cimd_fetcher_refuses_redirect_loops_and_enforces_response_bounds() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let router = axum::Router::new()
         .route(
             "/redirect",
-            axum::routing::get(|| async { axum::response::Redirect::temporary("/document") }),
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/redirect") }),
         )
         .route(
             "/wrong-type",
@@ -565,34 +591,6 @@ async fn hardened_cimd_fetcher_refuses_redirect_type_size_and_prohibited_destina
     );
     for path in ["redirect", "wrong-type", "large"] {
         assert!(fetcher.fetch(format!("{origin}/{path}")).await.is_err());
-    }
-    let policy = PublicOAuthCimdDestinationPolicy;
-    for address in [
-        "https://127.0.0.1/client.json",
-        "https://10.0.0.1/client.json",
-        "https://169.254.1.1/client.json",
-        "https://169.254.169.254/latest/meta-data",
-        "https://224.0.0.1/client.json",
-        "https://192.88.99.1/client.json",
-        "https://[::1]/client.json",
-        "https://[fe80::1]/client.json",
-        "https://[2001::1]/client.json",
-        "https://[2001:2::1]/client.json",
-        "https://[2001:db8::1]/client.json",
-        "https://[2002:c000:0201::1]/client.json",
-        "https://[3fff::1]/client.json",
-        "https://[64:ff9b:1::1]/client.json",
-    ] {
-        assert!(policy.resolve(Url::parse(address).unwrap()).await.is_err());
-    }
-    for address in [
-        "https://8.8.8.8/client.json",
-        "https://[2606:4700:4700::1111]/client.json",
-    ] {
-        assert!(
-            policy.resolve(Url::parse(address).unwrap()).await.is_ok(),
-            "{address}"
-        );
     }
     task.abort();
 }
@@ -617,7 +615,7 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
         }))
         .unwrap();
     initial_document
-        .validate_public_client(&client_id, true)
+        .validate_public_client(&client_id, McpOAuthEndpointPolicy::AllowLoopbackHttp)
         .unwrap();
     let document_client_id = client_id.clone();
     let version_for_route = version.clone();
@@ -675,9 +673,8 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
     .unwrap()
     .with_client_registration(OAuthClientRegistrationOptions {
         metadata_fetcher: Some(Arc::new(
-            HardenedOAuthClientMetadataFetcher::loopback_for_tests().with_loopback_redirects(true),
+            HardenedOAuthClientMetadataFetcher::loopback_for_tests(),
         )),
-        allow_loopback_redirects: true,
         ..OAuthClientRegistrationOptions::default()
     })
     .unwrap();

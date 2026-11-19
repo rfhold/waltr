@@ -10,7 +10,7 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{Jwk, KeyAlgorithm},
 };
-use reqwest::Client;
+use reqwest::{Client, Response, StatusCode, header::LOCATION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use url::{Position, Url};
@@ -35,6 +35,7 @@ const ALLOWED_ALGORITHMS: &[Algorithm] = &[
 const ID_TOKEN_CLOCK_SKEW_SECONDS: u64 = 60;
 const MAX_ID_TOKEN_AGE_SECONDS: u64 = 10 * 60;
 const DISCOVERY_RESPONSE_LIMIT: usize = 64 * 1024;
+const MAX_METADATA_REDIRECTS: usize = 3;
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
 const DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -50,16 +51,12 @@ pub enum TokenEndpointAuthMethod {
     None,
 }
 
-/// Redirect-free HTTP client for OIDC back-channel requests.
+/// OIDC back-channel client with explicit redirects only for hosted metadata reads.
 #[derive(Debug, Clone)]
 pub struct AccessAuthHttpClient(Client);
 
 impl AccessAuthHttpClient {
-    pub(crate) const fn from_pinned_client(client: Client) -> Self {
-        Self(client)
-    }
-
-    /// Build a client from caller-selected timeout and TLS settings while always disabling redirects.
+    /// Build from caller-selected timeout and TLS settings. Credential requests never redirect.
     ///
     /// # Errors
     ///
@@ -74,6 +71,53 @@ impl AccessAuthHttpClient {
     pub(super) const fn inner(&self) -> &Client {
         &self.0
     }
+
+    pub(super) async fn get_metadata(
+        &self,
+        mut url: Url,
+        request_error: OidcError,
+    ) -> Result<Response, OidcError> {
+        let mut remaining = MAX_METADATA_REDIRECTS;
+        loop {
+            let Ok(response) = self.0.get(url.clone()).send().await else {
+                return Err(request_error);
+            };
+            if !matches!(
+                response.status(),
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::SEE_OTHER
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            ) {
+                return Ok(response);
+            }
+            if remaining == 0 {
+                return Err(request_error);
+            }
+            let locations = response.headers().get_all(LOCATION);
+            let mut locations = locations.iter();
+            let Some(target) = locations
+                .next()
+                .and_then(|location| location.to_str().ok())
+                .filter(|location| !location.is_empty() && locations.next().is_none())
+                .and_then(|location| metadata_redirect_target(&url, location))
+            else {
+                return Err(request_error);
+            };
+            url = target;
+            remaining -= 1;
+        }
+    }
+}
+
+fn metadata_redirect_target(previous: &Url, location: &str) -> Option<Url> {
+    let target = previous.join(location).ok()?;
+    (target.origin() == previous.origin()
+        && target.username().is_empty()
+        && target.password().is_none()
+        && target.fragment().is_none())
+    .then_some(target)
 }
 
 /// Validated OIDC discovery metadata and initial signing keys.
@@ -107,33 +151,7 @@ impl DiscoveredOidcProvider {
         let issuer_url = Url::parse(config.issuer())
             .map_err(|_| OidcError::Discovery("configured issuer is invalid"))?;
         enforce_secure_endpoint(&issuer_url, config.transport_policy())?;
-        let discovery_urls = discovery_urls(&issuer_url)?;
-        let mut response = client
-            .inner()
-            .get(discovery_urls[0].clone())
-            .send()
-            .await
-            .map_err(|_| OidcError::Discovery("OIDC discovery request failed"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND && discovery_urls.len() == 2 {
-            response = client
-                .inner()
-                .get(discovery_urls[1].clone())
-                .send()
-                .await
-                .map_err(|_| OidcError::Discovery("OIDC discovery request failed"))?;
-        }
-        if !response.status().is_success() {
-            return Err(OidcError::Discovery(
-                "OIDC discovery endpoint returned an error",
-            ));
-        }
-        let body = read_bounded_body(
-            response,
-            DISCOVERY_RESPONSE_LIMIT,
-            "OIDC discovery response read failed",
-            "OIDC discovery response exceeds the size limit",
-        )
-        .await?;
+        let body = fetch_discovery(&client, &issuer_url).await?;
         let metadata = serde_json::from_slice::<ProviderMetadata>(&body)
             .map_err(|_| OidcError::Discovery("OIDC discovery document is invalid"))?;
         validate_discovered_issuer(config.issuer(), &metadata.issuer)?;
@@ -624,33 +642,7 @@ impl OidcVerifier {
         let issuer_url =
             Url::parse(issuer).map_err(|_| OidcError::Discovery("configured issuer is invalid"))?;
         enforce_secure_endpoint(&issuer_url, policy)?;
-        let urls = discovery_urls(&issuer_url)?;
-        let mut response = client
-            .inner()
-            .get(urls[0].clone())
-            .send()
-            .await
-            .map_err(|_| OidcError::Discovery("OIDC discovery request failed"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND && urls.len() == 2 {
-            response = client
-                .inner()
-                .get(urls[1].clone())
-                .send()
-                .await
-                .map_err(|_| OidcError::Discovery("OIDC discovery request failed"))?;
-        }
-        if !response.status().is_success() {
-            return Err(OidcError::Discovery(
-                "OIDC discovery endpoint returned an error",
-            ));
-        }
-        let body = read_bounded_body(
-            response,
-            DISCOVERY_RESPONSE_LIMIT,
-            "OIDC discovery response read failed",
-            "OIDC discovery response exceeds the size limit",
-        )
-        .await?;
+        let body = fetch_discovery(&client, &issuer_url).await?;
         let metadata = serde_json::from_slice::<AccessProviderMetadata>(&body)
             .map_err(|_| OidcError::Discovery("OIDC discovery document is invalid"))?;
         validate_discovered_issuer(issuer, &metadata.issuer)?;
@@ -1136,6 +1128,32 @@ fn discovery_urls(issuer: &Url) -> Result<Vec<Url>, OidcError> {
     } else {
         Ok(vec![primary, fallback])
     }
+}
+
+async fn fetch_discovery(
+    client: &AccessAuthHttpClient,
+    issuer: &Url,
+) -> Result<Vec<u8>, OidcError> {
+    let urls = discovery_urls(issuer)?;
+    let request_error = OidcError::Discovery("OIDC discovery request failed");
+    let mut response = client
+        .get_metadata(urls[0].clone(), request_error.clone())
+        .await?;
+    if response.status() == StatusCode::NOT_FOUND && urls.len() == 2 {
+        response = client.get_metadata(urls[1].clone(), request_error).await?;
+    }
+    if !response.status().is_success() {
+        return Err(OidcError::Discovery(
+            "OIDC discovery endpoint returned an error",
+        ));
+    }
+    read_bounded_body(
+        response,
+        DISCOVERY_RESPONSE_LIMIT,
+        "OIDC discovery response read failed",
+        "OIDC discovery response exceeds the size limit",
+    )
+    .await
 }
 
 pub(super) async fn read_bounded_body(
@@ -2332,37 +2350,7 @@ ZbAq2L8jXEetO4oBq+h/bLE=
     }
 
     #[tokio::test]
-    async fn discovery_and_jwks_redirect_targets_are_never_contacted() {
-        let target_hits = Arc::new(AtomicUsize::new(0));
-        let hits = Arc::clone(&target_hits);
-        let target = Router::new().fallback(move || {
-            hits.fetch_add(1, Ordering::SeqCst);
-            async { StatusCode::OK }
-        });
-        let (target_base, target_server) = spawn_server(target).await;
-        let location = format!("{target_base}/stolen");
-        let source = Router::new().route(
-            "/.well-known/openid-configuration",
-            get(move || {
-                let location = location.clone();
-                async move {
-                    (
-                        StatusCode::TEMPORARY_REDIRECT,
-                        [(header::LOCATION, location)],
-                    )
-                }
-            }),
-        );
-        let (base, source_server) = spawn_server(source).await;
-        assert!(
-            DiscoveredOidcProvider::discover(http_client(), local_config(&base))
-                .await
-                .is_err()
-        );
-        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
-        source_server.abort();
-
-        let location = format!("{target_base}/jwks");
+    async fn hosted_discovery_and_initial_jwks_follow_metadata_redirects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let base = format!("http://{address}");
@@ -2370,6 +2358,19 @@ ZbAq2L8jXEetO4oBq+h/bLE=
         let source = Router::new()
             .route(
                 "/.well-known/openid-configuration",
+                get(|| async {
+                    (
+                        StatusCode::PERMANENT_REDIRECT,
+                        [(header::LOCATION, "../metadata")],
+                    )
+                }),
+            )
+            .route(
+                "/mismatch/.well-known/openid-configuration",
+                get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/metadata")]) }),
+            )
+            .route(
+                "/metadata",
                 get(move || {
                     let base = metadata_base.clone();
                     async move { Json(valid_metadata(&base, format!("{base}/jwks"))) }
@@ -2377,21 +2378,107 @@ ZbAq2L8jXEetO4oBq+h/bLE=
             )
             .route(
                 "/jwks",
-                get(move || {
-                    let location = location.clone();
-                    async move { (StatusCode::FOUND, [(header::LOCATION, location)]) }
-                }),
-            );
+                get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/keys")]) }),
+            )
+            .route("/keys", get(|| async { Json(test_jwks("test-key")) }));
         let source_server =
             tokio::spawn(async move { axum::serve(listener, source).await.unwrap() });
-        assert!(
-            DiscoveredOidcProvider::discover(http_client(), local_config(&base))
+        let provider = DiscoveredOidcProvider::discover(http_client(), local_config(&base))
+            .await
+            .unwrap();
+        assert_eq!(provider.config.issuer(), base);
+        assert_eq!(provider.token_endpoint.as_str(), format!("{base}/token"));
+        let verifier = OidcVerifier::discover_access(
+            http_client(),
+            &base,
+            "api",
+            None,
+            OidcTransportPolicy::LoopbackHttp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verifier.issuer, base);
+        assert_eq!(
+            verifier
+                .jwks
+                .key("test-key")
                 .await
-                .is_err()
+                .unwrap()
+                .common
+                .key_id
+                .as_deref(),
+            Some("test-key")
         );
-        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+        let mismatched_issuer = format!("{base}/mismatch");
+        assert!(matches!(
+            DiscoveredOidcProvider::discover(http_client(), local_config(&mismatched_issuer)).await,
+            Err(OidcError::Discovery(
+                "discovered issuer does not exactly match configured issuer"
+            ))
+        ));
+        assert!(matches!(
+            OidcVerifier::discover_access(
+                http_client(),
+                &mismatched_issuer,
+                "api",
+                None,
+                OidcTransportPolicy::LoopbackHttp,
+            )
+            .await,
+            Err(OidcError::Discovery(
+                "discovered issuer does not exactly match configured issuer"
+            ))
+        ));
         source_server.abort();
-        target_server.abort();
+    }
+
+    #[test]
+    fn metadata_redirects_require_the_same_origin_and_clean_url() {
+        let source = Url::parse("https://issuer.example/tenant/.well-known/configuration").unwrap();
+        let target = metadata_redirect_target(&source, "/discovery").unwrap();
+        assert_eq!(target.as_str(), "https://issuer.example/discovery");
+        for location in [
+            "http://issuer.example/metadata",
+            "file:///metadata",
+            "https://keys.example/metadata",
+            "https://issuer.example:8443/metadata",
+            "https://user:password@issuer.example/metadata",
+            "https://issuer.example/metadata#fragment",
+        ] {
+            assert_eq!(
+                metadata_redirect_target(&source, location),
+                None,
+                "{location}"
+            );
+        }
+        let loopback = Url::parse("http://localhost:3000/metadata").unwrap();
+        assert!(metadata_redirect_target(&loopback, "/keys").is_some());
+        assert!(metadata_redirect_target(&loopback, "http://localhost:3001/keys").is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_redirect_chain_is_bounded() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&hits);
+        let router = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, "/.well-known/openid-configuration")],
+                    )
+                }
+            }),
+        );
+        let (base, server) = spawn_server(router).await;
+        assert!(matches!(
+            DiscoveredOidcProvider::discover(http_client(), local_config(&base)).await,
+            Err(OidcError::Discovery("OIDC discovery request failed"))
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_METADATA_REDIRECTS + 1);
+        server.abort();
     }
 
     fn valid_metadata(base: &str, jwks_uri: String) -> Value {
@@ -2408,7 +2495,7 @@ ZbAq2L8jXEetO4oBq+h/bLE=
     }
 
     #[tokio::test]
-    async fn token_redirect_does_not_replay_code_verifier_or_client_secret() {
+    async fn credential_redirects_do_not_replay_code_verifier_device_code_or_client_secret() {
         let target_hits = Arc::new(AtomicUsize::new(0));
         let hits = Arc::clone(&target_hits);
         let target = Router::new().fallback(move || {
@@ -2447,7 +2534,7 @@ ZbAq2L8jXEetO4oBq+h/bLE=
             client: http_client(),
             authorization_endpoint: Url::parse("http://127.0.0.1:8080/authorize").unwrap(),
             token_endpoint: Url::parse(&format!("{base}/token")).unwrap(),
-            device_authorization_endpoint: None,
+            device_authorization_endpoint: Some(Url::parse(&format!("{base}/token")).unwrap()),
             token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretBasic,
             id_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
             access_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
@@ -2459,6 +2546,13 @@ ZbAq2L8jXEetO4oBq+h/bLE=
                     code: "secret-code",
                     pkce_verifier: "secret-verifier",
                 })
+                .await
+                .is_err()
+        );
+        assert!(provider.request_device_authorization().await.is_err());
+        assert!(
+            provider
+                .poll_device_tokens("secret-device-code")
                 .await
                 .is_err()
         );

@@ -1,18 +1,13 @@
-use std::{
-    collections::{BTreeSet, HashSet},
-    fmt,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, fmt, time::Duration};
 
 use futures_util::StreamExt;
-use reqwest::{Url, header::CONTENT_TYPE, redirect::Policy};
+use reqwest::{StatusCode, Url, header, redirect::Policy};
 use serde::{
     Deserializer as _, Serialize,
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Number, Value};
+use url::Host;
 
 use super::{McpAuthorizationServerMetadata, McpBearerChallenge, McpProtectedResourceMetadata};
 use crate::{Error, Result};
@@ -20,7 +15,7 @@ use crate::{Error, Result};
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RESOLVED_ADDRESSES: usize = 16;
+const MAX_METADATA_REDIRECTS: usize = 3;
 
 /// URL scheme policy for OAuth endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,42 +26,11 @@ pub enum McpOAuthEndpointPolicy {
     AllowLoopbackHttp,
 }
 
-/// Caller-supplied validation for OAuth discovery destinations and resolved addresses.
-pub trait McpOAuthDestinationPolicy: Send + Sync {
-    /// Validate a fully parsed destination before DNS resolution.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the destination is not permitted.
-    fn validate(&self, destination: &Url) -> Result<()>;
-
-    /// Validate an address returned by DNS and later observed as the response peer.
-    ///
-    /// The default rejects non-public addresses. A test that needs loopback networking must
-    /// explicitly override this method rather than weakening process-global policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the address is not a public unicast destination.
-    fn validate_address(&self, address: IpAddr) -> Result<()> {
-        validate_public_address(address)
-    }
-}
-
-#[derive(Debug)]
-struct PublicDestination;
-
-impl McpOAuthDestinationPolicy for PublicDestination {
-    fn validate(&self, _destination: &Url) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Redirect-free, DNS-pinned, timeout-bounded, response-bounded OAuth discovery client.
+/// Timeout- and response-bounded OAuth discovery and registration client.
 #[derive(Clone)]
 pub struct McpOAuthDiscoveryClient {
     endpoint_policy: McpOAuthEndpointPolicy,
-    destination_policy: Arc<dyn McpOAuthDestinationPolicy>,
+    client: reqwest::Client,
     max_response_bytes: usize,
 }
 
@@ -85,12 +49,11 @@ impl McpOAuthDiscoveryClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if a redirect-free, proxy-free TLS client cannot be built.
+    /// Returns an error if an HTTP client cannot be built.
     pub fn new(endpoint_policy: McpOAuthEndpointPolicy) -> Result<Self> {
-        build_http_client(None)?;
         Ok(Self {
             endpoint_policy,
-            destination_policy: Arc::new(PublicDestination),
+            client: build_http_client()?,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         })
     }
@@ -99,16 +62,6 @@ impl McpOAuthDiscoveryClient {
     #[must_use]
     pub const fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = max_response_bytes;
-        self
-    }
-
-    /// Set explicit caller-owned destination and address policy.
-    #[must_use]
-    pub fn with_destination_policy(
-        mut self,
-        destination_policy: Arc<dyn McpOAuthDestinationPolicy>,
-    ) -> Self {
-        self.destination_policy = destination_policy;
         self
     }
 
@@ -166,59 +119,43 @@ impl McpOAuthDiscoveryClient {
         ))
     }
 
-    /// Fetch bounded JSON after validating, resolving, and pinning the destination.
+    /// Fetch bounded metadata JSON, following bounded same-origin redirects.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized error for unsafe destinations, DNS, HTTP, peer, content, or JSON.
+    /// Returns a sanitized error for unsafe URLs, HTTP, content, or JSON.
     pub async fn get_json<T: DeserializeOwned>(&self, destination: &str) -> Result<T> {
         let url = validate_endpoint("HTTP destination", destination, self.endpoint_policy)?;
-        self.destination_policy.validate(&url)?;
-        let addresses = resolve_destination(&url, self.destination_policy.as_ref()).await?;
-        let client = build_http_client(Some((&url, &addresses)))?;
-        let response = client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|_| Error::protocol("OAuth HTTP request failed"))?;
-        parse_json_response(
-            response,
-            &url,
-            &addresses,
-            self.destination_policy.as_ref(),
-            self.max_response_bytes,
+        let response = get_metadata(
+            &self.client,
+            url,
+            self.endpoint_policy,
+            DEFAULT_RESPONSE_TIMEOUT,
+            None,
         )
-        .await
+        .await?;
+        parse_json_response(response, self.max_response_bytes).await
     }
 
-    /// Send bounded JSON after validating, resolving, and pinning the destination.
+    /// Send JSON to a validated URL without following redirects and parse a bounded response.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized error for unsafe destinations, DNS, HTTP, peer, content, or JSON.
+    /// Returns a sanitized error for unsafe URLs, HTTP, content, or JSON.
     pub async fn post_json<T: Serialize + Sync + ?Sized, R: DeserializeOwned>(
         &self,
         destination: &str,
         value: &T,
     ) -> Result<R> {
         let url = validate_endpoint("HTTP destination", destination, self.endpoint_policy)?;
-        self.destination_policy.validate(&url)?;
-        let addresses = resolve_destination(&url, self.destination_policy.as_ref()).await?;
-        let client = build_http_client(Some((&url, &addresses)))?;
-        let response = client
-            .post(url.clone())
+        let response = self
+            .client
+            .post(url)
             .json(value)
             .send()
             .await
             .map_err(|_| Error::protocol("OAuth HTTP request failed"))?;
-        parse_json_response(
-            response,
-            &url,
-            &addresses,
-            self.destination_policy.as_ref(),
-            self.max_response_bytes,
-        )
-        .await
+        parse_json_response(response, self.max_response_bytes).await
     }
 }
 
@@ -262,10 +199,10 @@ pub fn authorization_server_metadata_urls(issuer: &str) -> Vec<String> {
     ]
 }
 
-/// Fetch protected-resource metadata with hardened default HTTPS/public-address policy.
+/// Fetch protected-resource metadata with the default HTTPS-only URL policy.
 ///
 /// The supplied client is retained for source compatibility but is intentionally not used because
-/// its redirect, proxy, DNS, and timeout behavior cannot be verified.
+/// its redirect and timeout behavior cannot be verified.
 ///
 /// # Errors
 ///
@@ -280,10 +217,10 @@ pub async fn discover_protected_resource_metadata(
         .await
 }
 
-/// Fetch authorization-server metadata with hardened default HTTPS/public-address policy.
+/// Fetch authorization-server metadata with the default HTTPS-only URL policy.
 ///
 /// The supplied client is retained for source compatibility but is intentionally not used because
-/// its redirect, proxy, DNS, and timeout behavior cannot be verified.
+/// its redirect and timeout behavior cannot be verified.
 ///
 /// # Errors
 ///
@@ -317,7 +254,7 @@ pub(super) fn validate_endpoint(
         )));
     }
     let host = url
-        .host_str()
+        .host()
         .ok_or_else(|| Error::protocol(format!("OAuth {name} requires a host")))?;
     let valid_scheme = url.scheme() == "https"
         || policy == McpOAuthEndpointPolicy::AllowLoopbackHttp
@@ -331,81 +268,84 @@ pub(super) fn validate_endpoint(
     Ok(url)
 }
 
-fn build_http_client(resolution: Option<(&Url, &[SocketAddr])>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .redirect(Policy::none())
-        .no_proxy()
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .timeout(DEFAULT_RESPONSE_TIMEOUT);
-    if let Some((url, addresses)) = resolution {
-        let host = url
-            .host_str()
-            .ok_or_else(|| Error::protocol("OAuth HTTP destination requires a host"))?;
-        builder = builder.resolve_to_addrs(host, addresses);
-    }
-    builder
+        .timeout(DEFAULT_RESPONSE_TIMEOUT)
         .build()
-        .map_err(|_| Error::protocol("failed to build hardened OAuth HTTP client"))
+        .map_err(|_| Error::protocol("failed to build OAuth HTTP client"))
 }
 
-async fn resolve_destination(
-    destination: &Url,
-    policy: &dyn McpOAuthDestinationPolicy,
-) -> Result<Vec<SocketAddr>> {
-    let host = destination
-        .host_str()
-        .ok_or_else(|| Error::protocol("OAuth HTTP destination requires a host"))?;
-    let port = destination
-        .port_or_known_default()
-        .ok_or_else(|| Error::protocol("OAuth HTTP destination requires a known port"))?;
-    let resolved = tokio::time::timeout(
-        DEFAULT_CONNECT_TIMEOUT,
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| Error::protocol("OAuth HTTP DNS resolution timed out"))?
-    .map_err(|_| Error::protocol("OAuth HTTP DNS resolution failed"))?;
-    let mut addresses = BTreeSet::new();
-    for address in resolved {
-        policy.validate_address(address.ip())?;
-        addresses.insert(address);
-        if addresses.len() > MAX_RESOLVED_ADDRESSES {
+// Use a no-follow client; only this metadata GET path may issue another request.
+pub(super) async fn get_metadata(
+    client: &reqwest::Client,
+    mut url: Url,
+    endpoint_policy: McpOAuthEndpointPolicy,
+    timeout: Duration,
+    accept: Option<&str>,
+) -> Result<reqwest::Response> {
+    let start = std::time::Instant::now();
+    let origin = url.origin();
+    let mut redirects_remaining = MAX_METADATA_REDIRECTS;
+    loop {
+        let remaining = timeout
+            .checked_sub(start.elapsed())
+            .ok_or_else(|| Error::protocol("OAuth metadata request timed out"))?;
+        let mut request = client.get(url.clone()).timeout(remaining);
+        if let Some(accept) = accept {
+            request = request.header(header::ACCEPT, accept);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| Error::protocol("OAuth metadata request failed"))?;
+        if !matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) {
+            return Ok(response);
+        }
+        redirects_remaining = redirects_remaining
+            .checked_sub(1)
+            .ok_or_else(|| Error::protocol("OAuth metadata redirect limit exceeded"))?;
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.trim() == *value
+                    && !value.contains('\\')
+                    && !value.chars().any(char::is_control)
+            })
+            .ok_or_else(|| Error::protocol("OAuth metadata redirect location is invalid"))?;
+        let target = url
+            .join(location)
+            .map_err(|_| Error::protocol("OAuth metadata redirect location is invalid"))?;
+        url = validate_endpoint("metadata redirect", target.as_str(), endpoint_policy)?;
+        if url.origin() != origin {
             return Err(Error::protocol(
-                "OAuth HTTP DNS response contains too many addresses",
+                "OAuth metadata redirect must stay on the same origin",
             ));
         }
     }
-    if addresses.is_empty() {
-        return Err(Error::protocol("OAuth HTTP DNS response was empty"));
-    }
-    Ok(addresses.into_iter().collect())
 }
 
 async fn parse_json_response<T: DeserializeOwned>(
     response: reqwest::Response,
-    destination: &Url,
-    addresses: &[SocketAddr],
-    policy: &dyn McpOAuthDestinationPolicy,
     max_response_bytes: usize,
 ) -> Result<T> {
-    if response.url() != destination {
-        return Err(Error::protocol("OAuth HTTP redirect refused"));
-    }
-    let peer = response
-        .remote_addr()
-        .ok_or_else(|| Error::protocol("OAuth HTTP response peer is unavailable"))?;
-    policy.validate_address(peer.ip())?;
-    if !addresses.iter().any(|address| address.ip() == peer.ip()) {
-        return Err(Error::protocol(
-            "OAuth HTTP response peer was not DNS-pinned",
-        ));
-    }
     if !response.status().is_success() {
         return Err(Error::protocol("OAuth HTTP response was unsuccessful"));
     }
     let content_type = response
         .headers()
-        .get(CONTENT_TYPE)
+        .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .map(str::trim)
@@ -525,49 +465,6 @@ impl<'de> serde::de::DeserializeSeed<'de> for UniqueValueSeed {
     }
 }
 
-fn validate_public_address(address: IpAddr) -> Result<()> {
-    let public = match address {
-        IpAddr::V4(address) => is_public_ipv4(address),
-        IpAddr::V6(address) => is_public_ipv6(address),
-    };
-    if public {
-        Ok(())
-    } else {
-        Err(Error::protocol(
-            "OAuth HTTP destination resolved to a non-public address",
-        ))
-    }
-}
-
-fn is_public_ipv4(address: Ipv4Addr) -> bool {
-    let [a, b, c, ..] = address.octets();
-    !(a == 0
-        || a == 10
-        || a == 127
-        || a >= 224
-        || a == 100 && (64..=127).contains(&b)
-        || a == 169 && b == 254
-        || a == 172 && (16..=31).contains(&b)
-        || a == 192 && b == 0
-        || a == 192 && b == 168
-        || a == 198 && ((18..=19).contains(&b) || b == 51 && c == 100)
-        || a == 203 && b == 0 && c == 113)
-}
-
-fn is_public_ipv6(address: Ipv6Addr) -> bool {
-    if let Some(address) = address.to_ipv4() {
-        return is_public_ipv4(address);
-    }
-    let segments = address.segments();
-    !address.is_unspecified()
-        && !address.is_loopback()
-        && !address.is_multicast()
-        && segments[0] & 0xfe00 != 0xfc00
-        && segments[0] & 0xffc0 != 0xfe80
-        && segments[0] & 0xffc0 != 0xfec0
-        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-}
-
 fn protected_resource_discovery_urls(
     endpoint: &str,
     challenge: Option<&McpBearerChallenge>,
@@ -603,11 +500,12 @@ fn parse_discovery_base(value: &str, allow_query: bool) -> Result<Url> {
     Ok(url)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+pub(super) fn is_loopback_host(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    }
 }
 
 fn protected_resource_metadata_url_for_path(url: &Url) -> Option<String> {
@@ -635,4 +533,86 @@ fn with_path_and_query(url: &Url, path: &str, preserve_query: bool) -> String {
     }
     url.set_fragment(None);
     url.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        response::Redirect,
+        routing::{get, post},
+    };
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn oauth_metadata_redirects_are_same_origin_and_writes_never_follow() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let alternate = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alternate_origin = format!("http://{}", alternate.local_addr().unwrap());
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+        let observe_write = redirected_requests.clone();
+        let observe_cross_origin = redirected_requests.clone();
+        let alternate_task = tokio::spawn(async move {
+            let endpoint = Router::new().route(
+                "/json",
+                get(move || async move {
+                    observe_cross_origin.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({}))
+                }),
+            );
+            axum::serve(alternate, endpoint).await.unwrap();
+        });
+        let server = Router::new()
+            .route("/read", get(|| async { Redirect::temporary("/json") }))
+            .route("/json", get(|| async { Json(json!({"ok": true})) }))
+            .route(
+                "/cross-origin",
+                get(
+                    move || async move { Redirect::temporary(&format!("{alternate_origin}/json")) },
+                ),
+            )
+            .route("/write", post(|| async { Redirect::temporary("/written") }))
+            .route(
+                "/written",
+                post(move || async move {
+                    observe_write.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({}))
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let discovery =
+            McpOAuthDiscoveryClient::new(McpOAuthEndpointPolicy::AllowLoopbackHttp).unwrap();
+
+        assert_eq!(
+            discovery
+                .get_json::<Value>(&format!("{origin}/read"))
+                .await
+                .unwrap(),
+            json!({"ok": true})
+        );
+        assert!(
+            discovery
+                .get_json::<Value>(&format!("{origin}/cross-origin"))
+                .await
+                .is_err()
+        );
+        assert!(
+            discovery
+                .post_json::<_, Value>(&format!("{origin}/write"), &json!({"secret": "test"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(redirected_requests.load(Ordering::Relaxed), 0);
+        task.abort();
+        alternate_task.abort();
+    }
 }

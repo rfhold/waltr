@@ -52,7 +52,7 @@ The static profile does not consume ambient `WALTR_*` deployment settings. Chang
 
 The `dev` volume contains both SQLite files, including unified outbound credentials in `waltr.sqlite3`, and filesystem agent sessions. It is disposable local state, not a production backup contract.
 
-The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. Their `WALTR_OAUTH_*` and `WALTR_TEST_MCP_*` values are test-fixture settings, not server deployment variables. The authenticated Waltr fixture enables the hosted MCP issuer, generates an ephemeral keyring in tmpfs, and sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` only so HTTPS Waltr-to-Waltr CIMD and token requests can reach private Compose aliases. Production deployments must leave this deterministic test exception unset. The fixture does not configure a direct MCP issuer or a preregistered self client.
+The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. The authenticated Waltr fixture enables the hosted MCP issuer and generates an ephemeral keyring in tmpfs. Its HTTPS requests use private Compose aliases with normal certificate verification. The fixture does not configure a direct MCP issuer or a preregistered self client.
 
 ## Routine Speech and Helpers
 
@@ -491,7 +491,6 @@ WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL=86400
 WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL=2592000
 WALTR_MCP_OAUTH_CODE_TTL=300
 WALTR_MCP_OAUTH_ALLOW_DCR=true
-WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=true
 WALTR_MCP_OAUTH_ALLOW_CIMD=true
 WALTR_TRUSTED_PROXIES=10.0.0.0/8,2001:db8::/32
 ```
@@ -504,16 +503,9 @@ The browser, native Waltr API, and inbound MCP endpoint are separate authorizati
 | Native Waltr API bearer | `WALTR_API_OIDC_ISSUER`, falling back to `WALTR_OIDC_ISSUER` | `WALTR_API_OIDC_AUDIENCE`, falling back to legacy `WALTR_OIDC_AUDIENCE`; generic `JWT` also requires `azp` equal to `WALTR_API_OIDC_CLIENT_ID` | `WALTR_API_REQUIRED_SCOPES`, empty when omitted |
 | Inbound MCP bearer | Local `WALTR_MCP_OAUTH_ISSUER` | Exact public `/mcp` resource | `WALTR_MCP_REQUIRED_SCOPES` |
 
-The hosted issuer is enabled only in OIDC mode. `WALTR_MCP_REQUIRED_SCOPES` and `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE` are required. The issuer defaults to the exact `WALTR_PUBLIC_URL` path plus `/oauth`; an override must equal that same HTTPS deployment-relative URL. Token/code lifetime bounds and defaults are documented in [Access Authentication](architecture/access-authentication.md). DCR, native HTTP loopback redirects, and CIMD default off and must be enabled independently. Enabling loopback redirects permits public clients resolved through either DCR or CIMD to use them.
+The hosted issuer operates only in OIDC mode. It requires `WALTR_MCP_REQUIRED_SCOPES` and `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE`. The issuer defaults to the exact `WALTR_PUBLIC_URL` path plus `/oauth`. An override must equal that same HTTPS deployment-relative URL. See [Access Authentication](architecture/access-authentication.md) for lifetimes and defaults. DCR and CIMD default off. Native public clients can register HTTP loopback callbacks under the normal native redirect rules.
 
-Private OAuth destinations are denied by default. Two optional, comma-separated allowlists admit RFC 1918 IPv4 and IPv6 unique-local addresses at exact HTTPS origins:
-
-| Setting | Direction |
-| --- | --- |
-| `WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS` | Client metadata documents fetched by Waltr's hosted authorization server. |
-| `WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS` | MCP discovery, registration, exchange, revocation, and refresh performed by Waltr's outbound MCP client. |
-
-Each entry must be only `https://host[:port]`, without credentials, a path, query, or fragment. Matching includes the effective port, duplicate origins are rejected, and the lists do not grant trust across directions. Waltr automatically trusts its initialized deployment origin for hosted self-CIMD. Server-owned outbound authorization gates automatic trust to the exact initialized self-MCP resource, and the server supplies that origin to agent session refresh. The Pulumi settings `mcpOAuthCimdTrustedPrivateOrigins` and `mcpOutboundOAuthTrustedPrivateOrigins` project nonempty lists into the corresponding environment variables.
+Private HTTPS OAuth destinations need no Waltr exception. Deployment egress controls determine reachability for OAuth discovery, client metadata, and token requests. Waltr still verifies certificates, issuer and resource identity, and registered callbacks.
 
 `WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. Environment-owned servers require it in every auth mode because the bundled self-MCP resource consumes it independently. It must use HTTPS except for loopback development and is not inferred from the browser callback. Disabling access auth permits this variable but still rejects actual partial browser, API, or hosted-MCP OIDC settings. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly. `WALTR_API_OIDC_CLIENT_ID` enables provider-generic `JWT` access tokens by requiring their `azp` claim to exactly match the configured native client; RFC 9068 `at+jwt` access tokens remain supported without that claim.
 
@@ -706,7 +698,6 @@ Embedded mode publishes no CIMD client metadata URI. Its local metadata endpoint
 
 If upstream advertises CIMD and DCR, embedded mode skips CIMD. It can use preregistration or DCR. Reauthorization in the same server generation reuses a valid DCR registration; a replacement generation performs fresh DCR because the previous generation's registration marker is stale.
 
-Embedded composition ignores `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS`. Only its explicit trusted-origin list can admit private HTTPS OAuth destinations.
 
 Embedded attempts and MCP credentials persist only an opaque per-generation callback marker. They never persist the loopback callback endpoint.
 
@@ -849,7 +840,7 @@ The keyring JSON requires top-level `schema_version: 1`, names one active versio
 
 The Pulumi workload exports logs, traces, and metrics over OTLP/HTTP protobuf to `https://telemetry.holdenitdown.net:4318` and profiles to `https://telemetry.holdenitdown.net:4040`. Its `OTEL_RESOURCE_ATTRIBUTES` sets `deployment.environment.name` to the Pulumi stack name, distinguishing `preview` from `prod`; profiles retain the `waltr-server` application name.
 
-The egress NetworkPolicy permits DNS, HTTPS discovery, OTLP on TCP `4318`, profiling on TCP `4040`, and PostgreSQL. The sidecar shares the pod's egress policy; its shell commands are not subject to the server's application HTTP destination policy. Application destination policy rejects private, loopback, link-local, metadata-service, DNS-rebinding, and redirect destinations by default. The exact initialized hosted MCP HTTPS origin is trusted automatically for self-CIMD, exact-self authorization orchestration, and agent session refresh; additional private origins require the direction-specific allowlists above. Trust never admits another scheme, host, or port. Fetches pin approved DNS addresses, verify the connected peer, use bounded headers/body/timeouts, require JSON, and send no ambient credentials. Loopback, link-local, metadata, reserved, and other prohibited addresses remain blocked even for a trusted origin. NetworkPolicy port filtering does not replace those checks.
+The egress NetworkPolicy permits DNS, HTTPS discovery, OTLP on TCP `4318`, profiling on TCP `4040`, and PostgreSQL. The sidecar shares the pod's egress policy. Port rules alone do not restrict HTTPS to particular destinations. The deployment owns egress restrictions for both the server and the sidecar.
 
 CloudNativePG writes compressed WAL and data backups under the generated S3 bucket's `database/` prefix, retains backups for 30 days, and runs a daily scheduled backup. Treat the MCP database and the matching wrapping-key Secret version as one recovery unit. A restored database without every wrapping key referenced by encrypted signing rows cannot issue or rotate credentials. See [MCP OAuth Key Rotation And Recovery](runbooks/mcp-oauth-key-rotation-recovery.md).
 
@@ -907,9 +898,9 @@ The public `waltr_server::build_app(BuildAppOptions)` reads environment-owned co
 
 V2 resource contracts and registries supply the accepted interaction bounds. The obsolete server `interaction_limits` fields are removed. For standalone embedding hosts, `routine_private_parent` supplies an existing private-storage parent. Embedded composition derives this parent from its explicit Waltr database path. The host removes the owned temporary child after joined shutdown.
 
-Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS` once as a boolean.
+Standalone outbound OAuth snapshots `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values at startup.
 
-Later environment changes do not alter active behavior. Embedded composition ignores the ambient private-test switch.
+Later environment changes do not alter the active snapshot.
 
 The snapshot excludes arbitrary process environment. Its redacted `Debug` representation reports configuration presence and count without values.
 
@@ -919,7 +910,7 @@ Environment-owned servers expand required `${env:WALTR_PUBLIC_URL}` in bundled `
 
 Embedded Tauri composition prebinds loopback, atomically overwrites the ordinary persisted `mcp-servers/waltr.yaml` slot with that generation's exact URL, and then loads the same bundled-plus-persisted catalog. The filesystem resource remains ordinarily inspectable, replaceable, watchable, and resettable. Reset can fail normal candidate validation because the bundled fallback needs `WALTR_PUBLIC_URL`.
 
-The host-owned generation credential remains memory-only and is available only when the effective resource URL exactly matches the initialized loopback endpoint, so an edited endpoint cannot receive it. Hosted servers retain their private-origin policy.
+The host-owned generation credential remains memory-only and is available only when the effective resource URL exactly matches the initialized loopback endpoint. An edited endpoint cannot receive it.
 
 Embedded outbound OAuth uses the exact callback derived from that same prebound origin. It does not consult ambient public or target redirect variables.
 

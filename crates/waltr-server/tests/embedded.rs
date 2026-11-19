@@ -9,7 +9,7 @@ use waltr::grpc::waltr::session::v1::{
 use waltr_server::{
     LocalBearer,
     embedded::{
-        EmbeddedCatalogFallback, EmbeddedCatalogSource, EmbeddedOutboundPolicy,
+        EmbeddedCatalogFallback, EmbeddedCatalogSource,
         EmbeddedServerConfig, build_embedded_server,
     },
 };
@@ -30,7 +30,6 @@ fn config(root: &std::path::Path, bearer: &str) -> EmbeddedServerConfig {
         catalog_fallback: None,
         default_agent: "coding".to_owned(),
         local_bearer: LocalBearer::new(bearer).unwrap(),
-        outbound_policy: EmbeddedOutboundPolicy::default(),
     }
 }
 

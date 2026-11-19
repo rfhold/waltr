@@ -267,6 +267,59 @@ async fn complete_device(
 }
 
 #[tokio::test]
+async fn workspace_binding_refresh_connection_failure_preserves_the_grant() {
+    let (issuer, server) = issuer().await;
+    let (resources, store) = setup(&issuer).await;
+    let service = AuthService::test_workspace_binding(resources.clone(), Arc::clone(&store));
+    let begin = service
+        .begin_auth(begin_request(AuthMethod::OauthDevice))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        complete_device(&service, &begin.attempt_id)
+            .await
+            .attempt
+            .unwrap()
+            .lifecycle,
+        AuthAttemptLifecycle::Succeeded as i32
+    );
+
+    let binding = WorkspaceBindingAuth::new(resources, store, OutboundHttpPolicy::loopback_test());
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut credential = binding.read(KEY).await.unwrap().unwrap().credential;
+    let OAuthCredentialContext::WorkspaceBinding(context) = &mut credential.context else {
+        panic!("expected a WorkspaceBinding grant");
+    };
+    context.token_endpoint =
+        Url::parse(&format!("http://{}/token", socket.local_addr().unwrap())).unwrap();
+    binding
+        .credentials
+        .write(&credential_key(KEY), credential)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = binding.refresh(KEY).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            error.message(),
+            "workspace binding refresh connection failed"
+        );
+        assert!(
+            !binding
+                .read(KEY)
+                .await
+                .unwrap()
+                .unwrap()
+                .reauthorization_required
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() {
     let (issuer, server) = issuer().await;
     let (resources, store) = setup(&issuer).await;

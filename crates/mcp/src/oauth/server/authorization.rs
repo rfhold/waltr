@@ -420,11 +420,7 @@ impl OAuthAuthorizationServer {
     /// # Errors
     ///
     /// Returns an error for confidential, malformed, duplicate, or over-quota clients.
-    pub async fn preregister_public_client(
-        &self,
-        client: OAuthClient,
-        allow_loopback_redirects: bool,
-    ) -> Result<()> {
+    pub async fn preregister_public_client(&self, client: OAuthClient) -> Result<()> {
         if client.registration_method != OAuthClientRegistrationMethod::Preconfigured
             || client.client_id.is_empty()
             || client.client_id.len() > 2048
@@ -434,9 +430,10 @@ impl OAuthAuthorizationServer {
             || client.client_secret_digest.is_some()
             || client.redirect_uris.is_empty()
             || client.redirect_uris.len() > self.state.store.config().max_redirect_uris_per_client
-            || client.redirect_uris.iter().any(|redirect| {
-                crate::validate_public_redirect_uri(redirect, allow_loopback_redirects).is_err()
-            })
+            || client
+                .redirect_uris
+                .iter()
+                .any(|redirect| crate::validate_public_redirect_uri(redirect).is_err())
         {
             return Err(Error::protocol(
                 "OAuth preregistered public client is invalid",
@@ -707,6 +704,12 @@ async fn resolve_client(
     let Some(fetcher) = &options.metadata_fetcher else {
         return Ok(None);
     };
+    let endpoint_policy = fetcher.endpoint_policy();
+    if super::super::discovery::validate_endpoint("client metadata URL", client_id, endpoint_policy)
+        .is_err()
+    {
+        return Ok(None);
+    }
     let metadata = if let Some(metadata) = state
         .store
         .client_metadata(client_id.to_owned(), now)
@@ -742,7 +745,7 @@ async fn resolve_client(
         serde_json::from_value(metadata.document.clone())
             .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?;
     document
-        .validate_public_client(client_id, options.allow_loopback_redirects)
+        .validate_public_client(client_id, endpoint_policy)
         .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?;
     Ok(Some((
         OAuthClient {
@@ -817,7 +820,6 @@ async fn register(
         return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
     };
     let registration = match registration.validate_and_normalize(
-        options.allow_loopback_redirects,
         state.store.config().max_redirect_uris_per_client,
         options.max_field_bytes,
     ) {

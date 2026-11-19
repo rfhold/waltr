@@ -49,8 +49,6 @@ const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEADLINE: Duration = Duration::from_secs(15);
 const TEST: &str = "app::tests::workspace_binding::workspace_binding_authorizes_exports_refreshes_and_stops_without_fallback";
 const EXPORTER_ROOT: &str = "WALTR_WORKSPACE_BINDING_TEST_EXPORTER_ROOT";
-const DESTINATION_URL: &str = "WALTR_WORKSPACE_BINDING_TEST_DESTINATION";
-const ISSUER_URL: &str = "WALTR_WORKSPACE_BINDING_TEST_ISSUER";
 const EXPORTER_ADDRESS: &str = "exporter-address";
 
 #[tokio::test]
@@ -114,12 +112,11 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         &local_root,
         destination_db,
         access,
-        Vec::new(),
     )
     .await;
     let machines = destination.machines.clone();
     let destination = RunningApp::start(destination, listener).await;
-    let mut exporter = start_exporter(&root, &endpoint, &idp.url);
+    let mut exporter = start_exporter(&root);
     let exporter_channel = connect(&exporter_address(&root, &mut exporter).await).await;
 
     let mut config = ResourceServiceClient::new(exporter_channel.clone());
@@ -252,12 +249,10 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     timeout(DEADLINE, idp_task).await.unwrap().unwrap();
 }
 
-fn start_exporter(root: &Path, destination: &str, issuer: &str) -> Child {
+fn start_exporter(root: &Path) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST, "--nocapture"])
         .env(EXPORTER_ROOT, root)
-        .env(DESTINATION_URL, destination)
-        .env(ISSUER_URL, issuer)
         .stdin(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -285,8 +280,6 @@ async fn exporter_address(root: &Path, child: &mut Child) -> String {
 }
 
 async fn serve_exporter(root: &Path) {
-    let endpoint = std::env::var(DESTINATION_URL).unwrap();
-    let issuer = std::env::var(ISSUER_URL).unwrap();
     let listener = loopback().await;
     let address = origin(&listener);
     let app = RunningApp::start(
@@ -295,7 +288,6 @@ async fn serve_exporter(root: &Path) {
             &root.join("exporter"),
             persistence().await,
             AccessAuthenticator::disabled(),
-            vec![endpoint.parse().unwrap(), issuer.parse().unwrap()],
         )
         .await,
         listener,
@@ -442,7 +434,6 @@ async fn application(
     workspace_root: &Path,
     persistence: Persistence,
     access_authenticator: AccessAuthenticator,
-    outbound_private_origins: Vec<url::Url>,
 ) -> ServerApplication {
     std::fs::create_dir_all(config_root.join(".waltr/resources/mcp-servers")).unwrap();
     std::fs::write(
@@ -461,9 +452,7 @@ async fn application(
             catalog_loader,
             access_authenticator,
             mcp_oauth: None,
-            outbound_private_origins,
             outbound_oauth: OutboundOAuthConfig::default().with_workspace_binding_loopback(),
-            automatic_self_mcp_resource: None,
             agent_state: None,
             local_admission: None,
             workspace_root: workspace_root.into(),

@@ -202,7 +202,11 @@ continues to use `reqwest::Client::new()` behavior; stdio ignores the HTTP clien
 
 Authorization is optional and applies only to HTTP. Protected-resource and issuer URLs
 require HTTPS except for loopback development URLs. Discovery validates exact resource
-and issuer identities. Dynamic client registration requests require `application_type`.
+and issuer identities. Metadata reads can follow up to three same-origin redirects
+without an HTTPS downgrade. Deployment egress controls determine which destinations
+are reachable. Registration and token requests do not follow redirects.
+
+Dynamic client registration requests require `application_type`.
 Responses can omit this metadata; an explicit value must match the request.
 Public-client validation still requires identical redirect URIs, grant types, response
 types, and client name, plus authentication method `none` and no client or registration credentials.
@@ -214,8 +218,8 @@ Hosted public-client metadata need not declare the nonstandard
 `code_challenge_methods` extension. Authorization still requires PKCE S256, and code
 redemption verifies the verifier. This applies to preregistered, CIMD, and DCR clients.
 
-The redirect-admission policy must explicitly allow native HTTP loopback callbacks.
-After admission, their port can differ at authorization; the original scheme, host,
+Native clients can register HTTP loopback callbacks.
+The port can differ at authorization; the original scheme, host,
 path, query, and all other components must remain identical. `localhost` and
 `127.0.0.1` are not interchangeable. HTTPS and non-loopback redirects remain exact
 matches. The transaction retains the actual authorization redirect, and token

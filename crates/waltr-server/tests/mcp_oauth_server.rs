@@ -15,11 +15,11 @@ const RESOURCE: &str = "https://waltr.example/mcp";
 const VERIFIER: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 
 #[tokio::test]
-async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy()
+async fn dynamic_registration_accepts_standard_native_loopback_redirects()
 -> Result<(), Box<dyn std::error::Error>> {
     waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
-    let denied_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), false);
+    let server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1));
     let client = reqwest::Client::new();
     let request = json!({
         "application_type": "native",
@@ -31,17 +31,8 @@ async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy(
         "client_uri": "https://opencode.ai",
         "scope": "mcp:use"
     });
-    let denied = client
-        .post(denied_server.url("/oauth/register"))
-        .json(&request)
-        .send()
-        .await?;
-    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
-    denied_server.stop();
-
-    let enabled_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), true);
     let registration = client
-        .post(enabled_server.url("/oauth/register"))
+        .post(server.url("/oauth/register"))
         .json(&request)
         .send()
         .await?;

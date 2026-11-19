@@ -1,115 +1,110 @@
-use std::{env, error::Error, fmt, net::IpAddr, time::Duration};
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
-use mcp::TrustedPrivateOAuthCimdDestinationPolicy;
-use reqwest::{Client, Response, Url, header::CONTENT_TYPE};
+use reqwest::{
+    Client, Response, StatusCode, Url,
+    header::{CONTENT_TYPE, LOCATION},
+    redirect::Policy,
+};
 use tonic::Status;
 
 pub(super) const OAUTH_RESPONSE_LIMIT: usize = 64 * 1024;
+const METADATA_REDIRECT_LIMIT: usize = 5;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct OutboundHttpPolicy {
     allow_loopback_http: bool,
-    allow_private_https: bool,
-    configured_private_origins: Vec<Url>,
-    automatic_self_resource: Option<Url>,
-    active_private_origins: Vec<Url>,
 }
 
 impl OutboundHttpPolicy {
-    pub(super) fn production(
-        configured_private_origins: Vec<Url>,
-        automatic_self_resource: Option<Url>,
-        allow_private_https: bool,
-    ) -> Self {
-        Self {
-            allow_loopback_http: false,
-            allow_private_https,
-            active_private_origins: configured_private_origins.clone(),
-            configured_private_origins,
-            automatic_self_resource,
-        }
+    pub(super) const fn production() -> Self {
+        Self::new(false)
     }
 
     #[cfg(test)]
     pub(super) const fn loopback_test() -> Self {
+        Self::new(true)
+    }
+
+    pub(super) const fn new(allow_loopback_http: bool) -> Self {
         Self {
-            allow_loopback_http: true,
-            allow_private_https: false,
-            configured_private_origins: Vec::new(),
-            automatic_self_resource: None,
-            active_private_origins: Vec::new(),
+            allow_loopback_http,
         }
     }
 
-    pub(super) async fn client_for(&self, value: &str) -> Result<(Url, Client), Status> {
+    pub(super) fn client_for(self, value: &str) -> Result<(Url, Client), Status> {
         let url = self.validate_url(value)?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| Status::failed_precondition("OAuth endpoint requires a host"))?;
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| Status::failed_precondition("OAuth endpoint has no usable port"))?;
-        let addresses = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| Status::unavailable("OAuth endpoint DNS resolution failed"))?
-            .collect::<Vec<_>>();
-        if addresses.is_empty()
-            || addresses
-                .iter()
-                .any(|address| !self.allows_address(&url, address.ip()))
-        {
-            return Err(Status::failed_precondition(
-                "OAuth endpoint resolves to a disallowed destination",
-            ));
-        }
-        let mut builder = crate::outbound_http::client_builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10));
-        if host.parse::<IpAddr>().is_err() {
-            builder = builder.resolve_to_addrs(host, &addresses);
-        }
-        let client = builder
+        let client = Self::client_builder()
+            .redirect(Policy::none())
             .build()
             .map_err(|_| Status::internal("failed to build outbound OAuth client"))?;
         Ok((url, client))
     }
 
-    pub(super) const fn allows_loopback_http(&self) -> bool {
-        self.allow_loopback_http
-    }
-
-    pub(super) fn trusted_private_origins(&self) -> &[Url] {
-        &self.active_private_origins
-    }
-
-    pub(super) fn for_mcp_resource(&self, resource: &str) -> Self {
-        let mut policy = self.clone();
-        policy
-            .active_private_origins
-            .clone_from(&self.configured_private_origins);
-        if Url::parse(resource).ok().as_ref() == self.automatic_self_resource.as_ref()
-            && let Some(resource) = &self.automatic_self_resource
-            && !policy.trusts_private_origin(resource)
-        {
-            policy.active_private_origins.push(resource.clone());
+    pub(super) async fn get_metadata(
+        self,
+        value: &str,
+        request_error: &'static str,
+    ) -> Result<Response, Status> {
+        let (mut url, client) = self.client_for(value)?;
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let mut remaining = METADATA_REDIRECT_LIMIT;
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout.is_zero() {
+                return Err(Status::unavailable(request_error));
+            }
+            let response = client
+                .get(url.clone())
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|_| Status::unavailable(request_error))?;
+            if !matches!(
+                response.status(),
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::SEE_OTHER
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            ) {
+                return Ok(response);
+            }
+            if remaining == 0 {
+                return Err(Status::failed_precondition(
+                    "OAuth metadata redirected too many times",
+                ));
+            }
+            let mut locations = response.headers().get_all(LOCATION).iter();
+            url = locations
+                .next()
+                .and_then(|value| value.to_str().ok())
+                .filter(|location| !location.is_empty() && locations.next().is_none())
+                .and_then(|location| self.metadata_redirect_target(&url, location))
+                .ok_or_else(|| {
+                    Status::failed_precondition("OAuth metadata redirect URL is invalid")
+                })?;
+            remaining -= 1;
         }
-        policy
     }
 
-    pub(super) fn without_trusted_private_origins(&self) -> Self {
-        let mut policy = self.clone();
-        policy.active_private_origins.clear();
-        policy
+    fn metadata_redirect_target(self, previous: &Url, location: &str) -> Option<Url> {
+        let target = previous.join(location).ok()?;
+        if previous.origin() != target.origin() {
+            return None;
+        }
+        self.validate_url(target.as_str()).ok()
     }
 
-    pub(super) async fn validate_destination(&self, value: &str) -> Result<Url, Status> {
-        self.client_for(value).await.map(|(url, _)| url)
+    pub(super) fn client_builder() -> reqwest::ClientBuilder {
+        crate::outbound_http::client_builder()
+            .referer(false)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(REQUEST_TIMEOUT)
     }
 
-    pub(super) fn validate_url(&self, value: &str) -> Result<Url, Status> {
+    pub(super) fn validate_url(self, value: &str) -> Result<Url, Status> {
         let url = Url::parse(value)
             .map_err(|_| Status::failed_precondition("OAuth endpoint URL is invalid"))?;
         if url.fragment().is_some()
@@ -121,125 +116,20 @@ impl OutboundHttpPolicy {
                 "OAuth endpoint URL contains disallowed components",
             ));
         }
-        let loopback = url
-            .host_str()
-            .and_then(|host| host.parse::<IpAddr>().ok())
-            .is_some_and(|address| address.is_loopback())
-            || url
-                .host_str()
-                .is_some_and(|host| host.eq_ignore_ascii_case("localhost"));
         if url.scheme() != "https"
-            && !(self.allow_loopback_http && url.scheme() == "http" && loopback)
+            && !(self.allow_loopback_http
+                && url.scheme() == "http"
+                && match url.host() {
+                    Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                    Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                    Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                    None => false,
+                })
         {
-            return Err(Status::failed_precondition(
-                "OAuth endpoints require HTTPS except in explicit loopback test mode",
-            ));
+            return Err(Status::failed_precondition("OAuth endpoints require HTTPS"));
         }
         Ok(url)
     }
-
-    fn allows_address(&self, url: &Url, address: IpAddr) -> bool {
-        if address.is_loopback() {
-            return self.allow_loopback_http;
-        }
-        if (self.allow_private_https || self.trusts_private_origin(url))
-            && match address {
-                IpAddr::V4(address) => address.is_private(),
-                IpAddr::V6(address) => address.is_unique_local(),
-            }
-        {
-            return true;
-        }
-        is_public_address(address)
-    }
-
-    fn trusts_private_origin(&self, url: &Url) -> bool {
-        self.active_private_origins
-            .iter()
-            .any(|trusted| trusted.origin() == url.origin())
-    }
-}
-
-#[derive(Debug)]
-pub struct TrustedPrivateOriginsError(String);
-
-impl fmt::Display for TrustedPrivateOriginsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Error for TrustedPrivateOriginsError {}
-
-pub fn trusted_private_origins_from_env() -> Result<Vec<Url>, TrustedPrivateOriginsError> {
-    match env::var("WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS") {
-        Ok(value) => parse_trusted_private_origins(&value),
-        Err(env::VarError::NotPresent) => Ok(Vec::new()),
-        Err(env::VarError::NotUnicode(_)) => Err(TrustedPrivateOriginsError(
-            "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS must contain valid UTF-8".to_owned(),
-        )),
-    }
-}
-
-fn parse_trusted_private_origins(value: &str) -> Result<Vec<Url>, TrustedPrivateOriginsError> {
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut origins = Vec::new();
-    for entry in value.split(',') {
-        let entry = entry.trim();
-        let origin = Url::parse(entry).map_err(|_| {
-            TrustedPrivateOriginsError(
-                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS must contain comma-separated HTTPS origins"
-                    .to_owned(),
-            )
-        })?;
-        if origin.scheme() != "https"
-            || origin.host_str().is_none()
-            || !origin.username().is_empty()
-            || origin.password().is_some()
-            || origin.path() != "/"
-            || origin.query().is_some()
-            || origin.fragment().is_some()
-        {
-            return Err(TrustedPrivateOriginsError(
-                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS must contain only HTTPS origins without paths, credentials, queries, or fragments"
-                    .to_owned(),
-            ));
-        }
-        TrustedPrivateOAuthCimdDestinationPolicy::new([origin.clone()]).map_err(|_| {
-            TrustedPrivateOriginsError(
-                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS contains a prohibited origin"
-                    .to_owned(),
-            )
-        })?;
-        if origins
-            .iter()
-            .any(|existing: &Url| existing.origin() == origin.origin())
-        {
-            return Err(TrustedPrivateOriginsError(
-                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS contains a duplicate origin"
-                    .to_owned(),
-            ));
-        }
-        origins.push(origin);
-    }
-    Ok(origins)
-}
-
-pub(super) fn validate_response_peer(
-    policy: &OutboundHttpPolicy,
-    response: &Response,
-) -> Result<(), Status> {
-    let peer = response.remote_addr().ok_or_else(|| {
-        Status::permission_denied("OAuth response peer address could not be verified")
-    })?;
-    if !policy.allows_address(response.url(), peer.ip()) {
-        return Err(Status::permission_denied(
-            "OAuth response came from a disallowed destination",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) async fn read_json_body(response: Response, limit: usize) -> Result<Vec<u8>, Status> {
@@ -278,135 +168,119 @@ pub(super) async fn read_json_body(response: Response, limit: usize) -> Result<V
     Ok(body)
 }
 
-fn is_public_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            !(address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
-                || octets[0] >= 240)
-        }
-        IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                return is_public_address(IpAddr::V4(mapped));
-            }
-            let segments = address.segments();
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.is_unique_local()
-                || address.is_unicast_link_local()
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn production_policy_rejects_private_metadata_and_loopback_destinations() {
-        let policy = OutboundHttpPolicy::production(Vec::new(), None, false);
+    #[test]
+    fn only_endpoint_url_shape_is_checked_before_a_request() {
+        let policy = OutboundHttpPolicy::production();
+        for endpoint in [
+            "https://127.0.0.1/token",
+            "https://10.0.0.1/token",
+            "https://issuer.example.invalid/token?tenant=one",
+        ] {
+            assert!(policy.client_for(endpoint).is_ok(), "{endpoint}");
+        }
         for endpoint in [
             "http://127.0.0.1/token",
-            "https://10.0.0.1/token",
-            "https://169.254.169.254/latest/meta-data",
-            "https://[fe80::1]/token",
+            "https://name:password@issuer.example/token",
+            "https://issuer.example/token#fragment",
         ] {
-            assert!(policy.client_for(endpoint).await.is_err(), "{endpoint}");
+            assert!(policy.client_for(endpoint).is_err(), "{endpoint}");
         }
-    }
-
-    #[tokio::test]
-    async fn loopback_http_requires_explicit_test_policy() {
-        assert!(
-            OutboundHttpPolicy::loopback_test()
-                .client_for("http://127.0.0.1/token")
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn trusted_https_origin_accepts_only_private_addresses_on_that_origin() {
-        let self_resource = Url::parse("https://preview-waltr.example/mcp").expect("trusted URL");
-        let configured = Url::parse("https://configured.example").expect("configured origin");
-        let policy = OutboundHttpPolicy::production(vec![configured], Some(self_resource), false);
-        let policy = policy.for_mcp_resource("https://preview-waltr.example/mcp");
-        let trusted = Url::parse("https://preview-waltr.example/token").expect("endpoint URL");
-        let other_host = Url::parse("https://other.example/token").expect("endpoint URL");
-        let other_port =
-            Url::parse("https://preview-waltr.example:444/token").expect("endpoint URL");
-
-        let configured = Url::parse("https://configured.example/token").expect("endpoint URL");
-        assert!(policy.allows_address(&trusted, "10.0.0.1".parse().expect("private IP")));
-        assert!(policy.allows_address(&configured, "10.0.0.1".parse().expect("private IP")));
-        assert!(policy.allows_address(&trusted, "fd00::1".parse().expect("private IP")));
-        assert!(!policy.allows_address(&other_host, "10.0.0.1".parse().expect("private IP")));
-        assert!(!policy.allows_address(&other_port, "10.0.0.1".parse().expect("private IP")));
-        assert!(!policy.allows_address(&trusted, "127.0.0.1".parse().expect("loopback IP")));
-        assert!(
-            !policy.allows_address(&trusted, "169.254.169.254".parse().expect("link-local IP"))
-        );
-        assert_eq!(
-            policy
-                .for_mcp_resource("https://other.example/mcp")
-                .trusted_private_origins()
-                .len(),
-            1
-        );
-        assert_eq!(
-            policy
-                .for_mcp_resource("https://preview-waltr.example/mcp")
-                .trusted_private_origins()
-                .len(),
-            2
-        );
-        assert_eq!(
-            policy
-                .for_mcp_resource("https://preview-waltr.example/other-mcp")
-                .trusted_private_origins()
-                .len(),
-            1
-        );
-        assert!(
-            policy
-                .without_trusted_private_origins()
-                .trusted_private_origins()
-                .is_empty()
-        );
     }
 
     #[test]
-    fn trusted_origin_parser_requires_exact_https_origins() {
-        let origins =
-            parse_trusted_private_origins("https://private.example, https://other.example:444")
-                .expect("valid origins");
-        assert_eq!(origins.len(), 2);
-        for invalid in [
-            "http://private.example",
-            "https://private.example/path",
-            "https://user@private.example",
-            "https://private.example?query",
-            "https://private.example#fragment",
-            "https://localhost",
-            "https://127.0.0.1",
-            "https://169.254.169.254",
-            "https://[::1]",
-            "https://private.example,",
-            "https://PRIVATE.example:443,https://private.example",
+    fn metadata_redirects_stay_on_the_same_origin() {
+        let policy = OutboundHttpPolicy::loopback_test();
+        let https = Url::parse("https://127.0.0.1/metadata").unwrap();
+        for location in [
+            "http://127.0.0.1/metadata",
+            "https://localhost/metadata",
+            "https://127.0.0.1:8443/metadata",
         ] {
-            assert!(parse_trusted_private_origins(invalid).is_err(), "{invalid}");
+            assert!(policy.validate_url(location).is_ok());
+            assert!(policy.metadata_redirect_target(&https, location).is_none());
         }
+        assert!(
+            policy
+                .metadata_redirect_target(&https, "https://127.0.0.1:443/other")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_metadata_gets_follow_clean_bounded_redirects() {
+        use axum::{Router, extract::Path, response::Redirect, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/step/{step}",
+                get(|Path(step): Path<usize>| async move {
+                    Redirect::temporary(&format!("/step/{}", step + 1))
+                }),
+            )
+            .route(
+                "/metadata",
+                get(|headers: axum::http::HeaderMap| async move {
+                    assert!(headers.get("referer").is_none());
+                    assert!(headers.get("authorization").is_none());
+                    "metadata"
+                }),
+            )
+            .route("/clean", get(|| async { Redirect::temporary("/metadata") }))
+            .route(
+                "/unclean",
+                get(|| async { Redirect::temporary("/metadata#fragment") }),
+            )
+            .route(
+                "/effect",
+                axum::routing::post(|| async { Redirect::temporary("/metadata") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let policy = OutboundHttpPolicy::loopback_test();
+
+        assert_eq!(
+            policy
+                .get_metadata(&format!("{base}/clean"), "test request failed")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "metadata"
+        );
+
+        assert_eq!(
+            policy
+                .get_metadata(&format!("{base}/unclean"), "test request failed")
+                .await
+                .unwrap_err()
+                .message(),
+            "OAuth metadata redirect URL is invalid"
+        );
+        assert_eq!(
+            policy
+                .get_metadata(&format!("{base}/step/0"), "test request failed")
+                .await
+                .unwrap_err()
+                .message(),
+            "OAuth metadata redirected too many times"
+        );
+
+        let (url, client) = policy.client_for(&format!("{base}/effect")).unwrap();
+        assert!(
+            client
+                .post(url)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_redirection()
+        );
+        server.abort();
     }
 }

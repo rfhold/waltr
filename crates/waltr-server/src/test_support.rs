@@ -335,7 +335,6 @@ impl AccessAuthBrowserFixture {
             false,
             false,
             false,
-            false,
         )
     }
 
@@ -355,7 +354,6 @@ impl AccessAuthBrowserFixture {
             false,
             false,
             false,
-            false,
             true,
         )
     }
@@ -371,7 +369,6 @@ impl AccessAuthBrowserFixture {
             session_ttl,
             false,
             true,
-            false,
             false,
             true,
         )
@@ -390,7 +387,6 @@ impl AccessAuthBrowserFixture {
             None,
             &self.database_url,
             session_ttl,
-            false,
             false,
             false,
             false,
@@ -413,7 +409,6 @@ impl AccessAuthBrowserFixture {
             false,
             false,
             false,
-            false,
         )
     }
 
@@ -430,7 +425,6 @@ impl AccessAuthBrowserFixture {
             None,
             &self.database_url,
             session_ttl,
-            false,
             false,
             false,
             false,
@@ -505,7 +499,6 @@ impl AccessAuthBrowserFixture {
             true,
             false,
             false,
-            false,
         )
     }
 
@@ -524,16 +517,14 @@ impl AccessAuthBrowserFixture {
             false,
             true,
             false,
-            false,
         )
     }
 
-    /// Start an app with DCR and an explicit HTTP loopback redirect policy.
+    /// Start an app with dynamic client registration enabled.
     #[must_use]
     pub fn start_server_with_mcp_oauth_dcr(
         &self,
         session_ttl: Duration,
-        allow_loopback_redirects: bool,
     ) -> RestartableAccessAuthServer {
         start_restartable_auth_server(
             &self.issuer,
@@ -544,7 +535,6 @@ impl AccessAuthBrowserFixture {
             false,
             true,
             true,
-            allow_loopback_redirects,
         )
     }
 
@@ -1110,7 +1100,6 @@ fn start_restartable_auth_server(
     fail_callback_cleanup: bool,
     enable_mcp_oauth: bool,
     allow_mcp_oauth_dcr: bool,
-    allow_mcp_oauth_loopback_redirects: bool,
 ) -> RestartableAccessAuthServer {
     start_restartable_auth_server_mode(
         issuer,
@@ -1121,7 +1110,6 @@ fn start_restartable_auth_server(
         fail_callback_cleanup,
         enable_mcp_oauth,
         allow_mcp_oauth_dcr,
-        allow_mcp_oauth_loopback_redirects,
         false,
     )
 }
@@ -1140,7 +1128,6 @@ fn start_restartable_auth_server_mode(
     fail_callback_cleanup: bool,
     enable_mcp_oauth: bool,
     allow_mcp_oauth_dcr: bool,
-    allow_mcp_oauth_loopback_redirects: bool,
     authentication_only: bool,
 ) -> RestartableAccessAuthServer {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -1246,7 +1233,6 @@ END
                     )
                     .expect("test MCP OAuth config should be valid")
                     .with_client_registration(allow_mcp_oauth_dcr, false)
-                    .with_loopback_redirects(allow_mcp_oauth_loopback_redirects)
                     .with_access_token_ttl(Duration::from_hours(1)),
                     &persistence,
                     authenticator.clone(),
@@ -1276,9 +1262,6 @@ END
             } else {
                 None
             };
-            let trusted_mcp_oauth_origin = mcp_oauth.as_ref().map(|oauth| {
-                reqwest::Url::parse(oauth.resource()).expect("test hosted MCP resource URL")
-            });
             if authentication_only {
                 let oauth = mcp_oauth.expect("MCP auth replica requires hosted OAuth");
                 let workspace = temp_root();
@@ -1293,7 +1276,6 @@ END
                         workspace_root: workspace,
                         config: crate::config::ConfigHandle::from_resources(state.clone()),
                         credential_store: crate::auth::CredentialStore::shared(persistence.outbound_oauth_store()),
-                        trusted_mcp_oauth_origins: trusted_mcp_oauth_origin.into_iter().collect(),
                         catalog: session::SessionCatalogSource::Dynamic(state.clone()),
                         event_sink: Arc::new(crate::session::UnboundSessionEvents),
                         sandbox: sandbox.handle(),
@@ -1327,8 +1309,7 @@ END
                 catalog_loader,
                 authenticator,
                 mcp_oauth,
-                move |routes, mut input| {
-                    input.trusted_mcp_oauth_origins = trusted_mcp_oauth_origin.into_iter().collect();
+                move |routes, input| {
                     Ok(session::add_sessions_service(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),

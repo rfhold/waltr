@@ -146,10 +146,9 @@ impl OAuthClient {
     }
 }
 
-// Admission of an HTTP loopback URI is the policy opt-in. Compare the original
-// bytes, excluding only the port, rather than normalizing unrelated components.
+// Compare original bytes excluding only the port, without normalizing other components.
 fn loopback_redirect_parts(value: &str) -> Option<(&str, &str)> {
-    crate::validate_public_redirect_uri(value, true).ok()?;
+    crate::validate_public_redirect_uri(value).ok()?;
     let url = url::Url::parse(value).ok()?;
     if url.scheme() != "http" {
         return None;
@@ -1092,7 +1091,7 @@ impl OAuthState {
             || client
                 .redirect_uris
                 .iter()
-                .any(|uri| crate::validate_public_redirect_uri(uri, true).is_err())
+                .any(|uri| crate::validate_public_redirect_uri(uri).is_err())
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
         }
@@ -1131,7 +1130,7 @@ impl OAuthState {
             || client
                 .redirect_uris
                 .iter()
-                .any(|uri| crate::validate_public_redirect_uri(uri, true).is_err())
+                .any(|uri| crate::validate_public_redirect_uri(uri).is_err())
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
         }
@@ -2094,7 +2093,10 @@ fn metadata_client(metadata: &OAuthCachedClientMetadata) -> Option<OAuthClient> 
     let document: crate::McpClientMetadataDocument =
         serde_json::from_value(metadata.document.clone()).ok()?;
     document
-        .validate_public_client(&metadata.client_id, true)
+        .validate_public_client(
+            &metadata.client_id,
+            crate::McpOAuthEndpointPolicy::AllowLoopbackHttp,
+        )
         .ok()?;
     Some(OAuthClient {
         client_id: metadata.client_id.clone(),

@@ -166,7 +166,7 @@ fn client_metadata_requires_exact_identity_public_profile_and_extensions() {
         ]),
     };
     document
-        .validate_public_client(client_id, false)
+        .validate_public_client(client_id, McpOAuthEndpointPolicy::HttpsOnly)
         .expect("valid CIMD profile");
     assert!(
         document
@@ -180,9 +180,13 @@ fn client_metadata_requires_exact_identity_public_profile_and_extensions() {
     document
         .extra
         .insert("code_challenge_methods".to_owned(), json!(["plain"]));
-    document.validate_public_client(client_id, false).unwrap();
+    document
+        .validate_public_client(client_id, McpOAuthEndpointPolicy::HttpsOnly)
+        .unwrap();
     document.extra.remove("code_challenge_methods");
-    document.validate_public_client(client_id, false).unwrap();
+    document
+        .validate_public_client(client_id, McpOAuthEndpointPolicy::HttpsOnly)
+        .unwrap();
     let mut confidential = serde_json::to_value(&document).unwrap();
     confidential["token_endpoint_auth_method"] = json!("client_secret_basic");
     assert!(serde_json::from_value::<McpClientMetadataDocument>(confidential).is_err());
@@ -201,8 +205,9 @@ fn opencode_client_metadata_needs_no_pkce_extension() {
         "token_endpoint_auth_method": "none"
     }))
     .unwrap();
-    document.validate_public_client(client_id, true).unwrap();
-    assert!(document.validate_public_client(client_id, false).is_err());
+    document
+        .validate_public_client(client_id, McpOAuthEndpointPolicy::HttpsOnly)
+        .unwrap();
 }
 
 #[test]
@@ -211,7 +216,7 @@ fn registration_normalizes_and_binds_application_type_to_redirect_policy() {
     request.redirect_uris.push(request.redirect_uris[0].clone());
     request.grant_types.reverse();
     let normalized = request
-        .validate_and_normalize(false, 4, 256)
+        .validate_and_normalize(4, 256)
         .expect("valid web registration");
     assert_eq!(normalized.redirect_uris.len(), 1);
     assert_eq!(
@@ -230,18 +235,16 @@ fn registration_normalizes_and_binds_application_type_to_redirect_policy() {
     ] {
         let mut invalid = normalized.clone();
         invalid.redirect_uris = vec![redirect.to_owned()];
-        assert!(invalid.validate_and_normalize(false, 4, 256).is_err());
+        assert!(invalid.validate_and_normalize(4, 256).is_err());
     }
     let mut native = normalized;
+    native.redirect_uris = vec![
+        "http://127.0.0.1:49152/callback".to_owned(),
+        "http://[::1]:49152/callback".to_owned(),
+    ];
+    assert!(native.clone().validate_and_normalize(4, 256).is_err());
     native.application_type = McpOAuthApplicationType::Native;
-    native.redirect_uris = vec!["http://127.0.0.1:49152/callback".to_owned()];
-    assert!(
-        native
-            .clone()
-            .validate_and_normalize(false, 4, 256)
-            .is_err()
-    );
-    assert!(native.validate_and_normalize(true, 4, 256).is_ok());
+    assert!(native.validate_and_normalize(4, 256).is_ok());
 }
 
 #[test]

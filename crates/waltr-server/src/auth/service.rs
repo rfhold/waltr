@@ -1,6 +1,6 @@
 use crate::agent_host::runtime_factory::{McpConnectionKind, McpResolvedConnection};
 use crate::auth::refresh::{CredentialRefreshCoordinator, CredentialRefreshError, RefreshMode};
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::auth::{
     CredentialStore, McpOAuthRegistration, McpOAuthRegistrationMethod, OAuthCredential,
@@ -45,74 +45,13 @@ use crate::{
     persistence::{DurableAttemptRecord, OutboundOAuthStore},
 };
 
-use super::outbound_http::{
-    OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body, validate_response_peer,
-};
+use super::outbound_http::{OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body};
 use super::{
     AuthTarget, WorkspaceBindingCredentialLease, oauth,
     workspace_binding::{WorkspaceBindingAuth, proto_target as proto_workspace_target},
 };
 
 const OAUTH_COMPLETION_LEASE_MS: i64 = 30_000;
-const CLIENT_METADATA_DNS_TIMEOUT: Duration = Duration::from_secs(2);
-
-// Preference only: local DNS cannot establish reachability from an authorization server.
-async fn client_metadata_is_public<F, Fut>(uri: &str, lookup: F) -> bool
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<Vec<IpAddr>>>,
-{
-    let Ok(url) = url::Url::parse(uri) else {
-        return false;
-    };
-    match url.host() {
-        Some(url::Host::Ipv4(address)) => metadata_address_is_public(IpAddr::V4(address)),
-        Some(url::Host::Ipv6(address)) => metadata_address_is_public(IpAddr::V6(address)),
-        Some(url::Host::Domain(hostname)) => {
-            match tokio::time::timeout(CLIENT_METADATA_DNS_TIMEOUT, lookup(hostname.to_owned()))
-                .await
-            {
-                Ok(Ok(addresses)) => {
-                    !addresses.is_empty() && addresses.into_iter().all(metadata_address_is_public)
-                }
-                _ => false,
-            }
-        }
-        None => false,
-    }
-}
-
-fn metadata_address_is_public(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            !(address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
-                || octets[0] >= 240)
-        }
-        IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                return metadata_address_is_public(IpAddr::V4(mapped));
-            }
-            let segments = address.segments();
-            // Conservatively exclude special-purpose and transition prefixes from global unicast.
-            (segments[0] & 0xe000) == 0x2000
-                && !(segments[0] == 0x2001 && segments[1] < 0x0200)
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-                && segments[0] != 0x2002
-                && !(segments[0] == 0x3fff && segments[1] < 0x1000)
-        }
-    }
-}
 
 /// gRPC auth service for provider credentials.
 #[derive(Debug)]
@@ -140,7 +79,6 @@ pub(crate) struct OutboundOAuthConfig {
     server_callback_uri: Option<String>,
     client_metadata_uri: Option<String>,
     environment: Arc<HashMap<std::ffi::OsString, std::ffi::OsString>>,
-    allow_private_test_destinations: bool,
     durable_callback_marker: Option<String>,
     #[cfg(test)]
     workspace_binding_loopback: bool,
@@ -162,12 +100,6 @@ impl OutboundOAuthConfig {
     }
 
     fn from_environment(environment: HashMap<std::ffi::OsString, std::ffi::OsString>) -> Self {
-        let allow_private_test_destinations = environment
-            .get(std::ffi::OsStr::new(
-                "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS",
-            ))
-            .and_then(|value| value.to_str())
-            == Some("true");
         let environment = Arc::new(
             environment
                 .into_iter()
@@ -183,7 +115,6 @@ impl OutboundOAuthConfig {
             client_metadata_uri: public_url
                 .and_then(|url| public_url_with_path(url, "/.well-known/oauth-client/waltr")),
             environment,
-            allow_private_test_destinations,
             durable_callback_marker: None,
             #[cfg(test)]
             workspace_binding_loopback: false,
@@ -195,7 +126,6 @@ impl OutboundOAuthConfig {
             server_callback_uri: Some(callback),
             client_metadata_uri: None,
             environment: Arc::default(),
-            allow_private_test_destinations: false,
             durable_callback_marker: Some(format!(
                 "urn:waltr:outbound-oauth-callback:{}",
                 Uuid::new_v4()
@@ -301,10 +231,6 @@ impl std::fmt::Debug for OutboundOAuthConfig {
             )
             .field("target_environment_entries", &self.environment.len())
             .field(
-                "private_test_destinations_enabled",
-                &self.allow_private_test_destinations,
-            )
-            .field(
                 "durable_callback_marker_configured",
                 &self.durable_callback_marker.is_some(),
             )
@@ -364,31 +290,28 @@ impl AuthService {
         resources: AgentDefinitionState,
         credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
-        configured_private_origins: Vec<reqwest::Url>,
-        automatic_self_resource: Option<reqwest::Url>,
         outbound_oauth: OutboundOAuthConfig,
+        has_local_admission: bool,
     ) -> Arc<Self> {
-        let self_mcp_credential_ownership = if outbound_oauth.durable_callback_marker.is_some()
-            && automatic_self_resource.is_some()
-        {
-            CredentialOwnership::EmbeddedHost
-        } else {
-            CredentialOwnership::Durable
-        };
-        let outbound_policy = OutboundHttpPolicy::production(
-            configured_private_origins,
-            automatic_self_resource,
-            outbound_oauth.allow_private_test_destinations,
-        );
-        let workspace_policy = outbound_policy.clone();
+        let self_mcp_credential_ownership =
+            if has_local_admission && outbound_oauth.durable_callback_marker.is_some() {
+                CredentialOwnership::EmbeddedHost
+            } else {
+                CredentialOwnership::Durable
+            };
+        let outbound_policy = OutboundHttpPolicy::production();
+        let workspace_policy = outbound_policy;
         #[cfg(test)]
         let workspace_policy = if outbound_oauth.workspace_binding_loopback {
             OutboundHttpPolicy::loopback_test()
         } else {
             workspace_policy
         };
-        let workspace_binding =
-            WorkspaceBindingAuth::new(resources.clone(), Arc::clone(&outbound_store), workspace_policy);
+        let workspace_binding = WorkspaceBindingAuth::new(
+            resources.clone(),
+            Arc::clone(&outbound_store),
+            workspace_policy,
+        );
         Arc::new(Self {
             resources,
             credential_store,
@@ -412,9 +335,8 @@ impl AuthService {
             resources,
             CredentialStore::shared(Arc::clone(&store)),
             store,
-            Vec::new(),
-            None,
             OutboundOAuthConfig::default().with_workspace_binding_loopback(),
+            false,
         )
     }
 
@@ -587,8 +509,8 @@ impl AuthService {
             ));
         }
 
-        let policy = self.outbound_policy.for_mcp_resource(&server.url);
-        let discovery = discover_mcp_auth(&target, &server.url, policy.clone()).await?;
+        let policy = self.outbound_policy;
+        let discovery = discover_mcp_auth(&target, &server.url, policy).await?;
         let auth_server = discovery.authorization_server;
         let (authorize_url, token_url) = required_authorization_endpoints(&target, &auth_server)?;
         let redirect_uri = self.outbound_oauth.redirect_uri(&server_key)?;
@@ -640,15 +562,8 @@ impl AuthService {
             AuthTarget::provider(provider_key),
             definition.definition,
             now_ms(),
-            &self.outbound_policy.without_trusted_private_origins(),
+            &self.outbound_policy,
         )?;
-        let policy = self.outbound_policy.without_trusted_private_origins();
-        policy
-            .validate_destination(&attempt.definition().authorize_url)
-            .await?;
-        policy
-            .validate_destination(&attempt.definition().token_url)
-            .await?;
         let attempt_id = Uuid::new_v4().to_string();
         response.attempt_id.clone_from(&attempt_id);
         self.attempts
@@ -725,9 +640,6 @@ impl AuthService {
                 let server = config.mcp_servers.get(key).ok_or_else(|| {
                     Status::not_found(format!("mcp server '{key}' does not exist"))
                 })?;
-                let policy = self.outbound_policy.for_mcp_resource(&server.url);
-                let coordinator = coordinator
-                    .with_trusted_mcp_oauth_origins(policy.trusted_private_origins().to_vec());
                 coordinator
                     .refresh_mcp(
                         &McpResolvedConnection {
@@ -788,23 +700,6 @@ impl AuthService {
         &self,
         request: McpRegistrationRequest<'_>,
     ) -> Result<McpOAuthRegistration, Status> {
-        self.resolve_mcp_registration_with_lookup(request, |hostname| async move {
-            tokio::net::lookup_host((hostname.as_str(), 443))
-                .await
-                .map(|addresses| addresses.map(|address| address.ip()).collect())
-        })
-        .await
-    }
-
-    async fn resolve_mcp_registration_with_lookup<F, Fut>(
-        &self,
-        request: McpRegistrationRequest<'_>,
-        lookup: F,
-    ) -> Result<McpOAuthRegistration, Status>
-    where
-        F: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = std::io::Result<Vec<IpAddr>>>,
-    {
         if let Some(registration) = configured_mcp_registration(
             &self.outbound_oauth,
             request.server_key,
@@ -813,40 +708,38 @@ impl AuthService {
         )? {
             return Ok(registration);
         }
-        let persisted = self.reusable_mcp_registration(&request).await?;
-        if let Some(registration) = persisted
-            .as_ref()
-            .filter(|registration| registration.method == McpOAuthRegistrationMethod::Preregistered)
-        {
-            return Ok(registration.clone());
-        }
-        if request
-            .authorization_server
-            .client_id_metadata_document_supported
-            == Some(true)
-            && let Some(client_id) = self.outbound_oauth.client_metadata_uri.clone()
-            && (request.authorization_server.registration_endpoint.is_none()
-                || client_metadata_is_public(&client_id, lookup).await)
-        {
-            if let Some(registration) = persisted.as_ref().filter(|registration| {
-                registration.method == McpOAuthRegistrationMethod::ClientMetadata
-                    && registration.client_id == client_id
-            }) {
-                return Ok(registration.clone());
+        let client_metadata_uri = self
+            .outbound_oauth
+            .client_metadata_uri
+            .as_deref()
+            .filter(|_| {
+                request
+                    .authorization_server
+                    .client_id_metadata_document_supported
+                    == Some(true)
+            });
+        if let Some(registration) = self.reusable_mcp_registration(&request).await?
+            && match registration.method {
+                McpOAuthRegistrationMethod::Preregistered | McpOAuthRegistrationMethod::Dynamic => {
+                    true
+                }
+                McpOAuthRegistrationMethod::ClientMetadata => {
+                    client_metadata_uri == Some(registration.client_id.as_str())
+                }
+                McpOAuthRegistrationMethod::Unknown => false,
             }
+        {
+            return Ok(registration);
+        }
+        if let Some(client_id) = client_metadata_uri {
             return Ok(McpOAuthRegistration {
                 method: McpOAuthRegistrationMethod::ClientMetadata,
-                client_id,
+                client_id: client_id.to_owned(),
                 redirect_uri: request.redirect_uri.to_owned(),
                 token_endpoint_auth_method: "none".to_owned(),
                 created_at_ms: Some(now_ms()),
                 expires_at_ms: None,
             });
-        }
-        if let Some(registration) = persisted
-            .filter(|registration| registration.method == McpOAuthRegistrationMethod::Dynamic)
-        {
-            return Ok(registration);
         }
         self.register_mcp_client(&request).await
     }
@@ -907,13 +800,10 @@ impl AuthService {
                 token_endpoint_auth_method: McpTokenEndpointAuthMethod::None,
                 client_name: Some("Waltr outbound MCP client".to_owned()),
             };
-            let response = register_public_client_hardened(
-                request.policy.clone(),
-                endpoint,
-                &registration_request,
-            )
-            .await
-            .map_err(|status| outbound_oauth_status(request.target, &status))?;
+            let response =
+                register_public_client_hardened(request.policy, endpoint, &registration_request)
+                    .await
+                    .map_err(|status| outbound_oauth_status(request.target, &status))?;
             return Ok(McpOAuthRegistration {
                 method: McpOAuthRegistrationMethod::Dynamic,
                 client_id: response.client_id,
@@ -948,7 +838,7 @@ impl AuthService {
                     attempt,
                     input,
                     now_ms(),
-                    self.outbound_policy.without_trusted_private_origins(),
+                    self.outbound_policy,
                 )
                 .await
                 .map_err(|status| outbound_oauth_status(&target, &status))?;
@@ -1038,8 +928,7 @@ impl AuthService {
                 "OAuth attempt is no longer pending",
             ));
         }
-        let policy =
-            policy.unwrap_or_else(|| self.outbound_policy.for_mcp_resource(attempt.resource()));
+        let policy = policy.unwrap_or(self.outbound_policy);
         let completion = oauth::complete_mcp_with_policy(&attempt, input, now_ms(), policy).await;
         let credential = match completion {
             Ok(credential) => credential,
@@ -1280,14 +1169,7 @@ impl GeneratedAuthService for AuthService {
             .await
             .map_err(|error| Status::internal(format!("failed to delete credential: {error}")))?;
         if let Some(credential) = mcp_credential {
-            let resource = credential
-                .mcp_context()
-                .map_or("", |context| context.resource.as_str());
-            revoke_mcp_credential_with_policy(
-                &credential,
-                self.outbound_policy.for_mcp_resource(resource),
-            )
-            .await;
+            revoke_mcp_credential_with_policy(&credential, self.outbound_policy).await;
         }
         let status = self.status_for(target).await?;
         Ok(Response::new(LogoutResponse {
@@ -1730,12 +1612,10 @@ async fn revoke_mcp_credential_with_policy(
         token_type_hint: Some(token_type_hint),
         client_id: context.registration.client_id.clone(),
     };
-    let Ok((endpoint, client)) = policy.client_for(endpoint).await else {
+    let Ok((endpoint, client)) = policy.client_for(endpoint) else {
         return;
     };
-    if let Ok(response) = client.post(endpoint).form(&request).send().await {
-        drop(validate_response_peer(&policy, &response));
-    }
+    drop(client.post(endpoint).form(&request).send().await);
 }
 
 fn configured_mcp_registration(
@@ -1816,34 +1696,26 @@ async fn discover_mcp_auth(
     endpoint: &str,
     policy: OutboundHttpPolicy,
 ) -> Result<McpAuthDiscovery, Status> {
-    policy
-        .validate_destination(endpoint)
-        .await
-        .map_err(|status| outbound_oauth_status(target, &status))?;
-    let challenge = request_mcp_challenge(policy.clone(), endpoint)
+    let challenge = request_mcp_challenge(policy, endpoint)
         .await
         .map_err(|status| outbound_oauth_status(target, &status))?;
     if let Some(metadata_url) = challenge.resource_metadata.as_deref() {
         policy
-            .validate_destination(metadata_url)
-            .await
+            .validate_url(metadata_url)
             .map_err(|status| outbound_oauth_status(target, &status))?;
     }
-    let protected = discover_protected_resource(policy.clone(), endpoint, &challenge)
+    let protected = discover_protected_resource(policy, endpoint, &challenge)
         .await
         .map_err(|status| outbound_oauth_status(target, &status))?;
     for issuer in &protected.authorization_servers {
-        if policy.validate_destination(issuer).await.is_err() {
+        if policy.validate_url(issuer).is_err() {
             continue;
         }
-        let Ok(authorization_server) = discover_authorization_server(policy.clone(), issuer).await
-        else {
+        let Ok(authorization_server) = discover_authorization_server(policy, issuer).await else {
             continue;
         };
         if public_authorization_server_compatible(&authorization_server)
-            && validate_authorization_server_destinations(policy.clone(), &authorization_server)
-                .await
-                .is_ok()
+            && validate_authorization_server_urls(policy, &authorization_server).is_ok()
         {
             return Ok(McpAuthDiscovery {
                 challenge,
@@ -1887,7 +1759,7 @@ async fn request_mcp_challenge(
     policy: OutboundHttpPolicy,
     endpoint: &str,
 ) -> Result<McpBearerChallenge, Status> {
-    let (endpoint, client) = policy.client_for(endpoint).await?;
+    let (endpoint, client) = policy.client_for(endpoint)?;
     let response = client
         .post(endpoint)
         .header("accept", "application/json, text/event-stream")
@@ -1914,7 +1786,6 @@ async fn request_mcp_challenge(
         .map_err(|error| {
             Status::unavailable(format!("failed to request MCP OAuth challenge: {error}"))
         })?;
-    validate_response_peer(&policy, &response)?;
     if !matches!(response.status().as_u16(), 401 | 403) {
         return Err(Status::failed_precondition(
             "MCP endpoint did not return an OAuth bearer challenge",
@@ -1945,7 +1816,7 @@ async fn discover_protected_resource(
         );
     for destination in destinations {
         let Ok(metadata) =
-            get_oauth_json::<mcp::McpProtectedResourceMetadata>(policy.clone(), &destination).await
+            get_oauth_json::<mcp::McpProtectedResourceMetadata>(policy, &destination).await
         else {
             continue;
         };
@@ -1964,8 +1835,7 @@ async fn discover_authorization_server(
 ) -> Result<mcp::McpAuthorizationServerMetadata, Status> {
     for destination in authorization_server_metadata_urls(issuer) {
         let Ok(metadata) =
-            get_oauth_json::<mcp::McpAuthorizationServerMetadata>(policy.clone(), &destination)
-                .await
+            get_oauth_json::<mcp::McpAuthorizationServerMetadata>(policy, &destination).await
         else {
             continue;
         };
@@ -1982,13 +1852,9 @@ async fn get_oauth_json<T: serde::de::DeserializeOwned>(
     policy: OutboundHttpPolicy,
     destination: &str,
 ) -> Result<T, Status> {
-    let (destination, client) = policy.client_for(destination).await?;
-    let response = client
-        .get(destination)
-        .send()
-        .await
-        .map_err(|_| Status::unavailable("OAuth discovery request failed"))?;
-    validate_response_peer(&policy, &response)?;
+    let response = policy
+        .get_metadata(destination, "OAuth discovery request failed")
+        .await?;
     if !response.status().is_success() {
         return Err(Status::failed_precondition(
             "OAuth discovery endpoint returned an error",
@@ -2004,14 +1870,13 @@ async fn register_public_client_hardened(
     endpoint: &str,
     request: &McpPublicClientRegistrationRequest,
 ) -> Result<mcp::McpClientRegistrationResponse, Status> {
-    let (endpoint, client) = policy.client_for(endpoint).await?;
+    let (endpoint, client) = policy.client_for(endpoint)?;
     let response = client
         .post(endpoint)
         .json(request)
         .send()
         .await
         .map_err(|_| Status::unavailable("OAuth client registration request failed"))?;
-    validate_response_peer(&policy, &response)?;
     if !response.status().is_success() {
         return Err(Status::failed_precondition(
             "OAuth client registration endpoint returned an error",
@@ -2028,11 +1893,11 @@ async fn register_public_client_hardened(
     Ok(registration)
 }
 
-async fn validate_authorization_server_destinations(
+fn validate_authorization_server_urls(
     policy: OutboundHttpPolicy,
     metadata: &mcp::McpAuthorizationServerMetadata,
 ) -> Result<(), Status> {
-    policy.validate_destination(&metadata.issuer).await?;
+    policy.validate_url(&metadata.issuer)?;
     for endpoint in [
         metadata.authorization_endpoint.as_deref(),
         metadata.token_endpoint.as_deref(),
@@ -2043,7 +1908,7 @@ async fn validate_authorization_server_destinations(
     .into_iter()
     .flatten()
     {
-        policy.validate_destination(endpoint).await?;
+        policy.validate_url(endpoint)?;
     }
     Ok(())
 }
@@ -2149,88 +2014,15 @@ mod tests {
         persistence::{DatabaseConfig, Persistence},
     };
 
-    #[tokio::test(start_paused = true)]
-    async fn client_metadata_dns_heuristic_is_bounded_and_conservative() {
-        for address in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "169.254.1.1",
-            "100.64.0.1",
-            "192.0.2.1",
-            "198.18.0.1",
-            "240.0.0.1",
-            "::1",
-            "::",
-            "fc00::1",
-            "fe80::1",
-            "ff02::1",
-            "::ffff:10.0.0.1",
-            "::127.0.0.1",
-            "2001:db8::1",
-            "2001:2::1",
-            "3fff::1",
-        ] {
-            assert!(
-                !metadata_address_is_public(address.parse().unwrap()),
-                "{address}"
-            );
-        }
-        for address in ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
-            assert!(
-                metadata_address_is_public(address.parse().unwrap()),
-                "{address}"
-            );
-        }
-        for uri in [
-            "https://127.0.0.1/client",
-            "https://[::1]/client",
-            "invalid",
-        ] {
-            assert!(
-                !client_metadata_is_public(uri, |_| async { panic!("literal needs no DNS") }).await
-            );
-        }
-        assert!(
-            client_metadata_is_public("https://[2606:4700:4700::1111]/client", |_| async {
-                panic!("literal needs no DNS")
-            })
-            .await
-        );
-        for addresses in [
-            vec![],
-            vec!["8.8.8.8", "10.0.0.1"],
-            vec!["8.8.8.8", "fc00::1"],
-        ] {
-            assert!(
-                !client_metadata_is_public("https://waltr.example/client", |_| async {
-                    Ok(addresses
-                        .into_iter()
-                        .map(|address| address.parse().unwrap())
-                        .collect())
-                })
-                .await
-            );
-        }
-        let start = tokio::time::Instant::now();
-        assert!(
-            !client_metadata_is_public("https://waltr.example/client", |_| {
-                std::future::pending::<std::io::Result<Vec<IpAddr>>>()
-            })
-            .await
-        );
-        assert_eq!(start.elapsed(), CLIENT_METADATA_DNS_TIMEOUT);
-    }
-
     #[tokio::test]
     async fn mcp_registration_preference_matrix_preserves_credentials() {
-        use McpOAuthRegistrationMethod::{ClientMetadata, Dynamic, Preregistered};
+        use McpOAuthRegistrationMethod::{ClientMetadata, Dynamic, Preregistered, Unknown};
 
-        // name, public DNS, DNS error, DCR offered, metadata URI, saved method, configured, expected
-        for (name, public, dns_error, dcr, metadata_uri, saved, configured, expected) in [
+        // name, DCR offered, CIMD supported, metadata URI, saved method, prereg configured, expected
+        for (name, dcr, cimd, metadata_uri, saved, configured, expected) in [
             (
                 "configured first",
-                false,
-                false,
+                true,
                 true,
                 true,
                 Some(ClientMetadata),
@@ -2239,7 +2031,6 @@ mod tests {
             ),
             (
                 "saved prereg first",
-                false,
                 true,
                 true,
                 true,
@@ -2248,40 +2039,17 @@ mod tests {
                 Preregistered,
             ),
             (
-                "private both",
-                false,
-                false,
+                "CIMD preferred over fresh DCR",
                 true,
-                true,
-                None,
-                false,
-                Dynamic,
-            ),
-            (
-                "public both",
-                true,
-                false,
                 true,
                 true,
                 None,
                 false,
                 ClientMetadata,
             ),
-            ("DNS failure", false, true, true, true, None, false, Dynamic),
             (
-                "private saved CIMD",
-                false,
-                false,
+                "saved DCR preferred over CIMD",
                 true,
-                true,
-                Some(ClientMetadata),
-                false,
-                Dynamic,
-            ),
-            (
-                "private saved DCR",
-                false,
-                false,
                 true,
                 true,
                 Some(Dynamic),
@@ -2289,19 +2057,8 @@ mod tests {
                 Dynamic,
             ),
             (
-                "public saved DCR",
+                "saved CIMD",
                 true,
-                false,
-                true,
-                true,
-                Some(Dynamic),
-                false,
-                ClientMetadata,
-            ),
-            (
-                "public saved CIMD",
-                true,
-                false,
                 true,
                 true,
                 Some(ClientMetadata),
@@ -2309,30 +2066,47 @@ mod tests {
                 ClientMetadata,
             ),
             (
-                "CIMD only",
-                false,
-                true,
-                false,
-                true,
-                None,
-                false,
-                ClientMetadata,
-            ),
-            (
-                "saved CIMD only",
-                false,
+                "unsupported saved CIMD",
                 true,
                 false,
                 true,
                 Some(ClientMetadata),
                 false,
+                Dynamic,
+            ),
+            ("CIMD only", false, true, true, None, false, ClientMetadata),
+            (
+                "unknown saved method falls through to CIMD",
+                true,
+                true,
+                true,
+                Some(Unknown),
+                false,
                 ClientMetadata,
             ),
-            ("embedded", false, true, true, false, None, false, Dynamic),
+            (
+                "unknown saved method falls through to DCR",
+                true,
+                false,
+                true,
+                Some(Unknown),
+                false,
+                Dynamic,
+            ),
+            (
+                "embedded stale CIMD",
+                true,
+                true,
+                false,
+                Some(ClientMetadata),
+                false,
+                Dynamic,
+            ),
+            ("embedded", true, true, false, None, false, Dynamic),
         ] {
             let (mut service, server, requests) = successful_lifecycle_service().await;
             let service_mut = Arc::get_mut(&mut service).unwrap();
-            let client_id = "https://waltr.example/client";
+            let client_id = "https://waltr.example.invalid/client";
             service_mut.outbound_oauth.client_metadata_uri =
                 metadata_uri.then(|| client_id.to_owned());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2341,7 +2115,7 @@ mod tests {
                 successful_oauth_router(&base, "https://resource.example/mcp", requests.clone());
             let registration_server = tokio::spawn(async move { axum::serve(listener, app).await });
             let mut metadata = mcp::McpAuthorizationServerMetadata::new(&base);
-            metadata.client_id_metadata_document_supported = Some(true);
+            metadata.client_id_metadata_document_supported = Some(cimd);
             metadata.registration_endpoint = dcr.then(|| format!("{base}/register"));
             let redirect = "https://waltr.example/callback";
             let target = AuthTarget::mcp_server("remote");
@@ -2384,29 +2158,14 @@ mod tests {
                     .unwrap();
             }
             let registration = service
-                .resolve_mcp_registration_with_lookup(
-                    McpRegistrationRequest {
-                        server_key: "remote",
-                        target: &target,
-                        resource,
-                        authorization_server: &metadata,
-                        redirect_uri: redirect,
-                        policy: OutboundHttpPolicy::loopback_test(),
-                    },
-                    |_| async move {
-                        assert!(
-                            !configured && saved != Some(Preregistered) && dcr && metadata_uri,
-                            "{name}"
-                        );
-                        if dns_error {
-                            Err(std::io::Error::other("synthetic DNS failure"))
-                        } else {
-                            Ok(vec![
-                                if public { "8.8.8.8" } else { "10.0.0.1" }.parse().unwrap(),
-                            ])
-                        }
-                    },
-                )
+                .resolve_mcp_registration(McpRegistrationRequest {
+                    server_key: "remote",
+                    target: &target,
+                    resource,
+                    authorization_server: &metadata,
+                    redirect_uri: redirect,
+                    policy: OutboundHttpPolicy::loopback_test(),
+                })
                 .await
                 .unwrap();
             assert_eq!(registration.method, expected, "{name}");
@@ -2487,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn hostile_environment_is_redacted_and_embedded_private_policy_stays_off() {
+    fn environment_retains_only_supported_oauth_settings_and_redacts_values() {
         let config = OutboundOAuthConfig::from_environment(HashMap::from([
             ("WALTR_PUBLIC_URL".into(), "https://waltr.example".into()),
             (
@@ -2498,12 +2257,7 @@ mod tests {
                 "UNRELATED_SECRET".into(),
                 "SENTINEL_UNRELATED_SECRET".into(),
             ),
-            (
-                "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS".into(),
-                "true".into(),
-            ),
         ]));
-        assert!(config.allow_private_test_destinations);
         assert!(config.variable("UNRELATED_SECRET").is_none());
         assert_eq!(
             config
@@ -2515,11 +2269,6 @@ mod tests {
         assert!(!debug.contains("SENTINEL_ALLOWED_VALUE"));
         assert!(!debug.contains("SENTINEL_UNRELATED_SECRET"));
         assert!(!debug.contains("https://waltr.example"));
-
-        let embedded = OutboundOAuthConfig::for_server_callback(
-            "http://127.0.0.1:43123/outbound-oauth/callback".to_owned(),
-        );
-        assert!(!embedded.allow_private_test_destinations);
     }
 
     #[test]
@@ -2676,9 +2425,8 @@ mod tests {
             resources,
             credential_store,
             outbound_store,
-            Vec::new(),
-            None,
             OutboundOAuthConfig::default(),
+            false,
         )
     }
 
@@ -3795,11 +3543,10 @@ mod tests {
             resources,
             credential_store,
             outbound_store,
-            Vec::new(),
-            None,
             OutboundOAuthConfig::for_server_callback(
                 "https://waltr.example/outbound-oauth/callback".to_owned(),
             ),
+            false,
         );
         let router = Router::new()
             .route(

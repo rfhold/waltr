@@ -61,7 +61,7 @@ async fn embedded_mcp_generation_origin_creates_sends_and_joins() {
         session_root: root.join("sessions"), workspace_root: root.join("workspace"),
         catalog_source: crate::embedded::EmbeddedCatalogSource::Path(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-dev-defaults.json")),
         catalog_cache_path: root.join("cache/models.json"), catalog_fallback: None, default_agent: "routine-title".into(),
-        local_bearer: crate::LocalBearer::new("current-local-generation").unwrap(), outbound_policy: Default::default(), routine_authority: Default::default(),
+        local_bearer: crate::LocalBearer::new("current-local-generation").unwrap(), routine_authority: Default::default(),
     }, move |routes, input, root| {
         let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::FilesystemSessionStore::new(root));
         let service = Arc::try_unwrap(crate::session::SessionService::from_sessions(sessions, input)).ok().unwrap().with_test_provider(provider);

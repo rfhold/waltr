@@ -32,8 +32,7 @@ async fn admitted_invocation_pins_backend_across_reload_without_unrelated_defaul
         let app = assemble_app(AppServices {
             config_service, persistence, catalog_loader: loader,
             access_authenticator: crate::access_auth::AccessAuthenticator::disabled(), mcp_oauth: None,
-            outbound_private_origins: vec![], outbound_oauth: Default::default(),
-            automatic_self_mcp_resource: Some(format!("http://{address}/mcp").parse().unwrap()),
+            outbound_oauth: Default::default(),
             agent_state: Some(state.clone()), local_admission: None, workspace_root: workspace, sandbox_socket: None,
             routine_authority: RoutineAuthority::default(), routine_private_parent: root,
         }, |routes, input| {
@@ -229,8 +228,7 @@ async fn catalog_speech_defaults_reach_production_backends_without_environment_a
         let app = assemble_app(AppServices {
             config_service, persistence, catalog_loader: loader,
             access_authenticator: crate::access_auth::AccessAuthenticator::disabled(), mcp_oauth: None,
-            outbound_private_origins: vec![], outbound_oauth: Default::default(),
-            automatic_self_mcp_resource: Some(format!("http://{address}/mcp").parse().unwrap()),
+            outbound_oauth: Default::default(),
             agent_state: Some(state), local_admission: None, workspace_root: workspace, sandbox_socket: None,
             routine_authority: RoutineAuthority::default(), routine_private_parent: root,
         }, |routes, input| {

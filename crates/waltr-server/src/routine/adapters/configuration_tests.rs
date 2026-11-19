@@ -329,7 +329,6 @@ async fn named_configuration_normal_mcp_preview_commit_and_complete_candidate_gu
                 ),
                 credential_store: FileCredentialStore::new(root.join("host-credentials.json"))
                     .into(),
-                trusted_mcp_oauth_origins: vec![],
                 catalog: SessionCatalogSource::Static(AgentDefinitionCatalog::from_sources(
                     vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: default}\nspec: {}\n".into()],
                     "default",

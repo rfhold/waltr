@@ -32,8 +32,7 @@ use mcp::{
         OAuthConsentPresentation, OAuthKeyEncryption, OAuthResource,
         OAuthResourceOwnerAuthentication, OAuthResourceOwnerAuthenticationRequest,
         OAuthResourceOwnerAuthenticator, OAuthSigningKeyState, PostgresOAuthAuthorizationStore,
-        PrivateNetworkOAuthCimdDestinationPolicy, SqliteOAuthAuthorizationStore,
-        TrustedPrivateOAuthCimdDestinationPolicy, VersionedOAuthWrappingKeyring,
+        SqliteOAuthAuthorizationStore, VersionedOAuthWrappingKeyring,
     },
     server::BoxFuture,
 };
@@ -91,10 +90,7 @@ pub struct McpOAuthEnabledConfig {
     refresh_family_ttl: Duration,
     code_ttl: Duration,
     allow_dcr: bool,
-    allow_loopback_redirects: bool,
     allow_cimd: bool,
-    cimd_trusted_private_origins: Vec<Url>,
-    allow_private_test_destinations: bool,
 }
 
 impl McpOAuthConfig {
@@ -113,10 +109,7 @@ impl McpOAuthConfig {
             "WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL",
             "WALTR_MCP_OAUTH_CODE_TTL",
             "WALTR_MCP_OAUTH_ALLOW_DCR",
-            "WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS",
             "WALTR_MCP_OAUTH_ALLOW_CIMD",
-            "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
-            "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS",
         ];
         let mut values = HashMap::new();
         for name in names {
@@ -204,12 +197,7 @@ impl McpOAuthConfig {
             Duration::from_mins(10),
         )?;
         let allow_dcr = boolean(values, "WALTR_MCP_OAUTH_ALLOW_DCR")?;
-        let allow_loopback_redirects = boolean(values, "WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS")?;
         let allow_cimd = boolean(values, "WALTR_MCP_OAUTH_ALLOW_CIMD")?;
-        let cimd_trusted_private_origins =
-            trusted_origins(values, "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS")?;
-        let allow_private_test_destinations =
-            boolean(values, "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS")?;
         Ok(Self::Enabled(McpOAuthEnabledConfig {
             issuer,
             resource,
@@ -221,10 +209,7 @@ impl McpOAuthConfig {
             refresh_family_ttl,
             code_ttl,
             allow_dcr,
-            allow_loopback_redirects,
             allow_cimd,
-            cimd_trusted_private_origins,
-            allow_private_test_destinations,
         }))
     }
 }
@@ -267,10 +252,7 @@ impl McpOAuthEnabledConfig {
             refresh_family_ttl: DEFAULT_REFRESH_FAMILY_TTL,
             code_ttl: DEFAULT_CODE_TTL,
             allow_dcr: false,
-            allow_loopback_redirects: false,
             allow_cimd: false,
-            cimd_trusted_private_origins: Vec::new(),
-            allow_private_test_destinations: false,
         })
     }
 
@@ -297,13 +279,6 @@ impl McpOAuthEnabledConfig {
     pub const fn with_client_registration(mut self, allow_dcr: bool, allow_cimd: bool) -> Self {
         self.allow_dcr = allow_dcr;
         self.allow_cimd = allow_cimd;
-        self
-    }
-
-    /// Configure whether dynamically registered clients may use HTTP loopback redirects.
-    #[must_use]
-    pub const fn with_loopback_redirects(mut self, allow: bool) -> Self {
-        self.allow_loopback_redirects = allow;
         self
     }
 
@@ -401,19 +376,11 @@ impl McpOAuthServer {
         )
         .map_err(|_| McpOAuthError::Configuration)?;
         if config.allow_dcr || config.allow_cimd {
-            let metadata_fetcher = if config.allow_cimd {
-                let fetcher = configure_cimd_metadata_fetcher(
-                    &config,
-                    HardenedOAuthClientMetadataFetcher::production(),
-                )?;
-                Some(Arc::new(fetcher) as _)
-            } else {
-                None
-            };
             let registration = OAuthClientRegistrationOptions {
                 dynamic_registration: config.allow_dcr,
-                allow_loopback_redirects: config.allow_loopback_redirects,
-                metadata_fetcher,
+                metadata_fetcher: config
+                    .allow_cimd
+                    .then(|| Arc::new(HardenedOAuthClientMetadataFetcher::production()) as _),
                 ..OAuthClientRegistrationOptions::default()
             };
             authorization = authorization
@@ -619,36 +586,6 @@ impl McpOAuthServer {
         }
         Ok(())
     }
-}
-
-fn configure_cimd_metadata_fetcher(
-    config: &McpOAuthEnabledConfig,
-    fetcher: HardenedOAuthClientMetadataFetcher,
-) -> Result<HardenedOAuthClientMetadataFetcher, McpOAuthError> {
-    let fetcher = fetcher.with_loopback_redirects(config.allow_loopback_redirects);
-    if config.allow_private_test_destinations {
-        Ok(fetcher.with_destination_policy(Arc::new(PrivateNetworkOAuthCimdDestinationPolicy)))
-    } else {
-        let policy = TrustedPrivateOAuthCimdDestinationPolicy::new(cimd_trusted_origins(config))
-            .map_err(|_| McpOAuthError::Configuration)?;
-        Ok(fetcher.with_destination_policy(Arc::new(policy)))
-    }
-}
-
-fn cimd_trusted_origins(config: &McpOAuthEnabledConfig) -> Vec<Url> {
-    let mut origins = config.cimd_trusted_private_origins.clone();
-    let mut self_origin = Url::parse(&config.public_url)
-        .expect("validated WALTR_PUBLIC_URL should remain an absolute URL");
-    self_origin.set_path("/");
-    self_origin.set_query(None);
-    self_origin.set_fragment(None);
-    if !origins
-        .iter()
-        .any(|origin| origin.origin() == self_origin.origin())
-    {
-        origins.push(self_origin);
-    }
-    origins
 }
 
 async fn oauth_authorization_store(
@@ -1018,49 +955,6 @@ fn boolean(values: &HashMap<&str, String>, name: &str) -> Result<bool, McpOAuthC
     }
 }
 
-fn trusted_origins(
-    values: &HashMap<&str, String>,
-    name: &str,
-) -> Result<Vec<Url>, McpOAuthConfigError> {
-    let Some(raw) = value(values, name) else {
-        return Ok(Vec::new());
-    };
-    let mut origins = Vec::new();
-    for entry in raw.split(',') {
-        let entry = entry.trim();
-        let origin = Url::parse(entry).map_err(|_| {
-            McpOAuthConfigError::Invalid(format!(
-                "{name} must contain comma-separated HTTPS origins"
-            ))
-        })?;
-        if origin.scheme() != "https"
-            || origin.host_str().is_none()
-            || !origin.username().is_empty()
-            || origin.password().is_some()
-            || origin.path() != "/"
-            || origin.query().is_some()
-            || origin.fragment().is_some()
-        {
-            return Err(McpOAuthConfigError::Invalid(format!(
-                "{name} must contain only HTTPS origins without paths, credentials, queries, or fragments"
-            )));
-        }
-        TrustedPrivateOAuthCimdDestinationPolicy::new([origin.clone()]).map_err(|_| {
-            McpOAuthConfigError::Invalid(format!("{name} contains a prohibited origin"))
-        })?;
-        if origins
-            .iter()
-            .any(|existing: &Url| existing.origin() == origin.origin())
-        {
-            return Err(McpOAuthConfigError::Invalid(format!(
-                "{name} contains a duplicate origin"
-            )));
-        }
-        origins.push(origin);
-    }
-    Ok(origins)
-}
-
 fn duration(
     values: &HashMap<&str, String>,
     name: &str,
@@ -1322,11 +1216,8 @@ mod tests {
         assert_eq!(config.issuer(), "https://waltr.example/base/oauth");
         assert_eq!(config.resource(), "https://waltr.example/base/mcp");
         assert_eq!(config.required_scopes(), ["mcp:use", "tools:read"]);
-        assert!(!config.allow_loopback_redirects);
-        assert_eq!(
-            cimd_trusted_origins(&config),
-            [Url::parse("https://waltr.example/").expect("self origin")]
-        );
+        assert!(!config.allow_cimd);
+        assert!(!config.allow_dcr);
     }
 
     #[test]
@@ -1343,7 +1234,7 @@ mod tests {
             ("WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL", "0"),
             ("WALTR_MCP_OAUTH_CODE_TTL", "601"),
             ("WALTR_MCP_OAUTH_ALLOW_DCR", "yes"),
-            ("WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS", "yes"),
+            ("WALTR_MCP_OAUTH_ALLOW_CIMD", "yes"),
         ] {
             let mut values = base.clone();
             values.insert(name, value.to_owned());
@@ -1383,133 +1274,6 @@ mod tests {
             McpOAuthConfig::from_values(&access_config(), &values),
             Err(McpOAuthConfigError::Invalid(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn cimd_native_loopback_metadata_follows_hosted_configuration() {
-        use mcp::oauth::{LoopbackOAuthCimdDestinationPolicy, OAuthClientMetadataFetcher as _};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("metadata listener");
-        let client_id = format!(
-            "http://{}/oauth/client.json",
-            listener.local_addr().expect("metadata address")
-        );
-        let redirects = [
-            "http://127.0.0.1:64539/callback",
-            "http://127.0.0.1:64539/mcp/oauth/callback",
-        ];
-        let document = serde_json::json!({
-            "client_id": client_id,
-            "client_name": "Native test client",
-            "application_type": "native",
-            "redirect_uris": redirects,
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none"
-        });
-        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&requests);
-        let app = Router::new().route(
-            "/oauth/client.json",
-            get(move || {
-                let document = document.clone();
-                let observed = Arc::clone(&observed);
-                async move {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(document)
-                }
-            }),
-        );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        for allow in [true, false] {
-            let values = HashMap::from([
-                ("WALTR_MCP_REQUIRED_SCOPES", "mcp:use".to_owned()),
-                (
-                    "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
-                    "/run/secrets/mcp-keys".to_owned(),
-                ),
-                ("WALTR_MCP_OAUTH_ALLOW_CIMD", "true".to_owned()),
-                (
-                    "WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS",
-                    allow.to_string(),
-                ),
-            ]);
-            let McpOAuthConfig::Enabled(config) =
-                McpOAuthConfig::from_values(&access_config(), &values).expect("hosted config")
-            else {
-                panic!("OIDC mode should enable hosted OAuth");
-            };
-            assert!(config.allow_cimd);
-            assert!(!config.allow_dcr);
-            let fetcher = configure_cimd_metadata_fetcher(
-                &config,
-                HardenedOAuthClientMetadataFetcher::loopback_for_tests(),
-            )
-            .expect("metadata fetcher")
-            .with_destination_policy(Arc::new(LoopbackOAuthCimdDestinationPolicy));
-            let result = fetcher.fetch(client_id.clone()).await;
-            if allow {
-                let fetched = result.expect("enabled native loopback metadata");
-                assert_eq!(fetched.document.redirect_uris, redirects);
-            } else {
-                assert!(result.is_err(), "disabled native loopback metadata");
-            }
-        }
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
-        server.abort();
-        assert!(
-            server
-                .await
-                .expect_err("metadata server stopped")
-                .is_cancelled()
-        );
-    }
-
-    #[test]
-    fn cimd_private_origins_are_exact_https_origins() {
-        let mut values = HashMap::from([
-            ("WALTR_MCP_REQUIRED_SCOPES", "mcp:use".to_owned()),
-            (
-                "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
-                "/run/secrets/mcp-keys".to_owned(),
-            ),
-            (
-                "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
-                "https://private.example, https://other.example:444".to_owned(),
-            ),
-        ]);
-        let McpOAuthConfig::Enabled(config) =
-            McpOAuthConfig::from_values(&access_config(), &values).expect("valid config")
-        else {
-            panic!("OIDC mode should enable hosted OAuth");
-        };
-        assert_eq!(config.cimd_trusted_private_origins.len(), 2);
-
-        for invalid in [
-            "http://private.example",
-            "https://private.example/path",
-            "https://user@private.example",
-            "https://private.example?query",
-            "https://private.example#fragment",
-            "https://private.example,",
-            "https://PRIVATE.example:443,https://private.example",
-            "https://localhost",
-            "https://127.0.0.1",
-            "https://169.254.169.254",
-            "https://[::1]",
-        ] {
-            values.insert(
-                "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
-                invalid.to_owned(),
-            );
-            assert!(
-                McpOAuthConfig::from_values(&access_config(), &values).is_err(),
-                "{invalid}"
-            );
-        }
     }
 
     #[tokio::test]

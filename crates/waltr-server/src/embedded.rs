@@ -40,25 +40,6 @@ impl fmt::Debug for EmbeddedCatalogSource {
     }
 }
 
-/// Explicit outbound HTTP exceptions used by provider/upstream-MCP OAuth.
-#[derive(Clone, Default)]
-pub struct EmbeddedOutboundPolicy {
-    /// Origins allowed to use private-network addresses during outbound OAuth.
-    pub trusted_private_origins: Vec<reqwest::Url>,
-}
-
-impl fmt::Debug for EmbeddedOutboundPolicy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EmbeddedOutboundPolicy")
-            .field(
-                "trusted_private_origin_count",
-                &self.trusted_private_origins.len(),
-            )
-            .finish()
-    }
-}
-
 /// Complete host-owned configuration for one embedded server generation.
 #[derive(Clone)]
 pub struct EmbeddedServerConfig {
@@ -82,8 +63,6 @@ pub struct EmbeddedServerConfig {
     pub default_agent: String,
     /// Process-generation bearer supplied by the embedding host.
     pub local_bearer: LocalBearer,
-    /// Explicit provider/upstream-MCP outbound OAuth policy.
-    pub outbound_policy: EmbeddedOutboundPolicy,
     /// Explicit operator-selected Routine roles and profiles; defaults grant none.
     pub routine_authority: crate::routine::production::RoutineAuthority,
 }
@@ -93,7 +72,6 @@ impl fmt::Debug for EmbeddedServerConfig {
         formatter
             .debug_struct("EmbeddedServerConfig")
             .field("catalog_source", &self.catalog_source)
-            .field("outbound_policy", &self.outbound_policy)
             .finish_non_exhaustive()
     }
 }
@@ -235,11 +213,6 @@ where
     )
     .map_err(|_| EmbeddedBuildError::Resources)?;
     let config_service = ConfigService::from_state(state.clone(), catalog_loader.clone());
-    let self_resource =
-        reqwest::Url::parse(&self_mcp_url).map_err(|_| EmbeddedBuildError::Application)?;
-    let trusted_origins = config.outbound_policy.trusted_private_origins;
-    let session_origins =
-        super::app::agent_trusted_origins(trusted_origins.clone(), Some(&self_resource));
     let session_root = config.session_root;
     let workspace_root = config.workspace_root;
     let bearer = config.local_bearer;
@@ -250,9 +223,7 @@ where
             catalog_loader,
             access_authenticator: AccessAuthenticator::disabled(),
             mcp_oauth: None,
-            outbound_private_origins: trusted_origins,
             outbound_oauth: OutboundOAuthConfig::for_server_callback(outbound_callback_url),
-            automatic_self_mcp_resource: Some(self_resource),
             agent_state: Some(state),
             local_admission: Some(LocalAdmission {
                 bearer,
@@ -267,10 +238,7 @@ where
                 .ok_or(EmbeddedBuildError::Paths)?
                 .to_owned(),
         },
-        move |routes, mut input| {
-            input.trusted_mcp_oauth_origins = session_origins;
-            register(routes, input, session_root)
-        },
+        move |routes, input| register(routes, input, session_root),
     )
     .await
     .map_err(|_| EmbeddedBuildError::Application)?;

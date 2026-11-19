@@ -510,16 +510,10 @@ impl WorkspaceBindingAuth {
             .refresh_token
             .as_ref()
             .ok_or_else(authorization_required)?;
-        let outcome = tokio::time::timeout(
-            REFRESH_TIMEOUT,
-            request.exchange(&self.policy, context, prior.secret()),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(Status::unavailable(
-                "workspace binding refresh outcome is unknown",
-            ))
-        });
+        let outcome =
+            tokio::time::timeout(REFRESH_TIMEOUT, request.exchange(context, prior.secret()))
+                .await
+                .unwrap_or_else(|_| Err(native::RefreshExchangeError::outcome_unknown()));
         match outcome {
             Ok(token) if self.current(key, binding) => {
                 record.credential.token = token;
@@ -537,12 +531,14 @@ impl WorkspaceBindingAuth {
                 Ok(Some(record))
             }
             outcome => {
+                let indeterminate = !matches!(outcome, Err(native::RefreshExchangeError::Connect));
                 self.credentials
-                    .abort_refresh(&target, claim, true)
+                    .abort_refresh(&target, claim, indeterminate)
                     .await
                     .map_err(storage_error)?;
                 Err(outcome
                     .err()
+                    .map(native::RefreshExchangeError::into_status)
                     .unwrap_or_else(|| Status::aborted("workspace binding changed during refresh")))
             }
         }

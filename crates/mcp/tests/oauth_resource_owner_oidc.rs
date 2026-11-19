@@ -12,6 +12,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
+    response::Redirect,
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -266,8 +267,13 @@ async fn browser_login_callback_and_resume_are_one_shot_and_exactly_bound() {
         challenge: Mutex::new(None),
     });
     let provider = Router::new()
-        .route("/.well-known/openid-configuration", get(test_metadata))
-        .route("/jwks", get(test_jwks))
+        .route(
+            "/.well-known/openid-configuration",
+            get(|| async { Redirect::temporary("/metadata") }),
+        )
+        .route("/metadata", get(test_metadata))
+        .route("/jwks", get(|| async { Redirect::temporary("/keys") }))
+        .route("/keys", get(test_jwks))
         .route("/token", post(test_token))
         .with_state(provider_state.clone());
     let provider_task =

@@ -37,7 +37,9 @@ use super::{
     OAuthResourceOwnerAuthentication, OAuthResourceOwnerAuthenticationRequest,
     OAuthResourceOwnerAuthenticator,
 };
-use crate::{McpOAuthSecret, McpPrincipalId, Result, server::BoxFuture};
+use crate::{McpOAuthEndpointPolicy, McpOAuthSecret, McpPrincipalId, Result, server::BoxFuture};
+
+use super::super::discovery::get_metadata;
 
 const ALGORITHMS: &[Algorithm] = &[
     Algorithm::RS256,
@@ -366,11 +368,7 @@ impl OidcResourceOwnerAuthenticator {
         entropy: Arc<dyn McpOAuthEntropy>,
         builder: reqwest::ClientBuilder,
     ) -> std::result::Result<Self, OidcResourceOwnerError> {
-        let client = builder
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(config.http_timeout)
-            .build()
-            .map_err(|_| OidcResourceOwnerError::Unavailable)?;
+        let client = provider_http_client(builder, config.http_timeout)?;
         let provider = Provider::discover(&client, &config).await?;
         Ok(Self {
             state: Arc::new(OidcState {
@@ -691,17 +689,9 @@ impl Provider {
     ) -> std::result::Result<Self, OidcResourceOwnerError> {
         let issuer = Url::parse(&config.issuer).map_err(|_| OidcResourceOwnerError::Discovery)?;
         let urls = discovery_urls(&issuer)?;
-        let mut response = client
-            .get(urls[0].clone())
-            .send()
-            .await
-            .map_err(|_| OidcResourceOwnerError::Unavailable)?;
+        let mut response = get_provider_metadata(client, urls[0].clone(), config).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND && urls.len() == 2 {
-            response = client
-                .get(urls[1].clone())
-                .send()
-                .await
-                .map_err(|_| OidcResourceOwnerError::Unavailable)?;
+            response = get_provider_metadata(client, urls[1].clone(), config).await?;
         }
         if !response.status().is_success() {
             return Err(OidcResourceOwnerError::Discovery);
@@ -752,7 +742,7 @@ impl Provider {
         } else {
             return Err(OidcResourceOwnerError::Discovery);
         };
-        let keys = fetch_keys(client, &jwks_uri, &algorithms).await?;
+        let keys = fetch_keys(client, &jwks_uri, &algorithms, config).await?;
         Ok(Self {
             client: client.clone(),
             authorization_endpoint,
@@ -886,7 +876,8 @@ impl Provider {
             .ok_or(OidcResourceOwnerError::InvalidToken)?;
         let mut key = self.keys.lock().await.get(kid).cloned();
         if key.is_none() {
-            let refreshed = fetch_keys(&self.client, &self.jwks_uri, &self.algorithms).await?;
+            let refreshed =
+                fetch_keys(&self.client, &self.jwks_uri, &self.algorithms, config).await?;
             key = refreshed.get(kid).cloned();
             *self.keys.lock().await = refreshed;
         }
@@ -997,16 +988,38 @@ fn validate_claims(
     })
 }
 
+fn provider_http_client(
+    builder: reqwest::ClientBuilder,
+    timeout: Duration,
+) -> std::result::Result<reqwest::Client, OidcResourceOwnerError> {
+    builder
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| OidcResourceOwnerError::Unavailable)
+}
+
+async fn get_provider_metadata(
+    client: &reqwest::Client,
+    uri: Url,
+    config: &OidcResourceOwnerConfig,
+) -> std::result::Result<reqwest::Response, OidcResourceOwnerError> {
+    let policy = match config.endpoint_policy {
+        OidcEndpointPolicy::HttpsOnly => McpOAuthEndpointPolicy::HttpsOnly,
+        OidcEndpointPolicy::LoopbackTest => McpOAuthEndpointPolicy::AllowLoopbackHttp,
+    };
+    get_metadata(client, uri, policy, config.http_timeout, None)
+        .await
+        .map_err(|_| OidcResourceOwnerError::Unavailable)
+}
+
 async fn fetch_keys(
     client: &reqwest::Client,
     uri: &Url,
     algorithms: &BTreeSet<String>,
+    config: &OidcResourceOwnerConfig,
 ) -> std::result::Result<HashMap<String, Jwk>, OidcResourceOwnerError> {
-    let response = client
-        .get(uri.clone())
-        .send()
-        .await
-        .map_err(|_| OidcResourceOwnerError::Unavailable)?;
+    let response = get_provider_metadata(client, uri.clone(), config).await?;
     if !response.status().is_success() {
         return Err(OidcResourceOwnerError::Provider);
     }
@@ -1221,6 +1234,7 @@ fn origin(url: &Url) -> String {
 fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|v| v.is_loopback())
 }
+
 fn discovery_urls(issuer: &Url) -> std::result::Result<Vec<Url>, OidcResourceOwnerError> {
     let primary = Url::parse(&format!(
         "{}/.well-known/openid-configuration",
@@ -1349,3 +1363,57 @@ impl fmt::Display for OidcResourceOwnerError {
     }
 }
 impl std::error::Error for OidcResourceOwnerError {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{response::Redirect, routing::post};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn oauth_oidc_token_exchange_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let redirected = Arc::new(AtomicUsize::new(0));
+        let observe_redirect = redirected.clone();
+        let router = Router::new()
+            .route("/token", post(|| async { Redirect::temporary("/other") }))
+            .route(
+                "/other",
+                post(move || async move {
+                    observe_redirect.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::BAD_REQUEST
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let config = OidcResourceOwnerConfig::new(
+            &origin,
+            "client",
+            Some(McpOAuthSecret::new("secret")),
+            format!("{origin}/oidc/callback"),
+            format!("{origin}/authorize"),
+            vec!["openid".to_owned()],
+            Duration::from_mins(1),
+            OidcEndpointPolicy::LoopbackTest,
+        )
+        .unwrap();
+        let provider = Provider {
+            client: provider_http_client(reqwest::Client::builder(), config.http_timeout).unwrap(),
+            authorization_endpoint: Url::parse(&format!("{origin}/upstream-authorize")).unwrap(),
+            token_endpoint: Url::parse(&format!("{origin}/token")).unwrap(),
+            token_auth: TokenAuth::Post,
+            algorithms: BTreeSet::new(),
+            jwks_uri: Url::parse(&format!("{origin}/keys")).unwrap(),
+            keys: Arc::new(Mutex::new(HashMap::new())),
+        };
+        assert!(matches!(
+            provider.exchange(&config, "code", "verifier").await,
+            Err(OidcResourceOwnerError::Provider)
+        ));
+        assert_eq!(redirected.load(Ordering::Relaxed), 0);
+        task.abort();
+    }
+}

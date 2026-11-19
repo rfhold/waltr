@@ -979,9 +979,7 @@ async fn standalone_and_embedded_compose_real_shared_v2_service() {
             catalog_loader: loader,
             access_authenticator: authenticator,
             mcp_oauth: None,
-            outbound_private_origins: Vec::new(),
             outbound_oauth: OutboundOAuthConfig::default(),
-            automatic_self_mcp_resource: None,
             agent_state: Some(state),
             local_admission: None,
             workspace_root: workspace,
@@ -1050,7 +1048,6 @@ async fn standalone_and_embedded_compose_real_shared_v2_service() {
         catalog_fallback: None,
         default_agent: "coding".into(),
         local_bearer: crate::LocalBearer::new("explicit-test-generation").unwrap(),
-        outbound_policy: Default::default(),
         routine_authority: RoutineAuthority::default(),
     })
     .await

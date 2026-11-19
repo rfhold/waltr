@@ -63,7 +63,7 @@ async fn generic_program_through_assembled_production_constructor_commits_and_st
         let app = assemble_app(AppServices {
             config_service:config,persistence,catalog_loader:loader,
             access_authenticator:crate::access_auth::AccessAuthenticator::disabled(),mcp_oauth:None,
-            outbound_private_origins:Vec::new(),outbound_oauth:OutboundOAuthConfig::default(),automatic_self_mcp_resource:Some(format!("http://{address}/mcp").parse().unwrap()),
+            outbound_oauth:OutboundOAuthConfig::default(),
             agent_state:Some(state),local_admission:None,workspace_root:workspace,sandbox_socket:None,
             routine_authority:RoutineAuthority::default(),routine_private_parent:root,
         }, move |routes,input| {

@@ -17,8 +17,8 @@ use tokio::sync::oneshot;
 use waltr_server::{
     LocalBearer,
     embedded::{
-        EmbeddedBuildError, EmbeddedCatalogFallback, EmbeddedCatalogSource, EmbeddedOutboundPolicy,
-        EmbeddedServerConfig, build_embedded_server,
+        EmbeddedBuildError, EmbeddedCatalogFallback, EmbeddedCatalogSource, EmbeddedServerConfig,
+        build_embedded_server,
     },
 };
 
@@ -153,7 +153,6 @@ impl AppPrivateRoots {
             catalog_fallback: Some(EmbeddedCatalogFallback::BuiltIn),
             default_agent: "coding".to_owned(),
             local_bearer: bearer,
-            outbound_policy: EmbeddedOutboundPolicy::default(),
         }
     }
 

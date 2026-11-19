@@ -547,9 +547,7 @@ async fn v2_owned_trace_chain_survives_native_and_browser_handler_return_in_both
             catalog_loader: loader,
             access_authenticator: crate::access_auth::AccessAuthenticator::disabled(),
             mcp_oauth: None,
-            outbound_private_origins: vec![],
             outbound_oauth: Default::default(),
-            automatic_self_mcp_resource: None,
             agent_state: Some(state),
             local_admission: None,
             workspace_root: workspace,
@@ -594,7 +592,6 @@ async fn v2_owned_trace_chain_survives_native_and_browser_handler_return_in_both
             catalog_fallback: None,
             default_agent: "coding".into(),
             local_bearer: crate::LocalBearer::new("trace-generation").unwrap(),
-            outbound_policy: Default::default(),
             routine_authority: Default::default(),
         },
         move |routes, input, session_root| {

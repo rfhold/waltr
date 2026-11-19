@@ -23,9 +23,7 @@ use waltr_agent::{
 
 use super::{
     AuthTarget, OAuthCredential,
-    outbound_http::{
-        OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body, validate_response_peer,
-    },
+    outbound_http::{OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body},
 };
 
 /// Resolved provider OAuth definition.
@@ -129,10 +127,6 @@ impl McpOAuthAttempt {
 
     pub(super) fn set_redirect_uri(&mut self, redirect_uri: String) {
         self.registration.redirect_uri = redirect_uri;
-    }
-
-    pub(super) fn resource(&self) -> &str {
-        &self.resource
     }
 
     pub(super) fn validate_response_issuer(&self, issuer: Option<&str>) -> Result<(), Status> {
@@ -245,7 +239,7 @@ pub fn begin_manual(
         target,
         definition,
         now_ms,
-        &OutboundHttpPolicy::production(Vec::new(), None, false),
+        &OutboundHttpPolicy::production(),
     )
 }
 
@@ -255,7 +249,7 @@ pub(super) fn begin_manual_with_policy(
     now_ms: i64,
     policy: &OutboundHttpPolicy,
 ) -> Result<(OAuthAttempt, BeginAuthResponse), Status> {
-    validate_definition(&definition, policy.allows_loopback_http())?;
+    validate_definition(&definition, policy)?;
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
     let state = Uuid::new_v4().to_string();
@@ -361,13 +355,7 @@ pub async fn complete_mcp(
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
-    complete_mcp_with_policy(
-        attempt,
-        input,
-        now_ms,
-        OutboundHttpPolicy::production(Vec::new(), None, false),
-    )
-    .await
+    complete_mcp_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
 }
 
 pub(super) async fn complete_mcp_with_policy(
@@ -393,14 +381,13 @@ pub(super) async fn complete_mcp_with_policy(
         ("code_verifier", attempt.verifier.as_str()),
         ("resource", attempt.resource.as_str()),
     ];
-    let (token_url, client) = policy.client_for(&attempt.token_url).await?;
+    let (token_url, client) = policy.client_for(&attempt.token_url)?;
     let response = client
         .post(token_url)
         .form(&pairs)
         .send()
         .await
         .map_err(|error| Status::unavailable(format!("MCP OAuth token request failed: {error}")))?;
-    validate_response_peer(&policy, &response)?;
     let status = response.status();
     let body = read_json_body(response, OAUTH_RESPONSE_LIMIT).await?;
     if !status.is_success() {
@@ -471,13 +458,7 @@ pub async fn complete_manual(
     input: &str,
     now_ms: i64,
 ) -> Result<OAuthCredential, Status> {
-    complete_manual_with_policy(
-        attempt,
-        input,
-        now_ms,
-        OutboundHttpPolicy::production(Vec::new(), None, false),
-    )
-    .await
+    complete_manual_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
 }
 
 pub(super) async fn complete_manual_with_policy(
@@ -537,7 +518,7 @@ async fn request_token(
     policy: OutboundHttpPolicy,
 ) -> Result<OAuthCredential, Status> {
     let pairs = token_request_pairs(definition, token_request);
-    let (token_url, client) = policy.client_for(&definition.token_url).await?;
+    let (token_url, client) = policy.client_for(&definition.token_url)?;
     let builder = client.post(token_url);
     let response = match request_style(definition)? {
         OauthTokenRequestStyle::Json => builder.json(&pairs_to_json(&pairs)).send().await,
@@ -545,7 +526,6 @@ async fn request_token(
         OauthTokenRequestStyle::Unspecified => unreachable!("validated request style"),
     }
     .map_err(|error| oauth_token_request_send_status(&error))?;
-    validate_response_peer(&policy, &response)?;
     token_response_to_credential(definition, response).await
 }
 
@@ -828,7 +808,7 @@ fn claim_path_string<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a
 
 fn validate_definition(
     definition: &OAuthProvider,
-    allow_loopback_http: bool,
+    policy: &OutboundHttpPolicy,
 ) -> Result<(), Status> {
     if definition.authorize_url.trim().is_empty()
         || definition.token_url.trim().is_empty()
@@ -840,30 +820,8 @@ fn validate_definition(
         ));
     }
     request_style(definition)?;
-    validate_front_channel_url(&definition.authorize_url, allow_loopback_http)?;
-    validate_front_channel_url(&definition.token_url, allow_loopback_http)?;
-    Ok(())
-}
-
-fn validate_front_channel_url(value: &str, allow_loopback_http: bool) -> Result<(), Status> {
-    let url = url::Url::parse(value)
-        .map_err(|_| Status::failed_precondition("OAuth endpoint URL is invalid"))?;
-    let loopback_http = allow_loopback_http
-        && url.scheme() == "http"
-        && url
-            .host_str()
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|address| address.is_loopback());
-    if (url.scheme() != "https" && !loopback_http)
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(Status::failed_precondition(
-            "OAuth endpoints must be absolute HTTPS URLs without credentials or fragments",
-        ));
-    }
+    policy.validate_url(&definition.authorize_url)?;
+    policy.validate_url(&definition.token_url)?;
     Ok(())
 }
 

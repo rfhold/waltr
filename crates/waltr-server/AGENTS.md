@@ -108,15 +108,13 @@ Derive the embedded outbound callback from the prebound loopback origin. Pass it
 
 Embedded composition must not read public or target OAuth redirect variables. Standalone startup snapshots its environment-owned OAuth configuration once.
 
-Embedded composition must ignore `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS`. Use only explicit trusted private origins.
-
 Persist an opaque generation marker instead of the embedded callback endpoint. Rehydrate it only for the exact active generation.
 
 Reuse a valid embedded DCR registration during same-generation reauthorization. A replacement generation rejects stale attempts and credentials, returns not found for stale attempt status/cancel, and performs fresh DCR rather than reusing the old generation's registration.
 
 Reject embedded self-MCP logout with failed precondition because its credential is host-owned; do not revoke or delete that generation credential.
 
-Configure no embedded CIMD metadata URI. If upstream offers CIMD and DCR, skip CIMD and preserve preregistration or DCR selection.
+Configure no embedded CIMD metadata URI. Prefer preconfigured or usable saved registration; otherwise use CIMD when configured and supported, or DCR when supported.
 
 Retain only supported outbound OAuth environment names. Keep arbitrary environment and all retained values out of `Debug`.
 

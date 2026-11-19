@@ -18,15 +18,11 @@ config:
   waltr:apiAudience: waltr-preview-api
   waltr:apiScope: waltr:use
   waltr:mcpScope: mcp:use
-  waltr:mcpOutboundOAuthTrustedPrivateOrigins:
-    - https://preview-homelab-mcp.holdenitdown.net
-    - https://preview-smarthome-mcp.holdenitdown.net
   waltr:mcpOAuthAccessTokenTtl: "259200"
   waltr:mcpOAuthRefreshTokenTtl: "86400"
   waltr:mcpOAuthRefreshFamilyTtl: "2592000"
   waltr:mcpOAuthCodeTtl: "300"
   waltr:mcpOAuthAllowDcr: true
-  waltr:mcpOAuthAllowLoopbackRedirects: true
   waltr:mcpOAuthAllowCimd: true
   waltr:mcpOAuthWrappingKeyVersions: [v1]
   waltr:mcpOAuthActiveWrappingKeyVersion: v1

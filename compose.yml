@@ -290,11 +290,9 @@ services:
       WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL: "86400"
       WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: "2592000"
       WALTR_MCP_OAUTH_CODE_TTL: "300"
-      # The browser fixture exercises CIMD, including on private test DNS.
       WALTR_MCP_OAUTH_ALLOW_DCR: "false"
-      WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true"
+      # The browser fixture exercises CIMD.
       WALTR_MCP_OAUTH_ALLOW_CIMD: "true"
-      WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS: "true"
       WALTR_OIDC_ISSUER: https://dex.test
       WALTR_OIDC_CLIENT_ID: waltr-access-test
       WALTR_OIDC_CLIENT_SECRET: waltr-access-test-secret

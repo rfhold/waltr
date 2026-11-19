@@ -1,8 +1,6 @@
 //! OAuth client-side protocol and hardened HTTP discovery helpers.
 
-pub use super::discovery::{
-    McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy,
-};
+pub use super::discovery::{McpOAuthDiscoveryClient, McpOAuthEndpointPolicy};
 
 use super::{McpClientRegistrationResponse, McpPublicClientRegistrationRequest};
 use crate::Result;

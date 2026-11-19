@@ -9,9 +9,7 @@ use crate::access_auth::{AccessAuthHttpClient, OidcVerifier};
 
 use super::super::{
     OAuthTokenSet, WorkspaceBindingOAuthContext,
-    outbound_http::{
-        OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body, validate_response_peer,
-    },
+    outbound_http::{OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body},
 };
 
 pub(super) const STEP: Duration = Duration::from_secs(5);
@@ -119,12 +117,10 @@ pub(super) async fn begin(
     let device_endpoint = metadata
         .device_authorization_endpoint
         .ok_or_else(device_unsupported)?;
-    let token_endpoint = policy
-        .validate_destination(&metadata.token_endpoint)
-        .await?;
-    let jwks_uri = policy.validate_destination(&metadata.jwks_uri).await?;
+    let token_endpoint = policy.validate_url(&metadata.token_endpoint)?;
+    let jwks_uri = policy.validate_url(&metadata.jwks_uri)?;
     let scope = native.scopes.join(" ");
-    let (device_url, http) = policy.client_for(&device_endpoint).await?;
+    let (device_url, http) = policy.client_for(&device_endpoint)?;
     let response = http
         .post(device_url)
         .form(&[
@@ -136,7 +132,6 @@ pub(super) async fn begin(
         .send()
         .await
         .map_err(|_| Status::unavailable("device authorization request failed"))?;
-    validate_response_peer(policy, &response)?;
     if !response.status().is_success() {
         let error = oauth_error(response).await?;
         return Err(match error.as_str() {
@@ -294,7 +289,7 @@ pub(super) async fn poll(
     context: &WorkspaceBindingOAuthContext,
     device_code: &str,
 ) -> Result<DevicePoll, Status> {
-    let (url, client) = policy.client_for(context.token_endpoint.as_str()).await?;
+    let (url, client) = policy.client_for(context.token_endpoint.as_str())?;
     let response = match client
         .post(url)
         .form(&[
@@ -309,7 +304,6 @@ pub(super) async fn poll(
         Err(error) if error.is_timeout() || error.is_connect() => return Ok(DevicePoll::Timeout),
         Err(_) => return Err(Status::unavailable("device token request failed")),
     };
-    validate_response_peer(policy, &response)?;
     let status = response.status();
     if status.is_success() {
         return decode(response).await.map(DevicePoll::Authorized);
@@ -336,12 +330,32 @@ pub(super) struct RefreshRequest {
     verifier: OidcVerifier,
 }
 
+pub(super) enum RefreshExchangeError {
+    Connect,
+    Uncertain(Status),
+}
+
+impl RefreshExchangeError {
+    pub(super) fn outcome_unknown() -> Self {
+        Self::Uncertain(Status::unavailable(
+            "workspace binding refresh outcome is unknown",
+        ))
+    }
+
+    pub(super) fn into_status(self) -> Status {
+        match self {
+            Self::Connect => Status::unavailable("workspace binding refresh connection failed"),
+            Self::Uncertain(status) => status,
+        }
+    }
+}
+
 impl RefreshRequest {
     pub(super) async fn prepare(
         policy: &OutboundHttpPolicy,
         context: &WorkspaceBindingOAuthContext,
     ) -> Result<Self, Status> {
-        let (url, client) = policy.client_for(context.token_endpoint.as_str()).await?;
+        let (url, client) = policy.client_for(context.token_endpoint.as_str())?;
         let verifier = verifier(policy, context).await?;
         Ok(Self {
             client,
@@ -352,10 +366,9 @@ impl RefreshRequest {
 
     pub(super) async fn exchange(
         self,
-        policy: &OutboundHttpPolicy,
         context: &WorkspaceBindingOAuthContext,
         refresh_token: &str,
-    ) -> Result<OAuthTokenSet, Status> {
+    ) -> Result<OAuthTokenSet, RefreshExchangeError> {
         let response = self
             .client
             .post(self.url)
@@ -366,17 +379,25 @@ impl RefreshRequest {
             ])
             .send()
             .await
-            .map_err(|_| Status::unavailable("workspace binding refresh outcome is unknown"))?;
-        validate_response_peer(policy, &response)?;
+            .map_err(|error| {
+                if error.is_connect() {
+                    RefreshExchangeError::Connect
+                } else {
+                    RefreshExchangeError::outcome_unknown()
+                }
+            })?;
         if !response.status().is_success() {
-            return Err(Status::unauthenticated(
+            return Err(RefreshExchangeError::Uncertain(Status::unauthenticated(
                 "workspace binding refresh was rejected",
-            ));
+            )));
         }
-        let token: TokenResponse = decode(response).await?;
+        let token: TokenResponse = decode(response)
+            .await
+            .map_err(RefreshExchangeError::Uncertain)?;
         let (_, token) = token
             .validate(&self.verifier, context, Some(refresh_token))
-            .await?;
+            .await
+            .map_err(RefreshExchangeError::Uncertain)?;
         Ok(token)
     }
 }
@@ -463,9 +484,11 @@ async fn verifier(
     policy: &OutboundHttpPolicy,
     context: &WorkspaceBindingOAuthContext,
 ) -> Result<OidcVerifier, Status> {
-    let (url, client) = policy.client_for(context.jwks_uri.as_str()).await?;
+    let url = policy.validate_url(context.jwks_uri.as_str())?;
+    let client = AccessAuthHttpClient::build(OutboundHttpPolicy::client_builder())
+        .map_err(|_| Status::internal("failed to build outbound OAuth client"))?;
     OidcVerifier::from_access_jwks(
-        AccessAuthHttpClient::from_pinned_client(client),
+        client,
         (url, context.signing_algorithms.clone()),
         &context.issuer,
         &context.audience,
@@ -476,14 +499,9 @@ async fn verifier(
 }
 
 async fn get(policy: &OutboundHttpPolicy, url: &str) -> Result<Response, Status> {
-    let (url, client) = policy.client_for(url).await?;
-    let response = client
-        .get(url)
-        .send()
+    policy
+        .get_metadata(url, "native API OAuth discovery failed")
         .await
-        .map_err(|_| Status::unavailable("native API OAuth discovery failed"))?;
-    validate_response_peer(policy, &response)?;
-    Ok(response)
 }
 
 async fn successful<T: DeserializeOwned>(response: Response) -> Result<T, Status> {

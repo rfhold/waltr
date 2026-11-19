@@ -13,9 +13,9 @@ pub use challenge::{
     McpAccessToken, McpAuthorizationError, McpBearerChallenge, McpPrincipalId, McpTokenValidation,
 };
 pub use discovery::{
-    McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy,
-    authorization_server_metadata_urls, discover_authorization_server_metadata,
-    discover_protected_resource_metadata, protected_resource_metadata_urls,
+    McpOAuthDiscoveryClient, McpOAuthEndpointPolicy, authorization_server_metadata_urls,
+    discover_authorization_server_metadata, discover_protected_resource_metadata,
+    protected_resource_metadata_urls,
 };
 pub use metadata::{McpAuthorizationServerMetadata, McpProtectedResourceMetadata};
 pub use protocol::{

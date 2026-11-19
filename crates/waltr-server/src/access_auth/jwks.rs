@@ -171,11 +171,8 @@ async fn fetch_keys_inner(
     algorithms: &HashSet<String>,
 ) -> Result<(HashMap<String, Jwk>, Duration), OidcError> {
     let response = client
-        .inner()
-        .get(uri.clone())
-        .send()
-        .await
-        .map_err(|_| OidcError::Provider("JWKS request failed"))?;
+        .get_metadata(uri.clone(), OidcError::Provider("JWKS request failed"))
+        .await?;
     if !response.status().is_success() {
         return Err(OidcError::Provider("JWKS endpoint returned an error"));
     }
@@ -426,6 +423,10 @@ mod tests {
         let app = Router::new()
             .route(
                 "/jwks",
+                get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/actual-jwks")]) }),
+            )
+            .route(
+                "/actual-jwks",
                 get(|State(keys): State<Arc<Mutex<JwkSet>>>| async move {
                     Json(keys.lock().await.clone())
                 }),
@@ -455,63 +456,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_kid_and_expiry_refreshes_never_follow_jwks_redirects() {
-        let target_hits = Arc::new(AtomicUsize::new(0));
-        let hits = Arc::clone(&target_hits);
-        let target = Router::new().fallback(move || {
-            hits.fetch_add(1, Ordering::SeqCst);
-            async { StatusCode::OK }
-        });
-        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_address = target_listener.local_addr().unwrap();
-        let target_server =
-            tokio::spawn(async move { axum::serve(target_listener, target).await.unwrap() });
-        let location = format!("http://{target_address}/stolen");
-
-        for refresh in ["unknown", "expired"] {
-            let requests = Arc::new(AtomicUsize::new(0));
-            let state = (Arc::clone(&requests), location.clone());
-            let source = Router::new()
-                .route(
-                    "/jwks",
-                    get(
-                        |State((requests, location)): State<(Arc<AtomicUsize>, String)>| async move {
-                            if requests.fetch_add(1, Ordering::SeqCst) == 0 {
-                                Json(rsa_set("known")).into_response()
-                            } else {
-                                (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, location)])
-                                    .into_response()
-                            }
-                        },
-                    ),
-                )
-                .with_state(state);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move { axum::serve(listener, source).await.unwrap() });
-            let cache = JwksCache::initialize(
-                http_client(),
-                Url::parse(&format!("http://{address}/jwks")).unwrap(),
-                test_algorithms(),
+    async fn jwks_refresh_follows_metadata_redirect() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                "/jwks",
+                get(|State(requests): State<Arc<AtomicUsize>>| async move {
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Json(rsa_set("original")).into_response()
+                    } else {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, "/keys")],
+                        )
+                            .into_response()
+                    }
+                }),
             )
-            .await
-            .unwrap();
-            let result = if refresh == "unknown" {
-                cache.key("unknown").await
-            } else {
-                cache.inner.state.lock().await.expires_at = Instant::now() - Duration::from_secs(1);
-                cache.key("known").await
-            };
-            assert_eq!(
-                result,
-                Err(OidcError::Provider("JWKS endpoint returned an error")),
-                "{refresh} refresh"
-            );
-            assert_eq!(requests.load(Ordering::SeqCst), 2);
-            assert_eq!(target_hits.load(Ordering::SeqCst), 0);
-            server.abort();
-        }
-        target_server.abort();
+            .route("/keys", get(|| async { Json(rsa_set("rotated")) }))
+            .with_state(Arc::clone(&requests));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let cache = JwksCache::initialize(
+            http_client(),
+            Url::parse(&format!("http://{address}/jwks")).unwrap(),
+            test_algorithms(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.key("rotated").await.unwrap().common.key_id.as_deref(),
+            Some("rotated")
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     #[tokio::test]

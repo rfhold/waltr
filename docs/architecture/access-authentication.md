@@ -46,7 +46,6 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 | `WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL` | No | Absolute refresh-family seconds, 60 through 31,536,000 and not shorter than the token TTL; defaults to 2,592,000. |
 | `WALTR_MCP_OAUTH_CODE_TTL` | No | Authorization-code seconds, 1 through 600; defaults to 300. |
 | `WALTR_MCP_OAUTH_ALLOW_DCR` | No | Exactly `true` or `false`; advertises and enables public Dynamic Client Registration when true. |
-| `WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS` | No | Exactly `true` or `false`; defaults to `false`. Allows public clients resolved through DCR or CIMD to use HTTP loopback redirect URIs when true. |
 | `WALTR_MCP_OAUTH_ALLOW_CIMD` | No | Exactly `true` or `false`; enables hardened Client ID Metadata Document resolution when true. |
 | `WALTR_AUTH_SESSION_TTL` | No | Browser session lifetime in seconds; defaults to 28,800 seconds and must be from 1 second through 30 days. |
 | `WALTR_AUTH_ALLOW_INSECURE_COOKIE` | No | Exactly `true` or `false`; defaults to `false`. Allows non-`Secure` cookies only as part of loopback HTTP local mode. |
@@ -116,7 +115,6 @@ Embedded mode deliberately configures no public CIMD URI. `GET /.well-known/oaut
 
 When an upstream server offers CIMD and DCR, embedded mode skips CIMD. It can use preregistration or DCR. A valid dynamic registration is reused for reauthorization within the same embedded generation; a replacement generation performs fresh DCR because it cannot rehydrate the old generation's redirect marker.
 
-Embedded outbound destination policy ignores `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS`. Only explicit `EmbeddedOutboundPolicy::trusted_private_origins` entries admit private HTTPS origins.
 
 Embedded configuration and lifecycle `Debug` output omits endpoints, bearers, app-private paths, and task or thread handles.
 
@@ -179,7 +177,7 @@ The API-root protected-resource document optionally includes the Waltr applicati
 
 The server advertises this extension only when `WALTR_API_OIDC_CLIENT_ID` is configured. It deduplicates `openid`, `offline_access`, and `WALTR_API_REQUIRED_SCOPES`, and supplies `WALTR_API_OIDC_AUDIENCE` or its legacy fallback as the audience. The extension contains no browser client secret.
 
-The helper validates the API resource, exact issuer, provider capabilities, and extension fields before it returns configuration. Discovery uses bundled TLS roots and follows no redirects. URL-only bootstrap is a Waltr application extension, not universal OIDC client discovery or Dynamic Client Registration (DCR). Older authenticated servers need an update or explicit native-client configuration; the helper rejects absent or invalid extension metadata.
+The helper validates the API resource, exact issuer, provider capabilities, and extension fields before it returns configuration. Discovery uses bundled TLS roots and can follow up to five same-origin redirects on metadata reads. URL-only bootstrap is a Waltr application extension, not universal OIDC client discovery or Dynamic Client Registration (DCR). Older authenticated servers need an update or explicit native-client configuration; the helper rejects absent or invalid extension metadata.
 
 Server metadata composition lives in [`handlers.rs`](../../crates/waltr-server/src/access_auth/handlers.rs) and [`service.rs`](../../crates/waltr-server/src/access_auth/service.rs). This extension changes neither API bearer validation nor hosted MCP authorization.
 
@@ -314,9 +312,7 @@ OIDC back-channel requests do not follow redirects. Deployments behind a reverse
 
 Environment-owned `build_app(BuildAppOptions)` is intentionally async and fallible because database migrations, OIDC discovery, and initial key loading precede listener binding. Explicit app builders are synchronous composition APIs and require initialized `Persistence`; builders that enable access authentication also require an initialized `AccessAuthenticator`.
 
-Standalone startup snapshots only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It separately snapshots the private-test switch as a boolean.
-
-Later environment changes do not alter active behavior. Embedded composition always disables that switch regardless of process environment.
+Standalone outbound OAuth snapshots `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values at startup. Later environment changes do not alter that snapshot.
 
 The snapshot excludes all unrelated environment entries. Its `Debug` output reports only bounded configuration facts and never prints retained values.
 
@@ -324,7 +320,9 @@ Embedded attempts and MCP credentials persist an opaque per-generation callback 
 
 Every embedded server restart creates another marker. It rejects stale attempts and hides stale marked credentials. Status and cancel return not found for stale attempts without mutating them. Outbound MCP targets therefore require reauthorization after restart.
 
-Outbound MCP authorization honors configured and reusable saved preregistrations first. When upstream offers both CIMD and DCR, Waltr checks its own metadata hostname through local DNS with a two-second bound. Private, loopback, link-local, mixed public/private, empty, failed, or timed-out results prefer DCR, even after a saved CIMD registration. Public results retain CIMD preference, even after a saved DCR registration. Waltr reuses a suitable saved registration within the selected method. CIMD-only servers retain CIMD; hosts without a metadata URI retain preregistration or DCR. This heuristic does not prove remote reachability and does not weaken outbound HTTP or SSRF protections. Selection applies to new authorization; current credentials remain intact until a successful flow replaces them.
+Outbound MCP authorization prefers configured preregistration, then a suitable saved registration. For a new registration, it prefers CIMD when the host exposes a metadata URI and the provider supports it. Otherwise, it uses DCR when the provider supports it. The host's DNS results do not select a registration method.
+
+Deployment egress controls determine OAuth network reachability. TLS verification, issuer and resource identity, and credential routing still apply. Metadata reads can follow a bounded number of same-origin redirects. Credential exchanges do not follow redirects.
 
 Outbound DCR requests use `web` for HTTPS callbacks and `native` for loopback/native callbacks. Upstream responses can omit `application_type`; Waltr does not infer a value. An explicit value must match the request. Redirect URIs, grants, response types, and client name must still match. Waltr still requires authentication method `none` and rejects client secrets and registration credentials.
 

@@ -345,13 +345,14 @@ Embedded mode advertises no CIMD client metadata URI because an upstream server 
 
 Streamable HTTP authentication failures preserve the parsed bearer challenge instead of flattening it into a display string. Session errors carry the server endpoint, HTTP status, protected-resource metadata URL, scope, bearer `error`, sanitized `error_description`, `error_uri`, and realm through `McpAuthorizationContext`; the server exposes that context in typed `AuthenticationFailure` gRPC status details under the outbound-MCP domain.
 
-A Streamable HTTP bearer challenge becomes an ordinary target-scoped session failure and never begins authorization itself. The user explicitly starts authorization for that MCP server from Config. The server then discovers the exact RFC 9728 protected resource, tries advertised authorization servers until it finds a compatible public server, and discovers RFC 8414 endpoints before selecting registration. Production discovery and every discovered authorization, token, registration, revocation, and JWKS destination require HTTPS and a public network destination by default. Waltr automatically supplies its initialized hosted MCP origin to agent session refresh, while server-owned authorization orchestration admits that origin only for the exact initialized self resource. Operators may additionally allow RFC 1918 IPv4 or IPv6 unique-local ingress for exact HTTPS origins with `WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS`; the comma-separated entries contain no path and match scheme, host, and effective port. Provider OAuth never receives this trust. Redirects are disabled, DNS answers are checked and pinned for direct requests, loopback/link-local/metadata addresses remain rejected, and the connected peer is checked where the HTTP stack exposes it. Registration selection is:
+A Streamable HTTP bearer challenge reports a target-scoped failure. It does not start authorization. The user starts authorization for that MCP server from Config. Waltr discovers the exact RFC 9728 protected resource and checks advertised issuers for compatible RFC 8414 metadata. HTTPS endpoints can resolve to private or public addresses. Deployment egress controls determine reachability. Waltr verifies TLS and OAuth identity. Metadata reads can follow a bounded number of same-origin redirects. Credential exchanges do not follow redirects.
+
+Registration preference:
 
 1. A configured preregistered client for that server key.
-2. A still-valid persisted preregistered or CIMD registration for the same issuer, resource, and redirect.
+2. A suitable saved registration for the same issuer, resource, and redirect.
 3. Waltr's `/.well-known/oauth-client/waltr` CIMD client ID when the server advertises CIMD.
-4. A still-valid persisted dynamic registration.
-5. Public DCR when the server advertises a registration endpoint.
+4. Public DCR when the server advertises a registration endpoint.
 
 Configured preregistration is optional, target-scoped, and issuer-bound. Normalize the server key by uppercasing ASCII letters/digits and replacing every other character with `_`; `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_CLIENT_ID` supplies the public client ID, required `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_ISSUER` must exactly match discovered authorization-server metadata, and optional `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_REDIRECT_URI` overrides the default server callback. There is no global registration, registration-specific `self` branch, or deployment-owned `WALTR_MCP_SELF_OAUTH_*` contract. If no mechanism is available, authorization returns typed `CONFIGURATION_REQUIRED` in the outbound-MCP domain.
 
@@ -361,9 +362,7 @@ For embedded mode, the explicit callback drives registration, server-callback at
 
 Embedded selection skips CIMD even when an upstream server also offers DCR. It can select preregistration or DCR. Same-generation reauthorization reuses a valid dynamic registration; a replacement generation performs fresh DCR because the old marker cannot be rehydrated.
 
-Standalone startup retains only `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values. It snapshots the private-test switch once.
-
-Embedded composition ignores the ambient private-test switch. Its explicit trusted-origin list solely controls private HTTPS OAuth destinations.
+Standalone outbound OAuth snapshots `WALTR_PUBLIC_URL` and supported `WALTR_MCP_*_OAUTH_{CLIENT_ID,ISSUER,REDIRECT_URI}` values at startup.
 
 Embedded attempts and credentials persist an opaque per-generation callback marker, not the callback endpoint. Only the matching active generation rehydrates the exact callback.
 
