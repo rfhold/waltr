@@ -13,6 +13,7 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
+    io::{BufRead, BufReader, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -27,6 +28,7 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tokio::sync::Mutex;
 
 struct StoredCredential;
@@ -85,26 +87,103 @@ fn make_provider_credential(
     )
 }
 
-#[derive(Clone)]
-struct TokenServerState {
-    requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
-    request_count: Arc<AtomicUsize>,
-    response: serde_json::Value,
+const TEST_TOKEN_CERT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../waltr-audio/tests/fixtures/tls/localhost-test-only.cert.pem"
+));
+const TEST_TOKEN_KEY: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../waltr-audio/tests/fixtures/tls/localhost-test-only.key.pem"
+));
+
+struct TestTokenResponse {
     status: StatusCode,
-    delay: Duration,
+    location: Option<&'static str>,
+    body: String,
 }
 
-async fn token_handler(
-    State(state): State<TokenServerState>,
-    axum::Form(form): axum::Form<BTreeMap<String, String>>,
-) -> impl IntoResponse {
-    state.request_count.fetch_add(1, Ordering::SeqCst);
-    state.requests.lock().await.push(form);
-    tokio::time::sleep(state.delay).await;
-    (state.status, Json(state.response))
+fn serve_token_request(
+    socket: std::net::TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    handler: impl FnOnce(&str, &str) -> TestTokenResponse,
+) -> std::io::Result<()> {
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let connection = rustls::ServerConnection::new(config).expect("TLS server connection");
+    let mut stream = BufReader::new(rustls::StreamOwned::new(connection, socket));
+    let mut request_line = String::new();
+    stream.read_line(&mut request_line)?;
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .expect("request path");
+    let mut length = 0;
+    loop {
+        let mut header = String::new();
+        if stream.read_line(&mut header)? == 0 || header == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse().expect("request body length");
+        }
+    }
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body)?;
+    let response = handler(path, std::str::from_utf8(&body).expect("UTF-8 token body"));
+    let stream = stream.get_mut();
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status.as_u16(),
+        response.status.canonical_reason().expect("response status"),
+        response.body.len(),
+    )?;
+    if let Some(location) = response.location {
+        write!(stream, "Location: {location}\r\n")?;
+    }
+    write!(stream, "\r\n{}", response.body)?;
+    stream.flush()
 }
 
-async fn token_server(response: serde_json::Value, delay: Duration) -> (String, TokenServerState) {
+async fn tls_token_fixture(
+    handler: impl Fn(&str, &str) -> TestTokenResponse + Send + Sync + 'static,
+) -> String {
+    let certificate = CertificateDer::from_pem_slice(TEST_TOKEN_CERT).expect("TLS certificate");
+    let key = PrivateKeyDer::from_pem_slice(TEST_TOKEN_KEY).expect("TLS key");
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .expect("TLS server configuration"),
+    );
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind token server");
+    let port = listener.local_addr().expect("token server address").port();
+    let handler = Arc::new(handler);
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.expect("accept token connection");
+            let socket = socket.into_std().expect("standard TCP stream");
+            let config = Arc::clone(&config);
+            let handler = Arc::clone(&handler);
+            tokio::task::spawn_blocking(move || {
+                serve_token_request(socket, config, |path, body| handler(path, body))
+                    .expect("serve token request");
+            });
+        }
+    });
+    format!("https://localhost:{port}/token")
+}
+
+async fn token_server(response: serde_json::Value, delay: Duration) -> (String, Arc<AtomicUsize>) {
     token_server_with_status(StatusCode::OK, response, delay).await
 }
 
@@ -112,33 +191,28 @@ async fn token_server_with_status(
     status: StatusCode,
     response: serde_json::Value,
     delay: Duration,
-) -> (String, TokenServerState) {
-    let state = TokenServerState {
-        requests: Arc::new(Mutex::new(Vec::new())),
-        request_count: Arc::new(AtomicUsize::new(0)),
-        response,
-        status,
-        delay,
-    };
-    let app = Router::new()
-        .route("/token", post(token_handler))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind token server");
-    let address = listener.local_addr().expect("token server address");
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve token endpoint");
-    });
-    (format!("http://{address}/token"), state)
+) -> (String, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&requests);
+    let url = tls_token_fixture(move |path, body| {
+        assert_eq!(path, "/token");
+        assert!(body.contains("refresh_token=old-provider-refresh"));
+        seen.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(delay);
+        TestTokenResponse {
+            status,
+            location: None,
+            body: response.to_string(),
+        }
+    })
+    .await;
+    (url, requests)
 }
 
 async fn token_error_server(
     status: StatusCode,
     response: serde_json::Value,
-) -> (String, TokenServerState) {
+) -> (String, Arc<AtomicUsize>) {
     token_server_with_status(status, response, Duration::ZERO).await
 }
 
@@ -176,68 +250,79 @@ async fn messages_server() -> (String, MessagesServerState) {
     (format!("http://{address}/v1/messages?beta=true"), state)
 }
 
-async fn malicious_token_server(oversized: bool) -> (String, Arc<AtomicUsize>) {
-    let redirected_requests = Arc::new(AtomicUsize::new(0));
-    let redirected = Arc::clone(&redirected_requests);
-    let app = if oversized {
-        Router::new().route(
-            "/token",
-            post(|| async {
-                (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    "x".repeat(64 * 1024 + 1),
-                )
-            }),
-        )
-    } else {
-        Router::new()
-            .route(
-                "/token",
-                post(|| async {
-                    (
-                        StatusCode::TEMPORARY_REDIRECT,
-                        [(header::LOCATION, "/secret-sink")],
-                    )
-                        .into_response()
-                }),
-            )
-            .route(
-                "/secret-sink",
-                post(move || {
-                    let redirected = Arc::clone(&redirected);
-                    async move {
-                        redirected.fetch_add(1, Ordering::SeqCst);
-                        Json(serde_json::json!({"access_token": "stolen"}))
-                    }
-                }),
-            )
-    };
+#[tokio::test]
+async fn provider_refresh_connect_failure_keeps_credential_retryable() {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
-        .expect("bind malicious token server");
-    let address = listener.local_addr().expect("token server address");
-    tokio::spawn(async move {
-        axum::serve(listener, app)
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let (coordinator, _, settings) = provider_coordinator(
+        format!("https://{address}/token"),
+        provider_credential(now_ms() - 1),
+    )
+    .await;
+    for _ in 0..2 {
+        let error = coordinator
+            .refresh_provider("test", &settings, RefreshMode::Normal)
             .await
-            .expect("serve malicious token endpoint");
-    });
-    (format!("http://{address}/token"), redirected_requests)
+            .unwrap_err();
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::NetworkFailed
+        );
+    }
 }
 
 #[tokio::test]
-async fn provider_refresh_rejects_redirects_and_oversized_responses() {
-    for oversized in [false, true] {
-        let (url, redirected) = malicious_token_server(oversized).await;
-        let (coordinator, _, settings) =
-            provider_coordinator(url, provider_credential(now_ms() - 1)).await;
-        assert!(
-            coordinator
-                .refresh_provider("test", &settings, RefreshMode::Normal)
-                .await
-                .is_err()
-        );
-        assert_eq!(redirected.load(Ordering::SeqCst), 0);
-    }
+async fn provider_refresh_does_not_forward_credentials_on_redirect() {
+    let redirected_requests = Arc::new(AtomicUsize::new(0));
+    let redirected = Arc::clone(&redirected_requests);
+    let url = tls_token_fixture(move |path, body| {
+        if path == "/token" {
+            assert!(body.contains("refresh_token=old-provider-refresh"));
+            TestTokenResponse {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                location: Some("/secret-sink"),
+                body: "{}".to_owned(),
+            }
+        } else {
+            redirected.fetch_add(1, Ordering::SeqCst);
+            TestTokenResponse {
+                status: StatusCode::OK,
+                location: None,
+                body: r#"{"access_token":"unexpected"}"#.to_owned(),
+            }
+        }
+    })
+    .await;
+    let (coordinator, _, settings) =
+        provider_coordinator(url, provider_credential(now_ms() - 1)).await;
+    let error = coordinator
+        .refresh_provider("test", &settings, RefreshMode::Normal)
+        .await
+        .expect_err("redirect must fail");
+    assert_eq!(
+        error.reason(),
+        crate::AuthenticationFailureReason::TokenExchangeFailed
+    );
+    assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn provider_refresh_rejects_oversized_responses() {
+    let (url, _) = token_server(serde_json::json!("x".repeat(64 * 1024)), Duration::ZERO).await;
+    let (coordinator, _, settings) =
+        provider_coordinator(url, provider_credential(now_ms() - 1)).await;
+    let error = coordinator
+        .refresh_provider("test", &settings, RefreshMode::Normal)
+        .await
+        .expect_err("oversized token response must fail");
+    assert_eq!(
+        error.reason(),
+        crate::AuthenticationFailureReason::ResponseInvalid
+    );
+    assert!(error.message().contains("size limit"));
 }
 
 fn provider_oauth_settings(token_url: String) -> SessionOAuthProviderSettings {
@@ -314,10 +399,15 @@ async fn provider_coordinator(
         .await
         .expect("store provider credential");
     (
-        CredentialRefreshCoordinator::new(store.clone()).with_loopback_test_mode(),
+        tls_provider_coordinator(store.clone()),
         store,
         provider_oauth_settings(token_url),
     )
+}
+
+fn tls_provider_coordinator(store: FileCredentialStore) -> CredentialRefreshCoordinator {
+    let cert = reqwest::Certificate::from_pem(TEST_TOKEN_CERT).expect("TLS test root");
+    CredentialRefreshCoordinator::new(store).with_test_root(cert)
 }
 
 #[tokio::test]
@@ -825,7 +915,7 @@ async fn forced_provider_refresh_preserves_and_reextracts_metadata_and_rotates_r
             .and_then(|metadata| metadata.get("preserved")),
         Some(&"preserved-value".to_owned())
     );
-    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(server.load(Ordering::SeqCst), 1);
     let stored = OAuthCredentialStore::read(&store, AuthTarget::provider("test").credential_key())
         .await
         .expect("read provider credential")
@@ -922,8 +1012,7 @@ async fn independently_constructed_provider_stores_share_singleflight() {
     .await;
     let (coordinator, store, settings) =
         provider_coordinator(token_url, provider_credential(now_ms() - 1)).await;
-    let second = CredentialRefreshCoordinator::new(FileCredentialStore::new(store.path()))
-        .with_loopback_test_mode();
+    let second = tls_provider_coordinator(FileCredentialStore::new(store.path()));
 
     let (first, second) = tokio::join!(
         coordinator.refresh_provider("test", &settings, RefreshMode::Normal),
@@ -948,7 +1037,7 @@ async fn independently_constructed_provider_stores_share_singleflight() {
             .secret(),
         "new-provider-access"
     );
-    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(server.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -972,9 +1061,13 @@ async fn stale_provider_refresh_cannot_replace_newer_credential() {
                 .await
         }
     });
-    while server.request_count.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refresh request reached the server");
     let mut replacement = provider_credential(now_ms() + 3_600_000);
     replacement.token.access_token = oauth2::AccessToken::new("newly-authorized-access".to_owned());
     replacement.token.refresh_token = Some(oauth2::RefreshToken::new(

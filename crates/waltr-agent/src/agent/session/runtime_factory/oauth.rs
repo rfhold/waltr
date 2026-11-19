@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    net::IpAddr,
     time::{Duration, SystemTime},
 };
 
@@ -82,7 +81,8 @@ enum RefreshFailureDisposition {
 #[derive(Debug, Clone)]
 pub struct CredentialRefreshCoordinator {
     credential_store: CredentialStore,
-    allow_loopback_http: bool,
+    #[cfg(test)]
+    test_root: Option<reqwest::Certificate>,
 }
 
 impl CredentialRefreshCoordinator {
@@ -91,13 +91,14 @@ impl CredentialRefreshCoordinator {
     pub fn new(credential_store: impl Into<CredentialStore>) -> Self {
         Self {
             credential_store: credential_store.into(),
-            allow_loopback_http: false,
+            #[cfg(test)]
+            test_root: None,
         }
     }
 
     #[cfg(test)]
-    pub(super) const fn with_loopback_test_mode(mut self) -> Self {
-        self.allow_loopback_http = true;
+    pub(super) fn with_test_root(mut self, root: reqwest::Certificate) -> Self {
+        self.test_root = Some(root);
         self
     }
 
@@ -107,8 +108,8 @@ impl CredentialRefreshCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns a sanitized error for invalid configuration, rejected exchanges, unsafe
-    /// destinations, invalid responses, or storage failures.
+    /// Returns a sanitized error for invalid configuration, failed transport, rejected
+    /// exchanges, invalid responses, or storage failures.
     pub async fn refresh_provider(
         &self,
         provider_key: &str,
@@ -153,13 +154,9 @@ impl CredentialRefreshCoordinator {
             validate_provider_credential(&target, &current)?;
             return Ok(Some(current.credential));
         }
-        let refreshed = match refresh_provider_oauth(
-            &target,
-            definition,
-            &record.credential,
-            self.allow_loopback_http,
-        )
-        .await
+        let refreshed = match self
+            .refresh_provider_oauth(&target, definition, &record.credential)
+            .await
         {
             Ok(credential) => credential,
             Err(error) => {
@@ -171,6 +168,29 @@ impl CredentialRefreshCoordinator {
         self.commit_refresh(&target, &credential_key, claim, refreshed)
             .await
             .map(|record| Some(record.credential))
+    }
+
+    fn oauth_client_for(
+        &self,
+        target: &AuthTarget,
+        value: &str,
+    ) -> Result<(Url, Client), CredentialRefreshError> {
+        let url = oauth_token_url(target, value)?;
+        let builder =
+            crate::outbound_http::client_builder().map_err(|_| oauth_client_error(target))?;
+        #[cfg(test)]
+        let builder = match &self.test_root {
+            // The local TLS fixture has its own root independent of platform trust.
+            Some(root) => Client::builder().tls_certs_only([root.clone()]),
+            None => builder,
+        };
+        let client = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| oauth_client_error(target))?;
+        Ok((url, client))
     }
 
     async fn read_record(
@@ -330,71 +350,77 @@ fn refresh_claim(revision: u64) -> OAuthRefreshClaim {
     }
 }
 
-async fn refresh_provider_oauth(
-    target: &AuthTarget,
-    definition: &SessionOAuthProviderSettings,
-    credential: &OAuthCredential,
-    allow_loopback_http: bool,
-) -> Result<OAuthCredential, CredentialRefreshError> {
-    if definition.client_id.is_empty() || definition.token_url.is_empty() {
-        return Err(refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::ConfigurationRequired,
-            "provider OAuth refresh configuration is missing",
-            RefreshFailureDisposition::RetrySafe,
-        ));
+impl CredentialRefreshCoordinator {
+    async fn refresh_provider_oauth(
+        &self,
+        target: &AuthTarget,
+        definition: &SessionOAuthProviderSettings,
+        credential: &OAuthCredential,
+    ) -> Result<OAuthCredential, CredentialRefreshError> {
+        if definition.client_id.is_empty() || definition.token_url.is_empty() {
+            return Err(refresh_error(
+                target.clone(),
+                AuthenticationFailureReason::ConfigurationRequired,
+                "provider OAuth refresh configuration is missing",
+                RefreshFailureDisposition::RetrySafe,
+            ));
+        }
+        let pairs = vec![
+            ("grant_type", "refresh_token"),
+            ("client_id", definition.client_id.as_str()),
+            (
+                "refresh_token",
+                credential
+                    .token
+                    .refresh_token
+                    .as_ref()
+                    .map(RefreshToken::secret)
+                    .ok_or_else(|| {
+                        refresh_error(
+                            target.clone(),
+                            AuthenticationFailureReason::CredentialRequired,
+                            "provider OAuth credential does not include a refresh token",
+                            RefreshFailureDisposition::ReauthorizationRequired,
+                        )
+                    })?,
+            ),
+        ];
+        let (token_url, client) = self.oauth_client_for(target, &definition.token_url)?;
+        let builder = client.post(token_url);
+        let response = match definition.token_request_style {
+            SessionOAuthTokenRequestStyle::Json => {
+                builder.json(&pairs_to_json(&pairs)).send().await
+            }
+            SessionOAuthTokenRequestStyle::FormUrlencoded => builder.form(&pairs).send().await,
+        }
+        .map_err(|error| {
+            refresh_error(
+                target.clone(),
+                AuthenticationFailureReason::NetworkFailed,
+                "provider OAuth token request failed",
+                if error.is_connect() {
+                    RefreshFailureDisposition::RetrySafe
+                } else {
+                    RefreshFailureDisposition::Indeterminate
+                },
+            )
+        })?;
+        let status = response.status();
+        let body = read_json_body(target, response).await?;
+        if !status.is_success() {
+            return Err(refresh_error(
+                target.clone(),
+                AuthenticationFailureReason::TokenExchangeFailed,
+                "provider OAuth token endpoint rejected the refresh request",
+                if status.is_server_error() {
+                    RefreshFailureDisposition::Indeterminate
+                } else {
+                    RefreshFailureDisposition::ReauthorizationRequired
+                },
+            ));
+        }
+        token_response_to_credential(target, definition, credential, &body)
     }
-    let pairs = vec![
-        ("grant_type", "refresh_token"),
-        ("client_id", definition.client_id.as_str()),
-        (
-            "refresh_token",
-            credential
-                .token
-                .refresh_token
-                .as_ref()
-                .map(RefreshToken::secret)
-                .ok_or_else(|| {
-                    refresh_error(
-                        target.clone(),
-                        AuthenticationFailureReason::CredentialRequired,
-                        "provider OAuth credential does not include a refresh token",
-                        RefreshFailureDisposition::ReauthorizationRequired,
-                    )
-                })?,
-        ),
-    ];
-    let (token_url, client) =
-        oauth_client_for(target, &definition.token_url, allow_loopback_http, &[]).await?;
-    let builder = client.post(token_url);
-    let response = match definition.token_request_style {
-        SessionOAuthTokenRequestStyle::Json => builder.json(&pairs_to_json(&pairs)).send().await,
-        SessionOAuthTokenRequestStyle::FormUrlencoded => builder.form(&pairs).send().await,
-    }
-    .map_err(|_| {
-        refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::NetworkFailed,
-            "provider OAuth token request failed",
-            RefreshFailureDisposition::Indeterminate,
-        )
-    })?;
-    validate_response_peer(target, &response, allow_loopback_http, &[])?;
-    let status = response.status();
-    let body = read_json_body(target, response).await?;
-    if !status.is_success() {
-        return Err(refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::TokenExchangeFailed,
-            "provider OAuth token endpoint rejected the refresh request",
-            if status.is_server_error() {
-                RefreshFailureDisposition::Indeterminate
-            } else {
-                RefreshFailureDisposition::ReauthorizationRequired
-            },
-        ));
-    }
-    token_response_to_credential(target, definition, credential, &body)
 }
 
 fn pairs_to_json(pairs: &[(&str, &str)]) -> serde_json::Value {
@@ -588,98 +614,26 @@ fn json_scalar_to_string(value: &serde_json::Value) -> String {
         .map_or_else(|| value.to_string(), ToOwned::to_owned)
 }
 
-async fn oauth_client_for(
-    target: &AuthTarget,
-    value: &str,
-    allow_loopback_http: bool,
-    trusted_private_origins: &[Url],
-) -> Result<(Url, Client), CredentialRefreshError> {
+fn oauth_token_url(target: &AuthTarget, value: &str) -> Result<Url, CredentialRefreshError> {
     let url = Url::parse(value).map_err(|_| refresh_configuration_error(target))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| refresh_configuration_error(target))?;
-    let loopback_host = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if url.fragment().is_some()
+    if url.scheme() != "https"
+        || !url.has_host()
+        || url.fragment().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
-        || (url.scheme() != "https"
-            && !(allow_loopback_http && url.scheme() == "http" && loopback_host))
     {
         return Err(refresh_configuration_error(target));
     }
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| refresh_configuration_error(target))?;
-    let addresses = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| {
-            refresh_error(
-                target.clone(),
-                AuthenticationFailureReason::NetworkFailed,
-                "OAuth token endpoint DNS resolution failed",
-                RefreshFailureDisposition::RetrySafe,
-            )
-        })?
-        .collect::<Vec<_>>();
-    if addresses.is_empty()
-        || addresses.iter().any(|address| {
-            !allows_address(
-                &url,
-                address.ip(),
-                allow_loopback_http,
-                trusted_private_origins,
-            )
-        })
-    {
-        return Err(refresh_configuration_error(target));
-    }
-    let mut builder = crate::outbound_http::client_builder()
-        .map_err(|_| {
-            refresh_error(
-                target.clone(),
-                AuthenticationFailureReason::NetworkFailed,
-                "failed to build OAuth token client",
-                RefreshFailureDisposition::RetrySafe,
-            )
-        })?
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10));
-    if host.parse::<IpAddr>().is_err() {
-        builder = builder.resolve_to_addrs(host, &addresses);
-    }
-    let client = builder.build().map_err(|_| {
-        refresh_error(
-            target.clone(),
-            AuthenticationFailureReason::NetworkFailed,
-            "failed to build OAuth token client",
-            RefreshFailureDisposition::RetrySafe,
-        )
-    })?;
-    Ok((url, client))
+    Ok(url)
 }
 
-fn validate_response_peer(
-    target: &AuthTarget,
-    response: &Response,
-    allow_loopback_http: bool,
-    trusted_private_origins: &[Url],
-) -> Result<(), CredentialRefreshError> {
-    if response.remote_addr().is_some_and(|peer| {
-        !allows_address(
-            response.url(),
-            peer.ip(),
-            allow_loopback_http,
-            trusted_private_origins,
-        )
-    }) {
-        return Err(refresh_configuration_error(target));
-    }
-    Ok(())
+fn oauth_client_error(target: &AuthTarget) -> CredentialRefreshError {
+    refresh_error(
+        target.clone(),
+        AuthenticationFailureReason::NetworkFailed,
+        "failed to build OAuth token client",
+        RefreshFailureDisposition::RetrySafe,
+    )
 }
 
 async fn read_json_body(
@@ -732,7 +686,7 @@ fn refresh_configuration_error(target: &AuthTarget) -> CredentialRefreshError {
     refresh_error(
         target.clone(),
         AuthenticationFailureReason::ConfigurationRequired,
-        "OAuth token endpoint is not a permitted destination",
+        "OAuth token endpoint must be an HTTPS URL without userinfo or a fragment",
         RefreshFailureDisposition::RetrySafe,
     )
 }
@@ -771,59 +725,6 @@ fn refresh_error(
     }
 }
 
-fn allows_address(
-    url: &Url,
-    address: IpAddr,
-    allow_loopback: bool,
-    trusted_private_origins: &[Url],
-) -> bool {
-    if address.is_loopback() {
-        return allow_loopback;
-    }
-    if trusted_private_origins
-        .iter()
-        .any(|trusted| trusted.origin() == url.origin())
-        && match address {
-            IpAddr::V4(address) => address.is_private(),
-            IpAddr::V6(address) => address.is_unique_local(),
-        }
-    {
-        return true;
-    }
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            !(address.is_private()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
-                || octets[0] >= 240)
-        }
-        IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                return allows_address(
-                    url,
-                    IpAddr::V4(mapped),
-                    allow_loopback,
-                    trusted_private_origins,
-                );
-            }
-            let segments = address.segments();
-            !(address.is_unspecified()
-                || address.is_multicast()
-                || address.is_unique_local()
-                || address.is_unicast_link_local()
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
-        }
-    }
-}
-
 pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -833,51 +734,30 @@ pub(super) fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
-mod destination_tests {
+mod url_tests {
     use super::*;
 
     #[test]
-    fn trusted_host_origin_accepts_only_rfc1918_and_ula_on_the_exact_origin() {
-        let trusted = Url::parse("https://preview-waltr.example/service").expect("trusted URL");
-        let token = Url::parse("https://preview-waltr.example/token").expect("token URL");
-        let other = Url::parse("https://other.example/token").expect("token URL");
-        let other_port = Url::parse("https://preview-waltr.example:444/token").expect("token URL");
-
-        assert!(allows_address(
-            &token,
-            "172.16.3.53".parse().expect("private IP"),
-            false,
-            std::slice::from_ref(&trusted),
-        ));
-        assert!(allows_address(
-            &token,
-            "fd00::1".parse().expect("private IP"),
-            false,
-            std::slice::from_ref(&trusted),
-        ));
-        assert!(!allows_address(
-            &other,
-            "172.16.3.53".parse().expect("private IP"),
-            false,
-            std::slice::from_ref(&trusted),
-        ));
-        assert!(!allows_address(
-            &other_port,
-            "172.16.3.53".parse().expect("private IP"),
-            false,
-            std::slice::from_ref(&trusted),
-        ));
-        assert!(!allows_address(
-            &token,
-            "127.0.0.1".parse().expect("loopback IP"),
-            false,
-            std::slice::from_ref(&trusted),
-        ));
-        assert!(!allows_address(
-            &token,
-            "169.254.169.254".parse().expect("link-local IP"),
-            false,
-            std::slice::from_ref(&trusted),
-        ));
+    fn token_url_checks_shape_not_address_class() {
+        let target = AuthTarget::provider("test");
+        for url in [
+            "https://172.16.3.53/token",
+            "https://[fd00::1]/token",
+            "https://localhost:8443/token?provider=test",
+        ] {
+            assert!(oauth_token_url(&target, url).is_ok());
+        }
+        for url in [
+            "http://localhost/token",
+            "https://user:pass@localhost/token",
+            "https://localhost/token#fragment",
+            "not a URL",
+        ] {
+            let error = oauth_token_url(&target, url).expect_err("invalid endpoint");
+            assert_eq!(
+                error.reason(),
+                AuthenticationFailureReason::ConfigurationRequired
+            );
+        }
     }
 }
