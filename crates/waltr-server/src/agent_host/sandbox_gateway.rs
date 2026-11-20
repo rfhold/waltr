@@ -30,6 +30,12 @@ use crate::{
 };
 
 pub(crate) mod peers;
+#[allow(
+    dead_code,
+    reason = "the session runtime wires this private transport in the next stage"
+)]
+pub(crate) mod stdio;
+pub(crate) use stdio::stdio_launch;
 
 const MAX_PENDING: usize = 128;
 const OUTBOUND_CAPACITY: usize = 128;
@@ -249,8 +255,19 @@ enum Pending {
     Workspace(oneshot::Sender<proto::WorkspaceResponse>),
 }
 
-type Outbound = mpsc::Sender<std::result::Result<proto::ConnectResponse, Status>>;
-type OutboundStream = ReceiverStream<std::result::Result<proto::ConnectResponse, Status>>;
+struct OutboundMessage {
+    body: HostBody,
+    frame: Option<(CancellationToken, tokio::sync::OwnedSemaphorePermit)>,
+}
+
+impl From<HostBody> for OutboundMessage {
+    fn from(body: HostBody) -> Self {
+        Self { body, frame: None }
+    }
+}
+
+type Outbound = mpsc::Sender<OutboundMessage>;
+type OutboundStream = ConnectStream;
 type AdmittedConnection = (ConnectionGuard, Outbound, OutboundStream);
 
 struct Connection {
@@ -262,6 +279,7 @@ struct Connection {
     expires: Option<Instant>,
     retired: CancellationToken,
     export_reply: Option<(String, oneshot::Sender<bool>)>,
+    stdio: stdio::ConnectionStdio,
 }
 
 impl Drop for Connection {
@@ -312,6 +330,7 @@ pub struct SandboxGateway {
 pub struct SandboxHandle {
     inner: Arc<Inner>,
     scope: Option<Arc<WorkspaceScope>>,
+    scope_epoch: Option<u64>,
 }
 
 /// Observe the trusted private worker without owning its transport.
@@ -347,6 +366,7 @@ impl WorkspaceExportConnection {
         &self,
         binding: &str,
         export: WorkspaceExport,
+        mcp_stdio_launches: Vec<proto::McpStdioLaunch>,
         access_token: String,
         expires_at_unix: u64,
     ) -> Result<()> {
@@ -355,6 +375,7 @@ impl WorkspaceExportConnection {
             .into_os_string()
             .into_string()
             .map_err(|_| error("workspace export root must be UTF-8"))?;
+        stdio::validate_catalog(&mcp_stdio_launches)?;
         self.change(
             binding,
             ExportChange::Apply(proto::WorkspaceExportApply {
@@ -365,6 +386,7 @@ impl WorkspaceExportConnection {
                     access_token,
                     expires_at_unix,
                 }),
+                mcp_stdio_launches,
             }),
         )
         .await
@@ -387,11 +409,17 @@ impl WorkspaceExportConnection {
     }
 
     pub(crate) async fn remove(&self, binding: &str) -> Result<()> {
-        self.change(
-            binding,
-            ExportChange::Remove(proto::WorkspaceExportRemove {}),
-        )
-        .await
+        let result = self
+            .change(
+                binding,
+                ExportChange::Remove(proto::WorkspaceExportRemove {}),
+            )
+            .await;
+        if result.is_err() {
+            // An unconfirmed revocation cannot leave the previous export live.
+            self.inner.disconnect(self.epoch);
+        }
+        result
     }
 
     async fn change(&self, binding: &str, change: ExportChange) -> Result<()> {
@@ -407,15 +435,23 @@ impl WorkspaceExportConnection {
             if connection.export_reply.is_some() {
                 return Err(error("workspace export control already pending"));
             }
+            if matches!(&change, ExportChange::Apply(apply)
+                if !apply.mcp_stdio_launches.is_empty() && !connection.stdio.supported())
+            {
+                return Err(error(
+                    "private sandbox worker does not support stdio exports",
+                ));
+            }
             connection
                 .outbound
-                .try_send(Ok(message(HostBody::WorkspaceExportControl(
-                    proto::WorkspaceExportControl {
+                .try_send(
+                    HostBody::WorkspaceExportControl(proto::WorkspaceExportControl {
                         request_id: request_id.clone(),
                         binding: binding.into(),
                         change: Some(change),
-                    },
-                ))))
+                    })
+                    .into(),
+                )
                 .map_err(|_| error("private sandbox connection unavailable for export control"))?;
             connection.export_reply = Some((request_id, tx));
         }
@@ -596,6 +632,7 @@ impl SandboxGateway {
         SandboxHandle {
             inner: self.inner.clone(),
             scope: None,
+            scope_epoch: None,
         }
     }
 
@@ -645,6 +682,7 @@ impl Drop for PendingGuard {
             SandboxHandle {
                 inner: self.inner.clone(),
                 scope: None,
+                scope_epoch: None,
             }
             .cancel(&self.id, worker);
         }
@@ -667,6 +705,15 @@ impl SandboxHandle {
 
     async fn bind_at(&self, path: &str, root: PathBuf) -> Result<Self> {
         let mut handle = self.clone();
+        handle.scope_epoch = self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .connection
+            .as_ref()
+            .filter(|connection| connection.live() && connection.root == root)
+            .map(|connection| connection.id);
         let scope = WorkspaceScope {
             machine_id: self.inner.workspace_id.clone(),
             canonical_root: root,
@@ -802,7 +849,7 @@ impl SandboxHandle {
                             .expect("guard holds pending request");
                         request.worker = Some(worker.clone());
                         request.sent = true;
-                        permit.send(Ok(message(body)));
+                        permit.send(body.into());
                         return Ok((worker, guard));
                     }
                 }
@@ -821,9 +868,10 @@ impl SandboxHandle {
                 if connection.worker != worker {
                     return;
                 }
-                let cancel = Ok(message(HostBody::Cancel(proto::Cancel {
+                let cancel = HostBody::Cancel(proto::Cancel {
                     invocation_id: id.to_owned(),
-                })));
+                })
+                .into();
                 match connection.outbound.try_send(cancel) {
                     Ok(()) => return,
                     Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -865,9 +913,10 @@ impl SandboxHandle {
                                     .as_ref()
                                     .is_some_and(|c| c.id == epoch && c.live())
                                 {
-                                    permit.send(Ok(message(HostBody::Cancel(proto::Cancel {
-                                        invocation_id: id,
-                                    }))));
+                                    permit.send(
+                                        HostBody::Cancel(proto::Cancel { invocation_id: id })
+                                            .into(),
+                                    );
                                     return;
                                 }
                             }
@@ -1215,6 +1264,15 @@ impl Inner {
                     drop(tx.send(reply.applied));
                 }
             }
+            body @ (WorkerBody::McpStdioCatalogAck(_)
+            | WorkerBody::McpStdioOpened(_)
+            | WorkerBody::McpStdioFrame(_)
+            | WorkerBody::McpStdioTerminal(_)) => {
+                let connection = state.connection.as_mut().expect("active connection");
+                connection
+                    .stdio
+                    .dispatch(body, self.account.is_none() && self.export_control)?;
+            }
             WorkerBody::Hello(_) => return Err(Status::invalid_argument("unexpected hello")),
         }
         Ok(())
@@ -1309,6 +1367,7 @@ impl SandboxGateway {
                 expires,
                 retired: retired.clone(),
                 export_reply: None,
+                stdio: stdio::ConnectionStdio::new(hello.mcp_stdio_version),
             });
             self.inner.ready.send_replace(true);
             epoch
@@ -1319,7 +1378,18 @@ impl SandboxGateway {
             retired,
             on_disconnect: None,
         };
-        Ok((guard, outbound, ReceiverStream::new(receiver)))
+        use tokio_stream::StreamExt as _;
+        let receiver = ReceiverStream::new(receiver).filter_map(|queued: OutboundMessage| {
+            if queued
+                .frame
+                .is_some_and(|(fence, _credit)| fence.is_cancelled())
+            {
+                None
+            } else {
+                Some(Ok(message(queued.body)))
+            }
+        });
+        Ok((guard, outbound, Box::pin(receiver)))
     }
 
     fn drive_connection(
@@ -1357,14 +1427,15 @@ impl SandboxGateway {
         if let Some(deadline) = expires {
             // Do not flush buffered work to a peer after its authorization ends.
             Box::pin(futures_util::stream::unfold(
-                Some(receiver),
-                move |receiver| async move {
-                    let mut receiver = receiver?;
+                Some((receiver, retired)),
+                move |state| async move {
+                    let (mut receiver, retired) = state?;
                     tokio::select! {
                         biased;
                         () = wait_for_expiry(Some(deadline)) => Some((Err(expired_bearer()), None)),
+                        () = retired.cancelled() => None,
                         message = tokio_stream::StreamExt::next(&mut receiver) => {
-                            message.map(|message| (message, Some(receiver)))
+                            message.map(|message| (message, Some((receiver, retired))))
                         }
                     }
                 },
@@ -1447,6 +1518,7 @@ mod tests {
                 generation,
                 tools: vec![],
                 canonical_root: "/worker/root".into(),
+                mcp_stdio_version: 0,
             })),
         }
     }
@@ -2188,7 +2260,7 @@ mod tests {
 
         let (outbound, mut receiver) = mpsc::channel(1);
         outbound
-            .send(Ok(message(HostBody::Cancel(proto::Cancel::default()))))
+            .send(HostBody::Cancel(proto::Cancel::default()).into())
             .await
             .unwrap();
         let worker = WorkerId {
@@ -2204,6 +2276,7 @@ mod tests {
             expires: None,
             retired: CancellationToken::new(),
             export_reply: None,
+            stdio: stdio::ConnectionStdio::new(0),
         });
         let handle = gateway.handle();
         let sending = tokio::spawn(async move {
@@ -2227,8 +2300,8 @@ mod tests {
         assert!(!sending.is_finished());
         drop(receiver.recv().await);
         assert!(matches!(
-            receiver.recv().await.unwrap().unwrap().body,
-            Some(HostBody::Prepare(_))
+            receiver.recv().await.unwrap().body,
+            HostBody::Prepare(_)
         ));
         gateway
             .inner

@@ -17,13 +17,40 @@ const BINDING: &str = "workspace-bindings/first.yaml";
 const FIRST: &str = "apiVersion: waltr.dev/v1alpha1
 kind: WorkspaceBinding
 metadata: {name: first}
-spec: {endpoint: 'http://127.0.0.1:1234', machineId: first, exportRoot: /first}
+spec: {endpoint: 'http://127.0.0.1:1234', machineId: first, exportRoot: /first, mcpStdioServers: [exported]}
 ";
 const UNRELATED: &str = "apiVersion: waltr.dev/v1alpha1
 kind: WorkspaceBinding
 metadata: {name: unrelated}
 spec: {endpoint: 'http://127.0.0.1:1234', machineId: unrelated, exportRoot: /unrelated}
 ";
+const SERVER: &str = "mcp-servers/exported.yaml";
+const STDIO: &str = "apiVersion: waltr.dev/v1alpha1
+kind: McpServer
+metadata: {name: exported}
+spec: {transport: stdio, command: '/inert/fixture --initial'}
+";
+const OTHER_SERVER: &str = "mcp-servers/other.yaml";
+
+fn expect_apply(change: Option<Change>, arg: &str) {
+    let Some(Change::Apply(export)) = change else {
+        panic!("expected export apply");
+    };
+    assert_eq!(export.export_root, "/first");
+    assert_eq!(
+        export.mcp_stdio_launches,
+        vec![stdio_launch("exported", &format!("/inert/fixture {arg}")).unwrap()]
+    );
+}
+
+fn etag(catalog: &AgentDefinitionState, path: &str) -> String {
+    let crate::resource_catalog::AgentDefinitionInspection::Resource(detail) =
+        catalog.inspect(Some(path)).unwrap()
+    else {
+        panic!("expected resource detail")
+    };
+    detail.persisted_etag
+}
 
 type WorkerStream = tonic::Streaming<proto::ConnectResponse>;
 
@@ -68,6 +95,8 @@ async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
     let catalog = resource_state_with_overrides(&[
         (BINDING, FIRST),
         ("workspace-bindings/unrelated.yaml", UNRELATED),
+        (SERVER, STDIO),
+        (OTHER_SERVER, &STDIO.replace("exported", "other")),
     ]);
     let gateway = SandboxGateway::new("workspace".into()).with_export_control();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -96,6 +125,7 @@ async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
             generation: 1,
             tools: vec![],
             canonical_root: "/worker/root".into(),
+            mcp_stdio_version: 1,
         })),
     })
     .await
@@ -137,7 +167,17 @@ async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
     ));
 
     let apply = command(&mut stream).await;
-    assert!(matches!(apply.change, Some(Change::Apply(_))));
+    expect_apply(apply.change, "--initial");
+    catalog
+        .replace(
+            OTHER_SERVER,
+            STDIO
+                .replace("exported", "other")
+                .replace("--initial", "--unrelated"),
+            &etag(&catalog, OTHER_SERVER),
+        )
+        .await
+        .unwrap();
     *current.lock().unwrap() = Some(test_lease("rotated", "first-grant"));
     ack(&tx, apply.request_id).await;
     let rotate = command(&mut stream).await;
@@ -149,17 +189,12 @@ async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
     *current.lock().unwrap() = Some(test_lease("replacement", "second-grant"));
     ack(&tx, remove.request_id).await;
     let apply = command(&mut stream).await;
-    assert!(matches!(apply.change, Some(Change::Apply(_))));
-    let crate::resource_catalog::AgentDefinitionInspection::Resource(detail) =
-        catalog.inspect(Some(BINDING)).unwrap()
-    else {
-        panic!("expected resource detail")
-    };
+    expect_apply(apply.change, "--initial");
     let changed = catalog
         .replace(
             BINDING,
             FIRST.replace("/first", "/changed"),
-            &detail.persisted_etag,
+            &etag(&catalog, BINDING),
         )
         .await
         .unwrap();
@@ -176,11 +211,76 @@ async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
     ));
     ack(&tx, removed_before_replacement.request_id).await;
     let replacement = command(&mut stream).await;
-    let Some(Change::Apply(export)) = replacement.change else {
-        panic!("expected reconfigured export")
-    };
-    assert_eq!(export.export_root, "/first");
+    expect_apply(replacement.change, "--initial");
+
+    // A referenced resource edit and revert both land while Apply is in flight.
+    let edited = catalog
+        .replace(
+            SERVER,
+            STDIO.replace("--initial", "--reverted"),
+            &etag(&catalog, SERVER),
+        )
+        .await
+        .unwrap();
+    catalog
+        .replace(SERVER, STDIO.to_owned(), &edited.persisted_etag)
+        .await
+        .unwrap();
     ack(&tx, replacement.request_id).await;
+    let remove = command(&mut stream).await;
+    assert!(matches!(remove.change, Some(Change::Remove(_))));
+    ack(&tx, remove.request_id).await;
+    let apply = command(&mut stream).await;
+    expect_apply(apply.change, "--initial");
+    ack(&tx, apply.request_id).await;
+
+    let edited = catalog
+        .replace(
+            SERVER,
+            STDIO.replace("--initial", "--edited"),
+            &etag(&catalog, SERVER),
+        )
+        .await
+        .unwrap();
+    let remove = command(&mut stream).await;
+    assert!(matches!(remove.change, Some(Change::Remove(_))));
+    ack(&tx, remove.request_id).await;
+    let apply = command(&mut stream).await;
+    expect_apply(apply.change, "--edited");
+    ack(&tx, apply.request_id).await;
+
+    let missing = catalog.reset(SERVER, &edited.persisted_etag).await.unwrap();
+    let remove = command(&mut stream).await;
+    assert!(matches!(remove.change, Some(Change::Remove(_))));
+    ack(&tx, remove.request_id).await;
+    assert!(
+        timeout(Duration::from_millis(100), stream.message())
+            .await
+            .is_err()
+    );
+    let http = catalog
+        .replace(
+            SERVER,
+            STDIO.replace(
+                "transport: stdio, command: '/inert/fixture --initial'",
+                "transport: streamableHttp, url: 'https://inert.test/mcp'",
+            ),
+            &missing.persisted_etag,
+        )
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), stream.message())
+            .await
+            .is_err()
+    );
+    catalog
+        .replace(SERVER, STDIO.to_owned(), &http.persisted_etag)
+        .await
+        .unwrap();
+    let apply = command(&mut stream).await;
+    expect_apply(apply.change, "--initial");
+    ack(&tx, apply.request_id).await;
     let task = tokio::spawn(
         WorkspaceExports {
             stop,

@@ -13,13 +13,16 @@ use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
+use waltr::grpc::waltr::{config::v1 as config_proto, sandbox::v1::McpStdioLaunch};
 use waltr_agent_sandbox::peer_config::WorkspaceExport;
 
 use crate::{
     agent_definition::{AgentDefinitionSnapshot, AgentDefinitionState},
-    agent_host::sandbox_gateway::{WorkspaceExportConnection, WorkspaceExportControl},
+    agent_host::sandbox_gateway::{
+        WorkspaceExportConnection, WorkspaceExportControl, stdio_launch,
+    },
     auth::{AuthService, WorkspaceBindingCredentialLease},
-    resource_catalog::WorkspaceBinding,
+    resource_catalog::{PublishedState, WorkspaceBinding},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -114,11 +117,49 @@ impl LeaseVersion {
 struct ObservedBinding {
     spec: WorkspaceBinding,
     incarnation: Option<Uuid>,
+    definitions: Vec<config_proto::McpServer>,
+    launches: Vec<McpStdioLaunch>,
 }
 
 impl ObservedBinding {
+    fn new(snapshot: &AgentDefinitionSnapshot, key: &str, spec: &WorkspaceBinding) -> Option<Self> {
+        let definitions = spec
+            .mcp_stdio_servers()
+            .iter()
+            .map(|name| {
+                snapshot
+                    .configuration()
+                    .mcp_servers
+                    .get(name)
+                    .cloned()
+                    .filter(|server| server.r#type == config_proto::McpServerType::Stdio as i32)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let launches = spec
+            .mcp_stdio_servers()
+            .iter()
+            .zip(&definitions)
+            .map(|(name, server)| stdio_launch(name, &server.command))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            spec: spec.clone(),
+            incarnation: snapshot.workspace_binding_incarnation(key),
+            definitions,
+            launches,
+        })
+    }
+
+    fn definitions_current(&self, configuration: &config_proto::Configuration) -> bool {
+        self.spec
+            .mcp_stdio_servers()
+            .iter()
+            .zip(&self.definitions)
+            .all(|(name, expected)| configuration.mcp_servers.get(name) == Some(expected))
+    }
+
     fn is_current(&self, snapshot: &AgentDefinitionSnapshot, key: &str) -> bool {
         self.incarnation == snapshot.workspace_binding_incarnation(key)
+            && self.definitions_current(snapshot.configuration())
             && snapshot
                 .workspace_bindings()
                 .get(key)
@@ -126,6 +167,20 @@ impl ObservedBinding {
                     self.spec == *binding
                         && self.spec.export_root().as_os_str() == binding.export_root().as_os_str()
                 })
+    }
+}
+
+fn observe_publication(
+    desired: &mut BTreeMap<String, BindingPoll>,
+    publication: Option<PublishedState>,
+) {
+    if let Some(publication) = publication {
+        if let Some(configuration) = publication.resource_catalog().effective_configuration {
+            desired.retain(|_, poll| poll.binding.definitions_current(&configuration));
+        }
+    } else {
+        // A missed publication may have revoked and then restored a referenced definition.
+        desired.retain(|_, poll| poll.binding.definitions.is_empty());
     }
 }
 
@@ -166,16 +221,28 @@ async fn reconcile<F, Lease>(
     let mut installed = BTreeMap::<String, Installed>::new();
     let mut polls = FuturesUnordered::new();
     while !stop.is_cancelled() {
+        // Observe intermediate accepted definitions too, including an edit reverted before an
+        // outstanding control acknowledgement returns.
+        loop {
+            match publications.try_recv() {
+                Ok(update) => observe_publication(&mut desired, Some(update)),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    observe_publication(&mut desired, None)
+                }
+                Err(_) => break,
+            }
+        }
         let snapshot = catalog.snapshot();
         desired.retain(|key, poll| poll.binding.is_current(&snapshot, key));
         for (key, binding) in snapshot.workspace_bindings() {
-            desired.entry(key.clone()).or_insert_with(|| BindingPoll {
-                binding: Arc::new(ObservedBinding {
-                    spec: binding.clone(),
-                    incarnation: snapshot.workspace_binding_incarnation(key),
-                }),
-                due: Some(Instant::now()),
-            });
+            if let std::collections::btree_map::Entry::Vacant(entry) = desired.entry(key.clone())
+                && let Some(binding) = ObservedBinding::new(&snapshot, key, binding)
+            {
+                entry.insert(BindingPoll {
+                    binding: Arc::new(binding),
+                    due: Some(Instant::now()),
+                });
+            }
         }
         for (key, entry) in &mut installed {
             entry.remove |= desired
@@ -214,8 +281,10 @@ async fn reconcile<F, Lease>(
             () = stop.cancelled() => break,
             () = connection.retired() => return,
             update = publications.recv() => {
-                if matches!(update, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
-                    break;
+                match update {
+                    Ok(update) => observe_publication(&mut desired, Some(update)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => observe_publication(&mut desired, None),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             Some((key, binding, result)) = polls.next() => {
@@ -298,7 +367,13 @@ async fn observe_lease(
             export_root: binding.spec.export_root().to_owned(),
         };
         connection
-            .apply(&key, export, lease.access_token, version.expires)
+            .apply(
+                &key,
+                export,
+                binding.launches.clone(),
+                lease.access_token,
+                version.expires,
+            )
             .await
     };
     if result.is_ok() {

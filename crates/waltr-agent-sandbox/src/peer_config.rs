@@ -6,7 +6,11 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{task::JoinHandle, time::Instant};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 use tonic::{
     metadata::AsciiMetadataValue,
@@ -17,7 +21,12 @@ use waltr::grpc::waltr::sandbox::v1::{
     workspace_export_control::Change,
 };
 
-use crate::wire::{DialAuthorization, run_worker_with_dial_authorization};
+use crate::{
+    Sandbox,
+    wire::{
+        DialAuthorization, WorkerRoot, run_worker_with_dial_authorization, stdio::LaunchCatalog,
+    },
+};
 
 /// One configured destination on an exporting installation.
 #[derive(Clone, serde::Deserialize)]
@@ -157,25 +166,34 @@ impl CheckedExport {
         self,
         authorization: impl Fn() -> Option<AsciiMetadataValue> + Send + Sync + 'static,
     ) -> ExportWorkers {
-        self.start_with_deadline(move || {
-            authorization().map(|header| DialAuthorization {
-                header,
-                expires: None,
-            })
-        })
+        let root = WorkerRoot::from(self.root.clone());
+        self.start_with_deadline(
+            root,
+            LaunchCatalog::default(),
+            CancellationToken::new(),
+            move || {
+                authorization().map(|header| DialAuthorization {
+                    header,
+                    expires: None,
+                })
+            },
+        )
     }
 
     fn start_with_deadline(
         self,
+        root: WorkerRoot,
+        catalog: LaunchCatalog,
+        stop: CancellationToken,
         authorization: impl Fn() -> Option<DialAuthorization> + Send + Sync + 'static,
     ) -> ExportWorkers {
-        let stop = CancellationToken::new();
         let task = tokio::spawn(run_worker_with_dial_authorization(
             self.endpoint.connect_lazy(),
-            self.root,
+            root,
             self.machine,
             stop.clone(),
             Arc::new(AtomicBool::new(false)),
+            catalog,
             authorization,
         ));
         ExportWorkers { stop, task }
@@ -206,11 +224,72 @@ impl Drop for ExportWorkers {
     }
 }
 
+pub(crate) struct StreamExports {
+    commands: mpsc::Sender<WorkspaceExportControl>,
+    results: mpsc::Receiver<(String, bool)>,
+    task: JoinHandle<()>,
+    fence: CancellationToken,
+}
+
+impl StreamExports {
+    pub(crate) fn start(fence: CancellationToken, validation: Arc<Semaphore>) -> Self {
+        // The private host sends only one unacknowledged command per stream.
+        let (commands, mut incoming) = mpsc::channel::<WorkspaceExportControl>(1);
+        let (replies, results) = mpsc::channel(1);
+        let stream = fence.clone();
+        let task = tokio::spawn(async move {
+            let mut exports = ExportState::default();
+            loop {
+                let control = tokio::select! {
+                    biased;
+                    () = stream.cancelled() => break,
+                    control = incoming.recv() => match control {
+                        Some(control) => control,
+                        None => break,
+                    },
+                };
+                let request_id = control.request_id.clone();
+                let applied = exports.change(control, &stream, &validation).await;
+                tokio::select! {
+                    biased;
+                    () = stream.cancelled() => break,
+                    result = replies.send((request_id, applied)) => {
+                        if result.is_err() { break; }
+                    }
+                }
+            }
+            exports.shutdown().await;
+        });
+        Self {
+            commands,
+            results,
+            task,
+            fence,
+        }
+    }
+
+    pub(crate) fn submit(&self, control: WorkspaceExportControl) {
+        if self.commands.try_send(control).is_err() {
+            self.fence.cancel();
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> Option<(String, bool)> {
+        self.results.recv().await
+    }
+
+    pub(crate) async fn shutdown(self) {
+        self.fence.cancel();
+        drop(self.task.await);
+    }
+}
+
 #[derive(Default)]
-pub(crate) struct StreamExports(HashMap<String, ActiveExport>);
+struct ExportState(HashMap<String, ActiveExport>);
 
 struct ActiveExport {
     config: CheckedExport,
+    catalog: LaunchCatalog,
     access: Arc<Mutex<Option<DialAuthorization>>>,
     worker: ExportWorkers,
 }
@@ -227,7 +306,7 @@ impl ActiveExport {
     }
 }
 
-fn checked_access(access: WorkspaceExportAccess) -> io::Result<DialAuthorization> {
+fn checked_access(access: &WorkspaceExportAccess) -> io::Result<DialAuthorization> {
     let expiry = UNIX_EPOCH
         .checked_add(Duration::from_secs(access.expires_at_unix))
         .ok_or_else(invalid)?;
@@ -253,14 +332,85 @@ fn checked_access(access: WorkspaceExportAccess) -> io::Result<DialAuthorization
     })
 }
 
-impl StreamExports {
-    pub(crate) async fn change(&mut self, control: WorkspaceExportControl) -> bool {
-        if control.request_id.is_empty() || control.binding.is_empty() {
+struct ValidatedExport {
+    config: CheckedExport,
+    sandbox: Sandbox,
+    catalog: LaunchCatalog,
+    access: DialAuthorization,
+}
+
+async fn validate_apply(
+    apply: WorkspaceExportApply,
+    validation: &Arc<Semaphore>,
+    fence: &CancellationToken,
+) -> io::Result<ValidatedExport> {
+    let access = checked_access(&apply.access.ok_or_else(invalid)?)?;
+    let permit = validation
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| invalid())?;
+    // Only inert validation may outlive the stream. Hold the permit until the
+    // filesystem work really completes, including when the stream drops its wait.
+    let fence = fence.clone();
+    let (config, sandbox, catalog) = tokio::spawn(async move {
+        let _permit = permit;
+        let (config, sandbox) = tokio::task::spawn_blocking(move || {
+            let config = WorkspaceExport {
+                endpoint: apply.endpoint,
+                machine_id: apply.machine_id,
+                export_root: apply.export_root.into(),
+            };
+            let CheckedExports(mut checked) = CheckedExports::load(&[config])?;
+            let config = checked.pop().ok_or_else(invalid)?;
+            let sandbox = Sandbox::new(&config.root).map_err(|_| invalid())?;
+            if sandbox.root() != config.root {
+                return Err(invalid());
+            }
+            Ok::<_, io::Error>((config, sandbox))
+        })
+        .await
+        .map_err(|_| invalid())??;
+        if fence.is_cancelled() {
+            return Err(invalid());
+        }
+        let catalog =
+            LaunchCatalog::load(sandbox.root().to_owned(), apply.mcp_stdio_launches).await?;
+        Ok((config, sandbox, catalog))
+    })
+    .await
+    .map_err(|_| invalid())??;
+    Ok(ValidatedExport {
+        config,
+        sandbox,
+        catalog,
+        access,
+    })
+}
+
+impl ExportState {
+    async fn change(
+        &mut self,
+        control: WorkspaceExportControl,
+        fence: &CancellationToken,
+        validation: &Arc<Semaphore>,
+    ) -> bool {
+        if fence.is_cancelled() || control.request_id.is_empty() || control.binding.is_empty() {
             return false;
         }
         let result = match control.change {
-            Some(Change::Apply(apply)) => self.apply(control.binding, apply).await,
-            Some(Change::Rotate(access)) => checked_access(access).and_then(|access| {
+            Some(Change::Apply(apply)) => {
+                let result = tokio::select! {
+                    biased;
+                    () = fence.cancelled() => return false,
+                    result = validate_apply(apply, validation, fence) => result,
+                };
+                match result {
+                    Ok(result) => self.apply(control.binding, result, fence).await,
+                    Err(error) => Err(error),
+                }
+            }
+            Some(Change::Rotate(access)) => checked_access(&access).and_then(|access| {
                 let active = self.0.get(&control.binding).ok_or_else(invalid)?;
                 *active.access.lock().unwrap() = Some(access);
                 Ok(())
@@ -276,26 +426,38 @@ impl StreamExports {
         result.is_ok()
     }
 
-    async fn apply(&mut self, binding: String, apply: WorkspaceExportApply) -> io::Result<()> {
-        let access = checked_access(apply.access.ok_or_else(invalid)?)?;
-        let config = WorkspaceExport {
-            endpoint: apply.endpoint,
-            machine_id: apply.machine_id,
-            export_root: apply.export_root.into(),
+    async fn apply(
+        &mut self,
+        binding: String,
+        validated: ValidatedExport,
+        fence: &CancellationToken,
+    ) -> io::Result<()> {
+        let ValidatedExport {
+            config,
+            sandbox,
+            catalog,
+            access,
+        } = validated;
+        let live = || {
+            !fence.is_cancelled()
+                && access
+                    .expires
+                    .is_some_and(|expires| expires > Instant::now())
         };
-        let CheckedExports(mut checked) = CheckedExports::load(&[config])?;
-        let config = checked.pop().ok_or_else(invalid)?;
-        if self.0.iter().any(|(id, active)| {
-            id != &binding
-                && active.config.origin == config.origin
-                && active.config.machine == config.machine
-        }) {
+        if !live()
+            || self.0.iter().any(|(id, active)| {
+                id != &binding
+                    && active.config.origin == config.origin
+                    && active.config.machine == config.machine
+            })
+        {
             return Err(invalid());
         }
         if let Some(active) = self.0.get_mut(&binding)
             && active.config.origin == config.origin
             && active.config.machine == config.machine
             && active.config.root == config.root
+            && active.catalog == catalog
         {
             *active.access.lock().unwrap() = Some(access);
             return Ok(());
@@ -303,23 +465,32 @@ impl StreamExports {
         if let Some(active) = self.0.remove(&binding) {
             active.shutdown().await;
         }
+        if !live() {
+            return Err(invalid());
+        }
         let access = Arc::new(Mutex::new(Some(access)));
         let current = access.clone();
-        let worker = config.clone().start_with_deadline(move || {
-            let mut current = current.lock().unwrap();
-            if current
-                .as_ref()
-                .and_then(|value| value.expires)
-                .is_some_and(|expires| expires <= Instant::now())
-            {
-                current.take();
-            }
-            current.clone()
-        });
+        let worker = config.clone().start_with_deadline(
+            WorkerRoot::Validated(sandbox),
+            catalog.clone(),
+            fence.child_token(),
+            move || {
+                let mut current = current.lock().unwrap();
+                if current
+                    .as_ref()
+                    .and_then(|value| value.expires)
+                    .is_some_and(|expires| expires <= Instant::now())
+                {
+                    current.take();
+                }
+                current.clone()
+            },
+        );
         self.0.insert(
             binding,
             ActiveExport {
                 config,
+                catalog,
                 access,
                 worker,
             },
@@ -327,7 +498,7 @@ impl StreamExports {
         Ok(())
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         for active in self.0.values() {
             active.cancel();
         }
@@ -337,7 +508,7 @@ impl StreamExports {
     }
 }
 
-impl Drop for StreamExports {
+impl Drop for ExportState {
     fn drop(&mut self) {
         for active in self.0.values() {
             active.cancel();

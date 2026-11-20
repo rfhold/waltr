@@ -10402,6 +10402,7 @@ dependencies = [
  "globset",
  "hyper-util",
  "ignore",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

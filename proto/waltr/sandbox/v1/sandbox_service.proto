@@ -15,6 +15,10 @@ message ConnectRequest {
     Completed completed = 4;
     WorkspaceResponse workspace_response = 5;
     WorkspaceExportAck workspace_export_ack = 6;
+    McpStdioCatalogAck mcp_stdio_catalog_ack = 7;
+    McpStdioOpened mcp_stdio_opened = 8;
+    McpStdioFrame mcp_stdio_frame = 9;
+    McpStdioTerminal mcp_stdio_terminal = 10;
   }
 }
 
@@ -25,6 +29,10 @@ message ConnectResponse {
     Cancel cancel = 3;
     WorkspaceRequest workspace_request = 4;
     WorkspaceExportControl workspace_export_control = 5;
+    McpStdioCatalogUpdate mcp_stdio_catalog_update = 6;
+    McpStdioOpen mcp_stdio_open = 7;
+    McpStdioFrame mcp_stdio_frame = 8;
+    McpStdioClose mcp_stdio_close = 9;
   }
 }
 
@@ -45,6 +53,8 @@ message WorkspaceExportApply {
   // Resolved on the exporting worker, not the controlling server.
   string export_root = 3;
   WorkspaceExportAccess access = 4;
+  // Exporter-owned definitions for this binding alone. Never sent to the hosted peer.
+  repeated McpStdioLaunch mcp_stdio_launches = 5;
 }
 
 message WorkspaceExportAccess {
@@ -61,7 +71,6 @@ message WorkspaceExportAck {
 }
 
 message Hello {
-
   string worker_id = 1;
   // The machine ID claimed by an outbound worker.
   string workspace_id = 2;
@@ -69,6 +78,69 @@ message Hello {
   repeated string tools = 4;
   // Canonical worker-local workspace root; never resolved on the host.
   string canonical_root = 5;
+  // Private stream protocol. Zero means unavailable; the current version is 1.
+  uint32 mcp_stdio_version = 6;
+}
+
+// Private platform types; none are part of the public MCP API.
+message McpStdioLaunch {
+  string name = 1;
+  string executable = 2;
+  repeated string arguments = 3;
+}
+
+// Only accepted from the private local host. Replaces the local catalog atomically.
+// An empty list revokes all names. Await the ack before sending another update.
+message McpStdioCatalogUpdate {
+  string request_id = 1;
+  repeated McpStdioLaunch launches = 2;
+}
+
+message McpStdioCatalogAck {
+  string request_id = 1;
+  // True after installing the replacement and joining any affected children.
+  bool applied = 2;
+}
+
+message McpStdioOpen {
+  // A canonical lowercase UUID, unique for the lifetime of this stream.
+  string channel_id = 1;
+  string server_name = 2;
+  // A worker-validated export-relative directory; "." is the export root.
+  string working_directory = 3;
+}
+
+message McpStdioOpened {
+  string channel_id = 1;
+  // False rejects the open without starting a channel. Wait for true to send frames.
+  bool opened = 2;
+}
+
+message McpStdioFrame {
+  string channel_id = 1;
+  // One opaque LF-delimited stdio frame, without its delimiter, in either direction.
+  // At most 1,048,448 payload bytes.
+  bytes data = 2;
+}
+
+message McpStdioClose {
+  string channel_id = 1;
+}
+
+enum McpStdioTerminalStatus {
+  MCP_STDIO_TERMINAL_STATUS_UNSPECIFIED = 0;
+  MCP_STDIO_TERMINAL_STATUS_CLOSED = 1;
+  MCP_STDIO_TERMINAL_STATUS_EXITED = 2;
+  MCP_STDIO_TERMINAL_STATUS_FAILED = 3;
+  MCP_STDIO_TERMINAL_STATUS_REVOKED = 4;
+}
+
+// Ordered after the open ack and preceding frames on a live stream; never replayed.
+message McpStdioTerminal {
+  string channel_id = 1;
+  McpStdioTerminalStatus status = 2;
+  // True only after successful direct-child shutdown/reaping. False is not proof of cleanup.
+  bool reaped = 3;
 }
 
 message Prepare {

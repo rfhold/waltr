@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
@@ -17,6 +18,7 @@ pub struct WorkspaceBinding {
     endpoint: Url,
     machine_id: String,
     export_root: PathBuf,
+    mcp_stdio_servers: Vec<String>,
 }
 
 impl WorkspaceBinding {
@@ -38,11 +40,17 @@ impl WorkspaceBinding {
         &self.export_root
     }
 
+    /// Exact exporter-local MCP resource keys permitted on this binding.
+    pub fn mcp_stdio_servers(&self) -> &[String] {
+        &self.mcp_stdio_servers
+    }
+
     pub(super) fn effective_value(&self) -> serde_json::Value {
         serde_json::json!({
             "endpoint": self.endpoint.as_str(),
             "machineId": self.machine_id(),
             "exportRoot": self.export_root(),
+            "mcpStdioServers": self.mcp_stdio_servers(),
         })
     }
 }
@@ -63,6 +71,8 @@ struct WorkspaceBindingSpec {
     endpoint: String,
     machine_id: String,
     export_root: String,
+    #[serde(default)]
+    mcp_stdio_servers: Vec<String>,
 }
 
 pub(super) fn materialize_workspace_binding(
@@ -80,6 +90,7 @@ pub(super) fn materialize_workspace_binding(
         endpoint,
         machine_id,
         export_root,
+        mut mcp_stdio_servers,
     } = resource.spec;
     let endpoint = parse_api_root(&endpoint).ok_or_else(|| {
         invalid_value(
@@ -107,10 +118,28 @@ pub(super) fn materialize_workspace_binding(
             "exportRoot must be absolute or start with `~/`".into(),
         ));
     }
+    if mcp_stdio_servers.len() > 32
+        || mcp_stdio_servers.iter().any(|name| {
+            name.is_empty()
+                || matches!(name.as_str(), "." | "..")
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+        || mcp_stdio_servers.iter().collect::<BTreeSet<_>>().len() != mcp_stdio_servers.len()
+    {
+        return Err(invalid_value(
+            path,
+            "mcpStdioServers must contain at most 32 distinct MCP resource keys".into(),
+        ));
+    }
+    mcp_stdio_servers.sort_unstable();
     Ok(WorkspaceBinding {
         endpoint,
         machine_id,
         export_root: export_root.into(),
+        mcp_stdio_servers,
     })
 }
 
@@ -232,6 +261,34 @@ mod tests {
             valid.replace("'~/workspace'", r#""/\0""#),
         ] {
             assert!(materialize_workspace_binding(&invalid, PATH).is_err());
+        }
+    }
+
+    #[test]
+    fn stdio_allowlist_is_optional_exact_and_unique() {
+        let yaml = source("https://host.example/", "machine", "~/workspace");
+        let parse = |names: &str| {
+            materialize_workspace_binding(&format!("{yaml}  mcpStdioServers: {names}\n"), PATH)
+        };
+        assert!(
+            materialize_workspace_binding(&yaml, PATH)
+                .unwrap()
+                .mcp_stdio_servers()
+                .is_empty()
+        );
+        let allowlist = parse("[echo_server, Z-1.dev]").unwrap();
+        assert_eq!(allowlist.mcp_stdio_servers(), ["Z-1.dev", "echo_server"]);
+        for names in [
+            "[echo, echo]",
+            "['']",
+            "['../echo']",
+            "['.']",
+            "[' foo']",
+            "[foo/bar]",
+            "['foo\\bar']",
+            "null",
+        ] {
+            assert!(parse(names).is_err(), "{names}");
         }
     }
 }

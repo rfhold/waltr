@@ -46,6 +46,7 @@ async fn socket_workspace_absent_on_server_runs_production_routines() {
             tx.send(worker::ConnectRequest { body: Some(worker::connect_request::Body::Hello(worker::Hello {
                 worker_id: "absent-workspace-fixture".into(), workspace_id: "local".into(),
                 generation: 1, tools: vec![], canonical_root: worker_root.to_str().unwrap().into(),
+                mcp_stdio_version: 0,
             })) }).await.unwrap();
             let mut client = worker::sandbox_service_client::SandboxServiceClient::new(channel);
             let mut responses = client.connect(ReceiverStream::new(rx)).await.unwrap().into_inner();

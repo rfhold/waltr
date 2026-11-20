@@ -190,6 +190,7 @@ fn apply(endpoint: &str, root: &str, token: &str) -> Change {
         machine_id: "laptop".into(),
         export_root: root.into(),
         access: Some(access(token)),
+        mcp_stdio_launches: Vec::new(),
     })
 }
 
@@ -385,6 +386,115 @@ async fn private_uds_control_uses_sidecar_home_rotates_and_retires_exports() {
     worker.kill().await.unwrap();
     private.abort();
     drop(private.await);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn private_loss_retires_outbound_export_while_replacement_validation_is_pending() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let private = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let channel =
+                Endpoint::from_shared(format!("http://{}", private.local_addr().unwrap()))
+                    .unwrap()
+                    .connect_lazy();
+            let mut private = Gateway::start(private);
+            let remote = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", remote.local_addr().unwrap());
+            let mut destination = Gateway::start(remote);
+            let replacement = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let replacement_endpoint = format!("http://{}", replacement.local_addr().unwrap());
+            let mut replacement = Gateway::start(replacement);
+            let stop = CancellationToken::new();
+            let worker = tokio::spawn(waltr_agent_sandbox::run_worker_with_shutdown(
+                channel,
+                root.path().to_owned(),
+                "local",
+                stop.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ));
+            let (tx, mut input) = timeout(WAIT, private.attempts.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .admit();
+            send_control(
+                &tx,
+                "start",
+                apply(&endpoint, root.path().to_str().unwrap(), TOKEN),
+            )
+            .await;
+            acknowledged(&mut input, "start", true).await;
+            let (remote, mut exported) = destination.next(TOKEN).await.admit();
+            send_workspace_request(&remote, "active", "info", ".", None).await;
+            workspace_reply(&mut exported, "active").await;
+
+            // Keep filesystem validation queued without using a slow or special filesystem.
+            let (started, occupied) = oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                blocked.recv_timeout(3 * WAIT)
+            });
+            timeout(WAIT, occupied).await.unwrap().unwrap();
+            send_control(
+                &tx,
+                "replace",
+                apply(
+                    &replacement_endpoint,
+                    root.path().to_str().unwrap(),
+                    NEXT_TOKEN,
+                ),
+            )
+            .await;
+            let channel_id = uuid::Uuid::new_v4().to_string();
+            tx.send(Ok(p::ConnectResponse {
+                body: Some(Host::McpStdioOpen(p::McpStdioOpen {
+                    channel_id: channel_id.clone(),
+                    server_name: "not-granted".into(),
+                    working_directory: ".".into(),
+                })),
+            }))
+            .await
+            .unwrap();
+            let reply = timeout(WAIT, input.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(reply.body, Some(Worker::McpStdioOpened(opened))
+                if opened.channel_id == channel_id && !opened.opened));
+
+            drop(tx);
+            drop(input);
+            assert!(!matches!(
+                timeout(WAIT, exported.message()).await.unwrap(),
+                Ok(Some(_))
+            ));
+            drop(remote);
+            release.send(()).unwrap();
+            timeout(WAIT, blocker).await.unwrap().unwrap().unwrap();
+
+            let (tx, mut input) = timeout(WAIT, private.attempts.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .admit();
+            send_control(&tx, "new-epoch", Change::Rotate(access(NEXT_TOKEN))).await;
+            acknowledged(&mut input, "new-epoch", false).await;
+            assert!(
+                timeout(Duration::from_millis(200), replacement.attempts.recv())
+                    .await
+                    .is_err()
+            );
+            stop.cancel();
+            timeout(WAIT, worker).await.unwrap().unwrap().unwrap();
+        });
 }
 
 #[tokio::test]

@@ -3,10 +3,12 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -16,6 +18,7 @@ use tokio::{
     time,
 };
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{self as stream_util, Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tonic::{metadata::AsciiMetadataValue, transport::Channel};
 use waltr::grpc::waltr::sandbox::v1::{
@@ -24,6 +27,9 @@ use waltr::grpc::waltr::sandbox::v1::{
 };
 
 use crate::{Sandbox, SandboxError, peer_config::StreamExports, tools::ShellDefaults};
+
+pub(crate) mod stdio;
+use stdio::{LaunchCatalog, StreamStdio};
 
 fn shell_defaults(request: &proto::Prepare) -> Result<Option<ShellDefaults>, SandboxError> {
     if request.tool_name != "shell" {
@@ -373,7 +379,7 @@ pub async fn run_worker_with_shutdown(
 ) -> Result<(), SandboxError> {
     worker_loop(
         channel,
-        root,
+        Sandbox::new(root)?,
         workspace_id,
         stop,
         connected,
@@ -401,6 +407,7 @@ pub async fn run_worker_with_authorization(
         workspace_id.into(),
         stop,
         connected,
+        LaunchCatalog::default(),
         move || {
             authorization().map(|header| DialAuthorization {
                 header,
@@ -419,25 +426,47 @@ pub(crate) struct DialAuthorization {
 
 enum WorkerPeer<'a> {
     Private,
-    Outbound(&'a (dyn Fn() -> Option<DialAuthorization> + Sync)),
+    Outbound {
+        authorization: &'a (dyn Fn() -> Option<DialAuthorization> + Sync),
+        catalog: LaunchCatalog,
+    },
+}
+
+pub(super) enum WorkerRoot {
+    Path(PathBuf),
+    Validated(Sandbox),
+}
+
+impl From<PathBuf> for WorkerRoot {
+    fn from(path: PathBuf) -> Self {
+        Self::Path(path)
+    }
 }
 
 pub(crate) fn run_worker_with_dial_authorization(
     channel: Channel,
-    root: PathBuf,
+    root: impl Into<WorkerRoot> + Send + 'static,
     workspace_id: String,
     stop: CancellationToken,
     connected: Arc<AtomicBool>,
+    catalog: LaunchCatalog,
     authorization: impl Fn() -> Option<DialAuthorization> + Send + Sync + 'static,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), SandboxError>> + Send>> {
     Box::pin(async move {
+        let sandbox = match root.into() {
+            WorkerRoot::Path(path) => Sandbox::new(path)?,
+            WorkerRoot::Validated(sandbox) => sandbox,
+        };
         worker_loop(
             channel,
-            root,
+            sandbox,
             workspace_id,
             stop,
             connected,
-            WorkerPeer::Outbound(&authorization),
+            WorkerPeer::Outbound {
+                authorization: &authorization,
+                catalog,
+            },
         )
         .await
     })
@@ -454,18 +483,19 @@ async fn wait_for_expiry(expires: Option<time::Instant>) {
 #[allow(clippy::too_many_lines)]
 async fn worker_loop(
     channel: Channel,
-    root: impl AsRef<Path>,
+    sandbox: Sandbox,
     workspace_id: impl Into<String>,
     stop: CancellationToken,
     connected: Arc<AtomicBool>,
     peer: WorkerPeer<'_>,
 ) -> Result<(), SandboxError> {
-    let sandbox = Arc::new(Sandbox::new(root)?);
+    let sandbox = Arc::new(sandbox);
     let hello = message(WorkerBody::Hello(proto::Hello {
         worker_id: uuid::Uuid::new_v4().to_string(),
         workspace_id: workspace_id.into(),
         generation: 0,
         canonical_root: sandbox.root().to_string_lossy().into_owned(),
+        mcp_stdio_version: stdio::VERSION,
         tools: {
             let mut tools = vec![
                 "read",
@@ -490,7 +520,11 @@ async fn worker_loop(
     let mut sender = None;
     let mut stream: Option<tonic::Streaming<proto::ConnectResponse>> = None;
     let mut stream_expiry = None;
-    let mut exports = StreamExports::default();
+    let mut exports = None::<StreamExports>;
+    let export_validation = Arc::new(Semaphore::new(1));
+    let mut stdio = None::<StreamStdio>;
+    let mut stream_fence = None::<CancellationToken>;
+    let path_checks = StreamStdio::path_checks();
     let mut delay = Duration::from_millis(50);
     let mut retry_at = time::Instant::now();
     let mut cleanup = time::interval(Duration::from_millis(100));
@@ -498,6 +532,10 @@ async fn worker_loop(
         tokio::select! {
             biased;
             () = stop.cancelled() => break,
+            _ = async {
+                stdio.as_mut().expect("live stdio").next().await;
+            }, if stdio.as_ref().is_some_and(StreamStdio::has_tasks)
+                && stream_fence.as_ref().is_some_and(|fence| !fence.is_cancelled()) => {}
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Ok((reply_key, reply))) = joined {
                     if reply_key.kind == ReplyKind::Completed { active.remove(&reply_key.id); }
@@ -511,51 +549,62 @@ async fn worker_loop(
             incoming = async {
                 tokio::select! {
                     biased;
+                    () = stream_fence.as_ref().expect("live fence").cancelled() => None,
                     () = wait_for_expiry(stream_expiry) => None,
                     incoming = stream.as_mut().expect("live stream").message() => incoming.ok().flatten(),
                 }
             }, if stream.is_some() => {
                 match incoming.and_then(|message| message.body) {
                     Some(HostBody::WorkspaceExportControl(control)) => {
-                        if matches!(peer, WorkerPeer::Private) {
-                            let request_id = control.request_id.clone();
-                            let applied = exports.change(control).await;
-                            let reply = message(WorkerBody::WorkspaceExportAck(proto::WorkspaceExportAck { request_id, applied }));
-                            tokio::select! {
-                                biased;
-                                () = stop.cancelled() => break,
-                                // Control acknowledgements aren't retained or replayed.
-                                _ = sender.as_ref().expect("live sender").send(reply) => {}
-                            }
+                        if let Some(exports) = &exports {
+                            exports.submit(control);
                         }
+                    }
+                    Some(body @ (HostBody::McpStdioCatalogUpdate(_) | HostBody::McpStdioOpen(_)
+                        | HostBody::McpStdioFrame(_) | HostBody::McpStdioClose(_))) => {
+                        stdio.as_mut().expect("live stdio").handle(body, &sandbox);
                     }
                     Some(body) => handle_request(body, &sandbox, &mut outstanding, sender.as_ref(), &mut active, &permits, &mut tasks),
                     None => {
                         connected.store(false, Ordering::Release);
                         sender = None;
                         stream = None;
-                        exports.shutdown().await;
+                        stream_fence.take().expect("live fence").cancel();
+                        stdio.take().expect("live stdio").shutdown().await;
+                        if let Some(exports) = exports.take() { exports.shutdown().await; }
                         retry_at = time::Instant::now() + delay;
                         delay = (delay * 2).min(Duration::from_secs(1));
                     }
                 }
             }
+            result = async { exports.as_mut().expect("live export control").next().await },
+                if exports.is_some() => {
+                if let Some((request_id, applied)) = result {
+                    stdio.as_ref().expect("live stdio").export_ack(request_id, applied);
+                } else {
+                    stream_fence.as_ref().expect("live fence").cancel();
+                }
+            }
             () = time::sleep_until(retry_at), if stream.is_none() => {
-                let access = if let WorkerPeer::Outbound(current_authorization) = peer {
-                    let Some(mut value) = current_authorization() else {
+                let (access, catalog) = if let WorkerPeer::Outbound { authorization, catalog } = &peer {
+                    let Some(mut value) = authorization() else {
                         retry_at = time::Instant::now() + delay;
                         delay = (delay * 2).min(Duration::from_secs(1));
                         continue;
                     };
                     value.header.set_sensitive(true);
-                    Some(value)
+                    (Some(value), catalog.clone())
                 } else {
-                    None
+                    (None, LaunchCatalog::default())
                 };
                 let (tx, rx) = mpsc::channel(256);
-                if tx.send(hello.clone()).await.is_err() { continue; }
-                let mut request = tonic::Request::new(ReceiverStream::new(rx));
+                let (stdio_tx, stdio_rx) = mpsc::channel(stdio::OUTPUT_DEPTH);
+                let fence = stop.child_token();
+                let dial_guard = fence.clone().drop_guard();
                 let expires = access.as_ref().and_then(|value| value.expires);
+                let mut request = tonic::Request::new(worker_requests(
+                    hello.clone(), rx, stdio_rx, fence.clone(), expires,
+                ));
                 if let Some(value) = access {
                     request.metadata_mut().insert("authorization", value.header);
                 }
@@ -573,6 +622,19 @@ async fn worker_loop(
                     flush_outstanding(&mut outstanding, &tx);
                     sender = Some(tx);
                     stream = Some(next);
+                    stdio = Some(StreamStdio::new(
+                        matches!(peer, WorkerPeer::Private),
+                        catalog,
+                        stdio_tx,
+                        fence.clone(),
+                        expires,
+                        path_checks.clone(),
+                    ));
+                    if matches!(peer, WorkerPeer::Private) {
+                        exports = Some(StreamExports::start(fence.clone(), export_validation.clone()));
+                    }
+                    drop(dial_guard.disarm());
+                    stream_fence = Some(fence);
                     stream_expiry = expires;
                     connected.store(true, Ordering::Release);
                     delay = Duration::from_millis(50);
@@ -584,6 +646,9 @@ async fn worker_loop(
         }
     }
     connected.store(false, Ordering::Release);
+    if let Some(fence) = stream_fence {
+        fence.cancel();
+    }
     drop(sender);
     drop(stream);
     for token in active.values() {
@@ -592,7 +657,12 @@ async fn worker_loop(
     for entry in outstanding.values() {
         entry.cancel.cancel();
     }
-    exports.shutdown().await;
+    if let Some(stdio) = stdio {
+        stdio.shutdown().await;
+    }
+    if let Some(exports) = exports {
+        exports.shutdown().await;
+    }
     drop(
         time::timeout(Duration::from_secs(2), async {
             while tasks.join_next().await.is_some() {}
@@ -601,6 +671,46 @@ async fn worker_loop(
     );
     tasks.abort_all();
     Ok(())
+}
+
+fn worker_requests(
+    hello: proto::ConnectRequest,
+    ordinary: mpsc::Receiver<proto::ConnectRequest>,
+    ephemeral: mpsc::Receiver<stdio::Outbound>,
+    fence: CancellationToken,
+    expiry: Option<time::Instant>,
+) -> impl Stream<Item = proto::ConnectRequest> + Send + 'static {
+    let replies = ReceiverStream::new(ordinary)
+        .merge(ReceiverStream::new(ephemeral).filter_map(stdio::Outbound::into_live_message));
+    let mut outgoing = Box::pin(stream_util::once(hello).chain(replies));
+    let mut closed = Box::pin(async move {
+        tokio::select! {
+            () = fence.cancelled() => {}
+            () = wait_for_expiry(expiry) => {}
+        }
+    });
+    let mut ended = false;
+    PollStream(move |cx: &mut Context<'_>| {
+        if ended || closed.as_mut().poll(cx).is_ready() {
+            ended = true;
+            Poll::Ready(None)
+        } else {
+            outgoing.as_mut().poll_next(cx)
+        }
+    })
+}
+
+struct PollStream<F>(F);
+
+impl<F, T> Stream for PollStream<F>
+where
+    F: FnMut(&mut Context<'_>) -> Poll<Option<T>> + Unpin,
+{
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        (self.0)(cx)
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -614,7 +724,11 @@ fn handle_request(
     tasks: &mut JoinSet<(ReplyKey, proto::ConnectRequest)>,
 ) {
     match body {
-        HostBody::WorkspaceExportControl(_) => {
+        HostBody::WorkspaceExportControl(_)
+        | HostBody::McpStdioCatalogUpdate(_)
+        | HostBody::McpStdioOpen(_)
+        | HostBody::McpStdioFrame(_)
+        | HostBody::McpStdioClose(_) => {
             unreachable!("controls are handled by the private stream")
         }
         HostBody::Prepare(request) => {

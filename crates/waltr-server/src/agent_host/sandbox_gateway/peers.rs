@@ -101,7 +101,7 @@ impl MachineRegistry {
         )
     }
 
-    fn claim(
+    pub(super) fn claim(
         &self,
         hello: proto::Hello,
         account: WorkspaceAccount,
