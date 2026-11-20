@@ -314,6 +314,7 @@ pub struct AgentDefinitionSnapshot {
     persisted_fingerprint: String,
     configuration: config_proto::Configuration,
     scripts: BTreeMap<String, Arc<crate::routine::definition::Definition>>,
+    routine_incarnations: BTreeMap<String, Uuid>,
     workspace_bindings: BTreeMap<String, WorkspaceBinding>,
     workspace_binding_incarnations: BTreeMap<String, Uuid>,
     etag: String,
@@ -353,6 +354,11 @@ impl AgentDefinitionSnapshot {
     /// Validated JavaScript definitions pinned to this resource snapshot.
     pub fn scripts(&self) -> &BTreeMap<String, Arc<crate::routine::definition::Definition>> {
         &self.scripts
+    }
+
+    /// Process-local identity of one continuously installed Routine revision.
+    pub(crate) fn routine_incarnation(&self, name: &str) -> Option<Uuid> {
+        self.routine_incarnations.get(name).copied()
     }
 
     /// Validated outbound workspace bindings keyed by resource name.
@@ -643,6 +649,13 @@ impl AgentDefinitionState {
                 .expect("agent-definition state lock poisoned");
             if let Some(mut snapshot) = snapshot {
                 let previous = &published.snapshot;
+                for (name, incarnation) in &mut snapshot.routine_incarnations {
+                    if previous.scripts.get(name).is_some_and(|routine| {
+                        routine.revision() == snapshot.scripts[name].revision()
+                    }) {
+                        *incarnation = previous.routine_incarnations[name];
+                    }
+                }
                 snapshot.workspace_binding_incarnations = snapshot
                     .workspace_bindings
                     .iter()
@@ -1368,6 +1381,10 @@ fn build_snapshot(
         }
     }
     configuration.etag.clone_from(&etag);
+    let routine_incarnations = scripts
+        .keys()
+        .map(|name| (name.clone(), Uuid::new_v4()))
+        .collect();
     Ok(AgentDefinitionSnapshot {
         catalog,
         default_agent: default_agent.to_owned(),
@@ -1376,6 +1393,7 @@ fn build_snapshot(
         persisted_fingerprint,
         configuration,
         scripts,
+        routine_incarnations,
         workspace_bindings,
         workspace_binding_incarnations: BTreeMap::new(),
         etag,

@@ -30,6 +30,7 @@ use serde_json::Value;
 use waltr_agent::{InferenceSettings, SessionCreateRequest, SessionId};
 mod context;
 mod lifecycle;
+mod mcp;
 mod semantic;
 mod tools;
 
@@ -62,7 +63,12 @@ pub(super) struct Composition<S: SessionStore + Clone + Send + Sync + 'static> {
     service: InvocationService,
     me: std::sync::OnceLock<std::sync::Weak<Self>>,
     scopes: Mutex<Vec<lifecycle::Scope<S>>>,
-    completion_predecessors: Mutex<BTreeMap<(String, String), tokio::sync::oneshot::Receiver<crate::routine::service::InvocationHandle>>>,
+    completion_predecessors: Mutex<
+        BTreeMap<
+            (String, String),
+            tokio::sync::oneshot::Receiver<crate::routine::service::InvocationHandle>,
+        >,
+    >,
     scope_maintenance: Arc<tokio::sync::Mutex<()>>,
     invocation_coalescer: crate::routine::triggers::InvocationCoalescer,
 }
@@ -78,12 +84,15 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
         blobs: Arc<FilesystemBlobStore>,
         text: Arc<dyn TextResultStore>,
     ) -> Result<Arc<Self>, PortError> {
-        let code = Arc::new(CodeModeHost::new(
-            service.clone(),
-            persistence.script_code_dispatch_store(),
-            sessions.clone(),
-            factory.clone(),
-        ).with_catalog(state.clone()));
+        let code = Arc::new(
+            CodeModeHost::new(
+                service.clone(),
+                persistence.script_code_dispatch_store(),
+                sessions.clone(),
+                factory.clone(),
+            )
+            .with_catalog(state.clone()),
+        );
         let owner = Arc::new(Self {
             state,
             options,
@@ -294,9 +303,10 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
             {
                 return Err(PortError::Denied);
             }
-            let factory = Arc::new(factory.as_ref().clone().with_workspace_account(
-                WorkspaceAccount::from_principal(&request.authenticated),
-            ));
+            let factory =
+                Arc::new(factory.as_ref().clone().with_workspace_account(
+                    WorkspaceAccount::from_principal(&request.authenticated),
+                ));
             let snapshot = state.snapshot();
             let name = &request.definition.envelope().name;
             if !snapshot
@@ -307,6 +317,24 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 return Err(PortError::Conflict);
             }
             let mut inference = None;
+            let mcp_required = request
+                .definition
+                .envelope()
+                .spec
+                .capabilities
+                .contains("mcp.call");
+            if mcp_required
+                && (request.transport.is_some()
+                    || request
+                        .definition
+                        .envelope()
+                        .spec
+                        .capabilities
+                        .contains("children.call"))
+            {
+                return Err(PortError::UnsupportedCapability);
+            }
+            let mut mcp_source = None;
             let tool_admitted = caller_policy.is_some();
             let mut restriction =
                 caller_policy.unwrap_or_else(|| PermissionPolicy::new(PermissionLevel::Deny));
@@ -324,7 +352,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 if factory.session_roles.source_excluded(&record) {
                     return Err(PortError::Denied);
                 }
-                if tool_admitted {
+                if tool_admitted || mcp_required {
                     factory
                         .authorize_session_workspace(&record)
                         .await
@@ -337,7 +365,19 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     }
                     None => false,
                 };
-                if request.definition.envelope().spec.capabilities.iter().any(|cap| matches!(cap.as_str(), "context.create" | "context.start" | "context.continue")) {
+                if request
+                    .definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .iter()
+                    .any(|cap| {
+                        matches!(
+                            cap.as_str(),
+                            "context.create" | "context.start" | "context.continue"
+                        )
+                    })
+                {
                     let owner = composition
                         .and_then(|owner| owner.upgrade())
                         .ok_or(PortError::Unavailable)?;
@@ -349,12 +389,29 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     );
                 }
                 if !tool_admitted {
-                    restriction = factory
-                        .runtime_for_record(&record, sessions.clone())
-                        .await
-                        .map_err(|_| PortError::Denied)?
-                        .1
-                        .permission_policy();
+                    restriction = if mcp_required {
+                        factory
+                            .routine_source_permissions(&record)
+                            .map_err(|_| PortError::Denied)?
+                    } else {
+                        factory
+                            .runtime_for_record(&record, sessions.clone())
+                            .await
+                            .map_err(|_| PortError::Denied)?
+                            .1
+                            .permission_policy()
+                    };
+                }
+                if mcp_required {
+                    if record
+                        .metadata
+                        .incarnation
+                        .as_deref()
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(PortError::Denied);
+                    }
+                    mcp_source = Some(record.clone());
                 }
                 inference = record.inference_settings.clone();
                 bundle = record.agent_definition.clone();
@@ -367,7 +424,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     .any(|cap| cap.starts_with("context."))
                 {
                     let caps = &request.definition.envelope().spec.capabilities;
-                    let original_allowed = tools::original_source_allowed(caps, &restriction, approved_original);
+                    let original_allowed =
+                        tools::original_source_allowed(caps, &restriction, approved_original);
                     if caps.contains("context.original") && !original_allowed {
                         return Err(PortError::Denied);
                     }
@@ -376,30 +434,68 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                             .with_original_ceiling(original_allowed)
                             .with_session_coordinator(sessions.clone()))
                     } else if caps.contains("context.continue") {
-                        CoordinatorContext::pin_paused(sessions.clone(), &id, &request.principal, original_allowed).await
+                        CoordinatorContext::pin_paused(
+                            sessions.clone(),
+                            &id,
+                            &request.principal,
+                            original_allowed,
+                        )
+                        .await
                     } else {
-                        CoordinatorContext::pin(sessions.clone(), &id, &request.principal, original_allowed).await
+                        CoordinatorContext::pin(
+                            sessions.clone(),
+                            &id,
+                            &request.principal,
+                            original_allowed,
+                        )
+                        .await
                     };
                     match pinned {
                         Ok(pinned) => {
                             let pinned = Arc::new(pinned.with_workspace_factory(factory.clone()));
-                            if !pinned.snapshot_identity().is_some_and(|identity| identity.matches(&record)) {
+                            if !pinned
+                                .snapshot_identity()
+                                .is_some_and(|identity| identity.matches(&record))
+                            {
                                 return Err(PortError::Conflict);
                             }
-                            if caps.contains("context.original") { pinned.resolve_source("original")?; }
+                            if caps.contains("context.original") {
+                                pinned.resolve_source("original")?;
+                            }
                             context_owner = Some(pinned.clone());
                             context = Some(pinned);
                         }
-                        Err(PortError::Conflict) if caps.iter().filter(|cap| cap.starts_with("context.")).all(|cap|
-                            matches!(cap.as_str(), "context.snapshot" | "context.metadata" | "context.transact")) => {
-                            let incarnation = record.metadata.incarnation.as_deref().ok_or(PortError::Conflict)?;
-                            context = Some(Arc::new(CoordinatorSessionContext::pin_for_incarnation(sessions.clone(), &id, incarnation).await?));
+                        Err(PortError::Conflict)
+                            if caps.iter().filter(|cap| cap.starts_with("context.")).all(
+                                |cap| {
+                                    matches!(
+                                        cap.as_str(),
+                                        "context.snapshot"
+                                            | "context.metadata"
+                                            | "context.transact"
+                                    )
+                                },
+                            ) =>
+                        {
+                            let incarnation = record
+                                .metadata
+                                .incarnation
+                                .as_deref()
+                                .ok_or(PortError::Conflict)?;
+                            context = Some(Arc::new(
+                                CoordinatorSessionContext::pin_for_incarnation(
+                                    sessions.clone(),
+                                    &id,
+                                    incarnation,
+                                )
+                                .await?,
+                            ));
                         }
                         Err(error) => return Err(error),
                     }
                 }
             } else {
-                if name == "configuration" {
+                if name == "configuration" || mcp_required {
                     return Err(PortError::Denied);
                 }
             }
@@ -411,7 +507,13 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     return Err(PortError::Denied);
                 }
             }
-            if request.definition.envelope().spec.capabilities.contains("children.call") {
+            if request
+                .definition
+                .envelope()
+                .spec
+                .capabilities
+                .contains("children.call")
+            {
                 let context = context_owner.ok_or(PortError::Denied)?;
                 let helper_sessions = sessions.clone();
                 let helper_factory = factory.clone();
@@ -439,7 +541,13 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 let definitions = snapshot
                     .scripts()
                     .iter()
-                    .filter(|(_, definition)| definition.envelope().spec.capabilities.is_subset(&request.definition.envelope().spec.capabilities))
+                    .filter(|(_, definition)| {
+                        definition
+                            .envelope()
+                            .spec
+                            .capabilities
+                            .is_subset(&request.definition.envelope().spec.capabilities)
+                    })
                     .map(|(name, definition)| (name.clone(), definition.clone()))
                     .collect();
                 let bindings = context::ContextBindings {
@@ -463,21 +571,24 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 });
             }
             let media = request.transport.is_some();
-            let helpers =
-                CoordinatorHelperRunner::new(
-                    sessions.clone(),
-                    factory.clone(),
-                    inference.clone(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    copy,
-                    request.principal.clone(),
-                )?
-                .with_catalog(snapshot.clone(), inference.clone())
-                .with_source_definition(bundle.clone());
-            let helpers = Arc::new(if !media || request.source_session.is_some() || tool_admitted {
-                helpers.with_permission_restriction(restriction.clone())
-            } else { helpers });
+            let helpers = CoordinatorHelperRunner::new(
+                sessions.clone(),
+                factory.clone(),
+                inference.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                copy,
+                request.principal.clone(),
+            )?
+            .with_catalog(snapshot.clone(), inference.clone())
+            .with_source_definition(bundle.clone());
+            let helpers = Arc::new(
+                if !media || request.source_session.is_some() || tool_admitted {
+                    helpers.with_permission_restriction(restriction.clone())
+                } else {
+                    helpers
+                },
+            );
             let result: Arc<dyn HostFactory> = if let Some(transport) = request.transport {
                 let principal_pools = {
                     let mut pools = pools.lock().map_err(|_| PortError::Unavailable)?;
@@ -489,7 +600,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         .or_insert_with(Pools::principal)
                         .clone()
                 };
-                let speech = Arc::new(crate::routine::media::speech::CatalogSpeech(snapshot.clone()));
+                let speech = Arc::new(crate::routine::media::speech::CatalogSpeech(
+                    snapshot.clone(),
+                ));
                 Arc::new(MediaHostFactory {
                     bindings: transport.bind_factory(Arc::new(MediaComposition {
                         principal: request.principal.clone(),
@@ -504,6 +617,24 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     })),
                 })
             } else {
+                let mcp = mcp_source
+                    .map(|source| {
+                        let publication = snapshot
+                            .routine_incarnation(name)
+                            .ok_or(PortError::Conflict)?;
+                        Ok(mcp::Factory {
+                            sessions: sessions.clone(),
+                            factory: factory.clone(),
+                            catalog: state,
+                            name: name.clone(),
+                            revision: request.definition.revision().to_owned(),
+                            publication,
+                            source,
+                            principal: request.authenticated.clone(),
+                            ceiling: tool_admitted.then(|| restriction.clone()),
+                        })
+                    })
+                    .transpose()?;
                 let tools = Arc::new(LazyTools {
                     factory: Arc::new(
                         factory
@@ -519,19 +650,35 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     executor: Arc::new(tokio::sync::Mutex::new(None)),
                     stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 });
-                let mut capabilities =
-                    BTreeSet::from(["helper.run".into(), "helper.validate".into(), "helper.streams".into()]);
+                let mut capabilities = BTreeSet::from([
+                    "helper.run".into(),
+                    "helper.validate".into(),
+                    "helper.streams".into(),
+                ]);
                 if !options.targets.is_empty() {
                     capabilities.extend(["tools.execute".into(), "tools.schemas".into()]);
                     capabilities.extend(options.targets.keys().cloned());
+                    if mcp.is_some() {
+                        capabilities.insert("mcp.call".into());
+                    }
                 }
                 for cap in &request.definition.envelope().spec.capabilities {
-                    let context_supported = context.is_some() && crate::routine::context::CAPABILITIES.contains(&cap.as_str());
-                    if cap.starts_with("helper.named.") || cap.starts_with("helper.capture.") && request.definition.envelope().spec.captures.contains_key(cap.trim_start_matches("helper.capture.")) || context_supported {
+                    let context_supported = context.is_some()
+                        && crate::routine::context::CAPABILITIES.contains(&cap.as_str());
+                    if cap.starts_with("helper.named.")
+                        || cap.starts_with("helper.capture.")
+                            && request
+                                .definition
+                                .envelope()
+                                .spec
+                                .captures
+                                .contains_key(cap.trim_start_matches("helper.capture."))
+                        || context_supported
+                    {
                         capabilities.insert(cap.clone());
                     }
                 }
-                Arc::new(RoutineAgentHostFactory {
+                let base = RoutineAgentHostFactory {
                     bindings: Arc::new(Bound {
                         principal: request.principal,
                         helpers,
@@ -540,7 +687,12 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         capabilities,
                         targets: options.targets,
                     }),
-                })
+                };
+                if let Some(mcp) = mcp {
+                    Arc::new(mcp::Host { base, mcp })
+                } else {
+                    Arc::new(base)
+                }
             };
             Ok(AuthorizedStart {
                 source_session: request.source_session,
@@ -629,15 +781,24 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> LazyTools<S> {
             return Ok(executor.clone());
         }
         let mut request = SessionCreateRequest::new(SessionId::generate());
-        request.inference_settings = Some(match &self.inference { Some(inference) => inference.clone(), None => default_inference(&self.catalog)? });
+        request.inference_settings = Some(match &self.inference {
+            Some(inference) => inference.clone(),
+            None => default_inference(&self.catalog)?,
+        });
         request.agent_definition = self.bundle.clone();
-        let created = self.factory
+        let created = self
+            .factory
             .create_with_workspace(&self.sessions, request, None, self.bundle.as_ref())
             .await
             .map_err(|_| PortError::Unavailable)?;
         let record = created.record;
         let id = record.id.clone();
-        self.factory.session_roles.register(&record, crate::agent_host::session_roles::SessionRole::Ephemeral)
+        self.factory
+            .session_roles
+            .register(
+                &record,
+                crate::agent_host::session_roles::SessionRole::Ephemeral,
+            )
             .map_err(|_| PortError::Unavailable)?;
         let (runtime, dispatcher) = match self
             .factory

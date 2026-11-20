@@ -100,6 +100,16 @@ impl std::fmt::Debug for RoutineAgentHostFactory {
     }
 }
 
+pub(crate) trait RoutineMcpPort: Send + Sync {
+    fn call(
+        self: Arc<Self>,
+        operation: String,
+        request: McpArguments,
+        cancellation: CancellationToken,
+    ) -> PortFuture<waltr_agent::ToolResult>;
+    fn cleanup(self: Arc<Self>) -> PortFuture<()>;
+}
+
 impl HostFactory for RoutineAgentHostFactory {
     fn preflight_child(
         &self,
@@ -140,6 +150,19 @@ impl HostFactory for RoutineAgentHostFactory {
         selected: SelectedEntrypoint,
         caller: Caller,
     ) -> PortFuture<PreparedHost> {
+        self.preflight_mcp(binding, definition, selected, caller, None)
+    }
+}
+
+impl RoutineAgentHostFactory {
+    pub(crate) fn preflight_mcp(
+        &self,
+        binding: crate::routine::history::InvocationBinding,
+        definition: Arc<Definition>,
+        selected: SelectedEntrypoint,
+        caller: Caller,
+        mcp: Option<Arc<dyn RoutineMcpPort>>,
+    ) -> PortFuture<PreparedHost> {
         let bindings = self.bindings.clone();
         Box::pin(async move {
             if binding.principal() != caller.principal {
@@ -178,6 +201,11 @@ impl HostFactory for RoutineAgentHostFactory {
             if required.contains("children.call") && children.is_none() {
                 return Err(PortError::UnsupportedCapability);
             }
+            if required.contains("mcp.call")
+                && (mcp.is_none() || !required.iter().any(|cap| cap.starts_with("tool.")))
+            {
+                return Err(PortError::UnsupportedCapability);
+            }
             if required
                 .iter()
                 .filter(|cap| cap.starts_with("tool."))
@@ -201,7 +229,9 @@ impl HostFactory for RoutineAgentHostFactory {
             if !definition.envelope().spec.captures.is_empty() {
                 bound.helpers.preflight_captures().await?;
             }
-            let streams = super::tool_streams::ToolStreams::new(definition.envelope().spec.tool_streams.clone());
+            let streams = super::tool_streams::ToolStreams::new(
+                definition.envelope().spec.tool_streams.clone(),
+            );
             if !definition.envelope().spec.tool_streams.is_empty() {
                 bound.helpers.bind_tool_streams(streams.clone()).await?;
             }
@@ -218,6 +248,7 @@ impl HostFactory for RoutineAgentHostFactory {
                 invocation: std::sync::Mutex::new(None),
                 context,
                 children,
+                mcp,
                 streams,
             });
             Ok(PreparedHost {
@@ -238,6 +269,7 @@ fn known_capability(cap: &str) -> bool {
             | "helper.validate"
             | "tools.execute"
             | "tools.schemas"
+            | "mcp.call"
             | "context.snapshot"
             | "context.original"
             | "context.history"
@@ -260,6 +292,7 @@ fn known_capability(cap: &str) -> bool {
 struct AgentHost {
     streams: Arc<super::tool_streams::ToolStreams>,
     children: Option<Arc<dyn ChildPort>>,
+    mcp: Option<Arc<dyn RoutineMcpPort>>,
     context: Option<Arc<dyn ContextPort>>,
     bindings: AdapterBindings,
     capabilities: BTreeSet<String>,
@@ -294,7 +327,8 @@ impl HelperArguments {
         callback: bool,
     ) -> Result<(), PortError> {
         self.input.validate()?;
-        if self.workspace.is_some() && matches!(self.selection, HelperSelection::Restricted { .. }) {
+        if self.workspace.is_some() && matches!(self.selection, HelperSelection::Restricted { .. })
+        {
             return Err(PortError::Invalid);
         }
         let selection = match &self.selection {
@@ -330,6 +364,15 @@ struct ToolArguments {
     call_id: String,
     arguments: Value,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpArguments {
+    pub server: String,
+    pub tool: String,
+    pub arguments: serde_json::Map<String, Value>,
+    pub workspace: Option<crate::routine::context::WorkspaceSelection>,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaArguments {
@@ -348,6 +391,7 @@ enum Operation {
     Context(ContextOperation),
     Helper(HelperArguments),
     Tool(ToolArguments),
+    Mcp(McpArguments),
     Schemas(SchemaArguments),
 }
 
@@ -356,7 +400,13 @@ impl AgentHost {
         if self.cancellation.is_cancelled()
             || request.bytes.is_some()
             || request.handle.is_some()
-            || !self.capabilities.contains(if request.operation == "helper.next" { "helper.streams" } else { &request.operation })
+            || !self
+                .capabilities
+                .contains(if request.operation == "helper.next" {
+                    "helper.streams"
+                } else {
+                    &request.operation
+                })
         {
             return Err(PortError::Denied);
         }
@@ -370,8 +420,11 @@ impl AgentHost {
         }
         match request.operation.as_str() {
             "helper.next" => {
-                if request.callback.is_some() { return Err(PortError::Invalid); }
-                let args: super::tool_streams::Next = serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
+                if request.callback.is_some() {
+                    return Err(PortError::Invalid);
+                }
+                let args: super::tool_streams::Next =
+                    serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
                 self.streams.check(&args.stream)?;
                 Ok(Operation::Next(args))
             }
@@ -428,6 +481,30 @@ impl AgentHost {
                 }
                 Ok(Operation::Tool(args))
             }
+            "mcp.call" => {
+                if request.callback.is_some() || self.mcp.is_none() {
+                    return Err(PortError::Denied);
+                }
+                let args: McpArguments =
+                    serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
+                let target = ConcreteToolTarget::new(&args.server, &args.tool)
+                    .map_err(|_| PortError::Invalid)?;
+                self.target_allowed(&target)?;
+                if args.workspace.as_ref().is_some_and(|workspace| {
+                    workspace.machine.is_empty()
+                        || workspace.machine.len() > 256
+                        || workspace.machine.chars().any(char::is_control)
+                        || workspace
+                            .working_directory
+                            .as_ref()
+                            .is_some_and(|directory| {
+                                directory.len() > 4096 || directory.chars().any(char::is_control)
+                            })
+                }) {
+                    return Err(PortError::Invalid);
+                }
+                Ok(Operation::Mcp(args))
+            }
             "tools.schemas" => {
                 if request.callback.is_some() {
                     return Err(PortError::Invalid);
@@ -481,6 +558,7 @@ impl OperationPolicy for AgentHost {
                 }
                 Operation::Helper(_) => json!({"operation":"helper.run"}),
                 Operation::Tool(args) => json!({"target":args.target,"callId":args.call_id}),
+                Operation::Mcp(args) => json!({"target":{"server":args.server,"tool":args.tool}}),
                 Operation::Schemas(args) => json!({"targets":args.targets}),
             })
         })();
@@ -490,7 +568,12 @@ impl OperationPolicy for AgentHost {
     fn project_result(&self, name: &str, reply: &HostReply) -> Result<Option<Value>, PortError> {
         if !(matches!(
             name,
-            "helper.run" | "helper.next" | "tools.execute" | "tools.schemas" | "children.call"
+            "helper.run"
+                | "helper.next"
+                | "tools.execute"
+                | "tools.schemas"
+                | "children.call"
+                | "mcp.call"
         ) || name.starts_with("context.") && known_capability(name))
         {
             return Err(PortError::Denied);
@@ -520,7 +603,7 @@ impl OperationPolicy for AgentHost {
 }
 
 impl HostDispatcher for AgentHost {
-    fn dispatch(&self, request: HostRequest, _: HostContext) -> HostFuture {
+    fn dispatch(&self, request: HostRequest, host_context: HostContext) -> HostFuture {
         let operation = self.parse(&request);
         let helpers = self.bindings.helpers.clone();
         let tools = self.bindings.tools.clone();
@@ -528,11 +611,15 @@ impl HostDispatcher for AgentHost {
         let limits = self.limits.clone();
         let context = self.context.clone();
         let children = self.children.clone();
+        let mcp = self.mcp.clone();
         let streams = self.streams.clone();
         Box::pin(async move {
             let value = match operation.map_err(|_| waltr_script::Error::Denied)? {
                 Operation::Next(args) => {
-                    let value = streams.next(&args.stream, cancellation).await.map_err(|_| waltr_script::Error::Cleanup)?;
+                    let value = streams
+                        .next(&args.stream, cancellation)
+                        .await
+                        .map_err(|_| waltr_script::Error::Cleanup)?;
                     json!({"status":"completed", "value":value})
                 }
                 Operation::Children(args) => {
@@ -558,7 +645,10 @@ impl HostDispatcher for AgentHost {
                     json!({"status":"completed","result":result})
                 }
                 Operation::Helper(args) => {
-                    let helpers = helpers.select_inference(&args.inference).map_err(|_| waltr_script::Error::Invalid)?.unwrap_or(helpers);
+                    let helpers = helpers
+                        .select_inference(&args.inference)
+                        .map_err(|_| waltr_script::Error::Invalid)?
+                        .unwrap_or(helpers);
                     let source = args
                         .source
                         .as_ref()
@@ -631,6 +721,20 @@ impl HostDispatcher for AgentHost {
                         }
                     }
                 }
+                Operation::Mcp(args) => {
+                    let operation = crate::routine::service::committed_mcp_call(&host_context)
+                        .map_err(|_| waltr_script::Error::Denied)?;
+                    match mcp
+                        .ok_or(waltr_script::Error::Denied)?
+                        .call(operation, args, cancellation)
+                        .await
+                    {
+                        Ok(result) => json!({"status":"completed","result":result}),
+                        Err(PortError::Denied) => json!({"status":"denied"}),
+                        Err(PortError::Invalid) => return Err(waltr_script::Error::Invalid),
+                        Err(_) => return Err(waltr_script::Error::Cleanup),
+                    }
+                }
                 Operation::Schemas(args) => {
                     let schemas = tools
                         .schemas(args.targets, cancellation)
@@ -651,8 +755,9 @@ impl HostDispatcher for AgentHost {
         let cleaned = self.cleaned.clone();
         let context = self.context.clone();
         let children = self.children.clone();
+        let mcp = self.mcp.clone();
         Box::pin(async move {
-            let (helper, tool, context, children) = tokio::join!(
+            let (helper, tool, context, children, mcp) = tokio::join!(
                 helpers.cleanup(),
                 tools.cleanup(),
                 async move {
@@ -666,12 +771,14 @@ impl HostDispatcher for AgentHost {
                         Some(children) => children.cleanup().await,
                         None => Ok(()),
                     }
-                }
+                },
+                cleanup_mcp(mcp)
             );
             helper.map_err(|_| waltr_script::Error::Cleanup)?;
             tool.map_err(|_| waltr_script::Error::Cleanup)?;
             context.map_err(|_| waltr_script::Error::Cleanup)?;
             children.map_err(|_| waltr_script::Error::Cleanup)?;
+            mcp.map_err(|_| waltr_script::Error::Cleanup)?;
             cleaned.store(true, Ordering::Release);
             Ok(())
         })
@@ -691,7 +798,7 @@ impl Reservation for JoinedReservation {
         Box::pin(async move {
             host.streams.cancel();
             host.cancellation.cancel();
-            let (helper, tool, context, children) = tokio::join!(
+            let (helper, tool, context, children, mcp) = tokio::join!(
                 host.bindings.helpers.cleanup(),
                 host.bindings.tools.cleanup(),
                 async {
@@ -706,17 +813,23 @@ impl Reservation for JoinedReservation {
                         None => Ok(()),
                     }
                 },
+                cleanup_mcp(host.mcp.clone()),
             );
             helper?;
             tool.map_err(|_| PortError::Uncertain)?;
             context?;
             children?;
+            mcp?;
             host.cleaned.store(true, Ordering::Release);
             Ok(())
         })
     }
     fn validate_success(&self) -> Result<(), PortError> {
-        if self.0.streams.was_drained() { Ok(()) } else { Err(PortError::Invalid) }
+        if self.0.streams.was_drained() {
+            Ok(())
+        } else {
+            Err(PortError::Invalid)
+        }
     }
     fn finalize(&self, _: bool) -> PortFuture<()> {
         // Finalization is reached only after the engine has joined HostDispatcher::cleanup.
@@ -728,5 +841,12 @@ impl Reservation for JoinedReservation {
                 Err(PortError::Uncertain)
             }
         })
+    }
+}
+
+async fn cleanup_mcp(mcp: Option<Arc<dyn RoutineMcpPort>>) -> Result<(), PortError> {
+    match mcp {
+        Some(mcp) => mcp.cleanup().await,
+        None => Ok(()),
     }
 }

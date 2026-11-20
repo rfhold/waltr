@@ -158,6 +158,79 @@ async fn workspace_binding_incarnation_tracks_accepted_changes_per_key() {
 }
 
 #[tokio::test]
+async fn routine_incarnation_does_not_revive_after_unobserved_replace_and_restore() {
+    let directory = TestDirectory::new("routine-incarnation");
+    let path = "routines/publication-marker.yaml";
+    let routine = |description: &str| {
+        format!(
+            "apiVersion: waltr.routine/v1\nkind: Routine\nname: publication-marker\ndescription: {description}\nspec:\n  source: 'export default () => true;'\n  entrypoints: {{run: {{trigger: manual}}}}\n  parameters: {{schemaVersion: waltr.value/v1, schema: {{type: boolean}}}}\n  result: {{schemaVersion: waltr.value/v1, schema: {{type: boolean}}}}\n"
+        )
+    };
+    let original = routine("original");
+    directory.resource(path, &original);
+    let state = unified_state(&directory).await;
+    let initial = state.snapshot();
+    let admitted = initial.routine_incarnation("publication-marker").unwrap();
+    let updates = state.subscribe();
+
+    directory.resource(
+        "routines/unrelated.yaml",
+        &routine("unrelated").replace("publication-marker", "unrelated"),
+    );
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none());
+    assert_eq!(
+        state.snapshot().routine_incarnation("publication-marker"),
+        Some(admitted)
+    );
+
+    directory.resource(path, &routine("replacement"));
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none());
+    directory.resource(path, &original);
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none());
+    let restored = state.snapshot();
+    assert_eq!(
+        restored.scripts()["publication-marker"].revision(),
+        initial.scripts()["publication-marker"].revision()
+    );
+    assert_ne!(
+        restored.routine_incarnation("publication-marker"),
+        Some(admitted)
+    );
+    assert_eq!(
+        updates.len(),
+        3,
+        "the observer never consumed the replacement"
+    );
+
+    let restored_id = restored.routine_incarnation("publication-marker").unwrap();
+    directory.resource(path, "not a Routine");
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_some());
+    assert_eq!(
+        state.snapshot().routine_incarnation("publication-marker"),
+        Some(restored_id)
+    );
+
+    fs::remove_file(directory.0.join(".waltr/resources").join(path)).unwrap();
+    state.reload_from_disk().await;
+    assert_eq!(
+        state.snapshot().routine_incarnation("publication-marker"),
+        None
+    );
+    directory.resource(path, &original);
+    state.reload_from_disk().await;
+    let recreated_id = state
+        .snapshot()
+        .routine_incarnation("publication-marker")
+        .unwrap();
+    assert_ne!(recreated_id, admitted);
+    assert_ne!(recreated_id, restored_id);
+}
+
+#[tokio::test]
 async fn bundled_configuration_agent_enforces_resource_only_hosted_permissions() {
     use crate::{
         agent_host::{AgentPermissionSelector, Capability, HostRuntimeBuilder, ResolvedPermission},

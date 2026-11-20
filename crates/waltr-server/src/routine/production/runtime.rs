@@ -266,7 +266,11 @@ fn catalog_entries(
     capabilities.insert("media.execute".into());
     capabilities.insert("media.inputs".into());
     if !authority.targets.is_empty() {
-        capabilities.extend(["tools.execute".into(), "tools.schemas".into()]);
+        capabilities.extend([
+            "tools.execute".into(),
+            "tools.schemas".into(),
+            "mcp.call".into(),
+        ]);
         capabilities.extend(authority.targets.keys().cloned());
     }
     for (name, definition) in snapshot.scripts() {
@@ -282,7 +286,9 @@ fn catalog_entries(
                 }
             }
         }
-        let session = name == "configuration"
+        let direct_mcp = definition.envelope().spec.capabilities.contains("mcp.call");
+        let session = direct_mcp
+            || name == "configuration"
             || definition
                 .envelope()
                 .spec
@@ -295,7 +301,9 @@ fn catalog_entries(
             .entrypoints
             .iter()
             .filter_map(|(entry, descriptor)| {
-                matches!(descriptor.trigger, Trigger::Manual | Trigger::Interactive).then(|| {
+                (matches!(descriptor.trigger, Trigger::Manual)
+                    || (!direct_mcp && matches!(descriptor.trigger, Trigger::Interactive)))
+                .then(|| {
                     (
                         entry.clone(),
                         BTreeSet::from([if session {

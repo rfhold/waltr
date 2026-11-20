@@ -824,7 +824,15 @@ async fn run(
     };
     drop(send.send(Ok(handle)));
     // Catch adapter/engine panics while retaining the admitted reservation.
-    let execution = execute(&shared, &id, &definition, input, &cancel, &prepared, caller.origin_machine_id);
+    let execution = execute(
+        &shared,
+        &id,
+        &definition,
+        input,
+        &cancel,
+        &prepared,
+        caller.origin_machine_id,
+    );
     let (outcome, release) = match AssertUnwindSafe(execution).catch_unwind().await {
         Ok(pair) => pair,
         Err(_) => {
@@ -996,6 +1004,22 @@ async fn execute(
     (outcome, cleanup && finalized && durable.is_some())
 }
 
+tokio::task_local! {
+    static COMMITTED_MCP_CALL: (InvocationId, String);
+}
+
+pub(super) fn committed_mcp_call(context: &HostContext) -> Result<String, PortError> {
+    COMMITTED_MCP_CALL
+        .try_with(|(invocation, id)| {
+            if *invocation == context.invocation() {
+                Ok(id.clone())
+            } else {
+                Err(PortError::Denied)
+            }
+        })
+        .unwrap_or(Err(PortError::Denied))
+}
+
 struct JournalHost {
     origin_machine_id: Option<String>,
     trace: tracing::Span,
@@ -1014,13 +1038,24 @@ impl HostDispatcher for JournalHost {
             let origin = self.origin_machine_id.clone();
             let cancelled = self.cancel.clone();
             return Box::pin(async move {
-                if cancelled.is_cancelled() { return Err(waltr_script::Error::Cancelled); }
-                if request.bytes.is_some() || request.handle.is_some() || request.callback.is_some()
-                    || !request.arguments.as_json().as_object().is_some_and(|obj| obj.is_empty()) {
+                if cancelled.is_cancelled() {
+                    return Err(waltr_script::Error::Cancelled);
+                }
+                if request.bytes.is_some()
+                    || request.handle.is_some()
+                    || request.callback.is_some()
+                    || !request
+                        .arguments
+                        .as_json()
+                        .as_object()
+                        .is_some_and(|obj| obj.is_empty())
+                {
                     return Err(waltr_script::Error::Invalid);
                 }
                 let mut value = serde_json::json!({});
-                if let Some(origin) = origin { value["originMachineId"] = origin.into(); }
+                if let Some(origin) = origin {
+                    value["originMachineId"] = origin.into();
+                }
                 StructuredValue::new(value, &Limits::default()).map(waltr_script::HostReply::Value)
             });
         }
@@ -1085,7 +1120,16 @@ impl HostDispatcher for JournalHost {
             let reply = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(waltr_script::Error::Cancelled),
-                reply = async { inner.dispatch(request, context).await } => reply,
+                reply = async {
+                    if name == "mcp.call" {
+                        COMMITTED_MCP_CALL.scope(
+                            (context.invocation(), id.clone()),
+                            async { inner.dispatch(request, context).await },
+                        ).await
+                    } else {
+                        inner.dispatch(request, context).await
+                    }
+                } => reply,
             };
             dispatch_error = reply.as_ref().err().copied();
             let (status, result) = match &reply {

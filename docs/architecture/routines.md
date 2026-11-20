@@ -56,6 +56,25 @@ Point the [audio question shortcut](../examples/routines/audio-interactions.md#a
 
 `context.create` accepts the same optional `workspace` object. It requires a pinned source, an invocation-local source handle, and the `context.create` capability. The desktop origin alone supplies none of these. Without an explicit selection, source-derived sessions and named helpers inherit the source workspace. Restricted helpers do not accept workspace selection.
 
+### Call an MCP tool on a selected worker
+
+An installed Routine with a verified source session can use `mcp.call` without a model or helper. Declare `mcp.call` and an operator-granted `tool.*` capability for the exact server and upstream tool names. The source agent must select the MCP server. Its normal policy, the caller’s permission ceiling, and middleware still apply.
+
+```js
+const reply = await host.call('mcp.call', {
+  server: 'repository',
+  tool: 'read_summary',
+  arguments: {},
+  workspace: {machine: 'laptop', workingDirectory: 'rfhold/waltr'}
+});
+```
+
+Stdio requires `workspace.machine`; omit `workingDirectory` to use the export root. The caller must own the live claim for a remote machine. The desktop origin never selects the target. The [exporter must allow the named stdio resource](../deployment.md#export-a-workspace-to-another-waltr-server). For Streamable HTTP, omit `workspace`: the connection stays on the server.
+
+Start a manual Routine from its source session. Normal tool permission prompts go to that session. Worker stdio does not support upstream MCP elicitation; it fails closed. This operation is not available to source-less, media, or child invocations, public MCP, or public code.
+
+The invocation reuses a connection only for the same target and current configuration. It closes its connections at completion or cancellation. The journal records the exact tool identity and status, not raw arguments or results. Unknown outcomes do not replay.
+
 ## Automatic Completion Admission
 
 Normal gRPC session runs capture the actual originating principal and access lease in their runtime factory. Queued runs retain that factory; different host bindings do not batch together. First-user-message title and completion compaction use this origin, excluding helper/ephemeral sessions.

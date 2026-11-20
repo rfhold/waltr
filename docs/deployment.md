@@ -109,6 +109,7 @@ spec:
   endpoint: https://waltr.example
   machineId: laptop
   exportRoot: ~/repos
+  mcpStdioServers: []
 ```
 
 On the exporting server, select the binding in Config and choose **Authorize**. Follow the device sign-in instructions for the destination. The exporting server keeps and refreshes the grant outside YAML. Reset authorization or remove the binding to stop the export. Desktop profile switches do not stop a running server's exports.
@@ -116,6 +117,12 @@ On the exporting server, select the binding in Config and choose **Authorize**. 
 Use HTTPS without a path prefix, URL credentials, query, or fragment. A machine ID identifies one peer at that destination; use 1–128 ASCII letters, digits, periods, underscores, or hyphens. `local` is reserved. The worker resolves `exportRoot` in its own filesystem and expands `~` against its own home. The root sets the starting location, not a sandbox. The tool policy can allow paths outside it, and shell commands inherit the worker's operating-system permissions and mounts. For a sidecar, mount the directory in the worker.
 
 The hosted server rejects a second live connection for `laptop` and keeps the first. Another installation signed into the same account can claim the name after disconnect. The server does not redirect work to `local` or retry an uncertain execution. An offline optional peer does not affect hosted `/ready`; loss of the required default worker does.
+
+**Stdio MCP.** To allow a stdio resource on this export, add its exact `McpServer` name to `mcpStdioServers`. An empty list allows none. The exporter must define each listed resource with `transport: stdio`. The destination must also define the same name with `transport: stdio` and select it for the session's agent. The destination catalog requires a command, but only the exporter's command runs for this workspace. The child inherits the worker's OS permissions; `exportRoot` does not confine it.
+
+Worker stdio requires Linux or macOS and a filesystem that supports pinned directory identity. Other worker platforms reject stdio requests rather than launching from an unverified directory. See [Routine MCP workspace selection](architecture/routines.md#call-an-mcp-tool-on-a-selected-worker) for direct calls.
+
+On macOS, the process launcher may run a file as shell input if the OS rejects its executable format. Configure a valid executable or name the interpreter explicitly for scripts. This fallback does not change the exporter allowlist, configured arguments, cleared environment, or verified starting directory.
 
 ## MCP Apps Assets And App Container
 

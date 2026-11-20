@@ -37,6 +37,8 @@ use waltr::grpc::waltr::{
     },
 };
 
+mod stdio_mcp;
+
 const MACHINE: &str = "exporting-machine";
 const BINDING: &str = "test-binding";
 const RESOURCE: &str = "workspace-bindings/test-binding.yaml";
@@ -70,6 +72,8 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     std::fs::create_dir_all(export_root.join(PROJECT)).unwrap();
     std::fs::write(export_root.join(PROJECT).join(SENTINEL), CONTENTS).unwrap();
     assert!(!local_root.join(PROJECT).join(SENTINEL).exists());
+    stdio_mcp::install_program(&local_root.join(PROJECT));
+    stdio_mcp::install_program(&export_root.join(PROJECT));
 
     let listener = loopback().await;
     let endpoint = origin(&listener);
@@ -112,6 +116,7 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         &local_root,
         destination_db,
         access,
+        stdio_mcp::Role::Destination,
     )
     .await;
     let machines = destination.machines.clone();
@@ -136,8 +141,9 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         .replace_resource(ReplaceResourceRequest {
             path: RESOURCE.into(),
             source: format!(
-                "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata: {{name: {BINDING}}}\nspec:\n  endpoint: {endpoint}\n  machineId: {MACHINE}\n  exportRoot: '{}'\n",
-                export_root.display()
+                "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata: {{name: {BINDING}}}\nspec:\n  endpoint: {endpoint}\n  machineId: {MACHINE}\n  exportRoot: '{}'\n  mcpStdioServers: [{}]\n",
+                export_root.display(),
+                stdio_mcp::SERVER,
             ),
             expected_etag: absent.persisted_etag,
         })
@@ -177,6 +183,9 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
             .unwrap_err(),
     );
     assert_sentinel(&machines, &account).await;
+    let mcp = stdio_mcp::Probe::new(destination.channel.clone(), &mut sessions, &bearer).await;
+    mcp.assert_denied(&other).await;
+    mcp.assert_marker(&bearer).await;
 
     let refreshed = auth
         .refresh_auth(RefreshAuthRequest { target: target() })
@@ -198,6 +207,7 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         !machines.owns_live(MACHINE, &account)
     })
     .await;
+    mcp.assert_denied(&bearer).await;
     assert_offline(
         sessions
             .create_session(selection(MACHINE, &bearer))
@@ -212,6 +222,7 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         || machines.owns_live(MACHINE, &account),
     )
     .await;
+    mcp.assert_marker(&bearer).await;
     let deleted = config
         .reset_resource(ResetResourceRequest {
             path: RESOURCE.into(),
@@ -288,6 +299,7 @@ async fn serve_exporter(root: &Path) {
             &root.join("exporter"),
             persistence().await,
             AccessAuthenticator::disabled(),
+            stdio_mcp::Role::Exporter,
         )
         .await,
         listener,
@@ -360,13 +372,20 @@ fn target() -> Option<AuthTarget> {
 }
 
 fn selection(machine: &str, token: &str) -> GrpcRequest<CreateSessionRequest> {
-    let mut request = GrpcRequest::new(CreateSessionRequest {
-        workspace: Some(WorkspaceSelection {
-            machine_id: machine.into(),
-            working_directory: Some(PROJECT.into()),
-        }),
-        ..Default::default()
-    });
+    authenticated(
+        CreateSessionRequest {
+            workspace: Some(WorkspaceSelection {
+                machine_id: machine.into(),
+                working_directory: Some(PROJECT.into()),
+            }),
+            ..Default::default()
+        },
+        token,
+    )
+}
+
+fn authenticated<T>(message: T, token: &str) -> GrpcRequest<T> {
+    let mut request = GrpcRequest::new(message);
     request.set_timeout(DEADLINE);
     request
         .metadata_mut()
@@ -437,6 +456,7 @@ async fn application(
     workspace_root: &Path,
     persistence: Persistence,
     access_authenticator: AccessAuthenticator,
+    role: stdio_mcp::Role,
 ) -> ServerApplication {
     std::fs::create_dir_all(config_root.join(".waltr/resources/mcp-servers")).unwrap();
     std::fs::write(
@@ -444,6 +464,7 @@ async fn application(
         "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {name: waltr}\nspec: {transport: streamableHttp, url: 'http://127.0.0.1:1/mcp'}\n",
     )
     .unwrap();
+    let routine_authority = stdio_mcp::install_resources(config_root, role);
     let catalog_loader = default_catalog_loader();
     let config_service = ConfigService::new(config_root, catalog_loader.clone())
         .await
@@ -460,7 +481,7 @@ async fn application(
             local_admission: None,
             workspace_root: workspace_root.into(),
             sandbox_socket: None,
-            routine_authority: RoutineAuthority::default(),
+            routine_authority,
             routine_private_parent: config_root.into(),
         },
         |routes, input| {
