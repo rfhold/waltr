@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
@@ -26,8 +27,8 @@ use crate::{
 use super::{
     connection::McpConnection,
     transport::{
-        McpBearerProvider, McpBearerProviderError, McpTransportConfig, McpTransportError,
-        McpTransportLimits, McpTransportOptions,
+        McpBearerProvider, McpBearerProviderError, McpFramedChannel, McpTransportConfig,
+        McpTransportError, McpTransportLimits, McpTransportOptions,
     },
 };
 
@@ -399,11 +400,8 @@ impl McpClient {
         transport_options: McpTransportOptions,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
-        let active_subscriptions = Arc::new(StdRwLock::new(HashSet::new()));
-        let adapter = Arc::new(ClientHandlerAdapter {
-            inner: Arc::clone(&handler),
-            active_subscriptions: Arc::clone(&active_subscriptions),
-        });
+        let adapter = ClientHandlerAdapter::new(Arc::clone(&handler));
+        let active_subscriptions = Arc::clone(&adapter.active_subscriptions);
         let connection = McpConnection::start_with_transport_options(
             server_name.into(),
             transport,
@@ -412,6 +410,31 @@ impl McpClient {
             transport_options,
         )
         .await?;
+        Self::discover(connection, handler, options, cancellation_token).await
+    }
+
+    /// Discover MCP capabilities over an already-open channel supplied by the caller.
+    ///
+    /// `max_message_bytes` is an inclusive limit on both inbound and outbound
+    /// JSON-RPC frames, counting any trailing CR. A full inbound queue closes
+    /// the transport rather than buffering more frames. No HTTP headers are sent.
+    /// Call [`Self::shutdown`] to await channel cleanup. Dropping the client,
+    /// or dropping an in-flight request, does not confirm any remote action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery fails.
+    pub async fn connect_framed(
+        channel: Arc<dyn McpFramedChannel>,
+        max_message_bytes: NonZeroUsize,
+        handler: Arc<dyn McpClientHandler>,
+        options: McpClientOptions,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
+        let adapter = ClientHandlerAdapter::new(Arc::clone(&handler));
+        let active_subscriptions = Arc::clone(&adapter.active_subscriptions);
+        let connection =
+            McpConnection::start_framed(channel, max_message_bytes, adapter, active_subscriptions);
         Self::discover(connection, handler, options, cancellation_token).await
     }
 
@@ -638,6 +661,44 @@ impl McpClient {
         call: McpToolCall,
         cancellation_token: CancellationToken,
     ) -> Result<McpToolResult> {
+        self.call_tool_inner(
+            call,
+            cancellation_token,
+            None::<fn() -> std::future::Ready<Result<()>>>,
+        )
+        .await
+    }
+
+    /// Call a tool with an operation-local check before the initial request and every
+    /// continuation. A failing check ends the operation without sending that round.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a failed check or when the tool request fails.
+    pub async fn call_tool_checked<F, Fut>(
+        &self,
+        call: McpToolCall,
+        cancellation_token: CancellationToken,
+        before_send: F,
+    ) -> Result<McpToolResult>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.call_tool_inner(call, cancellation_token, Some(before_send))
+            .await
+    }
+
+    async fn call_tool_inner<F, Fut>(
+        &self,
+        call: McpToolCall,
+        cancellation_token: CancellationToken,
+        before_send: Option<F>,
+    ) -> Result<McpToolResult>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         if call
             .progress_token
             .as_ref()
@@ -647,9 +708,15 @@ impl McpClient {
                 "MCP progress token must be a string or integer",
             ));
         }
-        self.request("tools/call", Some(call.to_params()), cancellation_token)
-            .await
-            .map(McpToolResult::new)
+        self.request_rounds(
+            "tools/call",
+            Some(call.to_params()),
+            cancellation_token,
+            Some(self.timeout),
+            before_send,
+        )
+        .await
+        .map(McpToolResult::new)
     }
 
     /// Get a server prompt.
@@ -934,7 +1001,6 @@ impl McpClient {
             .await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn request_with_timeout(
         &self,
         method: &str,
@@ -942,6 +1008,29 @@ impl McpClient {
         cancellation_token: CancellationToken,
         timeout: Option<Duration>,
     ) -> Result<Value> {
+        self.request_rounds(
+            method,
+            params,
+            cancellation_token,
+            timeout,
+            None::<fn() -> std::future::Ready<Result<()>>>,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn request_rounds<F, Fut>(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        cancellation_token: CancellationToken,
+        timeout: Option<Duration>,
+        before_send: Option<F>,
+    ) -> Result<Value>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let mut params = params.unwrap_or_else(|| json!({}));
         let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let cancellation_token = cancellation_token.child_token();
@@ -955,7 +1044,7 @@ impl McpClient {
             if cancellation_token.is_cancelled() {
                 return Err(crate::Error::protocol("MCP request canceled"));
             }
-            let remaining = deadline
+            let mut remaining = deadline
                 .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 return Err(crate::Error::protocol("MCP request timed out"));
@@ -969,6 +1058,32 @@ impl McpClient {
                 .unwrap_or_default();
             meta.extend(self.request_meta.clone());
             params_object.insert("_meta".to_owned(), Value::Object(meta));
+            let headers = if let Some(check) = &before_send {
+                let headers = tokio::select! {
+                    biased;
+                    () = cancellation_token.cancelled() => return Err(crate::Error::protocol("MCP request canceled")),
+                    () = elicitation_deadline(deadline) => return Err(crate::Error::protocol("MCP request timed out")),
+                    headers = self.http_headers(method, &params) => headers?,
+                };
+                tokio::select! {
+                    biased;
+                    () = cancellation_token.cancelled() => return Err(crate::Error::protocol("MCP request canceled")),
+                    () = elicitation_deadline(deadline) => return Err(crate::Error::protocol("MCP request timed out")),
+                    result = check() => result?,
+                }
+                if cancellation_token.is_cancelled() {
+                    return Err(crate::Error::protocol("MCP request canceled"));
+                }
+                remaining = deadline.map(|deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                });
+                if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                    return Err(crate::Error::protocol("MCP request timed out"));
+                }
+                headers
+            } else {
+                self.http_headers(method, &params).await?
+            };
             let result = self
                 .connection
                 .request_with_trace_propagation(
@@ -977,7 +1092,7 @@ impl McpClient {
                     remaining,
                     cancellation_token.clone(),
                     self.trace_propagation,
-                    self.http_headers(method, &params).await?,
+                    headers,
                 )
                 .await?;
             let result_type = result
@@ -1233,6 +1348,13 @@ impl super::connection::McpConnectionHandler for ClientHandlerAdapter {
 }
 
 impl ClientHandlerAdapter {
+    fn new(inner: Arc<dyn McpClientHandler>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            active_subscriptions: Arc::new(StdRwLock::new(HashSet::new())),
+        })
+    }
+
     fn belongs_to_active_subscription(&self, params: Option<&Value>) -> bool {
         let Some(id) = params
             .and_then(|params| params.get("_meta"))

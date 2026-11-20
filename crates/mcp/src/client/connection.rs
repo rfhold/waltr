@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
-    sync::{Arc, RwLock},
+    num::NonZeroUsize,
+    sync::{Arc, Mutex as StdMutex, RwLock},
     time::Duration,
 };
 
@@ -17,8 +18,9 @@ use tracing::Instrument as _;
 use crate::{
     Error, McpAuthorizationError, McpTracePropagation, Result,
     client::transport::{
-        McpBearerProviderError, McpTransport, McpTransportConfig, McpTransportError,
-        McpTransportOptions, TransportInbound,
+        McpBearerProviderError, McpFramedChannel, McpTransport, McpTransportConfig,
+        McpTransportError, McpTransportOptions, TransportInbound,
+        framed::{FramedInbound, FramedTransport},
     },
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, cancellation_params, json_rpc_notification,
@@ -28,6 +30,7 @@ use crate::{
 };
 
 type PendingMap = BTreeMap<JsonRpcId, oneshot::Sender<Result<Value>>>;
+type PendingRequests = StdMutex<PendingMap>;
 type EventRoutes = Arc<RwLock<BTreeMap<JsonRpcId, (EventNotifications, CancellationToken)>>>;
 
 #[derive(Clone)]
@@ -52,12 +55,41 @@ pub trait McpConnectionHandler: Send + Sync {
 
 /// JSON-RPC connection over one MCP transport.
 pub struct McpConnection {
-    transport: McpTransport,
-    pending: Arc<Mutex<PendingMap>>,
+    transport: ConnectionTransport,
+    pending: Arc<PendingRequests>,
     event_routes: EventRoutes,
     dispatch_cancellation: CancellationToken,
     dispatch_task: Mutex<Option<JoinHandle<()>>>,
     active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ConnectionTransport {
+    Configured(McpTransport),
+    Framed(FramedTransport),
+}
+
+enum ConnectionInbound {
+    Configured(mpsc::UnboundedReceiver<TransportInbound>),
+    Framed(FramedInbound),
+}
+
+impl ConnectionInbound {
+    async fn recv(&mut self) -> Option<TransportInbound> {
+        match self {
+            Self::Configured(inbound) => inbound.recv().await,
+            Self::Framed(inbound) => inbound.recv().await,
+        }
+    }
+}
+
+impl ConnectionTransport {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Configured(transport) => transport.kind(),
+            Self::Framed(_) => "framed",
+        }
+    }
 }
 
 impl fmt::Debug for McpConnection {
@@ -80,35 +112,53 @@ impl McpConnection {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let transport =
             McpTransport::start_with_options(server_name, transport, inbound_tx, options).await?;
-        Self::finish_start(transport, handler, active_subscriptions, inbound_rx).await
+        Ok(Self::finish_start(
+            ConnectionTransport::Configured(transport),
+            handler,
+            active_subscriptions,
+            ConnectionInbound::Configured(inbound_rx),
+        ))
     }
 
-    async fn finish_start(
-        transport: McpTransport,
+    pub(crate) fn start_framed(
+        channel: Arc<dyn McpFramedChannel>,
+        max_message_bytes: NonZeroUsize,
         handler: Arc<dyn McpConnectionHandler>,
         active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
-        inbound_rx: mpsc::UnboundedReceiver<TransportInbound>,
-    ) -> Result<Arc<Self>> {
-        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+    ) -> Arc<Self> {
+        let (transport, inbound) = FramedTransport::new(channel, max_message_bytes);
+        Self::finish_start(
+            ConnectionTransport::Framed(transport),
+            handler,
+            active_subscriptions,
+            ConnectionInbound::Framed(inbound),
+        )
+    }
+
+    fn finish_start(
+        transport: ConnectionTransport,
+        handler: Arc<dyn McpConnectionHandler>,
+        active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
+        inbound_rx: ConnectionInbound,
+    ) -> Arc<Self> {
+        let pending = Arc::new(PendingRequests::default());
         let dispatch_cancellation = CancellationToken::new();
         let event_routes = Arc::new(RwLock::new(BTreeMap::new()));
-        let connection = Arc::new(Self {
-            transport,
-            pending: Arc::clone(&pending),
-            event_routes: Arc::clone(&event_routes),
-            dispatch_cancellation: dispatch_cancellation.clone(),
-            dispatch_task: Mutex::new(None),
-            active_subscriptions,
-        });
         let task = tokio::spawn(dispatch_loop(
-            pending,
-            event_routes,
+            Arc::clone(&pending),
+            Arc::clone(&event_routes),
             inbound_rx,
             handler,
-            dispatch_cancellation,
+            dispatch_cancellation.clone(),
         ));
-        *connection.dispatch_task.lock().await = Some(task);
-        Ok(connection)
+        Arc::new(Self {
+            transport,
+            pending,
+            event_routes,
+            dispatch_cancellation,
+            dispatch_task: Mutex::new(Some(task)),
+            active_subscriptions,
+        })
     }
 
     /// Send a request and wait for its response.
@@ -197,7 +247,14 @@ impl McpConnection {
         if let Some(meta) = params.as_ref().and_then(|v| v.get("_meta")) {
             event_cancellation["_meta"] = meta.clone();
         }
-        self.pending.lock().await.insert(id.clone(), tx);
+        self.pending
+            .lock()
+            .expect("pending requests lock poisoned")
+            .insert(id.clone(), tx);
+        let pending = PendingRequest {
+            requests: &self.pending,
+            id: &id,
+        };
         let send_result = tokio::select! {
             result = self.send(
                 json_rpc_request(id.clone(), method, params),
@@ -211,7 +268,7 @@ impl McpConnection {
             }
         };
         if let Err(error) = send_result {
-            self.pending.lock().await.remove(&id);
+            drop(pending);
             if method == "events/stream" && request_cancellation.is_cancelled() {
                 drop(
                     time::timeout(
@@ -229,9 +286,11 @@ impl McpConnection {
         tokio::select! {
             biased;
             () = request_cancellation.cancelled() => {
-                self.pending.lock().await.remove(&id);
+                drop(pending);
                 if method == "events/stream" {
                     drop(time::timeout(Duration::from_secs(2), self.notify("notifications/cancelled", Some(event_cancellation))).await);
+                } else if matches!(self.transport, ConnectionTransport::Framed(_)) {
+                    self.notify_framed_cancellation(&id, "MCP request canceled").await;
                 } else if self.transport.kind() == "stdio" {
                     drop(self.notify("notifications/cancelled", Some(cancellation_params(&id, "Waltr request canceled"))).await);
                 }
@@ -241,8 +300,10 @@ impl McpConnection {
             }
             () = wait_for_deadline(deadline) => {
                 request_cancellation.cancel();
-                self.pending.lock().await.remove(&id);
-                if self.transport.kind() == "stdio" || method == "events/stream" {
+                drop(pending);
+                if matches!(self.transport, ConnectionTransport::Framed(_)) {
+                    self.notify_framed_cancellation(&id, "MCP request timed out").await;
+                } else if self.transport.kind() == "stdio" || method == "events/stream" {
                     drop(self.notify("notifications/cancelled", Some(cancellation_params(&id, "Waltr request timed out"))).await);
                 }
                 span.record("mcp.outcome", "timeout");
@@ -267,6 +328,10 @@ impl McpConnection {
                     }
                 }
             },
+            error = self.framed_backlog_overflowed() => {
+                span.record("mcp.outcome", "error");
+                Err(error)
+            }
         }
     }
 
@@ -337,27 +402,60 @@ impl McpConnection {
             .await
     }
 
+    async fn notify_framed_cancellation(&self, id: &JsonRpcId, reason: &str) {
+        drop(
+            time::timeout(
+                Duration::from_secs(2),
+                self.notify(
+                    "notifications/cancelled",
+                    Some(cancellation_params(id, reason)),
+                ),
+            )
+            .await,
+        );
+    }
+
     async fn send(
         &self,
         message: Value,
         cancellation: Option<&CancellationToken>,
         http_headers: &[(String, String)],
     ) -> Result<()> {
-        self.transport
-            .send(message, cancellation, http_headers)
-            .await
+        match &self.transport {
+            ConnectionTransport::Configured(transport) => {
+                transport.send(message, cancellation, http_headers).await
+            }
+            ConnectionTransport::Framed(transport) => transport.send(message, cancellation).await,
+        }
     }
 
     /// Wait for explicit shutdown or terminal transport closure.
     pub(crate) async fn closed(&self) {
-        self.dispatch_cancellation.cancelled().await;
+        tokio::select! {
+            () = self.dispatch_cancellation.cancelled() => {},
+            _ = self.framed_backlog_overflowed() => {},
+        }
+    }
+
+    async fn framed_backlog_overflowed(&self) -> Error {
+        match &self.transport {
+            ConnectionTransport::Framed(transport) => transport.backlog_overflowed().await,
+            ConnectionTransport::Configured(_) => std::future::pending().await,
+        }
     }
 
     /// Shutdown the underlying transport.
     pub async fn shutdown(&self) -> Result<()> {
-        let result = self.transport.shutdown().await;
+        let result = match &self.transport {
+            ConnectionTransport::Configured(transport) => transport.shutdown().await,
+            ConnectionTransport::Framed(transport) => {
+                self.dispatch_cancellation.cancel();
+                fail_pending(&self.pending, "MCP connection shut down");
+                transport.shutdown().await
+            }
+        };
         self.dispatch_cancellation.cancel();
-        fail_pending(&self.pending, "MCP connection shut down").await;
+        fail_pending(&self.pending, "MCP connection shut down");
         let task = {
             let mut dispatch_task = self.dispatch_task.lock().await;
             dispatch_task.take()
@@ -386,6 +484,17 @@ fn event_completion(result: &Value) -> Result<()> {
 struct ActiveSubscription {
     id: JsonRpcId,
     active: Arc<RwLock<HashSet<JsonRpcId>>>,
+}
+
+struct PendingRequest<'a> {
+    requests: &'a PendingRequests,
+    id: &'a JsonRpcId,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        remove_pending(self.requests, self.id);
+    }
 }
 
 struct EventRoute {
@@ -428,9 +537,9 @@ fn json_rpc_error_code(error: &Error) -> Option<i64> {
 }
 
 async fn dispatch_loop(
-    pending: Arc<Mutex<PendingMap>>,
+    pending: Arc<PendingRequests>,
     event_routes: EventRoutes,
-    mut inbound: mpsc::UnboundedReceiver<TransportInbound>,
+    mut inbound: ConnectionInbound,
     handler: Arc<dyn McpConnectionHandler>,
     cancellation: CancellationToken,
 ) {
@@ -442,7 +551,7 @@ async fn dispatch_loop(
         let Some(inbound) = inbound else { break };
         match inbound {
             TransportInbound::Message(JsonRpcInbound::Response(response)) => {
-                let sender = pending.lock().await.remove(&response.id);
+                let sender = remove_pending(&pending, &response.id);
                 if let Some(sender) = sender {
                     drop(sender.send(json_rpc_result(response)));
                 }
@@ -483,28 +592,25 @@ async fn dispatch_loop(
                 ));
             }
             TransportInbound::AuthorizationFailed(error) => {
-                fail_pending_with_authorization(&pending, &error).await;
+                fail_pending_with_authorization(&pending, &error);
                 handler.authorization_failed(error);
             }
             TransportInbound::BearerProviderFailed(error) => {
-                fail_pending_with_bearer_provider(&pending, error).await;
+                fail_pending_with_bearer_provider(&pending, error);
                 handler.bearer_provider_failed(error);
             }
             TransportInbound::TransportFailed(error) => {
-                fail_pending(&pending, &error.message).await;
+                fail_pending(&pending, &error.message);
                 handler.transport_failed(error);
             }
             TransportInbound::RequestFailed(id, error) => {
-                let sender = {
-                    let mut pending = pending.lock().await;
-                    pending.remove(&id)
-                };
+                let sender = remove_pending(&pending, &id);
                 if let Some(sender) = sender {
                     drop(sender.send(Err(Error::protocol(error))));
                 }
             }
             TransportInbound::Disconnected(error) => {
-                fail_pending(&pending, &error).await;
+                fail_pending(&pending, &error);
                 handler.disconnected(error);
                 cancellation.cancel();
             }
@@ -513,29 +619,34 @@ async fn dispatch_loop(
     cancellation.cancel();
 }
 
-async fn fail_pending_with_bearer_provider(
-    pending: &Arc<Mutex<PendingMap>>,
-    error: McpBearerProviderError,
-) {
-    let requests = std::mem::take(&mut *pending.lock().await);
-    for sender in requests.into_values() {
+fn remove_pending(
+    pending: &PendingRequests,
+    id: &JsonRpcId,
+) -> Option<oneshot::Sender<Result<Value>>> {
+    pending
+        .lock()
+        .expect("pending requests lock poisoned")
+        .remove(id)
+}
+
+fn take_pending(pending: &PendingRequests) -> PendingMap {
+    std::mem::take(&mut *pending.lock().expect("pending requests lock poisoned"))
+}
+
+fn fail_pending_with_bearer_provider(pending: &PendingRequests, error: McpBearerProviderError) {
+    for sender in take_pending(pending).into_values() {
         drop(sender.send(Err(Error::BearerProvider(error))));
     }
 }
 
-async fn fail_pending(pending: &Arc<Mutex<PendingMap>>, error: &str) {
-    let requests = std::mem::take(&mut *pending.lock().await);
-    for sender in requests.into_values() {
+fn fail_pending(pending: &PendingRequests, error: &str) {
+    for sender in take_pending(pending).into_values() {
         drop(sender.send(Err(Error::protocol(error.to_owned()))));
     }
 }
 
-async fn fail_pending_with_authorization(
-    pending: &Arc<Mutex<PendingMap>>,
-    error: &McpAuthorizationError,
-) {
-    let requests = std::mem::take(&mut *pending.lock().await);
-    for sender in requests.into_values() {
+fn fail_pending_with_authorization(pending: &PendingRequests, error: &McpAuthorizationError) {
+    for sender in take_pending(pending).into_values() {
         drop(sender.send(Err(Error::Authorization(Box::new(error.clone())))));
     }
 }

@@ -1,3 +1,4 @@
+pub(super) mod framed;
 mod http;
 mod sse;
 mod stdio;
@@ -16,6 +17,8 @@ use http::StreamableHttpTransport;
 use stdio::StdioTransport;
 
 use self::sse::{DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_SSE_LINE_BYTES};
+
+pub use framed::McpFramedChannel;
 
 /// Bounds applied while receiving MCP transport messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
