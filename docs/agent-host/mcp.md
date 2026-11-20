@@ -63,9 +63,11 @@ MCP server selection is part of the selected agent definition stored with the se
 
 ## Current Connection Authority
 
-Every normal run and template search reconstruction uses the cycle's selected agent definition. Waltr resolves all MCP keys against the current catalog snapshot. The current stdio command or Streamable HTTP URL is authoritative. Provider resource changes do not affect MCP resolution.
+Every normal run and template search resolves the selected agent's MCP keys against the current catalog. Streamable HTTP connects from the Waltr server and uses the current URL.
 
-A new reconstruction, including one after an agent switch, sees selected server additions, removals, command changes, URL changes, transport changes, and definition trace changes. An active captured runtime continues with its old MCP runtime. Unselected server changes have no effect. An absent required include fails that reconstruction instead of exposing a stale cached runtime.
+Stdio connects through the session's selected worker and starts in the session's working directory. The local worker uses the server's catalog. For an exported workspace, the destination selects an exact stdio resource name and the exporter supplies the command. The destination never sends its command to a remote worker. An unauthorized target, unavailable worker, or older worker without stdio support fails without fallback.
+
+A new reconstruction sees changes to selected resources and agent trace settings. An absent required include fails that reconstruction; it cannot use a stale cached runtime. A selected stdio resource change can revoke an active channel before the next reconstruction.
 
 Template search uses the same current resolution. It treats MCP preparation failures as best effort and continues without MCP templates. It never returns templates from a stale mismatched runtime.
 
@@ -95,9 +97,9 @@ The server host registry caches one MCP runtime per durable session. Its structu
 With Skills enabled, it also incorporates a digest of each selected server's current bearer token.
 This binds Skills runtime identity to credential changes and opt-in state. Provider settings and unselected MCP entries do not affect the fingerprint.
 
-An equal fingerprint reuses the cached runtime after credential preflight and exact incarnation, credentialed-server, and Apps-authority checks. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. A successful swap enqueues shutdown of the replaced runtime immediately; outstanding users do not keep its authority alive. Host retirement joins those shutdown tasks.
+Reuse requires matching fingerprints, credentials, session incarnation, and Apps authority. Stdio also requires the same workspace owner and directory, worker connection, and live channel. Provider-only and unselected resource changes do not force a replacement. A failed reconstruction cannot use the stale runtime. A successful replacement retires the old runtime even if callers still hold it.
 
-Session shutdown drains generic run ownership; server host retirement drains the MCP registry and private policy state. It awaits each `McpClientRuntime::shutdown`, including generic client stdio shutdown and child reaping. No additional bounded termination guarantee exists beyond that contract.
+Server host retirement drains the MCP registry and waits for runtime shutdown. The worker owns termination and reaps the direct child. If the server loses the worker's confirmation, it reports cleanup as unconfirmed. Neither worker disconnect nor an uncertain MCP outcome triggers replay.
 
 ## Tool Discovery
 
@@ -383,7 +385,7 @@ Server upstream transports use a bearer provider rather than copying one token i
 - MCP server instructions are injected into the provider system prompt by default for factory-built session runtimes; this is a factory policy, not generic MCP protocol behavior.
 - Resource URI subscriptions, sampling, and task runtime extensions are not implemented. List-change subscriptions and operation-bound roots/form/URL MRTR inputs are supported.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
-- Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
+- Stdio uses the session's working directory and clears the child environment. The agent MCP config does not override either.
 - Session RPC and UI timeline results expose the safe text projection rather than inline image data; direct model delivery and durable agent replay retain validated image blocks.
 - MCP server resources select `streamableHttp` or `stdio`. See [Resource Catalog](../architecture/config.md#resource-schemas).
 - Streamable HTTP sends one POST per message and uses request-scoped JSON or event-stream responses. Protocol sessions, GET delivery, resumability, and DELETE termination are absent.
@@ -404,7 +406,7 @@ Focused coverage:
 | [../../crates/waltr-server/src/bin/waltr-server-test-mcp-server.rs](../../crates/waltr-server/src/bin/waltr-server-test-mcp-server.rs) | Test MCP server binary. |
 | [../../crates/waltr-server/tests/mcp_oauth_server.rs](../../crates/waltr-server/tests/mcp_oauth_server.rs) | Waltr-hosted issuer, browser bridge/consent, token lifecycle, direct-upstream rejection, and restart behavior. |
 
-Stdio shutdown and child reaping belong to the server host retirement path and the generic transport contract, not the generic agent coordinator.
+The server host requests stdio shutdown; the worker owns the child and confirms reaping. The generic agent coordinator owns neither.
 
 ## References
 

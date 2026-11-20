@@ -264,7 +264,33 @@ impl CapabilityDispatcher {
         &self,
         identity: &str,
         expected_revision: &str,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        self.dispatch_bound(identity, expected_revision, context, false)
+            .await
+    }
+
+    pub(crate) async fn dispatch_routine_mcp(
+        &self,
+        target: &super::authorized_tools::ConcreteToolTarget,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        let Some(binding) = context.host_dispatch() else {
+            return Ok(context
+                .result("durable dispatch association is required")
+                .with_error());
+        };
+        let revision = binding.source_revision.clone();
+        self.dispatch_bound(&target.permission_name(), &revision, context, true)
+            .await
+    }
+
+    async fn dispatch_bound(
+        &self,
+        identity: &str,
+        expected_revision: &str,
         mut context: ToolExecutionContext,
+        routine: bool,
     ) -> Result<ToolResult> {
         if context.host_dispatch().is_none() {
             return Ok(context
@@ -458,7 +484,36 @@ impl CapabilityDispatcher {
         {
             return Ok(context.result(error.to_string()).with_error());
         }
-        capability.tool.call(context).await
+        if !routine {
+            return capability.tool.call(context).await;
+        }
+        let mut result = capability.tool.call(context.clone()).await?;
+        if let Some((chain, policy)) = &self.context {
+            use super::middleware::{
+                HookOutcome,
+                context::{MiddlewareStateLog, ToolResultContext},
+            };
+            let mut state =
+                MiddlewareStateLog::from_values(context.result_metadata().context_snapshot());
+            if let HookOutcome::ReplaceToolResult(replacement) = chain
+                .after_tool_call(&mut ToolResultContext {
+                    call: Some(context.call()),
+                    result: &mut result,
+                    middleware_state: &mut state,
+                    middleware_chain: chain.clone(),
+                    permission_policy: policy.clone(),
+                    cancellation_token: context.cancellation_token().clone(),
+                    session_id: context
+                        .session_id()
+                        .map_or("", waltr_agent::SessionId::as_str),
+                    turn: context.turn().unwrap_or_default(),
+                })
+                .await?
+            {
+                result = replacement;
+            }
+        }
+        Ok(result)
     }
 }
 

@@ -3,7 +3,8 @@
 use super::super::runtime_factory::{
     McpRuntimeFingerprint, PreparedMcpRuntime, ServerAgentRuntimeFactory,
 };
-use super::{McpClientRuntime, runtime::McpRuntimeStartError};
+use super::super::sandbox_gateway::SandboxHandle;
+use super::{McpClientRuntime, runtime::McpRuntimeStartError, worker_stdio::WorkerStdio};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -19,11 +20,29 @@ struct Cached {
     incarnation: String,
     fingerprint: McpRuntimeFingerprint,
     credentialed: BTreeSet<String>,
+    worker: Option<WorkerStdio>,
+    root: Option<String>,
+}
+
+struct PreparedReply {
+    runtime: Option<Arc<McpClientRuntime>>,
+    installed: bool,
+}
+
+impl Drop for PreparedReply {
+    fn drop(&mut self) {
+        if self.installed
+            && let Some(runtime) = &self.runtime
+        {
+            runtime.cancel();
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct ServerMcpRegistry {
     lifecycle: Arc<tokio::sync::RwLock<()>>,
+    stdio_admission: Arc<tokio::sync::Mutex<()>>,
     preparations: Mutex<Vec<Arc<Retirement>>>,
     entries: Mutex<BTreeMap<SessionId, Cached>>,
     preparation: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
@@ -67,11 +86,42 @@ fn retirement_error(message: impl Into<String>) -> waltr_agent::LlmError {
 }
 
 impl ServerMcpRegistry {
+    pub(crate) fn stdio_admission(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.stdio_admission.clone()
+    }
+
     pub(crate) async fn runtime<S>(
         self: &Arc<Self>,
         factory: &ServerAgentRuntimeFactory,
         record: &SessionRecord,
         sessions: &SessionCoordinator<S>,
+    ) -> Result<Option<Arc<McpClientRuntime>>, AgentSessionRuntimeError>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        self.runtime_inner(factory, record, sessions, None).await
+    }
+
+    pub(crate) async fn runtime_in_workspace<S>(
+        self: &Arc<Self>,
+        factory: &ServerAgentRuntimeFactory,
+        workspace: &SandboxHandle,
+        record: &SessionRecord,
+        sessions: &SessionCoordinator<S>,
+    ) -> Result<Option<Arc<McpClientRuntime>>, AgentSessionRuntimeError>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        self.runtime_inner(factory, record, sessions, Some(workspace.clone()))
+            .await
+    }
+
+    async fn runtime_inner<S>(
+        self: &Arc<Self>,
+        factory: &ServerAgentRuntimeFactory,
+        record: &SessionRecord,
+        sessions: &SessionCoordinator<S>,
+        workspace: Option<SandboxHandle>,
     ) -> Result<Option<Arc<McpClientRuntime>>, AgentSessionRuntimeError>
     where
         S: SessionStore + Clone + Send + Sync + 'static,
@@ -82,12 +132,49 @@ impl ServerMcpRegistry {
         let factory = factory.clone();
         let record = record.clone();
         let sessions = sessions.clone();
-        let (reply, receive) = tokio::sync::oneshot::channel();
+        let (mut reply, receive) = tokio::sync::oneshot::channel();
         let task_lifecycle = lifecycle.clone();
         let task = tokio::spawn(async move {
             let _lifecycle = task_lifecycle;
-            let result = owner.prepare(&factory, &record, &sessions).await;
-            drop(reply.send(result));
+            let guard = owner
+                .preparation
+                .lock()
+                .expect("MCP preparation lock poisoned")
+                .entry(record.id.clone())
+                .or_default()
+                .clone();
+            let _preparation = guard.lock().await;
+            if reply.is_closed() {
+                return Ok(());
+            }
+            let preparation = CancellationToken::new();
+            let work = owner.prepare(
+                &factory,
+                &record,
+                &sessions,
+                workspace.as_ref(),
+                &preparation,
+            );
+            tokio::pin!(work);
+            let result = tokio::select! {
+                () = reply.closed() => {
+                    preparation.cancel();
+                    work.await
+                }
+                result = &mut work => result,
+            };
+            match result {
+                Ok((runtime, installed)) => {
+                    if reply
+                        .send(Ok(PreparedReply { runtime, installed }))
+                        .is_err()
+                        && installed
+                    {
+                        owner.evict(&record.id);
+                    }
+                }
+                Err(error) => drop(reply.send(Err(error))),
+            }
             Ok(())
         });
         self.preparations
@@ -98,9 +185,10 @@ impl ServerMcpRegistry {
                 outcome: Mutex::new(None),
             }));
         drop(lifecycle);
-        receive.await.map_err(|_| {
+        let mut prepared = receive.await.map_err(|_| {
             AgentSessionRuntimeError::Internal("MCP preparation completion unavailable".into())
-        })?
+        })??;
+        Ok(prepared.runtime.take())
     }
 
     async fn prepare<S>(
@@ -108,7 +196,9 @@ impl ServerMcpRegistry {
         factory: &ServerAgentRuntimeFactory,
         record: &SessionRecord,
         sessions: &SessionCoordinator<S>,
-    ) -> Result<Option<Arc<McpClientRuntime>>, AgentSessionRuntimeError>
+        workspace: Option<&SandboxHandle>,
+        preparation: &CancellationToken,
+    ) -> Result<(Option<Arc<McpClientRuntime>>, bool), AgentSessionRuntimeError>
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
@@ -118,23 +208,44 @@ impl ServerMcpRegistry {
             .clone()
             .filter(|value| !value.is_empty())
             .ok_or_else(stale)?;
-        let guard = self
-            .preparation
-            .lock()
-            .expect("MCP preparation lock poisoned")
-            .entry(record.id.clone())
-            .or_default()
-            .clone();
-        let _preparation = guard.lock().await;
-        let prepared = match factory.mcp_feature_for_session(record)? {
-            Some(feature) => factory.prepare_mcp_runtime(&feature).await?,
-            None => None,
+        let prepared = tokio::select! {
+            biased;
+            () = preparation.cancelled() => return Err(preparation_canceled()),
+            result = async {
+                match factory.mcp_feature_for_session(record)? {
+                    Some(feature) => factory.prepare_mcp_runtime(&feature).await,
+                    None => Ok(None),
+                }
+            } => result?,
         };
         validate_record(sessions, record).await?;
-        let Some(prepared) = prepared else {
+        let Some(mut prepared) = prepared else {
             self.evict(&record.id);
-            return Ok(None);
+            return Ok((None, false));
         };
+        let has_stdio = prepared.connections.iter().any(|connection| {
+            connection.kind == super::super::runtime_factory::McpConnectionKind::Stdio
+        });
+        let worker = if !has_stdio {
+            None
+        } else if let Some(workspace) = workspace {
+            Some(factory.worker_stdio(workspace)?)
+        } else {
+            let restored = tokio::select! {
+                biased;
+                () = preparation.cancelled() => return Err(preparation_canceled()),
+                result = factory.for_session_workspace(record) => result?,
+            };
+            Some(factory.worker_stdio(&restored.sandbox)?)
+        };
+        let root = prepared
+            .connections
+            .iter()
+            .any(|connection| {
+                connection.kind == super::super::runtime_factory::McpConnectionKind::StreamableHttp
+            })
+            .then(|| factory.mcp_root_uri().ok())
+            .flatten();
         let cached = self
             .entries
             .lock()
@@ -145,22 +256,59 @@ impl ServerMcpRegistry {
             cached.incarnation == incarnation
                 && cached.fingerprint == prepared.fingerprint
                 && cached.credentialed == prepared.credentialed_servers
+                && cached.root == root
                 && cached.runtime.app_sources() == prepared.config.app_sources()
+                && cached.runtime.reusable()
+                && match (&cached.worker, &worker) {
+                    (None, None) => true,
+                    (Some(cached), Some(prepared)) => cached.same_target(prepared),
+                    _ => false,
+                }
         }) {
-            factory
-                .preflight_cached_mcp_authentication(&prepared.connections, &cached.credentialed)
-                .await?;
+            tokio::select! {
+                biased;
+                () = preparation.cancelled() => return Err(preparation_canceled()),
+                result = factory.preflight_cached_mcp_authentication(
+                    &prepared.connections,
+                    &cached.credentialed,
+                ) => result?,
+            }
             validate_record(sessions, record).await?;
-            return Ok(Some(cached.runtime));
+            if cached.runtime.reusable() {
+                return Ok((Some(cached.runtime), false));
+            }
         }
-        let root = factory.mcp_root_uri()?;
-        let runtime =
-            McpClientRuntime::start(prepared.config.clone(), root, CancellationToken::new())
-                .await
-                .map_err(|error| start_error(error, &prepared))?;
+        if preparation.is_cancelled() {
+            return Err(preparation_canceled());
+        }
+        self.evict(&record.id);
+        if let Some(worker) = &worker {
+            prepared.config = prepared
+                .config
+                .clone()
+                .with_worker_stdio(worker, &prepared.connections);
+        }
+        let lifetime = if has_stdio {
+            preparation.clone()
+        } else {
+            CancellationToken::new()
+        };
+        let runtime = McpClientRuntime::start_with_optional_root(
+            prepared.config.clone(),
+            root.clone(),
+            lifetime,
+        )
+        .await
+        .map_err(|error| start_error(error, &prepared))?;
         if let Err(error) = validate_record(sessions, record).await {
-            drop(runtime.shutdown().await);
+            self.enqueue(record.id.clone(), runtime);
             return Err(error);
+        }
+        if !runtime.reusable() {
+            self.enqueue(record.id.clone(), runtime);
+            return Err(AgentSessionRuntimeError::FailedPrecondition(
+                "worker MCP stdio connection closed during preparation".into(),
+            ));
         }
         let replaced = self
             .entries
@@ -173,15 +321,18 @@ impl ServerMcpRegistry {
                     incarnation,
                     fingerprint: prepared.fingerprint,
                     credentialed: prepared.credentialed_servers,
+                    worker,
+                    root,
                 },
             );
         if let Some(replaced) = replaced {
             self.enqueue(record.id.clone(), replaced.runtime);
         }
-        Ok(Some(runtime))
+        Ok((Some(runtime), has_stdio))
     }
 
     fn enqueue(&self, session: SessionId, runtime: Arc<McpClientRuntime>) {
+        runtime.cancel();
         let task = tokio::spawn(async move { runtime.shutdown().await });
         let retirement = Arc::new(Retirement {
             task: tokio::sync::Mutex::new(Some(task)),
@@ -342,6 +493,10 @@ fn stale() -> AgentSessionRuntimeError {
     )
 }
 
+fn preparation_canceled() -> AgentSessionRuntimeError {
+    AgentSessionRuntimeError::FailedPrecondition("MCP runtime preparation was canceled".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +578,10 @@ mod tests {
         assert!(validate_record(&sessions, &original).await.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "registry_worker_tests.rs"]
+mod registry_worker_tests;
 
 fn start_error(
     error: McpRuntimeStartError,

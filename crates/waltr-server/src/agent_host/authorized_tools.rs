@@ -100,6 +100,24 @@ pub struct ConcreteToolSummary {
 }
 
 impl CapabilityDispatcher {
+    pub(crate) fn routine_mcp_alias(&self, target: &ConcreteToolTarget) -> Option<String> {
+        let mut matches = self.capabilities().filter(|capability| {
+            capability.concrete_target.as_ref() == Some(target)
+                && capability
+                    .mcp_app_source
+                    .as_ref()
+                    .is_some_and(|source| source.ui.visible_to(mcp::apps::UiVisibility::Model))
+        });
+        let alias = matches.next()?.definition().name.clone();
+        (matches.next().is_none()
+            && self
+                .permission_policy()
+                .evaluate_target_tool_effect(&target.permission_name(), &alias)
+                .level
+                != PermissionLevel::Deny)
+            .then_some(alias)
+    }
+
     /// Discover a bounded exact-identity page under both concrete and alias policy.
     pub fn concrete_tool_page(
         &self,

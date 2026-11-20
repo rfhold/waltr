@@ -28,6 +28,26 @@ use waltr_agent::{
 #[path = "runtime_factory/test_sandbox.rs"]
 pub(super) mod test_sandbox;
 mod workspaces;
+
+struct RoutineNoInference;
+
+impl LlmStream for RoutineNoInference {
+    fn name(&self) -> &'static str {
+        "routine-no-inference"
+    }
+
+    fn stream_request<'a>(
+        &'a self,
+        _: waltr_agent::CompletionRequest<'a>,
+    ) -> waltr_agent::BoxStreamFuture<'a> {
+        Box::pin(async {
+            Err(LlmError::Protocol {
+                provider: "routine-no-inference",
+                message: "Routine MCP calls cannot run inference".into(),
+            })
+        })
+    }
+}
 use std::time::{SystemTime, UNIX_EPOCH};
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -123,7 +143,7 @@ where
             let mcp = self
                 .factory
                 .mcp_registry
-                .runtime(&self.factory, record, &self.sessions)
+                .runtime_in_workspace(&self.factory, &factory.sandbox, record, &self.sessions)
                 .await
                 .map_err(host_runtime_error)?;
             let host = self.owner.upgrade().ok_or_else(|| LlmError::Protocol {
@@ -173,7 +193,7 @@ where
             let mcp = self
                 .factory
                 .mcp_registry
-                .runtime(&self.factory, record, &self.sessions)
+                .runtime_in_workspace(&self.factory, &factory.sandbox, record, &self.sessions)
                 .await
                 .ok()
                 .flatten();
@@ -275,7 +295,7 @@ pub type McpConnectionResolveFuture = Pin<
     Box<dyn Future<Output = Result<Vec<McpResolvedConnection>, AgentSessionRuntimeError>> + Send>,
 >;
 
-type McpConnectionResolver =
+pub(crate) type McpConnectionResolver =
     Arc<dyn Fn(McpConnectionResolveRequest) -> McpConnectionResolveFuture + Send + Sync>;
 
 /// Identity of a prepared MCP runtime. Skills additionally bind credential incarnations.
@@ -333,6 +353,7 @@ pub struct ServerAgentRuntimeFactory {
     catalog_provider: Option<AgentCatalogProvider>,
     providers: waltr_agent::AgentSessionRuntimeFactory,
     mcp_connection_resolver: Option<McpConnectionResolver>,
+    mcp_resource_state: Option<crate::agent_definition::AgentDefinitionState>,
     code_tool_provider: Option<CodeToolProvider>,
     host_tool_provider: Option<HostToolProvider>,
     policy: Arc<dyn super::dispatcher::CapabilityPolicy>,
@@ -543,6 +564,7 @@ impl ServerAgentRuntimeFactory {
             catalog_provider: None,
             providers,
             mcp_connection_resolver: None,
+            mcp_resource_state: None,
             code_tool_provider: None,
             host_tool_provider: None,
             policy: Arc::new(super::dispatcher::UnconfiguredPolicy),
@@ -644,6 +666,14 @@ impl ServerAgentRuntimeFactory {
         + 'static,
     ) -> Self {
         self.mcp_connection_resolver = Some(Arc::new(resolve));
+        self
+    }
+
+    pub(crate) fn with_mcp_resource_state(
+        mut self,
+        state: crate::agent_definition::AgentDefinitionState,
+    ) -> Self {
+        self.mcp_resource_state = Some(state);
         self
     }
 
@@ -940,7 +970,10 @@ impl ServerAgentRuntimeFactory {
         S: SessionStore + Clone + Send + Sync + 'static,
     {
         let factory = self.for_session_workspace(record).await?;
-        let mcp = self.mcp_registry.runtime(self, record, &sessions).await?;
+        let mcp = self
+            .mcp_registry
+            .runtime_in_workspace(self, &factory.sandbox, record, &sessions)
+            .await?;
         factory.runtime_from_workspace(record, sessions, mcp).await
     }
 
@@ -968,13 +1001,30 @@ impl ServerAgentRuntimeFactory {
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        let factory = self;
         let settings = record.inference_settings.as_ref().ok_or_else(|| {
             AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required before prompting".to_owned(),
             )
         })?;
-        let definition = factory.definition_for_session(record)?;
+        let definition = self.definition_for_session(record)?;
+        let builder = self.base_runtime_builder(settings, &definition).await?;
+        self.assemble_runtime(record, sessions, mcp_runtime, definition, builder, None)
+            .await
+    }
+
+    async fn assemble_runtime<S>(
+        &self,
+        record: &SessionRecord,
+        sessions: SessionCoordinator<S>,
+        mcp_runtime: Option<Arc<McpClientRuntime>>,
+        definition: ResolvedAgent,
+        mut builder: HostRuntimeBuilder,
+        routine: Option<Arc<crate::permission::ServerPermissionPolicy>>,
+    ) -> Result<(AgentRuntime, super::dispatcher::CapabilityDispatcher), AgentSessionRuntimeError>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        let factory = self;
         let identity = record.agent_definition.as_ref().map_or_else(
             || {
                 factory.catalog.as_ref().map_or_else(
@@ -988,7 +1038,6 @@ impl ServerAgentRuntimeFactory {
                     .unwrap_or_default()
             },
         );
-        let mut builder = factory.base_runtime_builder(settings, &definition).await?;
         builder = builder.with_system_prompt_identity(identity);
         if let Some(task) = definition.features.task.as_ref() {
             let captured_bundle = record.agent_definition.clone().or_else(|| {
@@ -1019,7 +1068,10 @@ impl ServerAgentRuntimeFactory {
                 builder = builder.with_mcp_skills(Arc::clone(&mcp_runtime));
             }
             {
-                for tool in mcp_runtime.agent_tools(factory.policy.clone()).await {
+                for tool in mcp_runtime
+                    .agent_tools_with_routine_policy(factory.policy.clone(), routine.clone())
+                    .await
+                {
                     mcp_tool_names.push(tool.definition().name.clone());
                     mcp_tool_names.push(tool.identity());
 
@@ -1081,9 +1133,12 @@ impl ServerAgentRuntimeFactory {
         if let Some(restriction) = &factory.restriction {
             policy = policy.intersection(restriction.clone());
         }
+        let dispatch_policy = routine
+            .map(|policy| policy as Arc<dyn super::dispatcher::CapabilityPolicy>)
+            .unwrap_or_else(|| factory.policy.clone());
         let mut builder = builder
             .with_permission_policy(policy)
-            .with_dispatch_context(Some(record.id.clone()), factory.policy.clone());
+            .with_dispatch_context(Some(record.id.clone()), dispatch_policy);
         if let Some(provide) = &factory.host_tool_provider {
             let (runtime, dispatcher) = builder.clone().build_with_dispatcher();
             for tool in provide(record, runtime, dispatcher)? {
@@ -1123,6 +1178,146 @@ impl ServerAgentRuntimeFactory {
             builder = builder.with_tool(tool);
         }
         Ok(builder.build_with_dispatcher())
+    }
+
+    fn routine_builder(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<HostRuntimeBuilder, AgentSessionRuntimeError> {
+        let pinned = &record
+            .inference_settings
+            .as_ref()
+            .ok_or_else(|| {
+                AgentSessionRuntimeError::FailedPrecondition(
+                    "session runtime settings are required".into(),
+                )
+            })?
+            .provider;
+        let provider = match pinned.api {
+            waltr_agent::ModelApi::AnthropicMessages => waltr_agent::ProviderId::Anthropic,
+            _ => waltr_agent::ProviderId::OpenAi,
+        };
+        let model = ModelRef::new(provider, pinned.model_id.clone(), pinned.api);
+        Ok(HostRuntimeBuilder::from_provider(
+            waltr_agent::AgentRuntimeBuilder::new(model, Arc::new(RoutineNoInference)),
+        ))
+    }
+
+    pub(crate) fn routine_source_permissions(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<PermissionPolicy, AgentSessionRuntimeError> {
+        let definition = self.definition_for_session(record)?;
+        let builder = self.routine_builder(record)?;
+        let policy = self.definition_permission_policy(&definition, builder.model(), &[]);
+        Ok(match &self.restriction {
+            Some(ceiling) => policy.intersection(ceiling.clone()),
+            None => policy,
+        })
+    }
+
+    pub(crate) fn routine_mcp_preflight_policy(
+        &self,
+        record: &SessionRecord,
+        target: &super::authorized_tools::ConcreteToolTarget,
+        ceiling: Option<&PermissionPolicy>,
+    ) -> Result<(String, PermissionPolicy), AgentSessionRuntimeError> {
+        let alias = super::mcp::name::direct_tool_name(target.server(), target.tool());
+        let identity = target.permission_name();
+        let definition = self.definition_for_session(record)?;
+        let builder = self.routine_builder(record)?;
+        let policy = self.definition_permission_policy(
+            &definition,
+            builder.model(),
+            &[alias.clone(), identity.clone()],
+        );
+        let policy = [self.restriction.as_ref(), ceiling]
+            .into_iter()
+            .flatten()
+            .fold(policy, |policy, ceiling| {
+                policy.intersection(ceiling.clone())
+            });
+        Ok((alias, policy))
+    }
+
+    pub(crate) async fn routine_mcp_dispatcher<S>(
+        &self,
+        record: &SessionRecord,
+        sessions: SessionCoordinator<S>,
+        runtime: Arc<McpClientRuntime>,
+        sandbox: Option<super::sandbox_gateway::SandboxHandle>,
+        ceiling: Option<PermissionPolicy>,
+        policy: Arc<crate::permission::ServerPermissionPolicy>,
+    ) -> Result<super::dispatcher::CapabilityDispatcher, AgentSessionRuntimeError>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        let mut factory = self.clone().for_concrete_calls();
+        if let Some(ceiling) = ceiling {
+            factory.restriction = Some(match factory.restriction.take() {
+                Some(existing) => existing.intersection(ceiling),
+                None => ceiling,
+            });
+        }
+        if let Some(sandbox) = sandbox {
+            factory.root = sandbox.export_root().ok_or_else(|| {
+                AgentSessionRuntimeError::FailedPrecondition("workspace root unavailable".into())
+            })?;
+            factory.sandbox = sandbox;
+        }
+        let definition = factory.definition_for_session(record)?;
+        let builder = factory.apply_definition(factory.routine_builder(record)?, &definition);
+        let (_, dispatcher) = factory
+            .assemble_runtime(
+                record,
+                sessions,
+                Some(runtime),
+                definition,
+                builder,
+                Some(policy),
+            )
+            .await?;
+        Ok(dispatcher)
+    }
+
+    pub(crate) async fn prepare_routine_mcp(
+        &self,
+        record: &SessionRecord,
+        server: &str,
+        tool: &str,
+    ) -> Result<Option<PreparedMcpRuntime>, AgentSessionRuntimeError> {
+        let Some(mut feature) = self.mcp_feature_for_session(record)? else {
+            return Ok(None);
+        };
+        let Some(resolve) = &self.mcp_connection_resolver else {
+            return Ok(None);
+        };
+        let selected = resolve(McpConnectionResolveRequest {
+            servers: feature.servers.clone(),
+        })
+        .await?;
+        let explicitly_selected = match &feature.servers {
+            McpServerSelection::Include(keys) => keys.contains(server),
+            McpServerSelection::Exclude(keys) => !keys.contains(server),
+        };
+        let alias = super::mcp::name::direct_tool_name(server, tool);
+        if !explicitly_selected
+            || selected.iter().filter(|item| item.key == server).count() != 1
+            || selected.iter().any(|other| {
+                other.key != server
+                    && alias.starts_with(&super::mcp::name::direct_tool_name(&other.key, ""))
+            })
+        {
+            return Ok(None);
+        }
+        feature.servers = McpServerSelection::Include(BTreeSet::from([server.to_owned()]));
+        let prepared = self.prepare_mcp_runtime(&feature).await?;
+        Ok(prepared.filter(|prepared| {
+            prepared.connections.len() == 1
+                && selected
+                    .iter()
+                    .any(|original| original == &prepared.connections[0])
+        }))
     }
 
     #[cfg(test)]
@@ -1297,7 +1492,28 @@ impl ServerAgentRuntimeFactory {
     }
 
     pub(crate) fn mcp_root_uri(&self) -> Result<String, AgentSessionRuntimeError> {
-        Ok(format!("file://{}", self.sandbox_root()?.display()))
+        url::Url::from_file_path(self.sandbox_root()?)
+            .map(Into::into)
+            .map_err(|()| {
+                AgentSessionRuntimeError::FailedPrecondition(
+                    "sandbox worker root is invalid".into(),
+                )
+            })
+    }
+
+    pub(crate) fn worker_stdio(
+        &self,
+        workspace: &super::sandbox_gateway::SandboxHandle,
+    ) -> Result<super::mcp::worker_stdio::WorkerStdio, AgentSessionRuntimeError> {
+        let resolver = self.mcp_connection_resolver.clone().ok_or_else(|| {
+            AgentSessionRuntimeError::FailedPrecondition("MCP configuration unavailable".into())
+        })?;
+        super::mcp::worker_stdio::WorkerStdio::new(
+            workspace,
+            resolver,
+            self.mcp_resource_state.clone(),
+            self.mcp_registry.stdio_admission(),
+        )
     }
 
     async fn provider_builder(
@@ -1500,7 +1716,7 @@ impl ServerAgentRuntimeFactory {
         }))
     }
 
-    async fn mcp_connection_current(&self, server: &McpResolvedConnection) -> bool {
+    pub(crate) async fn mcp_connection_current(&self, server: &McpResolvedConnection) -> bool {
         let Some(resolve) = &self.mcp_connection_resolver else {
             return true;
         };

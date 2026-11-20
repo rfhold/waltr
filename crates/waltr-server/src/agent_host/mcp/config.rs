@@ -4,6 +4,9 @@ use mcp::{McpLogLevel, McpTracePropagation};
 use std::time::Duration;
 use std::{future::Future, pin::Pin, sync::Arc};
 
+use super::worker_stdio::WorkerStdio;
+use crate::agent_host::runtime_factory::{McpConnectionKind, McpResolvedConnection};
+
 pub(crate) type AppAuthorityValidator =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
@@ -213,6 +216,22 @@ impl McpConfig {
             .collect()
     }
 
+    pub(crate) fn with_worker_stdio(
+        mut self,
+        worker: &WorkerStdio,
+        connections: &[McpResolvedConnection],
+    ) -> Self {
+        for config in &mut self.servers {
+            if let Some(connection) = connections
+                .iter()
+                .find(|c| c.kind == McpConnectionKind::Stdio && c.key == config.name)
+            {
+                config.worker_stdio = Some((worker.clone(), connection.clone()));
+            }
+        }
+        self
+    }
+
     pub(super) fn into_parts(
         self,
     ) -> (
@@ -247,6 +266,7 @@ pub struct McpServerConfig {
     pub(super) app_authority: Option<AppAuthority>,
     pub(super) app_authority_validator: Option<AppAuthorityValidator>,
     pub(super) private_endpoint: Option<String>,
+    pub(super) worker_stdio: Option<(WorkerStdio, McpResolvedConnection)>,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -278,6 +298,7 @@ impl McpServerConfig {
             app_authority: None,
             app_authority_validator: None,
             private_endpoint: None,
+            worker_stdio: None,
         }
     }
 
@@ -304,6 +325,7 @@ impl McpServerConfig {
             app_authority: None,
             app_authority_validator: None,
             private_endpoint: None,
+            worker_stdio: None,
         }
     }
 
@@ -324,6 +346,7 @@ impl McpServerConfig {
             app_authority: None,
             app_authority_validator: None,
             private_endpoint: None,
+            worker_stdio: None,
         }
     }
 

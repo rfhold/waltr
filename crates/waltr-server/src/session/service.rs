@@ -187,16 +187,17 @@ where
             }
             SessionCatalogSource::Dynamic(state) => {
                 let state = state.clone();
+                let resource_state = state.clone();
                 runtime_factory
                     .with_agent_catalog_provider(move || state.snapshot().catalog().clone())
+                    .with_mcp_resource_state(resource_state)
             }
         };
         let resolver_config = config.clone();
-        let runtime_factory = runtime_factory
-            .with_mcp_connection_resolver(move |request| {
-                let config = resolver_config.clone();
-                Box::pin(async move { resolve_mcp_connections(&config.load().await, request) })
-            });
+        let runtime_factory = runtime_factory.with_mcp_connection_resolver(move |request| {
+            let config = resolver_config.clone();
+            Box::pin(async move { resolve_mcp_connections(&config.load().await, request) })
+        });
         let provider_factory = runtime_factory.session_factory(sessions.clone());
         let sessions = sessions
             .with_session_event_sink(event_sink)
@@ -628,6 +629,9 @@ where
         request: Request<waltr::grpc::waltr::session::v1::OpenSessionMcpAppRequest>,
     ) -> Result<Response<waltr::grpc::waltr::session::v1::OpenSessionMcpAppResponse>, Status> {
         let owner = super::mcp_apps::owner(&request);
+        let apps = self
+            .app_runtime
+            .for_principal(request.extensions().get::<AuthenticatedPrincipal>());
         let request = request.into_inner();
         if request.session_id.is_empty() || request.call_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -639,8 +643,7 @@ where
         let _guard = cancellation.clone().drop_guard();
         let app = tokio::time::timeout(
             super::mcp_apps::TIMEOUT,
-            self.app_runtime
-                .open_session_mcp_app(&session, &request.call_id, cancellation),
+            apps.open_session_mcp_app(&session, &request.call_id, cancellation),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("MCP app timeout"))?
@@ -665,6 +668,9 @@ where
     ) -> Result<Response<waltr::grpc::waltr::session::v1::CallSessionMcpAppToolResponse>, Status>
     {
         let owner = super::mcp_apps::owner(&request);
+        let apps = self
+            .app_runtime
+            .for_principal(request.extensions().get::<AuthenticatedPrincipal>());
         let request = request.into_inner();
         let entry = self.apps.get(&request.app_id, &owner)?;
         let deadline = tokio::time::Instant::now() + super::mcp_apps::TIMEOUT;
@@ -681,12 +687,7 @@ where
         let _guard = cancellation.clone().drop_guard();
         let result = tokio::time::timeout_at(
             deadline,
-            self.app_runtime.call_session_mcp_app_tool(
-                &entry.handle,
-                &request.name,
-                arguments,
-                cancellation,
-            ),
+            apps.call_session_mcp_app_tool(&entry.handle, &request.name, arguments, cancellation),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("MCP app timeout"))?

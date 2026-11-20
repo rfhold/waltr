@@ -19,7 +19,7 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
-use waltr_agent::ToolExecutionContext;
+use waltr_agent::{SessionId, ToolExecutionContext};
 
 #[derive(Default)]
 struct Approvals {
@@ -31,6 +31,17 @@ struct Approvals {
 pub struct ServerPermissionPolicy {
     broker: InteractionBroker,
     approvals: Mutex<Approvals>,
+    routine: Option<RoutinePermissionBinding>,
+}
+
+type SourceCheck =
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync;
+
+struct RoutinePermissionBinding {
+    operation: OperationBinding,
+    session: SessionId,
+    incarnation: String,
+    current: Arc<SourceCheck>,
 }
 
 impl ServerPermissionPolicy {
@@ -38,8 +49,51 @@ impl ServerPermissionPolicy {
         Arc::new(Self {
             broker,
             approvals: Mutex::default(),
+            routine: None,
         })
     }
+
+    /// Use the normal permission policy with a fresh cache and an already authorized live
+    /// source route. This binding is usable only by the matching durable Routine operation.
+    pub(crate) fn routine(
+        normal: &dyn CapabilityPolicy,
+        context: &ToolExecutionContext,
+        incarnation: String,
+        current: Arc<SourceCheck>,
+    ) -> Option<Arc<Self>> {
+        let session = context.session_id()?.clone();
+        let dispatch = context.host_dispatch()?;
+        let (broker, operation) = normal.interaction_binding(context)?;
+        if incarnation.is_empty()
+            || operation.operation_id != dispatch.invocation_id
+            || !matches!(&operation.destination, InteractionDestination::Session(id) if *id == session)
+            || operation.cancellation.is_cancelled()
+        {
+            return None;
+        }
+        Some(Arc::new(Self {
+            broker,
+            approvals: Mutex::default(),
+            routine: Some(RoutinePermissionBinding {
+                operation,
+                session,
+                incarnation,
+                current,
+            }),
+        }))
+    }
+
+    pub(crate) async fn routine_current(&self, context: &ToolExecutionContext) -> bool {
+        if let Some(routine) = &self.routine {
+            self.binding(context).is_ok()
+                && (routine.current)().await
+                && !context.is_cancelled()
+                && !routine.operation.cancellation.is_cancelled()
+        } else {
+            false
+        }
+    }
+
     fn binding(
         &self,
         context: &ToolExecutionContext,
@@ -47,6 +101,17 @@ impl ServerPermissionPolicy {
         let operation = context
             .host_dispatch()
             .ok_or(InteractionError::Unavailable)?;
+        if let Some(routine) = &self.routine {
+            return if operation.invocation_id == routine.operation.operation_id
+                && context.session_id() == Some(&routine.session)
+                && !context.is_cancelled()
+                && !routine.operation.cancellation.is_cancelled()
+            {
+                Ok(routine.operation.clone())
+            } else {
+                Err(InteractionError::Unavailable)
+            };
+        }
         let destination = InteractionDestination::Session(
             context
                 .session_id()
@@ -99,6 +164,9 @@ impl CapabilityPolicy for ServerPermissionPolicy {
             if context.is_cancelled() {
                 return Ok(Some("permission operation cancelled".into()));
             }
+            if self.routine.is_some() && !self.routine_current(context).await {
+                return Ok(Some("Routine source authority is no longer current".into()));
+            }
             let call = context.call();
             let input = policy.evaluate_input(&call.name, &call.arguments);
             let tool_effect = policy.evaluate_target_tool_effect(identity, &call.name);
@@ -128,7 +196,12 @@ impl CapabilityPolicy for ServerPermissionPolicy {
             if !denied.is_empty() {
                 return Ok(Some(super::policy_denial_message(&denied)));
             }
-            let Some(incarnation) = context.session_incarnation() else {
+            let Some(incarnation) = self
+                .routine
+                .as_ref()
+                .map(|routine| routine.incarnation.as_str())
+                .or_else(|| context.session_incarnation())
+            else {
                 return Ok(Some(
                     "permission operation has no durable session incarnation".into(),
                 ));
@@ -169,8 +242,13 @@ impl CapabilityPolicy for ServerPermissionPolicy {
             if tool != PermissionLevel::Ask && ask.is_empty() {
                 return Ok(None);
             }
-            let receipt =
-                serde_json::to_string(&(identity, policy.identity(), &call.arguments, &ask))?;
+            let receipt = if self.routine.is_some() {
+                // Discovery and full dispatch may build different rule sets. Reuse consent
+                // only for the same alias, arguments and requested claims in this operation.
+                serde_json::to_string(&(identity, &call.name, &call.arguments, &ask))?
+            } else {
+                serde_json::to_string(&(identity, policy.identity(), &call.arguments, &ask))?
+            };
             if self
                 .approvals
                 .lock()
@@ -181,7 +259,11 @@ impl CapabilityPolicy for ServerPermissionPolicy {
             {
                 return Ok(None);
             }
-            let suggested = suggested_patterns(&ask);
+            let suggested = if self.routine.is_some() {
+                Vec::new()
+            } else {
+                suggested_patterns(&ask)
+            };
             let response = self
                 .broker
                 .interact(
@@ -194,6 +276,9 @@ impl CapabilityPolicy for ServerPermissionPolicy {
                     },
                 )
                 .await;
+            if self.routine.is_some() && !self.routine_current(context).await {
+                return Ok(Some("Routine source authority is no longer current".into()));
+            }
             match response {
                 Ok(InteractionResponse::Permission(response)) if !context.is_cancelled() => {
                     match response {
@@ -205,7 +290,9 @@ impl CapabilityPolicy for ServerPermissionPolicy {
                             {
                                 return Ok(Some("permission approval capacity reached".into()));
                             }
-                            if let PermissionResponse::AllowAlways { patterns } = response {
+                            if let PermissionResponse::AllowAlways { patterns } = response
+                                && self.routine.is_none()
+                            {
                                 if approvals.patterns.len() >= 4096
                                     && !approvals.patterns.contains_key(&key)
                                 {
@@ -253,7 +340,19 @@ impl CapabilityPolicy for ServerPermissionPolicy {
         context: &'a ToolExecutionContext,
         request: Interaction,
     ) -> InteractionFuture<'a> {
-        Box::pin(async move { self.broker.interact(&self.binding(context)?, request).await })
+        Box::pin(async move {
+            if self.routine.is_some() && !self.routine_current(context).await {
+                return Err(InteractionError::Unavailable);
+            }
+            let response = self
+                .broker
+                .interact(&self.binding(context)?, request)
+                .await?;
+            if self.routine.is_some() && !self.routine_current(context).await {
+                return Err(InteractionError::Unavailable);
+            }
+            Ok(response)
+        })
     }
     fn finished(&self, operation_id: &str) {
         self.approvals

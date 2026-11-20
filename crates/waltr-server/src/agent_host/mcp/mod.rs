@@ -5,12 +5,13 @@ mod config;
 pub mod elicitation;
 mod error;
 mod event;
-mod name;
+pub(super) mod name;
 pub mod registry;
 mod runtime;
 mod server;
 pub mod session_apps;
 pub(crate) mod skills;
+pub(crate) mod worker_stdio;
 
 pub use config::{McpAppCredentialProvider, McpConfig, McpServerConfig, McpTransportConfig};
 pub use mcp::McpLogLevel;

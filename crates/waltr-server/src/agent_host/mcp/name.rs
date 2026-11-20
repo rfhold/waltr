@@ -1,4 +1,4 @@
-pub(in crate::agent_host::mcp) fn direct_tool_name(server: &str, tool: &str) -> String {
+pub(in crate::agent_host) fn direct_tool_name(server: &str, tool: &str) -> String {
     format!(
         "{}__{}",
         sanitize_tool_part(server),

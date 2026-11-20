@@ -8,8 +8,12 @@ use super::{
     apps::{MCP_APP_ASSOCIATION, McpAppAssociation},
     elicitation::McpOperation,
 };
-use crate::agent_host::{
-    dispatcher::CapabilityDispatcher, runtime_factory::ServerAgentRuntimeFactory,
+use crate::{
+    access_auth::AuthenticatedPrincipal,
+    agent_host::{
+        dispatcher::CapabilityDispatcher, runtime_factory::ServerAgentRuntimeFactory,
+        sandbox_gateway::WorkspaceAccount,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -101,12 +105,30 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> ServerMcpApps<S> {
             slots: Arc::new(tokio::sync::Semaphore::new(32)),
         }
     }
+    pub(crate) fn for_principal(&self, principal: Option<&AuthenticatedPrincipal>) -> Self {
+        Self {
+            sessions: self.sessions.clone(),
+            factory: self
+                .factory
+                .clone()
+                .with_workspace_account(principal.and_then(WorkspaceAccount::from_principal)),
+            slots: self.slots.clone(),
+        }
+    }
     async fn record(
         &self,
         id: &SessionId,
         incarnation: Option<&str>,
     ) -> Result<SessionRecord, McpAppError> {
         let record = self.sessions.store().load(id).await.map_err(failure)?;
+        self.factory
+            .authorize_session_workspace(&record)
+            .await
+            .map_err(|status| match status.code() {
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => McpAppError::Denied,
+                tonic::Code::FailedPrecondition => McpAppError::Stale,
+                _ => failure(status),
+            })?;
         if !matches!(
             record.snapshot().status,
             SessionStatus::Idle | SessionStatus::Finished

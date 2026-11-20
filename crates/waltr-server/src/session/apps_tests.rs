@@ -56,9 +56,7 @@ impl LlmStream for SelfStatusProvider {
 #[tokio::test]
 async fn embedded_self_status_records_app_association_from_local_credential_snapshot() {
     use crate::auth::{AuthTarget, CredentialStore, FileCredentialStore};
-    use crate::embedded::{
-        EmbeddedCatalogSource, EmbeddedServerConfig, build_embedded_server,
-    };
+    use crate::embedded::{EmbeddedCatalogSource, EmbeddedServerConfig, build_embedded_server};
 
     let root = crate::test_support::temp_root();
     let bearer = crate::LocalBearer::new("embedded-status-fixture-secret").unwrap();
@@ -345,6 +343,271 @@ fn request<T>(value: T, subject: &str) -> Request<T> {
         .extensions_mut()
         .insert(crate::access_auth::AuthenticatedPrincipal::apps_test_principal(subject));
     request
+}
+
+#[tokio::test]
+async fn hosted_stdio_mcp_apps_open_and_call_only_for_the_current_workspace_account() {
+    use crate::{
+        agent_host::{
+            runtime_factory::{McpConnectionKind, McpResolvedConnection},
+            sandbox_gateway::{
+                SandboxGateway, WorkspaceAccount, peers::MachineRegistry, stdio_launch,
+            },
+        },
+        test_support::{composition_auth, temp_root},
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let root = temp_root();
+    let worker_root = temp_root();
+    let workspace = worker_root.join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("app.sh"),
+        r#"#!/bin/sh
+while IFS= read -r req; do
+    id=${req#*'"id":'}
+    id=${id%%,*}
+    case "$req" in
+        *'"method":"server/discover"'*)
+            result='{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{}},"ttlMs":0,"cacheScope":"private"}' ;;
+        *'"method":"tools/list"'*)
+            result='{"tools":[{"name":"observe_fixture","inputSchema":{"type":"object"},"_meta":{"ui":{"resourceUri":"ui://hosted/view"}}}]}' ;;
+        *'"method":"resources/read"'*)
+            result='{"contents":[{"uri":"ui://hosted/view","mimeType":"text/html;profile=mcp-app","text":"<!doctype html><html><body><p>hosted worker app</p></body></html>"}]}' ;;
+        *'"method":"resources/list"'*)
+            result='{"resources":[]}' ;;
+        *'"method":"resources/templates/list"'*)
+            result='{"resourceTemplates":[]}' ;;
+        *'"method":"tools/call"'*)
+            result='{"content":[{"type":"text","text":"hosted worker tool"}]}' ;;
+        *) continue ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#,
+    )
+    .unwrap();
+    let worker = crate::sandbox::SandboxHost::start(worker_root.clone(), None)
+        .await
+        .unwrap();
+    let machines = MachineRegistry::default();
+    let persistence = crate::persistence::Persistence::initialize(
+        crate::persistence::DatabaseConfig::for_tests().unwrap(),
+    )
+    .await
+    .unwrap();
+    let (auth, token, issuer, auth_stop, auth_task) =
+        composition_auth(&persistence, "127.0.0.1:1".parse().unwrap()).await;
+    let authenticate = |token: String| {
+        let auth = auth.clone();
+        async move {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            auth.authenticate_bearer_headers(&headers, auth.api_required_scopes())
+                .await
+                .unwrap_or_else(|_| panic!("fixture bearer did not authenticate"))
+        }
+    };
+    let principal = authenticate(token.clone()).await;
+    let refreshed = authenticate(crate::test_support::sign_access_token_with_ttl(
+        &issuer,
+        "waltr:read",
+        Duration::from_mins(45),
+    ))
+    .await;
+    let account = WorkspaceAccount::from_principal(&principal).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = machines.mount(axum::Router::new(), auth);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    worker
+        .export_control()
+        .connection()
+        .unwrap()
+        .apply(
+            "fixture",
+            waltr_agent_sandbox::peer_config::WorkspaceExport {
+                endpoint,
+                machine_id: "apps-peer".into(),
+                export_root: worker_root,
+            },
+            vec![stdio_launch("fixture", "/bin/sh ./app.sh").unwrap()],
+            token,
+            (SystemTime::now() + Duration::from_mins(5))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !machines.owns_live("apps-peer", &account) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let catalog = crate::agent_host::definition::AgentDefinitionCatalog::from_sources(
+        vec![definition("allow")],
+        "apps",
+    )
+    .unwrap();
+    let resolved = catalog.resolved("apps").unwrap().clone();
+    let provider = Arc::new(Provider(AtomicUsize::new(0)));
+    let fixture_provider = provider.clone();
+    let interactions = crate::interaction::InteractionBroker::new();
+    let gateway = SandboxGateway::new("local".into()).with_export_control();
+    let factory = AgentSessionRuntimeFactory::new(
+        gateway.handle(),
+        root.clone(),
+        crate::auth::FileCredentialStore::new(root.join("credentials.json")),
+        resolved,
+    )
+    .with_agent_catalog(catalog)
+    .with_workspace_machines(machines.clone())
+    .with_runtime_provider(move |_| {
+        Ok(AgentRuntimeProvider::new(
+            waltr_agent::ModelRef::new(
+                waltr_agent::ProviderId::OpenAi,
+                "gpt-5-nano",
+                waltr_agent::ModelApi::OpenAiResponses,
+            ),
+            fixture_provider.clone(),
+        ))
+    })
+    .with_capability_policy(crate::permission::ServerPermissionPolicy::sessions(
+        interactions.clone(),
+    ))
+    .with_mcp_connection_resolver(move |_| {
+        Box::pin(async move {
+            Ok(vec![McpResolvedConnection {
+                key: "fixture".into(),
+                kind: McpConnectionKind::Stdio,
+                url: String::new(),
+                command: "/unusable/destination-does-not-launch".into(),
+            }])
+        })
+    });
+    let scoped = factory.clone().with_workspace_account(Some(account));
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
+    let id = SessionId::generate();
+    scoped
+        .create_with_workspace(
+            &sessions,
+            SessionCreateRequest::new(id.clone()),
+            Some(&WorkspaceSelection {
+                machine_id: "apps-peer".into(),
+                working_directory: Some("project".into()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = crate::test_support::resource_state_with_overrides(&[]);
+    let service = SessionService {
+        app_runtime: ServerMcpApps::new(sessions.clone(), factory.clone()),
+        interactions,
+        runtime_factory: Arc::new(factory),
+        routines: tokio::sync::Mutex::new(None),
+        origin_runs: super::OriginRuns::default(),
+        sessions: sessions.clone(),
+        config: crate::config::ConfigHandle::from_resources(state),
+        agent_catalog: SessionCatalogSource::Static(crate::test_support::default_agent_catalog()),
+        apps: apps::Registry::new(),
+    };
+    sessions
+        .set_inference_settings(
+            &id,
+            Some(waltr_agent::InferenceSettings {
+                provider: waltr_agent::InferenceProviderSettings {
+                    key: "test".into(),
+                    api: waltr_agent::ModelApi::OpenAiResponses,
+                    url: String::new(),
+                    model_id: "gpt-5-nano".into(),
+                    model_cost: None,
+                    headers: Default::default(),
+                    oauth: None,
+                    reasoning_effort: None,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    service
+        .request_sessions(Some(principal.clone()), &id)
+        .await
+        .unwrap()
+        .submit_prompt(
+            id.clone(),
+            "observe",
+            waltr_agent::RunConflictPolicy::RejectIfActive,
+        )
+        .await
+        .unwrap()
+        .handle
+        .wait()
+        .await
+        .unwrap();
+
+    let open = || OpenSessionMcpAppRequest {
+        session_id: id.as_str().to_owned(),
+        call_id: "original".into(),
+    };
+    for wrong in [request(open(), "other"), Request::new(open())] {
+        assert_eq!(
+            service
+                .open_session_mcp_app(wrong)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+    let mut owner_open = Request::new(open());
+    owner_open.extensions_mut().insert(principal);
+    let app = service
+        .open_session_mcp_app(owner_open)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        app.html,
+        "<!doctype html><html><body><p>hosted worker app</p></body></html>"
+    );
+    let call = || CallSessionMcpAppToolRequest {
+        app_id: app.app_id.clone(),
+        name: "observe_fixture".into(),
+        arguments_json: "{}".into(),
+    };
+    for wrong in [request(call(), "other"), Request::new(call())] {
+        assert_eq!(
+            service
+                .call_session_mcp_app_tool(wrong)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
+    let mut owner_call = Request::new(call());
+    owner_call.extensions_mut().insert(refreshed);
+    let result = service
+        .call_session_mcp_app_tool(owner_call)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(result.result_json.contains("hosted worker tool"));
+    assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+    service.apps.clear();
+    scoped.mcp_registry().retire_all().await.unwrap();
+    sessions.shutdown().await;
+    worker.shutdown().await;
+    machines.shutdown();
+    server.abort();
+    auth_stop.cancel();
+    auth_task.await.unwrap();
 }
 
 #[tokio::test]

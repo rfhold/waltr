@@ -37,7 +37,7 @@ impl ServerAgentRuntimeFactory {
         self
     }
 
-    async fn resolve_workspace(
+    pub(crate) async fn resolve_workspace(
         &self,
         selection: &WorkspaceSelection,
     ) -> Result<SandboxHandle, tonic::Status> {
@@ -200,7 +200,20 @@ impl ServerAgentRuntimeFactory {
                 .map_err(workspace_runtime_error)?;
             factory.root = scope.canonical_root;
         } else {
-            factory.root = self.sandbox_root()?;
+            match self.sandbox_root() {
+                Ok(root) => factory.root = root,
+                Err(error) => {
+                    let features = self.definition_for_session(record)?.features;
+                    if features.mcp.is_none()
+                        || features.filesystem.is_some()
+                        || features.agents.is_some()
+                        || features.skills.is_some()
+                        || features.shell.is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+            }
         }
         Ok(factory)
     }

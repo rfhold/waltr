@@ -16,7 +16,7 @@ pub struct TestSandbox {
 
 impl TestSandbox {
     pub async fn new(root: impl AsRef<Path>) -> Self {
-        let gateway = SandboxGateway::new(WORKSPACE.into());
+        let gateway = SandboxGateway::new(WORKSPACE.into()).with_export_control();
         let (sender, receiver) = mpsc::channel::<Result<DuplexStream, io::Error>>(4);
         let service = gateway.service();
         let server = tokio::spawn(async move {

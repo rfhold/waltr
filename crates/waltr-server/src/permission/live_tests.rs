@@ -196,3 +196,65 @@ async fn intersection_ceiling_denies_before_any_ask_or_effect() {
     assert_eq!(effects.load(Ordering::SeqCst), 0);
     assert!(broker.snapshot(&session).pending.is_empty());
 }
+
+#[tokio::test]
+async fn routine_approval_is_operation_local_and_rechecks_source_after_the_answer() {
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let broker = InteractionBroker::new();
+        let standard = ServerPermissionPolicy::sessions(broker.clone());
+        let source = SessionId::generate();
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let make_context = |operation: &str| {
+            ToolExecutionContext::new(ToolCall::new(operation, "effect", json!({})))
+                .with_session_context(source.clone(), 0)
+                .with_host_operation(waltr_agent::HostDispatchBinding {
+                    invocation_id: operation.into(),
+                    source_revision: "revision".into(),
+                })
+        };
+        let mut watch = broker.subscribe(source.clone());
+        let policy = PermissionPolicy::new(PermissionLevel::Ask);
+        for (operation, stays_current) in [("committed-one", true), ("committed-two", false)] {
+            let context = make_context(operation);
+            let live = current.clone();
+            let bound = ServerPermissionPolicy::routine(
+                standard.as_ref(),
+                &context,
+                "record-incarnation".into(),
+                Arc::new(move || {
+                    let current = live.clone();
+                    Box::pin(async move { current.load(Ordering::Acquire) })
+                }),
+            )
+            .unwrap();
+            assert!(
+                bound.authorize(&make_context("unrelated"), "effect", &policy, &[])
+                    .await.unwrap().is_some()
+            );
+            let owner = tokio::spawn({
+                let bound = bound.clone();
+                let policy = policy.clone();
+                let context = context.clone();
+                async move { bound.authorize(&context, "effect", &policy, &[]).await.unwrap() }
+            });
+            let snapshot = loop {
+                let snapshot = watch.next().await.unwrap();
+                if !snapshot.pending.is_empty() {
+                    break snapshot;
+                }
+            };
+            let pending = &snapshot.pending[0];
+            assert_eq!(pending.operation_id, operation);
+            assert!(matches!(&pending.request, Interaction::Permission { patterns, .. } if patterns.is_empty()));
+            current.store(stays_current, Ordering::Release);
+            broker.respond(&source, &snapshot.generation, &pending.id, operation,
+                InteractionResponse::Permission(PermissionResponse::AllowOnce)).unwrap();
+            assert_eq!(owner.await.unwrap().is_none(), stays_current);
+            if stays_current {
+                assert!(bound.authorize(&context, "effect", &policy, &[]).await.unwrap().is_none());
+            }
+            bound.finished(operation);
+        }
+        assert!(broker.snapshot(&source).pending.is_empty());
+    }).await.unwrap();
+}

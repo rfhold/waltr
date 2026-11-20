@@ -26,6 +26,7 @@ use waltr_agent::{
     LlmError, Result, ToolProgressSink, ToolResultContent, ToolResultContentBlock, ToolResultImage,
 };
 
+use super::worker_stdio::{MAX_FRAME_BYTES, WorkerChannel, WorkerOpenError};
 use super::{config::McpServerConfig, event::McpRuntimeEvent};
 
 const WALTR_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -80,9 +81,10 @@ pub(super) struct McpServerRuntime {
     retired: std::sync::atomic::AtomicBool,
     skill_cancellation: CancellationToken,
     client: McpClient,
+    worker: Option<Arc<WorkerChannel>>,
     transport_kind: &'static str,
     #[allow(dead_code)]
-    root_uri: String,
+    root_uri: Option<String>,
     events: broadcast::Sender<McpRuntimeEvent>,
     active_progress: Arc<std::sync::Mutex<BTreeMap<String, ToolProgressSink>>>,
     background: tokio_util::task::TaskTracker,
@@ -102,15 +104,27 @@ struct McpServerState {
 
 struct ServerHandler {
     name: String,
-    root_uri: String,
+    root_uri: Option<String>,
     events: broadcast::Sender<McpRuntimeEvent>,
     active_progress: Arc<std::sync::Mutex<BTreeMap<String, ToolProgressSink>>>,
     background: tokio_util::task::TaskTracker,
+    worker_stdio: bool,
     refresh: Mutex<Option<std::sync::Weak<McpServerRuntime>>>,
     cancellation: CancellationToken,
     tools_epoch: Arc<AtomicU64>,
     prompts_epoch: Arc<AtomicU64>,
     resources_epoch: Arc<AtomicU64>,
+}
+
+pub(super) enum McpServerStartError {
+    WorkerRejected(LlmError),
+    Other(LlmError),
+}
+
+impl From<LlmError> for McpServerStartError {
+    fn from(error: LlmError) -> Self {
+        Self::Other(error)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,19 +136,24 @@ impl McpServerRuntime {
         log_level: Option<McpLogLevel>,
         trace_propagation: McpTracePropagation,
         skills: bool,
-        root_uri: String,
+        root_uri: Option<String>,
         events: broadcast::Sender<McpRuntimeEvent>,
         cancellation_token: CancellationToken,
-    ) -> Result<Arc<Self>> {
+    ) -> std::result::Result<Arc<Self>, McpServerStartError> {
+        let cancellation_token = cancellation_token.child_token();
         let name = config.name.clone();
         let endpoint = match &config.transport {
             mcp::client::McpTransportConfig::StreamableHttp { endpoint, .. } => endpoint.clone(),
             _ => String::new(),
         };
-        let source = config.app_source();
+        let mut source = config.app_source();
         let app_authority = config.app_authority.clone();
         let app_authority_validator = config.app_authority_validator.clone();
         let transport_kind = config.transport.kind();
+        let root_uri = match &config.worker_stdio {
+            Some((worker, _)) => worker.root_uri(),
+            None => root_uri,
+        };
         let active_progress = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let background = tokio_util::task::TaskTracker::new();
         let handler = Arc::new(ServerHandler {
@@ -143,6 +162,7 @@ impl McpServerRuntime {
             events: events.clone(),
             active_progress: Arc::clone(&active_progress),
             background: background.clone(),
+            worker_stdio: config.worker_stdio.is_some(),
             refresh: Mutex::new(None),
             cancellation: cancellation_token.clone(),
             tools_epoch: Arc::new(AtomicU64::new(0)),
@@ -173,7 +193,8 @@ impl McpServerRuntime {
         #[cfg(target_os = "android")]
         let private = config.private_endpoint.is_some();
         if let Some(private_endpoint) = config.private_endpoint {
-            if let mcp::client::McpTransportConfig::StreamableHttp { endpoint, .. } = &mut transport {
+            if let mcp::client::McpTransportConfig::StreamableHttp { endpoint, .. } = &mut transport
+            {
                 *endpoint = private_endpoint;
             }
             transport_options = transport_options
@@ -196,16 +217,63 @@ impl McpServerRuntime {
                     .expect("default server HTTP client must build"),
             );
         }
-        let client = McpClient::connect_with_transport_options(
-            name.clone(),
-            transport,
-            handler.clone(),
-            options,
-            transport_options,
-            cancellation_token.clone(),
-        )
-        .await
-        .map_err(|error| client_error(error, &name, &endpoint))?;
+        let (client, worker) = match transport {
+            mcp::client::McpTransportConfig::Stdio { .. } => {
+                let (placement, connection) = config.worker_stdio.ok_or_else(|| {
+                    protocol_error("MCP stdio requires an authorized worker workspace")
+                })?;
+                let worker = placement
+                    .open(&connection, cancellation_token.clone())
+                    .await
+                    .map_err(|error| match error {
+                        WorkerOpenError::Rejected(error) => McpServerStartError::WorkerRejected(
+                            client_error(error, &name, &endpoint),
+                        ),
+                        WorkerOpenError::Other(error) => {
+                            client_error(error, &name, &endpoint).into()
+                        }
+                    })?;
+                if worker.is_exported() {
+                    // The destination cannot attest that a later export by name has the same launch.
+                    source = Some(format!("worker-export:{}", uuid::Uuid::now_v7()));
+                }
+                let result = McpClient::connect_framed(
+                    worker.clone(),
+                    std::num::NonZeroUsize::new(MAX_FRAME_BYTES).expect("worker frame limit"),
+                    handler.clone(),
+                    options,
+                    cancellation_token.clone(),
+                )
+                .await;
+                let client = match result {
+                    Ok(client) => client,
+                    Err(error) => {
+                        use mcp::client::McpFramedChannel as _;
+                        let error = match worker.shutdown().await {
+                            Ok(()) => error,
+                            Err(cleanup) => mcp::Error::protocol(format!(
+                                "{error}; worker MCP stdio child cleanup not confirmed: {cleanup}"
+                            )),
+                        };
+                        return Err(client_error(error, &name, &endpoint).into());
+                    }
+                };
+                (client, Some(worker))
+            }
+            transport @ mcp::client::McpTransportConfig::StreamableHttp { .. } => (
+                McpClient::connect_with_transport_options(
+                    name.clone(),
+                    transport,
+                    handler.clone(),
+                    options,
+                    transport_options,
+                    cancellation_token.clone(),
+                )
+                .await
+                .map_err(|error| client_error(error, &name, &endpoint))?,
+                None,
+            ),
+        };
         let runtime = Arc::new(Self {
             name,
             endpoint,
@@ -217,6 +285,7 @@ impl McpServerRuntime {
             retired: std::sync::atomic::AtomicBool::new(false),
             skill_cancellation: cancellation_token.clone(),
             client,
+            worker,
             transport_kind,
             root_uri,
             events,
@@ -230,8 +299,10 @@ impl McpServerRuntime {
             .finish_initialization(cancellation_token.clone())
             .await
         {
-            drop(runtime.shutdown().await);
-            return Err(error);
+            if let Err(shutdown_error) = runtime.shutdown().await {
+                tracing::warn!(server = %runtime.name, %shutdown_error, "MCP discovery cleanup failed");
+            }
+            return Err(error.into());
         }
         let capabilities = runtime.client.capabilities();
         let has_list_changes = capabilities
@@ -287,6 +358,11 @@ impl McpServerRuntime {
         &self.name
     }
 
+    pub(super) fn reusable(&self) -> bool {
+        !self.retired.load(Ordering::Acquire)
+            && self.worker.as_ref().is_none_or(|worker| worker.alive())
+    }
+
     pub(super) fn source(&self) -> Option<&str> {
         self.source.as_deref()
     }
@@ -296,6 +372,9 @@ impl McpServerRuntime {
     }
 
     pub(super) async fn app_authority_current(&self) -> bool {
+        if !self.reusable() {
+            return false;
+        }
         if let Some(validate) = &self.app_authority_validator {
             if !validate().await {
                 return false;
@@ -501,12 +580,18 @@ impl McpServerRuntime {
                 || self.client.clone(),
                 |operation| operation.client(&self.client),
             );
-            let response = client
-                .call_tool(
-                    McpToolCall::new(tool, arguments).with_progress_token(progress_token.clone()),
-                    cancellation_token,
-                )
-                .await;
+            let call =
+                McpToolCall::new(tool, arguments).with_progress_token(progress_token.clone());
+            let response = if let Some(operation) = operation
+                .as_ref()
+                .filter(|operation| operation.has_authority_check())
+            {
+                client
+                    .call_tool_checked(call, cancellation_token, || operation.check_current())
+                    .await
+            } else {
+                client.call_tool(call, cancellation_token).await
+            };
             drop(registration);
             let response = response.map_err(|error| self.client_error(error))?;
             mcp_tool_result(&response)
@@ -887,10 +972,10 @@ fn mcp_tool_result(response: &mcp::McpToolResult) -> Result<McpAgentToolResult> 
 
 impl McpClientHandler for ServerHandler {
     fn roots(&self) -> Vec<McpRoot> {
-        vec![McpRoot::new(
-            self.root_uri.clone(),
-            Some("workspace".to_owned()),
-        )]
+        self.root_uri
+            .iter()
+            .map(|uri| McpRoot::new(uri.clone(), Some("workspace".to_owned())))
+            .collect()
     }
 
     fn tools_changed(&self) {
@@ -995,6 +1080,9 @@ impl McpClientHandler for ServerHandler {
     }
 
     fn disconnected(&self, error: String) {
+        if self.worker_stdio {
+            self.cancellation.cancel();
+        }
         drop(self.events.send(McpRuntimeEvent::ServerDisconnected {
             server_key: self.name.clone(),
             error,
@@ -1172,10 +1260,11 @@ mod tests {
         let (events, mut receiver) = broadcast::channel(8);
         let handler = ServerHandler {
             name: "test_server".to_owned(),
-            root_uri: "file:///workspace".to_owned(),
+            root_uri: Some("file:///workspace".to_owned()),
             events,
             active_progress: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             background: tokio_util::task::TaskTracker::new(),
+            worker_stdio: false,
             refresh: Mutex::new(None),
             cancellation: tokio_util::sync::CancellationToken::new(),
             tools_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),

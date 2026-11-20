@@ -12,6 +12,10 @@ use tokio_util::sync::CancellationToken;
 pub struct McpOperation {
     broker: InteractionBroker,
     binding: OperationBinding,
+    routine: Option<(
+        Arc<crate::permission::ServerPermissionPolicy>,
+        waltr_agent::ToolExecutionContext,
+    )>,
 }
 
 impl McpOperation {
@@ -19,7 +23,11 @@ impl McpOperation {
         &self.binding.operation_id
     }
     pub fn new(broker: InteractionBroker, binding: OperationBinding) -> Self {
-        Self { broker, binding }
+        Self {
+            broker,
+            binding,
+            routine: None,
+        }
     }
 
     pub(crate) fn for_context(
@@ -28,6 +36,30 @@ impl McpOperation {
     ) -> Option<Self> {
         let (broker, binding) = policy.interaction_binding(context)?;
         Some(Self::new(broker, binding))
+    }
+
+    pub(super) fn for_routine(
+        policy: Arc<crate::permission::ServerPermissionPolicy>,
+        context: &waltr_agent::ToolExecutionContext,
+    ) -> Option<Self> {
+        let mut operation = Self::for_context(policy.as_ref(), context)?;
+        operation.routine = Some((policy, context.clone()));
+        Some(operation)
+    }
+
+    pub(super) async fn check_current(&self) -> mcp::Result<()> {
+        if let Some((policy, context)) = &self.routine
+            && !policy.routine_current(context).await
+        {
+            return Err(mcp::Error::protocol(
+                "Routine source authority is no longer current",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_authority_check(&self) -> bool {
+        self.routine.is_some()
     }
 
     pub fn capabilities(&self) -> McpElicitationCapabilities {
@@ -62,6 +94,7 @@ impl McpClientHandler for McpOperation {
     ) -> McpElicitationFuture {
         let this = self.clone();
         Box::pin(async move {
+            this.check_current().await?;
             let modes = this.capabilities();
             if matches!(&request, McpElicitationRequest::Form { .. } if !modes.form)
                 || matches!(&request, McpElicitationRequest::Url { .. } if !modes.url)
@@ -92,6 +125,7 @@ impl McpClientHandler for McpOperation {
                 _ => return Err(mcp::Error::protocol("MCP input response mode mismatch")),
             };
             request.validate_response(&response)?;
+            this.check_current().await?;
             // URL acceptance is consent only. The upstream owns completion and continuation state.
             Ok(response)
         })

@@ -55,7 +55,7 @@ A provider catalog selector names a models.dev provider and an `include` list. O
 
 `McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command. Both forms belong to the ordinary catalog schema in every host build.
 
-`WorkspaceBinding` uses `spec.endpoint`, `spec.machineId`, and `spec.exportRoot`. The catalog rejects duplicate destination and machine pairs without accessing the worker filesystem. Start authorization explicitly from Config; credentials are not part of the resource. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
+`WorkspaceBinding` uses `spec.endpoint`, `spec.machineId`, and `spec.exportRoot`. Optional `spec.mcpStdioServers` lists exact stdio `McpServer` names from the exporter's catalog and defaults to empty. The catalog rejects duplicate destination and machine pairs without access to the worker filesystem. Start authorization from Config; credentials are not part of the resource. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
 
 `Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
 Optional `spec.sessionDictation` selects the session composer's default interaction Routine and ports:

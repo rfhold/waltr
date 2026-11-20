@@ -11,7 +11,10 @@ use mcp::{
 use waltr_agent::{AgentTool, LlmError, Result, ToolDefinition, ToolProgressSink, ToolResult};
 
 use super::{
-    config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, server::McpServerRuntime,
+    config::McpConfig,
+    event::McpRuntimeEvent,
+    name::direct_tool_name,
+    server::{McpServerRuntime, McpServerStartError},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +66,13 @@ impl Drop for McpClientRuntime {
 pub(crate) struct McpRuntimeStartError {
     pub(crate) server_key: String,
     pub(crate) error: LlmError,
+    single_worker_open_rejected: bool,
+}
+
+impl McpRuntimeStartError {
+    pub(crate) fn single_worker_open_rejected(&self) -> bool {
+        self.single_worker_open_rejected
+    }
 }
 
 impl std::fmt::Display for McpRuntimeStartError {
@@ -99,6 +109,14 @@ impl std::fmt::Debug for McpClientRuntime {
 
 #[allow(clippy::too_many_arguments)]
 impl McpClientRuntime {
+    pub(crate) fn reusable(&self) -> bool {
+        !self.lifetime.is_cancelled() && self.servers.values().all(|server| server.reusable())
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.lifetime.cancel();
+    }
+
     pub(crate) fn lifetime(&self) -> CancellationToken {
         self.lifetime.child_token()
     }
@@ -125,20 +143,31 @@ impl McpClientRuntime {
             tokio::select! { _ = token.cancelled() => {}, _ = tokio::time::sleep_until(expires) => token.cancel() }
         });
     }
+    #[cfg(test)]
     pub(crate) async fn start(
         config: McpConfig,
         root_uri: String,
         cancellation_token: CancellationToken,
     ) -> std::result::Result<Arc<Self>, McpRuntimeStartError> {
+        Self::start_with_optional_root(config, Some(root_uri), cancellation_token).await
+    }
+
+    pub(crate) async fn start_with_optional_root(
+        config: McpConfig,
+        root_uri: Option<String>,
+        cancellation_token: CancellationToken,
+    ) -> std::result::Result<Arc<Self>, McpRuntimeStartError> {
         let cancellation_token = cancellation_token.child_token();
         let startup_guard = cancellation_token.clone().drop_guard();
         let (servers, timeout, log_level, trace_propagation, skills) = config.into_parts();
+        let single_server = servers.len() == 1;
         let mut server_labels = std::collections::BTreeSet::new();
         for server in &servers {
             if !server_labels.insert(&server.name) {
                 return Err(McpRuntimeStartError {
                     server_key: server.name.clone(),
                     error: protocol_error("duplicate host-assigned MCP server label"),
+                    single_worker_open_rejected: false,
                 });
             }
         }
@@ -169,7 +198,15 @@ impl McpClientRuntime {
                             );
                         }
                     }
-                    return Err(McpRuntimeStartError { server_key, error });
+                    let (error, single_worker_open_rejected) = match error {
+                        McpServerStartError::WorkerRejected(error) => (error, single_server),
+                        McpServerStartError::Other(error) => (error, false),
+                    };
+                    return Err(McpRuntimeStartError {
+                        server_key,
+                        error,
+                        single_worker_open_rejected,
+                    });
                 }
             };
             active.insert(runtime.name().to_owned(), runtime);
@@ -190,9 +227,18 @@ impl McpClientRuntime {
         self.events.subscribe()
     }
 
+    #[cfg(test)]
     pub(crate) async fn agent_tools(
         self: &Arc<Self>,
         policy: Arc<dyn super::super::dispatcher::CapabilityPolicy>,
+    ) -> Vec<super::super::Capability> {
+        self.agent_tools_with_routine_policy(policy, None).await
+    }
+
+    pub(crate) async fn agent_tools_with_routine_policy(
+        self: &Arc<Self>,
+        policy: Arc<dyn super::super::dispatcher::CapabilityPolicy>,
+        routine: Option<Arc<crate::permission::ServerPermissionPolicy>>,
     ) -> Vec<super::super::Capability> {
         let mut tools = Vec::new();
         let mut inventory = Vec::new();
@@ -234,11 +280,10 @@ impl McpClientRuntime {
                 );
                 let closure_server_name = server_name.clone();
                 let operation_policy = policy.clone();
+                let routine = routine.clone();
                 let mut agent_tool = AgentTool::new_async(definition, move |context| {
-                    let operation = super::elicitation::McpOperation::for_context(
-                        operation_policy.as_ref(),
-                        &context,
-                    );
+                    let routine = routine.clone();
+                    let operation_policy = operation_policy.clone();
                     let runtime = Arc::clone(&runtime);
                     let server_name = closure_server_name.clone();
                     let tool_name = tool_name.clone();
@@ -248,6 +293,19 @@ impl McpClientRuntime {
                     let cancellation_token = context.cancellation_token().clone();
                     let source = closure_source.clone();
                     Box::pin(async move {
+                        let operation = if let Some(policy) = routine {
+                            Some(
+                                super::elicitation::McpOperation::for_routine(policy, &context)
+                                    .ok_or_else(|| {
+                                        protocol_error("Routine interaction route unavailable")
+                                    })?,
+                            )
+                        } else {
+                            super::elicitation::McpOperation::for_context(
+                                operation_policy.as_ref(),
+                                &context,
+                            )
+                        };
                         if !source
                             .ui
                             .visibility
