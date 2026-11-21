@@ -22,7 +22,11 @@ pub(super) struct ApprovedContextAdmission {
 }
 
 impl ApprovedContextAdmission {
-    pub(super) fn consume(self, request: &StartRequest, record: &waltr_agent::SessionRecord) -> Result<PermissionPolicy, PortError> {
+    pub(super) fn consume(
+        self,
+        request: &StartRequest,
+        record: &waltr_agent::SessionRecord,
+    ) -> Result<PermissionPolicy, PortError> {
         if request.source_session.as_deref() != Some(self.session.as_str())
             || record.id != self.session
             || record.metadata.incarnation.as_deref() != Some(self.incarnation.as_str())
@@ -33,12 +37,18 @@ impl ApprovedContextAdmission {
             || self.call.is_empty()
             || self.cancellation.is_cancelled()
             || self.policy.evaluate_tool("manage-context") == PermissionLevel::Deny
-        { return Err(PortError::Denied); }
+        {
+            return Err(PortError::Denied);
+        }
         Ok(self.policy)
     }
 }
 
-pub(super) fn original_source_allowed(capabilities: &BTreeSet<String>, policy: &PermissionPolicy, approved: bool) -> bool {
+pub(super) fn original_source_allowed(
+    capabilities: &BTreeSet<String>,
+    policy: &PermissionPolicy,
+    approved: bool,
+) -> bool {
     capabilities.contains("context.original")
         && (approved || policy.evaluate_tool("manage-context") == PermissionLevel::Allow)
 }
@@ -110,6 +120,7 @@ pub(super) fn provide<S: SessionStore + Clone + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use waltr_agent::SessionCreateRequest;
 
     #[tokio::test]
     async fn approved_ask_evidence_is_consumed_only_for_exact_call_target_and_incarnation() {
@@ -120,21 +131,54 @@ mod tests {
                 "parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"null"}},
                 "result":{"schemaVersion":"waltr.value/v1","schema":{"type":"null"}},"capabilities":["context.original"]}
         }).to_string(), &engine).unwrap();
-        let authenticated = AuthenticatedPrincipal::local_process(&crate::local_admission::ValidatedLocalOrigin(Arc::new(CancellationToken::new())));
+        let authenticated = AuthenticatedPrincipal::local_process(
+            &crate::local_admission::ValidatedLocalOrigin(Arc::new(CancellationToken::new())),
+        );
         let store = waltr_agent::MemorySessionStore::new();
-        let record = store.create(SessionCreateRequest::new(SessionId::generate())).await.unwrap();
-        let mut request = StartRequest { principal:principal_id(&authenticated), authenticated, transport:None,
-            definition, entrypoint:"run".into(), source_session:Some(record.id.as_str().into()) };
-        let evidence = || ApprovedContextAdmission { session:record.id.clone(), incarnation:record.metadata.incarnation.clone().unwrap(),
-            principal:request.principal.clone(), routine:request.definition.envelope().name.clone(), revision:request.definition.revision().into(),
-            entrypoint:"run".into(), call:"exact-approved-call".into(), policy:PermissionPolicy::new(PermissionLevel::Ask), cancellation:CancellationToken::new() };
+        let record = store
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
+        let mut request = StartRequest {
+            principal: principal_id(&authenticated),
+            authenticated,
+            transport: None,
+            definition,
+            entrypoint: "run".into(),
+            source_session: Some(record.id.as_str().into()),
+        };
+        let evidence = || ApprovedContextAdmission {
+            session: record.id.clone(),
+            incarnation: record.metadata.incarnation.clone().unwrap(),
+            principal: request.principal.clone(),
+            routine: request.definition.envelope().name.clone(),
+            revision: request.definition.revision().into(),
+            entrypoint: "run".into(),
+            call: "exact-approved-call".into(),
+            policy: PermissionPolicy::new(PermissionLevel::Ask),
+            cancellation: CancellationToken::new(),
+        };
         let caps = BTreeSet::from(["context.original".into()]);
         let approved = evidence().consume(&request, &record).unwrap();
         assert!(original_source_allowed(&caps, &approved, true));
-        assert!(!original_source_allowed(&caps, &approved, false), "direct Ask has no live approval");
-        assert!(!original_source_allowed(&caps, &PermissionPolicy::new(PermissionLevel::Deny), false));
-        assert!(original_source_allowed(&caps, &PermissionPolicy::new(PermissionLevel::Allow), false));
-        assert!(!original_source_allowed(&BTreeSet::new(), &approved, true), "approval does not add capabilities");
+        assert!(
+            !original_source_allowed(&caps, &approved, false),
+            "direct Ask has no live approval"
+        );
+        assert!(!original_source_allowed(
+            &caps,
+            &PermissionPolicy::new(PermissionLevel::Deny),
+            false
+        ));
+        assert!(original_source_allowed(
+            &caps,
+            &PermissionPolicy::new(PermissionLevel::Allow),
+            false
+        ));
+        assert!(
+            !original_source_allowed(&BTreeSet::new(), &approved, true),
+            "approval does not add capabilities"
+        );
         for fault in 0..8 {
             let mut changed = evidence();
             match fault {
@@ -147,10 +191,16 @@ mod tests {
                 6 => changed.cancellation.cancel(),
                 _ => changed.call.clear(),
             }
-            assert!(matches!(changed.consume(&request, &record), Err(PortError::Denied)));
+            assert!(matches!(
+                changed.consume(&request, &record),
+                Err(PortError::Denied)
+            ));
         }
         let fixed = evidence();
         request.source_session = Some(SessionId::generate().as_str().into());
-        assert!(matches!(fixed.consume(&request, &record), Err(PortError::Denied)));
+        assert!(matches!(
+            fixed.consume(&request, &record),
+            Err(PortError::Denied)
+        ));
     }
 }

@@ -257,6 +257,8 @@ See the embedded [resource contract](../../crates/waltr-server/resources/skills/
 
 See [Routines](routines.md) for revision pinning, validation, detached starts, persistence, replay, and restart behavior.
 
+For installed manual and interactive Routines, `spec.mcpTools` declares exact configured server and upstream tool pairs for `tools.execute`. The declaration uses the same write permission as the rest of the Routine resource. See [Routine MCP calls](routines.md#call-an-mcp-tool-on-a-selected-worker) for placement, source policy, and result handles.
+
 Resource writes serialize through Waltr. They do not isolate `.waltr` from another local writer. Restrict resource-tree writes to trusted processes.
 
 ## Client Contract

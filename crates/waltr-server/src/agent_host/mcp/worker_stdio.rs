@@ -41,6 +41,7 @@ pub(crate) struct WorkerStdio {
     resolver: McpConnectionResolver,
     resources: Option<AgentDefinitionState>,
     admission: Arc<Mutex<()>>,
+    retain_admitted_connection: bool,
 }
 
 impl WorkerStdio {
@@ -66,7 +67,13 @@ impl WorkerStdio {
             resolver,
             resources,
             admission,
+            retain_admitted_connection: false,
         })
+    }
+
+    pub(crate) fn retain_admitted_connection(mut self) -> Self {
+        self.retain_admitted_connection = true;
+        self
     }
 
     pub(crate) fn same_target(&self, other: &Self) -> bool {
@@ -90,7 +97,11 @@ impl WorkerStdio {
     ) -> Result<Arc<WorkerChannel>, WorkerOpenError> {
         let lease = lifetime.child_token();
         let opening = lease.clone().drop_guard();
-        let mut updates = self.resources.as_ref().map(AgentDefinitionState::subscribe);
+        let mut updates = if self.retain_admitted_connection {
+            None
+        } else {
+            self.resources.as_ref().map(AgentDefinitionState::subscribe)
+        };
         // Remote admission never publishes; serialize only local catalog publication and open.
         let _admission = if self.exported() {
             None
@@ -111,16 +122,18 @@ impl WorkerStdio {
                 .await??
                 != launches
             {
-                return Err(revoked().into());
+                return Err(WorkerOpenError::Rejected(revoked()));
             }
         }
-        let current = self
-            .before_open(&lease, self.connections(selection(expected)))
-            .await??;
-        if !matches(&current, expected)
-            || !drain_updates(&mut updates, expected)
-            || lease.is_cancelled()
-        {
+        if !self.retain_admitted_connection || !self.exported() {
+            let current = self
+                .before_open(&lease, self.connections(selection(expected)))
+                .await??;
+            if !matches(&current, expected) || !drain_updates(&mut updates, expected) {
+                return Err(WorkerOpenError::Rejected(revoked()));
+            }
+        }
+        if lease.is_cancelled() {
             return Err(revoked().into());
         }
         let channel = if self.exported() {
@@ -178,12 +191,12 @@ impl WorkerStdio {
     async fn local_catalog(
         &self,
         expected: &McpResolvedConnection,
-    ) -> mcp::Result<Vec<McpStdioLaunch>> {
+    ) -> Result<Vec<McpStdioLaunch>, WorkerOpenError> {
         let catalog = self
             .connections(McpServerSelection::Exclude(BTreeSet::new()))
             .await?;
         if !matches(&catalog, expected) {
-            return Err(revoked());
+            return Err(WorkerOpenError::Rejected(revoked()));
         }
         let mut launches = catalog
             .iter()
@@ -326,6 +339,12 @@ impl WorkerChannel {
     }
 
     async fn validate(&self) -> mcp::Result<()> {
+        if self.worker.retain_admitted_connection {
+            return self
+                .worker
+                .before_open(&self.lease, std::future::ready(()))
+                .await;
+        }
         let permitted = tokio::select! {
             biased;
             () = self.lease.cancelled() => false,

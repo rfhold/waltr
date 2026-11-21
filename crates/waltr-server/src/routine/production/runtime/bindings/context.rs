@@ -105,7 +105,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory
     }
 }
 
-struct NoTools;
+pub(super) struct NoTools;
 impl AuthorizedToolExecutor for NoTools {
     fn execute(
         &self,

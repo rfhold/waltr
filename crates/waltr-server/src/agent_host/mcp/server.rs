@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -554,6 +554,7 @@ impl McpServerRuntime {
         progress: ToolProgressSink,
         cancellation_token: CancellationToken,
         operation: Option<super::elicitation::McpOperation>,
+        track_routine_send: bool,
     ) -> Result<McpAgentToolResult> {
         let span = tracing::info_span!(
             "mcp.agent.operation",
@@ -582,18 +583,40 @@ impl McpServerRuntime {
             );
             let call =
                 McpToolCall::new(tool, arguments).with_progress_token(progress_token.clone());
-            let response = if let Some(operation) = operation
+            let may_have_sent = AtomicBool::new(false);
+            let authority = operation
                 .as_ref()
-                .filter(|operation| operation.has_authority_check())
-            {
+                .filter(|operation| operation.has_authority_check());
+            let response = if track_routine_send || authority.is_some() {
                 client
-                    .call_tool_checked(call, cancellation_token, || operation.check_current())
+                    .call_tool_checked(call, cancellation_token, || async {
+                        if let Some(operation) = authority {
+                            operation.check_current().await?;
+                        }
+                        may_have_sent.store(true, Ordering::Relaxed);
+                        Ok(())
+                    })
                     .await
             } else {
                 client.call_tool(call, cancellation_token).await
             };
             drop(registration);
-            let response = response.map_err(|error| self.client_error(error))?;
+            let response = response.map_err(|error| {
+                if !track_routine_send {
+                    return self.client_error(error);
+                }
+                if !may_have_sent.load(Ordering::Relaxed) {
+                    return LlmError::Authorization {
+                        provider: "mcp",
+                        message: "MCP tool dispatch refused before sending".into(),
+                        status: None,
+                    };
+                }
+                if matches!(error, mcp::Error::BearerProvider(_)) {
+                    return protocol_error("MCP bearer unavailable after tool dispatch began");
+                }
+                self.client_error(error)
+            })?;
             mcp_tool_result(&response)
         }
         .instrument(span)

@@ -335,8 +335,10 @@ Required media ports fail preflight because these adapters provide no media I/O.
 | JavaScript operation | Strict argument shape | Required capabilities |
 | --- | --- | --- |
 | `helper.run` | `{selection,inference?,input?,task,capture?,source?,maxTurns,deadlineMs,responseBytes,completionBytes}`, optional callback and fifth-argument payload resource | `helper.run` and exact helper identity |
-| `tools.execute` | `{target:{server,tool},callId,arguments}` | `tools.execute` and constructor-mapped `tool.<id>` |
-| `tools.schemas` | `{targets:[{server,tool}]}` | `tools.schemas` and each mapped target |
+| Installed `tools.execute` | `{target:{server,tool},arguments,workspace?,result?}` | `tools.execute` and the exact pair in `spec.mcpTools` |
+| Installed `tools.read` | `{}`, with the fifth-argument result handle | `tools.execute` and an invocation-owned handle |
+| Session-bound `tools.execute` | `{target:{server,tool},callId,arguments}` | `tools.execute` and constructor-mapped `tool.<id>` |
+| Session-bound `tools.schemas` | `{targets:[{server,tool}]}` | `tools.schemas` and each mapped target |
 
 Helper selections use `{kind:"named",name}` or `{kind:"restricted",profile}`.
 Named helpers pin the current catalog bundle. Restricted profiles supply explicit inference, prompt, tools, and total turn limits.

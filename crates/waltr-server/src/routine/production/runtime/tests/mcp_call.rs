@@ -21,6 +21,8 @@ while IFS= read -r request; do
             case "$request" in
                 *'"mode":"cancel"'*|*'"mode":"retire-source"'*) continue ;;
                 *'"mode":"disconnect"'*) exit 0 ;;
+                *'"mode":"catalog-edit"'*)
+                    while [ ! -f allow-result ]; do sleep 0.02; done ;;
                 *'"mode":"replace-restore"'*)
                     while [ ! -f allow-continuation ]; do sleep 0.02; done
                     printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","requestState":"fixture"}}\n' "$id"
@@ -65,9 +67,14 @@ impl mcp::server::ServerHandler for HttpMarker {
     ) -> mcp::server::BoxFuture<mcp::server::ServerResult<mcp::McpToolResult>> {
         assert_eq!(call.name, "http.marker");
         self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Box::pin(async {
+        Box::pin(async move {
+            let text = if call.arguments.get("large") == Some(&json!(true)) {
+                "x".repeat(70_000)
+            } else {
+                "server-http-marker".into()
+            };
             Ok(mcp::McpToolResult {
-                raw: json!({"content":[{"type":"text","text":"server-http-marker"}]}),
+                raw: json!({"content":[{"type":"text","text":text}]}),
             })
         })
     }
@@ -91,50 +98,64 @@ fn install(resources: &std::path::Path, http: &str) {
     std::fs::write(files.join("mcp-servers/routine-refused.yaml"),
         format!("apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {{name: routine-refused}}\nspec: {{transport: stdio, command: '{}'}}\n", missing.display())
     ).unwrap();
-    let script = r#"export default async function (mode) {
-        if (mode !== 'success') {
+    let script = r#"const call = (server, tool, args) => host.call('tools.execute', {target:{server,tool},...args});
+     export default async function (mode) {
+         if (mode === 'catalog-edit') {
+             const actual = await call('routine-stdio','read.marker',{arguments:{mode},workspace:{machine:'local',workingDirectory:'bound'}});
+             const stale = await call('routine-refused','read.marker',{arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
+             return actual.status === 'completed' && JSON.stringify(actual.result).includes('worker-only-marker') && stale.status === 'denied';
+         }
+         if (mode !== 'success') {
             try {
-                await host.call('mcp.call',{server:'routine-stdio',tool:'read.marker',arguments:{mode},workspace:{machine:'local',workingDirectory:'bound'}});
+                await call('routine-stdio','read.marker',{arguments:{mode},workspace:{machine:'local',workingDirectory:'bound'}});
             } catch (_) {}
              if (mode === 'disconnect' || mode === 'replace-restore') {
                 try {
-                    await host.call('mcp.call',{server:'routine-stdio',tool:'read.marker',arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
+                    await call('routine-stdio','read.marker',{arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
                 } catch (_) {}
             }
             return false;
         }
         for (const tool of ['read_marker', 'not-granted']) {
             let denied = false;
-            try { await host.call('mcp.call', {server:'routine-stdio',tool,arguments:{}}); } catch (_) { denied = true; }
+            try { await call('routine-stdio',tool,{arguments:{}}); } catch (_) { denied = true; }
             if (!denied) throw Error('missing exact grant');
         }
-        const noMachine = await host.call('mcp.call', {server:'routine-stdio',tool:'read.marker',arguments:{}});
+        let retired = false;
+        try { await host.call('mcp.call', {server:'routine-stdio',tool:'read.marker',arguments:{}}); } catch (_) { retired = true; }
+        if (!retired) throw Error('retired operation accepted');
+        const noMachine = await call('routine-stdio','read.marker',{arguments:{}});
         if (noMachine.status !== 'denied') throw Error('implicit workspace');
-        const wrongMachine = await host.call('mcp.call', {server:'routine-stdio',tool:'read.marker',arguments:{},workspace:{machine:'unclaimed-machine',workingDirectory:'bound'}});
+        const wrongMachine = await call('routine-stdio','read.marker',{arguments:{},workspace:{machine:'unclaimed-machine',workingDirectory:'bound'}});
         if (wrongMachine.status !== 'denied') throw Error('unauthorized workspace');
         let first;
         for (let i = 0; i < 2; ++i) {
             if (i === 1) {
-                const refused = await host.call('mcp.call',{server:'routine-refused',tool:'read.marker',arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
+                const refused = await call('routine-refused','read.marker',{arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
                 if (refused.status !== 'denied') throw Error('worker open refusal was not known');
             }
-            const actual = await host.call('mcp.call',{server:'routine-stdio',tool:'read.marker',arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
+            const actual = await call('routine-stdio','read.marker',{arguments:{},workspace:{machine:'local',workingDirectory:'bound'}});
             if (actual.status !== 'completed' || actual.result.is_error || !JSON.stringify(actual.result).includes('worker-only-marker')) {
                 throw Error('worker result did not match');
             }
             first = actual.result;
         }
-        const http = await host.call('mcp.call', {server:'routine-http',tool:'http.marker',arguments:{},workspace:{machine:'unclaimed-machine',workingDirectory:'bound'}});
-        const app = await host.call('mcp.call', {server:'routine-http',tool:'http.app-only',arguments:{}});
+         const http = await call('routine-http','http.marker',{arguments:{},workspace:{machine:'unclaimed-machine',workingDirectory:'bound'}});
+         const large = await call('routine-http','http.marker',{arguments:{large:true},result:'handle'});
+         const projection = await host.call('tools.read', {}, null, null, large);
+         if (projection.status !== 'completed' || projection.resultUnavailable !== 'limit') throw Error('completed effect lost on result limit');
+        const app = await call('routine-http','http.app-only',{arguments:{}});
         if (app.status !== 'denied') throw new Error('App-only tool exposed to Routine');
         return JSON.stringify(first).includes('worker-only-marker') && http.status === 'completed' && !http.result.is_error && JSON.stringify(http.result).includes('server-http-marker');
     }"#;
     std::fs::write(files.join("routines/direct-mcp.yaml"), serde_json::to_vec(&json!({
         "apiVersion":"waltr.routine/v1","kind":"Routine","name":"direct-mcp","description":"Direct MCP contract",
-        "spec":{"source":script,"entrypoints":{"run":{"trigger":"manual"},"unsupported":{"trigger":"interactive"}},
+        "spec":{"source":script,"entrypoints":{"run":{"trigger":"manual"}},
             "parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"string","maxLength":32}},
             "result":{"schemaVersion":"waltr.value/v1","schema":{"type":"boolean"}},
-             "capabilities":["mcp.call","tool.read-marker","tool.refused-marker","tool.http-marker","tool.app-only"]}
+            "capabilities":["tools.execute"],
+            "mcpTools":[{"server":"routine-stdio","tool":TOOL},{"server":"routine-refused","tool":TOOL},
+                {"server":"routine-http","tool":"http.marker"},{"server":"routine-http","tool":"http.app-only"}]}
     })).unwrap()).unwrap();
 }
 
@@ -162,10 +183,13 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
             .unwrap();
         let state = config.state().clone();
         let snapshot = state.snapshot();
-        let (catalog, _) = catalog_entries(&snapshot, &RoutineAuthority::default()).unwrap();
+        let (catalog, _) = catalog_entries(&snapshot).unwrap();
         assert_eq!(
             catalog["direct-mcp"].offers,
-            BTreeMap::from([("run".into(), BTreeSet::from([StartContext::Session]))])
+            BTreeMap::from([(
+                "run".into(),
+                BTreeSet::from([StartContext::Global, StartContext::Session])
+            )])
         );
         let routine = snapshot.scripts().get("direct-mcp").unwrap();
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
@@ -200,44 +224,7 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
                 workspace_root: workspace.clone(),
                 sandbox_socket: None,
                 routine_private_parent: root,
-                routine_authority: RoutineAuthority {
-                    targets: [
-                        (
-                            "tool.read-marker".into(),
-                            crate::agent_host::authorized_tools::ConcreteToolTarget::new(
-                                "routine-stdio",
-                                TOOL,
-                            )
-                            .unwrap(),
-                        ),
-                        (
-                            "tool.refused-marker".into(),
-                            crate::agent_host::authorized_tools::ConcreteToolTarget::new(
-                                "routine-refused",
-                                TOOL,
-                            )
-                            .unwrap(),
-                        ),
-                        (
-                            "tool.http-marker".into(),
-                            crate::agent_host::authorized_tools::ConcreteToolTarget::new(
-                                "routine-http",
-                                "http.marker",
-                            )
-                            .unwrap(),
-                        ),
-                        (
-                            "tool.app-only".into(),
-                            crate::agent_host::authorized_tools::ConcreteToolTarget::new(
-                                "routine-http",
-                                "http.app-only",
-                            )
-                            .unwrap(),
-                        ),
-                    ]
-                    .into(),
-                    ..Default::default()
-                },
+                routine_authority: RoutineAuthority::default(),
             },
             move |_, input| {
                 Ok(crate::session::SessionService::from_sessions(
@@ -283,14 +270,9 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
                 ..Default::default()
             }),
         };
-        assert!(
-            service
-                .start_invocation(start(None, "success"))
-                .await
-                .is_err()
-        );
+        let mut session_changes = sessions.watch_sessions();
         let invocation = service
-            .start_invocation(start(Some(source_id.as_str().into()), "success"))
+            .start_invocation(start(None, "success"))
             .await
             .unwrap()
             .into_inner()
@@ -321,6 +303,8 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
             .invocation
             .unwrap();
         assert_eq!(row.status, p::InvocationStatus::Succeeded as i32, "{row:?}");
+        use futures_util::{FutureExt as _, StreamExt as _};
+        assert!(session_changes.next().now_or_never().is_none());
         assert_eq!(
             serde_json::from_slice::<Value>(&row.result.unwrap().json).unwrap(),
             json!(true)
@@ -364,16 +348,20 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
             1
         );
         assert!(!workspace.join("launched").exists());
-        assert_eq!(http_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(http_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_reaped(&bound);
         for (mode, expected_calls) in [
             ("disconnect", 3),
             ("cancel", 4),
             ("replace-restore", 5),
             ("retire-source", 6),
+            ("catalog-edit", 7),
         ] {
             let invocation = service
-                .start_invocation(start(Some(source_id.as_str().into()), mode))
+                .start_invocation(start(
+                    (mode != "catalog-edit").then(|| source_id.as_str().into()),
+                    mode,
+                ))
                 .await
                 .unwrap()
                 .into_inner()
@@ -417,6 +405,27 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
                         std::fs::write(bound.join("allow-continuation"), "").unwrap();
                     }
                     "retire-source" => sessions.delete(&source_id).await.unwrap(),
+                    "catalog-edit" => {
+                        let path =
+                            resources.join(".waltr/resources/mcp-servers/routine-stdio.yaml");
+                        let original = std::fs::read_to_string(&path).unwrap();
+                        std::fs::write(
+                            &path,
+                            original.replace("/bin/sh ./child.sh", "/bin/sh ./replacement.sh"),
+                        )
+                        .unwrap();
+                        let unopened =
+                            resources.join(".waltr/resources/mcp-servers/routine-refused.yaml");
+                        let original = std::fs::read_to_string(&unopened).unwrap();
+                        std::fs::write(
+                            unopened,
+                            original.replace("uninstalled-fixture-executable", "new-executable"),
+                        )
+                        .unwrap();
+                        state.reload_from_disk().await;
+                        assert!(state.reload_error().is_none());
+                        std::fs::write(bound.join("allow-result"), "").unwrap();
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -436,11 +445,19 @@ async fn installed_routine_dispatches_exact_worker_mcp_without_inference_or_orig
                 .into_inner()
                 .invocation
                 .unwrap();
-            assert_eq!(
-                row.status,
-                p::InvocationStatus::Uncertain as i32,
-                "{mode}: {row:?}"
-            );
+            if mode == "catalog-edit" {
+                assert_eq!(row.status, p::InvocationStatus::Succeeded as i32, "{row:?}");
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&row.result.unwrap().json).unwrap(),
+                    json!(true)
+                );
+            } else {
+                assert_eq!(
+                    row.status,
+                    p::InvocationStatus::Uncertain as i32,
+                    "{mode}: {row:?}"
+                );
+            }
             assert_eq!(
                 std::fs::read_to_string(bound.join("calls"))
                     .unwrap()

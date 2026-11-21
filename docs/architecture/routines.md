@@ -58,12 +58,20 @@ Point the [audio question shortcut](../examples/routines/audio-interactions.md#a
 
 ### Call an MCP tool on a selected worker
 
-An installed Routine with a verified source session can use `mcp.call` without a model or helper. Declare `mcp.call` and an operator-granted `tool.*` capability for the exact server and upstream tool names. The source agent must select the MCP server. Its normal policy, the caller’s permission ceiling, and middleware still apply.
+An installed manual or interactive Routine can call an MCP tool without creating a chat session or running a model. Declare `tools.execute` and list the exact configured server and upstream tool in the Routine resource:
+
+```yaml
+spec:
+  capabilities: [tools.execute]
+  mcpTools:
+    - {server: repository, tool: read_summary}
+```
+
+The server checks the declaration before it connects. Current catalog write permissions apply to the whole resource. Interactive entrypoints require `media.execute`; manual entrypoints cannot declare it or require media ports. Use separate definitions for these entrypoint types. The declaration does not grant helper access, schema discovery, or access from a child, scheduled, or public code invocation.
 
 ```js
-const reply = await host.call('mcp.call', {
-  server: 'repository',
-  tool: 'read_summary',
+const reply = await host.call('tools.execute', {
+  target: {server: 'repository', tool: 'read_summary'},
   arguments: {},
   workspace: {machine: 'laptop', workingDirectory: 'rfhold/waltr'}
 });
@@ -71,13 +79,17 @@ const reply = await host.call('mcp.call', {
 
 Stdio requires `workspace.machine`; omit `workingDirectory` to use the export root. The caller must own the live claim for a remote machine. The desktop origin never selects the target. The [exporter must allow the named stdio resource](../deployment.md#export-a-workspace-to-another-waltr-server). For Streamable HTTP, omit `workspace`: the connection stays on the server.
 
-Start a manual Routine from its source session. Normal tool permission prompts go to that session. Worker stdio does not support upstream MCP elicitation; it fails closed. This operation is not available to source-less, media, or child invocations, public MCP, or public code.
+Without a source chat, the Routine declaration authorizes the call. There is no session permission prompt or upstream elicitation route. With a verified source chat, its agent must also select the server; the normal source policy, caller ceiling, and middleware still apply. Worker stdio does not support upstream MCP elicitation in either case.
 
-The invocation reuses a connection only for the same target and current configuration. It closes its connections at completion or cancellation. The journal records the exact tool identity and status, not raw arguments or results. Unknown outcomes do not replay.
+The invocation owns its connections and closes them at completion or cancellation. A source-less invocation uses its admission snapshot and does not watch for caller catalog edits. A new local stdio launch must still match the live worker launch catalog. Transport-level credential and worker revocation checks still apply, including a worker catalog update that revokes the launch. The journal records the exact tool identity and status, not raw arguments or results. Unknown outcomes do not replay.
+
+By default, `tools.execute` returns `{status: "completed", result}` or `{status: "denied"}` for a known refusal. Set `result: "handle"` to keep the completed result in server memory. Pass the handle as the fifth argument to `host.call('tools.read', {}, null, null, handle)` to read bounded text and image metadata, or pass it to `helper.run` with `imageIndex` to attach one image. The default index is zero among image blocks. The image must fit the existing helper and tool-result limits, and the selected model must support its format. Image bytes do not enter JavaScript in handle mode. If a completed result cannot be returned or retained within the limits, the reply is `{status: "completed", resultUnavailable: "limit"}`.
+
+Installed Routines must use this `tools.execute` contract; `mcp.call` and installed `tools.schemas` are not supported. Update existing Routine definitions before rollout. History needs no migration. Session-bound Code Mode keeps its separate `callId` and schema-discovery contract.
 
 ## Automatic Completion Admission
 
-Normal gRPC session runs capture the actual originating principal and access lease in their runtime factory. Queued runs retain that factory; different host bindings do not batch together. First-user-message title and completion compaction use this origin, excluding helper/ephemeral sessions.
+Normal gRPC session runs capture the actual originating principal and access lease in their runtime factory. Queued runs retain that factory; different host bindings do not batch together. First-user-message title and completion compaction use this origin, excluding helper sessions.
 
 The agent coordinator owns the atomic terminal barrier, pause, source cursor, continuation and ordinary queue. The reviewed completion adapter adopts the completed-run lease and joins admission, execution and pause cleanup. The JavaScript compaction program selects pressure at 180,000 tokens or 80 percent of a known context limit; missing limits remain unknown. It does not invent usage or retry interrupted work.
 
@@ -95,7 +107,7 @@ The bundled category programs define `routine.categories.v1` session checkpoints
 
 Routine source CAS retains the public complete-record revision, strict context digest, durable incarnation and pre-state metadata/mask predicates. Execution-token equality cannot replace these checks. Metadata-only transactions advance the public revision without invalidation of live execution; a concurrent title remains compatible with the parent's first response. Combined metadata/mask transactions advance both domains once. The completed-source matcher retains its explicit mask-commit allowance; pause ownership, continuation cursors and committed receipts remain mandatory. Routine program revisions and observation cursors remain separate namespaces. See [agent revision domains](../agent/storage.md#revision-domains-and-append-receipts).
 
-Origin-bound semantic consumers use post-commit generic turn, tool-result and run-finished facts plus host-confirmed idle state. Trusted server-local `SessionRoles` binds helper, ephemeral and task provenance to actual session IDs and incarnations. Public `task.*` metadata remains audit data. A private creation sink prevents automatic helper triggers before classification. Twenty turns or two tasks request categorization; idle uses live boundary markers. Lag resets counters without hydration replay. `InvocationCoalescer` binds exact source identity, Routine revision, entrypoint and execution ID. Reuse requires joined known success, a context-owned generic commit and current revision/incarnation, never category proof interpretation. Each consumer stops on its original lease and joins its admitted work on shutdown.
+Origin-bound semantic consumers use post-commit generic turn, tool-result and run-finished facts plus host-confirmed idle state. Trusted server-local `SessionRoles` binds helper and task provenance to actual session IDs and incarnations. Public `task.*` metadata remains audit data. A private creation sink prevents automatic helper triggers before classification. Twenty turns or two tasks request categorization; idle uses live boundary markers. Lag resets counters without hydration replay. `InvocationCoalescer` binds exact source identity, Routine revision, entrypoint and execution ID. Reuse requires joined known success, a context-owned generic commit and current revision/incarnation, never category proof interpretation. Each consumer stops on its original lease and joins its admitted work on shutdown.
 
 `manage-context` and `configure-waltr` are normal permission-controlled session tools. Direct configuration requires a source whose current normal policy explicitly allows `configure-waltr`; no global manual offer exists. Both paths intersect the named helper's own permissions with the actual caller policy. Authentication and the configuration agent's own grants do not supply caller authority.
 

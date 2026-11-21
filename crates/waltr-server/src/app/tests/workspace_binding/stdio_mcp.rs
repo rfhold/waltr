@@ -1,10 +1,8 @@
 use super::*;
-use crate::agent_host::authorized_tools::ConcreteToolTarget;
 use waltr::grpc::waltr::{routine::v2 as p, session::v1::AgentSelectionRequest};
 
 pub(super) const SERVER: &str = "workspace-marker";
 const TOOL: &str = "read.marker";
-const GRANT: &str = "tool.workspace-marker";
 const AGENT: &str = "workspace-marker-source";
 const ROUTINE: &str = "read-workspace-marker";
 const PROGRAM: &str = "marker-mcp.sh";
@@ -44,8 +42,8 @@ pub(super) fn install_resources(root: &Path, role: Role) -> RoutineAuthority {
     .unwrap();
     let source = format!(
         r#"export default async function () {{
-            const reply = await host.call('mcp.call', {{
-                server: '{SERVER}', tool: '{TOOL}', arguments: {{}},
+            const reply = await host.call('tools.execute', {{
+                target: {{server: '{SERVER}', tool: '{TOOL}'}}, arguments: {{}},
                 workspace: {{machine: '{MACHINE}', workingDirectory: '{PROJECT}'}}
             }});
             if (reply.status !== 'completed' || reply.result.is_error) throw Error('marker call failed');
@@ -65,16 +63,14 @@ pub(super) fn install_resources(root: &Path, role: Role) -> RoutineAuthority {
                 "entrypoints": {"run": {"trigger": "manual"}},
                 "parameters": {"schemaVersion": "waltr.value/v1", "schema": {"type": "null"}},
                 "result": {"schemaVersion": "waltr.value/v1", "schema": {"type": "string", "maxLength": 128}},
-                "capabilities": ["mcp.call", GRANT],
+                "capabilities": ["tools.execute"],
+                "mcpTools": [{"server":SERVER,"tool":TOOL}],
             },
         }))
         .unwrap(),
     )
     .unwrap();
-    RoutineAuthority {
-        targets: [(GRANT.into(), ConcreteToolTarget::new(SERVER, TOOL).unwrap())].into(),
-        ..Default::default()
-    }
+    RoutineAuthority::default()
 }
 
 pub(super) struct Probe {

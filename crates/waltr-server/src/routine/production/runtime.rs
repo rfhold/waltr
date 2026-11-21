@@ -91,7 +91,7 @@ impl ProductionRuntime {
         input.authority.validate()?;
         let mut updates = input.state.subscribe();
         let snapshot = input.state.snapshot();
-        let (entries, capabilities) = catalog_entries(&snapshot, &input.authority)?;
+        let (entries, capabilities) = catalog_entries(&snapshot)?;
         let catalog = Arc::new(MemoryCatalog::new(entries, capabilities)?);
         let engine = Arc::new(waltr_script::Engine::new(128).map_err(|_| PortError::Unavailable)?);
         let history = input.persistence.script_invocation_store();
@@ -136,7 +136,6 @@ impl ProductionRuntime {
         let attachments = AttachmentRegistry::new(history.clone(), blobs.clone());
         let blob_registry =
             BlobRegistry::new(blobs.clone(), clock, history.clone(), attachments.clone());
-        let catalog_authority = input.authority.clone();
         let machines = factory.workspace_machines().clone();
         let policy = bindings::Composition::new(
             input.state.clone(),
@@ -177,7 +176,7 @@ impl ProductionRuntime {
                             Err(_) => return Err(PortError::Unavailable),
                         }
                         let snapshot = state.snapshot();
-                        let (entries, capabilities) = catalog_entries(&snapshot, &catalog_authority)?;
+                        let (entries, capabilities) = catalog_entries(&snapshot)?;
                         catalog.replace(entries, capabilities)?;
                     }
                 }
@@ -243,7 +242,6 @@ impl HostFactory for Unbound {
 }
 fn catalog_entries(
     snapshot: &crate::resource_catalog::AgentDefinitionSnapshot,
-    authority: &RoutineAuthority,
 ) -> Result<(BTreeMap<String, CatalogEntry>, BTreeSet<String>), PortError> {
     let mut entries = BTreeMap::new();
     let mut capabilities = BTreeSet::from(
@@ -265,15 +263,11 @@ fn catalog_entries(
     );
     capabilities.insert("media.execute".into());
     capabilities.insert("media.inputs".into());
-    if !authority.targets.is_empty() {
-        capabilities.extend([
-            "tools.execute".into(),
-            "tools.schemas".into(),
-            "mcp.call".into(),
-        ]);
-        capabilities.extend(authority.targets.keys().cloned());
-    }
     for (name, definition) in snapshot.scripts() {
+        let direct_mcp = !definition.envelope().spec.mcp_tools.is_empty();
+        if direct_mcp {
+            capabilities.insert("tools.execute".into());
+        }
         for capability in &definition.envelope().spec.capabilities {
             if let Some(capture) = capability.strip_prefix("helper.capture.") {
                 if definition.envelope().spec.captures.contains_key(capture) {
@@ -286,15 +280,20 @@ fn catalog_entries(
                 }
             }
         }
-        let direct_mcp = definition.envelope().spec.capabilities.contains("mcp.call");
-        let session = direct_mcp
-            || name == "configuration"
+        let session = name == "configuration"
             || definition
                 .envelope()
                 .spec
                 .capabilities
                 .iter()
                 .any(|cap| cap.starts_with("context."));
+        let contexts = if session {
+            BTreeSet::from([StartContext::Session])
+        } else if direct_mcp {
+            BTreeSet::from([StartContext::Global, StartContext::Session])
+        } else {
+            BTreeSet::from([StartContext::Global])
+        };
         let offers = definition
             .envelope()
             .spec
@@ -302,17 +301,14 @@ fn catalog_entries(
             .iter()
             .filter_map(|(entry, descriptor)| {
                 (matches!(descriptor.trigger, Trigger::Manual)
-                    || (!direct_mcp && matches!(descriptor.trigger, Trigger::Interactive)))
-                .then(|| {
-                    (
-                        entry.clone(),
-                        BTreeSet::from([if session {
-                            StartContext::Session
-                        } else {
-                            StartContext::Global
-                        }]),
-                    )
-                })
+                    || (matches!(descriptor.trigger, Trigger::Interactive)
+                        && (!direct_mcp
+                            || definition
+                                .envelope()
+                                .spec
+                                .capabilities
+                                .contains("media.execute"))))
+                .then(|| (entry.clone(), contexts.clone()))
             })
             .collect();
         entries.insert(

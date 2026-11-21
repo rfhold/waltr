@@ -59,6 +59,9 @@ pub struct Program {
     /// Required capabilities, checked together by the supplied host factory.
     #[serde(default)]
     pub capabilities: BTreeSet<String>,
+    /// Exact MCP targets available to installed manual and interactive invocations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tools: Vec<crate::agent_host::authorized_tools::ConcreteToolTarget>,
     /// Resource-owned capture contracts bound to exact helper selections.
     #[serde(default)]
     pub captures: BTreeMap<String, CaptureContract>,
@@ -428,6 +431,26 @@ impl Definition {
             return Err(DefinitionError("invalid Routine identity"));
         }
         let spec = &envelope.spec;
+        if spec.mcp_tools.len() > 64
+            || spec.mcp_tools.iter().collect::<BTreeSet<_>>().len() != spec.mcp_tools.len()
+            || (!spec.mcp_tools.is_empty()
+                && (!spec.capabilities.contains("tools.execute")
+                    || spec.capabilities.contains("tools.schemas")
+                    || spec.capabilities.contains("children.call")
+                    || spec.entrypoints.values().any(|entry| match entry.trigger {
+                        Trigger::Manual => {
+                            spec.capabilities.contains("media.execute")
+                                || spec.ports.values().any(|port| port.required)
+                        }
+                        Trigger::Interactive => !spec.capabilities.contains("media.execute"),
+                        _ => false,
+                    })
+                    || !spec.entrypoints.values().all(|entry| {
+                        matches!(entry.trigger, Trigger::Manual | Trigger::Interactive)
+                    })))
+        {
+            return Err(DefinitionError("invalid installed MCP tool declaration"));
+        }
         if spec.budgets.deadline_ms > 30_000 && !spec.capabilities.contains("media.execute") {
             return Err(DefinitionError("long deadline requires media preflight"));
         }
@@ -595,6 +618,40 @@ mod nullable_tests {
 
     fn contract(schema: Value) -> Contract {
         serde_json::from_value(json!({"schemaVersion":SCHEMA_VERSION,"schema":schema})).unwrap()
+    }
+    #[test]
+    fn installed_mcp_targets_are_exact_and_only_for_manual_or_interactive_routines() {
+        let engine = waltr_script::Engine::new(1).unwrap();
+        let mut envelope: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/routines/title.json")).unwrap();
+        let target = json!({"server":"computer-use","tool":"screenshot_window"});
+        envelope["spec"]["entrypoints"] = json!({"run":{"trigger":"manual"}});
+        envelope["spec"]["capabilities"] = json!(["tools.execute"]);
+        envelope["spec"]["mcpTools"] = json!([target]);
+        Definition::parse(&envelope.to_string(), &engine).unwrap();
+        for (field, value) in [
+            ("mcpTools", json!([target, target])),
+            ("mcpTools", json!([{"server":"computer-use","tool":""}])),
+            ("capabilities", json!(["tools.schemas"])),
+            ("capabilities", json!(["tools.execute", "media.execute"])),
+            (
+                "ports",
+                json!({"source":{"direction":"input","media":"file","required":true,"maxBytes":1024,"formats":["blob"]}}),
+            ),
+            ("entrypoints", json!({"run":{"trigger":"event"}})),
+            ("entrypoints", json!({"run":{"trigger":"interactive"}})),
+            (
+                "entrypoints",
+                json!({"run":{"trigger":"manual"},"interactive":{"trigger":"interactive"}}),
+            ),
+        ] {
+            let mut invalid = envelope.clone();
+            invalid["spec"][field] = value;
+            assert!(
+                Definition::parse(&invalid.to_string(), &engine).is_err(),
+                "{field}"
+            );
+        }
     }
     #[test]
     fn tool_streams_strict_declarations_and_empty_revision_compatibility() {

@@ -1,4 +1,8 @@
 //! Host-owned media operations over the ordinary invocation and helper services.
+use super::authorized_tools::{
+    McpArguments, RoutineMcpPort, execute_mcp, is_tool_result, parse_mcp, tool_image_attachment,
+    tool_result_handle,
+};
 #[cfg(test)]
 #[path = "script_routine_media_tests.rs"]
 mod tests;
@@ -121,6 +125,12 @@ impl ResultPool {
     pub fn retained(&self) -> usize {
         self.1 - self.0.available_permits()
     }
+    pub(super) fn reserve(&self, bytes: u32) -> Result<OwnedSemaphorePermit, waltr_script::Error> {
+        self.0
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| waltr_script::Error::Limit)
+    }
 }
 /// Authenticated transport and adapter composition. Construction performs no effects.
 pub struct MediaBindings {
@@ -206,6 +216,18 @@ impl HostFactory for MediaHostFactory {
         selected: SelectedEntrypoint,
         caller: Caller,
     ) -> PortFuture<PreparedHost> {
+        self.preflight_mcp(binding, definition, selected, caller, None)
+    }
+}
+impl MediaHostFactory {
+    pub(crate) fn preflight_mcp(
+        &self,
+        binding: InvocationBinding,
+        definition: Arc<Definition>,
+        selected: SelectedEntrypoint,
+        caller: Caller,
+        mcp: Option<Arc<dyn RoutineMcpPort>>,
+    ) -> PortFuture<PreparedHost> {
         let factory = self.bindings.clone();
         Box::pin(async move {
             if binding.principal() != caller.principal {
@@ -214,7 +236,7 @@ impl HostFactory for MediaHostFactory {
             let mut bindings = factory
                 .bind(binding.clone(), definition.clone(), selected, caller)
                 .await?;
-            validate_bindings(&bindings, &binding, &definition)?;
+            validate_bindings(&bindings, &binding, &definition, mcp.is_some())?;
             if definition
                 .envelope()
                 .spec
@@ -278,6 +300,7 @@ impl HostFactory for MediaHostFactory {
                 ..State::default()
             };
             let host = Arc::new(MediaHost {
+                mcp,
                 binding,
                 definition,
                 bindings: Arc::new(bindings),
@@ -304,6 +327,7 @@ fn validate_bindings(
     b: &MediaBindings,
     binding: &InvocationBinding,
     definition: &Definition,
+    mcp: bool,
 ) -> Result<(), PortError> {
     if b.principal != binding.principal()
         || b.context.is_none()
@@ -324,6 +348,7 @@ fn validate_bindings(
                 && c != "helper.run"
                 && c != "helper.validate"
                 && c != "helper.streams"
+                && !(mcp && c == "tools.execute")
                 && !c.starts_with("helper.named.")
                 && !c.starts_with("helper.restricted.")
                 && !c.starts_with("helper.capture.")
@@ -471,6 +496,7 @@ struct Capture {
 }
 #[derive(Clone)]
 struct MediaHost {
+    mcp: Option<Arc<dyn RoutineMcpPort>>,
     tool_streams: Arc<super::tool_streams::ToolStreams>,
     cleanup: Arc<tokio::sync::Mutex<Cleanup>>,
     runtime: tokio::runtime::Handle,
@@ -581,6 +607,28 @@ impl MediaHost {
         drop(state);
         if request.bytes.is_some() {
             return Err(waltr_script::Error::Invalid);
+        }
+        if self.mcp.is_some() {
+            match request.operation.as_str() {
+                "tools.execute" => {
+                    let mcp = parse_mcp(request, |target| {
+                        self.definition.envelope().spec.mcp_tools.contains(target)
+                    })
+                    .map_err(|error| match error {
+                        PortError::Invalid => waltr_script::Error::Invalid,
+                        _ => waltr_script::Error::Denied,
+                    })?;
+                    return Ok(Arguments {
+                        mcp: Some(mcp),
+                        ..Arguments::default()
+                    });
+                }
+                "tools.read" => {
+                    context.validate_handle(tool_result_handle(request)?, "tools.result")?;
+                    return Ok(Arguments::default());
+                }
+                _ => {}
+            }
         }
         let mut args: Arguments = if request.operation.starts_with("context.") {
             if !self
@@ -787,7 +835,30 @@ impl MediaHost {
                 }
             }
             "helper.run" | "helper.open" => {
-                if request.handle.is_some() {
+                if is_tool_result(request) {
+                    if self.mcp.is_none()
+                        || request.operation != "helper.run"
+                        || args
+                            .helper
+                            .as_ref()
+                            .is_some_and(|helper| helper.field.is_some())
+                    {
+                        return Err(waltr_script::Error::Denied);
+                    }
+                    context.validate_handle(
+                        request
+                            .handle
+                            .as_ref()
+                            .ok_or(waltr_script::Error::Identity)?,
+                        "tools.result",
+                    )?;
+                } else if args
+                    .helper
+                    .as_ref()
+                    .is_some_and(|helper| helper.image_index.is_some())
+                {
+                    return Err(waltr_script::Error::Invalid);
+                } else if request.handle.is_some() {
                     self.resource(request, context)?;
                 }
             }
@@ -891,6 +962,10 @@ impl MediaHost {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Arguments {
+    #[serde(skip)]
+    mcp: Option<McpArguments>,
+    #[serde(skip)]
+    operation_id: Option<String>,
     task: Option<String>,
     stream: Option<String>,
     outputs: Option<Vec<String>>,
@@ -926,12 +1001,19 @@ impl OperationPolicy for MediaHost {
     fn before(&self, request: &HostRequest, context: &HostContext) -> PortFuture<Value> {
         let checked = self
             .check(request, context)
-            .map(|_| json!({"operation":request.operation}))
+            .map(|args| match args.mcp {
+                Some(mcp) => json!({"target":mcp.target}),
+                None => json!({"operation":request.operation}),
+            })
             .map_err(|_| PortError::Denied);
         Box::pin(async move { checked })
     }
-    fn project_result(&self, _: &str, reply: &HostReply) -> Result<Option<Value>, PortError> {
+    fn project_result(&self, name: &str, reply: &HostReply) -> Result<Option<Value>, PortError> {
         Ok(Some(match reply {
+            HostReply::Value(v) if name == "tools.execute" => {
+                json!({"status":v.as_json().get("status")})
+            }
+            HostReply::Handle(_) if name == "tools.execute" => json!({"status":"completed"}),
             HostReply::Handle(h) => json!({"kind":h.kind()}),
             HostReply::Bytes(b) => json!({"bytes":b.len()}),
             HostReply::Value(_) => json!({"status":"completed"}),
@@ -947,6 +1029,29 @@ impl MediaHost {
         args: Arguments,
     ) -> Result<HostReply, waltr_script::Error> {
         let value = match request.operation.as_str() {
+            "tools.execute" => {
+                return execute_mcp(
+                    self.mcp.clone().ok_or(waltr_script::Error::Denied)?,
+                    args.operation_id.ok_or(waltr_script::Error::Denied)?,
+                    args.mcp.ok_or(waltr_script::Error::Denied)?,
+                    &context,
+                    self.definition.limits(),
+                    self.cancel.clone(),
+                )
+                .await;
+            }
+            "tools.read" => {
+                return self
+                    .mcp
+                    .as_ref()
+                    .ok_or(waltr_script::Error::Denied)?
+                    .results()
+                    .read(
+                        &context,
+                        tool_result_handle(&request)?,
+                        self.definition.limits(),
+                    );
+            }
             "helper.submit" | "helper.idle" | "helper.seal" => {
                 let Resource::Target {
                     target,
@@ -1483,16 +1588,35 @@ impl MediaHost {
                 return self.issue(&context, Resource::Blob(result?));
             }
             "helper.run" | "helper.open" => {
+                let profile = args.helper.ok_or(waltr_script::Error::Invalid)?;
+                let image = if is_tool_result(&request) {
+                    Some(
+                        self.mcp
+                            .as_ref()
+                            .ok_or(waltr_script::Error::Denied)?
+                            .results()
+                            .image(
+                                &context,
+                                request
+                                    .handle
+                                    .as_ref()
+                                    .ok_or(waltr_script::Error::Identity)?,
+                                profile.image_index.unwrap_or(0),
+                            )?,
+                    )
+                } else {
+                    None
+                };
                 let resource = request
                     .handle
                     .as_ref()
+                    .filter(|_| image.is_none())
                     .map(|_| self.resource(&request, &context))
                     .transpose()?;
-                let profile = args.helper.ok_or(waltr_script::Error::Invalid)?;
                 let helpers = args
                     .helper_runner
                     .unwrap_or_else(|| self.bindings.helpers.clone());
-                let mut capabilities = if resource.is_some() {
+                let mut capabilities = if resource.is_some() || image.is_some() {
                     helpers
                         .input_capabilities(profile.selection.clone())
                         .await
@@ -1508,7 +1632,7 @@ impl MediaHost {
                     }
                 };
                 capabilities.text &= profile.input.text;
-                if resource.is_some() {
+                if resource.is_some() || image.is_some() {
                     helpers
                         .preflight_payload(
                             profile.selection.clone(),
@@ -1594,7 +1718,17 @@ impl MediaHost {
                                 .map_err(|_| waltr_script::Error::Limit)?,
                         )
                     }
-                    None => None,
+                    None => image
+                        .as_ref()
+                        .map(|image| {
+                            tool_image_attachment(
+                                image.image()?,
+                                capabilities,
+                                profile.input.max_bytes,
+                                &self.bindings.attachments,
+                            )
+                        })
+                        .transpose()?,
                 };
                 let observer = request.callback.map(|callback| {
                     Arc::new(ProposalObserver {
@@ -2001,7 +2135,13 @@ impl HostDispatcher for MediaHost {
     fn dispatch(&self, request: HostRequest, context: HostContext) -> HostFuture {
         let this = Arc::new(self.clone());
         Box::pin(async move {
-            let args = this.check(&request, &context)?;
+            let mut args = this.check(&request, &context)?;
+            if args.mcp.is_some() {
+                args.operation_id = Some(
+                    crate::routine::service::committed_operation(&context)
+                        .map_err(|_| waltr_script::Error::Denied)?,
+                );
+            }
             let mut jobs = this.jobs.lock().await;
             if jobs.len() >= this.definition.limits().host_calls {
                 return Err(waltr_script::Error::Limit);
@@ -2099,6 +2239,9 @@ impl MediaHost {
             task.take();
         }
         clean &= self.bindings.helpers.cleanup().await.is_ok();
+        if let Some(mcp) = &self.mcp {
+            clean &= mcp.clone().cleanup().await.is_ok();
+        }
         if let Some(context) = &self.bindings.context {
             clean &= context.cleanup().await.is_ok();
         }

@@ -72,6 +72,7 @@ pub(crate) fn host_method(method: &str) -> &'static str {
         "helper.seal" => "helper.seal",
         "helper.next" => "helper.next",
         "tools.execute" => "tools.execute",
+        "tools.read" => "tools.read",
         "tools.schemas" => "tools.schemas",
         "context.snapshot" => "context.snapshot",
         "context.history" => "context.history",

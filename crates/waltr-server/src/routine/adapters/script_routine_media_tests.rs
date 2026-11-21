@@ -658,6 +658,7 @@ async fn blank_followups_preserve_blocked_answer_and_completion_gate() {
                     transcripts: vec![Ok("initial question"), Ok(blank)],
                     block_active,
                 }),
+                None,
             )
             .await;
             assert!(!chunks.is_empty());
@@ -694,6 +695,7 @@ async fn blank_then_valid_followup_keeps_original_text_and_single_helper() {
             transcripts: vec![Ok("initial question"), Ok(""), Ok(task)],
             block_active: true,
         }),
+        None,
     )
     .await;
     assert!(!chunks.is_empty());
@@ -730,6 +732,7 @@ async fn empty_initial_question_fails_without_helper_or_history() {
                 transcripts: vec![Ok(blank)],
                 block_active: false,
             }),
+            None,
         )
         .await;
         assert!(chunks.is_empty() && bodies.is_empty() && results.is_empty());
@@ -753,6 +756,7 @@ async fn followup_stt_failure_joins_active_answer() {
             transcripts: vec![Ok("initial question"), Err(media::Error::Provider)],
             block_active: true,
         }),
+        None,
     )
     .await;
     assert_eq!(bodies.len(), 1);
@@ -935,6 +939,7 @@ async fn vertical_with_upload(
         input_models,
         upload,
         None,
+        None,
     )
     .await
 }
@@ -946,6 +951,7 @@ async fn vertical_with_recognition(
     input_models: BTreeMap<String, TransientModelCapabilities>,
     upload: Option<(blob::BlobKind, &'static str, Vec<u8>)>,
     recognition: Option<RecognitionPlan>,
+    mcp: Option<Arc<dyn RoutineMcpPort>>,
 ) -> (
     Vec<Chunk>,
     Vec<Value>,
@@ -1413,12 +1419,17 @@ async fn vertical_with_recognition(
         leases: leases.clone(),
     };
     let journal = persistence.script_invocation_store();
+    let base = MediaHostFactory {
+        bindings: Arc::new(Bind(Mutex::new(Some(bindings)))),
+    };
+    let host: Arc<dyn HostFactory> = match mcp {
+        Some(mcp) => Arc::new(ImageToolHost { base, mcp }),
+        None => Arc::new(base),
+    };
     let service = InvocationService::new(
         engine.clone(),
         journal.clone(),
-        Arc::new(MediaHostFactory {
-            bindings: Arc::new(Bind(Mutex::new(Some(bindings)))),
-        }),
+        host,
         Arc::new(SystemClock),
         1,
     )
@@ -1751,6 +1762,107 @@ fn input_capabilities() -> TransientModelCapabilities {
         text: true,
         max_body_bytes: 32 * 1024 * 1024,
     }
+}
+
+struct ImageToolHost {
+    base: MediaHostFactory,
+    mcp: Arc<dyn RoutineMcpPort>,
+}
+
+impl HostFactory for ImageToolHost {
+    fn preflight(
+        &self,
+        binding: InvocationBinding,
+        definition: Arc<Definition>,
+        selected: SelectedEntrypoint,
+        caller: Caller,
+    ) -> PortFuture<PreparedHost> {
+        self.base.preflight_mcp(
+            binding,
+            definition,
+            selected,
+            caller,
+            Some(self.mcp.clone()),
+        )
+    }
+}
+
+const TOOL_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDbkAAAAASUVORK5CYII=";
+
+struct ImageTool(super::super::authorized_tools::ToolResults);
+
+impl RoutineMcpPort for ImageTool {
+    fn call(
+        self: Arc<Self>,
+        operation: String,
+        request: McpArguments,
+        _: CancellationToken,
+    ) -> PortFuture<waltr_agent::ToolResult> {
+        Box::pin(async move {
+            assert!(!operation.is_empty());
+            assert_eq!(request.target.server(), "image-fixture");
+            assert_eq!(request.target.tool(), "capture");
+            let image = waltr_agent::ToolResultImage::new(TOOL_PNG, "image/png").unwrap();
+            Ok(waltr_agent::ToolResult::from_content(
+                operation,
+                "capture",
+                waltr_agent::ToolResultContent::from_blocks(vec![
+                    waltr_agent::ToolResultContentBlock::Image(image),
+                ])
+                .unwrap(),
+                false,
+            ))
+        })
+    }
+
+    fn results(&self) -> &super::super::authorized_tools::ToolResults {
+        &self.0
+    }
+
+    fn cleanup(self: Arc<Self>) -> PortFuture<()> {
+        Box::pin(async move { self.0.clear() })
+    }
+}
+
+#[tokio::test]
+async fn interactive_tool_result_handle_reaches_helper_as_image() {
+    if isolated("interactive_tool_result_handle_reaches_helper_as_image") {
+        return;
+    }
+    let program = include_str!("../../../tests/fixtures/routines/native-inspect.yaml")
+        .replace("media.execute, helper.run", "media.execute, tools.execute, helper.run")
+        .replace("  captures:", "  mcpTools: [{server: image-fixture, tool: capture}]\n  captures:")
+        .replace("    source: {direction: input, media: file, required: true, maxBytes: 67108864, formats: [blob]}\n", "")
+        .replace(
+            "const source = await host.call('media.upload', {port: 'source'});",
+            "const source = await host.call('tools.execute', {target:{server:'image-fixture',tool:'capture'},arguments:{},result:'handle'});\n      const result = await host.call('tools.read', {}, null, null, source);\n      if (result.content[0].mediaType !== 'image/png' || 'data' in result.content[0]) throw Error('bad image projection');",
+        );
+    let principal = ResultPool::principal();
+    let process = ResultPool::process();
+    let tools = Arc::new(ImageTool(super::super::authorized_tools::ToolResults::new(
+        principal.clone(),
+        process.clone(),
+    )));
+    let (_, bodies, results) = vertical_with_recognition(
+        &program,
+        false,
+        vec![capture(json!({"chosen":"answer"})), response("accepted")],
+        BTreeMap::new(),
+        BTreeMap::from([("inspect".into(), input_capabilities())]),
+        None,
+        None,
+        Some(tools),
+    )
+    .await;
+    assert!(
+        bodies[0]
+            .to_string()
+            .contains(&format!("data:image/png;base64,{TOOL_PNG}"))
+    );
+    assert_eq!(results[0].name, "answer");
+    assert_eq!(principal.retained(), 0);
+    assert_eq!(process.retained(), 0);
 }
 
 #[tokio::test]

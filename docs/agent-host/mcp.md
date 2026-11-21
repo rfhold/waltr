@@ -10,6 +10,8 @@ Waltr's ordinary public MCP catalog exposes management and administration tools,
 
 Separately granted public `code` requests retain JavaScript execution and named helpers. Public code omits upstream concrete targets from discovery and denies their schemas and execution before upstream runtime assembly. Named helpers retain their own internal agent authority. Custom public code ports must enforce the same no-proxy boundary.
 
+Installed manual and interactive Routines can [call exact configured MCP tools](../architecture/routines.md#call-an-mcp-tool-on-a-selected-worker) through invocation-owned connections. When a source chat is supplied, its normal tool policy still applies. This does not expose an upstream proxy through public MCP or Code Mode.
+
 | API | Purpose |
 | --- | --- |
 | `McpConfig` | Server-host collection of MCP servers, request timeout, log level, and trace propagation mode. |

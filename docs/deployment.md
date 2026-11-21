@@ -404,7 +404,7 @@ Each request retains its original token expiry and revocation lease through a fr
 Request metadata and guest arguments select neither identity nor profile.
 
 Media hosts use the same catalog defaults and JavaScript selectors as standalone deployments.
-`RoutineAuthority` retains explicit code grants and target bindings.
+Installed Routines declare [exact MCP targets](architecture/routines.md#call-an-mcp-tool-on-a-selected-worker) in their resource, not in `RoutineAuthority`.
 
 Routine JavaScript selects named helpers, tasks, capture names, source handles, turns, deadlines and response/completion budgets explicitly.
 `spec.captures` declares exact named selections and bounded `waltr.value/v1` contracts.
@@ -452,7 +452,7 @@ The routine creates a visible durable auxiliary session. It copies provider conn
 
 The title helper starts with only the task prompt containing the first durable user message; it receives no other source history.
 
-The routine writes the final text to source metadata key `title` only when that key is absent. The host excludes helper and ephemeral sessions from first-message triggers.
+The routine writes the final text to source metadata key `title` only when that key is absent. The host excludes helper sessions from first-message triggers.
 
 Event delivery and duplicate-attempt suppression before admission are process-local and bounded. Admitted event and manual invocations use one durable lifecycle recorder.
 

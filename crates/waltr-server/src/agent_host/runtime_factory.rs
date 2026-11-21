@@ -1069,7 +1069,7 @@ impl ServerAgentRuntimeFactory {
             }
             {
                 for tool in mcp_runtime
-                    .agent_tools_with_routine_policy(factory.policy.clone(), routine.clone())
+                    .agent_tools_with_routine_policy(factory.policy.clone(), routine.clone(), false)
                     .await
                 {
                     mcp_tool_names.push(tool.definition().name.clone());
@@ -1402,7 +1402,38 @@ impl ServerAgentRuntimeFactory {
                 _ => Vec::new(),
             },
         };
-        let mut connections = connections;
+        self.prepare_mcp_connections(feature, connections).await
+    }
+
+    pub(crate) async fn prepare_installed_routine_mcp(
+        &self,
+        snapshot: &crate::resource_catalog::AgentDefinitionSnapshot,
+        server: &str,
+    ) -> Result<Option<PreparedMcpRuntime>, AgentSessionRuntimeError> {
+        let feature = McpFeatureConfig {
+            servers: McpServerSelection::Include(BTreeSet::from([server.to_owned()])),
+            expose_tools: true,
+            instructions: false,
+            resources: false,
+            prompts: false,
+            skills: false,
+            trace_propagation: false,
+            default_permissions: false,
+        };
+        let connections = crate::session::resolve_mcp_connections(
+            snapshot.configuration(),
+            McpConnectionResolveRequest {
+                servers: feature.servers.clone(),
+            },
+        )?;
+        self.prepare_mcp_connections(&feature, connections).await
+    }
+
+    async fn prepare_mcp_connections(
+        &self,
+        feature: &McpFeatureConfig,
+        mut connections: Vec<McpResolvedConnection>,
+    ) -> Result<Option<PreparedMcpRuntime>, AgentSessionRuntimeError> {
         connections.sort();
         if let McpServerSelection::Include(requested) = &feature.servers {
             let resolved = connections

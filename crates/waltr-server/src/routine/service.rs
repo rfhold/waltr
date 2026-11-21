@@ -1005,11 +1005,11 @@ async fn execute(
 }
 
 tokio::task_local! {
-    static COMMITTED_MCP_CALL: (InvocationId, String);
+    static COMMITTED_OPERATION: (InvocationId, String);
 }
 
-pub(super) fn committed_mcp_call(context: &HostContext) -> Result<String, PortError> {
-    COMMITTED_MCP_CALL
+pub(super) fn committed_operation(context: &HostContext) -> Result<String, PortError> {
+    COMMITTED_OPERATION
         .try_with(|(invocation, id)| {
             if *invocation == context.invocation() {
                 Ok(id.clone())
@@ -1120,16 +1120,10 @@ impl HostDispatcher for JournalHost {
             let reply = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(waltr_script::Error::Cancelled),
-                reply = async {
-                    if name == "mcp.call" {
-                        COMMITTED_MCP_CALL.scope(
-                            (context.invocation(), id.clone()),
-                            async { inner.dispatch(request, context).await },
-                        ).await
-                    } else {
-                        inner.dispatch(request, context).await
-                    }
-                } => reply,
+                reply = COMMITTED_OPERATION.scope(
+                    (context.invocation(), id.clone()),
+                    async { inner.dispatch(request, context).await },
+                ) => reply,
             };
             dispatch_error = reply.as_ref().err().copied();
             let (status, result) = match &reply {

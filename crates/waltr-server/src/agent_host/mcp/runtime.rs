@@ -232,13 +232,15 @@ impl McpClientRuntime {
         self: &Arc<Self>,
         policy: Arc<dyn super::super::dispatcher::CapabilityPolicy>,
     ) -> Vec<super::super::Capability> {
-        self.agent_tools_with_routine_policy(policy, None).await
+        self.agent_tools_with_routine_policy(policy, None, false)
+            .await
     }
 
     pub(crate) async fn agent_tools_with_routine_policy(
         self: &Arc<Self>,
         policy: Arc<dyn super::super::dispatcher::CapabilityPolicy>,
         routine: Option<Arc<crate::permission::ServerPermissionPolicy>>,
+        installed_routine: bool,
     ) -> Vec<super::super::Capability> {
         let mut tools = Vec::new();
         let mut inventory = Vec::new();
@@ -281,6 +283,7 @@ impl McpClientRuntime {
                 let closure_server_name = server_name.clone();
                 let operation_policy = policy.clone();
                 let routine = routine.clone();
+                let track_routine_send = installed_routine || routine.is_some();
                 let mut agent_tool = AgentTool::new_async(definition, move |context| {
                     let routine = routine.clone();
                     let operation_policy = operation_policy.clone();
@@ -340,6 +343,7 @@ impl McpClientRuntime {
                                 progress,
                                 cancellation_token,
                                 operation,
+                                track_routine_send,
                             )
                             .await?;
                         if eligible
@@ -643,6 +647,7 @@ impl McpClientRuntime {
         progress: ToolProgressSink,
         cancellation_token: CancellationToken,
         operation: Option<super::elicitation::McpOperation>,
+        track_routine_send: bool,
     ) -> Result<super::server::McpAgentToolResult> {
         self.servers
             .get(server_name)
@@ -654,6 +659,7 @@ impl McpClientRuntime {
                 progress,
                 cancellation_token,
                 operation,
+                track_routine_send,
             )
             .await
     }
@@ -690,6 +696,7 @@ impl McpClientRuntime {
                 ToolProgressSink::noop(),
                 cancellation,
                 route,
+                false,
             )
             .await?;
         Ok((

@@ -1,7 +1,6 @@
 //! Shared application-owned JavaScript execution and authenticated host composition.
 use super::{code_mode::CodeProfile, ports::PortError};
-use crate::agent_host::authorized_tools::ConcreteToolTarget;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use waltr_agent::SessionId;
 
 mod runtime;
@@ -12,8 +11,6 @@ pub use runtime::{ProductionInput, ProductionRuntime};
 pub struct RoutineAuthority {
     /// Exact identities, durable sessions, and independently restricted code profiles.
     pub code: Vec<RoutineCodeGrant>,
-    /// Exact normal-tool identities available to installed Routine programs.
-    pub targets: BTreeMap<String, ConcreteToolTarget>,
 }
 
 /// Code grants are never inferred from application membership or model visibility.
@@ -33,13 +30,7 @@ pub struct RoutineCodeGrant {
 
 impl RoutineAuthority {
     pub(crate) fn validate(&self) -> Result<(), PortError> {
-        if self.code.len() > 128
-            || self.targets.len() > 128
-            || self.targets.keys().any(|key| {
-                !key.strip_prefix("tool.")
-                    .is_some_and(super::definition::identifier)
-            })
-        {
+        if self.code.len() > 128 {
             return Err(PortError::Invalid);
         }
         let mut identities = BTreeSet::new();

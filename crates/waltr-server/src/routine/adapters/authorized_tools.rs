@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -27,8 +27,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use waltr_agent::ToolCall;
 use waltr_script::{
-    CleanupFuture, HostContext, HostDispatcher, HostFuture, HostReply, HostRequest, InvocationId,
-    Limits, StructuredValue,
+    CleanupFuture, HostContext, HostDispatcher, HostFuture, HostHandle, HostReply, HostRequest,
+    InvocationId, Limits, StructuredValue,
 };
 
 /// Fresh per-invocation authenticated bindings. A target capability is a constructor-selected
@@ -107,7 +107,260 @@ pub(crate) trait RoutineMcpPort: Send + Sync {
         request: McpArguments,
         cancellation: CancellationToken,
     ) -> PortFuture<waltr_agent::ToolResult>;
+    fn results(&self) -> &ToolResults;
     fn cleanup(self: Arc<Self>) -> PortFuture<()>;
+}
+
+const TOOL_RESULT_HANDLE: &str = "tools.result";
+
+pub(crate) struct ToolResults {
+    pools: [super::media::ResultPool; 3],
+    values: Mutex<Vec<(HostHandle, Arc<RetainedToolResult>)>>,
+}
+
+struct RetainedToolResult {
+    value: waltr_agent::ToolResult,
+    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+pub(crate) struct ToolResultImageRef {
+    result: Arc<RetainedToolResult>,
+    index: usize,
+}
+
+impl ToolResultImageRef {
+    pub(crate) fn image(&self) -> Result<&waltr_agent::ToolResultImage, waltr_script::Error> {
+        match self.result.value.content.blocks().get(self.index) {
+            Some(waltr_agent::ToolResultContentBlock::Image(image)) => Ok(image),
+            _ => Err(waltr_script::Error::Invalid),
+        }
+    }
+}
+
+impl ToolResults {
+    pub(crate) fn new(
+        principal: super::media::ResultPool,
+        process: super::media::ResultPool,
+    ) -> Self {
+        Self {
+            pools: [super::media::ResultPool::principal(), principal, process],
+            values: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn clear(&self) -> Result<(), PortError> {
+        self.values
+            .lock()
+            .map_err(|_| PortError::Uncertain)?
+            .clear();
+        Ok(())
+    }
+
+    fn store(
+        &self,
+        context: &HostContext,
+        result: waltr_agent::ToolResult,
+    ) -> Result<HostReply, waltr_script::Error> {
+        use waltr_agent::ToolResultContentBlock::{Image, Text};
+        let bytes = result.content.blocks().iter().fold(
+            result
+                .text_projection()
+                .len()
+                .saturating_add(std::mem::size_of_val(&result)),
+            |bytes, block| {
+                bytes
+                    .saturating_add(std::mem::size_of_val(block))
+                    .saturating_add(match block {
+                        Image(image) => image
+                            .data()
+                            .len()
+                            .saturating_add(image.media_type().len())
+                            .saturating_add(image.sha256().len()),
+                        Text { text } => text.len(),
+                    })
+            },
+        );
+        let bytes = u32::try_from(bytes).map_err(|_| waltr_script::Error::Limit)?;
+        let mut values = self
+            .values
+            .lock()
+            .map_err(|_| waltr_script::Error::Cleanup)?;
+        if values.len() >= 32 {
+            return Err(waltr_script::Error::Limit);
+        }
+        let permits = self
+            .pools
+            .iter()
+            .map(|pool| pool.reserve(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let handle = context.issue_handle(TOOL_RESULT_HANDLE)?;
+        values.push((
+            handle.clone(),
+            Arc::new(RetainedToolResult {
+                value: result,
+                _permits: permits,
+            }),
+        ));
+        Ok(HostReply::Handle(handle))
+    }
+
+    fn get(
+        &self,
+        context: &HostContext,
+        handle: &HostHandle,
+    ) -> Result<Arc<RetainedToolResult>, waltr_script::Error> {
+        context.validate_handle(handle, TOOL_RESULT_HANDLE)?;
+        self.values
+            .lock()
+            .map_err(|_| waltr_script::Error::Cleanup)?
+            .iter()
+            .find(|(key, _)| key == handle)
+            .map(|(_, value)| value.clone())
+            .ok_or(waltr_script::Error::Identity)
+    }
+
+    pub(crate) fn read(
+        &self,
+        context: &HostContext,
+        handle: &HostHandle,
+        limits: &Limits,
+    ) -> Result<HostReply, waltr_script::Error> {
+        use waltr_agent::ToolResultContentBlock::{Image, Text};
+        let result = self.get(context, handle)?;
+        let result = &result.value;
+        let mut remaining = limits.value_bytes;
+        for block in result.content.blocks() {
+            if let Text { text } = block {
+                if text.len() > remaining || text.len() > limits.string_bytes {
+                    return result_limit(limits);
+                }
+                remaining -= text.len();
+            }
+        }
+        let blocks = result.content.blocks().iter().map(|block| match block {
+            Text { text } => json!({"type":"text","text":text}),
+            Image(image) => json!({"type":"image","mediaType":image.media_type(),"bytes":image.decoded_bytes()}),
+        }).collect::<Vec<_>>();
+        completed_mcp_value(
+            json!({"status":"completed","isError":result.is_error,"content":blocks}),
+            limits,
+        )
+    }
+
+    pub(crate) fn image(
+        &self,
+        context: &HostContext,
+        handle: &HostHandle,
+        index: usize,
+    ) -> Result<ToolResultImageRef, waltr_script::Error> {
+        let result = self.get(context, handle)?;
+        if result.value.is_error {
+            return Err(waltr_script::Error::Invalid);
+        }
+        let index = result
+            .value
+            .content
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block, waltr_agent::ToolResultContentBlock::Image(_)))
+            .nth(index)
+            .map(|(index, _)| index)
+            .ok_or(waltr_script::Error::Invalid)?;
+        Ok(ToolResultImageRef { result, index })
+    }
+}
+
+fn completed_mcp_value(value: Value, limits: &Limits) -> Result<HostReply, waltr_script::Error> {
+    match StructuredValue::new(value, limits) {
+        Err(waltr_script::Error::Value) => result_limit(limits),
+        result => result.map(HostReply::Value),
+    }
+}
+
+fn result_limit(limits: &Limits) -> Result<HostReply, waltr_script::Error> {
+    StructuredValue::new(
+        json!({"status":"completed","resultUnavailable":"limit"}),
+        limits,
+    )
+    .map(HostReply::Value)
+}
+
+pub(crate) async fn execute_mcp(
+    mcp: Arc<dyn RoutineMcpPort>,
+    operation: String,
+    args: McpArguments,
+    context: &HostContext,
+    limits: &Limits,
+    cancellation: CancellationToken,
+) -> Result<HostReply, waltr_script::Error> {
+    let handle = args.result.is_some();
+    let value = match mcp.clone().call(operation, args, cancellation).await {
+        Ok(result) if handle => {
+            return match mcp.results().store(context, result) {
+                Err(waltr_script::Error::Limit) => result_limit(limits),
+                reply => reply,
+            };
+        }
+        Ok(result) => json!({"status":"completed","result":result}),
+        Err(PortError::Denied) => json!({"status":"denied"}),
+        Err(PortError::Invalid) => return Err(waltr_script::Error::Invalid),
+        Err(_) => return Err(waltr_script::Error::Cleanup),
+    };
+    completed_mcp_value(value, limits)
+}
+
+pub(crate) fn tool_result_handle(
+    request: &HostRequest,
+) -> Result<&HostHandle, waltr_script::Error> {
+    if request.callback.is_some()
+        || request.bytes.is_some()
+        || !request
+            .arguments
+            .clone()
+            .into_json()
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        return Err(waltr_script::Error::Invalid);
+    }
+    request
+        .handle
+        .as_ref()
+        .filter(|handle| handle.kind() == TOOL_RESULT_HANDLE)
+        .ok_or(waltr_script::Error::Identity)
+}
+
+pub(crate) fn is_tool_result(request: &HostRequest) -> bool {
+    request
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.kind() == TOOL_RESULT_HANDLE)
+}
+
+pub(crate) fn tool_image_attachment(
+    image: &waltr_agent::ToolResultImage,
+    capabilities: waltr_agent::TransientModelCapabilities,
+    max_bytes: usize,
+    budget: &waltr_agent::TransientInputBudget,
+) -> Result<waltr_agent::TransientAttachment, waltr_script::Error> {
+    use base64::Engine as _;
+    use waltr_agent::TransientInputKind;
+    let kind = match image.media_type() {
+        "image/png" if capabilities.png => TransientInputKind::Png,
+        "image/jpeg" if capabilities.jpeg => TransientInputKind::Jpeg,
+        "image/webp" if capabilities.webp => TransientInputKind::WebP,
+        _ => return Err(waltr_script::Error::Denied),
+    };
+    if image.decoded_bytes() > max_bytes as u64 {
+        return Err(waltr_script::Error::Limit);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data())
+        .map_err(|_| waltr_script::Error::Invalid)?;
+    budget
+        .attachment(kind, bytes)
+        .map_err(|_| waltr_script::Error::Limit)
 }
 
 impl HostFactory for RoutineAgentHostFactory {
@@ -201,9 +454,7 @@ impl RoutineAgentHostFactory {
             if required.contains("children.call") && children.is_none() {
                 return Err(PortError::UnsupportedCapability);
             }
-            if required.contains("mcp.call")
-                && (mcp.is_none() || !required.iter().any(|cap| cap.starts_with("tool.")))
-            {
+            if !definition.envelope().spec.mcp_tools.is_empty() && mcp.is_none() {
                 return Err(PortError::UnsupportedCapability);
             }
             if required
@@ -249,6 +500,13 @@ impl RoutineAgentHostFactory {
                 context,
                 children,
                 mcp,
+                mcp_targets: definition
+                    .envelope()
+                    .spec
+                    .mcp_tools
+                    .iter()
+                    .cloned()
+                    .collect(),
                 streams,
             });
             Ok(PreparedHost {
@@ -269,7 +527,7 @@ fn known_capability(cap: &str) -> bool {
             | "helper.validate"
             | "tools.execute"
             | "tools.schemas"
-            | "mcp.call"
+            | "tools.read"
             | "context.snapshot"
             | "context.original"
             | "context.history"
@@ -293,6 +551,7 @@ struct AgentHost {
     streams: Arc<super::tool_streams::ToolStreams>,
     children: Option<Arc<dyn ChildPort>>,
     mcp: Option<Arc<dyn RoutineMcpPort>>,
+    mcp_targets: BTreeSet<ConcreteToolTarget>,
     context: Option<Arc<dyn ContextPort>>,
     bindings: AdapterBindings,
     capabilities: BTreeSet<String>,
@@ -319,6 +578,7 @@ pub(crate) struct HelperArguments {
     pub response_bytes: usize,
     pub completion_bytes: usize,
     pub field: Option<String>,
+    pub image_index: Option<usize>,
 }
 impl HelperArguments {
     pub(crate) fn validate(
@@ -366,12 +626,46 @@ struct ToolArguments {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct McpArguments {
-    pub server: String,
-    pub tool: String,
+    pub target: ConcreteToolTarget,
     pub arguments: serde_json::Map<String, Value>,
     pub workspace: Option<crate::routine::context::WorkspaceSelection>,
+    pub result: Option<McpResultMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum McpResultMode {
+    Handle,
+}
+
+pub(crate) fn parse_mcp(
+    request: &HostRequest,
+    allowed: impl FnOnce(&ConcreteToolTarget) -> bool,
+) -> Result<McpArguments, PortError> {
+    if request.callback.is_some() || request.handle.is_some() || request.bytes.is_some() {
+        return Err(PortError::Invalid);
+    }
+    let args: McpArguments = serde_json::from_value(request.arguments.clone().into_json())
+        .map_err(|_| PortError::Invalid)?;
+    if !allowed(&args.target) {
+        return Err(PortError::Denied);
+    }
+    if args.workspace.as_ref().is_some_and(|workspace| {
+        workspace.machine.is_empty()
+            || workspace.machine.len() > 256
+            || workspace.machine.chars().any(char::is_control)
+            || workspace
+                .working_directory
+                .as_ref()
+                .is_some_and(|directory| {
+                    directory.len() > 4096 || directory.chars().any(char::is_control)
+                })
+    }) {
+        return Err(PortError::Invalid);
+    }
+    Ok(args)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,6 +686,7 @@ enum Operation {
     Helper(HelperArguments),
     Tool(ToolArguments),
     Mcp(McpArguments),
+    ReadTool,
     Schemas(SchemaArguments),
 }
 
@@ -400,10 +695,15 @@ impl AgentHost {
         if self.cancellation.is_cancelled()
             || request.bytes.is_some()
             || request.handle.is_some()
+                && !(self.mcp.is_some()
+                    && is_tool_result(request)
+                    && matches!(request.operation.as_str(), "tools.read" | "helper.run"))
             || !self
                 .capabilities
                 .contains(if request.operation == "helper.next" {
                     "helper.streams"
+                } else if request.operation == "tools.read" && self.mcp.is_some() {
+                    "tools.execute"
                 } else {
                     &request.operation
                 })
@@ -456,6 +756,7 @@ impl AgentHost {
                     serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
                 args.validate(&self.capabilities, request.callback.is_some())?;
                 if args.field.is_some()
+                    || args.image_index.is_some() && !is_tool_result(request)
                     || args.response_bytes > 65536
                     || args.completion_bytes > 65536
                 {
@@ -469,7 +770,15 @@ impl AgentHost {
                 }
                 Ok(Operation::Helper(args))
             }
+            "tools.read" if self.mcp.is_some() => {
+                tool_result_handle(request).map_err(|_| PortError::Invalid)?;
+                Ok(Operation::ReadTool)
+            }
             "tools.execute" => {
+                if self.mcp.is_some() {
+                    return parse_mcp(request, |target| self.mcp_targets.contains(target))
+                        .map(Operation::Mcp);
+                }
                 if request.callback.is_some() {
                     return Err(PortError::Invalid);
                 }
@@ -480,30 +789,6 @@ impl AgentHost {
                     return Err(PortError::Invalid);
                 }
                 Ok(Operation::Tool(args))
-            }
-            "mcp.call" => {
-                if request.callback.is_some() || self.mcp.is_none() {
-                    return Err(PortError::Denied);
-                }
-                let args: McpArguments =
-                    serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
-                let target = ConcreteToolTarget::new(&args.server, &args.tool)
-                    .map_err(|_| PortError::Invalid)?;
-                self.target_allowed(&target)?;
-                if args.workspace.as_ref().is_some_and(|workspace| {
-                    workspace.machine.is_empty()
-                        || workspace.machine.len() > 256
-                        || workspace.machine.chars().any(char::is_control)
-                        || workspace
-                            .working_directory
-                            .as_ref()
-                            .is_some_and(|directory| {
-                                directory.len() > 4096 || directory.chars().any(char::is_control)
-                            })
-                }) {
-                    return Err(PortError::Invalid);
-                }
-                Ok(Operation::Mcp(args))
             }
             "tools.schemas" => {
                 if request.callback.is_some() {
@@ -558,7 +843,8 @@ impl OperationPolicy for AgentHost {
                 }
                 Operation::Helper(_) => json!({"operation":"helper.run"}),
                 Operation::Tool(args) => json!({"target":args.target,"callId":args.call_id}),
-                Operation::Mcp(args) => json!({"target":{"server":args.server,"tool":args.tool}}),
+                Operation::Mcp(args) => json!({"target":args.target}),
+                Operation::ReadTool => json!({"operation":"tools.read"}),
                 Operation::Schemas(args) => json!({"targets":args.targets}),
             })
         })();
@@ -573,10 +859,15 @@ impl OperationPolicy for AgentHost {
                 | "tools.execute"
                 | "tools.schemas"
                 | "children.call"
-                | "mcp.call"
+                | "tools.read"
         ) || name.starts_with("context.") && known_capability(name))
         {
             return Err(PortError::Denied);
+        }
+        if name == "tools.execute"
+            && matches!(reply, HostReply::Handle(h) if h.kind() == TOOL_RESULT_HANDLE)
+        {
+            return Ok(Some(json!({"status":"completed"})));
         }
         let HostReply::Value(value) = reply else {
             return Err(PortError::Invalid);
@@ -645,6 +936,16 @@ impl HostDispatcher for AgentHost {
                     json!({"status":"completed","result":result})
                 }
                 Operation::Helper(args) => {
+                    let image = request
+                        .handle
+                        .as_ref()
+                        .map(|handle| {
+                            mcp.as_ref()
+                                .ok_or(waltr_script::Error::Denied)?
+                                .results()
+                                .image(&host_context, handle, args.image_index.unwrap_or(0))
+                        })
+                        .transpose()?;
                     let helpers = helpers
                         .select_inference(&args.inference)
                         .map_err(|_| waltr_script::Error::Invalid)?
@@ -660,6 +961,38 @@ impl HostDispatcher for AgentHost {
                         })
                         .transpose()
                         .map_err(|_| waltr_script::Error::Denied)?;
+                    let budget = waltr_agent::TransientInputBudget::process();
+                    let mut capabilities = waltr_agent::TransientModelCapabilities {
+                        png: false,
+                        jpeg: false,
+                        webp: false,
+                        pdf: false,
+                        text: args.input.text,
+                        max_body_bytes: args.input.max_bytes.min(65536),
+                    };
+                    let attachment = if let Some(image) = image {
+                        capabilities = helpers
+                            .input_capabilities(args.selection.clone())
+                            .await
+                            .map_err(|_| waltr_script::Error::Denied)?;
+                        capabilities.text &= args.input.text;
+                        helpers
+                            .preflight_payload(
+                                args.selection.clone(),
+                                capabilities,
+                                args.capture.clone(),
+                            )
+                            .await
+                            .map_err(|_| waltr_script::Error::Denied)?;
+                        Some(tool_image_attachment(
+                            image.image()?,
+                            capabilities,
+                            args.input.max_bytes,
+                            &budget,
+                        )?)
+                    } else {
+                        None
+                    };
                     let observer = request.callback.map(|callback| {
                         Arc::new(ScriptCompletionObserver {
                             callback,
@@ -679,16 +1012,9 @@ impl HostDispatcher for AgentHost {
                             },
                             source,
                             Some(crate::routine::ports::HelperPayload {
-                                budget: waltr_agent::TransientInputBudget::process(),
-                                attachments: Vec::new(),
-                                capabilities: waltr_agent::TransientModelCapabilities {
-                                    png: false,
-                                    jpeg: false,
-                                    webp: false,
-                                    pdf: false,
-                                    text: args.input.text,
-                                    max_body_bytes: args.input.max_bytes.min(65536),
-                                },
+                                budget,
+                                attachments: attachment.into_iter().collect(),
+                                capabilities,
                                 response_bytes: args.response_bytes,
                                 completion_bytes: args.completion_bytes,
                             }),
@@ -722,18 +1048,24 @@ impl HostDispatcher for AgentHost {
                     }
                 }
                 Operation::Mcp(args) => {
-                    let operation = crate::routine::service::committed_mcp_call(&host_context)
+                    let operation = crate::routine::service::committed_operation(&host_context)
                         .map_err(|_| waltr_script::Error::Denied)?;
-                    match mcp
-                        .ok_or(waltr_script::Error::Denied)?
-                        .call(operation, args, cancellation)
-                        .await
-                    {
-                        Ok(result) => json!({"status":"completed","result":result}),
-                        Err(PortError::Denied) => json!({"status":"denied"}),
-                        Err(PortError::Invalid) => return Err(waltr_script::Error::Invalid),
-                        Err(_) => return Err(waltr_script::Error::Cleanup),
-                    }
+                    return execute_mcp(
+                        mcp.ok_or(waltr_script::Error::Denied)?,
+                        operation,
+                        args,
+                        &host_context,
+                        &limits,
+                        cancellation,
+                    )
+                    .await;
+                }
+                Operation::ReadTool => {
+                    return mcp.ok_or(waltr_script::Error::Denied)?.results().read(
+                        &host_context,
+                        tool_result_handle(&request)?,
+                        &limits,
+                    );
                 }
                 Operation::Schemas(args) => {
                     let schemas = tools

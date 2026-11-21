@@ -19,15 +19,12 @@ use crate::{
     },
 };
 use crate::{
-    agent_host::authorized_tools::{
-        AuthorizedToolError, AuthorizedToolExecutor, AuthorizedToolFuture, AuthorizedToolRequest,
-        ConcreteToolTarget, SessionAuthorizedToolExecutor,
-    },
+    agent_host::authorized_tools::{AuthorizedToolExecutor, ConcreteToolTarget},
     permission::{PermissionLevel, PermissionPolicy},
 };
 use futures_util::FutureExt as _;
 use serde_json::Value;
-use waltr_agent::{InferenceSettings, SessionCreateRequest, SessionId};
+use waltr_agent::{InferenceSettings, SessionId};
 mod context;
 mod lifecycle;
 mod mcp;
@@ -288,7 +285,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
         let blobs = self.blobs.clone();
         let text = self.text.clone();
         let stopped = self.stopped.load(std::sync::atomic::Ordering::Acquire);
-        let options = self.options.clone();
         let pools = self.pools.clone();
         let process_pools = self.process_pools.clone();
         let service = self.service.clone();
@@ -317,20 +313,20 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 return Err(PortError::Conflict);
             }
             let mut inference = None;
-            let mcp_required = request
+            let mcp_required = !request.definition.envelope().spec.mcp_tools.is_empty();
+            if request
                 .definition
                 .envelope()
                 .spec
                 .capabilities
-                .contains("mcp.call");
-            if mcp_required
-                && (request.transport.is_some()
-                    || request
-                        .definition
-                        .envelope()
-                        .spec
-                        .capabilities
-                        .contains("children.call"))
+                .contains("tools.execute")
+                != mcp_required
+                || request
+                    .definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .contains("tools.schemas")
             {
                 return Err(PortError::UnsupportedCapability);
             }
@@ -495,7 +491,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     }
                 }
             } else {
-                if name == "configuration" || mcp_required {
+                if name == "configuration" {
                     return Err(PortError::Denied);
                 }
             }
@@ -589,21 +585,50 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     helpers
                 },
             );
-            let result: Arc<dyn HostFactory> = if let Some(transport) = request.transport {
-                let principal_pools = {
-                    let mut pools = pools.lock().map_err(|_| PortError::Unavailable)?;
-                    if pools.len() >= 128 && !pools.contains_key(&request.principal) {
-                        return Err(PortError::Busy);
-                    }
+            let principal_pools = if media || mcp_required {
+                let mut pools = pools.lock().map_err(|_| PortError::Unavailable)?;
+                if pools.len() >= 128 && !pools.contains_key(&request.principal) {
+                    return Err(PortError::Busy);
+                }
+                Some(
                     pools
                         .entry(request.principal.clone())
                         .or_insert_with(Pools::principal)
-                        .clone()
-                };
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            let mcp = if mcp_required {
+                Some(mcp::Factory {
+                    sessions: sessions.clone(),
+                    factory: factory.clone(),
+                    catalog: state,
+                    snapshot: snapshot.clone(),
+                    name: name.clone(),
+                    revision: request.definition.revision().to_owned(),
+                    publication: snapshot
+                        .routine_incarnation(name)
+                        .ok_or(PortError::Conflict)?,
+                    source: mcp_source,
+                    principal: request.authenticated.clone(),
+                    ceiling: tool_admitted.then(|| restriction.clone()),
+                    result_principal: principal_pools
+                        .as_ref()
+                        .ok_or(PortError::Unavailable)?
+                        .result
+                        .clone(),
+                    result_process: process_pools.result.clone(),
+                })
+            } else {
+                None
+            };
+            let result: Arc<dyn HostFactory> = if let Some(transport) = request.transport {
+                let principal_pools = principal_pools.ok_or(PortError::Unavailable)?;
                 let speech = Arc::new(crate::routine::media::speech::CatalogSpeech(
                     snapshot.clone(),
                 ));
-                Arc::new(MediaHostFactory {
+                let base = MediaHostFactory {
                     bindings: transport.bind_factory(Arc::new(MediaComposition {
                         principal: request.principal.clone(),
                         helpers,
@@ -615,52 +640,20 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                         process_pools,
                         snapshot: true,
                     })),
-                })
+                };
+                if let Some(mcp) = mcp {
+                    Arc::new(mcp::MediaHost { base, mcp })
+                } else {
+                    Arc::new(base)
+                }
             } else {
-                let mcp = mcp_source
-                    .map(|source| {
-                        let publication = snapshot
-                            .routine_incarnation(name)
-                            .ok_or(PortError::Conflict)?;
-                        Ok(mcp::Factory {
-                            sessions: sessions.clone(),
-                            factory: factory.clone(),
-                            catalog: state,
-                            name: name.clone(),
-                            revision: request.definition.revision().to_owned(),
-                            publication,
-                            source,
-                            principal: request.authenticated.clone(),
-                            ceiling: tool_admitted.then(|| restriction.clone()),
-                        })
-                    })
-                    .transpose()?;
-                let tools = Arc::new(LazyTools {
-                    factory: Arc::new(
-                        factory
-                            .as_ref()
-                            .clone()
-                            .for_concrete_calls()
-                            .with_permission_restriction(restriction),
-                    ),
-                    sessions,
-                    inference,
-                    catalog: snapshot,
-                    bundle,
-                    executor: Arc::new(tokio::sync::Mutex::new(None)),
-                    stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                });
                 let mut capabilities = BTreeSet::from([
                     "helper.run".into(),
                     "helper.validate".into(),
                     "helper.streams".into(),
                 ]);
-                if !options.targets.is_empty() {
-                    capabilities.extend(["tools.execute".into(), "tools.schemas".into()]);
-                    capabilities.extend(options.targets.keys().cloned());
-                    if mcp.is_some() {
-                        capabilities.insert("mcp.call".into());
-                    }
+                if mcp.is_some() {
+                    capabilities.insert("tools.execute".into());
                 }
                 for cap in &request.definition.envelope().spec.capabilities {
                     let context_supported = context.is_some()
@@ -682,10 +675,10 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                     bindings: Arc::new(Bound {
                         principal: request.principal,
                         helpers,
-                        tools,
+                        tools: Arc::new(context::NoTools),
                         context,
                         capabilities,
-                        targets: options.targets,
+                        targets: BTreeMap::new(),
                     }),
                 };
                 if let Some(mcp) = mcp {
@@ -761,70 +754,6 @@ impl InvocationAdapterFactory for Bound {
         Box::pin(async move { Ok(context) })
     }
 }
-#[derive(Clone)]
-struct LazyTools<S: SessionStore + Clone + Send + Sync + 'static> {
-    factory: Arc<AgentSessionRuntimeFactory>,
-    sessions: SessionCoordinator<S>,
-    inference: Option<InferenceSettings>,
-    catalog: Arc<crate::resource_catalog::AgentDefinitionSnapshot>,
-    bundle: Option<Value>,
-    executor: Arc<tokio::sync::Mutex<Option<Arc<SessionAuthorizedToolExecutor<S>>>>>,
-    stopped: Arc<std::sync::atomic::AtomicBool>,
-}
-impl<S: SessionStore + Clone + Send + Sync + 'static> LazyTools<S> {
-    async fn executor(&self) -> Result<Arc<SessionAuthorizedToolExecutor<S>>, PortError> {
-        let mut guard = self.executor.lock().await;
-        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(PortError::Denied);
-        }
-        if let Some(executor) = &*guard {
-            return Ok(executor.clone());
-        }
-        let mut request = SessionCreateRequest::new(SessionId::generate());
-        request.inference_settings = Some(match &self.inference {
-            Some(inference) => inference.clone(),
-            None => default_inference(&self.catalog)?,
-        });
-        request.agent_definition = self.bundle.clone();
-        let created = self
-            .factory
-            .create_with_workspace(&self.sessions, request, None, self.bundle.as_ref())
-            .await
-            .map_err(|_| PortError::Unavailable)?;
-        let record = created.record;
-        let id = record.id.clone();
-        self.factory
-            .session_roles
-            .register(
-                &record,
-                crate::agent_host::session_roles::SessionRole::Ephemeral,
-            )
-            .map_err(|_| PortError::Unavailable)?;
-        let (runtime, dispatcher) = match self
-            .factory
-            .runtime_for_record(&record, self.sessions.clone())
-            .await
-        {
-            Ok(pair) => pair,
-            Err(_) => {
-                self.sessions
-                    .delete(&id)
-                    .await
-                    .map_err(|_| PortError::Uncertain)?;
-                return Err(PortError::Unavailable);
-            }
-        };
-        let executor = Arc::new(SessionAuthorizedToolExecutor::new(
-            self.sessions.clone(),
-            id,
-            runtime,
-            dispatcher,
-        ));
-        *guard = Some(executor.clone());
-        Ok(executor)
-    }
-}
-
 struct MediaComposition {
     principal: String,
     helpers: Arc<dyn HelperRunner>,
@@ -896,51 +825,6 @@ impl MediaBindingFactory for MediaComposition {
             }
         })();
         Box::pin(async move { result })
-    }
-}
-impl<S: SessionStore + Clone + Send + Sync + 'static> AuthorizedToolExecutor for LazyTools<S> {
-    fn execute(
-        &self,
-        request: AuthorizedToolRequest,
-        cancellation: CancellationToken,
-    ) -> AuthorizedToolFuture<waltr_agent::ToolResult> {
-        let owner = self.clone();
-        Box::pin(async move {
-            owner
-                .executor()
-                .await
-                .map_err(|_| AuthorizedToolError::Unavailable)?
-                .execute(request, cancellation)
-                .await
-        })
-    }
-    fn schemas(
-        &self,
-        targets: Vec<ConcreteToolTarget>,
-        cancellation: CancellationToken,
-    ) -> AuthorizedToolFuture<Vec<waltr_agent::ToolDefinition>> {
-        let owner = self.clone();
-        Box::pin(async move {
-            owner
-                .executor()
-                .await
-                .map_err(|_| AuthorizedToolError::Unavailable)?
-                .schemas(targets, cancellation)
-                .await
-        })
-    }
-    fn cleanup(&self) -> AuthorizedToolFuture<()> {
-        let owner = self.clone();
-        Box::pin(async move {
-            owner
-                .stopped
-                .store(true, std::sync::atomic::Ordering::Release);
-            let executor = owner.executor.lock().await.clone();
-            if let Some(executor) = executor {
-                executor.cleanup().await?;
-            }
-            Ok(())
-        })
     }
 }
 struct Cold;

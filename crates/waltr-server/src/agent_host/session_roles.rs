@@ -15,7 +15,6 @@ pub(crate) struct TaskOrigin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionRole {
     Helper,
-    Ephemeral,
     Task(TaskOrigin),
 }
 
@@ -71,7 +70,10 @@ impl SessionRoles {
         self.get(&record.id, record.metadata.incarnation.as_deref()).is_some()
     }
     pub fn source_excluded(&self, record: &SessionRecord) -> bool {
-        matches!(self.get(&record.id, record.metadata.incarnation.as_deref()), Some(SessionRole::Helper | SessionRole::Ephemeral))
+        matches!(
+            self.get(&record.id, record.metadata.incarnation.as_deref()),
+            Some(SessionRole::Helper)
+        )
     }
     pub fn forget(&self, id: &SessionId) {
         if let Ok(mut roles) = self.0.lock() {
