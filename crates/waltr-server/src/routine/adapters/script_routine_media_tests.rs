@@ -1790,7 +1790,11 @@ impl HostFactory for ImageToolHost {
 const TOOL_PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDbkAAAAASUVORK5CYII=";
 
-struct ImageTool(super::super::authorized_tools::ToolResults);
+struct ImageTool(
+    super::super::authorized_tools::ToolResults,
+    &'static str,
+    &'static str,
+);
 
 impl RoutineMcpPort for ImageTool {
     fn call(
@@ -1801,12 +1805,12 @@ impl RoutineMcpPort for ImageTool {
     ) -> PortFuture<waltr_agent::ToolResult> {
         Box::pin(async move {
             assert!(!operation.is_empty());
-            assert_eq!(request.target.server(), "image-fixture");
-            assert_eq!(request.target.tool(), "capture");
+            assert_eq!(request.target.server(), self.1);
+            assert_eq!(request.target.tool(), self.2);
             let image = waltr_agent::ToolResultImage::new(TOOL_PNG, "image/png").unwrap();
             Ok(waltr_agent::ToolResult::from_content(
                 operation,
-                "capture",
+                self.2,
                 waltr_agent::ToolResultContent::from_blocks(vec![
                     waltr_agent::ToolResultContentBlock::Image(image),
                 ])
@@ -1840,10 +1844,11 @@ async fn interactive_tool_result_handle_reaches_helper_as_image() {
         );
     let principal = ResultPool::principal();
     let process = ResultPool::process();
-    let tools = Arc::new(ImageTool(super::super::authorized_tools::ToolResults::new(
-        principal.clone(),
-        process.clone(),
-    )));
+    let tools = Arc::new(ImageTool(
+        super::super::authorized_tools::ToolResults::new(principal.clone(), process.clone()),
+        "image-fixture",
+        "capture",
+    ));
     let (_, bodies, results) = vertical_with_recognition(
         &program,
         false,
@@ -1863,6 +1868,63 @@ async fn interactive_tool_result_handle_reaches_helper_as_image() {
     assert_eq!(results[0].name, "answer");
     assert_eq!(principal.retained(), 0);
     assert_eq!(process.retained(), 0);
+}
+
+#[tokio::test]
+async fn window_ask_attaches_image_to_initial_prompt_and_keeps_audio_followups() {
+    if isolated("window_ask_attaches_image_to_initial_prompt_and_keeps_audio_followups") {
+        return;
+    }
+    let program =
+        include_str!("../../../../../.waltr/resources/routines/audio-ask-window-and-speak.yaml")
+            .replace("routine-research-answer", "media")
+            .replace(
+                "{provider: 'whispers', model: 'dictation'}",
+                "{from:'defaults'}",
+            )
+            .replace(
+                "{provider: 'whispers-tts', model: 'reader'}",
+                "{from:'defaults'}",
+            );
+    let tools = Arc::new(ImageTool(
+        super::super::authorized_tools::ToolResults::new(
+            ResultPool::principal(),
+            ResultPool::process(),
+        ),
+        "computer-use",
+        "screenshot_window",
+    ));
+    let mut followup = tool("speak", json!({"text":"Follow-up finding."}));
+    followup["choices"][0]["delta"]["tool_calls"][0]["id"] = json!("followup-speech");
+    let (chunks, bodies, results) = vertical_with_recognition(
+        &program,
+        false,
+        vec![
+            tool("speak", json!({"text":"First finding."})),
+            response("initial answer"),
+            followup,
+            response("follow-up answer"),
+        ],
+        BTreeMap::new(),
+        BTreeMap::from([("media".into(), input_capabilities())]),
+        None,
+        None,
+        Some(tools),
+    )
+    .await;
+    assert!(chunks.iter().any(|chunk| matches!(chunk, Chunk::Audio(_))));
+    assert_eq!(results.len(), 1);
+    assert_eq!(bodies.len(), 4);
+    let image = format!("data:image/png;base64,{TOOL_PNG}");
+    assert!(bodies[0].to_string().contains(&image));
+    let prompts = bodies[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2);
+    assert!(!prompts[1].to_string().contains(&image));
 }
 
 #[tokio::test]

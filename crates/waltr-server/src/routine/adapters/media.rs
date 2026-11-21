@@ -668,7 +668,7 @@ impl MediaHost {
                 )
                 .map_err(|_| waltr_script::Error::Denied)?;
             if request.operation == "helper.open"
-                && (request.handle.is_some()
+                && ((request.handle.is_some() && !is_tool_result(request))
                     || helper.source.is_some()
                     || helper.field.is_some()
                     || request.callback.is_some())
@@ -837,7 +837,6 @@ impl MediaHost {
             "helper.run" | "helper.open" => {
                 if is_tool_result(request) {
                     if self.mcp.is_none()
-                        || request.operation != "helper.run"
                         || args
                             .helper
                             .as_ref()
@@ -1752,7 +1751,7 @@ impl MediaHost {
                             },
                             HelperPayload {
                                 budget: self.bindings.attachments.clone(),
-                                attachments: Vec::new(),
+                                attachments: attachment.into_iter().collect(),
                                 capabilities,
                                 completion_bytes: profile.completion_bytes,
                                 response_bytes: profile.response_bytes,

@@ -154,9 +154,6 @@ pub(super) fn open<S: SessionStore + Clone + Send + Sync + 'static>(
     cancellation: CancellationToken,
 ) -> PortFuture<Arc<dyn HelperTarget>> {
     Box::pin(async move {
-        if !payload.attachments.is_empty() {
-            return Err(PortError::UnsupportedCapability);
-        }
         let mut groups = runner.groups.lock().await;
         if runner.owners.lock().await.closed || groups.len() >= 16 {
             return Err(PortError::Denied);
@@ -187,6 +184,7 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
     runner: &CoordinatorHelperRunner<S>,
     record: &SessionRecord,
     runtime: AgentRuntime,
+    input: Option<waltr_agent::TransientInput>,
     limits: AgentRunLimits,
     cancel: CancellationToken,
     deadline: tokio::time::Instant,
@@ -197,7 +195,7 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
         .session_factory(runner.sessions.clone())
         .with_host_runtime_factory(Arc::new(PinnedRuntime {
             record: record.clone(),
-            runtime,
+            runtime: runtime.clone(),
         }));
     let sessions = runner.sessions.clone().with_runtime_factory(factory);
     let incarnation = record
@@ -205,15 +203,30 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
         .incarnation
         .clone()
         .ok_or(PortError::Invalid)?;
-    let first = sessions
-        .submit_owned_input(
-            record.id.clone(),
-            &incarnation,
-            AgentSessionRunInput::Continue,
-            limits,
-        )
-        .await
-        .map_err(|_| PortError::Unavailable)?;
+    let first = match input {
+        Some(input) => {
+            sessions
+                .start_owned_with_transient_input(
+                    record.id.clone(),
+                    &incarnation,
+                    runtime,
+                    input,
+                    limits,
+                )
+                .await
+        }
+        None => {
+            sessions
+                .submit_owned_input(
+                    record.id.clone(),
+                    &incarnation,
+                    AgentSessionRunInput::Continue,
+                    limits,
+                )
+                .await
+        }
+    }
+    .map_err(|_| PortError::Unavailable)?;
     let target = Target {
         sessions,
         id: record.id.clone(),

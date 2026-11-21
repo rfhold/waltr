@@ -159,6 +159,9 @@ Queues have no persistent subscription, attachment to another chat, delivery rec
 
 The media host also exposes an invocation-owned helper submission target.
 `helper.open` returns only after the initial ordinary run is admitted;
+it accepts an MCP result handle as its fifth argument to attach one image to
+the initial prompt, with the same `imageIndex` and limits as `helper.run`.
+The image stays in the initial run's live context, not in history or in later runs.
 `helper.submit` admits bounded text prompts into that exact durable incarnation
 through the generic coordinator's opt-in `NextTurnIfActive` policy.
 The active run adopts ordinary user messages after the complete response and tool

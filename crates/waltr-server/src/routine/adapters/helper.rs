@@ -807,18 +807,37 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                 .as_ref()
                 .map(|streams| streams.claim(&request.selection))
                 .transpose()?;
-            let sessions = this
-                .sessions
-                .clone()
-                .with_session_event_sink(Arc::new(
-                    crate::agent_host::session_roles::PrivateCreationEvents,
-                ));
+            let sessions = this.sessions.clone().with_session_event_sink(Arc::new(
+                crate::agent_host::session_roles::PrivateCreationEvents,
+            ));
             let session = match request.selection {
-                HelperSelection::Named { .. } => this.factory.create_with_workspace(
-                    &sessions, create, request.workspace.as_ref(), this.source_definition.as_ref()
-                ).await.map_err(|_| helper_failure("session_create", "workspace_or_storage", None, PortError::Unavailable))?,
-                HelperSelection::Restricted { .. } if request.workspace.is_none() => sessions.create(create).await
-                    .map_err(|error| helper_failure("session_create", llm_category(&error), None, PortError::Unavailable))?,
+                HelperSelection::Named { .. } => this
+                    .factory
+                    .create_with_workspace(
+                        &sessions,
+                        create,
+                        request.workspace.as_ref(),
+                        this.source_definition.as_ref(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        helper_failure(
+                            "session_create",
+                            "workspace_or_storage",
+                            None,
+                            PortError::Unavailable,
+                        )
+                    })?,
+                HelperSelection::Restricted { .. } if request.workspace.is_none() => {
+                    sessions.create(create).await.map_err(|error| {
+                        helper_failure(
+                            "session_create",
+                            llm_category(&error),
+                            None,
+                            PortError::Unavailable,
+                        )
+                    })?
+                }
                 HelperSelection::Restricted { .. } => return Err(PortError::Invalid),
             };
             let id = session.id().clone();
@@ -1000,19 +1019,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             };
             let run_cancellation = cancellation.child_token();
             let outcome = async {
-                if let Some(opening) = opening {
-                    return followup::run(
-                        &this,
-                        &session.record,
-                        runtime.with_completion_validation(validation),
-                        limits,
-                        run_cancellation.clone(),
-                        started + request.deadline,
-                        opening,
-                    )
-                    .await;
-                }
-                match &payload {
+                let input = match &payload {
                     Some(payload) if !payload.attachments.is_empty() => {
                         let record = this.sessions.store().load(&id).await.map_err(|_| {
                             helper_failure(
@@ -1068,6 +1075,25 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                                 PortError::Invalid,
                             )
                         })?;
+                        Some(input)
+                    }
+                    _ => None,
+                };
+                if let Some(opening) = opening {
+                    return followup::run(
+                        &this,
+                        &session.record,
+                        runtime.with_completion_validation(validation),
+                        input,
+                        limits,
+                        run_cancellation.clone(),
+                        started + request.deadline,
+                        opening,
+                    )
+                    .await;
+                }
+                match input {
+                    Some(input) => {
                         owner
                             .helper_with_transient_input(
                                 runtime,
@@ -1077,13 +1103,14 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                                 run_cancellation.clone(),
                             )
                             .await
-                            .map_err(|error| owned_failure(error, &id))
                     }
-                    _ => owner
-                        .helper(runtime, validation, limits, run_cancellation.clone())
-                        .await
-                        .map_err(|error| owned_failure(error, &id)),
+                    None => {
+                        owner
+                            .helper(runtime, validation, limits, run_cancellation.clone())
+                            .await
+                    }
                 }
+                .map_err(|error| owned_failure(error, &id))
             };
             tokio::pin!(outcome);
             let invalid_origin = async {

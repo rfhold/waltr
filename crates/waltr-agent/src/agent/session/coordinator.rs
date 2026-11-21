@@ -1735,6 +1735,33 @@ where
         .await
     }
 
+    /// Start the initial owned run with transient input without binding it to later runs.
+    pub async fn start_owned_with_transient_input(
+        &self,
+        session_id: SessionId,
+        incarnation: &str,
+        mut runtime: AgentRuntime,
+        input: crate::TransientInput,
+        limits: AgentRunLimits,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        runtime.provider =
+            crate::transient_input::bind_provider(runtime.provider, input).map_err(|_| {
+                AgentSessionRunError::Unavailable {
+                    session_id: session_id.clone(),
+                }
+            })?;
+        self.submit_configured_bound(
+            session_id,
+            AgentSessionRunInput::Continue,
+            RunConflictPolicy::RejectIfActive,
+            limits,
+            Some(runtime),
+            None,
+            Some(incarnation),
+        )
+        .await
+    }
+
     /// Submit a normal prompt to the exact owned incarnation at its next safe turn.
     /// An idle session starts normally; an active run retains its own limits and
     /// runtime. Paused, completing, canceled, or full runs reject admission.

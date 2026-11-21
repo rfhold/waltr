@@ -1,0 +1,127 @@
+apiVersion: waltr.routine/v1
+kind: Routine
+name: audio-ask-window-and-speak
+description: Ask a spoken question about the focused Mac window, research the answer, and speak the findings.
+spec:
+  source: |
+    export default async function () {
+      const first = await host.call('media.input.next', {port: 'question'});
+      if (first === null) throw new Error('question required');
+      const screenshot = host.call('tools.execute', {
+        target: {server: 'computer-use', tool: 'screenshot_window'},
+        arguments: {}, workspace: {machine: 'preview'}, result: 'handle'
+      });
+      const [image, transcript] = await Promise.all([
+        screenshot,
+        host.call('media.collect', {cap: 4096, speech: {provider: 'whispers', model: 'dictation'}}, null, null, first)
+      ]);
+      const question = await host.call('media.readText', {max: 4096}, null, null, transcript);
+      if (!question.trim()) throw new Error('question required');
+      const feed = await host.call('media.text.open', {});
+      const speech = host.call('media.synthesize', {output: 'audio', utterances: true, speech: {provider: 'whispers-tts', model: 'reader'}}, null, null, feed);
+      const helper = await host.call('helper.open', {
+        selection: {kind: 'named', name: 'routine-research-answer'},
+        inference: {from: 'defaults'}, task: question,
+        maxTurns: 40, deadlineMs: 180000, responseBytes: 8192, completionBytes: 2097152
+      }, null, null, image);
+      await host.call('media.input.acknowledge', {}, null, null, first);
+      const consume = (async () => {
+        while (true) {
+          const next = await host.call('helper.next', {stream: 'speech'});
+          if (next.value === null) break;
+          await host.call('media.text.write', {text: next.value.arguments.text}, null, null, feed);
+        }
+        await host.call('media.text.close', {}, null, null, feed);
+      })();
+      const followups = (async () => {
+        let next = host.call('media.input.next', {port: 'question'});
+        let revision = 0;
+        const waitIdle = version => host.call('helper.idle', {}, null, null, helper).then(() => ({idle: version}));
+        let idle = waitIdle(revision);
+        while (true) {
+          let event = await Promise.race([
+            next.then(capture => ({capture})),
+            idle
+          ]);
+          if (event.idle !== undefined) {
+            if (event.idle !== revision) { idle = waitIdle(revision); continue; }
+            if (await host.call('media.input.seal', {})) break;
+            event = {capture: await next};
+          }
+          if (event.capture === null) break;
+          const text = await host.call('media.collect', {cap: 4096, speech: {provider: 'whispers', model: 'dictation'}}, null, null, event.capture);
+          const task = await host.call('media.readText', {max: 4096}, null, null, text);
+          if (task.trim()) {
+            await host.call('helper.submit', {task}, null, null, helper);
+            revision++;
+          }
+          await host.call('media.input.acknowledge', {}, null, null, event.capture);
+          next = host.call('media.input.next', {port: 'question'});
+        }
+        await next;
+        return await host.call('helper.seal', {}, null, null, helper);
+      })();
+      const completed = await Promise.all([followups, consume, speech]);
+      const result = completed[0];
+      const answer = await host.call('media.readText', {field: 'response', max: 8192}, null, null, result);
+      await host.call('media.publish', {name: 'answer'}, null, null, result);
+      await host.call('media.finish', {});
+      return {answer};
+    }
+  entrypoints:
+    ask:
+      trigger: interactive
+  parameters:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties: {}
+      required: []
+  result:
+    schemaVersion: waltr.value/v1
+    schema:
+      type: object
+      properties:
+        answer: {type: string, maxLength: 8192}
+      required: [answer]
+  capabilities:
+  - media.execute
+  - media.inputs
+  - tools.execute
+  - helper.run
+  - helper.named.routine-research-answer
+  - helper.streams
+  mcpTools:
+  - {server: computer-use, tool: screenshot_window}
+  toolStreams:
+    speech:
+      selection: {kind: named, name: routine-research-answer}
+      tool: speak
+      description: Queue a brief research finding or final conclusion for speech; success means queued, not heard.
+      maxCalls: 4
+      maxBytes: 16384
+      contract:
+        schemaVersion: waltr.value/v1
+        schema:
+          type: object
+          properties: {text: {type: string, maxLength: 1024}}
+          required: [text]
+  budgets:
+    valueBytes: 65536
+    resultBytes: 65536
+    hostCalls: 256
+    inFlight: 16
+    deadlineMs: 300000
+  ports:
+    question:
+      direction: input
+      media: audio
+      required: true
+      maxBytes: 5760000
+      formats: [pcm16le-24000-mono]
+    audio:
+      direction: output
+      media: audio
+      required: true
+      maxBytes: 16777216
+      formats: [pcm16le-24000-mono]
