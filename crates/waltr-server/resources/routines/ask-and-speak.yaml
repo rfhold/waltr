@@ -8,7 +8,7 @@ spec:
       if (!input.question.trim()) throw new Error('question required');
       const result = await host.call('helper.run', {
         selection: {kind: 'named', name: 'routine-answer'},
-        inference: {from: 'defaults'}, task: input.question,
+        inference: {from: 'defaults'}, content: [{type: 'text', text: input.question}],
         maxTurns: 1, deadlineMs: 60000, responseBytes: 8192, completionBytes: 16384
       });
       const bytes = new Uint8Array(await host.call('media.read', {field: 'response', max: 8192}, null, null, result));

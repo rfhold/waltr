@@ -11,7 +11,7 @@ spec:
       const speech = host.call('media.synthesize', {output: 'audio', utterances: true, speech: {provider: 'whispers-tts', model: 'reader'}}, null, null, feed);
       const helper = host.call('helper.run', {
         selection: {kind: 'named', name: 'routine-research-answer'},
-        inference: {from: 'defaults'}, task: question,
+        inference: {from: 'defaults'}, content: [{type: 'text', text: question}],
         maxTurns: 40, deadlineMs: 180000, responseBytes: 8192, completionBytes: 2097152
       });
       const consume = (async () => {

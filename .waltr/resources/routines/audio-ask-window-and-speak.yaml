@@ -17,13 +17,15 @@ spec:
       ]);
       const question = await host.call('media.readText', {max: 4096}, null, null, transcript);
       if (!question.trim()) throw new Error('question required');
+      await host.call('helper.image.bind', {name: 'window'}, null, null, image);
       const feed = await host.call('media.text.open', {});
       const speech = host.call('media.synthesize', {output: 'audio', utterances: true, speech: {provider: 'whispers-tts', model: 'reader'}}, null, null, feed);
       const helper = await host.call('helper.open', {
         selection: {kind: 'named', name: 'routine-research-answer'},
-        inference: {from: 'defaults'}, task: question,
+        inference: {from: 'defaults'},
+        content: [{type: 'text', text: question}, {type: 'image', image: {source: 'window'}}],
         maxTurns: 40, deadlineMs: 180000, responseBytes: 8192, completionBytes: 2097152
-      }, null, null, image);
+      });
       await host.call('media.input.acknowledge', {}, null, null, first);
       const consume = (async () => {
         while (true) {
@@ -39,10 +41,15 @@ spec:
         const waitIdle = version => host.call('helper.idle', {}, null, null, helper).then(() => ({idle: version}));
         let idle = waitIdle(revision);
         while (true) {
-          let event = await Promise.race([
-            next.then(capture => ({capture})),
-            idle
-          ]);
+          let event;
+          try {
+            event = await Promise.race([next.then(capture => ({capture})), idle]);
+          } catch (error) {
+            if (await host.call('media.input.seal', {})) {
+              await Promise.allSettled([next, consume, speech]);
+            }
+            throw error;
+          }
           if (event.idle !== undefined) {
             if (event.idle !== revision) { idle = waitIdle(revision); continue; }
             if (await host.call('media.input.seal', {})) break;
@@ -52,7 +59,7 @@ spec:
           const text = await host.call('media.collect', {cap: 4096, speech: {provider: 'whispers', model: 'dictation'}}, null, null, event.capture);
           const task = await host.call('media.readText', {max: 4096}, null, null, text);
           if (task.trim()) {
-            await host.call('helper.submit', {task}, null, null, helper);
+            await host.call('helper.submit', {content: [{type: 'text', text: task}]}, null, null, helper);
             revision++;
           }
           await host.call('media.input.acknowledge', {}, null, null, event.capture);

@@ -13,7 +13,7 @@ export default async function (input) {
   const helper = (await host.call('helper.run', {
     selection: {kind: 'named', name: 'routine-category-context'},
     source: source.source,
-    task: JSON.stringify({selected, instruction: input.instruction}),
+    content: [{type: 'text', text: JSON.stringify({selected, instruction: input.instruction})}],
     capture: 'mask-decision',
     maxTurns: 3,
     deadlineMs: 20000, responseBytes: 65536, completionBytes: 65536

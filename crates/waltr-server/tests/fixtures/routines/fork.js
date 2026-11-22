@@ -3,7 +3,7 @@ export default async function (input) {
   const source = (await host.call('context.snapshot', {})).result;
   const helper = (await host.call('helper.run', {
     selection: {kind: 'named', name: 'routine-fork'}, source: source.source,
-    task: '<fork-direction>\n' + input.direction + '\n</fork-direction>',
+    content: [{type: 'text', text: '<fork-direction>\n' + input.direction + '\n</fork-direction>'}],
     maxTurns: 3,
     deadlineMs: 20000, responseBytes: 24576, completionBytes: 32768
   })).result;

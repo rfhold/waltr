@@ -7,7 +7,7 @@ export default async function (input) {
   }
   const helper = (await host.call('helper.run', {
     selection: {kind: 'named', name: 'routine-compaction'}, source: snapshot.source,
-    task: 'Compact the pinned effective context. Preserve decisions and unfinished work.',
+    content: [{type: 'text', text: 'Compact the pinned effective context. Preserve decisions and unfinished work.'}],
     maxTurns: 3,
     deadlineMs: 20000, responseBytes: 32768, completionBytes: 65536
   })).result;

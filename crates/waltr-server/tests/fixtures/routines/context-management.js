@@ -17,7 +17,7 @@ export default async function (input) {
   const helper = (await host.call('helper.run', {
     selection: {kind: 'named', name: 'routine-context-strategy'},
     source: snapshot.source,
-    task: JSON.stringify({coverage, instruction: input.instruction}),
+    content: [{type: 'text', text: JSON.stringify({coverage, instruction: input.instruction})}],
     capture: 'context-strategy',
     maxTurns: 3,
     deadlineMs: 20000, responseBytes: 65536, completionBytes: 65536

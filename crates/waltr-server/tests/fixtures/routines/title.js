@@ -6,7 +6,7 @@ export default async function () {
   if (!first) return false;
   const helper = (await host.call('helper.run', {
     selection: {kind: 'named', name: 'routine-title'},
-    task: JSON.stringify(first),
+    content: [{type: 'text', text: JSON.stringify(first)}],
     maxTurns: 1,
     deadlineMs: 10000, responseBytes: 4096, completionBytes: 8192
   })).result;

@@ -38,7 +38,7 @@ spec:
       const feed = await host.call('media.text.open', {});
       const speech = host.call('media.synthesize', {output:'audio', speech:{provider:'whispers-tts',model:'reader'}}, null, null, feed);
       const helper = host.call('helper.run', {
-        selection:{kind:'named',name:'routine-speaker'}, task:input.task,
+        selection:{kind:'named',name:'routine-speaker'}, content:[{type:'text',text:input.task}],
         maxTurns:16, deadlineMs:90000, responseBytes:65536, completionBytes:65536
       });
       const consume = (async () => {

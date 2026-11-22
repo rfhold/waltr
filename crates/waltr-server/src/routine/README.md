@@ -334,13 +334,15 @@ Required media ports fail preflight because these adapters provide no media I/O.
 
 | JavaScript operation | Strict argument shape | Required capabilities |
 | --- | --- | --- |
-| `helper.run` | `{selection,inference?,input?,task,capture?,source?,maxTurns,deadlineMs,responseBytes,completionBytes}`, optional callback and fifth-argument payload resource | `helper.run` and exact helper identity |
+| `helper.run` | `{selection,inference?,input?,content,capture?,source?,maxTurns,deadlineMs,responseBytes,completionBytes}`, optional callback; on the media host, an optional fifth-argument PDF/text resource with a single text part | `helper.run` and exact helper identity |
+| `helper.image.bind` | `{name}` and the fifth-argument invocation-owned image source handle | `helper.run` and possession of the source handle |
 | Installed `tools.execute` | `{target:{server,tool},arguments,workspace?,result?}` | `tools.execute` and the exact pair in `spec.mcpTools` |
 | Installed `tools.read` | `{}`, with the fifth-argument result handle | `tools.execute` and an invocation-owned handle |
 | Session-bound `tools.execute` | `{target:{server,tool},callId,arguments}` | `tools.execute` and constructor-mapped `tool.<id>` |
 | Session-bound `tools.schemas` | `{targets:[{server,tool}]}` | `tools.schemas` and each mapped target |
 
 Helper selections use `{kind:"named",name}` or `{kind:"restricted",profile}`.
+Message `content` is an ordered array of `{type:"text",text}` and `{type:"image",image:{source,index?}}` parts. It requires nonblank text or an image. Bind a name to an image-bearing tool-result handle, or to a committed image upload on the media host, before using it as `source`. `index` selects an image in the tool result and defaults to zero; an upload has only index zero. A name applies only within the owning invocation and grants no access to other sources.
 Named helpers pin the current catalog bundle. Restricted profiles supply explicit inference, prompt, tools, and total turn limits.
 `spec.captures` maps each capture name to `{selection:{kind:"named",name},contract:{schemaVersion:"waltr.value/v1",schema}}`.
 Capture names require `helper.capture.<id>`. `_helper_capture` validates the resource-declared closed contract through normal policy.
@@ -371,7 +373,8 @@ Deadline expiry alone does not prove cleanup. The invocation reservation remains
 | Total helper turns | 1..64, including corrections; restricted profile limits also apply |
 | JavaScript helper deadline | 1..30000 milliseconds, within invocation lifetime |
 | Neutral validation deadline | Greater than zero, at most 300 seconds |
-| Task / restricted prompt / capture contract | 16384 bytes each |
+| Message text / restricted prompt / capture contract | 16384 UTF-8 bytes each |
+| Message content / image parts / image source names | 32 parts per message, including at most 4 images, and 32 source names per invocation |
 | Restricted profiles / capture contracts / requested schemas | 32 each |
 | Helpers per invocation | 64 |
 | Cumulative evidence | 256 calls and 262144 encoded bytes |
@@ -399,8 +402,8 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | `media.input.next` | With `media.inputs`, take the next distinct capture from the declared audio input; returns a capture handle, or null after sealing |
 | `media.input.acknowledge` | Resolve a closed, consumed capture after derived work is admitted or an empty transcript is deliberately discarded |
 | `media.input.seal` | Atomically stop capture admission; returns false while an admitted capture remains unresolved |
-| `helper.open` | Media host only: the text-only `helper.run` arguments, without a source, payload, field, or callback; returns an opaque target after initial ordinary admission |
-| `helper.submit` | `{task}` and a target handle: admit an ordinary user prompt at that helper's next safe model boundary |
+| `helper.open` | Media host only: `helper.run` arguments without a context source, fifth-argument resource, field, or callback; returns an opaque target after initial ordinary admission |
+| `helper.submit` | `{content}` and the fifth-argument target handle: admit an ordinary user message at that helper's next safe model boundary |
 | `helper.idle` | `{}` and a target handle: join the accepted prefix without closing its tool streams |
 | `helper.seal` | `{}` and a target handle: reject later submissions, join accepted work, close the producer, and return the final helper result handle |
 | `media.synthesize` | PCM16LE, 24 kHz, mono from exactly one `port` or JavaScript `text` string, with host-approved speech options |
@@ -441,6 +444,10 @@ The active run adopts FIFO prompts after the complete response and all tool resu
 before its next model request or normal completion. Adjacent prompts share that
 request; no extra run or budget reset occurs. Provider retries retain their canonical
 request. An idle helper starts a normal run with the same private runtime factory.
+Images stay at the positions in the messages that introduced them, even if a
+follow-up starts a new run after idle. Helper history records references, not
+image bytes. The live invocation owns the bytes; the window Ask Routine takes
+one screenshot for the opening question and sends text for audio follow-ups.
 Paused, suspended, failed, canceled, full, or complete-gate runs reject admission.
 Prior ordinary queued work or a different host binding also causes rejection.
 An active permission interaction still controls its tool; a prompt does not bypass it.

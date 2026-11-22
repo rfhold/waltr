@@ -31,7 +31,7 @@ export default async function () {
       itemUpdates.push(entry);
       byId[id] = entry;
     }
-    const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'routine-categorization'}, source: input.source, task: JSON.stringify({items, previous}), capture: 'categories', maxTurns: 3, deadlineMs: 20000, responseBytes: 65536, completionBytes: 65536})).result;
+    const helper = (await host.call('helper.run', {selection: {kind: 'named', name: 'routine-categorization'}, source: input.source, content: [{type: 'text', text: JSON.stringify({items, previous})}], capture: 'categories', maxTurns: 3, deadlineMs: 20000, responseBytes: 65536, completionBytes: 65536})).result;
     if (helper.captures.length !== 1) throw new Error('one category capture required');
     const update = helper.captures[0].value;
     if (!Array.isArray(update.categories) || !Array.isArray(update.assignments) || typeof update.note !== 'string') throw new Error('invalid category capture');

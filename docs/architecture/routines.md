@@ -47,7 +47,7 @@ const result = await host.call('helper.run', {
   selection: {kind: 'named', name: 'coding'},
   inference: {from: 'defaults'},
   workspace: {machine: 'laptop', workingDirectory: 'rfhold/waltr'},
-  task: 'Read README.md and answer this question about the repository: ' + question,
+  content: [{type: 'text', text: 'Read README.md and answer this question about the repository: ' + question}],
   maxTurns: 3, deadlineMs: 60000, responseBytes: 8192, completionBytes: 16384
 });
 ```
@@ -83,7 +83,7 @@ Without a source chat, the Routine declaration authorizes the call. There is no 
 
 The invocation owns its connections and closes them at completion or cancellation. A source-less invocation uses its admission snapshot and does not watch for caller catalog edits. A new local stdio launch must still match the live worker launch catalog. Transport-level credential and worker revocation checks still apply, including a worker catalog update that revokes the launch. The journal records the exact tool identity and status, not raw arguments or results. Unknown outcomes do not replay.
 
-By default, `tools.execute` returns `{status: "completed", result}` or `{status: "denied"}` for a known refusal. Set `result: "handle"` to keep the completed result in server memory. Pass the handle as the fifth argument to `host.call('tools.read', {}, null, null, handle)` to read bounded text and image metadata, or pass it to `helper.run` with `imageIndex` to attach one image. The default index is zero among image blocks. The image must fit the existing helper and tool-result limits, and the selected model must support its format. Image bytes do not enter JavaScript in handle mode. If a completed result cannot be returned or retained within the limits, the reply is `{status: "completed", resultUnavailable: "limit"}`.
+By default, `tools.execute` returns `{status: "completed", result}` or `{status: "denied"}` for a known refusal. Set `result: "handle"` to keep the completed result in server memory. Pass the handle as the fifth argument to `host.call('tools.read', {}, null, null, handle)` to read bounded text and image metadata, or pass it to `helper.image.bind` to name an image for use in helper messages. The default index is zero among image blocks. The image must fit the helper and tool-result limits. Image bytes do not enter JavaScript in handle mode. If a completed result cannot be returned or retained within the limits, the reply is `{status: "completed", resultUnavailable: "limit"}`.
 
 Installed Routines must use this `tools.execute` contract; `mcp.call` and installed `tools.schemas` are not supported. Update existing Routine definitions before rollout. History needs no migration. Session-bound Code Mode keeps its separate `callId` and schema-discovery contract.
 
@@ -119,7 +119,7 @@ Native `Interact` and browser split-lane attachment RPCs use the same service, p
 
 ### Speech And Text
 
-Media adapters own readers, writers, helper input, blobs, text and speech work through cancellation and join. Speech resolves each operation's JavaScript selector or catalog default; an unconfigured required speech direction fails closed. Non-speech media does not select a cloud provider implicitly. JavaScript selects normal helpers through explicit `helper.run` arguments: selection, task, capture, source, turns, deadline and response/completion budgets.
+Media adapters own readers, writers, helper input, blobs, text and speech work through cancellation and join. Speech resolves each operation's JavaScript selector or catalog default; an unconfigured required speech direction fails closed. Non-speech media does not select a cloud provider implicitly. JavaScript selects normal helpers through explicit `helper.run` arguments: selection, message content, capture, source, turns, deadline and response/completion budgets.
 
 `media.synthesize` accepts exactly one source: a committed-text `port`, a bounded JavaScript `text` string, or an opaque internal text-feed handle. Source validation precedes speech effects. String synthesis uses a bounded text stream with a joined feeder and speech producer; cancellation stops both. The `ask-and-speak` Routine waits for one tool-free `routine-answer` completion from inference defaults, then publishes text and streams speech through speech defaults. It copies no source history. `media.read` exposes completed response bytes through the helper's opaque invocation resource; JavaScript decodes those bytes before synthesis.
 
@@ -137,6 +137,8 @@ Each invocation pins one catalog snapshot. Speech calls accept `speech: {from: '
 `helper.run` accepts `inference: {from: 'defaults'}`, `{from: 'source-session'}`, or exact `{provider, model}`. Omission uses `spec.inference`. Source selection copies the authorized session's inference snapshot and fails without a source. Source and exact selections accept `reasoningEffort`; `null` explicitly disables reasoning. The title Routine uses this override. Context copy and fork destination inference remain separate contracts.
 
 Helpers accept `input: {text: true, maxBytes: 8388608}`. The server enforces this 8 MiB maximum and validates model implementation capabilities. JavaScript declarations grant no image or PDF support, tools, credentials, or capture permission. The host resolves credentials from the pinned catalog. Catalog reloads affect subsequent invocations.
+
+`helper.run`, `helper.open`, and `helper.submit` take ordered `content` parts. Image parts name a bound resource; they do not contain bytes. A follow-up can attach another image without moving the opening image to the new turn. The provider adapter encodes supported image formats without a per-model allowlist. An invocation-only image remains available while the invocation lives; saved message images follow the ordinary session rules.
 
 Capture, playback and codec conversion belong to clients. Opaque upload/read grants do not expose native paths. Supported image/document inputs remain PNG, JPEG, WebP, PDF and UTF-8; video is excluded. Output leases are bounded, non-renewable and do not authorize replay. Durable selected text uses the accepted separate text-result budget, not an unbounded protobuf result.
 
@@ -158,11 +160,11 @@ An early successful root with undrained calls fails invocation completion valida
 Queues have no persistent subscription, attachment to another chat, delivery receipt, or restart replay.
 
 The media host also exposes an invocation-owned helper submission target.
-`helper.open` returns only after the initial ordinary run is admitted;
-it accepts an MCP result handle as its fifth argument to attach one image to
-the initial prompt, with the same `imageIndex` and limits as `helper.run`.
-The image stays in the initial run's live context, not in history or in later runs.
-`helper.submit` admits bounded text prompts into that exact durable incarnation
+`helper.open` returns only after the initial ordinary run is admitted. Bind a
+tool-result image with `helper.image.bind` before naming it in ordered `content`.
+The helper retains invocation-owned bytes for subsequent runs within that
+invocation; saved helper history cannot replay those bytes after it ends.
+`helper.submit` admits bounded text and image messages into that exact session incarnation
 through the generic coordinator's opt-in `NextTurnIfActive` policy.
 The active run adopts ordinary user messages after the complete response and tool
 batch, before its next model request or normal completion.

@@ -21,7 +21,7 @@ Ports select exact formats such as `pcm16le-24000-mono` and `utf8`. Each resourc
 
 Provider resources define speech endpoints, model options, and credentials. Defaults select `spec.speech.stt`, `diarize`, and `tts` independently. JavaScript calls use `speech: {from: 'defaults'}` or exact `{provider, model}` selectors. Exact synthesis selectors also accept `voice`, `language`, and `rate`. Omitted options use catalog model settings. The host permits no codec conversion or credential injection.
 
-JavaScript calls `helper.run` with explicit selection, inference, input limits, task, capture, source, turns, deadline, and response/completion limits. Named agents include `routine-cleanup`, `routine-conversation-filter`, and `routine-conversation-notes`. These media helpers use `inference: {from: 'defaults'}` and `input: {text: true, maxBytes: 8388608}`. Payloads use the fifth `host.call` argument as committed invocation resources. Prompts and permissions remain normal Agent resources. Input declarations grant no image, PDF, or tool authority.
+JavaScript calls `helper.run` with an explicit selection, inference, input limits, ordered `content`, capture, source, turns, deadline, and response/completion limits. Named agents include `routine-cleanup`, `routine-conversation-filter`, and `routine-conversation-notes`. These helpers use `inference: {from: 'defaults'}` and `input: {text: true, maxBytes: 8388608}`. They put the prompt in one text part and pass the committed transcript resource as the fifth `host.call` argument. Prompts and permissions remain normal Agent resources. Input declarations grant no image, PDF, or tool authority.
 
 ## Committed Text And Notes
 
