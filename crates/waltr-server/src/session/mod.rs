@@ -232,15 +232,12 @@ pub fn add_store_service(
 }
 
 /// Register a test session service backed by an existing coordinator.
-#[cfg(any(test, feature = "test"))]
-pub(crate) fn add_sessions_service<S>(
+#[cfg(any(debug_assertions, feature = "test"))]
+pub(crate) fn add_sessions_service(
     routes: &mut RoutesBuilder,
-    sessions: SessionCoordinator<S>,
+    sessions: SessionCoordinator<MemorySessionStore>,
     input: SessionRegistrationInput,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
+) -> Arc<dyn SessionHost> {
     add_image_sessions_service(
         routes,
         sessions,
