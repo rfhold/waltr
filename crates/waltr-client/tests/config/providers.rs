@@ -7,6 +7,7 @@ use crate::support::{
 
 #[tokio::test]
 async fn stream_dispatches_config_provider_commands() {
+    isolate_config_test!();
     let runtime = ClientRuntime::for_endpoint(server_endpoint());
     let mut stream = runtime.into_state_stream(no_sleep);
 
@@ -49,16 +50,7 @@ async fn stream_dispatches_config_provider_commands() {
         })
     ));
 
-    let patched = next_snapshot_until(&mut stream, |snapshot| {
-        matches!(
-            snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::ConfigPatch {
-                status: "ready",
-                ..
-            })
-        )
-    })
-    .await;
+    let patched = super::config_patch_result(&mut stream, &patch_started, "ready").await;
     let patched_config = patched
         .config
         .current

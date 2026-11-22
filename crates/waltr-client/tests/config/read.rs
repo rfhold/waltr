@@ -4,6 +4,7 @@ use crate::support::server::{absent_slot_etag, provider_resource_write, server_e
 
 #[tokio::test]
 async fn grpc_executor_loads_and_reloads_config() {
+    isolate_config_test!();
     let client = GrpcEffectExecutor::for_endpoint(server_endpoint());
 
     let initial = client.load_config().await.expect("config should load");

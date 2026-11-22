@@ -7,6 +7,7 @@ use crate::support::{
 
 #[tokio::test]
 async fn provider_and_mcp_edits_preserve_bundled_raw_source() {
+    isolate_config_test!();
     let endpoint = server_endpoint();
     let runtime = ClientRuntime::for_endpoint(endpoint.clone());
     let mut stream = runtime.into_state_stream(no_sleep);
@@ -27,7 +28,7 @@ async fn provider_and_mcp_edits_preserve_bundled_raw_source() {
         .expect("codex provider");
     let original_codex = codex.clone();
     codex.url = "https://edited.example.test/responses".to_owned();
-    dispatch_stream_command(
+    let started = dispatch_stream_command(
         &mut stream,
         ClientCommand::UpdateProvider {
             original_name: "codex".to_owned(),
@@ -38,17 +39,14 @@ async fn provider_and_mcp_edits_preserve_bundled_raw_source() {
     )
     .await
     .expect("codex edit should start");
-    next_snapshot_until(&mut stream, |snapshot| {
-        snapshot.config.patch.status == "ready"
-    })
-    .await;
+    super::config_patch_result(&mut stream, &started, "ready").await;
 
     let waltr = config
         .mcp_servers
         .get("waltr")
         .cloned()
         .expect("self MCP server");
-    dispatch_stream_command(
+    let started = dispatch_stream_command(
         &mut stream,
         ClientCommand::UpdateMcpServer {
             original_name: "waltr".to_owned(),
@@ -59,16 +57,14 @@ async fn provider_and_mcp_edits_preserve_bundled_raw_source() {
     )
     .await
     .expect("self MCP edit should start");
-    next_snapshot_until(&mut stream, |snapshot| {
-        snapshot.config.patch.status == "ready"
-    })
-    .await;
+    super::config_patch_result(&mut stream, &started, "ready").await;
 
     let catalog = GrpcEffectExecutor::for_endpoint(endpoint)
         .load_resource_catalog()
         .await
         .expect("catalog should load");
     let codex_source = resource_source(&catalog, "providers/codex.yaml");
+    assert!(codex_source.contains("url: https://edited.example.test/responses"));
     assert!(codex_source.contains("include:\n    - gpt-5.*"));
     let mcp_source = resource_source(&catalog, "mcp-servers/waltr.yaml");
     assert_eq!(mcp_source, initial_mcp_source);

@@ -1,6 +1,4 @@
-use waltr_client::{
-    ClientCommand, ClientOperationView, ClientRuntime, GrpcEffectExecutor, ResourceWrite,
-};
+use waltr_client::{ClientCommand, ClientRuntime, GrpcEffectExecutor, ResourceWrite};
 
 use crate::support::{
     server::{absent_slot_etag, provider_resource_write, server_endpoint},
@@ -9,6 +7,7 @@ use crate::support::{
 
 #[tokio::test]
 async fn stale_resource_baseline_conflicts_instead_of_overwriting() {
+    isolate_config_test!();
     let client_a = GrpcEffectExecutor::for_endpoint(server_endpoint());
     let client_b = client_a.clone();
 
@@ -39,6 +38,7 @@ async fn stale_resource_baseline_conflicts_instead_of_overwriting() {
     reason = "the two-client watch, conflict, and authoritative reload lifecycle stays explicit"
 )]
 async fn watched_update_after_form_open_conflicts_and_reloads_authoritative_state() {
+    isolate_config_test!();
     let endpoint = server_endpoint();
     let runtime = ClientRuntime::for_endpoint(endpoint.clone());
     let mut stream = runtime.into_state_stream(no_sleep);
@@ -98,17 +98,7 @@ async fn watched_update_after_form_open_conflicts_and_reloads_authoritative_stat
     )
     .await
     .expect("stale form submission should start");
-    let operation_key = started.config.patch.key.expect("patch operation key");
-    let failed = next_snapshot_until(&mut stream, |snapshot| {
-        matches!(
-            snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::ConfigPatch {
-                status: "failed",
-                ..
-            })
-        )
-    })
-    .await;
+    let failed = super::config_patch_result(&mut stream, &started, "failed").await;
 
     assert!(
         failed

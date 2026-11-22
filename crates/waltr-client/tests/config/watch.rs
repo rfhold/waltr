@@ -10,6 +10,7 @@ use crate::support::{
 
 #[tokio::test]
 async fn grpc_executor_watches_config_changes() {
+    isolate_config_test!();
     let client = GrpcEffectExecutor::for_endpoint(server_endpoint());
 
     let initial = client.load_config().await.expect("config should load");

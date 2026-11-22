@@ -7,6 +7,7 @@ use crate::support::{
 
 #[tokio::test]
 async fn provider_reset_removes_override_and_reveals_bundled_fallback() {
+    isolate_config_test!();
     let runtime = ClientRuntime::for_endpoint(server_endpoint());
     let mut stream = runtime.into_state_stream(no_sleep);
     let initial = load_config(&mut stream).await;
@@ -21,7 +22,7 @@ async fn provider_reset_removes_override_and_reveals_bundled_fallback() {
 
     let mut override_provider = provider_view("anthropic");
     override_provider.url = "https://override.example.test/messages".to_owned();
-    dispatch_stream_command(
+    let started = dispatch_stream_command(
         &mut stream,
         ClientCommand::UpdateProvider {
             original_name: "anthropic".to_owned(),
@@ -32,16 +33,16 @@ async fn provider_reset_removes_override_and_reveals_bundled_fallback() {
     )
     .await
     .expect("provider override should start");
-    let overridden = next_snapshot_until(&mut stream, |snapshot| {
-        snapshot.config.patch.status == "ready"
-            && snapshot
-                .config
-                .current
-                .as_ref()
-                .and_then(|config| config.providers.get("anthropic"))
-                .is_some_and(|provider| provider.url == "https://override.example.test/messages")
-    })
-    .await;
+    let overridden = super::config_patch_result(&mut stream, &started, "ready").await;
+    assert_eq!(
+        overridden
+            .config
+            .current
+            .as_ref()
+            .and_then(|config| config.providers.get("anthropic"))
+            .map(|provider| provider.url.as_str()),
+        Some("https://override.example.test/messages")
+    );
 
     let started = dispatch_stream_command(
         &mut stream,
@@ -51,23 +52,21 @@ async fn provider_reset_removes_override_and_reveals_bundled_fallback() {
     )
     .await
     .expect("provider reset should start");
-    let operation_key = started.config.patch.key.expect("reset operation key");
-    let reset = next_snapshot_until(&mut stream, |snapshot| {
-        matches!(
-            snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::ConfigPatch {
-                status: "ready",
-                config: None,
-                ..
-            })
-        ) && snapshot
-            .config
-            .current
-            .as_ref()
-            .and_then(|config| config.providers.get("anthropic"))
-            == Some(&initial_provider)
-    })
-    .await;
+    let operation_key = started
+        .config
+        .patch
+        .key
+        .as_deref()
+        .expect("reset operation key");
+    let reset = super::config_patch_result(&mut stream, &started, "ready").await;
+    assert!(matches!(
+        reset.operations.current.get(operation_key),
+        Some(ClientOperationView::ConfigPatch {
+            status: "ready",
+            config: None,
+            ..
+        })
+    ));
 
     let reset_provider = reset
         .config
@@ -88,6 +87,7 @@ async fn provider_reset_removes_override_and_reveals_bundled_fallback() {
 
 #[tokio::test]
 async fn self_mcp_reset_fails_closed_when_bundled_template_is_unavailable() {
+    isolate_config_test!();
     let runtime = ClientRuntime::for_endpoint(server_endpoint());
     let mut stream = runtime.into_state_stream(no_sleep);
     let initial = load_config(&mut stream).await;
@@ -102,17 +102,13 @@ async fn self_mcp_reset_fails_closed_when_bundled_template_is_unavailable() {
     )
     .await
     .expect("self MCP reset should start");
-    let operation_key = started.config.patch.key.expect("reset operation key");
-    let failed = next_snapshot_until(&mut stream, |snapshot| {
-        matches!(
-            snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::ConfigPatch {
-                status: "failed",
-                ..
-            })
-        )
-    })
-    .await;
+    let operation_key = started
+        .config
+        .patch
+        .key
+        .as_deref()
+        .expect("reset operation key");
+    let failed = super::config_patch_result(&mut stream, &started, "failed").await;
 
     assert_eq!(failed.config.current.as_ref(), Some(&prior));
     assert!(
@@ -124,7 +120,7 @@ async fn self_mcp_reset_fails_closed_when_bundled_template_is_unavailable() {
             .is_some_and(|error| error.contains("invalid_argument"))
     );
     assert!(matches!(
-        failed.operations.current.get(&operation_key),
+        failed.operations.current.get(operation_key),
         Some(ClientOperationView::ConfigPatch {
             status: "failed",
             config: None,
@@ -135,6 +131,7 @@ async fn self_mcp_reset_fails_closed_when_bundled_template_is_unavailable() {
 
 #[tokio::test]
 async fn rename_failure_keeps_destination_and_reloads_authoritative_state() {
+    isolate_config_test!();
     let endpoint = server_endpoint();
     let runtime = ClientRuntime::for_endpoint(endpoint.clone());
     let mut stream = runtime.into_state_stream(no_sleep);
@@ -160,17 +157,7 @@ async fn rename_failure_keeps_destination_and_reloads_authoritative_state() {
     )
     .await
     .expect("rename should start");
-    let operation_key = started.config.patch.key.expect("rename operation key");
-    let failed = next_snapshot_until(&mut stream, |snapshot| {
-        matches!(
-            snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::ConfigPatch {
-                status: "failed",
-                ..
-            })
-        )
-    })
-    .await;
+    let failed = super::config_patch_result(&mut stream, &started, "failed").await;
 
     let current = failed
         .config
