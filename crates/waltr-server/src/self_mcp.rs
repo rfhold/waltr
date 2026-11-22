@@ -133,8 +133,12 @@ impl PrivateSelfMcp {
         }));
     }
 
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) fn stop_admission(&self) {
         self.binding.lifetime.cancel();
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        self.stop_admission();
         self.listener.take();
         if let Some(task) = self.task.as_mut() {
             // Connection tasks, including HTTP/2 service futures, join inside the owned server.

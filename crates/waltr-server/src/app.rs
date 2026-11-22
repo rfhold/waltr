@@ -211,6 +211,9 @@ impl ServerApplication {
         }
         machines.shutdown();
         drop(router);
+        if let Some(private) = &self_mcp {
+            private.stop_admission();
+        }
         if let Some(exports) = workspace_exports {
             exports.shutdown().await;
         }
@@ -431,6 +434,9 @@ impl ServerApplication {
             readiness.shutdown.cancel();
         }
         machines.shutdown();
+        if let Some(private) = &self_mcp {
+            private.stop_admission();
+        }
         if let Some(exports) = workspace_exports {
             exports.shutdown().await;
         }
