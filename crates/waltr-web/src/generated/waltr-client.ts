@@ -830,7 +830,23 @@ export type PendingInteractionView = { identity: InteractionIdentity, request: I
 
 export type SessionInteractionsView = { generation: string | null, revision: bigint, connected: boolean, error: string | null, pending: Array<PendingInteractionView>, };
 
-export type TimelineContentView = { "kind": "empty" } | { "kind": "textDelta", delta: string, } | { "kind": "textSnapshot", text: string, } | { "kind": "toolCall", id: string, name: string, arguments_json: string, } | { "kind": "toolResult", id: string, name: string, content: string, error: boolean, } | { "kind": "contentRef", content_id: string, bytes: bigint, } | { "kind": "json", value_json: string, } | { "kind": "unknown" };
+export type MessageImageFormatView = "png" | "jpeg" | "webp";
+
+export type UserMessagePartView = { "kind": "text",
+/**
+ * Text exactly as saved.
+ */
+text: string, } | { "kind": "image",
+/**
+ * Verified raster format.
+ */
+format: MessageImageFormatView,
+/**
+ * Exact image length in bytes.
+ */
+size_bytes: number, } | { "kind": "unknown" };
+
+export type TimelineContentView = { "kind": "empty" } | { "kind": "textDelta", delta: string, } | { "kind": "textSnapshot", text: string, } | { "kind": "userMessage", parts: Array<UserMessagePartView>, } | { "kind": "toolCall", id: string, name: string, arguments_json: string, } | { "kind": "toolResult", id: string, name: string, content: string, error: boolean, } | { "kind": "contentRef", content_id: string, bytes: bigint, } | { "kind": "json", value_json: string, } | { "kind": "unknown" };
 
 export type TimelineEventView = {
 /**

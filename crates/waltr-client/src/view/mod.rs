@@ -18,13 +18,13 @@ pub use config::{
 };
 pub use session::{
     InferenceProviderSettingsView, InferenceSettingsMatchView, InferenceSettingsView,
-    ProjectedTimelineEntryView, SelectableAgentView, SessionAssociationsView,
+    MessageImageFormatView, MessageImageInfoView, ProjectedTimelineEntryView, SelectableAgentView, SessionAssociationsView,
     SessionCapabilitiesView, SessionCoordinationPhaseView, SessionCoordinationReasonView,
     SessionCoordinationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
     SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
     SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
     TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
-    TimelineStatusView, TimestampView, WorkspaceSelection,
+    TimelineStatusView, TimestampView, UserMessagePartView, WorkspaceSelection,
 };
 
 #[cfg(test)]
@@ -32,6 +32,8 @@ mod tests {
     use std::{collections::HashMap, fs, path::PathBuf};
 
     use ts_rs::TS as _;
+
+    use super::{MessageImageFormatView, UserMessagePartView};
 
     use crate::{
         AccessSnapshot, AccessStatus, AuthAttemptSnapshot, AuthSnapshot, AuthStatusSnapshot,
@@ -311,6 +313,8 @@ mod tests {
             crate::InteractionElicitationAction::decl(),
             crate::PendingInteractionView::decl(),
             crate::SessionInteractionsView::decl(),
+            MessageImageFormatView::decl(),
+            UserMessagePartView::decl(),
             TimelineContentView::decl(),
             TimelineEventView::decl(),
             TimelinePresentationView::decl(),

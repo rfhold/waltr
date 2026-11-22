@@ -1235,6 +1235,7 @@ pub(crate) type InteractionRuntimeTransport = crate::DefaultGrpcTransport;
 pub struct ClientRuntime {
     reducer: Client,
     executor: GrpcEffectExecutor,
+    message_images: crate::MessageImageLane,
     status_watch: Option<(u64, StatusChangeStream)>,
     config_watch: Option<ConfigWatchUpdateStream>,
     session_watch: Option<SessionWatchUpdateStream>,
@@ -1342,6 +1343,12 @@ impl fmt::Debug for ClientRuntime {
     }
 }
 
+impl Drop for ClientRuntime {
+    fn drop(&mut self) {
+        self.message_images.close();
+    }
+}
+
 impl ClientRuntime {
     /// Create a same-origin browser runtime for a named destination.
     #[cfg(target_arch = "wasm32")]
@@ -1372,6 +1379,7 @@ impl ClientRuntime {
     fn with_executor(executor: GrpcEffectExecutor) -> Self {
         Self {
             reducer: Client::new(),
+            message_images: crate::MessageImageLane::new(executor.transport().clone()),
             executor,
             status_watch: None,
             config_watch: None,
@@ -1396,6 +1404,12 @@ impl ClientRuntime {
     #[must_use]
     pub(crate) fn interaction_transport(&self) -> InteractionRuntimeTransport {
         self.executor.transport().clone()
+    }
+
+    /// Clone the bounded binary lane pinned to this runtime's route and access.
+    #[must_use]
+    pub fn message_images(&self) -> crate::MessageImageLane {
+        self.message_images.clone()
     }
 
     /// Return the current reducer snapshot.
@@ -1765,6 +1779,9 @@ impl ClientRuntime {
     }
 
     fn suspend_protected_watches(&mut self) {
+        let state = self.reducer.state();
+        self.message_images
+            .update_access(state.access_generation, state.permits_watch_maintenance());
         self.interaction_watches.retain(|session, (epoch, _)| {
             self.reducer
                 .state()

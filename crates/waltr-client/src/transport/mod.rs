@@ -4,6 +4,7 @@ mod auth;
 mod catalog;
 mod config;
 mod interaction;
+pub(crate) mod message_images;
 pub use interaction::RoutineInteractionTransport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
 mod native_trace;
@@ -353,6 +354,8 @@ struct RequestCredentials {
     credential_revision: u64,
     #[cfg(not(target_arch = "wasm32"))]
     authorization: Option<AsciiMetadataValue>,
+    #[cfg(not(target_arch = "wasm32"))]
+    access_expiry_revision: OnceLock<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -922,21 +925,31 @@ impl NativeCredentialProvider {
         lease: NativeCredentialLease,
         credential_revision: u64,
     ) -> bool {
+        self.clear_bearer_token_with_revision(lease, credential_revision)
+            .is_some()
+    }
+
+    fn clear_bearer_token_with_revision(
+        &self,
+        lease: NativeCredentialLease,
+        credential_revision: u64,
+    ) -> Option<u64> {
         let mut state = self.write_state();
         if state.lease_generation != lease.lease_generation
             || state.credential_revision != credential_revision
         {
-            return false;
+            return None;
         }
         if state.authorization.is_none() {
-            return true;
+            return Some(state.credential_revision);
         }
         state.lease_generation = state.lease_generation.saturating_add(1);
         state.credential_revision = state.credential_revision.saturating_add(1);
         state.authorization = None;
+        let cleared_revision = state.credential_revision;
         drop(state);
         self.invalidate_media();
-        true
+        Some(cleared_revision)
     }
 
     fn invalidate_media(&self) {
@@ -966,6 +979,7 @@ impl NativeCredentialProvider {
             lease_generation: state.lease_generation,
             credential_revision: state.credential_revision,
             authorization: state.authorization.clone(),
+            access_expiry_revision: OnceLock::new(),
         };
         drop(state);
         credentials
@@ -1412,16 +1426,19 @@ fn status_error(error: &tonic::Status, credentials: &RequestCredentials) -> Clie
         && domain == Some(waltr::grpc::waltr::auth::v1::AuthenticationDomain::WaltrAccess)
     {
         #[cfg(not(target_arch = "wasm32"))]
-        if !credentials.provider.clear_bearer_token_if_current(
-            NativeCredentialLease {
-                lease_generation: credentials.lease_generation,
-            },
-            credentials.credential_revision,
-        ) {
-            return ClientError::new(format!(
-                "{}: stale Waltr credentials were rejected",
-                status_code_name(error.code())
-            ));
+        {
+            let Some(revision) = credentials.provider.clear_bearer_token_with_revision(
+                NativeCredentialLease {
+                    lease_generation: credentials.lease_generation,
+                },
+                credentials.credential_revision,
+            ) else {
+                return ClientError::new(format!(
+                    "{}: stale Waltr credentials were rejected",
+                    status_code_name(error.code())
+                ));
+            };
+            let _ = credentials.access_expiry_revision.set(revision);
         }
 
         return ClientError::waltr_login_required(format!(
@@ -1869,6 +1886,7 @@ mod tests {
         assert!(error.is_waltr_login_required());
         assert_eq!(credentials.credential_lease(), lease);
         assert_eq!(credentials.credential_revision(), revision);
+        assert_eq!(request.access_expiry_revision.get(), Some(&revision));
         assert!(!credentials.has_bearer_token());
         assert!(
             credentials
@@ -1913,6 +1931,7 @@ mod tests {
         let error = status_error(&waltr_access_status("expired"), &request);
 
         assert_eq!(error.kind(), crate::ClientErrorKind::Other);
+        assert_eq!(request.access_expiry_revision.get(), None);
         assert!(credentials.has_bearer_token());
     }
 
@@ -1938,6 +1957,37 @@ mod tests {
                 .replace_bearer_token_if_current(lease, "stale-refresh")
                 .unwrap()
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn access_expiry_receipt_does_not_adopt_credentials_installed_during_clear() {
+        struct ReplaceOnWake(NativeCredentialProvider);
+
+        impl std::task::Wake for ReplaceOnWake {
+            fn wake(self: Arc<Self>) {
+                self.0.replace_bearer_token("replacement").unwrap();
+            }
+        }
+
+        let credentials = NativeCredentialProvider::new();
+        credentials.replace_bearer_token("rejected").unwrap();
+        let rejected_revision = credentials.credential_revision();
+        let request = credentials.request_credentials();
+        let media_waker = request.media_waker();
+        media_waker.register(&std::task::Waker::from(Arc::new(ReplaceOnWake(
+            credentials.clone(),
+        ))));
+
+        let error = status_error(&waltr_access_status("expired"), &request);
+
+        assert!(error.is_waltr_login_required());
+        assert_eq!(
+            request.access_expiry_revision.get().copied(),
+            Some(rejected_revision + 1)
+        );
+        assert_eq!(credentials.credential_revision(), rejected_revision + 2);
+        assert!(credentials.has_bearer_token());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

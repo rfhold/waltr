@@ -15,6 +15,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::{ClientCommand, ClientCommandRequest, ClientRuntime, ClientStateStreamEvent};
 
 mod interaction;
+mod message_images;
 
 #[wasm_bindgen(
     inline_js = "export function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); } export function utcMs() { return Date.now(); }"
@@ -32,6 +33,7 @@ unsafe extern "C" {
 pub struct WaltrClient {
     endpoint: String,
     interaction_transport: crate::coordination::runtime::InteractionRuntimeTransport,
+    message_images: crate::MessageImageLane,
     interactions: Rc<RefCell<interaction::Host>>,
     commands: mpsc::UnboundedSender<ClientCommandRequest>,
     latest_snapshot: Rc<RefCell<String>>,
@@ -81,6 +83,7 @@ impl WaltrClient {
 
     fn with_runtime(endpoint: String, runtime: ClientRuntime) -> Self {
         let interaction_transport = runtime.interaction_transport();
+        let message_images = runtime.message_images();
         let runtime = runtime.into_state_stream(browser_sleep);
         let latest_snapshot = Rc::new(RefCell::new(
             serde_json::to_string(&runtime.snapshot()).unwrap_or_else(|error| error.to_string()),
@@ -102,6 +105,7 @@ impl WaltrClient {
         Self {
             endpoint,
             interaction_transport,
+            message_images,
             interactions,
             commands,
             latest_snapshot,
@@ -141,6 +145,7 @@ impl WaltrClient {
                 | ClientCommand::StartWaltrLogin
         ) {
             self.interactions.borrow_mut().cancel();
+            self.message_images.suspend_for_access_change();
         }
         let (result, receiver) = oneshot::channel();
 
@@ -157,6 +162,7 @@ impl WaltrClient {
     #[wasm_bindgen(js_name = dispose)]
     pub fn dispose(&self) {
         self.interactions.borrow_mut().cancel();
+        self.message_images.close();
         self.interactions.borrow_mut().disposed = true;
         let latest = self.latest_snapshot.borrow().clone();
         if let Ok(mut snapshot) = serde_json::from_str::<serde_json::Value>(&latest) {

@@ -414,6 +414,11 @@ fn known_method(service: &str, method: &str) -> Option<MethodAttributes> {
                 "GetTimeline",
                 "WatchTimeline",
                 "SubmitUserMessage",
+                "BeginMessageImageUpload",
+                "WriteMessageImageChunk",
+                "SealMessageImageUpload",
+                "AbortMessageImageUpload",
+                "ReadMessageImage",
                 "InterruptSession",
                 "RollbackSession",
                 "ContinueSession",
@@ -870,8 +875,20 @@ mod tests {
         );
         assert_eq!(grpc_status_from_http(http::StatusCode::OK), None);
 
-        let known = method_attributes("/waltr.session.v1.SessionService/ListSessions");
-        assert_eq!(known.operation, "session.ListSessions");
+        for method in [
+            "ListSessions",
+            "SubmitUserMessage",
+            "BeginMessageImageUpload",
+            "WriteMessageImageChunk",
+            "SealMessageImageUpload",
+            "AbortMessageImageUpload",
+            "ReadMessageImage",
+        ] {
+            let known = method_attributes(&format!("/waltr.session.v1.SessionService/{method}"));
+            assert_eq!(known.service, "waltr.session.v1.SessionService");
+            assert_eq!(known.method, method);
+            assert_eq!(known.operation, format!("session.{method}"));
+        }
         for method in ["Interact", "OpenAttachment"] {
             let known = method_attributes(&format!("/waltr.routine.v2.RoutineService/{method}"));
             assert_eq!(known.service, "waltr.routine.v2.RoutineService");

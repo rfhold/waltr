@@ -78,6 +78,10 @@ pub use transport::{
     SessionTimelineProjectionMode, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
     SessionWatchEvent, SessionWatchUpdate, WaltrTransport,
 };
+pub use transport::message_images::{
+    MAX_MESSAGE_IMAGE_BYTES, MAX_MESSAGE_IMAGE_COUNT, MAX_MESSAGE_TOTAL_IMAGE_BYTES,
+    MessageImageLane, MessageInputPart,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
 pub use view::{
@@ -85,7 +89,8 @@ pub use view::{
     CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
     CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSummaryView, ConfigView,
     InferenceDefaultsView, InferenceProviderSettingsView, InferenceSettingsMatchView,
-    InferenceSettingsView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
+    InferenceSettingsView, McpServerTypeView, McpServerView, MessageImageFormatView,
+    MessageImageInfoView, ModelCapabilitiesView,
     ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
     ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
@@ -96,7 +101,7 @@ pub use view::{
     SessionSuspensionKindView, SessionTimelineView, SessionView, SpeechDefaultsView,
     SpeechSelectionView, SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
     TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView,
-    WorkspaceSelection,
+    UserMessagePartView, WorkspaceSelection,
 };
 pub use waltr::grpc::waltr::catalog::v1::{
     CatalogDefaultField, CatalogDriftField, CatalogDriftSeverity, CatalogMatch,

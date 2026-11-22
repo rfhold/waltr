@@ -38,6 +38,10 @@ macro_rules! apps_service {
             async fn watch_timeline(&self, _: tonic::Request<proto::WatchTimelineRequest>) -> Result<tonic::Response<Self::WatchTimelineStream>, tonic::Status> {
                 Err(tonic::Status::unimplemented("not used"))
             }
+            type ReadMessageImageStream = futures_util::stream::Empty<Result<proto::ReadMessageImageResponse, tonic::Status>>;
+            async fn read_message_image(&self, _: tonic::Request<proto::ReadMessageImageRequest>) -> Result<tonic::Response<Self::ReadMessageImageStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used"))
+            }
             async fn call_session_mcp_app_tool(&self, _: tonic::Request<proto::CallSessionMcpAppToolRequest>) -> Result<tonic::Response<proto::CallSessionMcpAppToolResponse>, tonic::Status> {
                 self.started.notify_one();
                 std::future::pending().await
@@ -62,6 +66,10 @@ apps_service! {
     update_session_agent(UpdateSessionAgentRequest) -> UpdateSessionAgentResponse,
     get_timeline(GetTimelineRequest) -> GetTimelineResponse,
     submit_user_message(SubmitUserMessageRequest) -> SubmitUserMessageResponse,
+    begin_message_image_upload(BeginMessageImageUploadRequest) -> BeginMessageImageUploadResponse,
+    write_message_image_chunk(WriteMessageImageChunkRequest) -> WriteMessageImageChunkResponse,
+    seal_message_image_upload(SealMessageImageUploadRequest) -> SealMessageImageUploadResponse,
+    abort_message_image_upload(AbortMessageImageUploadRequest) -> AbortMessageImageUploadResponse,
     interrupt_session(InterruptSessionRequest) -> InterruptSessionResponse,
     rollback_session(RollbackSessionRequest) -> RollbackSessionResponse,
     continue_session(ContinueSessionRequest) -> ContinueSessionResponse,

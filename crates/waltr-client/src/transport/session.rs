@@ -618,7 +618,10 @@ where
     transport
         .session_client(&credentials)
         .await?
-        .submit_user_message(SubmitUserMessageRequest { session_id, text })
+        .submit_user_message(SubmitUserMessageRequest {
+            session_id,
+            parts: vec![super::message_images::text_part(text)],
+        })
         .await
         .map_err(|error| status_error(&error, &credentials))?;
 

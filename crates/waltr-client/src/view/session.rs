@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use waltr::grpc::waltr::session::v1::{
-    ProjectedTimelineEvent, SessionCapabilities, SessionCoordinationPhase,
+    MessageImageFormat, ProjectedTimelineEvent, SessionCapabilities, SessionCoordinationPhase,
     SessionCoordinationReason, SessionCoordinationState, SessionProgress, SessionProgressPhase,
     SessionPromptDisposition, SessionRunStage, SyntheticTimelineEvent, TimelinePresentation,
-    projected_timeline_event, timeline_content,
+    projected_timeline_event, timeline_content, user_message_timeline_part,
 };
 
 use crate::{
@@ -562,6 +562,9 @@ pub enum TimelineContentView {
     TextSnapshot {
         text: String,
     },
+    UserMessage {
+        parts: Vec<UserMessagePartView>,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -581,6 +584,70 @@ pub enum TimelineContentView {
         value_json: String,
     },
     Unknown,
+}
+
+/// Raster image format shared by composers and history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageImageFormatView {
+    /// PNG.
+    Png,
+    /// JPEG.
+    Jpeg,
+    /// WebP.
+    Webp,
+}
+
+/// Public metadata for one saved image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageImageInfoView {
+    /// Verified raster format.
+    pub format: MessageImageFormatView,
+    /// Exact image length in bytes.
+    pub size_bytes: u32,
+}
+
+/// An ordered message part. Its array position is the image read index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum UserMessagePartView {
+    /// Text at this position.
+    Text {
+        /// Text exactly as saved.
+        text: String,
+    },
+    /// Safe metadata for an image at this position.
+    Image {
+        /// Verified raster format.
+        format: MessageImageFormatView,
+        /// Exact image length in bytes.
+        size_bytes: u32,
+    },
+    /// Unrecognized part; its position still counts.
+    Unknown,
+}
+
+impl From<MessageImageFormatView> for MessageImageFormat {
+    fn from(value: MessageImageFormatView) -> Self {
+        match value {
+            MessageImageFormatView::Png => Self::Png,
+            MessageImageFormatView::Jpeg => Self::Jpeg,
+            MessageImageFormatView::Webp => Self::Webp,
+        }
+    }
+}
+
+impl TryFrom<i32> for MessageImageFormatView {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match MessageImageFormat::try_from(value) {
+            Ok(MessageImageFormat::Png) => Ok(Self::Png),
+            Ok(MessageImageFormat::Jpeg) => Ok(Self::Jpeg),
+            Ok(MessageImageFormat::Webp) => Ok(Self::Webp),
+            _ => Err(()),
+        }
+    }
 }
 
 impl From<SessionSummary> for SessionView {
@@ -941,6 +1008,27 @@ impl From<TimelineContent> for TimelineContentView {
             Some(timeline_content::Content::TextSnapshot(content)) => {
                 Self::TextSnapshot { text: content.text }
             }
+            Some(timeline_content::Content::UserMessage(content)) => Self::UserMessage {
+                parts: content
+                    .parts
+                    .into_iter()
+                    .map(|part| match part.part {
+                        Some(user_message_timeline_part::Part::Text(text)) => {
+                            UserMessagePartView::Text { text }
+                        }
+                        Some(user_message_timeline_part::Part::Image(image)) => {
+                            match MessageImageFormatView::try_from(image.format) {
+                                Ok(format) => UserMessagePartView::Image {
+                                    format,
+                                    size_bytes: image.size_bytes,
+                                },
+                                Err(()) => UserMessagePartView::Unknown,
+                            }
+                        }
+                        None => UserMessagePartView::Unknown,
+                    })
+                    .collect(),
+            },
             Some(timeline_content::Content::ToolCall(content)) => Self::ToolCall {
                 id: content.id,
                 name: content.name,
@@ -960,6 +1048,62 @@ impl From<TimelineContent> for TimelineContentView {
                 value_json: content.value_json,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod message_parts_tests {
+    use serde_json::json;
+    use waltr::grpc::waltr::session::v1::{
+        MessageImageInfo, UserMessageTimelineContent, UserMessageTimelinePart,
+    };
+
+    use super::*;
+
+    #[test]
+    fn raw_and_effective_timeline_preserve_order_and_image_indexes() {
+        use user_message_timeline_part::Part;
+
+        let parts = [
+            Some(Part::Text("before ".into())),
+            None,
+            Some(Part::Image(MessageImageInfo {
+                format: MessageImageFormat::Webp as i32,
+                size_bytes: 17,
+            })),
+            Some(Part::Text(" after".into())),
+        ];
+        let timeline = TimelineEvent {
+            item_id: "i7".into(),
+            cursor: 7,
+            content: Some(TimelineContent {
+                content: Some(timeline_content::Content::UserMessage(
+                    UserMessageTimelineContent {
+                        parts: parts.map(|part| UserMessageTimelinePart { part }).into(),
+                    },
+                )),
+            }),
+            ..TimelineEvent::default()
+        };
+
+        let raw = TimelineEventView::from(timeline.clone());
+        let effective = ProjectedTimelineEntryView::try_from(ProjectedTimelineEvent {
+            event: Some(projected_timeline_event::Event::Durable(timeline)),
+            ..ProjectedTimelineEvent::default()
+        }).unwrap();
+        let ProjectedTimelineEntryView::Durable { event, .. } = effective else {
+            panic!("expected durable event");
+        };
+        assert_eq!(raw.content, event.content);
+        assert_eq!(
+            serde_json::to_value(raw.content).unwrap(),
+            json!({"kind":"userMessage","parts":[
+                {"kind":"text","text":"before "},
+                {"kind":"unknown"},
+                {"kind":"image","format":"webp","size_bytes":17},
+                {"kind":"text","text":" after"}
+            ]})
+        );
     }
 }
 
