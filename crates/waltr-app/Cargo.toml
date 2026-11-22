@@ -30,6 +30,7 @@ hyper-util = { workspace = true, features = ["service"], optional = true }
 futures-channel.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true
+waltr-audio-io.workspace = true
 waltr-desktop.workspace = true
 waltr.workspace = true
 waltr-client = { workspace = true, features = ["native-tracing", "native-access"] }
@@ -61,7 +62,6 @@ webpki-roots.workspace = true
 waltr.workspace = true
 tempfile.workspace = true
 waltr-server = { path = "../waltr-server", version = "0.3.0", default-features = false, features = ["test"] }
-waltr-audio-io.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tauri = { version = "=2.10.1", features = ["test"] }
 
