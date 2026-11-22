@@ -2109,6 +2109,7 @@ async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> wal
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
+    let mut stream = sessions.watch_timeline(session_id.clone());
     let submission = sessions
         .submit_prompt(
             session_id.clone(),
@@ -2116,7 +2117,6 @@ async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> wal
             waltr_agent::RunConflictPolicy::ReplaceActive,
         )
         .await?;
-    let mut stream = sessions.watch_timeline(session_id.clone());
 
     loop {
         let update = stream.next().await.expect("tool call event");
@@ -2942,6 +2942,7 @@ fn test_session_from_timeline(timeline: Vec<AgentTimelineEvent>) -> AgentTestSes
             TimelineContent::Empty
             | TimelineContent::TextDelta { .. }
             | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::UserMessage { .. }
             | TimelineContent::ContentRef { .. }
             | TimelineContent::Json { .. }
             | TimelineContent::ToolCall { .. }

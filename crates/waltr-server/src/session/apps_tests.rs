@@ -512,6 +512,10 @@ done
         runtime_factory: Arc::new(factory),
         routines: tokio::sync::Mutex::new(None),
         origin_runs: super::OriginRuns::default(),
+        image_objects: super::SessionImageObjects::memory(super::MEMORY_IMAGE_OBJECT_BYTES),
+        image_uploads: Arc::new(super::ImageUploads::default()),
+        image_reaper: std::sync::Once::new(),
+        image_read_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         sessions: sessions.clone(),
         config: crate::config::ConfigHandle::from_resources(state),
         agent_catalog: SessionCatalogSource::Static(crate::test_support::default_agent_catalog()),
@@ -720,6 +724,10 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
         runtime_factory: Arc::new(factory),
         routines: tokio::sync::Mutex::new(None),
         origin_runs: super::OriginRuns::default(),
+        image_objects: super::SessionImageObjects::memory(super::MEMORY_IMAGE_OBJECT_BYTES),
+        image_uploads: Arc::new(super::ImageUploads::default()),
+        image_reaper: std::sync::Once::new(),
+        image_read_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         sessions: sessions.clone(),
         config: crate::config::ConfigHandle::from_resources(state),
         agent_catalog: SessionCatalogSource::Static(crate::test_support::default_agent_catalog()),
@@ -1098,6 +1106,11 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
             .await
             .unwrap();
     }
+    let admission_id = SessionId::generate();
+    sessions
+        .create(SessionCreateRequest::new(admission_id.clone()))
+        .await
+        .unwrap();
     let owners = service.origin_runs.tasks.lock().await;
     let principal = request((), "alice")
         .extensions()
@@ -1106,7 +1119,7 @@ async fn apps_rpc_owns_handles_preserves_snapshot_no_inference_and_fails_closed(
         .clone();
     let admission = crate::session::SessionHost::submit_prompt_authorized(
         service.as_ref(),
-        id.clone(),
+        admission_id,
         "closed admission".into(),
         principal,
     );

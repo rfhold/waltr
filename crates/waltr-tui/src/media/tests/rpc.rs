@@ -629,9 +629,9 @@ async fn narrowed_stream_input(media: RoutineMedia, accepted_chunk_bytes: u32) {
     d.ports[0].media = media;
     d.ports[0].formats = vec![
         if media == RoutineMedia::Text {
-            "text"
+            "utf8"
         } else {
-            "pcm16le"
+            "pcm16le-24000-mono"
         }
         .into(),
     ];
@@ -723,14 +723,14 @@ async fn native_v2_raw_audio_save_and_exact_final_text_wait_for_clean_completion
         panic!()
     };
     d.ports[1].media = RoutineMedia::Audio;
-    d.ports[1].formats = vec!["pcm16le".into()];
+    d.ports[1].formats = vec!["pcm16le-24000-mono".into()];
     d.ports.push(RoutinePort {
         name: "transcript".into(),
         direction: RoutineDirection::Output,
         media: RoutineMedia::Text,
         required: true,
         max_bytes: RoutineRevision(65536),
-        formats: vec!["text".into()],
+        formats: vec!["utf8".into()],
     });
     plan.selected_text = Some("transcript".into());
     let (_cancel, canceled) = watch::channel(false);
@@ -832,9 +832,9 @@ async fn native_v2_text_and_explicit_pcm_files_close_streams_before_finish_input
         d.ports[0].media = media;
         d.ports[0].formats = vec![
             if media == RoutineMedia::Text {
-                "text"
+                "utf8"
             } else {
-                "pcm16le"
+                "pcm16le-24000-mono"
             }
             .into(),
         ];

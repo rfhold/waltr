@@ -69,21 +69,23 @@ fn text_result_sqlite_watchdog_transaction_and_credit_evidence() {
     let deadline = Instant::now() + Duration::from_secs(90);
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
+            break Some(status);
         }
-        assert!(
-            Instant::now() < deadline,
-            "private SQLite child watchdog expired; Drop kills and reaps"
-        );
+        if Instant::now() >= deadline {
+            break None;
+        }
         // Watchdog polling only; SQL/source ordering uses gates, never elapsed time.
         std::thread::sleep(Duration::from_millis(10));
     };
+    drop(child);
     let mut output = String::new();
     std::fs::File::open(fixture.0.join("child.log"))
         .unwrap()
         .take(32 * 1024)
         .read_to_string(&mut output)
         .unwrap();
+    let status =
+        status.unwrap_or_else(|| panic!("private SQLite child watchdog expired: {output}"));
     assert!(status.success(), "private child failed: {output}");
     assert!(
         output.contains("TEXT_RESULT_EVIDENCE_COMPLETE"),
@@ -514,7 +516,9 @@ async fn reader_credit(backend: &PersistencePool, store: &SqlTextResultStore) {
     let mut held = process_credit()
         .try_acquire_many_owned(TOTAL_CREDIT)
         .unwrap();
-    drop(held.split(MAX_CHUNK_BYTES).unwrap());
+    // Leave room for verified object loading and the separate returned chunk.
+    let working_credit = MAX_TEXT_BYTES + MAX_CHUNK_BYTES;
+    drop(held.split(working_credit + MAX_CHUNK_BYTES).unwrap());
     let chunk = store
         .read(
             scope(id),
@@ -528,8 +532,13 @@ async fn reader_credit(backend: &PersistencePool, store: &SqlTextResultStore) {
     assert_eq!(chunk.bytes().len(), MAX_CHUNK_BYTES);
     assert_eq!(
         process_credit().available_permits(),
-        0,
-        "read retains its entire 64KiB checkout"
+        working_credit,
+        "read returns its working credit but retains its entire 64KiB checkout"
+    );
+    held.merge(
+        process_credit()
+            .try_acquire_many_owned(working_credit as u32)
+            .unwrap(),
     );
     assert!(process_credit().try_acquire_owned().is_err());
     drop(chunk);

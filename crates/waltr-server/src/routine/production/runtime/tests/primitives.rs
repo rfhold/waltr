@@ -5,6 +5,11 @@ use waltr_agent::{AgentRuntime, MemorySessionStore, SessionCreateRequest, Sessio
 
 #[tokio::test]
 async fn generic_program_through_assembled_production_constructor_commits_and_starts_once() {
+    if !crate::test_support::isolated_process_test(
+        "routine::production::runtime::tests::primitives::generic_program_through_assembled_production_constructor_commits_and_starts_once",
+    ) {
+        return;
+    }
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let root = crate::test_support::temp_root();
         let resources = root.join("resources");
@@ -102,8 +107,11 @@ async fn generic_program_through_assembled_production_constructor_commits_and_st
         assert_eq!(detail.status,p::InvocationStatus::Succeeded as i32);
         let destination: String = serde_json::from_slice(&detail.result.unwrap().json).unwrap();
         let record = sessions.store().load(&SessionId::new(destination)).await.unwrap();
-        let prompts = record.journal.iter().filter_map(|event| match event { waltr_agent::SessionJournalEvent::PromptAppended { prompt } => Some(prompt.as_str()),_ => None }).collect::<Vec<_>>();
-        assert_eq!(prompts,vec![message]);
+        let prompts = record.timeline_events().filter_map(|event| match &event.content {
+            waltr_agent::TimelineContent::UserMessage { message } => Some(message.parts()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(prompts, vec![&[waltr_agent::UserMessagePart::Text { text: message.into() }][..]]);
         assert_eq!(sessions.store().load(&source_id).await.unwrap().metadata_value("editable.key"),Some(&serde_json::Value::Null));
         stop.cancel();
         server.await.unwrap().unwrap();

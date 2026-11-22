@@ -188,6 +188,9 @@ fn ack(mut frame: OutputFrame) {
 
 #[tokio::test]
 async fn repeated_capture_identity_order_and_completion_share_one_admission_gate() {
+    if isolated("repeated_capture_identity_order_and_completion_share_one_admission_gate") {
+        return;
+    }
     let mut fixture = Fixture::with_repeated_input(Duration::from_secs(5), true).await;
     let driver = Driver(fixture.pending.clone());
     ack(fixture.frame().await);
