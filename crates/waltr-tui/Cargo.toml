@@ -31,6 +31,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "
 tracing = { workspace = true, optional = true }
 url.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 insta.workspace = true
 tonic.workspace = true

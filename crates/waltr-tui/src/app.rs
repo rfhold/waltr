@@ -20,6 +20,7 @@ use crate::{
         ProviderSection, RoutinesSection, SectionAction, SessionDataAction, SessionDataState,
         SessionsSection, register_timeline_watch_command, targets_match,
     },
+    session_images::{self, Completion as ImageCompletion, Request as ImageRequest},
     ui,
     ui::Notice,
 };
@@ -122,6 +123,27 @@ pub struct App {
 }
 
 impl App {
+    pub(crate) fn image_owner(&mut self) -> Option<u64> {
+        if self.screen != AppScreen::Sessions
+            || !self
+                .client_snapshot
+                .as_ref()
+                .is_some_and(session_images::route_ready)
+        {
+            self.sessions_section.cancel_image_operation();
+            return None;
+        }
+        self.sessions_section.image_owner()
+    }
+
+    pub(crate) fn take_image_request(&mut self) -> Option<ImageRequest> {
+        self.sessions_section.take_image_request()
+    }
+
+    pub(crate) fn complete_image(&mut self, id: u64, completion: ImageCompletion) {
+        self.sessions_section.complete_image(id, completion);
+    }
+
     pub(crate) fn media_owner(&self) -> Option<u64> {
         if self.screen != AppScreen::Routines
             || !self
@@ -1168,6 +1190,7 @@ impl App {
             KeyCommand::LeaderCommand(LeaderCommand::Logout) => {
                 self.leader_armed = false;
                 if self.has_native_credential {
+                    self.sessions_section.cancel_image_operation();
                     AppAction::NativeAuth(NativeAuthAction::Logout)
                 } else {
                     AppAction::Continue
@@ -1638,6 +1661,12 @@ impl App {
     }
 
     fn handle_sessions_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        if self.sessions_section.image_editor_open() {
+            self.leader_armed = false;
+            self.sessions_section
+                .handle_image_editor_key(key, self.client_snapshot.as_ref());
+            return AppAction::Continue;
+        }
         if self.sessions_section.session_commands_open() {
             let action = self.sessions_section.handle_key(
                 key,

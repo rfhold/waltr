@@ -4,6 +4,7 @@ mod agent_selector;
 pub(crate) mod command_palette;
 mod composer;
 mod context;
+mod images;
 mod inference_editor;
 mod prompts;
 mod template_style;
@@ -13,7 +14,7 @@ use std::collections::BTreeSet;
 
 use ratatui::{
     Frame,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -28,6 +29,7 @@ use waltr_client::{
 
 use crate::{
     screens::{OperationResult, OperationTracker, SectionAction},
+    session_images::{self, Completion, Request},
     theme::{StatusRole, THEME},
     ui,
 };
@@ -91,6 +93,7 @@ pub struct SessionsSection {
     pending_inference_editor: bool,
     composer_draft: String,
     composer_cursor: usize,
+    images: images::Images,
     resource_autocomplete: ResourceAutocompleteState,
     timeline_scroll_from_bottom: usize,
     expanded_shell_tools: BTreeSet<String>,
@@ -140,8 +143,14 @@ struct RollbackModal {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RollbackModalTarget {
-    UserMessage { cursor: u64, text: String },
-    Turn { turn: u64 },
+    UserMessage {
+        cursor: u64,
+        text: String,
+        editable: bool,
+    },
+    Turn {
+        turn: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,11 +163,17 @@ enum RollbackModalAction {
 }
 
 impl RollbackModal {
-    fn new(target: TimelineClickTarget) -> Self {
+    fn new(target: TimelineClickTarget, draft_has_images: bool) -> Self {
         let target = match target {
-            TimelineClickTarget::UserMessage { cursor, text } => {
-                RollbackModalTarget::UserMessage { cursor, text }
-            }
+            TimelineClickTarget::UserMessage {
+                cursor,
+                text,
+                editable,
+            } => RollbackModalTarget::UserMessage {
+                cursor,
+                text,
+                editable: editable && !draft_has_images,
+            },
             TimelineClickTarget::Turn { turn } => RollbackModalTarget::Turn { turn },
         };
         Self {
@@ -170,11 +185,16 @@ impl RollbackModal {
 
 fn rollback_modal_actions(target: &RollbackModalTarget) -> Vec<RollbackModalAction> {
     match target {
-        RollbackModalTarget::UserMessage { .. } => vec![
+        RollbackModalTarget::UserMessage { editable: true, .. } => vec![
             RollbackModalAction::Rerun,
             RollbackModalAction::Edit,
             RollbackModalAction::Cancel,
         ],
+        RollbackModalTarget::UserMessage {
+            editable: false, ..
+        } => {
+            vec![RollbackModalAction::Rerun, RollbackModalAction::Cancel]
+        }
         RollbackModalTarget::Turn { .. } => vec![
             RollbackModalAction::RollBack,
             RollbackModalAction::Continue,
@@ -207,6 +227,7 @@ impl SessionsSection {
             pending_inference_editor: false,
             composer_draft: String::new(),
             composer_cursor: 0,
+            images: images::Images::new(),
             resource_autocomplete: ResourceAutocompleteState {
                 request_id: None,
                 session_id: None,
@@ -252,6 +273,40 @@ impl SessionsSection {
     #[must_use]
     pub const fn in_detail(&self) -> bool {
         self.detail_session_id.is_some()
+    }
+
+    pub(crate) fn image_owner(&self) -> Option<u64> {
+        self.detail_session_id.as_ref().and(self.images.owner())
+    }
+
+    pub(crate) fn cancel_image_operation(&mut self) {
+        self.images.cancel();
+    }
+
+    pub(crate) fn take_image_request(&mut self) -> Option<Request> {
+        self.images.queued.take()
+    }
+
+    pub(crate) fn complete_image(&mut self, id: u64, completion: Completion) {
+        if self.images.receive(id, completion) {
+            self.composer_draft.clear();
+            self.composer_cursor = 0;
+        }
+    }
+
+    pub(crate) const fn image_editor_open(&self) -> bool {
+        self.images.editor.is_some()
+    }
+
+    pub(crate) fn handle_image_editor_key(
+        &mut self,
+        key: KeyEvent,
+        snapshot: Option<&ClientSnapshot>,
+    ) {
+        if key.kind != KeyEventKind::Release {
+            self.images
+                .editor_key(key, snapshot.is_some_and(session_images::route_ready));
+        }
     }
 
     /// Whether the active session command palette owns terminal input.
@@ -578,6 +633,11 @@ impl SessionsSection {
             return true;
         }
 
+        if self.images.editor.take().is_some() {
+            self.images.cancel();
+            return true;
+        }
+
         if self.has_pending_operation() {
             return true;
         }
@@ -716,6 +776,15 @@ impl SessionsSection {
                     action
                 }
             };
+        }
+
+        if self.image_editor_open() {
+            self.handle_image_editor_key(key, snapshot);
+            return SectionAction::Continue;
+        }
+        if key.kind == KeyEventKind::Press && self.images.pending() && key.code == KeyCode::F(4) {
+            self.images.cancel();
+            return SectionAction::Continue;
         }
 
         if self.has_pending_operation() {
@@ -872,6 +941,12 @@ impl SessionsSection {
         snapshot: Option<&ClientSnapshot>,
     ) -> SectionAction {
         match key.code {
+            KeyCode::F(5) if key.kind == KeyEventKind::Press => {
+                self.clear_resource_autocomplete();
+                self.images.error = None;
+                self.images.editor = Some(images::Editor::default());
+                SectionAction::Continue
+            }
             KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_inference_reasoning(snapshot)
             }
@@ -965,12 +1040,31 @@ impl SessionsSection {
                         | SessionPromptDispositionView::SupersedeSuspension
                 )
             });
-        if text.is_empty() || !timeline_ready(snapshot, &session_id) || !can_submit {
+        let has_images = !self.images.attachments.is_empty();
+        if text.is_empty() && !has_images {
+            return SectionAction::Continue;
+        }
+        if !timeline_ready(snapshot, &session_id) || !can_submit {
+            if has_images {
+                self.images.error = Some("This session cannot accept a message right now".into());
+            }
             return SectionAction::Continue;
         }
 
-        self.submit.begin();
-        SectionAction::ClientCommand(ClientCommand::SubmitUserMessage { session_id, text })
+        if !has_images {
+            self.images.error = None;
+            self.submit.begin();
+            SectionAction::ClientCommand(ClientCommand::SubmitUserMessage { session_id, text })
+        } else {
+            self.submit.clear_error();
+            if snapshot.is_some_and(session_images::route_ready) {
+                self.images.send(session_id, text);
+                self.clear_resource_autocomplete();
+            } else {
+                self.images.error = Some("The selected session route is not ready".into());
+            }
+            SectionAction::Continue
+        }
     }
 
     #[allow(
@@ -1262,7 +1356,14 @@ impl SessionsSection {
                     cursor: *cursor,
                 })
             }
-            (RollbackModalTarget::UserMessage { cursor, text }, RollbackModalAction::Edit) => {
+            (
+                RollbackModalTarget::UserMessage {
+                    cursor,
+                    text,
+                    editable: true,
+                },
+                RollbackModalAction::Edit,
+            ) => {
                 self.rollback.begin();
                 self.composer_draft = retemplatize_user_message(text);
                 self.composer_cursor = self.composer_draft.len();
@@ -1383,6 +1484,10 @@ impl SessionsSection {
         column: u16,
         row: u16,
     ) -> SectionAction {
+        if self.image_editor_open() || self.images.pending() {
+            return SectionAction::Continue;
+        }
+
         let Some(timeline_area) = self.detail_timeline_area(snapshot, area) else {
             return SectionAction::Continue;
         };
@@ -1424,7 +1529,10 @@ impl SessionsSection {
             timeline_row,
             &self.expanded_shell_tools,
         ) {
-            self.rollback_modal = Some(RollbackModal::new(target));
+            self.rollback_modal = Some(RollbackModal::new(
+                target,
+                !self.images.attachments.is_empty(),
+            ));
         }
 
         SectionAction::Continue
@@ -1464,6 +1572,7 @@ impl SessionsSection {
             || self.inference_settings_update.is_pending()
             || self.agent_update.is_pending()
             || self.submit.is_pending()
+            || self.images.pending()
             || self.interrupt.is_pending()
             || self.rollback.is_pending()
             || self.continue_session.is_pending()
@@ -1476,6 +1585,7 @@ impl SessionsSection {
         self.delete_session_id = None;
         self.composer_draft.clear();
         self.composer_cursor = 0;
+        self.images = images::Images::new();
         self.clear_resource_autocomplete();
         self.timeline_scroll_from_bottom = 0;
         self.expanded_shell_tools.clear();
@@ -1740,6 +1850,7 @@ impl SessionsSection {
         if let Some(palette) = &self.command_palette {
             palette.render(frame, area, snapshot);
         }
+        self.images.render_editor(frame, area);
     }
 
     fn detail_composer_height(&self) -> u16 {
@@ -2371,6 +2482,7 @@ fn status_messages(snapshot: Option<&ClientSnapshot>, section: &SessionsSection)
         .or_else(|| section.inference_settings_update.error())
         .or_else(|| section.agent_update.error())
         .or_else(|| section.submit.error())
+        .or(section.images.error.as_deref())
         .or_else(|| section.interrupt.error())
         .or_else(|| section.rollback.error())
         .or_else(|| section.continue_session.error())
@@ -2805,8 +2917,41 @@ mod tests {
     use waltr_client::{ClientSessionTemplateKind, ClientSessionTemplateSearchTarget};
 
     use super::{
-        prompt_token_at_cursor, retemplatize_user_message, template_autocomplete_token_at_cursor,
+        Completion, SessionsSection, prompt_token_at_cursor, retemplatize_user_message,
+        template_autocomplete_token_at_cursor,
     };
+
+    #[test]
+    fn image_send_failure_keeps_the_draft_and_leaving_ignores_stale_completion() {
+        let mut section = SessionsSection::new();
+        section.detail_session_id = Some("chat".into());
+        section.composer_draft = "compare".into();
+        section
+            .images
+            .attachments
+            .push(crate::session_images::Image::test_png());
+        section.images.send("chat".into(), "compare".into());
+        let first = section.take_image_request().unwrap();
+        assert_eq!(section.image_owner(), Some(first.id));
+        section.cancel_image_operation();
+        assert_eq!(section.image_owner(), None);
+        section.complete_image(
+            first.id,
+            Completion::Sent(Err("Message send canceled".into()), None),
+        );
+        assert_eq!(section.composer_draft, "compare");
+        assert_eq!(section.images.attachments.len(), 1);
+        assert!(section.images.error.is_some());
+
+        section.images.send("chat".into(), "compare".into());
+        let second = section.take_image_request().unwrap();
+        section.clear_detail_route();
+        section.detail_session_id = Some("other-chat".into());
+        section.composer_draft = "another message".into();
+        section.complete_image(second.id, Completion::Sent(Ok(()), None));
+        assert_eq!(section.composer_draft, "another message");
+        assert!(section.images.attachments.is_empty());
+    }
 
     #[test]
     fn prompt_autocomplete_detects_first_line_slash_tokens() {

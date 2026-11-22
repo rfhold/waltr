@@ -2,20 +2,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use waltr_client::{
-    ClientCommand, ProjectedTimelineEntryView, SessionTimelineView,
-    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
-    TimelineStatusView,
-};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
 use serde_json::Value;
+use waltr_client::{
+    ClientCommand, ProjectedTimelineEntryView, SessionTimelineView, TimelineContentView,
+    TimelineEventKindView, TimelineEventView, TimelinePresentationView, TimelineStatusView,
+    UserMessagePartView,
+};
 
 use crate::{
     markdown::{self, MarkdownRenderOptions, MarkdownTone},
+    session_images::image_label,
     theme::{StatusRole, THEME},
     ui,
 };
@@ -32,6 +33,10 @@ use super::{
     reason = "timeline variants retain render-ready event data"
 )]
 enum TimelineItemModel {
+    UserMessage {
+        cursor: u64,
+        parts: Vec<UserMessagePartView>,
+    },
     Text {
         item_id: String,
         cursor: u64,
@@ -70,8 +75,14 @@ enum TimelineItemModel {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TimelineClickTarget {
-    UserMessage { cursor: u64, text: String },
-    Turn { turn: u64 },
+    UserMessage {
+        cursor: u64,
+        text: String,
+        editable: bool,
+    },
+    Turn {
+        turn: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,13 +217,25 @@ pub(super) fn timeline_click_target_at_row(
     expanded_shell_tools: &BTreeSet<String>,
 ) -> Option<TimelineClickTarget> {
     timeline_item_at_row(timeline, width, row, expanded_shell_tools).and_then(|item| match item {
+        TimelineItemModel::UserMessage { cursor, parts } => {
+            let editable = matches!(parts.as_slice(), [UserMessagePartView::Text { .. }]);
+            Some(TimelineClickTarget::UserMessage {
+                cursor,
+                text: user_message_summary(&parts),
+                editable,
+            })
+        }
         TimelineItemModel::Text {
             cursor,
             text,
             label: "user",
             durable_actions: true,
             ..
-        } => Some(TimelineClickTarget::UserMessage { cursor, text }),
+        } => Some(TimelineClickTarget::UserMessage {
+            cursor,
+            text,
+            editable: true,
+        }),
         TimelineItemModel::Text {
             durable_actions: false,
             ..
@@ -324,6 +347,13 @@ fn timeline_items(events: &[ProjectedTimelineEntryView]) -> Vec<TimelineItemMode
             }
             continue;
         };
+        if let TimelineContentView::UserMessage { parts } = &event.content {
+            items.push(TimelineItemModel::UserMessage {
+                cursor: event.cursor,
+                parts: parts.clone(),
+            });
+            continue;
+        }
         match event.channel.as_deref() {
             Some("user_text" | "assistant_text" | "thinking") => {
                 upsert_text_item(&mut items, event);
@@ -646,6 +676,21 @@ fn append_timeline_item_lines(
     expanded_shell_tools: &BTreeSet<String>,
 ) {
     match item {
+        TimelineItemModel::UserMessage { parts, .. } => {
+            let mut rendered = Vec::new();
+            for part in parts {
+                match part {
+                    UserMessagePartView::Text { text } => {
+                        rendered.extend(markdown_text_lines(&text, MarkdownTone::User));
+                    }
+                    part => rendered.push(Line::styled(
+                        user_part_label(&part),
+                        THEME.panel_muted_style(),
+                    )),
+                }
+            }
+            append_user_message_lines(lines, rendered, width, false);
+        }
         TimelineItemModel::Text {
             label,
             text,
@@ -725,9 +770,17 @@ fn append_markdown_text_lines(
     width: Option<u16>,
     mask_replacement: bool,
 ) {
+    let rendered = markdown_text_lines(text, tone);
+    if tone == MarkdownTone::User {
+        append_user_message_lines(lines, rendered, width, mask_replacement);
+    } else {
+        lines.extend(rendered);
+    }
+}
+
+fn markdown_text_lines(text: &str, tone: MarkdownTone) -> Vec<Line<'static>> {
     if has_template_markers(text) {
-        append_template_text_lines(lines, text, tone, width, mask_replacement);
-        return;
+        return template_text_lines(text, tone);
     }
 
     let options = match tone {
@@ -753,28 +806,7 @@ fn append_markdown_text_lines(
             base_style: THEME.muted_text_style(),
         },
     };
-    let rendered = markdown::render_markdown(text, options);
-    if tone == MarkdownTone::User {
-        append_user_message_lines(lines, rendered, width, mask_replacement);
-    } else {
-        lines.extend(rendered);
-    }
-}
-
-fn append_template_text_lines(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    tone: MarkdownTone,
-    width: Option<u16>,
-    mask_replacement: bool,
-) {
-    let rendered = template_text_lines(text, tone);
-
-    if tone == MarkdownTone::User {
-        append_user_message_lines(lines, rendered, width, mask_replacement);
-    } else {
-        lines.extend(rendered);
-    }
+    markdown::render_markdown(text, options)
 }
 
 fn template_text_lines(text: &str, tone: MarkdownTone) -> Vec<Line<'static>> {
@@ -1570,6 +1602,7 @@ fn event_text_content(content: &TimelineContentView) -> String {
         TimelineContentView::Empty => String::new(),
         TimelineContentView::TextDelta { delta } => delta.clone(),
         TimelineContentView::TextSnapshot { text } => text.clone(),
+        TimelineContentView::UserMessage { parts } => user_message_summary(parts),
         TimelineContentView::ToolCall {
             id,
             name,
@@ -1589,6 +1622,24 @@ fn event_text_content(content: &TimelineContentView) -> String {
         }
         TimelineContentView::Json { value_json } => value_json.clone(),
         TimelineContentView::Unknown => "unknown content".to_owned(),
+    }
+}
+
+fn user_message_summary(parts: &[UserMessagePartView]) -> String {
+    parts
+        .iter()
+        .map(user_part_label)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn user_part_label(part: &UserMessagePartView) -> String {
+    match part {
+        UserMessagePartView::Text { text } => text.clone(),
+        UserMessagePartView::Image { format, size_bytes } => {
+            format!("[Image: {}]", image_label(*format, *size_bytes as usize))
+        }
+        UserMessagePartView::Unknown => "[Unsupported message part]".into(),
     }
 }
 
@@ -1655,12 +1706,77 @@ fn top_level_input_entries(input: &Value) -> Vec<ToolInputEntry> {
 #[cfg(test)]
 mod projected_tests {
     use waltr_client::{
-        OperationSnapshot, ProjectedTimelineEntryView, SessionTimelineView,
+        MessageImageFormatView, OperationSnapshot, ProjectedTimelineEntryView, SessionTimelineView,
         SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
         TimelinePresentationView, TimelineStatusView,
     };
 
     use super::*;
+
+    #[test]
+    fn user_message_renders_image_metadata_in_order_and_disallows_text_edit() {
+        let timeline = SessionTimelineView {
+            events: vec![ProjectedTimelineEntryView::Durable {
+                identity: "user-prompt".into(),
+                presentation: TimelinePresentationView::Durable,
+                event: TimelineEventView {
+                    cursor: 7,
+                    session_id: "chat".into(),
+                    turn: 2,
+                    item_id: "prompt".into(),
+                    parent_id: None,
+                    kind: TimelineEventKindView::ItemFinished,
+                    channel: Some("user_text".into()),
+                    content: TimelineContentView::UserMessage {
+                        parts: vec![
+                            UserMessagePartView::Image {
+                                format: MessageImageFormatView::Webp,
+                                size_bytes: 18,
+                            },
+                            UserMessagePartView::Text {
+                                text: "compare".into(),
+                            },
+                            UserMessagePartView::Image {
+                                format: MessageImageFormatView::Png,
+                                size_bytes: 21,
+                            },
+                        ],
+                    },
+                    status: Some(TimelineStatusView::Finished),
+                    metadata_json: "{}".into(),
+                },
+            }],
+            projection_revision: Some(7),
+            raw_page_boundary: None,
+            has_more: false,
+            load: operation(),
+            watch: operation(),
+        };
+        let lines = timeline_lines(Some(&timeline), Some(60), &BTreeSet::new());
+        for (index, text) in [
+            "[Image: WebP, 18 bytes]",
+            "compare",
+            "[Image: PNG, 21 bytes]",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                lines[index + 1]
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains(text))
+            );
+        }
+        assert!(matches!(
+            timeline_click_target_at_row(&timeline, 60, 1, &BTreeSet::new()),
+            Some(TimelineClickTarget::UserMessage {
+                cursor: 7,
+                editable: false,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn mask_replacement_uses_user_markdown_turquoise_marker_and_no_action_identity() {

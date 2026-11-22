@@ -145,7 +145,11 @@ pub(super) fn render_composer(
     let (input_widget, cursor_position) = composer_input_widget(section, input_area);
     frame.render_widget(input_widget, input_area);
     frame.render_widget(
-        Paragraph::new(Line::default()).style(panel_style()),
+        Paragraph::new(Line::styled(
+            section.images.render_hint(),
+            THEME.muted_text_style(),
+        ))
+        .style(panel_style()),
         spacer_area,
     );
     render_composer_metadata(frame, metadata_area, session);

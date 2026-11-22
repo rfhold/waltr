@@ -14,6 +14,7 @@ use crate::{
     event::{AppEvent, NativeLoginEvent},
     input::{self, InputEvent},
     native_auth::{self, NativeAuthAction},
+    session_images,
 };
 
 const EVENT_BUFFER: usize = 256;
@@ -32,6 +33,7 @@ type RuntimeChannels = (
 pub(crate) struct RuntimeClientCommand {
     command: ClientCommand,
     logout_barrier: bool,
+    credential_revision: Option<u64>,
 }
 
 impl RuntimeClientCommand {
@@ -39,6 +41,7 @@ impl RuntimeClientCommand {
         Self {
             command,
             logout_barrier: false,
+            credential_revision: None,
         }
     }
 
@@ -46,7 +49,23 @@ impl RuntimeClientCommand {
         Self {
             command: ClientCommand::LogoutWaltr,
             logout_barrier: true,
+            credential_revision: None,
         }
+    }
+
+    fn image_access_expiry(completion: &session_images::Completion) -> Option<Self> {
+        completion.access_expiry_revision().map(|revision| Self {
+            command: ClientCommand::WaltrAccessExpired {
+                error: "Waltr login required".into(),
+            },
+            logout_barrier: false,
+            credential_revision: Some(revision),
+        })
+    }
+
+    fn is_current(&self, credentials: &NativeCredentialProvider) -> bool {
+        self.credential_revision
+            .is_none_or(|revision| revision == credentials.credential_revision())
     }
 }
 
@@ -86,8 +105,10 @@ pub async fn run_with_options(
             commands,
             native_auth,
             &mut runtime.media,
+            &mut runtime.images,
         ))
         .await;
+        runtime.images.shutdown().await;
         runtime.media.shutdown().await;
         runtime.abort();
         result
@@ -106,14 +127,44 @@ async fn run_with_events(
     commands: mpsc::Sender<RuntimeClientCommand>,
     native_auth: mpsc::Sender<NativeAuthAction>,
     media: &mut crate::media::Broker,
+    images: &mut session_images::Runtime,
 ) -> io::Result<()> {
     let _ = terminal.draw(|frame| app.draw(frame))?;
 
-    while let Some(event) = events.recv().await {
+    loop {
+        let event = tokio::select! {
+            (id, completion) = images.wait() => {
+                let expiry = if app.image_owner() == Some(id) {
+                    RuntimeClientCommand::image_access_expiry(&completion)
+                } else {
+                    None
+                };
+                app.complete_image(id, completion);
+                if let Some(command) = expiry
+                    && commands.send(command).await.is_err()
+                {
+                    return Ok(());
+                }
+                let _ = terminal.draw(|frame| app.draw(frame))?;
+                continue;
+            }
+            event = events.recv() => event,
+        };
+        let Some(event) = event else {
+            return Ok(());
+        };
         let event = event?;
         let now = event.timestamp(std::time::Instant::now());
+        let action = app.handle_event(&event, now);
+        images.sync_owner(app.image_owner());
+        if let Some(request) = app.take_image_request() {
+            let id = request.id;
+            if let Err(completion) = images.start(request) {
+                app.complete_image(id, completion);
+            }
+        }
 
-        match app.handle_event(&event, now) {
+        match action {
             AppAction::Media(request) => media.start(request).await,
             AppAction::Exit => return Ok(()),
             AppAction::Continue => {}
@@ -157,13 +208,12 @@ async fn run_with_events(
 
         let _ = terminal.draw(|frame| app.draw(frame))?;
     }
-
-    Ok(())
 }
 
 struct RuntimeEvents {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     media: crate::media::Broker,
+    images: session_images::Runtime,
 }
 
 impl RuntimeEvents {
@@ -173,14 +223,21 @@ impl RuntimeEvents {
         let (native_actions, native_action_receiver) = mpsc::channel(8);
         let endpoint = client_endpoint_or_default(client_endpoint);
         let credentials = NativeCredentialProvider::new();
-        let mut transport = NativeGrpcTransport::with_credential_provider(endpoint.clone(), credentials.clone());
+        let mut transport =
+            NativeGrpcTransport::with_credential_provider(endpoint.clone(), credentials.clone());
         match std::env::var("WALTR_DESTINATION") {
-            Ok(destination) => transport = transport.for_destination(&destination)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid WALTR_DESTINATION"))?,
+            Ok(destination) => {
+                transport = transport.for_destination(&destination).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Invalid WALTR_DESTINATION")
+                })?
+            }
             Err(std::env::VarError::NotPresent) => {}
             Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
         }
-        let media = crate::media::Broker::new(transport.clone(), credentials.clone(), events.clone());
+        let media =
+            crate::media::Broker::new(transport.clone(), credentials.clone(), events.clone());
+        let client = ClientRuntime::with_transport(transport);
+        let images = session_images::Runtime::new(client.message_images(), credentials.clone());
         let tasks = vec![
             spawn_tick_events(events.clone()),
             spawn_input_events(events.clone()),
@@ -188,8 +245,9 @@ impl RuntimeEvents {
             spawn_client_events(
                 events.clone(),
                 command_receiver,
-                transport,
+                client,
                 native_actions.clone(),
+                credentials.clone(),
             ),
             native_auth::spawn(
                 events,
@@ -200,7 +258,16 @@ impl RuntimeEvents {
             ),
         ];
 
-        Ok((receiver, commands, native_actions, Self { tasks, media }))
+        Ok((
+            receiver,
+            commands,
+            native_actions,
+            Self {
+                tasks,
+                media,
+                images,
+            },
+        ))
     }
 
     fn abort(self) {
@@ -274,11 +341,12 @@ fn spawn_ctrl_c_events(events: mpsc::Sender<io::Result<AppEvent>>) -> tokio::tas
 fn spawn_client_events(
     events: mpsc::Sender<io::Result<AppEvent>>,
     mut commands: mpsc::Receiver<RuntimeClientCommand>,
-    transport: NativeGrpcTransport,
+    client: ClientRuntime,
     native_auth: mpsc::Sender<NativeAuthAction>,
+    credentials: NativeCredentialProvider,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let mut client = ClientRuntime::with_transport(transport).into_state_stream(sleep_millis);
+        let mut client = client.into_state_stream(sleep_millis);
         let mut previous_attempt_id = None;
 
         loop {
@@ -286,10 +354,13 @@ fn spawn_client_events(
             let command_barrier = logout_barrier.clone();
             match client
                 .next_or_dispatch(async {
-                    commands.recv().await.map(|queued| {
-                        command_barrier.set(queued.logout_barrier);
-                        ClientCommandRequest::new(queued.command)
-                    })
+                    while let Some(queued) = commands.recv().await {
+                        if queued.is_current(&credentials) {
+                            command_barrier.set(queued.logout_barrier);
+                            return Some(ClientCommandRequest::new(queued.command));
+                        }
+                    }
+                    None
                 })
                 .await
             {
@@ -349,6 +420,46 @@ fn client_endpoint_or_default(client_endpoint: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_expiry_requires_a_typed_error_and_current_credential_revision() {
+        use session_images::Completion;
+        use waltr_client::ClientError;
+
+        let credentials = NativeCredentialProvider::new();
+        let lease = credentials.replace_bearer_token("original").unwrap();
+        let rejected_revision = credentials.credential_revision();
+        assert!(credentials.clear_bearer_token_if_current(lease, rejected_revision));
+        let cleared_revision = credentials.credential_revision();
+        assert_ne!(cleared_revision, rejected_revision);
+        assert!(
+            RuntimeClientCommand::image_access_expiry(&Completion::Sent(
+                Err(ClientError::new("Waltr login required")),
+                Some(cleared_revision),
+            ))
+            .is_none()
+        );
+        assert!(
+            RuntimeClientCommand::image_access_expiry(&Completion::Sent(
+                Err(ClientError::waltr_login_required("expired")),
+                None,
+            ))
+            .is_none()
+        );
+        let command = RuntimeClientCommand::image_access_expiry(&Completion::Sent(
+            Err(ClientError::waltr_login_required("expired")),
+            Some(cleared_revision),
+        ))
+        .unwrap();
+        assert!(matches!(
+            command.command,
+            ClientCommand::WaltrAccessExpired { .. }
+        ));
+        assert!(command.is_current(&credentials));
+
+        credentials.replace_bearer_token("replacement").unwrap();
+        assert!(!command.is_current(&credentials));
+    }
 
     #[tokio::test]
     async fn logout_barrier_is_published_before_its_reducer_snapshot() {

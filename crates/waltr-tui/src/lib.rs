@@ -11,5 +11,6 @@ pub mod media;
 pub mod native_auth;
 pub mod runtime;
 pub mod screens;
+mod session_images;
 pub mod theme;
 pub mod ui;
