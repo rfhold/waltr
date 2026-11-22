@@ -155,6 +155,24 @@ test("keeps a loaded history image mounted across fresh timeline snapshots", asy
   expect(revoke).not.toHaveBeenCalledWith(src);
 });
 
+test("preserves loaded images and draft attachments when the same session record is republished", async () => {
+  const { bridge, snapshot, publish, revoke } = setup([history()]);
+  const image = await screen.findByRole("img", { name: "Message attachment" });
+  const src = image.getAttribute("src");
+  pick(file());
+  const draft = await screen.findByRole("img", { name: "Attachment 1" });
+
+  for (let index = 0; index < 3; index++) {
+    publish(structuredClone(snapshot));
+    await Promise.resolve();
+    expect(screen.getByRole("img", { name: "Message attachment" })).toBe(image);
+    expect(screen.getByRole("img", { name: "Attachment 1" })).toBe(draft);
+  }
+  expect(bridge.read).toHaveBeenCalledOnce();
+  expect(bridge.cancelAll).not.toHaveBeenCalled();
+  expect(revoke).not.toHaveBeenCalledWith(src);
+});
+
 test("refuses pixel bombs and APNG before creating draft or history object URLs", async () => {
   const animated = pngFixture(1, 1, true);
   const { bridge, create } = setup([history(animated.byteLength)]);

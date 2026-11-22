@@ -1,5 +1,5 @@
 import { A, useLocation, useNavigate, useParams } from "@solidjs/router";
-import { Virtualizer, type CustomContainerComponentProps, type CustomItemComponentProps, type VirtualizerHandle } from "virtua/solid";
+import { Virtualizer, type CustomContainerComponentProps, type CustomItemComponentProps } from "virtua/solid";
 import {
   For,
   Match,
@@ -475,11 +475,14 @@ function SessionDetail(props: { session: SessionView }) {
   const app = useAppState();
   const location = useLocation();
   const sessions = useSessionsRoute();
+  // Snapshots replace the session object even when its identity is unchanged.
+  const sessionIdentity = createMemo(() => props.session.id);
+  const destinationScope = createMemo(() => app.dictationPreferenceScope?.());
   const phone = useMediaQuery("(max-width: 700px)");
   const [editingInferenceSettings, setEditingInferenceSettings] = createSignal(false);
   const [editingAgent, setEditingAgent] = createSignal(false);
   const [openedApp, setOpenedApp] = createSignal<{ sessionId: string; callId: string }>();
-  const bindDraft = () => app.sessionDrafts?.bind(location.pathname, props.session.id);
+  const bindDraft = () => app.sessionDrafts?.bind(location.pathname, sessionIdentity());
   let draftOwner = untrack(bindDraft);
   const [draft, writeDraft] = createSignal(draftOwner?.text ?? "");
   const [draftRevision, setDraftRevision] = createSignal(0);
@@ -492,7 +495,7 @@ function SessionDetail(props: { session: SessionView }) {
     draftOwner?.write(value);
   };
   onCleanup(() => draftOwner?.dispose());
-  createEffect(on([() => location.pathname, () => props.session.id], () => {
+  createEffect(on([() => location.pathname, sessionIdentity], () => {
     draftOwner?.dispose();
     draftOwner = bindDraft();
     setDraft(draftOwner?.text ?? "");
@@ -500,13 +503,12 @@ function SessionDetail(props: { session: SessionView }) {
   const attachments = imageDraft(() => setDraftRevision(revision => revision + 1));
   const imageBridge = createMemo(() => app.messageImages?.());
   const imageAccess = createMemo(() => app.systemReady() && app.snapshot()?.access.status === "authenticated");
-  const imageDestination = createMemo(() => app.dictationPreferenceScope?.());
   const [imageScope, setImageScope] = createSignal<ImageReadScope>();
   type ImageUpload = { scope: ImageReadScope; bridge: MessageImagesBridge; cancelled: boolean; cancelAck?: Promise<boolean> };
   const [imageUpload, setImageUpload] = createSignal<ImageUpload>();
   let filePicker: HTMLInputElement | undefined;
 
-  createEffect(on([() => props.session.id, imageDestination, imageBridge, imageAccess], ([session, , bridge, ready]) => {
+  createEffect(on([sessionIdentity, destinationScope, imageBridge, imageAccess], ([session, , bridge, ready]) => {
     if (!ready || !bridge || bridge.retired.aborted) return;
     const controller = new AbortController();
     const scope = imageReadScope(bridge, session, controller.signal);
@@ -525,7 +527,7 @@ function SessionDetail(props: { session: SessionView }) {
       release();
     });
   }));
-  createEffect(on(() => [props.session.id, app.dictationPreferenceScope?.()] as const, () => {
+  createEffect(on([sessionIdentity, destinationScope], () => {
     activeDictationDraft?.rollback();
     activeDictationDraft = undefined;
     setDraftRevision(value => value + 1);
@@ -540,7 +542,6 @@ function SessionDetail(props: { session: SessionView }) {
   const [expandedShellOutputs, setExpandedShellOutputs] = createSignal<Record<string, boolean>>({});
   const [historyShift, setHistoryShift] = createSignal(false);
   let timelineScroll: HTMLDivElement | undefined;
-  let timelineVirtualizer: VirtualizerHandle | undefined;
   let messageTextarea: HTMLTextAreaElement | undefined;
   let highlightLayer: HTMLDivElement | undefined;
   let registeredTimelineSession: string | undefined;
@@ -555,11 +556,11 @@ function SessionDetail(props: { session: SessionView }) {
   let viewportUpdateShouldStickToTail = false;
   let clearHistoryShiftFrame: number | undefined;
 
-  const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
+  const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[sessionIdentity()]);
   const interruptible = createMemo(() => props.session.capabilities.canInterrupt);
   const items = createMemo<TimelineItemModel[]>((previous) => {
     const next = timelineItems(timeline());
-    // The virtualizer keys by object identity. Retain unchanged image rows and their read owners.
+    // Preserve unchanged image parts so the nested list retains its read owners.
     const imageRows = new Map<string, TextTimelineItem>();
     for (const row of previous) {
       if (row.kind === "user" && row.parts?.some(part => part.kind === "image")) {
@@ -575,6 +576,10 @@ function SessionDetail(props: { session: SessionView }) {
       return row.parts.every((part, index) => sameMessagePart(part, priorParts[index])) ? prior : row;
     });
   }, []);
+  const itemsByKey = createMemo(() => new Map(items().map(item => [timelineItemKey(item), item])));
+  const itemKeys = createMemo(() => items().map(timelineItemKey), [], {
+    equals: (previous, next) => previous.length === next.length && previous.every((key, index) => key === next[index]),
+  });
   const lastTurn = createMemo(() => items().reduce<bigint | undefined>((last, item) => last === undefined || item.turn > last ? item.turn : last, undefined));
   const turnFooterItemIds = createMemo(() => {
     const lastByTurn = new Map<string, string>();
@@ -635,7 +640,7 @@ function SessionDetail(props: { session: SessionView }) {
   }));
 
   createEffect(() => {
-    const sessionId = props.session.id;
+    const sessionId = sessionIdentity();
 
     if (!app.clientLoaded() || !app.systemReady() || registeredTimelineSession === sessionId) {
       return;
@@ -673,7 +678,7 @@ function SessionDetail(props: { session: SessionView }) {
   });
 
   createEffect(() => {
-    const sessionId = props.session.id;
+    const sessionId = sessionIdentity();
 
     if (!app.clientLoaded() || !app.systemReady() || registeredRoutineInvocationSession === sessionId) {
       return;
@@ -729,7 +734,7 @@ function SessionDetail(props: { session: SessionView }) {
     const currentTimeline = timeline();
     const currentItems = items();
     const scroller = timelineScroll;
-    const sessionId = props.session.id;
+    const sessionId = sessionIdentity();
     reconcilePendingHistory(currentTimeline);
     const shouldInitialScroll = currentItems.length > 0 && initialScrollSession !== sessionId;
 
@@ -1139,9 +1144,9 @@ function SessionDetail(props: { session: SessionView }) {
   };
 
   const scrollTimelineToBottom = (scroller: HTMLElement) => {
-    const scrollSize = import.meta.env.MODE === "test" ? scroller.scrollHeight : timelineVirtualizer?.scrollSize ?? scroller.scrollHeight;
-    timelineVirtualizer?.scrollTo(scrollSize);
-    scroller.scrollTop = scrollSize;
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 1) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
   };
 
   return (
@@ -1177,37 +1182,29 @@ function SessionDetail(props: { session: SessionView }) {
           <Virtualizer
             as={TimelineVirtualizerList}
             item={TimelineVirtualizerItem}
-            data={items()}
+            data={itemKeys()}
             shift={historyShift()}
             keepMounted={testKeepMountedIndexes()}
             scrollRef={timelineScroll}
-            ref={(handle) => {
-              timelineVirtualizer = handle;
-            }}
-            onScroll={(offset) => {
-              if (timelineScroll) {
-                timelineScroll.scrollTop = offset;
-                scheduleTimelineViewportUpdate(timelineScroll);
-              }
-            }}
           >
-            {(item) => (
-              <div class={`sessions__timeline-item sessions__timeline-item--${item.kind}${isMaskReplacement(item) ? " sessions__timeline-item--mask-replacement" : ""}`} data-timeline-item-key={timelineItemKey(item)}>
+            {(key) => {
+              const item = createMemo<TimelineItemModel>(previous => itemsByKey().get(key) ?? previous, itemsByKey().get(key)!);
+              return <div class={`sessions__timeline-item sessions__timeline-item--${item().kind}${isMaskReplacement(item()) ? " sessions__timeline-item--mask-replacement" : ""}`} data-timeline-item-key={item().id}>
                 <TimelineItem
-                  item={item}
+                  item={item()}
                   imageScope={imageScope()}
                   onOpenApp={(callId) => setOpenedApp({ sessionId: props.session.id, callId })}
                   expandedShellOutputs={expandedShellOutputs()}
                   onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
-                  showTurnActions={turnFooterItemIds().has(item.id)}
-                  canRollbackTurn={lastTurn() !== undefined && item.turn < lastTurn()!}
+                  showTurnActions={turnFooterItemIds().has(item().id)}
+                  canRollbackTurn={lastTurn() !== undefined && item().turn < lastTurn()!}
                   onRollbackTurn={rollbackTurn}
                   onContinueTurn={continueTurn}
                   onContinueCursor={continueCursor}
                   onEditUserMessage={editUserMessage}
                 />
-              </div>
-            )}
+              </div>;
+            }}
           </Virtualizer>
         </Show>
       </div>
@@ -2450,7 +2447,7 @@ function appendToolProgress(
 }
 
 function timelineItemKey(item: TimelineItemModel) {
-  return item.id;
+  return `${item.kind}:${item.id}`;
 }
 
 function textKind(channel: string): "user" | "assistant" | "thinking" | undefined {

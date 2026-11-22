@@ -1204,6 +1204,36 @@ describe("sessions route", () => {
     expect(screen.getByLabelText("Session timeline").textContent).not.toContain("timeline disconnected");
   });
 
+  test("text-only timeline updates retain rows and do not write scroll at the tail", async () => {
+    const sessionId = "session-stable-timeline";
+    const base = snapshotWithSessions([sessionWithInferenceSettings(sessionId)]);
+    base.sessions.timelines[sessionId] = readySessionTimeline();
+    const entry = (text: string) => timelineEvent({
+      sessionId, cursor: 1n, itemId: "answer", channel: "assistant_text",
+      content: { kind: "textSnapshot", text },
+    });
+    const initial = snapshotWithTimelineEvents(base, sessionId, [entry("First")]);
+    let publish!: (snapshot: ClientSnapshot) => void;
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: `/sessions/${sessionId}`,
+      snapshot: initial,
+      onSnapshotSetter: setter => { publish = setter; },
+    });
+    const timeline = screen.getByLabelText("Session timeline");
+    setScrollGeometry(timeline, { scrollTop: 400, scrollHeight: 500, clientHeight: 100 });
+    const row = timelineItemElement("answer");
+    const composer = screen.getByRole("textbox", { name: "Session message" }) as HTMLTextAreaElement;
+    fireEvent.input(composer, { target: { value: "Unsent draft" } });
+
+    publish(structuredClone(snapshotWithTimelineEvents(base, sessionId, [entry("Updated")])));
+    await screen.findByText("Updated");
+    await waitForTimelineScroll();
+
+    expect(timelineItemElement("answer")).toBe(row);
+    expect(timeline.scrollTop).toBe(400);
+    expect(composer.value).toBe("Unsent draft");
+  });
+
   test("session detail keeps initial timeline replay pinned to the bottom", async () => {
     let publishSnapshot!: (snapshot: ClientSnapshot) => void;
     const snapshot = snapshotWithSessions([
