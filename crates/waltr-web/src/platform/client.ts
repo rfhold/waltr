@@ -37,6 +37,7 @@ export type ClientAdapter = {
   dispose: () => void | Promise<void>;
   dictation?: import("./dictation").DictationHost;
   media?: import("./media").MediaBridge;
+  messageImages?: import("./message-images").MessageImagesBridge;
   dictationPreferenceScope?: string;
   access?: AccessOperations;
   accessDiagnostic?: {

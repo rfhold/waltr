@@ -10,6 +10,10 @@ const wasm = vi.hoisted(() => ({
     openMediaInteraction: ReturnType<typeof vi.fn>;
     cancelMediaInteraction: ReturnType<typeof vi.fn>;
     mediaInteractionStatusJson: ReturnType<typeof vi.fn>;
+    sendMessageWithImages: ReturnType<typeof vi.fn>;
+    readMessageImage: ReturnType<typeof vi.fn>;
+    cancelMessageImageSend: ReturnType<typeof vi.fn>;
+    cancelMessageImages: ReturnType<typeof vi.fn>;
   }>,
   cancelCapture: vi.fn(),
 }));
@@ -26,6 +30,10 @@ vi.mock("../../generated/wasm-current/waltr_client", () => {
       let rejectNext: ((error: Error) => void) | undefined;
       const client = {
         ...mediaBridge(),
+        sendMessageWithImages: vi.fn(async () => {}),
+        readMessageImage: vi.fn(async () => new Uint8Array([1, 2])),
+        cancelMessageImageSend: vi.fn(),
+        cancelMessageImages: vi.fn(),
         dispatchJson: vi.fn(async () => JSON.stringify(snapshot("dispatched"))),
         dispose: vi.fn(() => rejectNext?.(new Error("client state stream closed"))),
         nextStateJson: vi.fn(() => new Promise<string>((_resolve, reject) => {
@@ -72,6 +80,24 @@ describe("browser WASM client adapter", () => {
       method: "POST",
       credentials: "same-origin",
     });
+  });
+
+  test("uses the WASM binary lane and retires that exact adapter on disposal", async () => {
+    const adapter = await loadBrowserClient();
+    const images = adapter.messageImages!;
+    const parts = [{ kind: "image", format: "png", bytes: new Uint8Array([1, 2]) }] as const;
+    await images.send("session", [...parts]);
+    await expect(images.read("session", "item", 0, "png", 2)).resolves.toEqual(parts[0].bytes);
+    images.cancelSend();
+    images.cancelAll();
+    const client = wasm.clients[0];
+    expect(client.sendMessageWithImages).toHaveBeenCalledWith("session", parts);
+    expect(client.readMessageImage).toHaveBeenCalledWith("session", "item", 0, 2);
+    expect(client.cancelMessageImageSend).toHaveBeenCalledOnce();
+    expect(client.cancelMessageImages).toHaveBeenCalledOnce();
+    expect(client.dispatchJson).not.toHaveBeenCalled();
+    adapter.dispose();
+    expect(images.retired.aborted).toBe(true);
   });
 
   test.each(["logout", "accessLoss", "dispose"])("%s cancels capture and the same client's owned interaction", async exit => {

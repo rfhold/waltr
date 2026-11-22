@@ -1,4 +1,4 @@
-import { Navigate, Route, Router } from "@solidjs/router";
+import { Navigate, Route, Router, useLocation } from "@solidjs/router";
 
 import { AppLayout } from "./layouts/AppLayout";
 import { ShellLayout } from "./layouts/ShellLayout";
@@ -20,7 +20,10 @@ const fixtureRoutesEnabled = import.meta.env.DEV || import.meta.env.MODE === "te
 
 export function AppRouter(props: { base?: string }) {
   return (
-    <Router root={(root) => <AppLayout remote={Boolean(props.base)}>{root.children}</AppLayout>} base={props.base}>
+    <Router root={(root) => {
+      const location = useLocation();
+      return <AppLayout remote={Boolean(props.base)} pathname={() => location.pathname}>{root.children}</AppLayout>;
+    }} base={props.base}>
       <Route path="/" component={ShellLayout}>
         <Route path="/" component={LandingRoute} />
         <Route path="/routines" component={RoutinesRoute} />

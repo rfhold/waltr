@@ -100,9 +100,11 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
       return;
     }
 
+    const drafts = app.sessionDrafts;
     const current = () => mounted && app.accessOperations() === accessOperations;
     try {
       const signedOut = await accessOperations.logout();
+      if (signedOut) drafts?.clear();
       if (!current()) return;
       if (!signedOut) {
         setLogoutError("Waltr could not sign you out. Try again.");

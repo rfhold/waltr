@@ -1,4 +1,4 @@
-import { A, useNavigate, useParams } from "@solidjs/router";
+import { A, useLocation, useNavigate, useParams } from "@solidjs/router";
 import { Virtualizer, type CustomContainerComponentProps, type CustomItemComponentProps, type VirtualizerHandle } from "virtua/solid";
 import {
   For,
@@ -39,12 +39,15 @@ import type {
   SessionTimelineView,
   SessionView,
   TimestampView,
+  UserMessagePartView,
 } from "../../generated/waltr-client";
+import { MAX_MESSAGE_TEXT_BYTES, type MessageImagePart, type MessageImagesBridge } from "../../platform/message-images";
 import { SessionCommandPalette } from "./SessionCommandPalette";
 import { DictationControl } from "../../components/DictationControl";
 import { validSelection } from "../../platform/dictation";
 import { dictationDraft, type DictationDraft } from "../../components/dictation-draft";
 import { SessionInteractions } from "./SessionInteractions";
+import { HistoryImage, imageDraft, imageReadScope, type ImageReadScope } from "./message-images";
 
 const TIMELINE_CHANNELS = [
   "user_text",
@@ -470,12 +473,15 @@ function SessionRouteAlerts() {
 
 function SessionDetail(props: { session: SessionView }) {
   const app = useAppState();
+  const location = useLocation();
   const sessions = useSessionsRoute();
   const phone = useMediaQuery("(max-width: 700px)");
   const [editingInferenceSettings, setEditingInferenceSettings] = createSignal(false);
   const [editingAgent, setEditingAgent] = createSignal(false);
   const [openedApp, setOpenedApp] = createSignal<{ sessionId: string; callId: string }>();
-  const [draft, writeDraft] = createSignal("");
+  const bindDraft = () => app.sessionDrafts?.bind(location.pathname, props.session.id);
+  let draftOwner = untrack(bindDraft);
+  const [draft, writeDraft] = createSignal(draftOwner?.text ?? "");
   const [draftRevision, setDraftRevision] = createSignal(0);
   const [dictationInvalidation, setDictationInvalidation] = createSignal(0);
   const [dictationActive, setDictationActive] = createSignal(false);
@@ -483,7 +489,42 @@ function SessionDetail(props: { session: SessionView }) {
   const setDraft = (value: string) => {
     setDraftRevision(revision => revision + 1);
     writeDraft(value);
+    draftOwner?.write(value);
   };
+  onCleanup(() => draftOwner?.dispose());
+  createEffect(on([() => location.pathname, () => props.session.id], () => {
+    draftOwner?.dispose();
+    draftOwner = bindDraft();
+    setDraft(draftOwner?.text ?? "");
+  }, { defer: true }));
+  const attachments = imageDraft(() => setDraftRevision(revision => revision + 1));
+  const imageBridge = createMemo(() => app.messageImages?.());
+  const imageAccess = createMemo(() => app.systemReady() && app.snapshot()?.access.status === "authenticated");
+  const imageDestination = createMemo(() => app.dictationPreferenceScope?.());
+  const [imageScope, setImageScope] = createSignal<ImageReadScope>();
+  type ImageUpload = { scope: ImageReadScope; bridge: MessageImagesBridge; cancelled: boolean; cancelAck?: Promise<boolean> };
+  const [imageUpload, setImageUpload] = createSignal<ImageUpload>();
+  let filePicker: HTMLInputElement | undefined;
+
+  createEffect(on([() => props.session.id, imageDestination, imageBridge, imageAccess], ([session, , bridge, ready]) => {
+    if (!ready || !bridge || bridge.retired.aborted) return;
+    const controller = new AbortController();
+    const scope = imageReadScope(bridge, session, controller.signal);
+    const release = () => {
+      if (controller.signal.aborted) return;
+      controller.abort();
+      attachments.clear();
+      setImageScope(undefined);
+      setImageUpload(undefined);
+      void Promise.resolve(bridge.cancelAll()).catch(() => {});
+    };
+    bridge.retired.addEventListener("abort", release, { once: true });
+    setImageScope(scope);
+    onCleanup(() => {
+      bridge.retired.removeEventListener("abort", release);
+      release();
+    });
+  }));
   createEffect(on(() => [props.session.id, app.dictationPreferenceScope?.()] as const, () => {
     activeDictationDraft?.rollback();
     activeDictationDraft = undefined;
@@ -833,7 +874,11 @@ function SessionDetail(props: { session: SessionView }) {
 
   const submit = async () => {
     const text = draft().trim();
-    if (dictationActive() || !text || !timelineReady() || !canSubmitPrompt(props.session)) {
+    const images = attachments.images();
+    const bridge = imageBridge();
+    const scope = imageScope();
+    if (dictationActive() || imageUpload() || attachments.checking() || (!text && !images.length)
+      || !timelineReady() || !canSubmitPrompt(props.session) || (images.length && (!scope || !bridge))) {
       return;
     }
 
@@ -841,21 +886,59 @@ function SessionDetail(props: { session: SessionView }) {
     const submittedRevision = draftRevision();
     const submittedSession = props.session.id;
     setCommandError(undefined);
+    let upload: ImageUpload | undefined;
     try {
-      await app.dispatchSubmitUserMessage(submittedSession, text);
+      if (images.length && scope && bridge) {
+        if (text.length > MAX_MESSAGE_TEXT_BYTES || new TextEncoder().encode(text).length > MAX_MESSAGE_TEXT_BYTES) {
+          setCommandError({ message: "Message text exceeds 16 KiB." });
+          return;
+        }
+        upload = { scope, bridge, cancelled: false };
+        setImageUpload(upload);
+        const parts: MessageImagePart[] = text ? [{ kind: "text", text }] : [];
+        const imageParts = await Promise.all(images.map(async ({ file, format }): Promise<MessageImagePart> => ({
+          kind: "image", format, bytes: new Uint8Array(await file.arrayBuffer()),
+        })));
+        if (upload.cancelled || scope.signal.aborted || props.session.id !== submittedSession) return;
+        await bridge.send(submittedSession, [...parts, ...imageParts]);
+        if (scope.signal.aborted || props.session.id !== submittedSession) return;
+        attachments.clear();
+      } else {
+        await app.dispatchSubmitUserMessage(submittedSession, text);
+      }
       if (props.session.id === submittedSession && draftRevision() === submittedRevision) {
         setDraft("");
         setCaret({ start: 0, end: 0 });
         clearResourceAutocomplete();
       }
     } catch (error) {
+      const unconfirmed = upload?.cancelAck ? !await upload.cancelAck : false;
+      if (props.session.id !== submittedSession || upload?.scope.signal.aborted) return;
       const current = app.snapshot();
       setCommandError({
-        message: error instanceof Error ? error.message : "Unable to send message.",
-        authenticationFailure: sessionOperationAuthenticationFailure(current, current?.sessions.submitUserMessage.key, "sessionSubmitUserMessage", props.session.id),
+        message: unconfirmed ? "Upload cancellation could not be confirmed. Check the session before retrying."
+          : error instanceof Error ? error.message : upload && typeof error === "string" ? error : "Unable to send message.",
+        authenticationFailure: upload ? undefined : sessionOperationAuthenticationFailure(current, current?.sessions.submitUserMessage.key, "sessionSubmitUserMessage", props.session.id),
       });
+    } finally {
+      if (upload && imageUpload()?.scope === upload.scope) setImageUpload(undefined);
     }
   };
+
+  const cancelImageUpload = () => {
+    const upload = imageUpload();
+    if (!upload || upload.cancelled) return;
+    upload.cancelled = true;
+    upload.cancelAck = Promise.resolve(upload.bridge.cancelSend()).then(() => true, () => false);
+    setImageUpload({ ...upload });
+    void upload.cancelAck.then(confirmed => {
+      if (!confirmed && imageUpload()?.cancelAck === upload.cancelAck && !upload.scope.signal.aborted) {
+        setCommandError({ message: "Upload cancellation could not be confirmed. Check the session before retrying." });
+      }
+    });
+  };
+  const canAttach = () => Boolean(imageScope()) && !imageUpload() && !attachments.checking();
+  const addImages = (files: File[]) => { if (canAttach()) void attachments.add(files); };
 
   const sendTemplateSearch = async (token: ActiveTemplateToken) => {
     const requestId = clientRequestId(`${props.session.id}-resource`);
@@ -1095,6 +1178,7 @@ function SessionDetail(props: { session: SessionView }) {
               <div class={`sessions__timeline-item sessions__timeline-item--${item.kind}${isMaskReplacement(item) ? " sessions__timeline-item--mask-replacement" : ""}`} data-timeline-item-key={timelineItemKey(item)}>
                 <TimelineItem
                   item={item}
+                  imageScope={imageScope()}
                   onOpenApp={(callId) => setOpenedApp({ sessionId: props.session.id, callId })}
                   expandedShellOutputs={expandedShellOutputs()}
                   onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
@@ -1131,6 +1215,17 @@ function SessionDetail(props: { session: SessionView }) {
           event.preventDefault();
           void submit();
         }}
+        onDragOver={(event) => {
+          if (!event.dataTransfer?.types.includes("Files")) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = canAttach() ? "copy" : "none";
+        }}
+        onDrop={(event) => {
+          const files = Array.from(event.dataTransfer?.files ?? []);
+          if (!files.length) return;
+          event.preventDefault();
+          addImages(files);
+        }}
       >
         <div class="sessions__composer-input" onKeyDown={handleResourceAutocompleteKeyDown}>
           <Show when={visibleResourceOptions().length > 0}>
@@ -1164,6 +1259,12 @@ function SessionDetail(props: { session: SessionView }) {
               aria-expanded={visibleResourceOptions().length > 0}
               placeholder="Send a message..."
               value={draft()}
+              onPaste={(event) => {
+                const files = Array.from(event.clipboardData?.files ?? []);
+                if (!files.length) return;
+                if (!event.clipboardData?.types.includes("text/plain")) event.preventDefault();
+                addImages(files);
+              }}
               onCompositionStart={() => setDraftRevision(value => value + 1)}
               onInput={(event) => {
                 setDraft(event.currentTarget.value);
@@ -1176,6 +1277,17 @@ function SessionDetail(props: { session: SessionView }) {
               onScroll={(event) => syncHighlightScroll(event.currentTarget)}
             />
           </div>
+          <Show when={attachments.images().length}>
+            <ul class="sessions__draft-images" aria-label="Attached images">
+              <For each={attachments.images()}>{(image, index) => (
+                <li>
+                  <img src={image.url} alt={`Attachment ${index() + 1}`} />
+                  <button type="button" disabled={!canAttach()} onClick={() => attachments.remove(image)} aria-label={`Remove attachment ${index() + 1}`}>Remove</button>
+                </li>
+              )}</For>
+            </ul>
+          </Show>
+          <Show when={attachments.error()}>{error => <InlineAlert tone="danger">{error()}</InlineAlert>}</Show>
           <Show when={templateSearchPending() && visibleResourceOptions().length === 0}>
             <p class="sessions__resource-status">Searching resources...</p>
           </Show>
@@ -1189,7 +1301,13 @@ function SessionDetail(props: { session: SessionView }) {
           configuredSelection={app.snapshot()?.config.current?.sessionDictation}
           configurationVersion={app.snapshot()?.config.current?.etag}
           revision={draftRevision()} selection={caret()}
-          onActive={active => { setDictationActive(active); if (!active) activeDictationDraft = undefined; }}
+          onActive={active => {
+            setDictationActive(active);
+            if (!active && activeDictationDraft) {
+              draftOwner?.write(draft());
+              activeDictationDraft = undefined;
+            }
+          }}
           beginDraft={() => {
             setDraftRevision(value => value + 1);
             activeDictationDraft = dictationDraft({
@@ -1216,6 +1334,15 @@ function SessionDetail(props: { session: SessionView }) {
           }}
         />}</Show>
         <div class="sessions__composer-actions">
+          <Show when={imageBridge()}>
+            <input hidden type="file" multiple accept="image/png,image/jpeg,image/webp" ref={filePicker}
+              aria-label="Choose images"
+              onChange={(event) => {
+                addImages(Array.from(event.currentTarget.files ?? []));
+                event.currentTarget.value = "";
+              }} />
+            <button type="button" disabled={!canAttach()} onClick={() => filePicker?.click()}>Attach images</button>
+          </Show>
           <button
             type="button"
             class={`sessions__composer-stop${interruptible() ? "" : " sessions__composer-stop--hidden"}`}
@@ -1226,9 +1353,13 @@ function SessionDetail(props: { session: SessionView }) {
           >
             Stop
           </button>
-          <button type="submit" disabled={dictationActive() || !draft().trim() || !timelineReady() || !canSubmitPrompt(props.session)}>
-            Send
-          </button>
+          <Show when={imageUpload()} fallback={
+            <button type="submit" disabled={dictationActive() || attachments.checking() || (!draft().trim() && !attachments.images().length) || !timelineReady() || !canSubmitPrompt(props.session)}>
+              Send
+            </button>
+          }>{upload => <button type="button" disabled={upload().cancelled} onClick={cancelImageUpload}>
+            {upload().cancelled ? "Cancelling…" : "Cancel upload"}
+          </button>}</Show>
         </div>
       </form>
       <SessionDetailStatusBar
@@ -1266,7 +1397,7 @@ type TimelineItemModel =
   | ToolTimelineItem
   | TurnMetricsTimelineItem;
 
-type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string; maskReplacement?: boolean };
+type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string; maskReplacement?: boolean; parts?: UserMessagePartView[] };
 type TemplateTextPart = TemplatePlainTextPart | TemplateResultPart | TemplateErrorPart;
 type TemplatePlainTextPart = { kind: "text"; text: string };
 type TemplateResultPart = {
@@ -1654,6 +1785,7 @@ function TimelineVirtualizerItem(props: CustomItemComponentProps) {
 
 function TimelineItem(props: {
   item: TimelineItemModel;
+  imageScope?: ImageReadScope;
   onOpenApp: (callId: string) => void;
   expandedShellOutputs: Record<string, boolean>;
   onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
@@ -1670,7 +1802,7 @@ function TimelineItem(props: {
     <>
       <Switch>
         <Match when={textTimelineItem(item())}>
-          {(textItem) => <TextTimelineItemView item={textItem()} />}
+          {(textItem) => <TextTimelineItemView item={textItem()} imageScope={props.imageScope} />}
         </Match>
         <Match when={toolTimelineItem(item())}>
           {(toolItem) => (
@@ -1719,9 +1851,11 @@ function TimelineItemActions(props: {
               <button type="button" onClick={() => void props.onContinueCursor(item().cursor)}>
                 Rerun
               </button>
-              <button type="button" onClick={() => void props.onEditUserMessage(item())}>
+              <Show when={!item().parts?.some(part => part.kind !== "text")}>
+                <button type="button" onClick={() => void props.onEditUserMessage(item())}>
                 Edit
-              </button>
+                </button>
+              </Show>
             </>
           )}
         </Show>
@@ -1755,10 +1889,17 @@ function TurnMetricsTimelineItemView(props: { item: TurnMetricsTimelineItem }) {
   );
 }
 
-function TextTimelineItemView(props: { item: Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }> }) {
-  return hasTemplateMarkers(props.item.text)
-    ? <div class={`sessions__markdown sessions__markdown--${props.item.kind} sessions__template-inline`}>{renderTemplateInline(props.item.text)}</div>
-    : <MarkdownMessage text={props.item.text} tone={props.item.kind} />;
+function TextTimelineItemView(props: { item: TextTimelineItem; imageScope?: ImageReadScope }) {
+  const renderText = (text: string) => hasTemplateMarkers(text)
+    ? <div class={`sessions__markdown sessions__markdown--${props.item.kind} sessions__template-inline`}>{renderTemplateInline(text)}</div>
+    : <MarkdownMessage text={text} tone={props.item.kind} />;
+  return <Show when={props.item.parts} fallback={renderText(props.item.text)}>
+    {parts => <div class="sessions__message-parts">
+      <For each={parts()}>{(part, index) => part.kind === "text" ? renderText(part.text)
+        : part.kind === "image" ? <HistoryImage scope={props.imageScope} item={props.item.id} index={index()} image={part} />
+          : <span>Unsupported attachment</span>}</For>
+    </div>}
+  </Show>;
 }
 
 function ToolTimelineItemView(props: {
@@ -2028,6 +2169,19 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
     const event = entry.event;
     const channel = event.channel ?? "";
     switch (event.content.kind) {
+      case "userMessage": {
+        if (entry.presentation !== "durable") break;
+        const parts = event.content.parts;
+        const text = parts.flatMap(part => part.kind === "text" ? [part.text] : []).join("");
+        const existing = textByItem.get(event.itemId);
+        if (existing) Object.assign(existing, { parts, text, cursor: event.cursor });
+        else {
+          const item = { id: event.itemId, turn: event.turn, cursor: event.cursor, kind: "user" as const, text, parts };
+          textByItem.set(event.itemId, item);
+          items.push(item);
+        }
+        break;
+      }
       case "textDelta":
       case "textSnapshot": {
         const kind = textKind(channel);

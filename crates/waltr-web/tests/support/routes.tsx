@@ -1,4 +1,4 @@
-import { MemoryRouter, Navigate, Route, createMemoryHistory } from "@solidjs/router";
+import { MemoryRouter, Navigate, Route, createMemoryHistory, useLocation } from "@solidjs/router";
 import type { MemoryHistory } from "@solidjs/router";
 
 import {
@@ -89,9 +89,13 @@ export function RoutinesRouteWithRouter() {
   return <MemoryRouter history={currentHistory}><Route path="/routines" component={RoutinesRoute} /><Route path="/routines/:invocationId" component={RoutineInvocationRoute} /></MemoryRouter>;
 }
 
-export function SessionsRouteWithRouter() {
+export function SessionsRouteWithRouter(props: { accessLayout?: boolean } = {}) {
   return (
-    <MemoryRouter history={currentHistory}>
+    <MemoryRouter history={currentHistory} root={root => {
+      if (!props.accessLayout) return root.children;
+      const location = useLocation();
+      return <AppLayout pathname={() => location.pathname}>{root.children}</AppLayout>;
+    }}>
       <Route path="/sessions" component={SessionsRoute}>
         <Route path="/" component={SessionsListRoute} />
         <Route path="/data" component={SessionsDataRoute} />

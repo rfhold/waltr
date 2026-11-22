@@ -27,6 +27,8 @@ export function renderWithAppState(
     accessOperations?: AccessOperations | null;
     dictation?: import("../../src/platform/dictation").DictationHost;
     media?: import("../../src/platform/media").MediaBridge;
+    messageImages?: import("../../src/platform/message-images").MessageImagesBridge;
+    sessionDrafts?: ReturnType<typeof import("../../src/app/session-draft").sessionDrafts>;
     dictationPreferenceScope?: string;
     submitUserMessage?: (sessionId: string, text: string) => Promise<ClientSnapshot>;
     openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
@@ -496,6 +498,8 @@ export function renderWithAppState(
           dispatchUpdateSessionAgent,
           dictation: () => options.dictation,
           media: () => options.media,
+          messageImages: () => options.messageImages,
+          sessionDrafts: options.sessionDrafts,
           dictationPreferenceScope: () => options.dictationPreferenceScope ?? "test-server",
           dispatchSubmitUserMessage: options.submitUserMessage ?? dispatchSubmitUserMessage,
           dispatchInterruptSession,

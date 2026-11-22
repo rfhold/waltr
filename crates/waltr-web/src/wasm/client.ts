@@ -14,6 +14,7 @@ export async function loadBrowserClient(destination?: string): Promise<ClientAda
   await init();
 
   const client = destination === undefined ? WaltrClient.forCurrentOrigin() : WaltrClient.forDestination(destination);
+  const imageRuntime = new AbortController();
   let currentSnapshot: ClientSnapshot | undefined;
   const dictation = browserDictation(client, () => currentSnapshot);
   let currentSnapshotJson: string | undefined;
@@ -104,6 +105,13 @@ export async function loadBrowserClient(destination?: string): Promise<ClientAda
     entryDestinations: async () => JSON.parse(await WaltrClient.entryDestinationsJson()),
     dictation,
     media: client,
+    messageImages: {
+      retired: imageRuntime.signal,
+      send: (session, parts) => client.sendMessageWithImages(session, parts),
+      read: (session, item, index, _format, size) => client.readMessageImage(session, item, index, size),
+      cancelSend: () => client.cancelMessageImageSend(),
+      cancelAll: () => client.cancelMessageImages(),
+    },
     dictationPreferenceScope: window.location.origin,
     start,
     subscribe: (listener) => {
@@ -123,10 +131,16 @@ export async function loadBrowserClient(destination?: string): Promise<ClientAda
     },
     dispatch,
     access: {
-      openLogin: (url) => { dictation.cancel(); window.location.assign(url); },
+      openLogin: (url) => {
+        dictation.cancel();
+        imageRuntime.abort();
+        window.location.assign(url);
+      },
       logout: async () => {
         dictation.cancel();
+        client.cancelMessageImages();
         const response = await fetch("/oidc/logout", { method: "POST", credentials: "same-origin" });
+        if (response.ok) imageRuntime.abort();
         return response.ok;
       },
     },
@@ -136,6 +150,7 @@ export async function loadBrowserClient(destination?: string): Promise<ClientAda
       }
 
       disposed = true;
+      imageRuntime.abort();
       dictation.dispose();
       started = false;
       client.dispose();

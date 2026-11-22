@@ -11,6 +11,7 @@ import { AppStateContextProvider, type AppPhase } from "./context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
 import type { ClientAdapter, ClientAdapterLoader } from "../platform/client";
 import { FixtureAppStateProvider, fixtureSnapshotForPath } from "./fixtures";
+import { sessionDrafts } from "./session-draft";
 import { reportApplicationError } from "../telemetry";
 
 type AppStateProviderProps = ParentProps<{
@@ -34,6 +35,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
   const [authorizationDraft, setAuthorizationDraft] = createSignal<{ attemptId: string; input: string }>();
   const [ignoredTerminalAttemptId, setIgnoredTerminalAttemptId] = createSignal<string>();
   const operationWaiters = new Set<OperationWaiter>();
+  const drafts = __WALTR_BUILD_PLATFORM__ === "browser" ? sessionDrafts() : undefined;
   const [clientAdapter] = createResource(() => props.loadClientAdapter());
   const [minimumSplashElapsed] = createResource(async () => {
     await sleep(300);
@@ -119,6 +121,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
     onCleanup(() => {
       cancelled = true;
+      drafts?.clear();
       unsubscribe();
       unsubscribeDiagnostic?.();
       unsubscribeAudioFailure?.();
@@ -160,6 +163,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
   });
 
   const dispatch = async (command: ClientCommand) => {
+    if (command.type === "logoutWaltr") drafts?.clear();
     try {
       return await getLoadedClient(clientAdapter()).dispatch(command);
     } catch (error) {
@@ -410,6 +414,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         authorizationDraft,
         dictation: () => { snapshot(); return clientAdapter()?.dictation; },
         media: () => { snapshot(); return clientAdapter()?.media; },
+        messageImages: () => { snapshot(); return clientAdapter()?.messageImages; },
+        sessionDrafts: drafts,
         dictationPreferenceScope: () => clientAdapter()?.dictationPreferenceScope,
         accessOperations: () => clientAdapter()?.access,
         accessDiagnostic,

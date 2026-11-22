@@ -24,6 +24,8 @@ export type AppState = {
   authorizationDraft: Accessor<{ attemptId: string; input: string } | undefined>;
   dictation?: Accessor<import("../platform/dictation").DictationHost | undefined>;
   media?: Accessor<import("../platform/media").MediaBridge | undefined>;
+  messageImages?: Accessor<import("../platform/message-images").MessageImagesBridge | undefined>;
+  sessionDrafts?: ReturnType<typeof import("./session-draft").sessionDrafts>;
   dictationPreferenceScope?: Accessor<string | undefined>;
   accessOperations: Accessor<AccessOperations | undefined>;
   accessDiagnostic?: Accessor<import("../platform/client").AccessDiagnostic | undefined>;

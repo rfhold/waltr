@@ -1568,6 +1568,42 @@
   min-width: 0;
 }
 
+.sessions__draft-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sessions__draft-images li {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.sessions__draft-images img {
+  width: 5rem;
+  height: 4rem;
+  object-fit: contain;
+}
+
+.sessions__message-parts {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.sessions__history-image {
+  display: block;
+  max-width: min(100%, 36rem);
+  max-height: 24rem;
+  object-fit: contain;
+}
+
+.sessions__history-image-status {
+  color: var(--color-text-muted);
+}
+
 .sessions__composer-textarea-shell {
   position: relative;
   display: grid;

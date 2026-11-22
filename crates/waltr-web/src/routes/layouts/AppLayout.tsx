@@ -6,8 +6,12 @@ import { OAuthDialog } from "../auth/OAuthDialog";
 import { SplashRoute } from "../splash/SplashRoute";
 import { AudioFailureAlert } from "../../components/AudioFailureAlert";
 
-export function AppLayout(props: ParentProps<{ remote?: boolean }>) {
+export function AppLayout(props: ParentProps<{ remote?: boolean; pathname?: () => string }>) {
   const app = useAppState();
+  createEffect(() => {
+    const path = props.pathname?.();
+    if (path !== undefined) app.sessionDrafts?.select(path);
+  });
   const accessStatus = () => app.snapshot()?.access.status;
   const authenticated = () => accessStatus() === "authenticated";
   let automaticLoginClaimed = false;
