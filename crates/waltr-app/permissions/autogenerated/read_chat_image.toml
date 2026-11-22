@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-chat-image"
+description = "Enables the read_chat_image command without any pre-configured scope."
+commands.allow = ["read_chat_image"]
+
+[[permission]]
+identifier = "deny-read-chat-image"
+description = "Denies the read_chat_image command without any pre-configured scope."
+commands.deny = ["read_chat_image"]

@@ -7,6 +7,8 @@
 mod activity;
 mod app_container;
 pub mod audio_permissions;
+mod chat_images;
+use chat_images::{cancel_chat_images, read_chat_image, send_chat_images};
 mod dictation;
 mod native_audio;
 mod native_media;
@@ -1085,6 +1087,7 @@ pub fn run() {
                     });
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let window = window
+                .disable_drag_drop_handler()
                 .title("Waltr")
                 .inner_size(1180.0, 780.0)
                 .min_inner_size(720.0, 540.0)
@@ -1109,6 +1112,9 @@ pub fn run() {
             routine_media,
             routine_media_append,
             routine_media_bytes,
+            send_chat_images,
+            read_chat_image,
+            cancel_chat_images,
             start_runtime,
             dictation_start,
             dictation_finish,

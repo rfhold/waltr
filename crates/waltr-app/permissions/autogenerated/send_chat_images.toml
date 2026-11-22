@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-send-chat-images"
+description = "Enables the send_chat_images command without any pre-configured scope."
+commands.allow = ["send_chat_images"]
+
+[[permission]]
+identifier = "deny-send-chat-images"
+description = "Denies the send_chat_images command without any pre-configured scope."
+commands.deny = ["send_chat_images"]

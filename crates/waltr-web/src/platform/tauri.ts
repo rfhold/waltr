@@ -13,6 +13,8 @@ import type {
 import { nativeDictation } from "./native-dictation";
 import type { DictationHost } from "./dictation";
 import { nativeMedia } from "./native-media";
+import { nativeMessageImages } from "./native-message-images";
+import type { MessageImagesBridge } from "./message-images";
 import type { MediaBridge } from "./media";
 
 const BRIDGE_EVENT = "waltr://bridge";
@@ -53,6 +55,19 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
   let dictationSupported = false;
   let media: MediaBridge | undefined;
   let mediaSupported = false;
+  let imageAccessChanges = 0;
+  let imageRuntime: AbortController | undefined;
+  let messageImages: MessageImagesBridge | undefined;
+  let imageOperation = 0;
+  const nextImageOperation = () => {
+    if (imageOperation === 0xffffffff) throw new Error("The chat image operation limit was reached.");
+    return ++imageOperation;
+  };
+  const replaceImageRuntime = (id?: number) => {
+    imageRuntime?.abort();
+    imageRuntime = id === undefined ? undefined : new AbortController();
+    messageImages = imageRuntime && id !== undefined ? nativeMessageImages(api.invoke, id, imageRuntime.signal, nextImageOperation) : undefined;
+  };
   const mediaFor = (id: number) => mediaSupported ? nativeMedia(api.invoke, id, () => !disposed && generation === id && announcedGeneration === id) : undefined;
   let generation: number | undefined;
   let announcedGeneration: number | undefined;
@@ -78,6 +93,11 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
   };
 
   const publishSnapshot = (snapshot: ClientSnapshot) => {
+    if (!snapshot.status.ready || snapshot.access.status !== "authenticated") {
+      if (messageImages) replaceImageRuntime();
+    } else if (imageAccessChanges === 0 && generation !== undefined && announcedGeneration === generation && !messageImages) {
+      replaceImageRuntime(generation);
+    }
     if (!snapshot.status.ready) dictation?.cancel();
     currentSnapshot = snapshot;
     for (const listener of snapshotListeners) listener(snapshot);
@@ -107,6 +127,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
       });
     } else if (event.payload.type === "platform" && event.payload.startup !== "ready") {
       dictation?.cancel();
+      replaceImageRuntime();
     }
   };
   const recover = async () => {
@@ -169,7 +190,10 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
           && canAnnounceGeneration(payload)
           && (announcedGeneration === undefined || payload.generation > announcedGeneration)) {
           announcedGeneration = payload.generation;
+          replaceImageRuntime();
         }
+        if (payload.generation === announcedGeneration && (generation !== payload.generation || payload.sequence > sequence) && payload.payload.type === "platform"
+          && payload.payload.startup !== "ready") replaceImageRuntime();
         if (generation === undefined) pendingEvents.push(payload);
         else void enqueue(payload).catch(() => undefined);
       });
@@ -198,6 +222,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
       }
       runtimeReady = true;
     } catch (error) {
+      replaceImageRuntime();
       if (!disposed) acceptNativeAppsBootstrap(undefined);
       started = false;
       unlisten?.();
@@ -214,6 +239,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
   const dispose = async () => {
     if (disposed) return;
     disposed = true;
+    replaceImageRuntime();
     dictation?.dispose();
     acceptNativeAppsBootstrap(undefined);
     runtimeReady = false;
@@ -232,6 +258,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
     snapshot: () => currentSnapshot,
     get dictation() { return dictation; },
     get media() { return media; },
+    get messageImages() { return messageImages; },
     dictationPreferenceScope: `native:${destination ?? "local"}`,
     start,
     subscribe: (listener) => {
@@ -241,12 +268,31 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
     },
     dispatch: async (command: ClientCommand) => {
       if (disposed || generation === undefined) throw new Error("Native client is not ready");
-      const event = await api.invoke<BridgeEvent>("client_dispatch", { command, generation });
-      if (disposed || event.generation !== generation) throw new Error("native command returned stale client state");
-      await enqueue(event);
-      if (event.payload.type !== "state") throw new Error("native command did not return client state");
-      if (!currentSnapshot) throw new Error("native command did not publish client state");
-      return currentSnapshot;
+      const requestedGeneration = generation;
+      const changesImageAccess = command.type === "logoutWaltr" || command.type === "startWaltrLogin" || command.type === "reprobeWaltrAccess"
+        || command.type === "waltrAccessExpired" || command.type === "completeWaltrLogin" || command.type === "failWaltrLogin";
+      if (changesImageAccess) {
+        imageAccessChanges++;
+        replaceImageRuntime();
+      }
+      let published = false;
+      try {
+        const event = await api.invoke<BridgeEvent>("client_dispatch", { command, generation: requestedGeneration });
+        if (disposed || event.generation !== generation) throw new Error("native command returned stale client state");
+        await enqueue(event);
+        if (event.payload.type !== "state") throw new Error("native command did not return client state");
+        if (!currentSnapshot) throw new Error("native command did not publish client state");
+        published = true;
+      } finally {
+        if (changesImageAccess) {
+          imageAccessChanges--;
+          if (published && !disposed && requestedGeneration === generation && currentSnapshot && !messageImages
+            && imageAccessChanges === 0 && currentSnapshot.status.ready && currentSnapshot.access.status === "authenticated") {
+            publishSnapshot({ ...currentSnapshot });
+          }
+        }
+      }
+      return currentSnapshot!;
     },
     dispose,
     entryDestinations: async () => {

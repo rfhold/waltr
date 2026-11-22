@@ -448,6 +448,7 @@ impl<T: Clone + Send + Sync> Publisher<T> {
 enum HostRequest {
     Media(crate::native_media::Request),
     MediaRaw(crate::native_media::RawRequest),
+    ChatImage(crate::chat_images::Request),
     Dictation(Box<crate::dictation::Job>),
     Hold(crate::native_audio::Held),
     Access(waltr_client::NativeAccessAction),
@@ -1311,6 +1312,40 @@ impl RuntimeBridge {
             .await
             .map_err(|_| "Native client generation was replaced".to_owned())?
     }
+
+    pub(crate) async fn image_request(
+        &self,
+        generation: u64,
+        operation: crate::chat_images::Operation,
+        credit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<crate::chat_images::Response, String> {
+        let (reply, result) = oneshot::channel();
+        {
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = running
+                .as_ref()
+                .filter(|r| r.generation == generation && self.is_current(generation))
+                .ok_or("Native client generation was replaced")?;
+            running
+                .requests
+                .try_send(HostRequest::ChatImage(crate::chat_images::Request {
+                    operation,
+                    reply,
+                    credit,
+                }))
+                .map_err(|_| "Native client is busy")?;
+        }
+        let response = result
+            .await
+            .map_err(|_| "Native client generation was replaced")??;
+        self.with_current(generation, || {
+            response.ensure_current()?;
+            Ok(response)
+        })
+    }
     #[cfg(any(target_os = "android", test))]
     pub(crate) fn cancel_audio(&self) {
         self.cancel_generation_audio(self.active_generation.load(Ordering::Acquire));
@@ -1825,6 +1860,7 @@ async fn run_generation(
             request = requests.recv() => match request {
                 Some(HostRequest::Media(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::MediaRaw(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
+                Some(HostRequest::ChatImage(request)) => { drop(request.reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Access(_) | HostRequest::Dictation(_) | HostRequest::Hold(_)) => {},
                 Some(HostRequest::LogoutAccess { reply } | HostRequest::StartAccess { reply, .. }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
@@ -1964,6 +2000,8 @@ async fn run_connected_generation(
         Some(attempt) => ClientRuntime::with_transport_and_pending_auth_attempt(transport, attempt),
         None => ClientRuntime::with_transport(transport),
     };
+    let mut chat_images =
+        crate::chat_images::Host::new(runtime.message_images(), credentials.clone());
     let mut stream =
         runtime.into_state_stream(|delay_ms| tokio::time::sleep(Duration::from_millis(delay_ms)));
     let initial_payload = BridgePayload::State {
@@ -2067,6 +2105,21 @@ async fn run_connected_generation(
             }
             _ = audio_tasks.join_next(), if !audio_tasks.is_empty() => {},
             _ = media_tasks.join_next(), if !media_tasks.is_empty() => {},
+            joined = chat_images.tasks.join_next(), if !chat_images.tasks.is_empty() => {
+                if let Some(Ok(Some(revision))) = joined
+                    && publisher.is_current()
+                    && credentials.credential_revision() == revision
+                {
+                    chat_images.revoke().await;
+                    if let Ok(snapshot) = dispatch_command(&mut stream, ClientCommand::WaltrAccessExpired {
+                        error: "Waltr login required".into(),
+                    }).await {
+                        reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
+                        access_host.observe(access.as_ref(), &credentials, &snapshot, false).await;
+                        publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) });
+                    }
+                }
+            },
             changed = platform.changed() => {
                 if changed.is_err() {
                     break ConnectedExit::Stopped;
@@ -2084,6 +2137,7 @@ async fn run_connected_generation(
                     waltr_client::NativeAccessOutput::ClientCommand { command, logout_barrier: _ } => {
                         let start_reply = if matches!(*command, ClientCommand::StartWaltrLogin) { access_start_reply.take() } else { None };
                         audio_access(&audio, &shortcut_epoch, publisher.generation, false);
+                        chat_images.revoke().await;
                         if complete_logout(&media, (&audio, &mut audio_tasks, publisher.generation), || publisher.is_current(), async || Ok(())).await.is_err() {
                             if let Some(reply) = start_reply {
                                 drop(reply.send(Err("Native sign-in could not start".into())));
@@ -2139,6 +2193,11 @@ async fn run_connected_generation(
                     let media = media.clone();
                     media_tasks.spawn_local(async move { media.dispatch_raw(request).await; });
                 }
+                Some(HostRequest::ChatImage(request)) => {
+                    if publisher.is_current() {
+                        chat_images.dispatch(request).await;
+                    }
+                }
                 Some(HostRequest::Hold(held)) => {
                     if let Some(app) = target.app.clone() {
                         let complete = if let Some(id) = held.alternate_destination() {
@@ -2167,6 +2226,7 @@ async fn run_connected_generation(
                     }
                 }
                 Some(HostRequest::LogoutAccess { reply }) => {
+                    chat_images.revoke().await;
                     if let Some(reply) = access_start_reply.take() {
                         drop(reply.send(Err("Native sign-in was interrupted".into())));
                     }
@@ -2230,6 +2290,7 @@ async fn run_connected_generation(
                     if !publisher.is_current() { drop(reply.send(Err("Native client generation was replaced".into()))); continue; }
                     if matches!(*command, ClientCommand::StartWaltrLogin | ClientCommand::CompleteWaltrLogin { .. } | ClientCommand::FailWaltrLogin { .. } | ClientCommand::ReprobeWaltrAccess | ClientCommand::LogoutWaltr | ClientCommand::WaltrAccessExpired { .. }) {
                         audio_access(&audio, &shortcut_epoch, publisher.generation, false);
+                        chat_images.revoke().await;
                         if let Err(error) = complete_logout(&media, (&audio, &mut audio_tasks, publisher.generation), || publisher.is_current(), async || Ok(())).await {
                             drop(reply.send(Err(error)));
                             continue;
@@ -2274,6 +2335,9 @@ async fn run_connected_generation(
                         };
                     };
                     if let Ok(snapshot) = &result {
+                        if !snapshot_connected(snapshot) {
+                            chat_images.revoke().await;
+                        }
                         reconcile_consumers(&media, &audio, snapshot, &mut audio_tasks, publisher.generation).await;
                         audio_access(&audio, &shortcut_epoch, publisher.generation, target.destination.is_some() || snapshot_connected(snapshot));
                         access_host.observe(access.as_ref(), &credentials, snapshot, started_probe).await;
@@ -2290,6 +2354,9 @@ async fn run_connected_generation(
                 None => break ConnectedExit::Stopped,
             },
             snapshot = stream.next() => {
+                if !snapshot_connected(&snapshot) {
+                    chat_images.revoke().await;
+                }
                 reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
                 audio_access(&audio, &shortcut_epoch, publisher.generation, target.destination.is_some() || snapshot_connected(&snapshot));
                 access_host.observe(access.as_ref(), &credentials, &snapshot, false).await;
@@ -2299,6 +2366,7 @@ async fn run_connected_generation(
             }
         }
     };
+    chat_images.revoke().await;
     shortcut_epoch.set_enabled(publisher.generation, false);
     audio.access_for(publisher.generation, false);
     media.drain().await;
