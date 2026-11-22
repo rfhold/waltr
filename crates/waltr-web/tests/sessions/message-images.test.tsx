@@ -98,7 +98,7 @@ test("rejects a non-raster drop without previewing or sending it", async () => {
   expect(bridge.send).not.toHaveBeenCalled();
 });
 
-function history(size = png.byteLength): ProjectedTimelineEntryView {
+function history(size = png.byteLength): Extract<ProjectedTimelineEntryView, { entryKind: "durable" }> {
   return {
     entryKind: "durable", presentation: "durable", identity: "saved",
     event: {
@@ -124,6 +124,35 @@ test("renders ordered history via its exact authorized part and revokes it on ac
   expect(bridge.cancelAll).toHaveBeenCalledOnce();
   expect(revoke).toHaveBeenCalledWith(image.getAttribute("src"));
   expect(screen.queryByRole("img", { name: "Message attachment" })).toBeNull();
+});
+
+test("keeps a loaded history image mounted across fresh timeline snapshots", async () => {
+  const { bridge, snapshot, publish, revoke } = setup([history()]);
+  const frame = screen.getByText("Image attachment").parentElement;
+  const image = await screen.findByRole("img", { name: "Message attachment" });
+  const src = image.getAttribute("src");
+  expect(image.parentElement).toBe(frame);
+  const timeline = readySessionTimeline();
+  const delta: ProjectedTimelineEntryView = {
+    entryKind: "durable", presentation: "durable", identity: "answer",
+    event: {
+      ...history().event, cursor: 3n, itemId: "answer", channel: "assistant_text",
+      content: { kind: "textDelta", delta: "New answer" },
+    },
+  };
+  publish({
+    ...snapshot,
+    sessions: {
+      ...snapshot.sessions,
+      timelines: { ...snapshot.sessions.timelines, alpha: { ...timeline, events: [history(), delta] } },
+    },
+  });
+  await screen.findByText("New answer");
+  expect(screen.getByRole("img", { name: "Message attachment" })).toBe(image);
+  expect(image.parentElement).toBe(frame);
+  expect(image.getAttribute("src")).toBe(src);
+  expect(bridge.read).toHaveBeenCalledTimes(1);
+  expect(revoke).not.toHaveBeenCalledWith(src);
 });
 
 test("refuses pixel bombs and APNG before creating draft or history object URLs", async () => {

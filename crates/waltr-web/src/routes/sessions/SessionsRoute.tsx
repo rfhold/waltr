@@ -557,7 +557,24 @@ function SessionDetail(props: { session: SessionView }) {
 
   const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
   const interruptible = createMemo(() => props.session.capabilities.canInterrupt);
-  const items = createMemo(() => timelineItems(timeline()));
+  const items = createMemo<TimelineItemModel[]>((previous) => {
+    const next = timelineItems(timeline());
+    // The virtualizer keys by object identity. Retain unchanged image rows and their read owners.
+    const imageRows = new Map<string, TextTimelineItem>();
+    for (const row of previous) {
+      if (row.kind === "user" && row.parts?.some(part => part.kind === "image")) {
+        imageRows.set(row.id, row);
+      }
+    }
+    return next.map(row => {
+      if (row.kind !== "user" || !row.parts) return row;
+      const prior = imageRows.get(row.id);
+      const priorParts = prior?.parts;
+      if (!prior || !priorParts || prior.cursor !== row.cursor || prior.turn !== row.turn
+        || priorParts.length !== row.parts.length) return row;
+      return row.parts.every((part, index) => sameMessagePart(part, priorParts[index])) ? prior : row;
+    });
+  }, []);
   const lastTurn = createMemo(() => items().reduce<bigint | undefined>((last, item) => last === undefined || item.turn > last ? item.turn : last, undefined));
   const turnFooterItemIds = createMemo(() => {
     const lastByTurn = new Map<string, string>();
@@ -1398,6 +1415,14 @@ type TimelineItemModel =
   | TurnMetricsTimelineItem;
 
 type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string; maskReplacement?: boolean; parts?: UserMessagePartView[] };
+function sameMessagePart(part: UserMessagePartView, prior: UserMessagePartView): boolean {
+  switch (part.kind) {
+    case "text": return prior.kind === "text" && part.text === prior.text;
+    case "image": return prior.kind === "image" && part.format === prior.format && part.size_bytes === prior.size_bytes;
+    case "unknown": return prior.kind === "unknown";
+  }
+}
+
 type TemplateTextPart = TemplatePlainTextPart | TemplateResultPart | TemplateErrorPart;
 type TemplatePlainTextPart = { kind: "text"; text: string };
 type TemplateResultPart = {

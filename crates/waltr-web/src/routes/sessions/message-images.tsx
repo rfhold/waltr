@@ -144,7 +144,9 @@ export function HistoryImage(props: { scope?: ImageReadScope; item: string; inde
         if (!row.signal.aborted && !scope.signal.aborted) setFailed(true);
       });
     }));
-  return <Show when={url()} fallback={<span class="sessions__history-image-status">{failed() ? "Image unavailable" : "Image attachment"}</span>}>
-    {source => <img class="sessions__history-image" src={source()} alt="Message attachment" />}
-  </Show>;
+  return <div class="sessions__history-image-frame">
+    <Show when={url()} fallback={<span class="sessions__history-image-status">{failed() ? "Image unavailable" : "Image attachment"}</span>}>
+      {source => <img class="sessions__history-image" src={source()} alt="Message attachment" />}
+    </Show>
+  </div>;
 }
