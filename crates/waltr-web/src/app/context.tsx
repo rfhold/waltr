@@ -17,6 +17,7 @@ export type AppState = {
   clientError: Accessor<unknown>;
   clientLoadError: Accessor<unknown>;
   clientLoaded: Accessor<boolean>;
+  entryDestinations?: Accessor<import("../platform/client").ClientAdapter["entryDestinations"]>;
   systemReady: Accessor<boolean>;
   explicitAuthTarget: Accessor<ClientAuthTarget | undefined>;
   presentedAuthAttemptId: Accessor<string | undefined>;

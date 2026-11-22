@@ -5,6 +5,7 @@ import type { ParentProps } from "solid-js";
 import { useAppState } from "../../app/context";
 import { ownerPath } from "../../app/destination";
 import { reportApplicationView } from "../../telemetry";
+import { DestinationRail } from "./DestinationRail";
 
 export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   const app = useAppState();
@@ -178,6 +179,7 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
             <span aria-hidden="true">x</span>
           </button>
         </div>
+        <Show when={app.systemReady() && app.minimumSplashElapsed()}><DestinationRail /></Show>
         <nav class="shell__nav" aria-label="Main">
           <A
             class="shell__link"

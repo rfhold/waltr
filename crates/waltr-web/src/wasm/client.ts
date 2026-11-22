@@ -101,6 +101,7 @@ export async function loadBrowserClient(destination?: string): Promise<ClientAda
 
   return {
     snapshot: () => currentSnapshot,
+    entryDestinations: async () => JSON.parse(await WaltrClient.entryDestinationsJson()),
     dictation,
     media: client,
     dictationPreferenceScope: window.location.origin,

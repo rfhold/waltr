@@ -11,6 +11,38 @@ import { ConfigRouteWithChildren, ShellRouteWithChildren } from "../support/rout
 import { claudeConfig, mcpServerView, snapshotWithConfig } from "../support/snapshots";
 
 describe("config authentication status", () => {
+  test.each(["provider", "mcpServer"] as const)("switches the %s authentication panel with the selected row", (kind) => {
+    const config = claudeConfig();
+    const first = kind === "provider" ? "claude" : "first";
+    if (kind === "provider") {
+      config.providers.second = { ...config.providers.claude! };
+    } else {
+      for (const name of [first, "second"]) {
+        config.mcpServers[name] = mcpServerView({ name, kind: "streamableHttp", url: "https://mcp.example" });
+      }
+    }
+    const snapshot = snapshotWithConfig(config);
+    const prefix = kind === "provider" ? "provider" : "mcp";
+    snapshot.auth.statuses[`${prefix}:${first}`] = authStatus(kind, first, "oauthConfigured");
+    snapshot.auth.statuses[`${prefix}:second`] = authStatus(kind, "second", "notConfigured");
+    renderWithAppState(() => <ConfigRouteWithChildren />, { snapshot });
+    if (kind === "mcpServer") fireEvent.click(screen.getByRole("tab", { name: "MCP Servers" }));
+    expect(screen.getByLabelText(`Authentication for ${first}`).textContent).toContain("Connected");
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    expect(screen.getByLabelText(`Confirm reset authentication for ${first}`)).toBeTruthy();
+    const second = screen.getByRole("button", { name: /^second / });
+    fireEvent.click(second);
+    const auth = screen.getByLabelText("Authentication for second");
+    expect(auth.textContent).toContain("Not connected");
+    expect(second.closest("li")).toBe(auth.closest("li"));
+    expect(second.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(second);
+    expect(second.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByLabelText("Authentication for second")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${first} `) }));
+    expect(screen.queryByLabelText(`Confirm reset authentication for ${first}`)).toBeNull();
+  });
+
   test.each([
     ["oauthConfigured", "Connected"],
     ["apiKeyConfigured", "API key configured"],

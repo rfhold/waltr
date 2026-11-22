@@ -18,6 +18,7 @@ export function renderWithAppState(
     snapshot?: ClientSnapshot;
     commands?: ClientCommand[];
     clientLoaded?: boolean;
+    entryDestinations?: import("../../src/platform/client").ClientAdapter["entryDestinations"];
     clientLoadError?: unknown;
     clientError?: unknown;
     minimumSplashElapsed?: boolean;
@@ -437,6 +438,7 @@ export function renderWithAppState(
           clientError: () => options.clientError,
           clientLoadError: () => options.clientLoadError,
           clientLoaded: () => options.clientLoaded ?? true,
+          entryDestinations: () => options.entryDestinations,
           systemReady,
           explicitAuthTarget,
           presentedAuthAttemptId,

@@ -18,6 +18,8 @@ mod native_access;
 mod resource;
 mod routine;
 mod transport;
+mod destinations;
+pub use destinations::{DestinationEntry, entry_destinations};
 mod view;
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]

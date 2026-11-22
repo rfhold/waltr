@@ -71,6 +71,14 @@ impl WaltrClient {
         Ok(Self::with_runtime(endpoint, runtime))
     }
 
+    /// List the Remotes on the current origin, regardless of the current view.
+    #[wasm_bindgen(js_name = entryDestinationsJson)]
+    pub async fn entry_destinations_json() -> Result<String, JsValue> {
+        let entry = crate::transport::WasmGrpcTransport::new(normalize_endpoint(None));
+        let remotes = crate::entry_destinations(&entry).await.map_err(js_error)?;
+        serde_json::to_string(&remotes).map_err(js_error)
+    }
+
     fn with_runtime(endpoint: String, runtime: ClientRuntime) -> Self {
         let interaction_transport = runtime.interaction_transport();
         let runtime = runtime.into_state_stream(browser_sleep);

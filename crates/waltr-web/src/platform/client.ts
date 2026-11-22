@@ -1,6 +1,7 @@
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 
 export type ClientSnapshotListener = (snapshot: ClientSnapshot) => void;
+export type DestinationEntry = { name: string; routeId: string | null };
 
 export type AccessDiagnostic = {
   restoring: boolean;
@@ -46,6 +47,7 @@ export type ClientAdapter = {
     dismiss: (diagnosticId: number) => Promise<void>;
   };
   openAuthorizationAttempt?: (attemptId: string) => Promise<void>;
+  entryDestinations?: () => Promise<DestinationEntry[]>;
   openExternalUrl?: (url: string) => Promise<void>;
 };
 

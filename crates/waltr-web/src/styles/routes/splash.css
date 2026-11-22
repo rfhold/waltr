@@ -36,6 +36,10 @@
   text-transform: uppercase;
 }
 
+.splash__recovery {
+  text-decoration: none;
+}
+
 .access {
   position: fixed;
   inset: 0;

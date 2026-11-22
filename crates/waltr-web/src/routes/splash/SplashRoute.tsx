@@ -1,9 +1,9 @@
-import { createMemo } from "solid-js";
+import { Show, createMemo } from "solid-js";
 
 import { useAppState } from "../../app/context";
 import { logoText } from "./splash";
 
-export function SplashRoute() {
+export function SplashRoute(props: { remote?: boolean }) {
   const app = useAppState();
   const status = createMemo(() => {
     if (app.clientLoadError()) {
@@ -33,6 +33,11 @@ export function SplashRoute() {
       <p class="splash__status" role="status" aria-live="polite">
         {status()}
       </p>
+      <Show when={props.remote}>
+        <a class="ui-button splash__recovery" href="/" rel="external">
+          {__WALTR_BUILD_PLATFORM__ === "tauri" ? "Return to Local" : "Return to current server"}
+        </a>
+      </Show>
     </main>
   );
 }

@@ -249,6 +249,13 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, destin
       return currentSnapshot;
     },
     dispose,
+    entryDestinations: async () => {
+      const current = generation;
+      if (disposed || current === undefined) throw new Error("Native client is not ready");
+      const result = await api.invoke<import("./client").DestinationEntry[]>("entry_destinations", { generation: current });
+      if (disposed || generation !== current) throw new Error("Native client changed");
+      return result;
+    },
     accessDiagnostic: {
       subscribe: (listener) => {
         diagnosticListeners.add(listener);

@@ -403,6 +403,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
         clientError,
         clientLoadError: () => clientAdapter.error,
         clientLoaded: () => Boolean(clientAdapter()),
+        entryDestinations: () => clientAdapter()?.entryDestinations,
         systemReady,
         explicitAuthTarget,
         presentedAuthAttemptId,

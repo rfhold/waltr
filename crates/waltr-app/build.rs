@@ -32,6 +32,7 @@ fn main() {
             "routine_media_bytes",
             "client_dispatch",
             "client_state",
+            "entry_destinations",
             "dispose_runtime",
             "open_external_url",
             "open_authorization_attempt",

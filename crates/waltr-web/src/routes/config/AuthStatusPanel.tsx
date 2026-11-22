@@ -43,7 +43,7 @@ export function AuthStatusPanel(props: { target: ClientAuthTarget }) {
     <section class="auth-status" aria-label={`Authentication for ${props.target.key}`}>
       <div class="auth-status__heading">
         <div>
-          <h3>Authentication</h3>
+          <h3>{`Authentication for ${props.target.key}`}</h3>
           <p>Credentials stay on the server and are never shown here.</p>
         </div>
         <span class={`auth-status__badge auth-status__badge--${statusTone(status()?.kind)}`}>

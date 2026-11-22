@@ -18,6 +18,7 @@
     "allow-logout-access",
     "allow-client-dispatch",
     "allow-client-state",
+    "allow-entry-destinations",
     "allow-dispose-runtime",
     "allow-open-external-url",
     "allow-open-authorization-attempt"

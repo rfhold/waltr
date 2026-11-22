@@ -61,6 +61,7 @@ export function McpServersSection(props: ParentProps & {
   const navigate = useNavigate();
   const watchedConfig = props.watchedConfig;
   const [selectedServer, setSelectedServer] = createSignal<string>();
+  const [authCollapsed, setAuthCollapsed] = createSignal(false);
   const [deleteServer, setDeleteServer] = createSignal<string>();
   const [operationError, setOperationError] = createSignal<string>();
   const [operationPending, setOperationPending] = createSignal(false);
@@ -120,25 +121,30 @@ export function McpServersSection(props: ParentProps & {
       <Show when={operationError()}>
         {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
       </Show>
-      <Show when={watchedConfig()} keyed>
+      <Show when={watchedConfig()}>
         {(currentConfig) => (
           <ActionList class="config__list" label="MCP server list">
             <Show
-              when={serverEntries(currentConfig).length > 0}
+              when={serverEntries(currentConfig()).length > 0}
               fallback={<p class="panel">No MCP servers configured yet.</p>}
             >
-              <For each={serverEntries(currentConfig)}>
-                {([serverName, server]) => (
-                  <ActionRow class="provider-row" selected={visibleServerName() === serverName}>
+              <For each={serverEntries(currentConfig()).map(([name]) => name)}>
+                {(serverName) => {
+                  const server = () => currentConfig().mcpServers[serverName];
+                  const expanded = () => !routeServerName() && selectedServer() === serverName && !authCollapsed();
+                  return <ActionRow class="provider-row" selected={visibleServerName() === serverName}>
                     <button
                       type="button"
                       class="provider-row__summary"
-                      aria-pressed={visibleServerName() === serverName}
-                      onClick={() => setSelectedServer(serverName)}
+                      aria-expanded={expanded()}
+                      onClick={() => {
+                        setAuthCollapsed(expanded());
+                        setSelectedServer(serverName);
+                      }}
                     >
                       <strong>{serverName}</strong>
-                      <span>{server.kind}</span>
-                      <code>{server.kind === "streamableHttp" ? server.url || "No URL configured" : server.command || "No command configured"}</code>
+                      <span>{server()?.kind}</span>
+                      <code>{server()?.kind === "streamableHttp" ? server()?.url || "No URL configured" : server()?.command || "No command configured"}</code>
                     </button>
                     <Show
                       when={deleteServer() === serverName}
@@ -179,15 +185,15 @@ export function McpServersSection(props: ParentProps & {
                         onCancel={() => setDeleteServer(undefined)}
                       />
                     </Show>
-                  </ActionRow>
-                )}
+                    <Show when={expanded()}>
+                      <AuthStatusPanel target={{ kind: "mcpServer", key: serverName }} />
+                    </Show>
+                  </ActionRow>;
+                }}
               </For>
             </Show>
           </ActionList>
         )}
-      </Show>
-      <Show when={!routeServerName() && selectedServer()}>
-        {(serverName) => <AuthStatusPanel target={{ kind: "mcpServer", key: serverName() }} />}
       </Show>
       {props.children}
     </McpServersSectionContext.Provider>
@@ -306,8 +312,8 @@ function McpServerFormPanel(props: {
             )}
           </Field>
         </Show>
-        <Show when={form().mode === "edit" && form().originalName}>
-          {(serverName) => <AuthStatusPanel target={{ kind: "mcpServer", key: serverName() }} />}
+        <Show when={form().mode === "edit" && form().originalName} keyed>
+          {(serverName) => <AuthStatusPanel target={{ kind: "mcpServer", key: serverName }} />}
         </Show>
         <div class="config__form-actions">
           <button type="submit" disabled={props.pending || requiredFieldMissing()}>Save</button>

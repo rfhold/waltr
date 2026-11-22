@@ -103,6 +103,7 @@ export function ProvidersSection(props: ParentProps & {
   const navigate = useNavigate();
   const watchedConfig = props.watchedConfig;
   const [selectedProvider, setSelectedProvider] = createSignal<string>();
+  const [authCollapsed, setAuthCollapsed] = createSignal(false);
   const [deleteProvider, setDeleteProvider] = createSignal<string>();
   const [operationError, setOperationError] = createSignal<string>();
   const [operationPending, setOperationPending] = createSignal(false);
@@ -208,25 +209,30 @@ export function ProvidersSection(props: ParentProps & {
       <Show when={operationError()}>
         {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
       </Show>
-      <Show when={watchedConfig()} keyed>
+      <Show when={watchedConfig()}>
         {(currentConfig) => (
           <ActionList class="config__list" label="Provider list">
             <Show
-              when={providerEntries(currentConfig).length > 0}
+              when={providerEntries(currentConfig()).length > 0}
               fallback={<p class="panel">No providers configured yet.</p>}
             >
-              <For each={providerEntries(currentConfig)}>
-                {([providerName, provider]) => (
-                  <ActionRow class="provider-row" selected={visibleProviderName() === providerName}>
+              <For each={providerEntries(currentConfig()).map(([name]) => name)}>
+                {(providerName) => {
+                  const provider = () => currentConfig().providers[providerName];
+                  const expanded = () => !providerFormDraft() && selectedProvider() === providerName && !authCollapsed();
+                  return <ActionRow class="provider-row" selected={visibleProviderName() === providerName}>
                     <button
                       type="button"
                       class="provider-row__summary"
-                      aria-pressed={visibleProviderName() === providerName}
-                      onClick={() => setSelectedProvider(providerName)}
+                      aria-expanded={expanded()}
+                      onClick={() => {
+                        setAuthCollapsed(expanded());
+                        setSelectedProvider(providerName);
+                      }}
                     >
                       <strong>{providerName}</strong>
-                      <span>{provider.kind}</span>
-                      <code>{provider.url || "No URL configured"}</code>
+                      <span>{provider()?.kind}</span>
+                      <code>{provider()?.url || "No URL configured"}</code>
                     </button>
                     <Show
                       when={deleteProvider() === providerName}
@@ -267,15 +273,15 @@ export function ProvidersSection(props: ParentProps & {
                         onCancel={() => setDeleteProvider(undefined)}
                       />
                     </Show>
-                  </ActionRow>
-                )}
+                    <Show when={expanded()}>
+                      <AuthStatusPanel target={{ kind: "provider", key: providerName }} />
+                    </Show>
+                  </ActionRow>;
+                }}
               </For>
             </Show>
           </ActionList>
         )}
-      </Show>
-      <Show when={!providerFormDraft() && selectedProvider()}>
-        {(providerName) => <AuthStatusPanel target={{ kind: "provider", key: providerName() }} />}
       </Show>
       <Show when={providerFormDraft()}>
         {(draft) => (
@@ -487,8 +493,8 @@ function ProviderFormPanel(props: {
               )}
             </Show>
           </fieldset>
-          <Show when={form().mode === "edit" && form().originalName}>
-            {(providerName) => <AuthStatusPanel target={{ kind: "provider", key: providerName() }} />}
+          <Show when={form().mode === "edit" && form().originalName} keyed>
+            {(providerName) => <AuthStatusPanel target={{ kind: "provider", key: providerName }} />}
           </Show>
           <div class="config__form-actions">
             <button type="submit" disabled={props.pending}>Save</button>

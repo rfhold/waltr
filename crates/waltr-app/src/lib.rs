@@ -527,6 +527,34 @@ fn client_state(
 }
 
 #[tauri::command]
+async fn entry_destinations(
+    generation: u64,
+    bridge: State<'_, Arc<RuntimeBridge>>,
+    server: State<'_, EmbeddedServerController>,
+) -> Result<Vec<waltr_client::DestinationEntry>, String> {
+    let connection = bridge.with_current(generation, || {
+        server.connection().ok_or_else(|| "Local server unavailable".to_owned())
+    })?;
+    let credentials = waltr_client::NativeCredentialProvider::new();
+    credentials
+        .replace_bearer_token(&connection.bearer)
+        .map_err(|_| "Local server unavailable".to_owned())?;
+    let entry = waltr_client::NativeGrpcTransport::with_credential_provider(
+        connection.endpoint, credentials,
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        waltr_client::entry_destinations(&entry),
+    ).await;
+    bridge.with_current(generation, || {
+        if server.connection().map(|value| value.generation) != Some(connection.generation) {
+            return Err("Local server unavailable".to_owned());
+        }
+        result.ok().and_then(Result::ok).ok_or_else(|| "Remote list unavailable".to_owned())
+    })
+}
+
+#[tauri::command]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri command injection owns State"
@@ -545,7 +573,6 @@ async fn dispose_runtime(
     let _operation = selection.operation.lock().await;
     if let Some(generation) = generation {
         if bridge.stop_generation_nonblocking(generation) {
-            selection.ticket.fetch_add(1, Ordering::AcqRel);
             #[cfg(target_os = "android")]
             if let Some(lifecycle) = MOBILE_LIFECYCLE.get() {
                 let mut lifecycle = lifecycle
@@ -1092,6 +1119,7 @@ pub fn run() {
             client_dispatch,
             dismiss_audio_failure,
             client_state,
+            entry_destinations,
             dispose_runtime,
             open_external_url,
             open_authorization_attempt,

@@ -558,7 +558,7 @@ Generation-bound outbound MCP attempts and credentials do not reopen. Same-gener
 
 ## Destinations
 
-The entry server is the embedded server in Tauri, the current origin in a hosted browser, and the configured endpoint in the TUI. Open a named Remote from **Config → Remotes** in the web shell, or set `WALTR_DESTINATION` for the TUI. Remote web views carry the destination in the URL. Unqualified URLs and shortcuts with no destination use the entry server.
+The entry server is the embedded server in Tauri, the current origin in a hosted browser, and the configured endpoint in the TUI. Use the circle icons in the web sidebar to switch views, or set `WALTR_DESTINATION` for the TUI. The sidebar reads a narrow Remote directory from the entry server, even when the selected view belongs to another server. Provider authorization stays under the selected server’s Config. Remote authorization stays under the entry server’s **Config → Remotes**. A switch opens the selected server’s home page and does not change desktop shortcuts. Unqualified URLs and shortcuts with no destination use the entry server.
 
 The shared transport sends `waltr-destination: <name>@<id>` on destination-scoped calls, including watch streams and Routine media. Typed API callers obtain `<id>` from `GetAuthStatus` for the entry server's `RemoteKey` target, in `metadata.remoteRouteId`. The ID binds the view to a grant, survives token refresh, and is not a credential. A new grant requires a fresh view. Remote resource writes and Remote authorization controls stay at the entry.
 
@@ -571,6 +571,7 @@ The adapter listens before runtime start and preserves generation/sequence check
 | IPC command | Arguments |
 | --- | --- |
 | `start_runtime` | `{ destination? }`; connects to the embedded server and returns the generation and platform-gated `dictation` capability. |
+| `entry_destinations` | `{ generation }`; lists Remote names and usable route IDs from the embedded entry, even in a Remote view. |
 | `dictation_start` | `{ generation, operationId, selection: { routine, trigger, input, output }, sessionId }`; session identity stays local. |
 | `dictation_finish`, `dictation_status`, `dictation_cancel` | `{ generation, operationId }`; no media crosses IPC. |
 | `client_state` | `{ afterSequence }`; the adapter validates the returned generation. |

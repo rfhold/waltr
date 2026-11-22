@@ -10,7 +10,7 @@ exports[`OAuth config presentation > MCP expired credential status and registrat
   >
     <div>
       <h3>
-        Authentication
+        Authentication for remote
       </h3>
       <p>
         Credentials stay on the server and are never shown here.
@@ -617,7 +617,7 @@ exports[`OAuth config presentation > provider public-client editor and credentia
   >
     <div>
       <h3>
-        Authentication
+        Authentication for claude
       </h3>
       <p>
         Credentials stay on the server and are never shown here.
@@ -699,7 +699,7 @@ exports[`OAuth config presentation > provider retained status after auth-list fa
   >
     <div>
       <h3>
-        Authentication
+        Authentication for claude
       </h3>
       <p>
         Credentials stay on the server and are never shown here.
