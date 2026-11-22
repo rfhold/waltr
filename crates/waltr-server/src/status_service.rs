@@ -1,16 +1,16 @@
 //! Implementation of the generated `StatusService`.
 
-use waltr::grpc::waltr::status::v1::{
-    SystemStatus, WatchStatusRequest, WatchStatusResponse,
-    status_service_server::StatusService as GeneratedStatusService,
-};
 use std::pin::Pin;
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
+use waltr::grpc::waltr::status::v1::{
+    GetFeatureStatusRequest, GetFeatureStatusResponse, SystemStatus, WatchStatusRequest,
+    WatchStatusResponse, status_service_server::StatusService as GeneratedStatusService,
+};
 
 /// gRPC status service for system-level server readiness.
-#[derive(Clone, Debug, Default)]
-pub struct StatusService;
+#[derive(Clone, Debug)]
+pub struct StatusService(pub(crate) crate::readiness::Readiness);
 
 #[tonic::async_trait]
 impl GeneratedStatusService for StatusService {
@@ -28,5 +28,12 @@ impl GeneratedStatusService for StatusService {
         .chain(tokio_stream::pending());
 
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn get_feature_status(
+        &self,
+        _request: Request<GetFeatureStatusRequest>,
+    ) -> Result<Response<GetFeatureStatusResponse>, Status> {
+        Ok(Response::new(self.0.features().await))
     }
 }

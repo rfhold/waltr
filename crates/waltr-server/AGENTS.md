@@ -120,7 +120,7 @@ Retain only supported outbound OAuth environment names. Keep arbitrary environme
 
 Keep one ordinary bundled and persisted resource catalog for standalone and embedded hosts. A build without the `shell` feature still accepts and exposes shell-bearing definitions, but runtime construction omits the shell tool and feature-derived shell tool permissions. Stdio MCP resources materialize and use ordinary runtime behavior in every build.
 
-Standalone mode uses `WALTR_SANDBOX_SOCKET=/run/waltr-sandbox/gateway.sock` for a local Unix domain socket and `WALTR_WORKSPACE_ROOT=/workspace` for the workspace identity. Connect a separate worker with the same socket path and `WALTR_SANDBOX_WORKSPACE_ROOT=/workspace`. Require a connected worker and its canonical root before startup completes; report disconnect through `/ready` without host-side execution fallback. Keep the socket private and off public routes/TCP.
+Standalone mode uses `WALTR_SANDBOX_SOCKET=/run/waltr-sandbox/gateway.sock` for a local Unix domain socket and `WALTR_WORKSPACE_ROOT=/workspace` for the workspace identity. Connect a separate worker with the same socket path and `WALTR_SANDBOX_WORKSPACE_ROOT=/workspace`. Require a connected worker and its canonical root before startup completes. Report a later disconnect in `GetFeatureStatus`, not `/ready`, and do not fall back to host-side execution. Keep the socket private and off public routes/TCP.
 
 Embedded desktop and Android always start the process-local duplex worker using explicit app-private roots; ignore standalone environment overrides. Shut down the owned worker/gateway with the host. A sidecar's separate mounts do not imply network isolation in a shared pod.
 

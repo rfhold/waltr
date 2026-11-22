@@ -2469,7 +2469,9 @@ mod tests {
         let (_routines, routines) =
             tokio::sync::watch::channel(crate::routine::production::RuntimeHealth::Running);
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let shutdown = tokio_util::sync::CancellationToken::new();
         let readiness = crate::readiness::Readiness {
+            shutdown: shutdown.clone(),
             invocations: None,
             persistence,
             oauth: None,
@@ -2503,7 +2505,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2)).await;
         alive.store(false, std::sync::atomic::Ordering::Release);
         let second = mcp_request(&router, call).await;
-        assert_eq!(second["result"]["structuredContent"]["ready"], false);
+        assert_eq!(second["result"]["structuredContent"]["ready"], true);
         assert!(
             second["result"]["structuredContent"]["observedAtUnixMs"]
                 .as_u64()
@@ -2576,6 +2578,7 @@ mod tests {
                 decoded.ui.permissions,
                 Some(mcp::apps::UiPermissions::default())
             );
+            shutdown.cancel();
             let refresh = mcp_request(&router, json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"status","arguments":{},"_meta":meta}})).await;
             assert_eq!(refresh["result"]["structuredContent"]["ready"], false);
             assert_eq!(

@@ -90,7 +90,7 @@ Every installation requires a default worker named `local` for workspace filesys
 
 Mount a writable socket directory at `/run/waltr-sandbox` in both processes with permissions that let their runtime identities connect. Share the socket directory, not a TCP port. Mount the workspace at `/workspace` in the worker. The worker's canonical root must match the server's selected workspace root. Standalone deployments must set the socket to use the separate process. Embedded Tauri hosts use in-process duplex transport and explicit app-private workspace paths.
 
-Compose defines static `dev`, `test`, and `test-auth` profiles, not a dynamic worker-mode profile. The worker is an internal service in each profile; server/test health gates must wait for a working connection. The test fixtures keep `/data` and workspace state ephemeral. A lost UDS stream makes `/ready` fail until the same worker reconnects, while `/health` continues to report server liveness; a worker that cannot connect during startup fails startup rather than silently moving workspace operations into the server. See [Private Workspace Boundary](architecture/agent.md#private-workspace-boundary) for request deadlines, reconnect, and unknown-outcome handling.
+Compose defines static `dev`, `test`, and `test-auth` profiles, not a dynamic worker-mode profile. The worker is an internal service in each profile. The test fixtures keep `/data` and workspace state ephemeral. Startup requires a worker connection. After startup, a lost UDS stream makes workspace operations unavailable until the worker reconnects; it does not fail `/ready`. See [Private Workspace Boundary](architecture/agent.md#private-workspace-boundary) for request deadlines, reconnect, and unknown-outcome handling.
 
 ### Export a workspace to another Waltr server
 
@@ -119,7 +119,7 @@ Use `destination: home` in a desktop shortcut and `workspace.machine: laptop` wh
 
 Use HTTPS without a path prefix, URL credentials, query, or fragment. A machine ID identifies one peer at that destination; use 1–128 ASCII letters, digits, periods, underscores, or hyphens. `local` is reserved. The worker resolves `exportRoot` in its own filesystem and expands `~` against its own home. The root sets the starting location, not a sandbox. The tool policy can allow paths outside it, and shell commands inherit the worker's operating-system permissions and mounts. For a sidecar, mount the directory in the worker.
 
-The hosted server rejects a second live connection for `laptop` and keeps the first. Another installation signed into the same account can claim the name after disconnect. The server does not redirect work to `local` or retry an uncertain execution. An offline optional peer does not affect hosted `/ready`; loss of the required default worker does.
+The hosted server rejects a second live connection for `laptop` and keeps the first. Another installation signed into the same account can claim the name after disconnect. The server does not redirect work to `local` or retry an uncertain execution. Neither an offline optional peer nor a default worker disconnect after startup affects `/ready`.
 
 **Stdio MCP.** To allow a stdio resource on this export, add its exact `McpServer` name to `mcpStdioServers`. An empty list allows none. The exporter must define each listed resource with `transport: stdio`. The destination must also define the same name with `transport: stdio` and select it for the session's agent. The destination catalog requires a command, but only the exporter's command runs for this workspace. The child inherits the worker's OS permissions; `exportRoot` does not confine it.
 
@@ -922,7 +922,9 @@ Embedded outbound OAuth uses the exact callback derived from that same prebound 
 
 Embedded configuration contains no client metadata URI. Therefore its local `/.well-known/oauth-client/waltr` route returns `404 Not Found`.
 
-`/health` reports process liveness. `/ready` checks worker connection, persistence, the shared invocation gate and quarantine state, catalog coordination, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content preserves the last-known-good snapshot; failure to coordinate an accepted Routine catalog closes admission and fails readiness. Startup requires a connected worker with a usable canonical root; after disconnect readiness fails until reconnection, without retrying an uncertain tool execution.
+`/health` reports process liveness. `/ready` checks the core Waltr database with a one-second deadline and returns unavailable once shutdown starts. Startup still requires a connected worker with a usable canonical root.
+
+Use the typed `waltr.status.v1.StatusService/GetFeatureStatus` RPC for feature diagnostics. It uses normal Waltr API admission and reports the definition watcher, default worker, Routine catalog, invocation service, and hosted MCP OAuth separately. It reports an absent hosted OAuth configuration as `NOT_CONFIGURED`. The status probe also emits a debug event with the same bounded categories. A degraded feature does not remove the server from ingress. Workspace calls keep their disconnect errors, and Routine coordination failure closes Routine admission. Uncertain invocations remain quarantined and count against Routine capacity. Hosted MCP OAuth retains its own validation and persistence checks.
 
 Startup reconciles unfinished script invocations before the service reports ready. It does not replay uncertain code or tool effects.
 

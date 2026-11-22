@@ -415,14 +415,13 @@ impl Persistence {
         }
     }
 
-    /// Check that both initialized database pools can serve queries.
+    /// Check that the core Waltr database can serve queries.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized backend error when either pool is unavailable.
+    /// Returns a sanitized backend error when the core pool is unavailable.
     pub async fn ready(&self) -> Result<(), PersistenceError> {
-        check_pool(&self.pool).await?;
-        check_pool(&self.mcp_pool).await
+        check_pool(&self.pool).await
     }
 
     pub(crate) fn outbound_oauth_store(&self) -> Arc<OutboundOAuthStore> {

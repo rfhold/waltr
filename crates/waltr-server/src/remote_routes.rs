@@ -551,5 +551,6 @@ routes! {
     }
     "waltr.status.v1.StatusService" => status::status_service_client::StatusServiceClient<Channel> {
         stream "WatchStatus" => watch_status(status::WatchStatusRequest);
+        unary "GetFeatureStatus" => get_feature_status(status::GetFeatureStatusRequest);
     }
 }

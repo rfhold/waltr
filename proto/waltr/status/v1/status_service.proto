@@ -4,6 +4,7 @@ package waltr.status.v1;
 
 service StatusService {
   rpc WatchStatus(WatchStatusRequest) returns (stream WatchStatusResponse);
+  rpc GetFeatureStatus(GetFeatureStatusRequest) returns (GetFeatureStatusResponse);
 }
 
 message SystemStatus {
@@ -14,4 +15,21 @@ message WatchStatusRequest {}
 
 message WatchStatusResponse {
   SystemStatus status = 1;
+}
+
+message GetFeatureStatusRequest {}
+
+enum FeatureHealth {
+  FEATURE_HEALTH_UNSPECIFIED = 0;
+  FEATURE_HEALTH_HEALTHY = 1;
+  FEATURE_HEALTH_DEGRADED = 2;
+  FEATURE_HEALTH_NOT_CONFIGURED = 3;
+}
+
+message GetFeatureStatusResponse {
+  FeatureHealth definition_watcher = 1;
+  FeatureHealth default_worker = 2;
+  FeatureHealth routine_catalog = 3;
+  FeatureHealth routine_invocations = 4;
+  FeatureHealth hosted_mcp_oauth = 5;
 }

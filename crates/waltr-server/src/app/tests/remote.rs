@@ -40,7 +40,10 @@ use waltr::grpc::waltr::{
         CreateSessionRequest, ListSessionsResponse, WorkspaceSelection,
         session_service_client::SessionServiceClient,
     },
-    status::v1::{WatchStatusRequest, status_service_client::StatusServiceClient},
+    status::v1::{
+        FeatureHealth, GetFeatureStatusRequest, WatchStatusRequest,
+        status_service_client::StatusServiceClient,
+    },
 };
 
 mod stdio_mcp;
@@ -232,6 +235,12 @@ async fn remote_authorizes_exports_refreshes_and_stops_without_fallback() {
 
     let initial_expiry = authorize(&mut auth, &idp).await;
     let selector = route_selector(&mut auth).await;
+    let features = routed_status
+        .get_feature_status(routed(GetFeatureStatusRequest {}, &selector))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(features.default_worker(), FeatureHealth::Healthy);
     wait_for("exported machine claim", || {
         machines.owns_live(MACHINE, &account)
     })

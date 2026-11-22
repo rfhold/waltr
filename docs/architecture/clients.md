@@ -75,7 +75,7 @@ Routine traffic uses `waltr.routine.v2.RoutineService` in standalone and embedde
 
 Absent code-mode opt-in adds no agent tool; a configured code tool remains bound to the originating real lease and durable session incarnation. See [Routines](routines.md).
 
-Status traffic uses the status service to watch system readiness. Catalog watch maintenance waits until the server reports ready.
+Status traffic uses `WatchStatus` to observe API admission. Catalog watch maintenance waits until the server reports ready. `GetFeatureStatus` reports independent feature health for diagnostics; it does not gate client startup.
 
 `crates/waltr-client/src/transport/mod.rs` defines the runtime-neutral `WaltrTransport` trait and the default transports:
 

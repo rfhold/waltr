@@ -532,6 +532,12 @@ async fn finished_driver_join_failure_is_sticky_even_after_reusable_was_set() {
         assert_eq!(gate.quarantined, 1);
         assert!(!gate.entries.contains_key("failed-driver"));
     }
+    assert!(fixture.service.is_ready());
+    assert!(!fixture.service.feature_healthy());
+    fixture.service.set_maintenance(true).unwrap();
+    assert!(!fixture.service.is_ready());
+    fixture.service.set_maintenance(false).unwrap();
+    assert!(fixture.service.is_ready());
     let outcome = completion.outcome.lock().unwrap().clone().unwrap();
     assert!(outcome.status.is_none());
     assert!(!outcome.cleanup_complete);
@@ -539,6 +545,7 @@ async fn finished_driver_join_failure_is_sticky_even_after_reusable_was_set() {
         fixture.service.shutdown().await,
         Err(PortError::Uncertain)
     ));
+    assert!(!fixture.service.is_ready());
 }
 
 #[tokio::test]

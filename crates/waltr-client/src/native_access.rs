@@ -4349,7 +4349,8 @@ mod tests {
         use waltr::grpc::waltr::{
             auth::v1::{AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason},
             status::v1::{
-                WatchStatusRequest, WatchStatusResponse,
+                GetFeatureStatusRequest, GetFeatureStatusResponse, WatchStatusRequest,
+                WatchStatusResponse,
                 status_service_server::{StatusService, StatusServiceServer},
             },
         };
@@ -4359,6 +4360,13 @@ mod tests {
         #[tonic::async_trait]
         impl StatusService for LoginRequiredStatus {
             type WatchStatusStream = stream::Empty<Result<WatchStatusResponse, tonic::Status>>;
+
+            async fn get_feature_status(
+                &self,
+                _: tonic::Request<GetFeatureStatusRequest>,
+            ) -> Result<tonic::Response<GetFeatureStatusResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("feature status not exercised"))
+            }
 
             async fn watch_status(
                 &self,

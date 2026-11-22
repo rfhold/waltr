@@ -164,8 +164,16 @@ impl Drop for InvocationHandle {
 }
 
 impl InvocationService {
-    /// Readiness excludes maintenance, shutdown, and unverifiable retained cleanup.
+    /// Check the admission lifecycle, not individual invocation cleanup.
+    /// Quarantined invocations retain their resources and still count against Routine capacity.
     pub fn is_ready(&self) -> bool {
+        self.shared
+            .gate
+            .lock()
+            .is_ok_and(|gate| !gate.maintenance && !gate.shutdown)
+    }
+
+    pub(crate) fn feature_healthy(&self) -> bool {
         self.shared.gate.lock().is_ok_and(|gate| {
             !gate.maintenance && !gate.shutdown && !gate.failed && gate.quarantined == 0
         })

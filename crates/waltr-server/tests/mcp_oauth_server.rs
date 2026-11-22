@@ -480,7 +480,7 @@ async fn restart_preserves_the_active_signing_key_and_registered_client()
 }
 
 #[tokio::test]
-async fn readiness_fails_closed_when_active_signing_public_key_mismatches_private_key()
+async fn signing_key_mismatch_degrades_hosted_oauth_without_failing_core_readiness()
 -> Result<(), Box<dyn std::error::Error>> {
     waltr_server::isolate_application_test!();
     let fixture = setup_access_auth_browser_fixture();
@@ -494,6 +494,35 @@ async fn readiness_fails_closed_when_active_signing_public_key_mismatches_privat
         client.get(server.url("/ready")).send().await?.status(),
         StatusCode::OK
     );
+    use waltr::grpc::waltr::status::v1::{
+        FeatureHealth, GetFeatureStatusRequest, status_service_client::StatusServiceClient,
+    };
+    let channel = tonic::transport::Endpoint::from_shared(server.base_url())?.connect().await?;
+    let mut status = StatusServiceClient::new(channel);
+    assert_eq!(
+        status
+            .get_feature_status(GetFeatureStatusRequest {})
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let request = || {
+        let mut request = tonic::Request::new(GetFeatureStatusRequest {});
+        let token = fixture.access_token(Duration::from_hours(1));
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    };
+    assert_eq!(
+        status
+            .get_feature_status(request())
+            .await?
+            .into_inner()
+            .hosted_mcp_oauth(),
+        FeatureHealth::Healthy,
+    );
 
     fixture.corrupt_mcp_signing_public_key().await;
 
@@ -503,7 +532,15 @@ async fn readiness_fails_closed_when_active_signing_public_key_mismatches_privat
     );
     assert_eq!(
         client.get(server.url("/ready")).send().await?.status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
+    );
+    assert_eq!(
+        status
+            .get_feature_status(request())
+            .await?
+            .into_inner()
+            .hosted_mcp_oauth(),
+        FeatureHealth::Degraded,
     );
     server.stop();
     Ok(())

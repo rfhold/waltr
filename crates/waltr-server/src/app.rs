@@ -172,7 +172,7 @@ impl ServerApplication {
             .clone()
     }
 
-    /// Check all server-owned readiness dependencies directly.
+    /// Check core readiness directly.
     async fn ready(&self) -> bool {
         let Some(readiness) = self.readiness.clone() else {
             return false;
@@ -180,7 +180,7 @@ impl ServerApplication {
         readiness.is_ready().await
     }
 
-    /// Wait until all server-owned readiness dependencies are ready.
+    /// Wait until core readiness passes.
     pub async fn wait_until_ready(&self) {
         loop {
             if self.ready().await {
@@ -199,13 +199,16 @@ impl ServerApplication {
             oauth_maintenance,
             routine_engine,
             session_host,
-            readiness: _,
+            readiness,
             test_background,
             workspace_exports,
             sandbox,
             app_container,
             self_mcp,
         } = self;
+        if let Some(readiness) = readiness {
+            readiness.shutdown.cancel();
+        }
         machines.shutdown();
         drop(router);
         if let Some(exports) = workspace_exports {
@@ -393,7 +396,7 @@ impl ServerApplication {
             oauth_maintenance,
             routine_engine,
             session_host,
-            readiness: _,
+            readiness,
             test_background,
             workspace_exports,
             sandbox,
@@ -404,6 +407,7 @@ impl ServerApplication {
         let child_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_child_failed = child_failed.clone();
         let shutdown_machines = machines.clone();
+        let shutdown_readiness = readiness.as_ref().map(|state| state.shutdown.clone());
         let owned_shutdown = async move {
             tokio::pin!(shutdown);
             tokio::select! {
@@ -416,10 +420,16 @@ impl ServerApplication {
                     }
                 } => { shutdown_child_failed.store(true, std::sync::atomic::Ordering::Release); },
             }
+            if let Some(shutdown) = shutdown_readiness {
+                shutdown.cancel();
+            }
             shutdown_machines.shutdown();
         };
         let result =
             crate::http_lifecycle::serve_owned_connections(listener, router, owned_shutdown).await;
+        if let Some(readiness) = readiness {
+            readiness.shutdown.cancel();
+        }
         machines.shutdown();
         if let Some(exports) = workspace_exports {
             exports.shutdown().await;
@@ -1250,6 +1260,7 @@ where
         waltr_mcp
     };
     let readiness = Readiness {
+        shutdown: CancellationToken::new(),
         persistence,
         oauth: mcp_oauth.clone(),
         definitions: definition_watcher.health(),
@@ -1277,7 +1288,7 @@ where
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service.clone()));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
     grpc_routes.add_service(routine_engine.rpc.clone().into_server());
-    grpc_routes.add_service(StatusServiceServer::new(StatusService));
+    grpc_routes.add_service(StatusServiceServer::new(StatusService(readiness.clone())));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()
         .layer(OtelGrpcLayer::default())
@@ -1744,7 +1755,11 @@ mod tests {
             .unwrap();
         app.sandbox.as_ref().unwrap().stop_worker_for_test();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while app.ready().await {
+            let readiness = app.readiness.as_ref().unwrap();
+            while readiness
+                .sandbox_alive
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1765,10 +1780,25 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(ready.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ready.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            app.readiness.as_ref().unwrap().features().await.default_worker(),
+            waltr::grpc::waltr::status::v1::FeatureHealth::Degraded,
+        );
 
+        let router = app.router();
         let error = app.bind("127.0.0.1:0".parse().unwrap()).await.unwrap_err();
         assert!(error.to_string().contains("sandbox worker unavailable"));
+        let stopped = tower::ServiceExt::oneshot(
+            router,
+            Request::builder()
+                .uri("/ready")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
