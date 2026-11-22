@@ -40,6 +40,7 @@ Do not use this skill to implement fixes unless the user asks for changes after 
 | Unnecessary UI gating | Empty data or transient state hides a supported route, tab, or prerequisite. | [Unnecessary UI gating](references/unnecessary-ui-gating.md) |
 | UI parity | Web and TUI shared flows diverging in labels, empty states, errors, or available actions. | `references/ui-parity.md` |
 | Test layering | Tests asserted at the wrong layer, duplicate lower-layer coverage, or omit contract/lifecycle cases. | `references/test-layering.md` |
+| Low-value test assertions | Counts, hard-coded inventories, or snapshots fail on routine additions without detecting a contract violation. | [Low-value test assertions](references/low-value-test-assertions.md) |
 | Unnecessary smoke stages | An extra validation stage repeats evidence or blocks progress without testing a distinct risk. | [Unnecessary smoke stages](references/unnecessary-smoke-stages.md) |
 | Obsessive checks | Locks, snapshots, trust checks, duplicate validation, session stops, or transactions impose stronger guarantees than callers need. | [Obsessive checks](references/obsessive-checks.md) |
 | Obsessive legacy migration handling | Flags, opt-ins, compatibility branches, or legacy wording protect no deployed consumer or supported rollout. | [Obsessive legacy migration handling](references/obsessive-legacy-migration-handling.md) |

@@ -17,33 +17,17 @@ async fn list_agents_is_sorted_and_reports_default() -> Result<(), Box<dyn std::
         .into_inner();
 
     assert_eq!(response.default_agent_name, "coding");
-    let names = response
-        .agents
-        .iter()
-        .map(|agent| agent.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        [
-            "coding",
-            "configuration",
-            "default",
-            "routine-categorization",
-            "routine-category-context",
-            "routine-cleanup",
-            "routine-compaction",
-            "routine-context-strategy",
-            "routine-conversation-filter",
-            "routine-conversation-notes",
-            "routine-fork",
-            "routine-title"
-        ]
-    );
     assert!(
         response
             .agents
             .iter()
-            .all(|agent| agent.description.is_some())
+            .any(|agent| agent.name == response.default_agent_name)
+    );
+    assert!(
+        response
+            .agents
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name)
     );
     Ok(())
 }

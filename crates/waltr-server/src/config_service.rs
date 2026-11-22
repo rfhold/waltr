@@ -216,14 +216,13 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response.catalog.unwrap().resources.len(), 16);
-
         let mut watch = service
             .watch_resource_catalog(Request::new(WatchResourceCatalogRequest {}))
             .await
             .unwrap()
             .into_inner();
         let initial = watch.next().await.unwrap().unwrap().catalog.unwrap();
+        assert_eq!(response.catalog.as_ref(), Some(&initial));
         let initial_resource = initial
             .resources
             .iter()
@@ -249,7 +248,18 @@ mod tests {
             .unwrap();
         let changed = watch.next().await.unwrap().unwrap().catalog.unwrap();
         assert_ne!(changed.etag, initial.etag);
-        assert_eq!(changed.resources.len(), 16);
+        let changed_resource = changed
+            .resources
+            .iter()
+            .find(|resource| resource.path == "agents/coding.yaml")
+            .unwrap();
+        assert!(changed_resource.active_source.contains("description: watched"));
+        let read_back = service
+            .get_resource_catalog(Request::new(GetResourceCatalogRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(read_back.catalog, Some(changed));
     }
 
     #[tokio::test]
