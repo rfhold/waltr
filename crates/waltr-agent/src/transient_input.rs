@@ -12,7 +12,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-use crate::{BoxStreamFuture, CompletionRequest, LlmError, LlmStream, Result, TimelineCursor};
+use crate::{
+    BoxStreamFuture, CompletionRequest, LlmError, LlmStream, MessageImageLoadError,
+    MessageImageLocation, MessageImageResolver, Result, TimelineCursor, UserMessagePart,
+    has_user_message_content, user_message::text_part,
+};
 
 const MIB: usize = 1024 * 1024;
 /// Maximum source size of one inline attachment.
@@ -270,10 +274,36 @@ impl fmt::Debug for TransientAttachment {
 }
 
 impl TransientAttachment {
-    /// Metadata only; never contains source or encoded bytes.
+    /// Return a verified descriptor for a supported image, without exposing its bytes.
+    #[must_use]
+    pub fn image_descriptor(&self) -> Option<crate::MessageImageDescriptor> {
+        let format = crate::MessageImageFormat::from_media_type(self.0.kind.media_type())?;
+        crate::MessageImageDescriptor::for_bytes(format, &self.0.bytes)
+    }
+
+    /// Copy this payload into a precharged buffer of the same kind.
+    ///
+    /// # Errors
+    /// Rejects a kind mismatch or insufficient remaining capacity.
+    pub fn copy_into(&self, target: &mut TransientAttachmentBuffer) -> Result<()> {
+        if self.0.kind != target.kind {
+            return Err(invalid("transient attachment kind mismatch"));
+        }
+        target.append(&self.0.bytes)
+    }
+
+    /// Metadata only; never contains source or encoded bytes, or an image digest.
     #[must_use]
     pub fn audit(&self) -> Value {
-        json!({"mediaType": self.0.kind.media_type(), "size": self.0.bytes.len(), "sha256": self.0.digest})
+        let mut metadata =
+            json!({"mediaType": self.0.kind.media_type(), "size": self.0.bytes.len()});
+        if matches!(
+            self.0.kind,
+            TransientInputKind::Utf8 | TransientInputKind::Pdf
+        ) {
+            metadata["sha256"] = json!(self.0.digest);
+        }
+        metadata
     }
 }
 
@@ -321,9 +351,27 @@ pub enum TransientInputApi {
 pub struct TransientInput {
     attachments: Vec<TransientAttachment>,
     target: TransientPromptTarget,
+    messages: Vec<OrderedMessage>,
     capabilities: TransientModelCapabilities,
     budget: TransientInputBudget,
     measure_binary: bool,
+    follow_up: bool,
+    canonical_messages: bool,
+}
+
+#[derive(Clone)]
+struct OrderedMessage {
+    target: TransientPromptTarget,
+    parts: Vec<UserMessagePart<TransientAttachment>>,
+}
+
+impl fmt::Debug for OrderedMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrderedMessage")
+            .field("target", &self.target)
+            .field("part_count", &self.parts.len())
+            .finish()
+    }
 }
 
 impl TransientInput {
@@ -338,36 +386,123 @@ impl TransientInput {
         capabilities: TransientModelCapabilities,
         attachments: Vec<TransientAttachment>,
     ) -> Result<Self> {
-        if attachments.is_empty() || attachments.len() > 4 || capabilities.max_body_bytes == 0 {
+        let input = Self {
+            attachments,
+            target,
+            messages: Vec::new(),
+            capabilities,
+            budget: budget.clone(),
+            measure_binary: false,
+            follow_up: false,
+            canonical_messages: false,
+        };
+        input.check_source_bounds()?;
+        input.preflight()?;
+        Ok(input)
+    }
+
+    /// Bind verified parts to a committed follow-up prompt. The supplied text
+    /// must equal the text projection of that prompt at provider dispatch.
+    ///
+    /// # Errors
+    /// Rejects non-image attachments, invalid order, or aggregate limit violations.
+    pub fn with_ordered_follow_up(
+        mut self,
+        target: TransientPromptTarget,
+        parts: Vec<UserMessagePart<TransientAttachment>>,
+    ) -> Result<Self> {
+        let previous = self
+            .messages
+            .last()
+            .map_or(self.target, |entry| entry.target);
+        if target.prompt_index <= previous.prompt_index
+            || target.turn < previous.turn
+            || target.cursor <= previous.cursor
+            || parts.len() > 32
+            || !has_user_message_content(&parts)
+            || !parts
+                .iter()
+                .any(|part| matches!(part, UserMessagePart::Image { .. }))
+        {
+            return Err(invalid("invalid ordered transient message"));
+        }
+        let text_bytes = parts.iter().try_fold(0usize, |bytes, part| match part {
+            UserMessagePart::Text { text } => bytes.checked_add(text.len()),
+            UserMessagePart::Image { image } => {
+                let format = crate::MessageImageFormat::from_media_type(image.0.kind.media_type())?;
+                format.matches_signature(&image.0.bytes).then_some(bytes)
+            }
+        });
+        if text_bytes.is_none_or(|bytes| bytes > 16384) {
+            return Err(invalid("invalid ordered transient message part"));
+        }
+        self.messages.push(OrderedMessage { target, parts });
+        self.check_source_bounds()?;
+        self.preflight()?;
+        Ok(self)
+    }
+
+    fn sources(&self) -> impl Iterator<Item = &TransientAttachment> {
+        self.attachments
+            .iter()
+            .chain(self.messages.iter().flat_map(|message| {
+                message.parts.iter().filter_map(|part| match part {
+                    UserMessagePart::Image { image } => Some(image),
+                    UserMessagePart::Text { .. } => None,
+                })
+            }))
+    }
+
+    fn check_source_bounds(&self) -> Result<()> {
+        if self.capabilities.max_body_bytes == 0 {
             return Err(invalid("invalid transient input bounds"));
         }
         let mut total = 0usize;
-        for attachment in &attachments {
-            if !Arc::ptr_eq(&attachment.0.source_credit.counter, &budget.source) {
+        let mut count = 0;
+        for attachment in self.sources() {
+            if !Arc::ptr_eq(&attachment.0.source_credit.counter, &self.budget.source) {
                 return Err(invalid("transient input budget mismatch"));
             }
             total = total
                 .checked_add(attachment.0.source_credit.bytes)
                 .ok_or_else(|| invalid("transient source overflow"))?;
+            count += 1;
         }
-        if total > MAX_TRANSIENT_SOURCE_BYTES {
+        if (!self.canonical_messages && !(1..=4).contains(&count))
+            || total > MAX_TRANSIENT_SOURCE_BYTES
+        {
             return Err(invalid("transient source limit exceeded"));
         }
-        let input = Self {
-            attachments,
-            target,
-            capabilities,
-            budget: budget.clone(),
-            measure_binary: false,
-        };
-        input.preflight()?;
-        Ok(input)
+        Ok(())
     }
 
     /// Borrow the host-pinned prompt identity.
     #[must_use]
     pub const fn target(&self) -> TransientPromptTarget {
         self.target
+    }
+
+    pub(crate) const fn is_follow_up(&self) -> bool {
+        self.follow_up
+    }
+
+    pub(crate) fn ordered_targets(&self) -> impl Iterator<Item = TransientPromptTarget> + '_ {
+        self.messages.iter().map(|message| message.target)
+    }
+
+    pub(crate) fn for_image_follow_up(&self) -> Option<Self> {
+        self.attachments
+            .iter()
+            .all(|item| {
+                matches!(
+                    item.0.kind,
+                    TransientInputKind::Png | TransientInputKind::Jpeg | TransientInputKind::WebP
+                )
+            })
+            .then(|| Self {
+                follow_up: true,
+                ..self.clone()
+            })
     }
 
     /// Metadata-only, explicitly non-replayable audit representation.
@@ -378,7 +513,7 @@ impl TransientInput {
     }
 
     pub(crate) fn preflight(&self) -> Result<()> {
-        for item in &self.attachments {
+        for item in self.sources() {
             let supported = match item.0.kind {
                 TransientInputKind::Utf8 => self.capabilities.text,
                 TransientInputKind::Pdf => self.capabilities.pdf,
@@ -393,39 +528,98 @@ impl TransientInput {
         Ok(())
     }
 
-    pub(crate) const fn matches_prompt(&self, index: usize) -> bool {
-        self.target.prompt_index == index
+    pub(crate) fn user_content(
+        &self,
+        index: usize,
+        prompt: &str,
+        api: TransientInputApi,
+    ) -> Option<Vec<Value>> {
+        if !self.attachments.is_empty() && self.target.prompt_index == index {
+            let mut parts = self.content(api);
+            parts.push(text_part(api, prompt));
+            return Some(parts);
+        }
+        self.messages
+            .iter()
+            .find(|message| message.target.prompt_index == index)
+            .map(|message| {
+                message
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        UserMessagePart::Text { text } => text_part(api, text),
+                        UserMessagePart::Image { image } => self.encode_part(image, api),
+                    })
+                    .collect()
+            })
     }
 
     pub(crate) fn content(&self, api: TransientInputApi) -> Vec<Value> {
-        self.attachments.iter().map(|item| {
-            let payload = &item.0;
-            if payload.kind == TransientInputKind::Utf8 {
-                let text = std::str::from_utf8(&payload.bytes).expect("constructor checked UTF-8");
-                return json!({"type": if api == TransientInputApi::OpenAiResponses { "input_text" } else { "text" }, "text": text});
+        self.attachments
+            .iter()
+            .map(|item| self.encode_part(item, api))
+            .collect()
+    }
+
+    fn encode_part(&self, item: &TransientAttachment, api: TransientInputApi) -> Value {
+        let payload = &item.0;
+        if payload.kind == TransientInputKind::Utf8 {
+            let text = std::str::from_utf8(&payload.bytes).expect("constructor checked UTF-8");
+            return text_part(api, text);
+        }
+        let data = if self.measure_binary {
+            String::new()
+        } else {
+            #[cfg(test)]
+            payload.encodings.fetch_add(1, Ordering::SeqCst);
+            STANDARD.encode(&payload.bytes)
+        };
+        let mime = payload.kind.media_type();
+        match (api, payload.kind) {
+            (TransientInputApi::Anthropic, kind) => {
+                json!({"type": if kind == TransientInputKind::Pdf { "document" } else { "image" }, "source": {"type": "base64", "media_type": mime, "data": data}})
             }
-            let data = if self.measure_binary { String::new() } else {
-                #[cfg(test)] payload.encodings.fetch_add(1, Ordering::SeqCst);
-                STANDARD.encode(&payload.bytes)
-            };
-            let mime = payload.kind.media_type();
-            match (api, payload.kind) {
-                (TransientInputApi::Anthropic, kind) => json!({"type": if kind == TransientInputKind::Pdf { "document" } else { "image" }, "source": {"type": "base64", "media_type": mime, "data": data}}),
-                (TransientInputApi::OpenAiChat, TransientInputKind::Pdf) => json!({"type": "file", "file": {"filename": "attachment.pdf", "file_data": format!("data:{mime};base64,{data}")}}),
-                (TransientInputApi::OpenAiResponses, TransientInputKind::Pdf) => json!({"type": "input_file", "filename": "attachment.pdf", "file_data": format!("data:{mime};base64,{data}")}),
-                (TransientInputApi::OpenAiChat, _) => json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{data}")}}),
-                (TransientInputApi::OpenAiResponses, _) => json!({"type": "input_image", "image_url": format!("data:{mime};base64,{data}")}),
+            (TransientInputApi::OpenAiChat, TransientInputKind::Pdf) => {
+                json!({"type": "file", "file": {"filename": "attachment.pdf", "file_data": format!("data:{mime};base64,{data}")}})
             }
-        }).collect()
+            (TransientInputApi::OpenAiResponses, TransientInputKind::Pdf) => {
+                json!({"type": "input_file", "filename": "attachment.pdf", "file_data": format!("data:{mime};base64,{data}")})
+            }
+            (TransientInputApi::OpenAiChat, _) => {
+                json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{data}")}})
+            }
+            (TransientInputApi::OpenAiResponses, _) => {
+                json!({"type": "input_image", "image_url": format!("data:{mime};base64,{data}")})
+            }
+        }
     }
 
     pub(crate) fn validate_request(&self, request: &CompletionRequest<'_>) -> Result<()> {
-        let prompt = request
-            .prompt_turns
-            .get(self.target.prompt_index)
-            .ok_or_else(|| invalid("transient prompt target missing"))?;
-        if prompt.turn != self.target.turn {
-            return Err(invalid("transient prompt target changed"));
+        if !self.attachments.is_empty() {
+            let prompt = request
+                .prompt_turns
+                .get(self.target.prompt_index)
+                .ok_or_else(|| invalid("transient prompt target missing"))?;
+            if prompt.turn != self.target.turn {
+                return Err(invalid("transient prompt target changed"));
+            }
+        }
+        for message in &self.messages {
+            let prompt = request
+                .prompt_turns
+                .get(message.target.prompt_index)
+                .ok_or_else(|| invalid("transient follow-up target missing"))?;
+            let text = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    UserMessagePart::Text { text } => Some(text.as_str()),
+                    UserMessagePart::Image { .. } => None,
+                })
+                .collect::<String>();
+            if prompt.turn != message.target.turn || text != prompt.prompt {
+                return Err(invalid("transient follow-up target changed"));
+            }
         }
         Ok(())
     }
@@ -445,7 +639,7 @@ impl TransientInput {
         serde_json::to_writer(&mut counter, body)
             .map_err(|_| invalid("transient provider body limit exceeded"))?;
         if self.measure_binary {
-            for item in &self.attachments {
+            for item in self.sources() {
                 if item.0.kind != TransientInputKind::Utf8 {
                     let encoded = item
                         .0
@@ -466,6 +660,147 @@ impl TransientInput {
         }
         Ok(())
     }
+}
+
+/// Resolve the committed media projection into the same bounded encoder used
+/// for invocation-local inputs. The temporary provider holds no replay state.
+pub(crate) async fn resolve_message_provider(
+    provider: &Arc<dyn LlmStream>,
+    resolver: Option<&dyn MessageImageResolver>,
+    record: &crate::SessionRecord,
+    messages: &std::collections::BTreeMap<usize, (crate::TimelineItemId, crate::UserMessage)>,
+    request: &CompletionRequest<'_>,
+) -> Result<Option<Arc<dyn LlmStream>>> {
+    let has_images = |message: &crate::UserMessage| {
+        message
+            .parts()
+            .iter()
+            .any(|part| matches!(part, UserMessagePart::Image { .. }))
+    };
+    let has_user_images = messages.values().any(|(_, message)| has_images(message));
+    if !has_user_images
+        && (provider.transient_api().is_none()
+            || !messages
+                .values()
+                .any(|(_, message)| message.parts().len() > 1))
+    {
+        return Ok(None);
+    }
+    if provider.transient_api().is_none() {
+        return Err(invalid("selected provider API cannot encode user images"));
+    }
+    let mut input = provider
+        .transient_input()
+        .cloned()
+        .unwrap_or_else(|| TransientInput {
+            attachments: Vec::new(),
+            target: TransientPromptTarget {
+                cursor: TimelineCursor::ZERO,
+                turn: 0,
+                prompt_index: 0,
+            },
+            messages: Vec::new(),
+            capabilities: TransientModelCapabilities {
+                png: true,
+                jpeg: true,
+                webp: true,
+                pdf: false,
+                text: true,
+                max_body_bytes: MAX_TRANSIENT_BODY_BYTES,
+            },
+            budget: TransientInputBudget::process(),
+            measure_binary: false,
+            follow_up: false,
+            canonical_messages: true,
+        });
+    // The old invocation overlay has already passed its own capability check.
+    // Canonical still images depend only on encoder support, not model names.
+    input.canonical_messages = true;
+    input.capabilities.png = true;
+    input.capabilities.jpeg = true;
+    input.capabilities.webp = true;
+    let mut source_bytes: usize = input.sources().map(|item| item.0.source_credit.bytes).sum();
+    for (&index, (item_id, message)) in messages {
+        if message.parts().len() == 1 && !has_images(message) {
+            continue;
+        }
+        if (!input.attachments.is_empty() && input.target.prompt_index == index)
+            || input
+                .messages
+                .iter()
+                .any(|message| message.target.prompt_index == index)
+        {
+            return Err(invalid("conflicting user image inputs"));
+        }
+        let turn = request
+            .prompt_turns
+            .get(index)
+            .ok_or_else(|| invalid("user image prompt missing"))?
+            .turn;
+        let mut parts = Vec::with_capacity(message.parts().len());
+        for (part_index, part) in message.parts().iter().enumerate() {
+            let part = match part {
+                UserMessagePart::Text { text } => UserMessagePart::Text { text: text.clone() },
+                UserMessagePart::Image { image } => {
+                    let resolver = resolver
+                        .ok_or_else(|| invalid("user message image resolver unavailable"))?;
+                    let descriptor = image.descriptor();
+                    let bytes = descriptor.bytes() as usize;
+                    source_bytes = source_bytes
+                        .checked_add(bytes)
+                        .filter(|total| *total <= MAX_TRANSIENT_SOURCE_BYTES)
+                        .ok_or_else(|| invalid("user image request source limit exceeded"))?;
+                    let kind = match descriptor.format() {
+                        crate::MessageImageFormat::Png => TransientInputKind::Png,
+                        crate::MessageImageFormat::Jpeg => TransientInputKind::Jpeg,
+                        crate::MessageImageFormat::WebP => TransientInputKind::WebP,
+                    };
+                    let mut buffer = input.budget.attachment_buffer(kind, bytes)?;
+                    let location = MessageImageLocation {
+                        session_id: &record.id,
+                        incarnation: record.metadata.incarnation.as_deref(),
+                        item_id,
+                        part_index,
+                    };
+                    resolver
+                        .load(location, *image, &mut buffer)
+                        .await
+                        .map_err(|failure| {
+                            invalid(match failure {
+                                MessageImageLoadError::Missing => "user message image missing",
+                                MessageImageLoadError::Corrupt => "user message image corrupt",
+                                MessageImageLoadError::Unavailable => {
+                                    "user message image unavailable"
+                                }
+                            })
+                        })?;
+                    if !descriptor.verifies(&buffer.bytes) {
+                        return Err(invalid("user message image corrupt"));
+                    }
+                    UserMessagePart::Image {
+                        image: buffer.finish()?,
+                    }
+                }
+            };
+            parts.push(part);
+        }
+        input.messages.push(OrderedMessage {
+            target: TransientPromptTarget {
+                cursor: TimelineCursor::ZERO,
+                turn,
+                prompt_index: index,
+            },
+            parts,
+        });
+    }
+    input.check_source_bounds()?;
+    input.validate_request(request)?;
+    input.preflight()?;
+    Ok(Some(Arc::new(InputProvider {
+        inner: provider.clone(),
+        input,
+        private_message_replay: true,
+    })))
 }
 
 struct LimitedWriter {
@@ -534,6 +869,7 @@ pub(crate) fn invalid(message: &'static str) -> LlmError {
 struct InputProvider {
     inner: Arc<dyn LlmStream>,
     input: TransientInput,
+    private_message_replay: bool,
 }
 
 /// Unforgeable active-request admission. Only the invocation adapter can create it.
@@ -560,7 +896,11 @@ pub(crate) fn bind_provider(
         return Err(invalid("provider API does not support transient input"));
     }
     input.preflight()?;
-    Ok(Arc::new(InputProvider { inner, input }))
+    Ok(Arc::new(InputProvider {
+        inner,
+        input,
+        private_message_replay: false,
+    }))
 }
 
 impl LlmStream for InputProvider {
@@ -574,7 +914,24 @@ impl LlmStream for InputProvider {
         Some(&self.input)
     }
     fn project_request(&self, _request: &CompletionRequest<'_>) -> Option<Value> {
+        if self.private_message_replay {
+            return Some(json!({"projection": "metadataOnly", "userMessageImages": true}));
+        }
         Some(json!({"projection": "metadataOnly", "transientInput": self.input.audit()}))
+    }
+    fn preflight_transient_request(
+        &self,
+        request: &CompletionRequest<'_>,
+        input: &AdmittedTransientInput,
+    ) -> Result<()> {
+        self.inner.preflight_transient_request(request, input)
+    }
+    fn stream_transient_request<'a>(
+        &'a self,
+        request: CompletionRequest<'a>,
+        input: &'a AdmittedTransientInput,
+    ) -> BoxStreamFuture<'a> {
+        self.inner.stream_transient_request(request, input)
     }
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
         Box::pin(async move {

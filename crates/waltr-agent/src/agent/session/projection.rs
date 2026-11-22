@@ -9,6 +9,39 @@ use crate::{
 
 use super::{Revision, SessionId, SessionMaskId, SessionRecord};
 
+impl SessionRecord {
+    /// Borrow the ordered message at an exact effective-visible timeline item.
+    ///
+    /// Returns `None` for missing, masked, rolled-back or non-message items.
+    /// This checks visibility without cloning content or building a timeline page.
+    #[must_use]
+    pub fn effective_user_message(&self, item_id: &TimelineItemId) -> Option<&crate::UserMessage> {
+        let event = self.timeline_events().find(|event| {
+            &event.item_id == item_id
+                && matches!(&event.content, TimelineContent::UserMessage { .. })
+                && event.channel.as_ref().is_some_and(|channel| channel.as_str() == CHANNEL_USER_TEXT)
+        })?;
+        if self.active_session_masks().iter().any(|active| mask_hides_event(&active.mask, event, |ids| ids.contains(item_id))) {
+            return None;
+        }
+        match &event.content {
+            TimelineContent::UserMessage { message } => Some(message),
+            _ => None,
+        }
+    }
+}
+
+fn mask_hides_event(
+    mask: &super::SessionMask,
+    event: &AgentTimelineEvent,
+    contains: impl FnOnce(&[TimelineItemId]) -> bool,
+) -> bool {
+    mask.item_ids.as_ref().map_or_else(
+        || event.cursor <= mask.selector.cursor,
+        |ids| contains(ids),
+    )
+}
+
 /// Timeline interpretation selected at the agent boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionTimelineMode {
@@ -219,12 +252,9 @@ fn project_effective_iter(
             break;
         };
         raw_page_boundary = Some(event.cursor);
-        if let Some(mask) = active.iter().find(|mask| {
-            mask.ids.as_ref().map_or_else(
-                || event.cursor <= mask.active.mask.selector.cursor,
-                |ids| ids.contains(&event.item_id),
-            )
-        }) {
+        if let Some(mask) = active.iter().find(|mask| mask_hides_event(&mask.active.mask, &event, |_| {
+            mask.ids.as_ref().is_some_and(|ids| ids.contains(&event.item_id))
+        })) {
             if mask.anchor == event.cursor && channel_selected(query, CHANNEL_USER_TEXT) {
                 events.push(mask_replacement_projection(record, &mask.active));
             }

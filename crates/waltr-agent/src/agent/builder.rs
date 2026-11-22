@@ -105,6 +105,7 @@ impl AgentRuntimeBuilder {
             retry_config: self.retry_config,
             max_provider_turns: self.max_provider_turns,
             host_context: self.host_context,
+            message_image_resolver: None,
         }
     }
 }

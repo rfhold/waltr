@@ -80,12 +80,10 @@ pub(super) fn responses_input_with_attachments(
     for item in request.replay_items() {
         match item {
             CompletionReplayItem::Prompt(prompt) => {
-                let mut content = attachments
-                    .filter(|input| input.matches_prompt(prompt_index))
-                    .map_or_else(Vec::new, |input| {
-                        input.content(crate::TransientInputApi::OpenAiResponses)
-                    });
-                content.push(json!({"type": "input_text", "text": prompt}));
+                let api = crate::TransientInputApi::OpenAiResponses;
+                let content = attachments
+                    .and_then(|input| input.user_content(prompt_index, prompt, api))
+                    .unwrap_or_else(|| vec![crate::user_message::text_part(api, prompt)]);
                 input.push(json!({
                     "type": "message",
                     "role": "user",

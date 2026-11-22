@@ -233,6 +233,7 @@ impl SessionCopy {
                 .channel
                 .as_ref()
                 .is_some_and(|channel| channel.as_str() == CHANNEL_USER_TEXT)
+                && !matches!(&event.content, TimelineContent::UserMessage { .. })
                 && user_turns
                     .insert(event.turn, included)
                     .is_some_and(|previous| previous != included)
@@ -371,7 +372,8 @@ pub(super) fn apply_prefix_replacement(
         } else {
             projected.push(event.clone());
         }
-        if let SessionJournalEvent::TurnFinished { turn: finished } = event {
+        if let SessionJournalEvent::TurnFinished { turn: finished }
+            | SessionJournalEvent::TurnInterrupted { turn: finished } = event {
             turn = turn.max(finished.saturating_add(1));
         }
     }
@@ -398,6 +400,7 @@ pub(super) fn apply_item_replacement(
         .filter_map(|event| match event {
             SessionJournalEvent::Timeline(event)
                 if selected.contains(&event.item_id)
+                    && !matches!(event.content, TimelineContent::UserMessage { .. })
                     && event
                         .channel
                         .as_ref()
@@ -438,7 +441,8 @@ pub(super) fn apply_item_replacement(
         } else {
             projected.push(event.clone());
         }
-        if let SessionJournalEvent::TurnFinished { turn: finished } = event {
+        if let SessionJournalEvent::TurnFinished { turn: finished }
+            | SessionJournalEvent::TurnInterrupted { turn: finished } = event {
             turn = turn.max(finished.saturating_add(1));
         }
     }
@@ -595,7 +599,9 @@ fn project_journal(
                             ));
                         }
                     }
-                    TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. } => {}
+                    TimelineContent::TextDelta { .. }
+                    | TimelineContent::TextSnapshot { .. }
+                    | TimelineContent::UserMessage { .. } => {}
                     TimelineContent::Empty
                     | TimelineContent::ContentRef { .. }
                     | TimelineContent::Json { .. } => unreachable!("timeline was allowlisted"),
@@ -633,7 +639,8 @@ fn replayable_timeline(event: &AgentTimelineEvent) -> bool {
         return false;
     }
     match &event.content {
-        TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. } => {
+        TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. }
+        | TimelineContent::UserMessage { .. } => {
             event.channel.as_ref().is_some_and(|channel| {
                 matches!(channel.as_str(), CHANNEL_USER_TEXT | CHANNEL_ASSISTANT_TEXT)
             })

@@ -419,7 +419,9 @@ Session and canonical item metadata contain opaque durable JSON values. `Session
 
 Metadata bounds are 128-byte keys, 64 KiB values, 128 keys per map, 4096 annotated items and 1 MiB aggregate metadata. A complete transaction permits at most 2 MiB. Host operations can impose stricter limits. Category schemas, checkpoint keys, background selection and mask names belong to Routine JavaScript, not the agent.
 
-The agent emits `SessionEvent::UserMessageCreated` only after a user prompt append succeeds. `SessionSemanticKind::{RunFinished,TurnCompleted,ToolResultCommitted}` reports generic post-commit facts. Delivery uses an injected `SessionEventSink`, runs best-effort, and never changes the source operation result. The agent does not replay or recover these events. Server-owned process-local roles classify helper and task sessions by actual session ID and incarnation. Public metadata supplies audit data, never classification authority or private approval recovery.
+The agent commits resumed user prompts and their timeline entries in one journal append. It publishes timeline entries and emits `SessionEvent::UserMessageCreated` only after the store returns the commit receipt. Queue admission does not imply a durable append.
+
+`SessionSemanticKind::{RunFinished,TurnCompleted,ToolResultCommitted}` reports generic post-commit facts. Delivery uses an injected `SessionEventSink`, runs best-effort, and never changes the source operation result. The agent does not replay or recover these events. Server-owned process-local roles classify helper and task sessions by actual session ID and incarnation. Public metadata supplies audit data, never classification authority or private approval recovery.
 
 `waltr-server` currently hosts sessions and exposes the same registered session service and coordinator through gRPC and the MCP `sessions` tool. MCP supports list, get, interrupt, wait, send, and wipe operations. Both surfaces must share that coordinator because active runs, queues, and live broadcasts are process-local.
 

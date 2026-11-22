@@ -63,9 +63,9 @@ fn chat_messages_with_input(
             CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
                 flush_tool_images(&mut messages, &mut pending_images);
-                if let Some(input) = input.filter(|input| input.matches_prompt(prompt_index)) {
-                    let mut content = input.content(crate::TransientInputApi::OpenAiChat);
-                    content.push(json!({"type": "text", "text": prompt}));
+                if let Some(content) = input.and_then(|input| {
+                    input.user_content(prompt_index, prompt, crate::TransientInputApi::OpenAiChat)
+                }) {
                     messages.push(json!({"role": "user", "content": content}));
                 } else {
                     messages.push(json!({ "role": "user", "content": prompt }));

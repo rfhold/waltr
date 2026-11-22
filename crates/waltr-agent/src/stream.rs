@@ -6,7 +6,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 use crate::Result;
 
@@ -624,18 +623,11 @@ impl ToolResultImage {
         if STANDARD.encode(&decoded) != data {
             return Err(ToolResultContentError::NonCanonicalBase64);
         }
-        let magic_matches = match media_type.as_str() {
-            "image/png" => decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "image/jpeg" => decoded.starts_with(&[0xff, 0xd8, 0xff]),
-            "image/webp" => {
-                decoded.len() >= 12 && &decoded[..4] == b"RIFF" && &decoded[8..12] == b"WEBP"
-            }
-            _ => return Err(ToolResultContentError::UnsupportedMediaType),
-        };
-        if !magic_matches {
-            return Err(ToolResultContentError::MediaTypeMismatch);
-        }
-        let digest = Sha256::digest(&decoded);
+        let format = crate::MessageImageFormat::from_media_type(&media_type)
+            .ok_or(ToolResultContentError::UnsupportedMediaType)?;
+        let descriptor = crate::MessageImageDescriptor::for_bytes(format, &decoded)
+            .ok_or(ToolResultContentError::MediaTypeMismatch)?;
+        let digest = descriptor.sha256();
         let mut sha256 = String::with_capacity(digest.len() * 2);
         for byte in digest {
             use std::fmt::Write as _;
@@ -644,7 +636,7 @@ impl ToolResultImage {
         Ok(Self {
             data,
             media_type,
-            decoded_bytes: decoded.len() as u64,
+            decoded_bytes: u64::from(descriptor.bytes()),
             sha256,
         })
     }

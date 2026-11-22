@@ -291,7 +291,8 @@ fn submission_failures_emit_typed_causes_without_raw_messages() {
                 owner
                     .start(
                         Box::pin(async move { Err(error) }),
-                        CancellationToken::new()
+                        CancellationToken::new(),
+                        false,
                     )
                     .await,
                 Err(OwnedExecutionError::Unavailable)
@@ -332,7 +333,8 @@ fn owner_state_failures_and_driver_rejection_do_not_poll_submission() {
                 owner
                     .start(
                         Box::pin(async { panic!("rejected submission polled") }),
-                        cancel
+                        cancel,
+                        false,
                     )
                     .await,
                 Err(OwnedExecutionError::Unavailable)

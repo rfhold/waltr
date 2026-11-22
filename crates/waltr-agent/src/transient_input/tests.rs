@@ -6,6 +6,31 @@ fn budget() -> TransientInputBudget {
     TransientInputBudget::isolated_for_test()
 }
 
+#[test]
+fn image_attachment_copies_only_to_matching_precharged_buffer() {
+    let budget = budget();
+    let png = b"\x89PNG\r\n\x1a\nsample";
+    let attachment = budget
+        .attachment(TransientInputKind::Png, png.to_vec())
+        .unwrap();
+    let descriptor = attachment.image_descriptor().unwrap();
+    assert!(descriptor.verifies(png));
+    let mut wrong = budget
+        .attachment_buffer(TransientInputKind::Jpeg, png.len())
+        .unwrap();
+    assert!(attachment.copy_into(&mut wrong).is_err());
+    let mut target = budget
+        .attachment_buffer(TransientInputKind::Png, png.len())
+        .unwrap();
+    attachment.copy_into(&mut target).unwrap();
+    assert!(attachment.copy_into(&mut target).is_err());
+    assert_eq!(target.finish().unwrap().image_descriptor(), Some(descriptor));
+    let invalid = budget
+        .attachment(TransientInputKind::Png, b"not png".to_vec())
+        .unwrap();
+    assert!(invalid.image_descriptor().is_none());
+}
+
 fn capabilities() -> TransientModelCapabilities {
     TransientModelCapabilities {
         png: true,
@@ -270,6 +295,73 @@ fn audit_and_preflight_never_encode_binary_and_debug_is_redacted() {
         .preflight_transient_request(&request(), &permit)
         .unwrap();
     assert_eq!(input.attachments[0].0.encodings.load(Ordering::SeqCst), 0);
+    let image = budget.attachment(TransientInputKind::Png, vec![1]).unwrap();
+    assert!(image.audit().get("sha256").is_none());
+}
+
+#[tokio::test]
+async fn fresh_requests_encode_distinct_images_at_their_user_message_positions() {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nopening";
+    const JPEG: &[u8] = b"\xff\xd8\xfffollowup";
+    for api in 0..4 {
+        let budget = budget();
+        let input = input(&budget, TransientInputKind::Png, PNG.to_vec())
+            .with_ordered_follow_up(
+                TransientPromptTarget {
+                    cursor: TimelineCursor::new(5),
+                    turn: 1,
+                    prompt_index: 1,
+                },
+                vec![
+                    UserMessagePart::Text {
+                        text: "before image".into(),
+                    },
+                    UserMessagePart::Image {
+                        image: budget
+                            .attachment(TransientInputKind::Jpeg, JPEG.to_vec())
+                            .unwrap(),
+                    },
+                    UserMessagePart::Text {
+                        text: "after image".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(input.validate_request(&request()).is_err());
+        let mut request = request();
+        request.prompt_turns.push(PromptTurn {
+            turn: 1,
+            prompt: "before imageafter image".into(),
+        });
+        let bound = bind_provider(provider(api, "http://unused.invalid"), input.clone()).unwrap();
+        for diagnostic in [
+            format!("{input:?}"),
+            bound.project_request(&request).unwrap().to_string(),
+        ] {
+            assert!(!diagnostic.contains("before image"));
+            assert!(!diagnostic.contains(&STANDARD.encode(JPEG)));
+        }
+        let body = capture(api, input, request).await;
+        let messages = if api < 2 {
+            &body["messages"]
+        } else {
+            &body["input"]
+        };
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "user");
+        let opening = messages[0]["content"].as_array().unwrap();
+        let follow_up = messages[1]["content"].as_array().unwrap();
+        assert_eq!(opening.len(), 2);
+        assert!(opening[0].to_string().contains(&STANDARD.encode(PNG)));
+        assert_eq!(opening[1]["text"], "initial task");
+        assert_eq!(follow_up.len(), 3);
+        assert_eq!(follow_up[0]["text"], "before image");
+        assert!(follow_up[1].to_string().contains(&STANDARD.encode(JPEG)));
+        assert_eq!(follow_up[2]["text"], "after image");
+        assert!(!messages[1].to_string().contains(&STANDARD.encode(PNG)));
+    }
 }
 
 #[tokio::test]
@@ -443,6 +535,237 @@ fn model() -> crate::ModelRef {
         "fake",
         crate::ModelApi::OpenAiChatCompletions,
     )
+}
+
+mod ordered_messages {
+    use super::*;
+    use crate::{
+        AgentRuntime, FilesystemSessionStore, MessageImageDescriptor, MessageImageFormat,
+        MessageImageLoadFuture, MessageImageReference, ResumeInput,
+        SessionContextMode, SessionCoordinator, SessionCopy, SessionCreateRequest, SessionId,
+        SessionJournalEvent, SessionStart, SessionStartMessage, TimelineContent,
+        TimelineItemId, UserMessage,
+    };
+    use std::sync::Mutex;
+
+    const FIRST: &[u8] = b"\x89PNG\r\n\x1a\nfirst-secret-image";
+    const SECOND: &[u8] = b"\x89PNG\r\n\x1a\nsecond-secret-image";
+
+    fn descriptor(bytes: &[u8]) -> MessageImageDescriptor {
+        MessageImageDescriptor::for_bytes(MessageImageFormat::Png, bytes).unwrap()
+    }
+
+    fn image(bytes: &[u8]) -> UserMessagePart<MessageImageReference> {
+        UserMessagePart::Image { image: MessageImageReference::Saved(descriptor(bytes)) }
+    }
+
+    fn text(text: &str) -> UserMessagePart<MessageImageReference> {
+        UserMessagePart::Text { text: text.into() }
+    }
+
+    fn first() -> UserMessage {
+        UserMessage::new(vec![text("before"), image(FIRST), text("after")]).unwrap()
+    }
+
+    #[derive(Default)]
+    struct Resolver {
+        failure: Option<MessageImageLoadError>,
+        loads: Mutex<Vec<(SessionId, TimelineItemId, usize)>>,
+    }
+
+    impl MessageImageResolver for Resolver {
+        fn load<'a>(
+            &'a self,
+            location: MessageImageLocation<'a>,
+            image: MessageImageReference,
+            target: &'a mut TransientAttachmentBuffer,
+        ) -> MessageImageLoadFuture<'a> {
+            Box::pin(async move {
+                self.loads.lock().unwrap().push((
+                    location.session_id.clone(),
+                    location.item_id.clone(),
+                    location.part_index,
+                ));
+                let bytes = match self.failure {
+                    Some(MessageImageLoadError::Corrupt) => b"\x89PNG\r\n\x1a\nwrong-secret-image".as_slice(),
+                    Some(other) => return Err(other),
+                    None if image == MessageImageReference::Saved(descriptor(FIRST)) => FIRST,
+                    None if image == MessageImageReference::Saved(descriptor(SECOND)) => SECOND,
+                    None => return Err(MessageImageLoadError::Missing),
+                };
+                target.append(bytes).map_err(|_| MessageImageLoadError::Corrupt)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProvider(Mutex<Vec<Vec<Vec<Value>>>>);
+
+    impl LlmStream for RecordingProvider {
+        fn name(&self) -> &'static str { "ordered-message-test" }
+        fn transient_api(&self) -> Option<TransientInputApi> { Some(TransientInputApi::OpenAiChat) }
+        fn preflight_transient_request(
+            &self, _: &CompletionRequest<'_>, _: &AdmittedTransientInput,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn stream_transient_request<'a>(
+            &'a self, request: CompletionRequest<'a>, admitted: &'a AdmittedTransientInput,
+        ) -> BoxStreamFuture<'a> {
+            Box::pin(async move {
+                let prompts = request.prompt_turns.iter().enumerate().map(|(index, prompt)| {
+                    admitted.input().user_content(index, &prompt.prompt, TransientInputApi::OpenAiChat)
+                        .unwrap_or_else(|| vec![text_part(TransientInputApi::OpenAiChat, &prompt.prompt)])
+                }).collect();
+                self.0.lock().unwrap().push(prompts);
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(CompletionEvent::Delta("answer".into())), Ok(CompletionEvent::Finished),
+                ])) as crate::BoxCompletionStream)
+            })
+        }
+        fn stream_request<'a>(&'a self, _: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async { panic!("a user image must never dispatch as plain text") })
+        }
+    }
+
+    async fn create<S: crate::SessionStore + Clone + Send + Sync + 'static>(
+        sessions: &SessionCoordinator<S>, id: SessionId,
+    ) {
+        let mut request = SessionCreateRequest::new(id);
+        request.start = SessionStart::Fresh { messages: vec![SessionStartMessage::from(first())] };
+        sessions.create(request).await.unwrap();
+    }
+
+    fn runtime(provider: Arc<RecordingProvider>, resolver: Arc<Resolver>) -> AgentRuntime {
+        AgentRuntime::builder(model(), provider).build().with_message_image_resolver(resolver)
+    }
+
+    #[tokio::test]
+    async fn saved_mixed_and_image_only_prompts_replay_in_order_after_filesystem_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = SessionId::new("saved-images");
+        let provider = Arc::new(RecordingProvider::default());
+        let sessions = SessionCoordinator::new(FilesystemSessionStore::new(directory.path()));
+        create(&sessions, id.clone()).await;
+        let original = sessions.store().load(&id).await.unwrap();
+        let original_item = original.timeline_events().next().unwrap().item_id.clone();
+        let first_resolver = Arc::new(Resolver::default());
+        let initial_runtime = runtime(provider.clone(), first_resolver.clone());
+        let first_run = sessions.resume(&initial_runtime, id.clone(), ResumeInput::Continue)
+            .stream().collect::<Vec<_>>().await;
+        assert!(first_run.iter().all(Result::is_ok), "{first_run:?}");
+        assert_eq!(*first_resolver.loads.lock().unwrap(), [(id.clone(), original_item.clone(), 1)]);
+        sessions.shutdown().await;
+        drop(sessions);
+
+        let reopened = SessionCoordinator::new(FilesystemSessionStore::new(directory.path()));
+        let resolver = Arc::new(Resolver::default());
+        let new_runtime = runtime(provider.clone(), resolver.clone());
+        let follow_up = UserMessage::new(vec![image(SECOND)]).unwrap();
+        let events = reopened.resume(&new_runtime, id.clone(), ResumeInput::UserMessages(vec![follow_up]))
+            .stream().collect::<Vec<_>>().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let record = reopened.store().load(&id).await.unwrap();
+        let prompts = record.timeline_events().filter(|event| matches!(&event.content, TimelineContent::UserMessage { .. })).collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].item_id, original_item);
+        assert_eq!((prompts[0].turn, prompts[1].turn), (0, 1));
+        assert_eq!(*resolver.loads.lock().unwrap(), [
+            (id.clone(), original_item, 1),
+            (id, prompts[1].item_id.clone(), 0),
+        ]);
+        let requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].len(), 1);
+        assert_eq!(requests[1].len(), 2);
+        assert_eq!(requests[0][0], requests[1][0]);
+        assert_eq!(requests[0][0][0]["text"], "before");
+        assert_eq!(requests[0][0][2]["text"], "after");
+        assert!(requests[0][0][1].to_string().contains(&STANDARD.encode(FIRST)));
+        assert_eq!(requests[1][1].len(), 1);
+        assert!(requests[1][1][0].to_string().contains(&STANDARD.encode(SECOND)));
+        for audit in record.provider_requests() {
+            let json = serde_json::to_string(audit).unwrap();
+            assert!(!json.contains("sha256"));
+            assert!(!json.contains(&STANDARD.encode(FIRST)));
+            assert!(!json.contains(&STANDARD.encode(SECOND)));
+        }
+        let durable = serde_json::to_string(&record).unwrap();
+        assert!(!durable.contains("secret-image"));
+        assert!(!durable.contains(&STANDARD.encode(FIRST)));
+    }
+
+    #[tokio::test]
+    async fn missing_corrupt_and_unconfigured_images_fail_before_dispatch_and_audit() {
+        for (failure, expected) in [
+            (None, "resolver unavailable"),
+            (Some(MessageImageLoadError::Missing), "image missing"),
+            (Some(MessageImageLoadError::Corrupt), "image corrupt"),
+        ] {
+            let sessions = SessionCoordinator::new(crate::MemorySessionStore::new());
+            let id = SessionId::new("bad-image");
+            create(&sessions, id.clone()).await;
+            let provider = Arc::new(RecordingProvider::default());
+            let mut runtime = AgentRuntime::builder(model(), provider.clone()).build();
+            if failure.is_some() {
+                runtime = runtime.with_message_image_resolver(Arc::new(Resolver { failure, ..Resolver::default() }));
+            }
+            let events = sessions.resume(&runtime, id.clone(), ResumeInput::Continue)
+                .stream().collect::<Vec<_>>().await;
+            let error = events.iter().find_map(|event| event.as_ref().err()).unwrap().to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("secret-image"));
+            assert!(provider.0.lock().unwrap().is_empty());
+            let record = sessions.store().load(&id).await.unwrap();
+            assert!(record.provider_requests().next().is_none());
+            assert_eq!(record.snapshot().prompts, ["beforeafter"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn mask_and_copy_select_canonical_ids_not_the_shared_turn() {
+        let store = crate::MemorySessionStore::new();
+        let mut create = SessionCreateRequest::new("multi-prompt");
+        let first_cursor = TimelineCursor::new(1);
+        let second_cursor = TimelineCursor::new(2);
+        let first_id = TimelineItemId::from_first_cursor(first_cursor);
+        let second_id = TimelineItemId::from_first_cursor(second_cursor);
+        let second = UserMessage::new(vec![image(SECOND)]).unwrap();
+        create.start = SessionStart::Fresh {
+            messages: vec![first().into(), second.clone().into()],
+        };
+        let record = store.create(create).await.unwrap();
+        store.append_journal(&record.id, record.execution_token().unwrap(),
+            vec![SessionJournalEvent::TurnFinished { turn: 0 }]).await.unwrap();
+        let id = record.id;
+        let record = store.load(&id).await.unwrap();
+        assert_eq!(record.effective_user_message(&first_id), Some(&first()));
+        assert!(record.effective_user_message(&TimelineItemId::from_first_cursor(TimelineCursor::new(99))).is_none());
+        let selected = SessionCopy::selected(&record, second_cursor, std::slice::from_ref(&second_id)).unwrap();
+        assert_eq!(selected.timeline().len(), 1);
+        assert_eq!(selected.timeline()[0].item_id, second_id);
+        let mask = crate::SessionMaskAddition::items(
+            "mask-first", second_cursor, vec![first_id.clone()], crate::ReplacementUserContent::new("summary"),
+        );
+        let mut mutation = crate::SessionMaskMutation::new(Some(second_cursor));
+        mutation.add.push(mask);
+        store.mutate(&id, crate::SessionMutation { masks: Some(mutation), ..Default::default() }).await.unwrap();
+        let record = store.load(&id).await.unwrap();
+        assert!(record.effective_user_message(&first_id).is_none());
+        assert_eq!(record.effective_user_message(&second_id), Some(&second));
+        let effective = record.materialize_context(SessionContextMode::Effective);
+        assert_eq!(effective.prompt_turns.iter().map(|prompt| prompt.prompt.as_str()).collect::<Vec<_>>(), ["summary", ""]);
+        assert_eq!(effective.user_messages.values().cloned().collect::<Vec<_>>(), [(second_id.clone(), second)]);
+        let mut copy = SessionCreateRequest::new("selected-sibling");
+        copy.start = SessionStart::Copy { copy: selected, messages: Vec::new() };
+        let copied = store.create(copy).await.unwrap();
+        assert!(copied.effective_user_message(&first_id).is_none());
+        assert!(copied.effective_user_message(&second_id).is_some());
+        let coordinator = SessionCoordinator::new(store);
+        let rolled_back = coordinator.rollback_to_cursor(id, first_cursor).await.unwrap();
+        assert!(rolled_back.record.effective_user_message(&first_id).is_some());
+        assert!(rolled_back.record.effective_user_message(&second_id).is_none());
+    }
 }
 
 async fn durable_canary_test<S: crate::SessionStore + Clone + Send + Sync + 'static>(store: S) {

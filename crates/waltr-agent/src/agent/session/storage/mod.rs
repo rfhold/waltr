@@ -436,6 +436,17 @@ pub(super) fn append_timeline_to_record(
     id: &SessionId,
     events: Vec<PendingTimelineEvent>,
 ) -> SessionStoreResult<Vec<AgentTimelineEvent>> {
+    let assigned = assign_timeline_events(record, id, events)?;
+    record.append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
+    record.touch_activity();
+    Ok(assigned)
+}
+
+pub(super) fn assign_timeline_events(
+    record: &SessionRecord,
+    id: &SessionId,
+    events: Vec<PendingTimelineEvent>,
+) -> SessionStoreResult<Vec<AgentTimelineEvent>> {
     let mut cursor = record.timeline_cursor_high_water();
     let mut effective_item_ids = record
         .timeline_events()
@@ -470,8 +481,6 @@ pub(super) fn append_timeline_to_record(
         effective_item_ids.insert(event.item_id.clone());
         assigned.push(event);
     }
-    record.append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
-    record.touch_activity();
     Ok(assigned)
 }
 
@@ -538,6 +547,7 @@ pub(super) fn timeline_item_text_from_record(
         match &event.content {
             TimelineContent::TextDelta { delta } => text.push_str(delta),
             TimelineContent::TextSnapshot { text: snapshot } => text.clone_from(snapshot),
+            TimelineContent::UserMessage { message } => text = message.text(),
             TimelineContent::ContentRef { content_id, .. } => {
                 return Err(SessionStoreError::TimelineContentUnavailable {
                     id: record.id.clone(),

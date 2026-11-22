@@ -32,7 +32,7 @@ pub enum SessionEvent {
         metadata: BTreeMap<String, Value>,
         /// Session revision containing the appended prompt.
         revision: crate::Revision,
-        /// Last durable timeline cursor available at event creation.
+        /// Cursor of the committed user message.
         cursor: Option<TimelineCursor>,
     },
 }

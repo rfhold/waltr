@@ -679,6 +679,10 @@ pub struct SessionSnapshot {
     /// User prompts with the provider turn they started.
     #[serde(default)]
     pub prompt_turns: Vec<PromptTurn>,
+    /// Canonical user messages keyed by index in `prompt_turns`. Legacy text
+    /// prompts and internal completion feedback have no canonical entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_messages: BTreeMap<usize, (crate::TimelineItemId, crate::UserMessage)>,
     /// Most recent user prompt or conversation input.
     pub current_prompt: Option<String>,
     /// Next provider turn number.
@@ -709,6 +713,7 @@ impl SessionSnapshot {
             revision: Revision::ZERO,
             prompts: Vec::new(),
             prompt_turns: Vec::new(),
+            user_messages: BTreeMap::new(),
             current_prompt: None,
             turn: 0,
             turns: Vec::new(),
@@ -776,13 +781,7 @@ impl SessionSnapshot {
         match event {
             SessionJournalEvent::Timeline(event) => self.apply_timeline_event(event),
             SessionJournalEvent::PromptAppended { prompt } => {
-                self.prompts.push(prompt.clone());
-                self.prompt_turns.push(PromptTurn {
-                    turn: self.turn,
-                    prompt: prompt.clone(),
-                });
-                self.current_prompt = Some(prompt.clone());
-                self.status = SessionStatus::BuildingRequest;
+                self.record_prompt(self.turn, prompt.clone());
             }
             SessionJournalEvent::ProviderRequestRecorded { .. } => {
                 self.status = SessionStatus::StreamingProvider;
@@ -861,6 +860,10 @@ impl SessionSnapshot {
         }
 
         match &event.content {
+            TimelineContent::UserMessage { message } if channel_is(event, crate::CHANNEL_USER_TEXT) => {
+                self.user_messages.insert(self.prompt_turns.len(), (event.item_id.clone(), message.clone()));
+                self.record_prompt(event.turn, message.text());
+            }
             TimelineContent::ToolCall { call } => self.record_tool_call(event.turn, call),
             TimelineContent::ToolResult { result } => self.record_tool_result(event.turn, result),
             TimelineContent::TextDelta { delta } if channel_is(event, CHANNEL_ASSISTANT_TEXT) => {
@@ -879,9 +882,17 @@ impl SessionSnapshot {
             TimelineContent::Empty
             | TimelineContent::TextDelta { .. }
             | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::UserMessage { .. }
             | TimelineContent::ContentRef { .. }
             | TimelineContent::Json { .. } => {}
         }
+    }
+
+    fn record_prompt(&mut self, turn: u64, prompt: String) {
+        self.prompts.push(prompt.clone());
+        self.prompt_turns.push(PromptTurn { turn, prompt: prompt.clone() });
+        self.current_prompt = Some(prompt);
+        self.status = SessionStatus::BuildingRequest;
     }
 
     fn apply_timeline_status(&mut self, status: TimelineStatus, event: &AgentTimelineEvent) {
@@ -1090,6 +1101,8 @@ pub enum ResumeInput {
     Prompt(String),
     /// Resume with multiple adjacent user prompts.
     Prompts(Vec<String>),
+    /// Resume with multiple adjacent ordered user messages.
+    UserMessages(Vec<crate::UserMessage>),
     /// Resume with externally completed tool results.
     ToolResults(Vec<ToolResult>),
 }
@@ -1111,7 +1124,8 @@ pub struct SessionRollbackTarget {
 fn remove_prompt_appended(events: &mut Vec<(usize, &SessionJournalEvent)>, prompt_index: u64) {
     let mut seen = 0_u64;
     let Some(position) = events.iter().position(|(_, event)| {
-        if matches!(event, SessionJournalEvent::PromptAppended { .. }) {
+        if matches!(event, SessionJournalEvent::PromptAppended { .. } |
+            SessionJournalEvent::Timeline(AgentTimelineEvent { content: TimelineContent::UserMessage { .. }, .. })) {
             let matches = seen == prompt_index;
             seen += 1;
             matches
@@ -1200,6 +1214,7 @@ fn timeline_failure_message(event: &AgentTimelineEvent) -> String {
         TimelineContent::TextSnapshot { text } => text.clone(),
         TimelineContent::Json { value } => value.to_string(),
         TimelineContent::Empty
+        | TimelineContent::UserMessage { .. }
         | TimelineContent::ToolCall { .. }
         | TimelineContent::ToolResult { .. }
         | TimelineContent::ContentRef { .. } => "timeline status failed".to_owned(),

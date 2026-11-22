@@ -143,9 +143,9 @@ fn anthropic_messages(
         match item {
             CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_content(&mut messages, &mut assistant_content);
-                if let Some(input) = input.filter(|input| input.matches_prompt(prompt_index)) {
-                    let mut content = input.content(crate::TransientInputApi::Anthropic);
-                    content.push(json!({"type": "text", "text": prompt}));
+                if let Some(content) = input.and_then(|input| {
+                    input.user_content(prompt_index, prompt, crate::TransientInputApi::Anthropic)
+                }) {
                     tool_results.extend(content);
                     flush_tool_results(&mut messages, &mut tool_results);
                 } else if tool_results.is_empty() {

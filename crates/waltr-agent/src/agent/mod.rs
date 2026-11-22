@@ -96,9 +96,34 @@ pub struct AgentRuntime {
     pub(super) retry_config: ProviderRetryConfig,
     pub(super) max_provider_turns: Option<u64>,
     host_context: Option<Arc<dyn crate::AgentHostContext>>,
+    message_image_resolver: Option<Arc<dyn crate::MessageImageResolver>>,
 }
 
 impl AgentRuntime {
+    /// Supply the host's loader for image references in committed messages.
+    #[must_use]
+    pub fn with_message_image_resolver(mut self, resolver: Arc<dyn crate::MessageImageResolver>) -> Self {
+        self.message_image_resolver = Some(resolver);
+        self
+    }
+
+    /// Retain an invocation's images for a subsequent user run.
+    ///
+    /// The agent validates the original message against the target record before
+    /// use. Non-image transient inputs remain scoped to the opening run.
+    ///
+    /// # Errors
+    /// Returns an error if this provider cannot encode the image input.
+    pub fn with_invocation_image_replay(
+        mut self,
+        input: &crate::TransientInput,
+    ) -> crate::Result<Self> {
+        if let Some(input) = input.for_image_follow_up() {
+            self.provider = crate::transient_input::bind_provider(self.provider, input)?;
+        }
+        Ok(self)
+    }
+
     /// Retain consumer validation when this runtime is rebuilt for queued runs.
     #[must_use]
     pub fn with_completion_validation(
@@ -803,7 +828,7 @@ mod tests {
         assert!(watched.iter().any(|event| {
             event.channel.as_ref().map(TimelineChannel::as_str) == Some(CHANNEL_USER_TEXT)
                 && event.kind == TimelineEventKind::ItemFinished
-                && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "hello")
+                && matches!(&event.content, TimelineContent::UserMessage { message } if message.text() == "hello")
         }));
         assert!(watched.iter().any(|event| {
             event.channel.as_ref().map(TimelineChannel::as_str) == Some(CHANNEL_ASSISTANT_TEXT)

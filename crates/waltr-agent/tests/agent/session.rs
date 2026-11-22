@@ -136,6 +136,7 @@ impl AgentTestSession {
                 TimelineContent::Empty
                 | TimelineContent::TextDelta { .. }
                 | TimelineContent::TextSnapshot { .. }
+                | TimelineContent::UserMessage { .. }
                 | TimelineContent::ContentRef { .. }
                 | TimelineContent::Json { .. }
                 | TimelineContent::ToolCall { .. }

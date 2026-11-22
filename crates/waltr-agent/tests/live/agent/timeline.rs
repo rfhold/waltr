@@ -133,7 +133,7 @@ async fn assert_provider_streams_timeline_updates(
         events.iter().any(|event| {
             crate::session::channel_is(event, CHANNEL_USER_TEXT)
                 && event.kind == TimelineEventKind::ItemFinished
-                && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == TEST_PROMPT)
+                && matches!(&event.content, TimelineContent::UserMessage { message } if message.text() == TEST_PROMPT)
         }),
         "{provider_name}: missing user prompt timeline event: {events:?}"
     );
@@ -287,7 +287,7 @@ fn user_prompt_cursor(
         .find(|event| {
             crate::session::channel_is(event, CHANNEL_USER_TEXT)
                 && event.kind == TimelineEventKind::ItemFinished
-                && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == prompt)
+                && matches!(&event.content, TimelineContent::UserMessage { message } if message.text() == prompt)
         })
         .map(|event| event.cursor)
         .ok_or_else(|| LlmError::Protocol {

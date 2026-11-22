@@ -80,6 +80,7 @@ impl AgentRunBuilder {
         let prompt = match &input {
             ResumeInput::Prompt(prompt) => prompt.clone(),
             ResumeInput::Prompts(prompts) => prompts.last().cloned().unwrap_or_default(),
+            ResumeInput::UserMessages(messages) => messages.last().map(crate::UserMessage::text).unwrap_or_default(),
             ResumeInput::Continue | ResumeInput::ToolResults(_) => String::new(),
         };
         AgentRunBuilder {
@@ -257,6 +258,7 @@ where
             retry_config,
             max_provider_turns,
             host_context,
+            message_image_resolver,
         } = runtime;
 
         let middleware_chain = if extra_tools.is_empty() {
@@ -279,6 +281,7 @@ where
             retry_config,
             max_provider_turns,
             host_context,
+            message_image_resolver,
             session_id,
             session_store,
             session_run_context,

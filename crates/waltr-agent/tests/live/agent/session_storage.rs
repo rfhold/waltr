@@ -530,6 +530,7 @@ where
                 assistant_text_by_item.insert(event.item_id.clone(), text.clone());
             }
             TimelineContent::Empty
+            | TimelineContent::UserMessage { .. }
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
             | TimelineContent::ContentRef { .. }
@@ -591,6 +592,7 @@ async fn collect(
             TimelineContent::Empty
             | TimelineContent::TextDelta { .. }
             | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::UserMessage { .. }
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
             | TimelineContent::ContentRef { .. }

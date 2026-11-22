@@ -12,6 +12,7 @@ mod resource;
 mod stream;
 pub mod timeline;
 mod transient_input;
+mod user_message;
 
 pub use agent::{
     ActiveSessionMask, AgentHostContext, AgentHostRuntimeFactory, AgentRunBuilder, AgentRunLimits,
@@ -100,6 +101,11 @@ pub use timeline::{
 };
 pub use transient_input::{
     AdmittedTransientInput, MAX_TRANSIENT_ATTACHMENT_BYTES, MAX_TRANSIENT_BODY_BYTES,
-    MAX_TRANSIENT_SOURCE_BYTES, TransientAttachment, TransientInput, TransientInputApi,
+    MAX_TRANSIENT_SOURCE_BYTES, TransientAttachment, TransientAttachmentBuffer, TransientInput, TransientInputApi,
     TransientInputBudget, TransientInputKind, TransientModelCapabilities, TransientPromptTarget,
+};
+pub use user_message::{
+    MessageImageDescriptor, MessageImageFormat, MessageImageLoadError, MessageImageLoadFuture,
+    MessageImageLocation, MessageImageReference, MessageImageResolver, UserMessage, UserMessageError,
+    UserMessagePart, has_user_message_content,
 };

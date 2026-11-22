@@ -582,6 +582,10 @@ pub enum AgentSessionRunInput {
     Prompt(String),
     /// Start or resume with multiple adjacent user prompts.
     Prompts(Vec<String>),
+    /// Start or resume with one ordered user message.
+    UserMessage(crate::UserMessage),
+    /// Start or resume with a batch of adjacent ordered user messages.
+    UserMessages(Vec<crate::UserMessage>),
     /// Resume with externally completed tool results.
     ToolResults(Vec<ToolResult>),
 }
@@ -591,8 +595,24 @@ impl AgentSessionRunInput {
         match self {
             Self::HostTool(_) => "host_tool",
             Self::Continue => "continue",
-            Self::Prompt(_) | Self::Prompts(_) => "prompt",
+            Self::Prompt(_) | Self::Prompts(_) | Self::UserMessage(_) | Self::UserMessages(_) => "prompt",
             Self::ToolResults(_) => "tool_results",
+        }
+    }
+
+    pub(super) fn into_user_message(self) -> Option<crate::UserMessage> {
+        match self {
+            Self::Prompt(prompt) => crate::UserMessage::from_text(prompt).ok(),
+            Self::UserMessage(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    pub(super) fn user_message_text_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Prompt(prompt) if !prompt.trim().is_empty() => Some(prompt.len()),
+            Self::UserMessage(message) => Some(message.text_bytes()),
+            _ => None,
         }
     }
 }

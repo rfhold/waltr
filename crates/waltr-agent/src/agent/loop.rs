@@ -62,6 +62,9 @@ where
     model_cost: Option<crate::ModelCost>,
     prompt: String,
     prompt_turns: Vec<PromptTurn>,
+    user_messages: BTreeMap<usize, (TimelineItemId, crate::UserMessage)>,
+    message_image_resolver: Option<Arc<dyn crate::MessageImageResolver>>,
+    context_projection_dirty: bool,
     input: Option<ResumeInput>,
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
@@ -114,7 +117,10 @@ const PENDING_USER_TEMPLATE: &str = "pending_user_template";
 
 #[derive(Serialize, Deserialize)]
 struct PendingUserTemplate {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     prompts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    messages: Vec<crate::UserMessage>,
     prompt_count: usize,
     submission: u64,
     #[serde(default)]
@@ -222,6 +228,7 @@ where
         let prompt = match &run.input {
             ResumeInput::Prompt(prompt) => prompt,
             ResumeInput::Prompts(prompts) => prompts.last().map_or("", String::as_str),
+            ResumeInput::UserMessages(_) => "",
             ResumeInput::Continue | ResumeInput::ToolResults(_) => "",
         }
         .to_owned();
@@ -231,6 +238,9 @@ where
             model_cost: run.model_cost,
             prompt,
             prompt_turns: Vec::new(),
+            user_messages: BTreeMap::new(),
+            message_image_resolver: run.message_image_resolver,
+            context_projection_dirty: false,
             input: Some(run.input),
             tools: run.tools,
             middleware_chain: run.middleware_chain,
@@ -275,11 +285,21 @@ where
     }
 
     pub(super) async fn next(self) -> Option<(Result<AgentTimelineEvent>, Self)> {
-        let (result, mut state) = self.next_event().await?;
+        let (mut result, mut state) = self.next_event().await?;
         if let Err(error) = &result {
             tracing::error!(session_id = %state.session_id.as_str(), %error, "agent run failed");
             if let Err(persistence_error) = state.record_run_failure(error).await {
-                tracing::error!(session_id = %state.session_id.as_str(), %error, %persistence_error, "failed to persist agent run failure");
+                if matches!(error, LlmError::Api { status: Some(400..=599), .. }) {
+                    // Owned runs report an HTTP rejection as cleanly joined. Do not
+                    // preserve that classification when finalization is uncertain.
+                    tracing::error!(session_id = %state.session_id.as_str(), "failed to finalize provider rejection");
+                    result = Err(LlmError::Protocol {
+                        provider: "agent",
+                        message: "run finalization uncertain".into(),
+                    });
+                } else {
+                    tracing::error!(session_id = %state.session_id.as_str(), %error, %persistence_error, "failed to persist agent run failure");
+                }
             }
             state.pending.clear();
             state.phase = AgentLoopPhase::Done;
@@ -382,7 +402,29 @@ where
                         Err(error) => return Some((Err(error), self)),
                     };
                     let request = completion_request_from_draft(&draft);
-                    let projected = self.provider.project_request(&request);
+                    let resolved = tokio::select! {
+                        biased;
+                        () = self.cancellation_token.cancelled() => {
+                            if let Err(error) = self.record_interrupted().await {
+                                return Some((Err(error), self));
+                            }
+                            return None;
+                        }
+                        () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
+                        resolved = crate::transient_input::resolve_message_provider(
+                            &self.provider,
+                            self.message_image_resolver.as_deref(),
+                            self.session_record.as_ref().expect("loaded session"),
+                            &self.user_messages,
+                            &request,
+                        ) => resolved,
+                    };
+                    let resolved = match resolved {
+                        Ok(provider) => provider,
+                        Err(error) => return Some((Err(error), self)),
+                    };
+                    let provider = resolved.unwrap_or_else(|| self.provider.clone());
+                    let projected = provider.project_request(&request);
                     let retry_checkpoint = self.retry_checkpoint();
 
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
@@ -418,7 +460,7 @@ where
                             self.phase = AgentLoopPhase::Done;
                             return None;
                         }
-                        result = self.provider.stream_request(request).instrument(provider_span) => result,
+                        result = provider.stream_request(request).instrument(provider_span) => result,
                         () = wait_deadline(self.completion_validation.as_ref().map(|validation| validation.deadline)) => return Some((Err(validation_error("total deadline exceeded")), self)),
                     };
                     match stream_result {
@@ -732,6 +774,14 @@ where
 
     async fn build_provider_request(&mut self) -> Result<Option<ModelRequestDraft>> {
         self.prepare_host_effects().await?;
+        if std::mem::take(&mut self.context_projection_dirty) {
+            let context = self.session_record.as_ref().expect("loaded session")
+                .materialize_context(SessionContextMode::Effective);
+            self.prompt = context.current_prompt.unwrap_or_default();
+            self.prompt_turns = context.prompt_turns;
+            self.user_messages = context.user_messages;
+            self.turns = context.turns;
+        }
         let prompt_turns = self.prompt_turns();
         let middleware_chain = self.middleware_chain.clone();
         let mut ctx = RequestContext {
@@ -1120,7 +1170,7 @@ where
         }
         self.synchronize_host_effects().await?;
         let record = self.session_record.clone().expect("initialized session");
-        self.input = Some(ResumeInput::Prompts(prompts));
+        self.input = Some(ResumeInput::UserMessages(prompts));
         if self.apply_resume_input(record).await? {
             self.phase = AgentLoopPhase::StartTurn;
         }
@@ -1274,33 +1324,35 @@ where
         }
         if !matches!(
             self.input,
-            Some(ResumeInput::Prompt(_) | ResumeInput::Prompts(_))
+            Some(ResumeInput::Prompt(_) | ResumeInput::Prompts(_) | ResumeInput::UserMessages(_))
         ) {
             return Err(session_store_error(
                 "cannot resume missing session without a prompt input",
             ));
         }
-        let plain_prompts = match self.input.as_ref() {
+        let initial_messages = match self.input.as_ref() {
             Some(ResumeInput::Prompt(prompt)) if !may_contain_template(prompt) => {
-                Some(vec![prompt.clone()])
+                Some(vec![SessionStartMessage::user(prompt.clone()).map_err(session_store_error)?])
             }
             Some(ResumeInput::Prompts(prompts))
                 if !prompts.is_empty()
                     && prompts.iter().all(|prompt| !may_contain_template(prompt)) =>
             {
-                Some(prompts.clone())
+                Some(prompts.iter().cloned().map(SessionStartMessage::user)
+                    .collect::<std::result::Result<Vec<_>, _>>().map_err(session_store_error)?)
+            }
+            Some(ResumeInput::UserMessages(messages)) if !messages.is_empty()
+                && !messages_contain_template(messages) =>
+            {
+                Some(messages.iter().cloned().map(SessionStartMessage::from).collect())
             }
             _ => None,
         };
         let mut request = SessionCreateRequest::new(self.session_id.clone());
-        if let Some(prompts) = &plain_prompts {
+        let starts_with_messages = initial_messages.is_some();
+        if let Some(messages) = initial_messages {
             request.start = SessionStart::Fresh {
-                messages: prompts
-                    .iter()
-                    .cloned()
-                    .map(SessionStartMessage::user)
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|error| session_store_error(error.to_string()))?,
+                messages,
             };
         }
         let record = self
@@ -1313,14 +1365,14 @@ where
         }
         self.session_incarnation = incarnation;
         let record = self.prepare_initial_record(record).await?;
-        if let Some(prompts) = plain_prompts {
+        if starts_with_messages {
             self.input = None;
             self.hydrate_from_record(&record)?;
             let events = record.timeline_events().cloned().collect::<Vec<_>>();
             if let Some(context) = &self.session_run_context {
                 context.timeline().publish_all(events.clone());
             }
-            self.publish_user_message_events(0, 0, &prompts);
+            self.publish_initial_user_messages(&events);
             self.pending.extend(events.into_iter().map(Ok));
             self.session_initialized = true;
             return Ok(true);
@@ -1382,37 +1434,58 @@ where
         }
         if let Some(input) = self.provider.transient_input() {
             input.preflight()?;
-            if !matches!(self.input, Some(ResumeInput::Continue)) {
+            let follow_up = input.is_follow_up();
+            if !(matches!(self.input, Some(ResumeInput::Continue)) && !follow_up
+                || matches!(self.input, Some(ResumeInput::Prompt(_) | ResumeInput::UserMessages(_))) && follow_up)
+            {
                 return Err(validation_error(
-                    "transient input requires a durable initial helper task",
+                    "transient input does not match this run input",
                 ));
             }
             let target = input.target();
             let context = record.materialize_context(SessionContextMode::Effective);
-            let task_event = record
-                .timeline_events()
-                .filter(|event| {
-                    event.channel.as_ref().is_some_and(|channel| {
-                        channel.as_str() == crate::timeline::CHANNEL_USER_TEXT
-                    })
-                })
-                .last();
-            if context.prompt_turns.len().checked_sub(1) != Some(target.prompt_index)
-                || context
-                    .prompt_turns
-                    .last()
-                    .is_none_or(|prompt| prompt.turn != target.turn)
-                || context.next_turn != target.turn
-                || !task_event.is_some_and(|event| {
-                    event.cursor == target.cursor
-                        && event.turn == target.turn
-                        && matches!(&event.content, crate::timeline::TimelineContent::TextSnapshot { text }
-                            if context.prompt_turns.last().is_some_and(|prompt| &prompt.prompt == text))
-                })
-            {
-                return Err(validation_error(
-                    "transient input initial task identity mismatch",
-                ));
+            let mut messages = record.timeline_events().filter(|event| {
+                event
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| channel.as_str() == crate::timeline::CHANNEL_USER_TEXT)
+            });
+            let task_event = if follow_up {
+                messages.find(|event| event.cursor == target.cursor)
+            } else {
+                messages.last()
+            };
+            let prompt = context.prompt_turns.get(target.prompt_index);
+            let matches_task = task_event.zip(prompt).is_some_and(|(event, prompt)| {
+                event.cursor == target.cursor
+                    && event.turn == target.turn
+                    && prompt.turn == event.turn
+                    && user_prompt_matches(event, prompt, context.user_messages.get(&target.prompt_index))
+            });
+            let matches_turn = if follow_up {
+                snapshot.status == SessionStatus::Finished && context.next_turn > target.turn
+            } else {
+                context.prompt_turns.len().checked_sub(1) == Some(target.prompt_index)
+                    && context.next_turn == target.turn
+            };
+            if !matches_task || !matches_turn {
+                return Err(validation_error("transient input task identity mismatch"));
+            }
+            for target in input.ordered_targets() {
+                let prompt = context.prompt_turns.get(target.prompt_index);
+                let event = record
+                    .timeline_events()
+                    .find(|event| event.cursor == target.cursor);
+                if !event.zip(prompt).is_some_and(|(event, prompt)| {
+                    event.turn == target.turn
+                        && prompt.turn == event.turn
+                        && event.channel.as_ref().is_some_and(|channel| {
+                            channel.as_str() == crate::timeline::CHANNEL_USER_TEXT
+                        })
+                        && user_prompt_matches(event, prompt, context.user_messages.get(&target.prompt_index))
+                }) {
+                    return Err(validation_error("transient follow-up task identity mismatch"));
+                }
             }
         }
         self.hydrate_from_record(&record)?;
@@ -1460,7 +1533,7 @@ where
             if snapshot.pending_work.iter()
                 .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
                 .all(|work| results.iter().any(|result| result.call_id == work.id)));
-        if !matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_))
+        if !matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_) | ResumeInput::UserMessages(_))
             && !pending_sandbox.is_empty()
             && !externally_resolved
         {
@@ -1470,7 +1543,7 @@ where
         }
 
         let continue_start_turn = true;
-        let new_prompts = matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_));
+        let new_prompts = matches!(input, ResumeInput::Prompt(_) | ResumeInput::Prompts(_) | ResumeInput::UserMessages(_));
         let record = match input {
             ResumeInput::Continue => record,
             ResumeInput::Prompt(prompt) => {
@@ -1515,6 +1588,20 @@ where
                     }
                 }
             }
+            ResumeInput::UserMessages(messages) => {
+                if messages_contain_template(&messages) {
+                    self.submit_pending_user_template(Vec::new(), messages).await?;
+                    self.session_record.as_ref().expect("submitted template").clone()
+                } else {
+                    match self.session_runtime()
+                        .resume_record(record, ResumeInput::UserMessages(messages))
+                        .await?
+                    {
+                        RuntimeResumeOutput::Resumed { record }
+                        | RuntimeResumeOutput::Suspended { record, .. } => record,
+                    }
+                }
+            }
             ResumeInput::ToolResults(results) => {
                 match self
                     .session_runtime()
@@ -1535,7 +1622,13 @@ where
     }
 
     async fn submit_template_prompts(&mut self, prompts: Vec<String>) -> Result<()> {
-        if prompts.is_empty() {
+        self.submit_pending_user_template(prompts, Vec::new()).await
+    }
+
+    async fn submit_pending_user_template(
+        &mut self, prompts: Vec<String>, messages: Vec<crate::UserMessage>,
+    ) -> Result<()> {
+        if prompts.is_empty() && messages.is_empty() {
             return Err(session_store_error("prompt batch must not be empty"));
         }
         let prompt_count = self
@@ -1549,6 +1642,7 @@ where
             PENDING_USER_TEMPLATE,
             serde_json::to_value(PendingUserTemplate {
                 prompts,
+                messages,
                 prompt_count,
                 submission: self.session_journal_len,
                 denied: false,
@@ -1578,9 +1672,29 @@ where
             .expect("loaded session")
             .snapshot();
         if snapshot.prompts.len() == pending.prompt_count {
-            let Some((prompts, tool_ids)) = self.render_prompt_templates(pending.prompts).await?
-            else {
-                return Ok(false);
+            let (input, tool_ids) = if pending.messages.is_empty() {
+                let Some((prompts, tool_ids)) = self.render_prompt_templates(pending.prompts).await? else {
+                    return Ok(false);
+                };
+                (ResumeInput::Prompts(prompts), tool_ids)
+            } else {
+                use crate::UserMessagePart::{Image, Text};
+                let prompts = pending.messages.iter().flat_map(|message| message.parts())
+                    .filter_map(|part| match part {
+                        Text { text } => Some(text.clone()),
+                        Image { .. } => None,
+                    }).collect();
+                let Some((rendered, tool_ids)) = self.render_prompt_templates(prompts).await? else {
+                    return Ok(false);
+                };
+                let mut rendered = rendered.into_iter();
+                let messages = pending.messages.into_iter().map(|message| {
+                    crate::UserMessage::new(message.into_parts().into_iter().map(|part| match part {
+                        Text { .. } => Text { text: rendered.next().expect("one output per text part") },
+                        Image { .. } => part,
+                    }).collect())
+                }).collect::<std::result::Result<_, _>>().map_err(session_store_error)?;
+                (ResumeInput::UserMessages(messages), tool_ids)
             };
             self.flush_middleware_state().await?;
             let record = self
@@ -1589,7 +1703,7 @@ where
                 .expect("committed template state");
             let output = self
                 .session_runtime()
-                .resume_record(record, ResumeInput::Prompts(prompts))
+                .resume_record(record, input)
                 .await?;
             let record = match output {
                 RuntimeResumeOutput::Resumed { record }
@@ -1648,6 +1762,8 @@ where
         self.session_metadata_values = record.metadata.values.clone();
         self.prompt = context.current_prompt.unwrap_or_default();
         self.prompt_turns = context.prompt_turns;
+        self.user_messages = context.user_messages;
+        self.context_projection_dirty = false;
         self.turns = context.turns;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
@@ -1828,6 +1944,7 @@ where
         self.session_execution_token =
             Some(current.execution_token().map_err(session_store_error)?);
         self.session_journal_len = current.journal.len() as u64;
+        self.context_projection_dirty |= current.journal.len() != previous.journal.len();
         self.session_record = Some(current);
         Ok(())
     }
@@ -2363,11 +2480,9 @@ where
         }
     }
 
-    fn publish_user_message_events(
+    fn publish_initial_user_messages(
         &self,
-        first_prompt_index: usize,
-        first_journal_index: usize,
-        prompts: &[String],
+        messages: &[AgentTimelineEvent],
     ) {
         let Some(sink) = self
             .session_run_context
@@ -2377,15 +2492,17 @@ where
         else {
             return;
         };
-        for (offset, text) in prompts.iter().enumerate() {
-            let prompt_index =
-                u64::try_from(first_prompt_index.saturating_add(offset)).unwrap_or(u64::MAX);
+        for (offset, event) in messages.iter().enumerate() {
+            let TimelineContent::UserMessage { message } = &event.content else {
+                continue;
+            };
+            let prompt_index = u64::try_from(offset).unwrap_or(u64::MAX);
             super::event::spawn_session_event(
                 Arc::clone(sink),
                 crate::SessionEvent::UserMessageCreated {
                     id: super::event::user_message_event_id(
                         &self.session_id,
-                        first_journal_index.saturating_add(offset.saturating_mul(2)),
+                        offset,
                     ),
                     session_id: self.session_id.clone(),
                     incarnation: self
@@ -2394,10 +2511,10 @@ where
                         .and_then(|record| record.metadata.incarnation.clone()),
                     prompt_index,
                     user_message_count: prompt_index.saturating_add(1),
-                    text: text.clone(),
+                    text: message.text(),
                     metadata: self.session_metadata_values.clone(),
                     revision: self.session_revision,
-                    cursor: self.last_timeline_cursor,
+                    cursor: Some(event.cursor),
                 },
             );
         }
@@ -2493,6 +2610,24 @@ fn tool_result_timeline_event(
         parent_id,
         result,
     )
+}
+
+fn messages_contain_template(messages: &[crate::UserMessage]) -> bool {
+    messages.iter().flat_map(|message| message.parts()).any(|part| {
+        matches!(part, crate::UserMessagePart::Text { text } if may_contain_template(text))
+    })
+}
+
+fn user_prompt_matches(
+    event: &AgentTimelineEvent,
+    prompt: &PromptTurn,
+    canonical: Option<&(TimelineItemId, crate::UserMessage)>,
+) -> bool {
+    match (&event.content, canonical) {
+        (TimelineContent::UserMessage { .. }, Some((item_id, _))) => &event.item_id == item_id,
+        (TimelineContent::TextSnapshot { text }, None) => text == &prompt.prompt,
+        _ => false,
+    }
 }
 
 fn canonical_request_json(draft: &ModelRequestDraft) -> Value {

@@ -10,6 +10,11 @@ use crate::{
 pub enum OwnedExecutionError {
     Unavailable,
     Uncertain,
+    /// A joined helper run received an HTTP rejection; upstream data is not retained.
+    ProviderRejected {
+        /// HTTP status, in the 400–599 range.
+        http_status: u16,
+    },
 }
 use futures_util::{
     FutureExt,
@@ -130,6 +135,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_rejection_is_uncertain_when_failure_append_fails() {
+        struct Reject;
+        impl LlmStream for Reject {
+            fn name(&self) -> &'static str {
+                "reject"
+            }
+
+            fn stream_request<'a>(&'a self, _: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+                Box::pin(async {
+                    Err(crate::LlmError::Api {
+                        provider: "reject",
+                        message: "unsupported input".into(),
+                        status: Some(400),
+                        headers: Vec::new(),
+                        code: None,
+                        body: None,
+                    })
+                })
+            }
+        }
+
+        for fail_append in [false, true] {
+            let store =
+                barrier_store::BarrierStore::default().with_failed_failure_append(fail_append);
+            let sessions = SessionCoordinator::new(store.clone());
+            let id = SessionId::generate();
+            let mut create = SessionCreateRequest::new(id.clone());
+            create.start = crate::SessionStart::Fresh {
+                messages: vec![crate::SessionStartMessage::user("opening").unwrap()],
+            };
+            create.inference_settings = Some(InferenceSettings {
+                provider: InferenceProviderSettings {
+                    key: "test".into(),
+                    api: ModelApi::OpenAiResponses,
+                    url: "https://unused.invalid".into(),
+                    model_id: "test".into(),
+                    model_cost: None,
+                    headers: Default::default(),
+                    oauth: None,
+                    reasoning_effort: None,
+                },
+            });
+            sessions.create(create).await.unwrap();
+            let runtime = AgentRuntime::builder(
+                ModelRef::new(ProviderId::OpenAi, "test", ModelApi::OpenAiResponses),
+                Arc::new(Reject),
+            )
+            .build();
+            let owner = SessionExecutionOwner::new(sessions.clone(), id.clone());
+            let result = owner
+                .start(
+                    Box::pin({
+                        let sessions = sessions.clone();
+                        let id = id.clone();
+                        async move {
+                            sessions
+                                .start_pinned_helper(id, runtime, None, AgentRunLimits::default())
+                                .await
+                        }
+                    }),
+                    CancellationToken::new(),
+                    true,
+                )
+                .await;
+            if fail_append {
+                assert_eq!(result, Err(OwnedExecutionError::Uncertain));
+                assert_eq!(owner.close().await, Err(OwnedExecutionError::Uncertain));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(OwnedExecutionError::ProviderRejected { http_status: 400 }),
+                );
+                assert_eq!(owner.close().await, Ok(()));
+            }
+            let record = store.load(&id).await.unwrap();
+            assert_eq!(
+                matches!(record.snapshot().status, crate::SessionStatus::Failed { .. }),
+                !fail_append,
+            );
+            sessions.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn blocked_store_admission_drains_after_request_and_only_close_waiter_drop() {
         let store = barrier_store::BarrierStore::default();
         let sessions = SessionCoordinator::new(store.clone());
@@ -216,6 +305,7 @@ mod tests {
                         })
                     }),
                     CancellationToken::new(),
+                    false,
                 )
                 .await;
             assert_eq!(
@@ -234,7 +324,8 @@ mod tests {
             assert_eq!(
                 late.start(
                     Box::pin(async { panic!("shutdown must reject before admission") }),
-                    CancellationToken::new()
+                    CancellationToken::new(),
+                    false,
                 )
                 .await,
                 Err(OwnedExecutionError::Unavailable)
@@ -308,6 +399,7 @@ mod tests {
                                 Ok(submission)
                             }),
                             CancellationToken::new(),
+                            false,
                         )
                         .await
                 }
@@ -417,6 +509,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> SessionExecutionOwner<S> {
                     .await
             }),
             cancellation,
+            false,
         )
         .await
     }
@@ -437,6 +530,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> SessionExecutionOwner<S> {
                     .await
             }),
             cancellation,
+            true,
         )
         .await
     }
@@ -480,6 +574,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> SessionExecutionOwner<S> {
             >,
         >,
         cancellation: CancellationToken,
+        report_provider_rejection: bool,
     ) -> Result<AgentSessionRunOutcome, OwnedExecutionError> {
         let mut state = self.state.lock().await;
         if state.closed
@@ -523,7 +618,17 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> SessionExecutionOwner<S> {
                         interrupted.map_err(|_| OwnedExecutionError::Uncertain)?;
                         Ok(outcome)
                     }
-                    outcome = &mut joined => outcome.map_err(|_| OwnedExecutionError::Uncertain),
+                    outcome = &mut joined => outcome.map_err(|error| {
+                        match error {
+                            crate::AgentSessionRunError::Agent(crate::LlmError::Api {
+                                status: Some(http_status @ 400..=599),
+                                ..
+                            }) if report_provider_rejection => {
+                                OwnedExecutionError::ProviderRejected { http_status }
+                            }
+                            _ => OwnedExecutionError::Uncertain,
+                        }
+                    }),
                 }
             })
             .await
@@ -555,7 +660,10 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> SessionExecutionOwner<S> {
             state.wait.clone()
         };
         if let Some(wait) = wait {
-            wait.await?;
+            match wait.await {
+                Ok(_) | Err(OwnedExecutionError::ProviderRejected { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

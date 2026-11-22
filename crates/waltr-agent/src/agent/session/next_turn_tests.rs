@@ -123,7 +123,18 @@ mod next_turn_tests {
             let (sessions, record) = session(provider.clone()).await;
             let first = prompt(&sessions, &record, "initial").await;
             provider.entered.notified().await;
-            let one = prompt(&sessions, &record, "one").await;
+            let one = sessions
+                .submit_owned_next_turn_message(
+                    record.id.clone(),
+                    record.metadata.incarnation.as_deref().unwrap(),
+                    crate::UserMessage::new(vec![
+                        crate::UserMessagePart::Text { text: "o".into() },
+                        crate::UserMessagePart::Text { text: "ne".into() },
+                    ]).unwrap(),
+                    AgentRunLimits::default(),
+                )
+                .await
+                .unwrap();
             let two = prompt(&sessions, &record, "two").await;
             for next in [&one, &two] {
                 assert_eq!(next.disposition, AgentSessionRunDisposition::Started);
@@ -164,6 +175,9 @@ mod next_turn_tests {
             assert_eq!(requests[1], expected);
             let finished = sessions.store.load(&record.id).await.unwrap();
             assert_eq!(finished.snapshot().prompts, ["initial", "one", "two"]);
+            let messages = finished.snapshot().user_messages;
+            assert_eq!(messages[&1].1.parts().len(), 2);
+            assert_ne!(messages[&1].0, messages[&2].0);
             assert_eq!(
                 finished
                     .journal
@@ -493,7 +507,7 @@ mod next_turn_tests {
             let worker = std::thread::spawn(move || {
                 let (tx, _rx) = oneshot::channel();
                 waiting.wait();
-                other.admit("accepted".into(), 1, tx)
+                other.admit(crate::UserMessage::from_text("accepted".into()).unwrap(), 1, tx)
             });
             barrier.wait();
             let prompts = input.drain(true);
@@ -501,7 +515,7 @@ mod next_turn_tests {
             assert_eq!(accepted, !prompts.is_empty());
             assert!(input.drain(true).is_empty());
             let (tx, _rx) = oneshot::channel();
-            assert!(!input.admit("late".into(), 2, tx));
+            assert!(!input.admit(crate::UserMessage::from_text("late".into()).unwrap(), 2, tx));
             assert_eq!(input.finish().len(), usize::from(accepted));
         }
     }

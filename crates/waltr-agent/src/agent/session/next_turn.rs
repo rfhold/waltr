@@ -11,7 +11,7 @@ struct State {
     closed: bool,
     count: usize,
     bytes: usize,
-    prompts: Vec<String>,
+    prompts: Vec<crate::UserMessage>,
     outcomes: Vec<(u64, RunOutcomeSender)>,
 }
 
@@ -24,25 +24,30 @@ impl NextTurnInput {
         result
     }
 
-    pub(crate) fn admit(&self, prompt: String, id: u64, outcome: RunOutcomeSender) -> bool {
+    pub(crate) fn admit(
+        &self,
+        prompt: crate::UserMessage,
+        id: u64,
+        outcome: RunOutcomeSender,
+    ) -> bool {
         let mut state = self.0.lock().expect("next-turn input lock poisoned");
+        let bytes = prompt.text_bytes();
         if state.closed
             || state.count >= 64
-            || prompt.len() > 16384
-            || prompt.trim().is_empty()
-            || state.bytes.saturating_add(prompt.len()) > 1048576
+            || bytes > 16384
+            || state.bytes.saturating_add(bytes) > 1048576
         {
             return false;
         }
         state.count += 1;
-        state.bytes += prompt.len();
+        state.bytes += bytes;
         state.prompts.push(prompt);
         state.outcomes.push((id, outcome));
         true
     }
 
     /// Closing an empty gate and admitting a prompt are one atomic ordering.
-    pub(crate) fn drain(&self, completing: bool) -> Vec<String> {
+    pub(crate) fn drain(&self, completing: bool) -> Vec<crate::UserMessage> {
         let mut state = self.0.lock().expect("next-turn input lock poisoned");
         if completing && state.prompts.is_empty() {
             state.closed = true;

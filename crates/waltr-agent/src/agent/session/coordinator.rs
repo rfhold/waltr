@@ -1716,6 +1716,7 @@ where
 
     /// Admit ordinary queued input only into the exact consumer-owned durable incarnation.
     /// Identity is checked under the same mutation boundary as queue admission.
+    /// Dropping the submission future after admission does not cancel the run.
     pub async fn submit_owned_input(
         &self,
         session_id: SessionId,
@@ -1777,9 +1778,25 @@ where
         prompt: String,
         limits: AgentRunLimits,
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        let message = crate::UserMessage::from_text(prompt)
+            .map_err(|_| AgentSessionRunError::Unavailable { session_id: session_id.clone() })?;
+        self.submit_owned_next_turn_message(session_id, incarnation, message, limits).await
+    }
+
+    /// Admit an ordered message at the exact owned session's next safe turn.
+    ///
+    /// # Errors
+    /// Rejects the same conflicts and stale incarnations as text admission.
+    pub async fn submit_owned_next_turn_message(
+        &self,
+        session_id: SessionId,
+        incarnation: &str,
+        message: crate::UserMessage,
+        limits: AgentRunLimits,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
         self.submit_configured_bound(
             session_id,
-            AgentSessionRunInput::Prompt(prompt),
+            AgentSessionRunInput::UserMessage(message),
             RunConflictPolicy::NextTurnIfActive,
             limits,
             None,
@@ -1802,7 +1819,7 @@ where
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         if policy == RunConflictPolicy::NextTurnIfActive
-            && (!matches!(&input, AgentSessionRunInput::Prompt(prompt) if !prompt.trim().is_empty() && prompt.len() <= 16384)
+            && (input.user_message_text_bytes().is_none_or(|bytes| bytes > 16384)
                 || cancellation.is_some())
         {
             return Err(AgentSessionRunError::Unavailable { session_id });
@@ -1917,9 +1934,7 @@ where
             } else if let Some(active_run) = current.active.as_ref() {
                 match policy {
                     RunConflictPolicy::NextTurnIfActive => {
-                        let AgentSessionRunInput::Prompt(prompt) = input else {
-                            unreachable!()
-                        };
+                        let prompt = input.into_user_message().expect("validated next-turn input");
                         if active_run.token.is_cancelled()
                             || !current.queued.is_empty()
                             || !match (&active_run.runtime_factory, &self.runtime_factory) {
@@ -2011,52 +2026,21 @@ where
         self.control.publish_coordination(&session_id, projected);
         drop(origin_operation);
 
-        if let Some(mut start) = start {
-            let resolution = if let Some(runtime) = prepared {
-                async {
-                    let captured = if runtime.provider.transient_input().is_some() {
-                        self.capture_runtime_record(&session_id).await?
-                    } else {
-                        self.capture_runtime_record_for_cycle(&session_id).await?
-                    };
-                    let settings =
-                        captured.record.inference_settings.as_ref().ok_or_else(|| {
-                            super::AgentSessionRuntimeError::FailedPrecondition(
-                                "pinned helper requires explicit inference settings".into(),
-                            )
-                        })?;
-                    let identity = SessionRunInferenceIdentity::from_settings(
-                        settings,
-                        captured
-                            .record
-                            .execution_token()
-                            .map_err(session_store_error)?,
-                    );
-                    let _operation = self
-                        .validate_incarnation(&session_id, captured.incarnation)
-                        .await?;
-                    Ok((runtime, identity))
+        if let Some(start) = start {
+            // Admission transfers ownership to the coordinator before any more awaits.
+            // Dropping the submission waiter must not drop the active run's startup.
+            let coordinator = self.clone();
+            let start_session_id = session_id.clone();
+            tokio::spawn(
+                async move {
+                    coordinator.start_admitted_run(start_session_id, start, prepared).await
                 }
-                .await
-            } else {
-                self.resolve_runtime_with_identity(&session_id).await
-            };
-            match resolution {
-                Ok((runtime, identity)) => {
-                    start.runtime = Some(runtime);
-                    start.inference_identity = Some(identity.clone());
-                    self.set_active_inference_identity(&session_id, start.id, identity)
-                        .await;
-                }
-                Err(error) => {
-                    let next = self.fail_active_start(&session_id, start.id).await;
-                    if let Some(next) = next {
-                        self.spawn_run(session_id.clone(), next);
-                    }
-                    return Err(error);
-                }
-            }
-            self.spawn_run(session_id.clone(), start);
+                .in_current_span(),
+            )
+            .await
+            .map_err(|_| {
+                super::AgentSessionRuntimeError::Internal("run startup task failed".into())
+            })??;
         }
 
         Ok(AgentSessionRunSubmission {
@@ -2065,6 +2049,62 @@ where
             disposition,
             handle,
         })
+    }
+
+    async fn start_admitted_run(
+        &self,
+        session_id: SessionId,
+        mut start: SessionRunStart,
+        prepared: Option<AgentRuntime>,
+    ) -> std::result::Result<(), AgentSessionRunError> {
+        match self.resolve_admitted_runtime(&session_id, prepared).await {
+            Ok((runtime, identity)) => {
+                start.runtime = Some(runtime);
+                start.inference_identity = Some(identity.clone());
+                self.set_active_inference_identity(&session_id, start.id, identity)
+                    .await;
+                self.spawn_run(session_id, start);
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(next) = self.fail_active_start(&session_id, start.id).await {
+                    self.spawn_run(session_id.clone(), next);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn resolve_admitted_runtime(
+        &self,
+        session_id: &SessionId,
+        prepared: Option<AgentRuntime>,
+    ) -> std::result::Result<(AgentRuntime, SessionRunInferenceIdentity), AgentSessionRunError> {
+        if let Some(runtime) = prepared {
+            let captured = if runtime.provider.transient_input().is_some() {
+                self.capture_runtime_record(session_id).await?
+            } else {
+                self.capture_runtime_record_for_cycle(session_id).await?
+            };
+            let settings = captured.record.inference_settings.as_ref().ok_or_else(|| {
+                super::AgentSessionRuntimeError::FailedPrecondition(
+                    "pinned helper requires explicit inference settings".into(),
+                )
+            })?;
+            let identity = SessionRunInferenceIdentity::from_settings(
+                settings,
+                captured
+                    .record
+                    .execution_token()
+                    .map_err(session_store_error)?,
+            );
+            let _operation = self
+                .validate_incarnation(session_id, captured.incarnation)
+                .await?;
+            Ok((runtime, identity))
+        } else {
+            self.resolve_runtime_with_identity(session_id).await
+        }
     }
 
     /// Return active-run state for a session, when present.
@@ -3029,10 +3069,10 @@ fn pop_next_start(
     let runtime_factory = queued.runtime_factory;
     let inference_identity = queued.inference_identity;
     let mut outcome_txs = vec![(queued.id, queued.outcome_tx)];
-    if let AgentSessionRunInput::Prompt(first) = input {
-        let mut prompts = vec![first];
+    if input.user_message_text_bytes().is_some() {
+        let mut adjacent = Vec::new();
         while let Some(next) = state.queued.front() {
-            if !matches!(next.input, AgentSessionRunInput::Prompt(_))
+            if next.input.user_message_text_bytes().is_none()
                 || independently_cancellable
                 || next.cancellation.is_some()
                 || next.limits != limits
@@ -3046,17 +3086,16 @@ fn pop_next_start(
                 break;
             }
             let next = state.queued.pop_front().expect("queued prompt exists");
-            let AgentSessionRunInput::Prompt(prompt) = next.input else {
-                unreachable!("front input was checked as prompt");
-            };
-            prompts.push(prompt);
+            let prompt = next.input.into_user_message().expect("front input is a user message");
+            adjacent.push(prompt);
             outcome_txs.push((next.id, next.outcome_tx));
         }
-        input = if prompts.len() == 1 {
-            AgentSessionRunInput::Prompt(prompts.pop().expect("single prompt exists"))
-        } else {
-            AgentSessionRunInput::Prompts(prompts)
-        };
+        if !adjacent.is_empty() {
+            let mut prompts = Vec::with_capacity(adjacent.len() + 1);
+            prompts.push(input.into_user_message().expect("front input is a user message"));
+            prompts.extend(adjacent);
+            input = AgentSessionRunInput::UserMessages(prompts);
+        }
     }
     let next_turn = super::next_turn::NextTurnInput::for_input(&input);
     state.active = Some(ActiveSessionRun {
@@ -3167,6 +3206,7 @@ where
 
                 max_provider_turns: runtime.max_provider_turns,
                 host_context: runtime.host_context,
+                message_image_resolver: runtime.message_image_resolver,
                 session_id: session_id.clone(),
                 session_store: coordinator.store.clone(),
                 session_run_context: Some(context),
@@ -3186,6 +3226,12 @@ where
             }
             AgentSessionRunInput::Prompts(prompts) => {
                 coordinator.resume(&runtime, session_id.clone(), ResumeInput::Prompts(prompts))
+            }
+            AgentSessionRunInput::UserMessage(message) => {
+                coordinator.resume(&runtime, session_id.clone(), ResumeInput::UserMessages(vec![message]))
+            }
+            AgentSessionRunInput::UserMessages(messages) => {
+                coordinator.resume(&runtime, session_id.clone(), ResumeInput::UserMessages(messages))
             }
             AgentSessionRunInput::ToolResults(results) => coordinator.resume(
                 &runtime,
@@ -3892,6 +3938,147 @@ mod tests {
 
         SessionCoordinator::new(MemorySessionStore::new())
             .with_runtime_factory(with_fake_host(environment))
+    }
+
+    #[tokio::test]
+    async fn dropping_owned_submission_before_admission_leaves_no_queued_work() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let record = sessions
+            .create(create_request(None, None, BTreeMap::new()))
+            .await
+            .unwrap()
+            .record;
+        let before = record.journal.len();
+        let admission = sessions.active_runs.lock().await;
+        {
+            let submission = sessions.submit_owned_input(
+                record.id.clone(),
+                record.metadata.incarnation.as_deref().unwrap(),
+                AgentSessionRunInput::UserMessage(
+                    crate::UserMessage::from_text("expired submission".into()).unwrap(),
+                ),
+                AgentRunLimits::default(),
+            );
+            tokio::pin!(submission);
+            assert!(futures_util::poll!(&mut submission).is_pending());
+        }
+        assert!(!admission.sessions.contains_key(&record.id));
+        drop(admission);
+        assert!(sessions.active_state(&record.id).await.is_none());
+        assert_eq!(
+            sessions.load(&record.id).await.unwrap().record.journal.len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_submission_during_runtime_resolution_does_not_strand_admitted_work() {
+        struct BlockingFirstBuild {
+            entered: Notify,
+            release: Notify,
+            builds: AtomicU64,
+            provider: Arc<QueuedPromptProvider>,
+        }
+        impl crate::AgentHostRuntimeFactory for BlockingFirstBuild {
+            fn build<'a>(&'a self, _: &'a SessionRecord) -> crate::HostRuntimeFuture<'a> {
+                Box::pin(async move {
+                    if self.builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                        self.entered.notify_one();
+                        self.release.notified().await;
+                    }
+                    Ok(AgentRuntime::builder(
+                        ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                        self.provider.clone(),
+                    )
+                    .build())
+                })
+            }
+        }
+
+        for shutdown in [false, true] {
+            let host = Arc::new(BlockingFirstBuild {
+                entered: Notify::new(),
+                release: Notify::new(),
+                builds: AtomicU64::new(0),
+                provider: Arc::new(QueuedPromptProvider::new()),
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let factory = AgentSessionRuntimeFactory::new(FileCredentialStore::new(
+                directory.path().join("auth.json"),
+            ))
+            .with_host_runtime_factory(host.clone());
+            let sessions =
+                SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+            let record = sessions
+                .create(create_request(
+                    Some(test_inference_settings()),
+                    None,
+                    BTreeMap::new(),
+                ))
+                .await
+                .unwrap()
+                .record;
+            let message = crate::UserMessage::from_text("opening".into()).unwrap();
+            {
+                let submission = sessions.submit_owned_input(
+                    record.id.clone(),
+                    record.metadata.incarnation.as_deref().unwrap(),
+                    AgentSessionRunInput::UserMessage(message),
+                    AgentRunLimits::default(),
+                );
+                tokio::pin!(submission);
+                tokio::select! {
+                    entered = tokio::time::timeout(Duration::from_secs(2), host.entered.notified()) => {
+                        entered.expect("runtime resolution was polled");
+                    }
+                    _ = &mut submission => panic!("runtime resolution must still be pending"),
+                }
+            }
+
+            let active = sessions.active_state(&record.id).await.unwrap();
+            let queued = sessions
+                .submit_prompt(record.id.clone(), "next", RunConflictPolicy::QueueIfActive)
+                .await
+                .unwrap();
+            assert_eq!(
+                queued.disposition,
+                AgentSessionRunDisposition::Queued { position: 1 },
+            );
+            assert_ne!(active.run_id, queued.run_id);
+            if shutdown {
+                // Shutdown retains the existing drain barrier for in-flight startup.
+                let shutdown = tokio::spawn({
+                    let sessions = sessions.clone();
+                    async move { sessions.shutdown().await }
+                });
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(2), queued.handle.wait())
+                        .await
+                        .expect("shutdown did not cancel queued submission"),
+                    Err(AgentSessionRunError::Canceled { .. }),
+                ));
+                assert!(!shutdown.is_finished());
+                host.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), shutdown)
+                    .await
+                    .expect("shutdown did not drain startup")
+                    .unwrap();
+                assert_eq!(host.builds.load(Ordering::SeqCst), 1);
+                assert!(host.provider.requests.lock().await.is_empty());
+            } else {
+                host.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), queued.handle.wait())
+                    .await
+                    .expect("next submission was stranded")
+                    .unwrap();
+                assert_eq!(host.builds.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    *host.provider.requests.lock().await,
+                    [vec!["opening"], vec!["opening", "next"]],
+                );
+            }
+            assert!(sessions.active_state(&record.id).await.is_none());
+        }
     }
 
     async fn completed_session(sessions: &SessionCoordinator<MemorySessionStore>) -> SessionId {
@@ -5553,7 +5740,7 @@ spec: {}"
             .unwrap();
         let crate::SessionEvent::UserMessageCreated { cursor, .. } = event;
         assert_eq!(cursor, Some(TimelineCursor::new(1)));
-        assert!(sessions.load(&id).await.unwrap().record.timeline_events().any(|event| matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "durable first message")));
+        assert!(sessions.load(&id).await.unwrap().record.timeline_events().any(|event| matches!(&event.content, TimelineContent::UserMessage { message } if message.text() == "durable first message")));
         provider.wait_for_request_count(1).await;
         submission.handle.cancel_and_wait().await.unwrap();
         sessions.shutdown().await;

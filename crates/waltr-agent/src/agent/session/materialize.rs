@@ -20,6 +20,7 @@ pub enum SessionContextMode {
 pub struct SessionMaterializedContext {
     pub current_prompt: Option<String>,
     pub prompt_turns: Vec<PromptTurn>,
+    pub user_messages: std::collections::BTreeMap<usize, (crate::TimelineItemId, crate::UserMessage)>,
     pub turns: Vec<CompletionTurn>,
     pub next_turn: u64,
     /// Opaque annotations for retained canonical items, not provider request content.
@@ -65,6 +66,7 @@ fn materialize_snapshot(snapshot: SessionSnapshot) -> SessionMaterializedContext
     SessionMaterializedContext {
         current_prompt,
         prompt_turns: snapshot.prompt_turns,
+        user_messages: snapshot.user_messages,
         turns: snapshot.turns,
         next_turn: snapshot.turn,
         item_metadata: Default::default(),

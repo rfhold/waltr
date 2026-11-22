@@ -632,11 +632,11 @@ async fn superseded_prompt_closes_turn_and_keeps_distinct_user_timeline_items() 
     assert_ne!(user_events[0].item_id, user_events[1].item_id);
     assert!(matches!(
         &user_events[0].content,
-        TimelineContent::TextSnapshot { text } if text == "first prompt"
+        TimelineContent::UserMessage { message } if message.text() == "first prompt"
     ));
     assert!(matches!(
         &user_events[1].content,
-        TimelineContent::TextSnapshot { text } if text == "second prompt"
+        TimelineContent::UserMessage { message } if message.text() == "second prompt"
     ));
 }
 
@@ -669,7 +669,7 @@ async fn durable_session_timeline_ranges_preserve_cursor_order() {
     );
     assert!(matches!(
         &all[0].content,
-        TimelineContent::TextSnapshot { text } if text == "range prompt"
+        TimelineContent::UserMessage { message } if message.text() == "range prompt"
     ));
     let first_assistant = all
         .iter()

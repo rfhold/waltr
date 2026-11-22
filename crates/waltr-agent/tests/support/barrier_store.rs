@@ -10,11 +10,18 @@ use tokio::sync::Notify;
 pub struct BarrierStore {
     inner: MemorySessionStore,
     armed: Arc<AtomicBool>,
+    fail_failure_append: bool,
     pub entered: Arc<Notify>,
     pub release: Arc<Notify>,
 }
 
 impl BarrierStore {
+    #[allow(dead_code)] // The server imports this fixture but doesn't inject journal faults.
+    pub fn with_failed_failure_append(mut self, fail: bool) -> Self {
+        self.fail_failure_append = fail;
+        self
+    }
+
     pub fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
     }
@@ -29,6 +36,22 @@ macro_rules! forward {
 }
 
 impl SessionStore for BarrierStore {
+    async fn append_journal(
+        &self,
+        id: &SessionId,
+        expected_revision: ExecutionToken,
+        events: Vec<SessionJournalEvent>,
+    ) -> SessionStoreResult<SessionCommitReceipt> {
+        if self.fail_failure_append
+            && events.iter().any(|event| matches!(event, SessionJournalEvent::Failed { .. }))
+        {
+            return Err(SessionStoreError::Backend {
+                message: "injected finalization append failure".into(),
+            });
+        }
+        self.inner.append_journal(id, expected_revision, events).await
+    }
+
     async fn load(&self, id: &SessionId) -> SessionStoreResult<SessionRecord> {
         if self.armed.swap(false, Ordering::SeqCst) {
             self.entered.notify_one();
@@ -42,7 +65,6 @@ impl SessionStore for BarrierStore {
         wipe() -> ();
         list() -> Vec<SessionSummary>;
         append_timeline(id: &SessionId, expected_revision: ExecutionToken, events: Vec<PendingTimelineEvent>) -> TimelineAppendReceipt;
-        append_journal(id: &SessionId, expected_revision: ExecutionToken, events: Vec<SessionJournalEvent>) -> SessionCommitReceipt;
         mutate(id: &SessionId, mutation: SessionMutation) -> SessionMutationOutcome;
         set_metadata_value_conditionally(id: &SessionId, key: String, value: Value, condition: MetadataSetCondition) -> MetadataSetOutcome;
         remove_metadata_value(id: &SessionId, key: String) -> SessionRecord;

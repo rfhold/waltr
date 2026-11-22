@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::timeline::{PendingTimelineEvent, PendingTimelineItemId, TimelineCursor};
+use crate::{UserMessage, timeline::{PendingTimelineEvent, TimelineCursor}};
 
 use super::{
     InferenceSettings, Revision, SessionCopy, SessionId, SessionJournalEvent, SessionRecord,
@@ -62,19 +62,9 @@ impl SessionCreateRequest {
             }
         };
         for message in messages {
-            let text = message.into_text();
-            journal.push(SessionJournalEvent::PromptAppended {
-                prompt: text.clone(),
-            });
             cursor = cursor.next();
             journal.push(SessionJournalEvent::Timeline(
-                PendingTimelineEvent::user_text_snapshot(
-                    id.clone(),
-                    turn,
-                    PendingTimelineItemId::New,
-                    text,
-                )
-                .with_cursor(cursor),
+                PendingTimelineEvent::user_message(id.clone(), turn, message.0).with_cursor(cursor),
             ));
         }
 
@@ -104,37 +94,26 @@ pub enum SessionStart {
 }
 
 /// Validated user message materialized during session creation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SessionStartMessage(String);
+pub struct SessionStartMessage(UserMessage);
 
 impl SessionStartMessage {
     /// Validate an exact user message.
     pub fn user(text: impl Into<String>) -> Result<Self, SessionStartMessageError> {
-        let text = text.into();
-        if text.is_empty() {
-            return Err(SessionStartMessageError);
-        }
-        Ok(Self(text))
+        UserMessage::from_text(text.into()).map(Self).map_err(|_| SessionStartMessageError)
     }
 
     /// Borrow the exact user text.
     #[must_use]
-    pub fn text(&self) -> &str {
-        &self.0
-    }
-
-    fn into_text(self) -> String {
-        self.0
+    pub fn text(&self) -> String {
+        self.0.text()
     }
 }
 
-impl<'de> Deserialize<'de> for SessionStartMessage {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Self::user(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+impl From<UserMessage> for SessionStartMessage {
+    fn from(message: UserMessage) -> Self {
+        Self(message)
     }
 }
 
@@ -176,11 +155,11 @@ mod tests {
         assert_eq!(timeline[1].cursor, TimelineCursor::new(2));
         assert!(matches!(
             &timeline[0].content,
-            TimelineContent::TextSnapshot { text } if text == "  first\nmessage  "
+            TimelineContent::UserMessage { message } if message.text() == "  first\nmessage  "
         ));
         assert!(matches!(
             &timeline[1].content,
-            TimelineContent::TextSnapshot { text } if text == "second"
+            TimelineContent::UserMessage { message } if message.text() == "second"
         ));
     }
 

@@ -355,6 +355,11 @@ pub enum TimelineContent {
         /// Complete text.
         text: String,
     },
+    /// The committed user message. This event also supplies the replay prompt.
+    UserMessage {
+        /// Ordered text and verified image references.
+        message: crate::UserMessage,
+    },
     /// Provider-neutral tool call.
     ToolCall {
         /// Tool call payload.
@@ -464,6 +469,21 @@ impl PendingTimelineEvent {
         text: impl Into<String>,
     ) -> Self {
         text_snapshot_event(session_id, turn, item_id, CHANNEL_USER_TEXT, text)
+    }
+
+    /// Create the canonical timeline and replay event for an ordered user message.
+    #[must_use]
+    pub fn user_message(session_id: SessionId, turn: u64, message: crate::UserMessage) -> Self {
+        let mut event = Self::new(
+            session_id,
+            turn,
+            PendingTimelineItemId::New,
+            TimelineEventKind::ItemFinished,
+            Some(CHANNEL_USER_TEXT.into()),
+            TimelineContent::UserMessage { message },
+        );
+        event.status = Some(TimelineStatus::Finished);
+        event
     }
 
     /// Create a final assistant text snapshot event.

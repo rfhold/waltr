@@ -25,6 +25,7 @@ where
     pub retry_config: ProviderRetryConfig,
     pub max_provider_turns: Option<u64>,
     pub(crate) host_context: Option<Arc<dyn crate::AgentHostContext>>,
+    pub(crate) message_image_resolver: Option<Arc<dyn crate::MessageImageResolver>>,
     pub session_id: SessionId,
     pub session_store: S,
     pub session_run_context: Option<SessionRunContext>,

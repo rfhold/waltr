@@ -18,7 +18,7 @@ use super::{
     CancelReason, InferenceSettings, MetadataSetCondition, MetadataSetOutcome, PendingWork,
     PendingWorkStatus, ResumeInput, SessionCreateRequest, SessionId, SessionIncarnation,
     SessionJournalEvent, SessionRecord, SessionRollbackTarget, SessionRunContext, SessionSnapshot,
-    SessionStatus, SessionStore, SessionSummary, Suspension,
+    SessionStatus, SessionStore, SessionSummary, Suspension, storage::assign_timeline_events,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -86,7 +86,7 @@ where
             super::SessionStart::Fresh { messages }
             | super::SessionStart::Copy { messages, .. } => messages
                 .iter()
-                .map(|message| message.text().to_owned())
+                .map(super::SessionStartMessage::text)
                 .collect::<Vec<_>>(),
         };
         let record = self
@@ -102,7 +102,9 @@ where
                 .iter()
                 .enumerate()
                 .filter_map(|(index, event)| {
-                    matches!(event, SessionJournalEvent::PromptAppended { .. }).then_some(index)
+                    matches!(event, SessionJournalEvent::Timeline(crate::AgentTimelineEvent {
+                        content: TimelineContent::UserMessage { .. }, ..
+                    })).then_some(index)
                 })
                 .collect::<Vec<_>>();
             let first = journal_indices.len().saturating_sub(initial_messages.len());
@@ -169,6 +171,7 @@ where
             ResumeInput::Continue => Ok(RuntimeResumeOutput::Resumed { record }),
             ResumeInput::Prompt(prompt) => self.resume_prompt(record, prompt).await,
             ResumeInput::Prompts(prompts) => self.resume_prompts(record, prompts).await,
+            ResumeInput::UserMessages(messages) => self.resume_user_messages(record, messages).await,
             ResumeInput::ToolResults(results) => self.resume_tool_results(record, results).await,
         }
     }
@@ -435,7 +438,20 @@ where
         record: SessionRecord,
         prompts: Vec<String>,
     ) -> Result<RuntimeResumeOutput> {
-        if prompts.is_empty() {
+        let messages = prompts
+            .into_iter()
+            .map(crate::UserMessage::from_text)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(session_store_error)?;
+        self.resume_user_messages(record, messages).await
+    }
+
+    async fn resume_user_messages(
+        &self,
+        record: SessionRecord,
+        messages: Vec<crate::UserMessage>,
+    ) -> Result<RuntimeResumeOutput> {
+        if messages.is_empty() {
             return Err(session_store_error("prompt batch must not be empty"));
         }
         let snapshot = record.snapshot();
@@ -463,34 +479,31 @@ where
         } else {
             snapshot.turn
         };
-        let mut created_prompts = Vec::with_capacity(prompts.len());
-        for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-            prompt_timeline.push(user_prompt_timeline_event(
-                &record.id,
-                turn,
-                snapshot.prompts.len() + prompt_index,
-                prompt.clone(),
-            ));
-            created_prompts.push((journal.len(), prompt.clone()));
-            journal.push(SessionJournalEvent::PromptAppended { prompt });
+        let mut created_prompts = Vec::with_capacity(messages.len());
+        for (index, message) in messages.into_iter().enumerate() {
+            created_prompts.push((record.journal.len() + cancellation_timeline.len() + journal.len() + index, message.text()));
+            prompt_timeline.push(PendingTimelineEvent::user_message(record.id.clone(), turn, message));
         }
 
-        let mut record = if cancellation_timeline.is_empty() {
-            record
-        } else {
-            self.append_timeline_and_reload(record, cancellation_timeline)
-                .await?
-        };
-        let journal_start = record.journal.len();
-        for (journal_index, _) in &mut created_prompts {
-            *journal_index = journal_start.saturating_add(*journal_index);
+        // The execution token guards the timeline high-water mark used for assignment.
+        // Commit the replay prompts and their visible messages in the same append.
+        let cancellation_count = cancellation_timeline.len();
+        cancellation_timeline.extend(prompt_timeline);
+        let timeline = assign_timeline_events(&record, &record.id, cancellation_timeline)
+            .map_err(session_store_error)?;
+        let (cancellations, messages) = timeline.split_at(cancellation_count);
+        let events = cancellations
+            .iter()
+            .cloned()
+            .map(SessionJournalEvent::Timeline)
+            .chain(journal)
+            .chain(messages.iter().cloned().map(SessionJournalEvent::Timeline))
+            .collect();
+        let record = self.commit_journal(record, events).await?;
+        if let Some(context) = &self.run_context {
+            context.timeline().publish_all(timeline);
         }
-        record = self.append_journal_and_reload(record, journal).await?;
-        if !prompt_timeline.is_empty() {
-            record = self
-                .append_timeline_and_reload(record, prompt_timeline)
-                .await?;
-        }
+        self.publish_session_summary(&record);
         self.publish_user_message_events(&record, snapshot.prompts.len(), created_prompts);
         Ok(RuntimeResumeOutput::Resumed { record })
     }
@@ -522,6 +535,16 @@ where
 
     async fn append_journal_and_reload(
         &self,
+        record: SessionRecord,
+        events: Vec<SessionJournalEvent>,
+    ) -> Result<SessionRecord> {
+        let record = self.commit_journal(record, events).await?;
+        self.publish_session_summary(&record);
+        Ok(record)
+    }
+
+    async fn commit_journal(
+        &self,
         mut record: SessionRecord,
         events: Vec<SessionJournalEvent>,
     ) -> Result<SessionRecord> {
@@ -537,7 +560,6 @@ where
             .map_err(session_store_error)?;
         record.adopt_commit(receipt);
         record.append_journal_events(events);
-        self.publish_session_summary(&record);
         Ok(record)
     }
 
@@ -592,6 +614,9 @@ where
             return;
         };
         for (offset, (journal_index, text)) in prompts.into_iter().enumerate() {
+            let Some(SessionJournalEvent::Timeline(message)) = record.journal.get(journal_index) else {
+                continue;
+            };
             let prompt_index =
                 u64::try_from(first_prompt_index.saturating_add(offset)).unwrap_or(u64::MAX);
             crate::agent::event::spawn_session_event(
@@ -605,7 +630,7 @@ where
                     text,
                     metadata: record.metadata.values.clone(),
                     revision: record.revision,
-                    cursor: record.last_timeline_cursor(),
+                    cursor: Some(message.cursor),
                 },
             );
         }
@@ -690,20 +715,6 @@ fn tool_result_timeline_event(
     )
 }
 
-fn user_prompt_timeline_event(
-    session_id: &SessionId,
-    turn: u64,
-    _prompt_index: usize,
-    prompt: String,
-) -> PendingTimelineEvent {
-    PendingTimelineEvent::user_text_snapshot(
-        session_id.clone(),
-        turn,
-        PendingTimelineItemId::New,
-        prompt,
-    )
-}
-
 fn open_prompt_turn(snapshot: &SessionSnapshot) -> Option<u64> {
     let prompt_turn = snapshot.prompt_turns.last()?;
     (prompt_turn.turn == snapshot.turn).then_some(prompt_turn.turn)
@@ -756,6 +767,44 @@ mod tests {
         assert_eq!(record.id, session_id());
         assert_eq!(record.revision, Revision::ZERO);
         assert!(record.journal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_batch_commits_replay_and_timeline_in_one_revision() {
+        let store = MemorySessionStore::new();
+        let runtime = AgentSessionRuntime::new(&store);
+        let record = runtime
+            .create(SessionCreateRequest::new(session_id()))
+            .await
+            .unwrap();
+        let prompts = vec![String::from("first"), String::from("second")];
+        runtime
+            .resume(&record.id, ResumeInput::Prompts(prompts.clone()))
+            .await
+            .unwrap();
+
+        let saved = store.load(&record.id).await.unwrap();
+        assert_eq!(saved.revision, record.revision.next());
+        assert_eq!(saved.snapshot().prompts, prompts);
+        let timeline: Vec<_> = saved.timeline_events().collect();
+        assert_eq!(timeline.len(), prompts.len());
+        for (index, event) in timeline.into_iter().enumerate() {
+            assert_eq!(event.cursor, TimelineCursor::new(index as u64 + 1));
+            assert_eq!(
+                event.content,
+                TimelineContent::UserMessage {
+                    message: crate::UserMessage::from_text(prompts[index].clone()).unwrap(),
+                }
+            );
+        }
+
+        assert!(
+            runtime
+                .resume_prompts(record, vec!["stale".into()])
+                .await
+                .is_err()
+        );
+        assert_eq!(store.load(&saved.id).await.unwrap().journal, saved.journal);
     }
 
     #[tokio::test]
