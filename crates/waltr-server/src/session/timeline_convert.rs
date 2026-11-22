@@ -160,6 +160,35 @@ fn timeline_content_to_proto(content: TimelineContent) -> Result<ProtoTimelineCo
         TimelineContent::TextSnapshot { text } => {
             timeline_content::Content::TextSnapshot(TextSnapshotTimelineContent { text })
         }
+        TimelineContent::UserMessage { message } => {
+            use waltr::grpc::waltr::session::v1::{
+                MessageImageFormat as WireFormat, MessageImageInfo, UserMessageTimelineContent,
+                UserMessageTimelinePart, user_message_timeline_part::Part,
+            };
+            use waltr_agent::{MessageImageFormat, UserMessagePart};
+            let parts = message
+                .parts()
+                .iter()
+                .map(|part| UserMessageTimelinePart {
+                    part: Some(match part {
+                        UserMessagePart::Text { text } => Part::Text(text.clone()),
+                        UserMessagePart::Image { image } => {
+                            let descriptor = image.descriptor();
+                            let format = match descriptor.format() {
+                                MessageImageFormat::Png => WireFormat::Png,
+                                MessageImageFormat::Jpeg => WireFormat::Jpeg,
+                                MessageImageFormat::WebP => WireFormat::Webp,
+                            };
+                            Part::Image(MessageImageInfo {
+                                format: format as i32,
+                                size_bytes: descriptor.bytes(),
+                            })
+                        }
+                    }),
+                })
+                .collect();
+            timeline_content::Content::UserMessage(UserMessageTimelineContent { parts })
+        }
         TimelineContent::ToolCall { call } => {
             timeline_content::Content::ToolCall(ToolCallTimelineContent {
                 id: call.id,

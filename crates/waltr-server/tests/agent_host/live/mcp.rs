@@ -242,6 +242,7 @@ fn test_session_from_timeline(timeline: Vec<AgentTimelineEvent>) -> AgentTestSes
             TimelineContent::Empty
             | TimelineContent::TextDelta { .. }
             | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::UserMessage { .. }
             | TimelineContent::ContentRef { .. }
             | TimelineContent::Json { .. }
             | TimelineContent::ToolCall { .. }

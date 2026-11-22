@@ -17,7 +17,9 @@ async fn submit_user_message_validates_request() -> Result<(), Box<dyn std::erro
     let error = client
         .submit_user_message(SubmitUserMessageRequest {
             session_id: String::new(),
-            text: "hello".to_owned(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                "hello",
+            )],
         })
         .await
         .expect_err("empty session id should fail");
@@ -32,7 +34,9 @@ async fn submit_user_message_validates_request() -> Result<(), Box<dyn std::erro
     let error = client
         .submit_user_message(SubmitUserMessageRequest {
             session_id: session.id,
-            text: "   ".to_owned(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                "   ",
+            )],
         })
         .await
         .expect_err("blank prompt should fail");
@@ -53,7 +57,9 @@ async fn submit_user_message_requires_session_runtime() -> Result<(), Box<dyn st
     let error = client
         .submit_user_message(SubmitUserMessageRequest {
             session_id: session.record.id.as_str().to_owned(),
-            text: "hello".to_owned(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                "hello",
+            )],
         })
         .await
         .expect_err("missing runtime should fail before starting a run");

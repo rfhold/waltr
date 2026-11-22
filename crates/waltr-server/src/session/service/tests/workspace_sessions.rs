@@ -459,7 +459,9 @@ async fn concurrent_scopes_survive_restart_without_local_fallback() {
         .submit_user_message(authorized(
             SubmitUserMessageRequest {
                 session_id: b.id.clone(),
-                text: "Do not dispatch".into(),
+                parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                    "Do not dispatch",
+                )],
             },
             &other,
         ))

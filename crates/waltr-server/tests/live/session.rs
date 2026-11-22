@@ -83,7 +83,9 @@ async fn assert_provider_submit_user_message(
     client
         .submit_user_message(SubmitUserMessageRequest {
             session_id: session.id.clone(),
-            text: "Reply with one short sentence.".to_owned(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                "Reply with one short sentence.",
+            )],
         })
         .await?;
 
@@ -111,7 +113,9 @@ async fn assert_provider_watch_timeline_reconnects_with_cursor(
     client
         .submit_user_message(SubmitUserMessageRequest {
             session_id: session.id.clone(),
-            text: "Reply with a short sentence containing the word reconnect.".to_owned(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                "Reply with a short sentence containing the word reconnect.",
+            )],
         })
         .await?;
 

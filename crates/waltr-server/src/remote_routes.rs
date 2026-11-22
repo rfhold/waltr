@@ -176,6 +176,7 @@ impl RemoteRoutes {
             },
             lease,
             request.headers(),
+            request.uri().path(),
         )?;
         telemetry.stage("dispatch");
         let dispatch_started = Instant::now();
@@ -438,6 +439,7 @@ mod telemetry_tests {
                     authority_id: "private-grant".into(),
                 },
                 &headers,
+                "/waltr.StatusService/WatchStatus",
             )
             .unwrap()
             .request(())
@@ -638,8 +640,29 @@ impl tower::Service<Request<Body>> for ObservedChannel {
 struct Outbound {
     channel: ObservedChannel,
     authorization: AsciiMetadataValue,
+    image_route: Option<AsciiMetadataValue>,
     grpc_timeout: Option<AsciiMetadataValue>,
     traceparent: Option<AsciiMetadataValue>,
+}
+
+// Correlates upload operations after authentication; it never grants access.
+pub(crate) const IMAGE_UPLOAD_ROUTE_HEADER: &str = "waltr-image-upload-route";
+
+fn image_upload_route(authority_id: &str) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    static SECRET: std::sync::LazyLock<[uuid::Uuid; 2]> =
+        std::sync::LazyLock::new(|| [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()]);
+    let grant = uuid::Uuid::parse_str(authority_id).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(grant.as_bytes());
+    digest.update(SECRET[0].as_bytes());
+    digest.update(SECRET[1].as_bytes());
+    let mut tag = String::with_capacity(64);
+    for byte in digest.finalize() {
+        use std::fmt::Write as _;
+        write!(tag, "{byte:02x}").expect("String writes cannot fail");
+    }
+    Some(tag)
 }
 
 impl Outbound {
@@ -647,6 +670,7 @@ impl Outbound {
         channel: ObservedChannel,
         lease: RemoteCredentialLease,
         headers: &HeaderMap,
+        path: &str,
     ) -> Result<Self, Status> {
         let mut authorization: AsciiMetadataValue = format!("Bearer {}", lease.access_token)
             .parse()
@@ -658,9 +682,28 @@ impl Outbound {
         let mut trace = OutboundTrace::default();
         TraceContextPropagator::new()
             .inject_context(&tracing::Span::current().context(), &mut trace);
+        let image_route = match descriptor(path) {
+            Some((
+                "waltr.session.v1.SessionService",
+                "BeginMessageImageUpload"
+                | "WriteMessageImageChunk"
+                | "SealMessageImageUpload"
+                | "AbortMessageImageUpload"
+                | "SubmitUserMessage",
+                _,
+            )) => {
+                let mut route: AsciiMetadataValue = image_upload_route(&lease.authority_id)
+                    .and_then(|id| id.parse().ok())
+                    .ok_or_else(|| Status::failed_precondition("Remote authorization changed"))?;
+                route.set_sensitive(true);
+                Some(route)
+            }
+            _ => None,
+        };
         Ok(Self {
             channel,
             authorization,
+            image_route,
             grpc_timeout,
             traceparent: trace.0,
         })
@@ -671,6 +714,11 @@ impl Outbound {
         request
             .metadata_mut()
             .insert("authorization", self.authorization.clone());
+        if let Some(route) = &self.image_route {
+            request
+                .metadata_mut()
+                .insert(IMAGE_UPLOAD_ROUTE_HEADER, route.clone());
+        }
         if let Some(timeout) = &self.grpc_timeout {
             request
                 .metadata_mut()
@@ -683,6 +731,42 @@ impl Outbound {
         }
         request
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn image_upload_relay_replaces_untrusted_correlation_with_checked_grant() {
+    let grant = uuid::Uuid::new_v4();
+    let mut headers = HeaderMap::new();
+    headers.insert(IMAGE_UPLOAD_ROUTE_HEADER, "untrusted".parse().unwrap());
+    let span = tracing::Span::none();
+    let outbound = Outbound::new(
+        ObservedChannel {
+            channel: Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            span,
+            started: Instant::now(),
+        },
+        RemoteCredentialLease {
+            access_token: "unused-test-token".into(),
+            expires_at_ms: 0,
+            authority_id: grant.to_string(),
+        },
+        &headers,
+        "/waltr.session.v1.SessionService/BeginMessageImageUpload",
+    )
+    .unwrap();
+    let request = outbound.request(());
+    let route = request.metadata().get(IMAGE_UPLOAD_ROUTE_HEADER).unwrap();
+    assert_eq!(
+        route.to_str().unwrap(),
+        image_upload_route(&grant.to_string()).unwrap()
+    );
+    assert_ne!(route.to_str().unwrap(), grant.simple().to_string());
+    assert_ne!(
+        route.to_str().unwrap(),
+        image_upload_route(&uuid::Uuid::new_v4().to_string()).unwrap()
+    );
+    assert!(route.is_sensitive());
 }
 
 fn map_status(status: Status) -> Status {
@@ -927,6 +1011,11 @@ routes! {
         unary "GetTimeline" => get_timeline(session::GetTimelineRequest);
         stream "WatchTimeline" => watch_timeline(session::WatchTimelineRequest);
         unary "SubmitUserMessage" => submit_user_message(session::SubmitUserMessageRequest);
+        unary "BeginMessageImageUpload" => begin_message_image_upload(session::BeginMessageImageUploadRequest);
+        unary "WriteMessageImageChunk" => write_message_image_chunk(session::WriteMessageImageChunkRequest);
+        unary "SealMessageImageUpload" => seal_message_image_upload(session::SealMessageImageUploadRequest);
+        unary "AbortMessageImageUpload" => abort_message_image_upload(session::AbortMessageImageUploadRequest);
+        stream "ReadMessageImage" => read_message_image(session::ReadMessageImageRequest);
         unary "InterruptSession" => interrupt_session(session::InterruptSessionRequest);
         unary "RollbackSession" => rollback_session(session::RollbackSessionRequest);
         unary "ContinueSession" => continue_session(session::ContinueSessionRequest);

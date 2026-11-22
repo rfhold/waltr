@@ -384,6 +384,9 @@ impl<S: waltr_agent::SessionStore + Clone + Send + Sync + 'static> AuthorizedToo
 fn map_owned_error(error: waltr_agent::OwnedExecutionError) -> AuthorizedToolError {
     match error {
         waltr_agent::OwnedExecutionError::Unavailable => AuthorizedToolError::Unavailable,
-        waltr_agent::OwnedExecutionError::Uncertain => AuthorizedToolError::Uncertain,
+        waltr_agent::OwnedExecutionError::Uncertain
+        | waltr_agent::OwnedExecutionError::ProviderRejected { .. } => {
+            AuthorizedToolError::Uncertain
+        }
     }
 }

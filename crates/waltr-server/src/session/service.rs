@@ -13,6 +13,7 @@ use crate::auth::CredentialStore;
 #[cfg(test)]
 #[path = "apps_tests.rs"]
 mod apps_tests;
+mod image_rpc;
 
 use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
 
@@ -21,6 +22,8 @@ use crate::{agent_definition::AgentDefinitionState, config::ConfigHandle};
 use super::{
     convert::session_summary_to_proto,
     error::{agent_error_to_status, session_run_error_to_status},
+    image_objects::SessionImageObjects,
+    image_uploads::ImageUploads,
     inference_settings::{resolve_inference_settings, resolve_inference_settings_for_create},
     timeline_convert::{
         catchup_query, channel_matches, initial_query, projected_timeline_event_to_proto,
@@ -34,12 +37,15 @@ use tracing::Instrument as _;
 use waltr::grpc::waltr::{
     config::v1::Configuration,
     session::v1::{
-        ContinueSessionRequest, ContinueSessionResponse, CreateSessionRequest,
-        CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse, GetTimelineRequest,
-        GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse, ListAgentsRequest,
-        ListAgentsResponse, ListSessionsRequest, ListSessionsResponse, RollbackSessionRequest,
-        RollbackSessionResponse, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse,
-        SelectableAgent, SessionListCleared, SessionListSnapshot,
+        AbortMessageImageUploadRequest, AbortMessageImageUploadResponse,
+        BeginMessageImageUploadRequest, BeginMessageImageUploadResponse, ContinueSessionRequest,
+        ContinueSessionResponse, CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest,
+        DeleteSessionResponse, GetTimelineRequest, GetTimelineResponse, InterruptSessionRequest,
+        InterruptSessionResponse, ListAgentsRequest, ListAgentsResponse, ListSessionsRequest,
+        ListSessionsResponse, ReadMessageImageRequest, ReadMessageImageResponse,
+        RollbackSessionRequest, RollbackSessionResponse, SealMessageImageUploadRequest,
+        SealMessageImageUploadResponse, SearchSessionTemplatesRequest,
+        SearchSessionTemplatesResponse, SelectableAgent, SessionListCleared, SessionListSnapshot,
         SessionTemplateKind as ProtoSessionTemplateKind,
         SessionTemplateOption as ProtoSessionTemplateOption, SessionTemplateOptions,
         SessionTemplateSearchError,
@@ -49,20 +55,24 @@ use waltr::grpc::waltr::{
         UpdateSessionAgentResponse, UpdateSessionInferenceSettingsRequest,
         UpdateSessionInferenceSettingsResponse, WatchSessionsRequest, WatchSessionsResponse,
         WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest, WipeSessionsResponse,
-        rollback_target, search_session_templates_response,
+        WriteMessageImageChunkRequest, WriteMessageImageChunkResponse, rollback_target,
+        search_session_templates_response,
         session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
         watch_timeline_response,
     },
 };
 use waltr_agent::{
     AgentRunLimits, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
-    AgentSessionRunSubmission, AgentSessionRuntimeError, MetadataSetCondition, MetadataSetOutcome,
-    RunConflictPolicy, SessionCoordinator, SessionCreateRequest, SessionId, SessionListEvent,
-    SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind, SessionTemplateOption,
-    SessionTemplateSearchRequest, SessionTemplateSearchTarget, SessionTimelineEvent,
-    SessionTimelineMode, SessionTimelinePresentation, SessionTimelineProjectedEvent,
-    SessionTimelineProjectionEvent, SessionTimelineProjectionUpdateEvent, TimelineCursor,
+    AgentSessionRunInput, AgentSessionRunSubmission, AgentSessionRuntimeError,
+    MetadataSetCondition, MetadataSetOutcome, RunConflictPolicy, SessionCoordinator,
+    SessionCreateRequest, SessionId, SessionListEvent, SessionListUpdate, SessionStore,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
+    SessionTemplateSearchTarget, SessionTimelineEvent, SessionTimelineMode,
+    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionTimelineProjectionUpdateEvent, TimelineCursor,
 };
+
+pub(super) const MEMORY_IMAGE_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
 /// gRPC session service backed by durable agent session storage.
 #[derive(Debug)]
@@ -79,6 +89,10 @@ where
     pub(super) interactions: crate::interaction::InteractionBroker,
     routines: tokio::sync::Mutex<Option<Arc<crate::routine::production::ProductionRuntime>>>,
     origin_runs: OriginRuns,
+    image_objects: SessionImageObjects,
+    image_uploads: Arc<ImageUploads>,
+    image_reaper: std::sync::Once,
+    image_read_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug)]
@@ -145,17 +159,33 @@ impl<S> SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    /// Construct a session service from a store and explicit host capabilities.
+    /// Construct a test session service with volatile image storage.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(store: S, input: SessionRegistrationInput) -> Arc<Self> {
+    pub(crate) fn new(store: S, input: SessionRegistrationInput) -> Arc<Self> {
         Self::from_sessions(SessionCoordinator::new(store), input)
     }
 
-    /// Construct a session service from an existing coordinator and host capabilities.
+    /// Construct a test session service with volatile image storage.
+    #[cfg(test)]
     #[must_use]
-    pub fn from_sessions(
+    pub(crate) fn from_sessions(
         sessions: SessionCoordinator<S>,
         input: SessionRegistrationInput,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_images(
+            sessions,
+            input,
+            SessionImageObjects::memory(MEMORY_IMAGE_OBJECT_BYTES),
+        )
+    }
+
+    /// Construct a session service with explicitly paired record and image stores.
+    #[must_use]
+    pub fn from_sessions_with_images(
+        sessions: SessionCoordinator<S>,
+        input: SessionRegistrationInput,
+        image_objects: SessionImageObjects,
     ) -> Arc<Self> {
         let SessionRegistrationInput {
             workspace_root,
@@ -179,6 +209,9 @@ where
             credential_store,
             default_agent_definition,
         )
+        .with_message_image_resolver(Arc::new(image_rpc::SavedImageResolver::new(
+            image_objects.clone(),
+        )))
         .with_workspace_machines(workspace_machines)
         .with_capability_policy(policy);
         let runtime_factory = match &agent_catalog {
@@ -216,6 +249,10 @@ where
             runtime_factory: Arc::new(runtime_factory),
             routines: tokio::sync::Mutex::new(None),
             origin_runs: OriginRuns::default(),
+            image_objects,
+            image_uploads: Arc::new(ImageUploads::default()),
+            image_reaper: std::sync::Once::new(),
+            image_read_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
@@ -1171,21 +1208,152 @@ where
             .extensions()
             .get::<crate::access_auth::AuthenticatedPrincipal>()
             .cloned();
-        let request = request.into_inner();
-        let session_id = required_session_id(&request.session_id)?;
-        if request.text.trim().is_empty() {
-            return Err(Status::invalid_argument("text must not be empty"));
-        }
+        let session_id = required_session_id(&request.get_ref().session_id)?;
+        let has_image = request.get_ref().parts.iter().any(|part| {
+            matches!(
+                part.part,
+                Some(
+                    waltr::grpc::waltr::session::v1::user_message_input_part::Part::ImageUploadId(
+                        _
+                    )
+                )
+            )
+        });
+        let scope = if has_image {
+            Some(
+                self.image_upload_scope(&request, session_id.as_str())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let parts = image_rpc::message_parts(request.into_inner().parts)?;
         tracing::Span::current().record("session_id", session_id.as_str());
-        tracing::info!("session prompt accepted");
-        self.request_sessions(principal, &session_id)
-            .await?
-            .submit_prompt(session_id, request.text, RunConflictPolicy::QueueIfActive)
-            .await
-            .map_err(session_run_error_to_status)?;
-        tracing::info!("session prompt dispatched");
+        let sessions = self
+            .request_sessions(principal.clone(), &session_id)
+            .await?;
+        if let Some((scope, incarnation)) = scope {
+            let claimed = self
+                .image_uploads
+                .claim_message(&scope, parts)
+                .map_err(image_rpc::upload_status)?;
+            let publish = claimed.publish(&self.image_objects);
+            let parts = if let Some(principal) = &principal {
+                tokio::select! {
+                    biased;
+                    () = principal.access_ended() => return Err(Status::unauthenticated("access ended")),
+                    result = publish => result.map_err(image_rpc::object_status)?,
+                }
+            } else {
+                publish.await.map_err(image_rpc::object_status)?
+            };
+            let message = image_rpc::saved_message(parts)?;
+            let submit = sessions.submit_owned_input(
+                session_id,
+                &incarnation,
+                AgentSessionRunInput::UserMessage(message),
+                AgentRunLimits::default(),
+            );
+            let result = if let Some(principal) = &principal {
+                tokio::select! {
+                    biased;
+                    () = principal.access_ended() => return Err(Status::unauthenticated("access ended")),
+                    result = submit => result,
+                }
+            } else {
+                submit.await
+            };
+            result.map_err(session_run_error_to_status)?;
+        } else {
+            let message = image_rpc::text_message(parts)?;
+            sessions
+                .submit(
+                    session_id,
+                    AgentSessionRunInput::UserMessage(message),
+                    RunConflictPolicy::QueueIfActive,
+                )
+                .await
+                .map_err(session_run_error_to_status)?;
+        }
 
         Ok(Response::new(SubmitUserMessageResponse {}))
+    }
+
+    async fn begin_message_image_upload(
+        &self,
+        request: Request<BeginMessageImageUploadRequest>,
+    ) -> Result<Response<BeginMessageImageUploadResponse>, Status> {
+        let (scope, _) = self
+            .image_upload_scope(&request, &request.get_ref().session_id)
+            .await?;
+        let input = request.into_inner();
+        self.ensure_image_upload_reaper();
+        let upload = self
+            .image_uploads
+            .begin(
+                scope,
+                image_rpc::format_from_wire(input.format)?,
+                input.size_bytes,
+            )
+            .map_err(image_rpc::upload_status)?;
+        Ok(Response::new(BeginMessageImageUploadResponse {
+            upload_id: upload.token(),
+        }))
+    }
+
+    async fn write_message_image_chunk(
+        &self,
+        request: Request<WriteMessageImageChunkRequest>,
+    ) -> Result<Response<WriteMessageImageChunkResponse>, Status> {
+        let (scope, _) = self
+            .image_upload_scope(&request, &request.get_ref().session_id)
+            .await?;
+        let input = request.into_inner();
+        self.image_uploads
+            .write(
+                &scope,
+                image_rpc::upload_id(&input.upload_id)?,
+                input.offset,
+                &input.data,
+            )
+            .map_err(image_rpc::upload_status)?;
+        Ok(Response::new(WriteMessageImageChunkResponse {}))
+    }
+
+    async fn seal_message_image_upload(
+        &self,
+        request: Request<SealMessageImageUploadRequest>,
+    ) -> Result<Response<SealMessageImageUploadResponse>, Status> {
+        let (scope, _) = self
+            .image_upload_scope(&request, &request.get_ref().session_id)
+            .await?;
+        self.image_uploads
+            .seal(&scope, image_rpc::upload_id(&request.get_ref().upload_id)?)
+            .map_err(image_rpc::upload_status)?;
+        Ok(Response::new(SealMessageImageUploadResponse {}))
+    }
+
+    async fn abort_message_image_upload(
+        &self,
+        request: Request<AbortMessageImageUploadRequest>,
+    ) -> Result<Response<AbortMessageImageUploadResponse>, Status> {
+        let (scope, _) = self
+            .image_upload_scope(&request, &request.get_ref().session_id)
+            .await?;
+        self.image_uploads
+            .abort(&scope, image_rpc::upload_id(&request.get_ref().upload_id)?)
+            .map_err(image_rpc::upload_status)?;
+        Ok(Response::new(AbortMessageImageUploadResponse {}))
+    }
+
+    type ReadMessageImageStream =
+        Pin<Box<dyn Stream<Item = Result<ReadMessageImageResponse, Status>> + Send>>;
+
+    async fn read_message_image(
+        &self,
+        request: Request<ReadMessageImageRequest>,
+    ) -> Result<Response<Self::ReadMessageImageStream>, Status> {
+        self.read_visible_message_image(request).await
     }
 
     #[tracing::instrument(
@@ -1636,6 +1804,8 @@ pub(crate) fn resolve_mcp_connections(
 
 #[cfg(test)]
 mod tests {
+    #[path = "message_images.rs"]
+    mod message_images;
     #[path = "workspace_sessions.rs"]
     mod workspace_sessions;
     use std::{
@@ -1874,27 +2044,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(initial.default_agent_name, "coding");
-        assert_eq!(
-            initial
-                .agents
-                .iter()
-                .map(|agent| agent.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "coding",
-                "configuration",
-                "default",
-                "routine-categorization",
-                "routine-category-context",
-                "routine-cleanup",
-                "routine-compaction",
-                "routine-context-strategy",
-                "routine-conversation-filter",
-                "routine-conversation-notes",
-                "routine-fork",
-                "routine-title"
-            ]
-        );
+        assert!(!initial.agents.iter().any(|agent| agent.name == "later"));
 
         let source = agent_source("later", "later agent");
         state

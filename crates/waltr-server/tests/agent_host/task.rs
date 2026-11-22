@@ -698,14 +698,13 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
     let parent = runs.load(&parent_id).await?;
     let prompts = parent
         .record
-        .journal
-        .iter()
-        .filter_map(|event| match event {
-            SessionJournalEvent::PromptAppended { prompt } => Some(prompt.as_str()),
+        .timeline_events()
+        .filter_map(|event| match &event.content {
+            waltr_agent::TimelineContent::UserMessage { message } => Some(message.text()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(prompts.first().copied(), Some("start tasks"));
+    assert_eq!(prompts.first().map(String::as_str), Some("start tasks"));
     assert!(
         prompts.iter().any(|prompt| prompt.contains(
             "Task ID: task_parent_0_task-1\nStatus: finished\n\nResult:\nfirst child done"

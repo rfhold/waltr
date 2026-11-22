@@ -345,7 +345,9 @@ async fn list_and_watch_sessions_project_pause_queue_and_release_coordination()
     client
         .submit_user_message(SubmitUserMessageRequest {
             session_id: created_id.clone(),
-            text: "queued while paused".to_owned(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(
+                "queued while paused",
+            )],
         })
         .await?;
     let queued =

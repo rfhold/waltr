@@ -8,7 +8,6 @@ use crate::{
     },
 };
 use axum::{Form, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use prost::Message as _;
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -37,7 +36,9 @@ use waltr::grpc::waltr::{
         resource_service_client::ResourceServiceClient,
     },
     session::v1::{
-        CreateSessionRequest, ListSessionsResponse, WorkspaceSelection,
+        AbortMessageImageUploadRequest, BeginMessageImageUploadRequest,
+        BeginMessageImageUploadResponse, CreateSessionRequest, ListSessionsRequest,
+        ListSessionsResponse, MessageImageFormat, WorkspaceSelection, WriteMessageImageChunkRequest,
         session_service_client::SessionServiceClient,
     },
     status::v1::{
@@ -254,7 +255,29 @@ async fn remote_authorizes_exports_refreshes_and_stops_without_fallback() {
         .session
         .unwrap();
     assert_eq!(remote_session.workspace.unwrap().machine_id, MACHINE);
-    let listed = grpc_web_list_sessions(&exporter_endpoint, &selector).await;
+    let upload: BeginMessageImageUploadResponse = grpc_web_session_unary(
+        &exporter_endpoint,
+        &selector,
+        "BeginMessageImageUpload",
+        BeginMessageImageUploadRequest {
+            session_id: remote_session.id.clone(),
+            format: MessageImageFormat::Png as i32,
+            size_bytes: 8,
+        },
+    )
+    .await;
+    let upload_id = upload.upload_id;
+    let abort_upload = AbortMessageImageUploadRequest {
+        session_id: remote_session.id.clone(),
+        upload_id: upload_id.clone(),
+    };
+    let listed: ListSessionsResponse = grpc_web_session_unary(
+        &exporter_endpoint,
+        &selector,
+        "ListSessions",
+        ListSessionsRequest {},
+    )
+    .await;
     assert!(
         listed
             .sessions
@@ -323,6 +346,18 @@ async fn remote_authorizes_exports_refreshes_and_stops_without_fallback() {
     assert_eq!(refreshed.kind, AuthStatusKind::OauthConfigured as i32);
     assert!(refreshed.expires_at_ms > initial_expiry);
     assert_eq!(selector, route_selector(&mut auth).await);
+    routed_sessions
+        .write_message_image_chunk(routed(
+            WriteMessageImageChunkRequest {
+                session_id: remote_session.id.clone(),
+                upload_id,
+                offset: 0,
+                data: b"\x89PNG\r\n\x1a\n".to_vec(),
+            },
+            &selector,
+        ))
+        .await
+        .unwrap();
     assert_eq!(
         auth.logout(routed(LogoutRequest { target: target() }, &selector))
             .await.unwrap_err().code(),
@@ -363,7 +398,8 @@ async fn remote_authorizes_exports_refreshes_and_stops_without_fallback() {
     assert_selection(&mut sessions, "local", &bearer).await;
 
     let _new_expiry = authorize(&mut auth, &idp).await;
-    assert_ne!(selector, route_selector(&mut auth).await);
+    let new_selector = route_selector(&mut auth).await;
+    assert_ne!(selector, new_selector);
     assert_eq!(
         routed_sessions
             .create_session(routed(selection(MACHINE, &bearer).into_inner(), &selector))
@@ -377,6 +413,22 @@ async fn remote_authorizes_exports_refreshes_and_stops_without_fallback() {
         || machines.owns_live(MACHINE, &account),
     )
     .await;
+    assert_eq!(
+        routed_sessions
+            .abort_message_image_upload(routed(abort_upload.clone(), &selector))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+    );
+    assert_eq!(
+        routed_sessions
+            .abort_message_image_upload(routed(abort_upload, &new_selector))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound,
+    );
     mcp.assert_marker(&bearer).await;
     let deleted = config
         .reset_resource(ResetResourceRequest {
@@ -429,17 +481,26 @@ async fn route_selector(auth: &mut EntryAuth) -> String {
     )
 }
 
-async fn grpc_web_list_sessions(endpoint: &str, selector: &str) -> ListSessionsResponse {
+async fn grpc_web_session_unary<R: prost::Message + Default>(
+    endpoint: &str,
+    selector: &str,
+    method: &str,
+    request: impl prost::Message,
+) -> R {
+    let encoded = request.encode_to_vec();
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&encoded);
     let response = reqwest::Client::new()
         .post(format!(
-            "{endpoint}/waltr.session.v1.SessionService/ListSessions"
+            "{endpoint}/waltr.session.v1.SessionService/{method}"
         ))
         .timeout(DEADLINE)
         .header("content-type", "application/grpc-web+proto")
         .header("x-grpc-web", "1")
         .header("authorization", format!("Bearer {ENTRY_BEARER}"))
         .header(waltr::destination::HEADER, selector)
-        .body(vec![0_u8; 5])
+        .body(frame)
         .send()
         .await
         .unwrap()
@@ -450,7 +511,10 @@ async fn grpc_web_list_sessions(endpoint: &str, selector: &str) -> ListSessionsR
         .unwrap();
     assert_eq!(response[0], 0);
     let length = u32::from_be_bytes(response[1..5].try_into().unwrap()) as usize;
-    ListSessionsResponse::decode(&response[5..5 + length]).unwrap()
+    let trailer = &response[5 + length..];
+    assert_eq!(trailer[0], 0x80);
+    assert!(std::str::from_utf8(&trailer[5..]).unwrap().contains("grpc-status:0\r\n"));
+    R::decode(&response[5..5 + length]).unwrap()
 }
 
 fn start_exporter(root: &Path) -> Child {

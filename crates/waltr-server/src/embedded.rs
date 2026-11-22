@@ -132,11 +132,11 @@ pub async fn build_embedded_server(
     config: EmbeddedServerConfig,
 ) -> Result<EmbeddedServer, EmbeddedBuildError> {
     build_embedded_server_with_registration(config, |routes, input, root| {
-        Ok(session::add_storage_service(
+        session::add_storage_service(
             routes,
             session::SessionStorageConfig::Filesystem { root },
             input,
-        ))
+        )
     })
     .await
 }

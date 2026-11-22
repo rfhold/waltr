@@ -352,6 +352,7 @@ pub struct ServerAgentRuntimeFactory {
     catalog: Option<AgentDefinitionCatalog>,
     catalog_provider: Option<AgentCatalogProvider>,
     providers: waltr_agent::AgentSessionRuntimeFactory,
+    message_image_resolver: Option<Arc<dyn waltr_agent::MessageImageResolver>>,
     mcp_connection_resolver: Option<McpConnectionResolver>,
     mcp_resource_state: Option<crate::agent_definition::AgentDefinitionState>,
     code_tool_provider: Option<CodeToolProvider>,
@@ -390,6 +391,18 @@ impl std::fmt::Debug for ServerAgentRuntimeFactory {
 }
 
 impl ServerAgentRuntimeFactory {
+    pub(crate) fn with_message_image_resolver(
+        mut self,
+        resolver: Arc<dyn waltr_agent::MessageImageResolver>,
+    ) -> Self {
+        self.message_image_resolver = Some(resolver);
+        self
+    }
+
+    pub(crate) fn message_image_resolver(&self) -> Option<Arc<dyn waltr_agent::MessageImageResolver>> {
+        self.message_image_resolver.clone()
+    }
+
     /// Compose provider inference with this server-owned host runtime and lifecycle.
     pub fn session_factory<S>(
         &self,
@@ -563,6 +576,7 @@ impl ServerAgentRuntimeFactory {
             catalog: None,
             catalog_provider: None,
             providers,
+            message_image_resolver: None,
             mcp_connection_resolver: None,
             mcp_resource_state: None,
             code_tool_provider: None,
@@ -1177,7 +1191,11 @@ impl ServerAgentRuntimeFactory {
             }
             builder = builder.with_tool(tool);
         }
-        Ok(builder.build_with_dispatcher())
+        let (mut runtime, dispatcher) = builder.build_with_dispatcher();
+        if let Some(resolver) = &factory.message_image_resolver {
+            runtime = runtime.with_message_image_resolver(resolver.clone());
+        }
+        Ok((runtime, dispatcher))
     }
 
     fn routine_builder(

@@ -217,6 +217,7 @@ async fn collect(
             TimelineContent::Empty
             | TimelineContent::TextDelta { .. }
             | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::UserMessage { .. }
             | TimelineContent::ToolCall { .. }
             | TimelineContent::ToolResult { .. }
             | TimelineContent::ContentRef { .. }

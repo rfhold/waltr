@@ -14,6 +14,8 @@ use waltr_agent::{
     TimelineCursor,
 };
 
+pub mod image_objects;
+pub mod image_uploads;
 pub mod service;
 pub mod storage;
 
@@ -24,8 +26,8 @@ pub mod interactions;
 mod mcp_apps;
 mod timeline_convert;
 
-pub use service::{SessionCatalogSource, SessionRegistrationInput, SessionService};
 pub(crate) use service::resolve_mcp_connections;
+pub use service::{SessionCatalogSource, SessionRegistrationInput, SessionService};
 pub use storage::SessionStorageConfigError;
 
 pub(crate) use storage::SessionStorageConfig;
@@ -176,11 +178,7 @@ pub fn add_service_from_env(
     routes: &mut RoutesBuilder,
     input: SessionRegistrationInput,
 ) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
-    Ok(add_storage_service(
-        routes,
-        SessionStorageConfig::from_env()?,
-        input,
-    ))
+    add_storage_service(routes, SessionStorageConfig::from_env()?, input)
 }
 
 /// Register the configured session store.
@@ -188,30 +186,54 @@ pub(crate) fn add_storage_service(
     routes: &mut RoutesBuilder,
     storage: SessionStorageConfig,
     input: SessionRegistrationInput,
-) -> Arc<dyn SessionHost> {
+) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
     match storage {
-        SessionStorageConfig::Memory => add_store_service(routes, MemorySessionStore::new(), input),
-        SessionStorageConfig::Filesystem { root } => {
-            add_store_service(routes, FilesystemSessionStore::new(root), input)
+        SessionStorageConfig::Memory => {
+            Ok(add_store_service(routes, MemorySessionStore::new(), input))
         }
-        SessionStorageConfig::S3(config) => add_store_service(routes, config.into_store(), input),
+        SessionStorageConfig::Filesystem { root } => {
+            let images = image_objects::SessionImageObjects::filesystem(&root).map_err(|_| {
+                SessionStorageConfigError::Invalid {
+                    variable: "WALTR_SESSION_FILESYSTEM_ROOT",
+                    requirement: "must have a usable sibling directory for message images",
+                }
+            })?;
+            Ok(add_image_sessions_service(
+                routes,
+                SessionCoordinator::new(FilesystemSessionStore::new(root)),
+                input,
+                images,
+            ))
+        }
+        SessionStorageConfig::S3(config) => {
+            let (store, images) = config.into_stores()?;
+            Ok(add_image_sessions_service(
+                routes,
+                SessionCoordinator::new(store),
+                input,
+                images,
+            ))
+        }
     }
 }
 
-/// Register a session service backed by an explicit store.
-pub fn add_store_service<S>(
+/// Register a session service whose records and images are both process-local.
+pub fn add_store_service(
     routes: &mut RoutesBuilder,
-    store: S,
+    store: MemorySessionStore,
     input: SessionRegistrationInput,
-) -> Arc<dyn SessionHost>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    add_sessions_service(routes, SessionCoordinator::new(store), input)
+) -> Arc<dyn SessionHost> {
+    add_image_sessions_service(
+        routes,
+        SessionCoordinator::new(store),
+        input,
+        image_objects::SessionImageObjects::memory(service::MEMORY_IMAGE_OBJECT_BYTES),
+    )
 }
 
-/// Register a session service backed by an existing coordinator.
-pub fn add_sessions_service<S>(
+/// Register a test session service backed by an existing coordinator.
+#[cfg(any(test, feature = "test"))]
+pub(crate) fn add_sessions_service<S>(
     routes: &mut RoutesBuilder,
     sessions: SessionCoordinator<S>,
     input: SessionRegistrationInput,
@@ -219,7 +241,25 @@ pub fn add_sessions_service<S>(
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    let service = SessionService::from_sessions(sessions, input);
+    add_image_sessions_service(
+        routes,
+        sessions,
+        input,
+        image_objects::SessionImageObjects::memory(service::MEMORY_IMAGE_OBJECT_BYTES),
+    )
+}
+
+/// Register a service with explicitly paired record and image stores.
+pub fn add_image_sessions_service<S>(
+    routes: &mut RoutesBuilder,
+    sessions: SessionCoordinator<S>,
+    input: SessionRegistrationInput,
+    images: image_objects::SessionImageObjects,
+) -> Arc<dyn SessionHost>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let service = SessionService::from_sessions_with_images(sessions, input, images);
     routes.add_service(
         waltr::grpc::waltr::session::v1::interaction_service_server::InteractionServiceServer::new(
             interactions::InteractionService::new(service.clone(), service.interactions.clone()),

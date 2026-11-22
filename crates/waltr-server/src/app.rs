@@ -767,7 +767,7 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
             routine_authority: options.routine_authority,
             routine_private_parent: private_parent,
         },
-        |grpc_routes, input| Ok(session::add_storage_service(grpc_routes, storage, input)),
+        |grpc_routes, input| session::add_storage_service(grpc_routes, storage, input),
         crate::self_mcp::public_resource_from_env(),
         machines,
     )
