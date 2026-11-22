@@ -340,6 +340,15 @@ The Pulumi workload definition uses S3 session storage backed by Ceph RGW, which
 
 The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not modify either Waltr or MCP SQL data, authentication sessions, OAuth credentials, or configuration. The operation is a blind delete without active-run or cross-replica coordination; stop session activity before invoking it or concurrent work may recreate records.
 
+Saved session images and their capacity records use a sibling namespace. With filesystem storage, make the session root's parent writable and include the sibling in backups. With S3, grant the session credentials access to the sibling key prefix as well as the record prefix. Back up both together, and do not expire image objects independently. See [saved session images](architecture/persistence.md#saved-session-images).
+
+Before rolling out to an S3-backed environment, verify that the backend enforces `If-None-Match: *` on immutable creates. Both modes require bucket list permission for the capacity ledger prefix and immediate visibility of committed entries in `ListObjectsV2`. Only `conditional-etag` also requires `If-Match`. In `single-writer`, only one Waltr process may write the prefix, with no overlap during replacement. A fake S3 test does not establish these guarantees for Ceph RGW.
+
+Roll out the ordered message API, clients, and Routine programs together. Review
+persisted Routine overrides before rollout: an override takes precedence over
+the bundled program and must use ordered helper `content`, even for text-only
+calls. No saved records are rewritten by the cutover.
+
 ## Routine Payload Storage
 
 The shared preview/prod Pulumi workload gives the server a separate, ephemeral `server-private` emptyDir with a `256Mi` size limit.

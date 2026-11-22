@@ -104,6 +104,12 @@ Session detail timeline commands explicitly request the Effective projection. Th
 Hosted MCP resources `waltr://sessions` and `waltr://sessions/{id}`, plus tool `query` action `session.wait`, expose the same complete metadata map.
 This feature requires no generic MCP behavior; `crates/mcp` remains unchanged.
 
+## Message Images
+
+Chat sends one ordered list of text and image parts. Native and browser clients stage image bytes through the selected session owner, then submit sealed handles in the message. A successful submit acknowledges admission; the timeline confirms the saved message. Public MCP still accepts only text for new session messages, but those messages use the same session context.
+
+Timeline image parts expose format and size. Clients fetch bytes separately by session, item, and part index. The shared client keeps image bytes and upload handles out of reducer state. The binary lane binds work to the current runtime, route, and access; clients discard incomplete or stale reads rather than displaying partial images.
+
 ## Live Interactions
 
 Shared retain/release/respond operations observe the server's `InteractionService`, separately from Routine audio/stream interactions. `snapshot.interactions` contains typed permission, question, form, and URL-consent requests. Get/watch snapshots fully replace pending state with a process generation and revision. Exact response identity and watch epochs reject stale sessions, requests, operations, reconnects, and client generations.

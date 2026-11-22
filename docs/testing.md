@@ -215,6 +215,15 @@ Run access-auth tests including embedded-web navigation and restart coverage gat
 
 Server library tests include SQLite persistence and OIDC store behavior. The container-backed PostgreSQL targets are ignored by default, so `cargo test -p waltr-server --lib` does not require Docker.
 
+For message images, run the agent and server suites separately:
+
+```sh
+cargo test -p waltr-agent --lib --test agent
+cargo test -p waltr-server --features test --lib --test session
+```
+
+The agent checks ordered provider requests and saved-message replay. The server checks upload scope, saved reads after reopen, access loss during a read, Remote grant changes, and the catalog-backed screenshot Routine with fake capture, speech, and inference. Filesystem and fake S3 tests do not verify a deployed bucket. The synthetic Routine test does not capture a real Mac window.
+
 Server library tests require network, valid-cache, and explicitly configured built-in precedence after fixed bounded models.dev request failure or timeout. Both disk and built-in fallbacks are stale. A malformed or unreadable configured cache must fail rather than reaching the built-in seed, and malformed seed content must fail validation.
 
 Embedded resource coverage must prove that startup prebinds loopback, atomically overwrites `mcp-servers/waltr.yaml` with the generation URL before catalog load, reports filesystem origin, and refreshes the durable file for each generation. Inspection, replace, watcher, reset, and persisted-slot ETag assertions must use the ordinary resource contract. Reset must exercise ordinary candidate validation, including failure when the bundled fallback cannot resolve `WALTR_PUBLIC_URL`; no embedded immutability or reset-special-case assertion belongs in this coverage.
