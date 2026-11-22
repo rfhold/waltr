@@ -982,7 +982,7 @@ activeAttemptId: string | null, };
 
 export type ClientAuthTarget = {
 /**
- * Target kind: `provider`, `mcpServer`, or `workspaceBinding`.
+ * Target kind: `provider`, `mcpServer`, or `remote`.
  */
 kind: string,
 /**
@@ -1008,7 +1008,7 @@ supportedMethods: Array<string>,
  */
 expiresAtMs: bigint,
 /**
- * Non-secret provider or MCP metadata.
+ * Non-secret authorization metadata.
  */
 metadata: { [key in string]?: string },
 /**
@@ -1410,9 +1410,9 @@ export type ConfigSnapshot = {
  */
 current: ConfigView | null,
 /**
- * Active workspace bindings keyed by their catalog resource name.
+ * Active remotes keyed by their catalog resource name.
  */
-workspaceBindings: { [key in string]?: WorkspaceBindingView },
+remotes: { [key in string]?: RemoteView },
 /**
  * Resource-slot write baselines keyed by canonical path.
  */
@@ -1434,7 +1434,7 @@ reset: OperationSnapshot,
  */
 watch: OperationSnapshot, };
 
-export type WorkspaceBindingView = {
+export type RemoteView = {
 /**
  * Destination server API root.
  */
@@ -1442,7 +1442,7 @@ endpoint: string,
 /**
  * Requested machine identifier at the destination.
  */
-machineId: string, };
+machineId: string | null, };
 
 export type StatusSnapshot = {
 /**

@@ -396,7 +396,7 @@ const fn oauth_target_label(target: &AuthTarget) -> &'static str {
     match target {
         AuthTarget::Provider { .. } => "provider",
         AuthTarget::McpServer { .. } => "MCP",
-        AuthTarget::WorkspaceBinding { .. } => "workspace binding",
+        AuthTarget::Remote { .. } => "remote",
     }
 }
 

@@ -91,7 +91,7 @@ function promptFixtureSnapshot(): ClientSnapshot {
     config: {
       current: { etag: "fixture", providers: {}, mcpServers: {}, inferenceDefaults: null },
       resourceBaselines: {},
-      workspaceBindings: {},
+      remotes: {},
       load: operationSnapshot("idle"),
       patch: operationSnapshot("idle"),
       reset: operationSnapshot("idle"),

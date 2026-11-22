@@ -12,22 +12,52 @@ use super::{
     materialize::{ResourceMetadata, invalid_value, parse_resource, validate_envelope},
 };
 
-/// A validated outbound workspace binding, without credentials or resolved filesystem state.
+/// A named outbound Waltr connection, optionally exporting one workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceBinding {
+pub struct Remote {
     endpoint: Url,
+    binding: Option<RemoteBinding>,
+}
+
+/// Worker-side workspace export, without resolved filesystem state.
+#[derive(Debug, Clone, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBinding {
     machine_id: String,
     export_root: PathBuf,
     mcp_stdio_servers: Vec<String>,
 }
 
-impl WorkspaceBinding {
+impl PartialEq for RemoteBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.machine_id == other.machine_id
+            && self.export_root.as_os_str() == other.export_root.as_os_str()
+            && self.mcp_stdio_servers == other.mcp_stdio_servers
+    }
+}
+
+impl Remote {
     /// The exact normalized destination API root.
     #[must_use]
     pub const fn endpoint(&self) -> &Url {
         &self.endpoint
     }
 
+    /// Optional workspace that this server exports to the destination.
+    pub const fn binding(&self) -> Option<&RemoteBinding> {
+        self.binding.as_ref()
+    }
+
+    pub(super) fn effective_value(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({ "endpoint": self.endpoint.as_str() });
+        if let Some(binding) = &self.binding {
+            value["binding"] = serde_json::json!(binding);
+        }
+        value
+    }
+}
+
+impl RemoteBinding {
     /// The machine identity to claim at this destination.
     #[must_use]
     pub fn machine_id(&self) -> &str {
@@ -44,60 +74,67 @@ impl WorkspaceBinding {
     pub fn mcp_stdio_servers(&self) -> &[String] {
         &self.mcp_stdio_servers
     }
-
-    pub(super) fn effective_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "endpoint": self.endpoint.as_str(),
-            "machineId": self.machine_id(),
-            "exportRoot": self.export_root(),
-            "mcpStdioServers": self.mcp_stdio_servers(),
-        })
-    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct WorkspaceBindingResource {
+struct RemoteResource {
     api_version: String,
     kind: String,
-    #[serde(rename = "metadata")]
-    _metadata: ResourceMetadata,
-    spec: WorkspaceBindingSpec,
+    metadata: ResourceMetadata,
+    spec: RemoteSpec,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct WorkspaceBindingSpec {
+struct RemoteSpec {
     endpoint: String,
+    binding: Option<RemoteBindingSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RemoteBindingSpec {
     machine_id: String,
     export_root: String,
     #[serde(default)]
     mcp_stdio_servers: Vec<String>,
 }
 
-pub(super) fn materialize_workspace_binding(
+pub(super) fn materialize_remote(
     source: &str,
     path: &str,
-) -> Result<WorkspaceBinding, AgentDefinitionLoadError> {
-    let resource: WorkspaceBindingResource = parse_resource(source, path)?;
-    validate_envelope(
-        &resource.api_version,
-        &resource.kind,
-        "WorkspaceBinding",
-        path,
-    )?;
-    let WorkspaceBindingSpec {
-        endpoint,
-        machine_id,
-        export_root,
-        mut mcp_stdio_servers,
-    } = resource.spec;
-    let endpoint = parse_api_root(&endpoint).ok_or_else(|| {
+) -> Result<Remote, AgentDefinitionLoadError> {
+    let resource: RemoteResource = parse_resource(source, path)?;
+    validate_envelope(&resource.api_version, &resource.kind, "Remote", path)?;
+    if !waltr::destination::is_remote_name(&resource.metadata.name) {
+        return Err(invalid_value(
+            path,
+            "invalid or reserved Remote name".into(),
+        ));
+    }
+    let endpoint = parse_api_root(&resource.spec.endpoint).ok_or_else(|| {
         invalid_value(
             path,
             "endpoint must be an HTTPS API root or a literal loopback HTTP API root, without userinfo, query, or fragment".into(),
         )
     })?;
+    let binding = resource
+        .spec
+        .binding
+        .map(|binding| materialize_binding(binding, path))
+        .transpose()?;
+    Ok(Remote { endpoint, binding })
+}
+
+fn materialize_binding(
+    RemoteBindingSpec {
+        machine_id,
+        export_root,
+        mut mcp_stdio_servers,
+    }: RemoteBindingSpec,
+    path: &str,
+) -> Result<RemoteBinding, AgentDefinitionLoadError> {
     if machine_id.is_empty()
         || machine_id == "local"
         || machine_id.len() > 128
@@ -135,8 +172,7 @@ pub(super) fn materialize_workspace_binding(
         ));
     }
     mcp_stdio_servers.sort_unstable();
-    Ok(WorkspaceBinding {
-        endpoint,
+    Ok(RemoteBinding {
         machine_id,
         export_root: export_root.into(),
         mcp_stdio_servers,
@@ -178,11 +214,11 @@ fn parse_api_root(raw: &str) -> Option<Url> {
 mod tests {
     use super::*;
 
-    const PATH: &str = "workspace-bindings/office.yaml";
+    const PATH: &str = "remotes/office.yaml";
 
     fn source(endpoint: &str, machine: &str, root: &str) -> String {
         format!(
-            "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata:\n  name: office\nspec:\n  endpoint: '{endpoint}'\n  machineId: '{machine}'\n  exportRoot: '{root}'\n"
+            "apiVersion: waltr.dev/v1alpha1\nkind: Remote\nmetadata:\n  name: office\nspec:\n  endpoint: '{endpoint}'\n  binding:\n    machineId: '{machine}'\n    exportRoot: '{root}'\n"
         )
     }
 
@@ -195,14 +231,13 @@ mod tests {
             ("http://[0:0:0:0:0:0:0:1]", "http://[::1]/"),
         ] {
             for root in ["/no-such-worker-dir/../workspace", "~/workspace"] {
-                let binding = materialize_workspace_binding(
-                    &source(raw, "Machine_01-test.example", root),
-                    PATH,
-                )
-                .unwrap();
+                let binding =
+                    materialize_remote(&source(raw, "Machine_01-test.example", root), PATH)
+                        .unwrap();
                 assert_eq!(binding.endpoint().as_str(), normalized);
-                assert_eq!(binding.machine_id(), "Machine_01-test.example");
-                assert_eq!(binding.export_root().as_os_str(), root);
+                let export = binding.binding().unwrap();
+                assert_eq!(export.machine_id(), "Machine_01-test.example");
+                assert_eq!(export.export_root().as_os_str(), root);
             }
         }
     }
@@ -226,8 +261,7 @@ mod tests {
             "http://[::ffff:127.0.0.1]/",
         ] {
             assert!(
-                materialize_workspace_binding(&source(endpoint, "machine", "~/workspace"), PATH)
-                    .is_err(),
+                materialize_remote(&source(endpoint, "machine", "~/workspace"), PATH).is_err(),
                 "{endpoint}"
             );
         }
@@ -238,14 +272,13 @@ mod tests {
         let endpoint = "https://host.example/";
         for machine in ["", "local", "a b", "a/b", "résumé", &"a".repeat(129)] {
             assert!(
-                materialize_workspace_binding(&source(endpoint, machine, "~/workspace"), PATH)
-                    .is_err(),
+                materialize_remote(&source(endpoint, machine, "~/workspace"), PATH).is_err(),
                 "{machine}"
             );
         }
         for root in ["", "~", "~user/workspace", "workspace", "./workspace"] {
             assert!(
-                materialize_workspace_binding(&source(endpoint, "machine", root), PATH).is_err(),
+                materialize_remote(&source(endpoint, "machine", root), PATH).is_err(),
                 "{root}"
             );
         }
@@ -257,10 +290,10 @@ mod tests {
             valid.replace("  exportRoot", "  export_root"),
             valid.replace("  name: office", "  name: office\n  credential: invalid"),
             valid.replace("waltr.dev/v1alpha1", "waltr.dev/v1alpha2"),
-            valid.replace("kind: WorkspaceBinding", "kind: WorkspaceExport"),
+            valid.replace("kind: Remote", "kind: WorkspaceExport"),
             valid.replace("'~/workspace'", r#""/\0""#),
         ] {
-            assert!(materialize_workspace_binding(&invalid, PATH).is_err());
+            assert!(materialize_remote(&invalid, PATH).is_err());
         }
     }
 
@@ -268,16 +301,21 @@ mod tests {
     fn stdio_allowlist_is_optional_exact_and_unique() {
         let yaml = source("https://host.example/", "machine", "~/workspace");
         let parse = |names: &str| {
-            materialize_workspace_binding(&format!("{yaml}  mcpStdioServers: {names}\n"), PATH)
+            materialize_remote(&format!("{yaml}    mcpStdioServers: {names}\n"), PATH)
         };
         assert!(
-            materialize_workspace_binding(&yaml, PATH)
+            materialize_remote(&yaml, PATH)
+                .unwrap()
+                .binding()
                 .unwrap()
                 .mcp_stdio_servers()
                 .is_empty()
         );
         let allowlist = parse("[echo_server, Z-1.dev]").unwrap();
-        assert_eq!(allowlist.mcp_stdio_servers(), ["Z-1.dev", "echo_server"]);
+        assert_eq!(
+            allowlist.binding().unwrap().mcp_stdio_servers(),
+            ["Z-1.dev", "echo_server"]
+        );
         for names in [
             "[echo, echo]",
             "['']",

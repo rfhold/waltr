@@ -157,10 +157,10 @@ impl Config {
             ] {
                 field(value)?;
             }
-            if binding.routine.destination.as_ref().is_some_and(|id| {
-                id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            if binding.routine.destination.as_deref().is_some_and(|name| {
+                name != waltr::destination::LOCAL && !waltr::destination::is_remote_name(name)
             }) {
-                return Err(ConfigError::Invalid("invalid saved server profile ID"));
+                return Err(ConfigError::Invalid("invalid Remote destination name"));
             }
             if binding
                 .max_capture_seconds
@@ -339,7 +339,7 @@ pub struct Routine {
     /// Final text output port identifier.
     #[serde(deserialize_with = "crate::bounded::string::<_, MAX_FIELD_BYTES>")]
     pub output: String,
-    /// Saved remote server profile ID; omission uses the connected generation.
+    /// Exact Remote name. Omission or `local` uses the embedded server.
     #[serde(default, deserialize_with = "destination")]
     pub destination: Option<String>,
 }
@@ -347,7 +347,12 @@ pub struct Routine {
 fn destination<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    crate::bounded::string::<D, MAX_FIELD_BYTES>(deserializer).map(Some)
+    #[derive(Deserialize)]
+    struct Named(#[serde(deserialize_with = "crate::bounded::string::<_, MAX_FIELD_BYTES>")] String);
+
+    Option::<Named>::deserialize(deserializer)?
+        .map(|Named(name)| Some(name))
+        .ok_or_else(|| serde::de::Error::custom("expected a Remote destination name"))
 }
 /// Unambiguous backend-independent device request, encoded as a YAML string.
 #[derive(Debug, Clone, PartialEq, Eq)]

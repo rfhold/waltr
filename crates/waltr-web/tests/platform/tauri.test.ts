@@ -361,7 +361,7 @@ describe("Tauri client adapter", () => {
     expect(unlisten).toHaveBeenCalledOnce();
   });
 
-  test("selects a server and keeps access login and logout native and generation-fenced", async () => {
+  test("passes only the named destination and fences its runtime generation", async () => {
     let emit!: (event: unknown) => void;
     const listen = vi.fn(async (_name, handler) => {
       emit = (payload) => handler({ payload });
@@ -375,25 +375,14 @@ describe("Tauri client adapter", () => {
     });
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
     await adapter.start();
-    await adapter.access!.openLogin("/oidc/login?return_to=SECRET");
-    await adapter.access!.startNativeLogin!("device");
-    await adapter.access!.startNativeLogin!("browser");
-    await expect(adapter.access!.logout()).resolves.toBe(true);
-    expect(invoke).toHaveBeenCalledWith("start_runtime", { serverId: "remote" });
-    expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12 });
-    expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12, method: "device" });
-    expect(invoke).toHaveBeenCalledWith("start_access_login", { generation: 12, method: "browser" });
-    expect(invoke).toHaveBeenCalledWith("logout_access", { generation: 12 });
-    expect(JSON.stringify(invoke.mock.calls)).not.toContain("SECRET");
+    expect(adapter.access).toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("start_runtime", { destination: "remote" });
     await adapter.dispose();
     expect(invoke).toHaveBeenCalledWith("dispose_runtime", { generation: 12 });
-    await expect(adapter.access!.logout()).rejects.toThrow("not ready");
-    await expect(adapter.access!.startNativeLogin!("device")).rejects.toThrow("not ready");
   });
 
-  test("advertised native media stays generation-bound and failed logout remains an explicit failure", async () => {
+  test("advertised native media stays generation-bound on a remote destination", async () => {
     let emit!: (event: unknown) => void;
-    let failLogout = true;
     const listen = vi.fn(async (_name, handler) => { emit = payload => handler({ payload }); return vi.fn(); });
     const invoke = vi.fn(async (command: string) => {
       if (command === "start_runtime") {
@@ -401,7 +390,6 @@ describe("Tauri client adapter", () => {
         return { generation: 12, routineMedia: true };
       }
       if (command === "routine_media") return { generation: 12, value: null };
-      if (command === "logout_access" && failLogout) throw new Error("Native cleanup remains unverified");
     });
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "remote");
     expect(adapter.media).toBeUndefined();
@@ -409,12 +397,6 @@ describe("Tauri client adapter", () => {
     const media = adapter.media!;
     await expect(media.takeMediaOutputJson(3)).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("routine_media", { generation: 12, operation: "outputMetadata", id: 3 });
-    await expect(adapter.access!.logout()).rejects.toThrow("cleanup remains unverified");
-    expect(invoke).not.toHaveBeenCalledWith("dispose_runtime", expect.anything());
-    expect(invoke).not.toHaveBeenCalledWith("dispatch_command", expect.anything());
-    failLogout = false;
-    await expect(adapter.access!.logout()).resolves.toBe(true);
-    expect(invoke.mock.calls.filter(([command]) => command === "logout_access")).toHaveLength(2);
     await adapter.dispose();
     await expect(media.takeMediaOutputJson(3)).rejects.toThrow("Stale");
   });
@@ -423,7 +405,7 @@ describe("Tauri client adapter", () => {
     const api = { invoke: vi.fn() as never, listen: vi.fn() as never };
     expect((await loadTauriClient(api)).access).toBeUndefined();
     expect((await loadTauriClient(api, "local")).access).toBeUndefined();
-    expect((await loadTauriClient(api, "remote")).access).toBeDefined();
+    expect((await loadTauriClient(api, "remote")).access).toBeUndefined();
   });
 
   test("dispatch and openers reject before IPC when unstarted or disposed", async () => {
@@ -460,7 +442,7 @@ describe("Tauri client adapter", () => {
     const invoke = vi.fn(async (command) => command === "start_runtime" ? runtime : undefined);
     const adapter = await loadTauriClient({ invoke: invoke as never, listen: listen as never }, "old");
     const starting = adapter.start();
-    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("start_runtime", { serverId: "old" }));
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("start_runtime", { destination: "old" }));
     await adapter.dispose();
     expect(invoke).not.toHaveBeenCalledWith("dispose_runtime");
     complete({ generation: 20 });

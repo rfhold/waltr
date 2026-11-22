@@ -18,9 +18,9 @@ import { SessionsDataRoute, SessionsDetailRoute, SessionsListRoute, SessionsRout
 
 const fixtureRoutesEnabled = import.meta.env.DEV || import.meta.env.MODE === "test";
 
-export function AppRouter() {
+export function AppRouter(props: { base?: string }) {
   return (
-    <Router root={AppLayout}>
+    <Router root={AppLayout} base={props.base}>
       <Route path="/" component={ShellLayout}>
         <Route path="/" component={LandingRoute} />
         <Route path="/routines" component={RoutinesRoute} />
@@ -48,7 +48,7 @@ export function AppRouter() {
           <Route path="/mcp/edit/:server" component={ConfigMcpEditRoute} />
           <Route path="/mcp" />
           <Route path="/defaults" />
-          <Route path="/workspace-bindings" />
+          <Route path="/remotes" />
         </Route>
       </Route>
     </Router>

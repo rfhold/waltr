@@ -60,7 +60,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-mu
 tokio-stream = { workspace = true, features = ["net", "sync"] }
 tower.workspace = true
 tower-http = { workspace = true, features = ["trace"] }
-tonic.workspace = true
+tonic = { workspace = true, features = ["transport", "tls-ring", "tls-webpki-roots"] }
+tonic-prost.workspace = true
 tonic-otel-layer.workspace = true
 tonic-tracing-opentelemetry.workspace = true
 tonic-web.workspace = true

@@ -34,11 +34,11 @@ async fn read_returns_complete_seven_kind_catalog() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-async fn workspace_binding_uses_normal_inspect_replace_watch_and_reset()
+async fn remote_uses_normal_inspect_replace_watch_and_reset()
 -> Result<(), Box<dyn std::error::Error>> {
     waltr_server::isolate_application_test!();
-    const PATH: &str = "workspace-bindings/office.yaml";
-    const SOURCE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata:\n  name: office\nspec:\n  endpoint: https://HOST.example:443\n  machineId: laptop\n  exportRoot: ~/worker-only\n";
+    const PATH: &str = "remotes/office.yaml";
+    const SOURCE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Remote\nmetadata:\n  name: office\nspec:\n  endpoint: https://HOST.example:443\n  binding: {machineId: laptop, exportRoot: ~/worker-only}\n";
     let mut client = resource_client(setup_server()).await?;
     let mut watch = client
         .watch_resource_catalog(WatchResourceCatalogRequest {})
@@ -53,7 +53,7 @@ async fn workspace_binding_uses_normal_inspect_replace_watch_and_reset()
         .into_inner()
         .resources
         .remove(0);
-    assert_eq!(absent.kind, ResourceKind::WorkspaceBinding as i32);
+    assert_eq!(absent.kind, ResourceKind::Remote as i32);
     assert!(!absent.persisted);
     assert!(absent.active.is_none());
 
@@ -81,13 +81,13 @@ async fn workspace_binding_uses_normal_inspect_replace_watch_and_reset()
     let active = inspection.active.unwrap();
     assert_eq!(active.origin, ResourceOrigin::Filesystem as i32);
     let fields = &active.effective_value.as_ref().unwrap().fields;
-    for (key, value) in [
-        ("endpoint", "https://host.example/"),
-        ("machineId", "laptop"),
-        ("exportRoot", "~/worker-only"),
-    ] {
+    assert_eq!(fields["endpoint"].kind, Some(resource_value::Kind::StringValue("https://host.example/".into())));
+    let Some(resource_value::Kind::ObjectValue(binding)) = &fields["binding"].kind else {
+        panic!("expected a workspace binding");
+    };
+    for (key, value) in [("machineId", "laptop"), ("exportRoot", "~/worker-only")] {
         assert_eq!(
-            fields[key].kind,
+            binding.fields[key].kind,
             Some(resource_value::Kind::StringValue(value.to_owned()))
         );
     }

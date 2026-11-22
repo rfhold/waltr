@@ -23,13 +23,13 @@ use super::{
         invalid_value, materialize_defaults, materialize_mcp_server, materialize_provider,
         materialized_snapshot_etag, proto_kind, proto_resource, yaml_json,
     },
+    remote::{Remote, materialize_remote},
     routine::MAX_ROUTINE_COUNT,
     store::{
         PersistedSlotPostcondition, atomic_write, check_expected_etag, discover_persisted,
         discover_persisted_for, load_external_sources, resource_disk_path, slot_etag, source_etag,
         tree_fingerprint, validate_resource_path, validate_resource_source,
     },
-    workspace_binding::{WorkspaceBinding, materialize_workspace_binding},
 };
 
 const DEFAULT_AGENT: &str = "coding";
@@ -220,8 +220,8 @@ pub enum ResourceKind {
     Defaults,
     /// Server-owned executable routine definition.
     Routine,
-    /// Outbound workspace binding.
-    WorkspaceBinding,
+    /// Outbound remote.
+    Remote,
 }
 
 impl fmt::Display for ResourceKind {
@@ -234,7 +234,7 @@ impl fmt::Display for ResourceKind {
             Self::McpServer => "McpServer",
             Self::Defaults => "Defaults",
             Self::Routine => "Routine",
-            Self::WorkspaceBinding => "WorkspaceBinding",
+            Self::Remote => "Remote",
         })
     }
 }
@@ -315,8 +315,8 @@ pub struct AgentDefinitionSnapshot {
     configuration: config_proto::Configuration,
     scripts: BTreeMap<String, Arc<crate::routine::definition::Definition>>,
     routine_incarnations: BTreeMap<String, Uuid>,
-    workspace_bindings: BTreeMap<String, WorkspaceBinding>,
-    workspace_binding_incarnations: BTreeMap<String, Uuid>,
+    remotes: BTreeMap<String, Remote>,
+    remote_incarnations: BTreeMap<String, Uuid>,
     etag: String,
 }
 
@@ -361,16 +361,16 @@ impl AgentDefinitionSnapshot {
         self.routine_incarnations.get(name).copied()
     }
 
-    /// Validated outbound workspace bindings keyed by resource name.
+    /// Validated outbound remotes keyed by resource name.
     #[must_use]
-    pub const fn workspace_bindings(&self) -> &BTreeMap<String, WorkspaceBinding> {
-        &self.workspace_bindings
+    pub const fn remotes(&self) -> &BTreeMap<String, Remote> {
+        &self.remotes
     }
 
     /// Return the process-local identity of a binding added or changed after catalog load.
     /// Read the binding from this same snapshot to distinguish an unchanged cold load from absence.
-    pub(crate) fn workspace_binding_incarnation(&self, key: &str) -> Option<Uuid> {
-        self.workspace_binding_incarnations.get(key).copied()
+    pub(crate) fn remote_incarnation(&self, key: &str) -> Option<Uuid> {
+        self.remote_incarnations.get(key).copied()
     }
 
     /// Return the materialized aggregate snapshot `ETag`.
@@ -656,12 +656,12 @@ impl AgentDefinitionState {
                         *incarnation = previous.routine_incarnations[name];
                     }
                 }
-                snapshot.workspace_binding_incarnations = snapshot
-                    .workspace_bindings
+                snapshot.remote_incarnations = snapshot
+                    .remotes
                     .iter()
                     .filter_map(|(key, binding)| {
-                        let incarnation = if previous.workspace_bindings.get(key) == Some(binding) {
-                            previous.workspace_binding_incarnation(key)
+                        let incarnation = if previous.remotes.get(key) == Some(binding) {
+                            previous.remote_incarnation(key)
                         } else {
                             Some(Uuid::new_v4())
                         };
@@ -1205,7 +1205,7 @@ fn build_snapshot(
     let mut sources = Vec::new();
     let mut configuration = config_proto::Configuration::default();
     let mut scripts = BTreeMap::new();
-    let mut workspace_bindings = BTreeMap::new();
+    let mut remotes = BTreeMap::new();
     let mut workspace_claims = BTreeMap::new();
     let script_engine = waltr_script::Engine::new(1)
         .map_err(|_| invalid_value("routines", "script validation engine unavailable".into()))?;
@@ -1227,19 +1227,17 @@ fn build_snapshot(
                 sources.push(source.clone());
                 yaml_json(&source, &path)?
             }
-            ResourceKind::WorkspaceBinding => {
-                let binding = materialize_workspace_binding(&source, &path)?;
-                let claim = (binding.endpoint().clone(), binding.machine_id().to_owned());
+            ResourceKind::Remote => {
+                let binding = materialize_remote(&source, &path)?;
+                let claim = binding.endpoint().clone();
                 if let Some(previous) = workspace_claims.insert(claim, key.name.clone()) {
                     return Err(invalid_value(
                         &path,
-                        format!(
-                            "endpoint and machineId already claimed by WorkspaceBinding `{previous}`"
-                        ),
+                        format!("endpoint already configured by Remote `{previous}`"),
                     ));
                 }
                 let value = binding.effective_value();
-                workspace_bindings.insert(key.name.clone(), binding);
+                remotes.insert(key.name.clone(), binding);
                 value
             }
             ResourceKind::Provider => {
@@ -1261,10 +1259,14 @@ fn build_snapshot(
                 configuration.inference_defaults = defaults.clone();
                 configuration.session_dictation = dictation.clone();
                 configuration.speech_defaults = speech.clone();
-                let mut value =
-                    defaults.map(|defaults| serde_json::to_value(defaults).expect("generated defaults serialize")).unwrap_or_else(|| serde_json::json!({}));
+                let mut value = defaults
+                    .map(|defaults| {
+                        serde_json::to_value(defaults).expect("generated defaults serialize")
+                    })
+                    .unwrap_or_else(|| serde_json::json!({}));
                 if let Some(speech) = speech {
-                    value["speech"] = serde_json::to_value(speech).expect("generated speech defaults serialize");
+                    value["speech"] =
+                        serde_json::to_value(speech).expect("generated speech defaults serialize");
                 }
                 if let Some(dictation) = dictation {
                     value["sessionDictation"] =
@@ -1374,10 +1376,16 @@ fn build_snapshot(
         let model = &provider.models[&defaults.model_key];
         if model.r#type != waltr::grpc::waltr::config::v1::ModelType::Llm as i32
             || defaults.reasoning_effort.as_ref().is_some_and(|effort| {
-                !model.options.as_ref().is_some_and(|options| options.reasoning_efforts.contains(effort))
+                !model
+                    .options
+                    .as_ref()
+                    .is_some_and(|options| options.reasoning_efforts.contains(effort))
             })
         {
-            return Err(invalid_value("defaults/default.yaml", "inference defaults require an LLM model with supported reasoning options".into()));
+            return Err(invalid_value(
+                "defaults/default.yaml",
+                "inference defaults require an LLM model with supported reasoning options".into(),
+            ));
         }
     }
     configuration.etag.clone_from(&etag);
@@ -1394,8 +1402,8 @@ fn build_snapshot(
         configuration,
         scripts,
         routine_incarnations,
-        workspace_bindings,
-        workspace_binding_incarnations: BTreeMap::new(),
+        remotes,
+        remote_incarnations: BTreeMap::new(),
         etag,
     })
 }

@@ -101,9 +101,9 @@ impl OAuthCredential {
         }
     }
 
-    pub(crate) fn workspace_context(&self) -> Option<&WorkspaceBindingOAuthContext> {
+    pub(crate) fn workspace_context(&self) -> Option<&RemoteOAuthContext> {
         match &self.context {
-            OAuthCredentialContext::WorkspaceBinding(context) => Some(context),
+            OAuthCredentialContext::Remote(context) => Some(context),
             _ => None,
         }
     }
@@ -201,7 +201,8 @@ pub enum OAuthCredentialContext {
     /// MCP resource, registration, and endpoints.
     Mcp(Box<McpOAuthContext>),
     /// Waltr native API authorization.
-    WorkspaceBinding(Box<WorkspaceBindingOAuthContext>),
+    #[serde(alias = "workspace_binding")]
+    Remote(Box<RemoteOAuthContext>),
 }
 
 impl std::fmt::Debug for OAuthCredentialContext {
@@ -212,14 +213,14 @@ impl std::fmt::Debug for OAuthCredentialContext {
                 .field("metadata_keys", &metadata.keys().collect::<Vec<_>>())
                 .finish(),
             Self::Mcp(context) => formatter.debug_tuple("Mcp").field(context).finish(),
-            Self::WorkspaceBinding(_) => formatter.write_str("WorkspaceBinding(<redacted>)"),
+            Self::Remote(_) => formatter.write_str("Remote(<redacted>)"),
         }
     }
 }
 
 /// Durable, account-pinned native API authorization context.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceBindingOAuthContext {
+pub struct RemoteOAuthContext {
     pub(super) endpoint: url::Url,
     pub(super) binding_fingerprint: String,
     pub(super) publication_incarnation: Option<String>,
@@ -233,9 +234,9 @@ pub struct WorkspaceBindingOAuthContext {
     pub(super) signing_algorithms: Option<Vec<String>>,
 }
 
-impl std::fmt::Debug for WorkspaceBindingOAuthContext {
+impl std::fmt::Debug for RemoteOAuthContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("WorkspaceBindingOAuthContext(<redacted>)")
+        formatter.write_str("RemoteOAuthContext(<redacted>)")
     }
 }
 

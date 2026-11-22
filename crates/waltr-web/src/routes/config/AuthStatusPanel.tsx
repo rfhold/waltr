@@ -13,12 +13,12 @@ export function AuthStatusPanel(props: { target: ClientAuthTarget }) {
   const [error, setError] = createSignal<string>();
   const status = createMemo(() => app.snapshot()?.auth.statuses[targetMapKey(props.target)]);
   const listError = createMemo(() => app.snapshot()?.auth.list.error);
-  const workspaceBinding = () => props.target.kind === "workspaceBinding";
+  const remote = () => props.target.kind === "remote";
   const oauthSupported = createMemo(() => status()?.supportedMethods.some((method) =>
-    workspaceBinding() ? method === "oauthDevice" : method.startsWith("oauth"),
+    remote() ? method === "oauthDevice" : method.startsWith("oauth"),
   ) ?? false);
   const canAuthorize = createMemo(() => oauthSupported() && status()?.kind !== "apiKeyConfigured"
-    && (!workspaceBinding() || status()?.kind !== "oauthConfigured"));
+    && (!remote() || status()?.kind !== "oauthConfigured"));
   const reauthorization = createMemo(() => ["oauthConfigured", "expired", "authorizationRequired"].includes(status()?.kind ?? ""));
 
   const requestStatuses = () => app.dispatch({ type: "requestAuthStatuses" }).catch(() => undefined);
@@ -78,7 +78,7 @@ export function AuthStatusPanel(props: { target: ClientAuthTarget }) {
       <Show when={error()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
 
       <div class="auth-status__actions">
-        <Show when={listError() || (workspaceBinding() && !status())}>
+        <Show when={listError() || (remote() && !status())}>
           <button
             type="button"
             disabled={app.snapshot()?.auth.list.status === "loading" || Boolean(pendingAction())}
@@ -96,7 +96,7 @@ export function AuthStatusPanel(props: { target: ClientAuthTarget }) {
             {reauthorization() ? "Reauthorize" : "Authorize"}
           </button>
         </Show>
-        <Show when={!workspaceBinding() && status()?.canRefresh}>
+        <Show when={!remote() && status()?.canRefresh}>
           <button
             type="button"
             disabled={Boolean(pendingAction())}
@@ -128,7 +128,7 @@ export function AuthStatusPanel(props: { target: ClientAuthTarget }) {
 }
 
 function targetMapKey(target: ClientAuthTarget) {
-  const prefix = target.kind === "mcpServer" ? "mcp" : target.kind === "workspaceBinding" ? "workspaceBinding" : "provider";
+  const prefix = target.kind === "mcpServer" ? "mcp" : target.kind === "remote" ? "remote" : "provider";
   return `${prefix}:${target.key}`;
 }
 

@@ -12,6 +12,7 @@ import {
 import type { Accessor, ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { ownerPath } from "../../app/destination";
 import { clientRequestId } from "../../app/requestId";
 import { ActionList, ActionRow, ConfirmAction, Dialog, Field, InlineAlert } from "../../components/ui";
 import type {
@@ -107,10 +108,10 @@ export function ProvidersSection(props: ParentProps & {
   const [operationPending, setOperationPending] = createSignal(false);
   const [deleteModel, setDeleteModel] = createSignal<string>();
   const [providerFormDraft, setProviderFormDraft] = createSignal<ProviderForm>();
-  const routeProviderName = createMemo(() => providerNameFromEditPath(location.pathname));
-  const showingModelFormRoute = createMemo(() => isProviderModelFormPath(location.pathname));
+  const routeProviderName = createMemo(() => providerNameFromEditPath(ownerPath(location.pathname)));
+  const showingModelFormRoute = createMemo(() => isProviderModelFormPath(ownerPath(location.pathname)));
   const activeProviderForm = createMemo<ActiveForm | undefined>(() => {
-    if (isCreateProviderFormPath(location.pathname)) {
+    if (isCreateProviderFormPath(ownerPath(location.pathname))) {
       return { mode: "create" };
     }
 

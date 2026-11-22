@@ -1378,33 +1378,33 @@ fn config_explicit_oauth_attempt_renders_snapshot() {
 }
 
 #[test]
-fn config_workspace_binding_requires_explicit_authorize_and_uses_device_verification() {
+fn config_remote_requires_explicit_authorize_and_uses_device_verification() {
     let key = "remote";
     let target = ClientAuthTarget {
-        kind: "workspaceBinding".to_owned(),
+        kind: "remote".to_owned(),
         key: key.to_owned(),
     };
     let now = Instant::now();
     let mut snapshot = watched_config_snapshot();
-    snapshot.config.workspace_bindings.insert(
+    snapshot.config.remotes.insert(
         key.to_owned(),
-        waltr_client::WorkspaceBindingView {
+        waltr_client::RemoteView {
             endpoint: "https://destination.example".to_owned(),
-            machine_id: "export-machine".to_owned(),
+            machine_id: Some("export-machine".to_owned()),
         },
     );
-    let mut status = auth_status("workspaceBinding", key, "notConfigured", false);
+    let mut status = auth_status("remote", key, "notConfigured", false);
     status.supported_methods = vec!["oauthDevice".to_owned()];
     snapshot
         .auth
         .statuses
-        .insert("workspaceBinding:remote".to_owned(), status.clone());
+        .insert("remote:remote".to_owned(), status.clone());
 
     let mut app = open_config_app_with(snapshot.clone());
     for _ in 0..3 {
         assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     }
-    assert_eq!(app.active_config_tab(), ConfigTab::WorkspaceBindings);
+    assert_eq!(app.active_config_tab(), ConfigTab::Remotes);
     assert!(app.outbound_auth_target().is_none());
     assert!(render_app(&app).contains("Not connected"));
     assert_eq!(
@@ -1422,7 +1422,7 @@ fn config_workspace_binding_requires_explicit_authorize_and_uses_device_verifica
         target.clone(),
     );
     drop(app.handle_event(&AppEvent::Client(Box::new(snapshot.clone())), now));
-    let mut attempt = test_auth_attempt("workspaceBinding", key, "pending");
+    let mut attempt = test_auth_attempt("remote", key, "pending");
     attempt.completion_mode = "serverDevicePoll".to_owned();
     attempt.auth_url = "https://example.invalid/not-for-display".to_owned();
     attempt.verification_url = "https://issuer.example/verify".to_owned();
@@ -1451,7 +1451,7 @@ fn config_workspace_binding_requires_explicit_authorize_and_uses_device_verifica
     snapshot
         .auth
         .statuses
-        .insert("workspaceBinding:remote".to_owned(), status);
+        .insert("remote:remote".to_owned(), status);
     drop(app.handle_event(&AppEvent::Client(Box::new(snapshot)), now));
     assert!(render_app(&app).contains("Connected"));
     assert!(!render_app(&app).contains("ABCD-EFGH"));

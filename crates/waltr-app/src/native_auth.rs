@@ -17,10 +17,26 @@ pub(crate) fn browser_url(input: &str) -> Result<url::Url, String> {
     if input.len() > 16_384 || input.chars().any(char::is_control) {
         return Err("Invalid authorization URL".into());
     }
-    crate::server_profiles::normalize_endpoint(input.split('?').next().unwrap_or_default())
-        .map_err(|_| "Invalid authorization URL")?;
     let url = url::Url::parse(input).map_err(|_| "Invalid authorization URL")?;
-    if url.fragment().is_some() {
+    let authority = input
+        .trim()
+        .split_once("://")
+        .map(|(_, tail)| tail.split(['/', '?', '#']).next().unwrap_or_default())
+        .ok_or("Invalid authorization URL")?;
+    let raw_host = if authority.starts_with('[') {
+        authority.split_once(']').map_or("", |(host, _)| host)
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    let loopback = matches!(raw_host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "[::1");
+    if !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+        || url.host_str().is_none()
+        || authority.contains('@')
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port() == Some(0)
+    {
         return Err("Invalid authorization URL".into());
     }
     Ok(url)
@@ -79,123 +95,6 @@ impl AccessBinding {
         )
     }
 
-    fn spawn_for_shortcut(&self, credentials: NativeCredentialProvider) -> NativeAccessCoordinator {
-        NativeAccessCoordinator::spawn_restore_only(
-            waltr_client::NativeAccessBootstrap {
-                config: self.config.clone(),
-                issuer: self.issuer.clone(),
-            },
-            credentials,
-            Arc::clone(&self.store),
-            8,
-        )
-    }
-}
-
-#[allow(clippy::future_not_send, reason = "the shortcut definition watch is LocalSet-owned")]
-pub(crate) async fn watch_shortcut_destination(
-    profile: crate::server_profiles::ServerProfile,
-    root: std::path::PathBuf,
-    audio: Arc<crate::native_audio::Host>,
-    generation: u64,
-    stop: tokio_util::sync::CancellationToken,
-) {
-    use futures_util::StreamExt as _;
-    use waltr_client::{
-        ClientCommand, NativeAccessAction, NativeAccessOutput, NativeAccessProgress,
-        NativeGrpcTransport, WaltrTransport as _,
-    };
-
-    let Some(endpoint) = profile.url else {
-        return;
-    };
-    let bootstrap = tokio::select! {
-        biased;
-        () = stop.cancelled() => return,
-        bootstrap = async {
-            loop {
-                if let Ok(bootstrap) = waltr_client::discover_native_access_config(
-                    &endpoint, waltr_client::NativeCallbackPolicy::External,
-                ).await {
-                    break bootstrap;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            }
-        } => bootstrap,
-    };
-    let binding = tokio::select! {
-        biased;
-        () = stop.cancelled() => return,
-        result = AccessBinding::from_bootstrap(profile.id.clone(), bootstrap, root) => result,
-    };
-    let Ok(binding) = binding else {
-        return;
-    };
-    let credentials = NativeCredentialProvider::new();
-    let transport = NativeGrpcTransport::with_credential_provider(endpoint, credentials.clone());
-    let mut access = binding.spawn_for_shortcut(credentials.clone());
-    let mut stream: Option<waltr_client::RoutineDefinitionWatchStream> = None;
-    let mut lease = None;
-    loop {
-        tokio::select! {
-            biased;
-            () = stop.cancelled() => break,
-            output = access.next_output() => match output {
-                Some(NativeAccessOutput::ClientCommand { command, .. }) => {
-                    audio.observe_shortcut(generation, &profile.id, None);
-                    stream = None;
-                    lease = match *command {
-                        ClientCommand::ReprobeWaltrAccess if credentials.has_bearer_token() => Some(credentials.credential_revision()),
-                        _ => None,
-                    };
-                }
-                Some(NativeAccessOutput::Progress(NativeAccessProgress::RestorationFinished))
-                    if !credentials.has_bearer_token() => break,
-                Some(NativeAccessOutput::Progress(NativeAccessProgress::RefreshSucceeded)) => {
-                    audio.observe_shortcut(generation, &profile.id, None);
-                    stream = None;
-                    lease = credentials.has_bearer_token().then(|| credentials.credential_revision());
-                }
-                Some(NativeAccessOutput::Progress(_)) => {},
-                None => break,
-            },
-            observation = async { stream.as_mut().expect("watch branch requires stream").next().await }, if stream.is_some() => {
-                let rejected = match (observation, lease) {
-                    (Some(Ok(snapshot)), Some(revision)) if credentials.credential_revision() == revision => {
-                        audio.observe_shortcut(generation, &profile.id, Some((snapshot, transport.clone(), revision)));
-                        continue;
-                    }
-                    (Some(Err(error)), Some(revision)) if error.is_waltr_login_required() => Some(revision),
-                    _ => None,
-                };
-                audio.observe_shortcut(generation, &profile.id, None);
-                stream = None;
-                if let Some(revision) = rejected {
-                    if credentials.credential_revision() == revision {
-                        lease = None;
-                    }
-                    drop(access.action_sender().send(NativeAccessAction::CredentialRevisionRejected(revision)).await);
-                }
-            },
-            result = async {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                transport.watch_manual_routines("native-shortcut-watch".into()).await
-            }, if stream.is_none() && lease.is_some() => match result {
-                Ok(opened) => stream = Some(opened),
-                Err(error) if error.is_waltr_login_required() => {
-                    if let Some(revision) = lease {
-                        if credentials.credential_revision() == revision {
-                            lease = None;
-                        }
-                        drop(access.action_sender().send(NativeAccessAction::CredentialRevisionRejected(revision)).await);
-                    }
-                }
-                Err(_) => {},
-            }
-        }
-    }
-    audio.observe_shortcut(generation, &profile.id, None);
-    access.stop().await;
 }
 
 #[derive(Default)]
@@ -398,7 +297,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
-    async fn shortcut_restore_uses_the_exact_saved_profile_grant() {
+    async fn restore_only_uses_the_exact_credential_namespace() {
         let (endpoint, mut exchanges, issuer_task) = issuer().await;
         let bootstrap =
             waltr_client::discover_native_access_config(&endpoint, NativeCallbackPolicy::External)
@@ -416,7 +315,15 @@ mod tests {
 
         for (binding, expected) in [(missing, false), (saved, true)] {
             let credentials = NativeCredentialProvider::new();
-            let mut coordinator = binding.spawn_for_shortcut(credentials.clone());
+            let mut coordinator = NativeAccessCoordinator::spawn_restore_only(
+                waltr_client::NativeAccessBootstrap {
+                    config: binding.config,
+                    issuer: binding.issuer,
+                },
+                credentials.clone(),
+                binding.store,
+                8,
+            );
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
                     match coordinator.next_output().await.unwrap() {
@@ -424,7 +331,7 @@ mod tests {
                         NativeAccessOutput::Progress(
                             NativeAccessProgress::AwaitingBrowser { .. }
                             | NativeAccessProgress::AwaitingDevice { .. },
-                        ) => panic!("a shortcut cannot start login"),
+                        ) => panic!("restore-only access cannot start login"),
                         _ => {}
                     }
                 }

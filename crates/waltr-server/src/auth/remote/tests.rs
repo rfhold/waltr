@@ -28,7 +28,7 @@ use super::*;
 const DEVICE_SECRET: &str = "private-device-secret";
 const REFRESH_SECRET: &str = "workspace-refresh-secret";
 const KEY: &str = "export";
-const BINDING_PATH: &str = "workspace-bindings/export.yaml";
+const BINDING_PATH: &str = "remotes/export.yaml";
 
 struct Issuer {
     base: String,
@@ -199,7 +199,7 @@ async fn token(
 
 async fn service(issuer: &Issuer) -> Arc<AuthService> {
     let (resources, store) = setup(issuer).await;
-    AuthService::test_workspace_binding(resources, store)
+    AuthService::test_remote(resources, store)
 }
 
 async fn setup(issuer: &Issuer) -> (AgentDefinitionState, Arc<OutboundOAuthStore>) {
@@ -212,7 +212,7 @@ async fn setup(issuer: &Issuer) -> (AgentDefinitionState, Arc<OutboundOAuthStore
 
 fn binding_yaml(endpoint: &str) -> String {
     format!(
-        "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata:\n  name: {KEY}\nspec:\n  endpoint: {endpoint}\n  machineId: machine\n  exportRoot: /fixture\n",
+        "apiVersion: waltr.dev/v1alpha1\nkind: Remote\nmetadata:\n  name: {KEY}\nspec:\n  endpoint: {endpoint}\n  binding: {{machineId: machine, exportRoot: /fixture}}\n",
     )
 }
 
@@ -227,7 +227,7 @@ async fn replace_binding(resources: &AgentDefinitionState, endpoint: &str) {
 async fn replace_slot(resources: &AgentDefinitionState, path: &str, source: String) {
     let AgentDefinitionInspection::Resource(current) = resources.inspect(Some(path)).unwrap()
     else {
-        panic!("expected one workspace binding");
+        panic!("expected one remote");
     };
     resources
         .replace(path, source, &current.persisted_etag)
@@ -267,10 +267,10 @@ async fn complete_device(
 }
 
 #[tokio::test]
-async fn workspace_binding_refresh_connection_failure_preserves_the_grant() {
+async fn remote_refresh_connection_failure_preserves_the_grant() {
     let (issuer, server) = issuer().await;
     let (resources, store) = setup(&issuer).await;
-    let service = AuthService::test_workspace_binding(resources.clone(), Arc::clone(&store));
+    let service = AuthService::test_remote(resources.clone(), Arc::clone(&store));
     let begin = service
         .begin_auth(begin_request(AuthMethod::OauthDevice))
         .await
@@ -285,12 +285,12 @@ async fn workspace_binding_refresh_connection_failure_preserves_the_grant() {
         AuthAttemptLifecycle::Succeeded as i32
     );
 
-    let binding = WorkspaceBindingAuth::new(resources, store, OutboundHttpPolicy::loopback_test());
+    let binding = RemoteAuth::new(resources, store, OutboundHttpPolicy::loopback_test());
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let mut credential = binding.read(KEY).await.unwrap().unwrap().credential;
-    let OAuthCredentialContext::WorkspaceBinding(context) = &mut credential.context else {
-        panic!("expected a WorkspaceBinding grant");
+    let OAuthCredentialContext::Remote(context) = &mut credential.context else {
+        panic!("expected a Remote grant");
     };
     context.token_endpoint =
         Url::parse(&format!("http://{}/token", socket.local_addr().unwrap())).unwrap();
@@ -303,10 +303,7 @@ async fn workspace_binding_refresh_connection_failure_preserves_the_grant() {
     for _ in 0..2 {
         let error = binding.refresh(KEY).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert_eq!(
-            error.message(),
-            "workspace binding refresh connection failed"
-        );
+        assert_eq!(error.message(), "remote refresh connection failed");
         assert!(
             !binding
                 .read(KEY)
@@ -320,18 +317,13 @@ async fn workspace_binding_refresh_connection_failure_preserves_the_grant() {
 }
 
 #[tokio::test]
-async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() {
+async fn remote_device_rpc_rotates_pinned_grant_and_resets_locally() {
     let (issuer, server) = issuer().await;
     let (resources, store) = setup(&issuer).await;
     replace_binding(&resources, "https://other.example/").await;
     replace_binding(&resources, &issuer.base).await;
-    assert!(
-        resources
-            .snapshot()
-            .workspace_binding_incarnation(KEY)
-            .is_some()
-    );
-    let service = AuthService::test_workspace_binding(resources, Arc::clone(&store));
+    assert!(resources.snapshot().remote_incarnation(KEY).is_some());
+    let service = AuthService::test_remote(resources, Arc::clone(&store));
     let list = service
         .list_auth_statuses(tonic::Request::new(ListAuthStatusesRequest {}))
         .await
@@ -392,13 +384,13 @@ async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() 
     let unrelated = endpoint.join("other").unwrap();
     assert!(
         service
-            .workspace_binding_credential_lease(KEY, &unrelated)
+            .remote_credential_lease(KEY, &unrelated)
             .await
             .unwrap()
             .is_none()
     );
     let initial = service
-        .workspace_binding_credential_lease(KEY, &endpoint)
+        .remote_credential_lease(KEY, &endpoint)
         .await
         .unwrap()
         .unwrap();
@@ -415,9 +407,9 @@ async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() 
 
     // A fresh catalog and auth service restore the SQL-backed completed grant.
     drop(service);
-    let service = AuthService::test_workspace_binding(cold_catalog(&issuer), store);
+    let service = AuthService::test_remote(cold_catalog(&issuer), store);
     let restored = service
-        .workspace_binding_credential_lease(KEY, &endpoint)
+        .remote_credential_lease(KEY, &endpoint)
         .await
         .unwrap()
         .unwrap();
@@ -431,7 +423,7 @@ async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() 
     };
     service.refresh_auth(refresh()).await.unwrap();
     let rotated = service
-        .workspace_binding_credential_lease(KEY, &endpoint)
+        .remote_credential_lease(KEY, &endpoint)
         .await
         .unwrap()
         .unwrap();
@@ -445,7 +437,7 @@ async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() 
     );
     assert!(
         service
-            .workspace_binding_credential_lease(KEY, &endpoint)
+            .remote_credential_lease(KEY, &endpoint)
             .await
             .unwrap()
             .is_none()
@@ -463,7 +455,7 @@ async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() 
     assert_eq!(status.kind, AuthStatusKind::NotConfigured as i32);
     assert!(
         service
-            .workspace_binding_credential_lease(KEY, &endpoint)
+            .remote_credential_lease(KEY, &endpoint)
             .await
             .unwrap()
             .is_none()
@@ -472,10 +464,10 @@ async fn workspace_binding_device_rpc_rotates_pinned_grant_and_resets_locally() 
 }
 
 #[tokio::test]
-async fn workspace_binding_device_grant_does_not_survive_live_endpoint_aba() {
+async fn remote_device_grant_does_not_survive_live_endpoint_aba() {
     let (issuer, server) = issuer().await;
     let (resources, store) = setup(&issuer).await;
-    let service = AuthService::test_workspace_binding(resources.clone(), store);
+    let service = AuthService::test_remote(resources.clone(), store);
     let endpoint = Url::parse(&issuer.base).unwrap();
     let begin = service
         .begin_auth(begin_request(AuthMethod::OauthDevice))
@@ -491,20 +483,20 @@ async fn workspace_binding_device_grant_does_not_survive_live_endpoint_aba() {
         AuthAttemptLifecycle::Succeeded as i32
     );
     let lease = service
-        .workspace_binding_credential_lease(KEY, &endpoint)
+        .remote_credential_lease(KEY, &endpoint)
         .await
         .unwrap()
         .unwrap();
 
     replace_slot(
         &resources,
-        "workspace-bindings/unrelated.yaml",
+        "remotes/unrelated.yaml",
         binding_yaml("https://unrelated.example/").replace("name: export", "name: unrelated"),
     )
     .await;
     assert_eq!(
         service
-            .workspace_binding_credential_lease(KEY, &endpoint)
+            .remote_credential_lease(KEY, &endpoint)
             .await
             .unwrap()
             .unwrap()
@@ -516,13 +508,10 @@ async fn workspace_binding_device_grant_does_not_survive_live_endpoint_aba() {
     let initial = resources.snapshot();
     replace_binding(&resources, "https://other.example/").await;
     replace_binding(&resources, &issuer.base).await;
-    assert_eq!(
-        resources.snapshot().workspace_bindings()[KEY],
-        initial.workspace_bindings()[KEY]
-    );
+    assert_eq!(resources.snapshot().remotes()[KEY], initial.remotes()[KEY]);
     assert!(
         service
-            .workspace_binding_credential_lease(KEY, &endpoint)
+            .remote_credential_lease(KEY, &endpoint)
             .await
             .unwrap()
             .is_none()
@@ -548,7 +537,7 @@ async fn workspace_binding_device_grant_does_not_survive_live_endpoint_aba() {
 }
 
 #[tokio::test]
-async fn workspace_binding_cancel_unsupported_and_mismatched_discovery_fail_closed() {
+async fn remote_cancel_unsupported_and_mismatched_discovery_fail_closed() {
     let (issuer, server) = issuer().await;
     let service = service(&issuer).await;
     issuer.advertise_device.store(false, Ordering::SeqCst);

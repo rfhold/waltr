@@ -945,7 +945,8 @@ impl ClientState {
     }
 
     fn clear_protected_state(&mut self, policy: ClearPolicy) {
-        self.interactions.invalidate(policy == ClearPolicy::TransientExpiry);
+        self.interactions
+            .invalidate(policy == ClearPolicy::TransientExpiry);
         self.apps = crate::McpAppsSnapshot::default();
         self.apps_completed_requests.clear();
         self.terminalize_loading_operations(policy);
@@ -1209,9 +1210,9 @@ impl ClientState {
         let completion_mode = attempt.completion_mode;
         let device = completion_mode
             == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerDevicePoll as i32;
-        let workspace_binding = matches!(
+        let remote = matches!(
             target.target,
-            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(_))
+            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::RemoteKey(_))
         );
         let verification_url = if device {
             safe_device_verification_url(&attempt.verification_url).unwrap_or_default()
@@ -1223,7 +1224,7 @@ impl ClientState {
         } else {
             safe_text(&attempt.user_code, 256)
         };
-        if workspace_binding != device
+        if remote != device
             || (device
                 && (verification_url.is_empty()
                     || user_code.is_empty()
@@ -2906,8 +2907,8 @@ pub fn auth_target_key(target: &AuthTarget) -> String {
         Some(waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(key)) => {
             format!("mcp:{key}")
         }
-        Some(waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(key)) => {
-            format!("workspaceBinding:{key}")
+        Some(waltr::grpc::waltr::auth::v1::auth_target::Target::RemoteKey(key)) => {
+            format!("remote:{key}")
         }
         None => "unknown:".to_owned(),
     }

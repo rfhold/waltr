@@ -3,13 +3,13 @@ import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from
 import type { ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { useServerSelection } from "../../app/serverSelection";
+import { ownerPath } from "../../app/destination";
 import { reportApplicationView } from "../../telemetry";
 
 export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   const app = useAppState();
-  const serverSelection = useServerSelection();
   const location = useLocation();
+  const path = () => ownerPath(location.pathname);
   const snapshot = createMemo(() => app.snapshot());
   const [loggingOut, setLoggingOut] = createSignal(false);
   const [logoutError, setLogoutError] = createSignal<string>();
@@ -45,9 +45,9 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
   });
 
   const currentNavigation = createMemo(() => {
-    if (location.pathname.startsWith("/sessions")) return "Sessions";
-    if (location.pathname.startsWith("/routines")) return "Routines";
-    if (location.pathname.startsWith("/config")) return "Config";
+    if (path().startsWith("/sessions")) return "Sessions";
+    if (path().startsWith("/routines")) return "Routines";
+    if (path().startsWith("/config")) return "Config";
     return "Home";
   });
 
@@ -181,27 +181,27 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
         <nav class="shell__nav" aria-label="Main">
           <A
             class="shell__link"
-            classList={{ active: location.pathname === "/" }}
+            classList={{ active: path() === "/" }}
             href="/"
-            aria-current={location.pathname === "/" ? "page" : undefined}
+            aria-current={path() === "/" ? "page" : undefined}
             onClick={() => closeDrawer()}
           >
             Home
           </A>
           <A
             class="shell__link"
-            classList={{ active: location.pathname.startsWith("/sessions") }}
+            classList={{ active: path().startsWith("/sessions") }}
             href="/sessions"
-            aria-current={location.pathname.startsWith("/sessions") ? "page" : undefined}
+            aria-current={path().startsWith("/sessions") ? "page" : undefined}
             onClick={() => closeDrawer()}
           >
             Sessions
           </A>
           <A
             class="shell__link"
-            classList={{ active: location.pathname.startsWith("/routines") }}
+            classList={{ active: path().startsWith("/routines") }}
             href="/routines"
-            aria-current={location.pathname.startsWith("/routines") ? "page" : undefined}
+            aria-current={path().startsWith("/routines") ? "page" : undefined}
             onClick={() => closeDrawer()}
           >
             Routines
@@ -210,16 +210,13 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
         <div class="shell__sidebar-bottom">
           <A
             class="shell__link"
-            classList={{ active: location.pathname.startsWith("/config") }}
+            classList={{ active: path().startsWith("/config") }}
             href="/config/provider"
-            aria-current={location.pathname.startsWith("/config") ? "page" : undefined}
+            aria-current={path().startsWith("/config") ? "page" : undefined}
             onClick={() => closeDrawer()}
           >
             Config
           </A>
-          <Show when={serverSelection}>
-            <button class="shell__logout" type="button" onClick={() => serverSelection?.switchServer()}>Switch server</button>
-          </Show>
           <Show when={app.accessOperations()}>
             <button class="shell__logout" type="button" disabled={loggingOut()} onClick={logout}>
               {loggingOut() ? "Signing out..." : "Sign out"}

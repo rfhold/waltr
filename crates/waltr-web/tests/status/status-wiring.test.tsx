@@ -13,7 +13,7 @@ describe("status wiring", () => {
         config: {
           current: { etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null },
           resourceBaselines: {},
-          workspaceBindings: {},
+          remotes: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),
@@ -37,7 +37,7 @@ describe("status wiring", () => {
         config: {
           current: null,
           resourceBaselines: {},
-          workspaceBindings: {},
+          remotes: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),

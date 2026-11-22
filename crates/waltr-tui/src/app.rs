@@ -100,7 +100,7 @@ pub struct App {
     active_config_tab: ConfigTab,
     provider_section: ProviderSection,
     mcp_section: McpSection,
-    workspace_binding_selection: usize,
+    remote_selection: usize,
     inference_defaults_section: InferenceDefaultsSection,
     sessions_section: SessionsSection,
     routines_section: RoutinesSection,
@@ -146,7 +146,7 @@ impl App {
             active_config_tab: ConfigTab::Providers,
             provider_section: ProviderSection::new(),
             mcp_section: McpSection::new(),
-            workspace_binding_selection: 0,
+            remote_selection: 0,
             inference_defaults_section: InferenceDefaultsSection::new(),
             sessions_section: SessionsSection::new(),
             routines_section: RoutinesSection::new(),
@@ -543,9 +543,9 @@ impl App {
                     AppAction::Continue
                 }
             }
-            KeyCode::Char('C') => self
-                .outbound_auth_url()
-                .map_or(AppAction::Continue, |url| AppAction::CopyAuthUrl(url.to_owned())),
+            KeyCode::Char('C') => self.outbound_auth_url().map_or(AppAction::Continue, |url| {
+                AppAction::CopyAuthUrl(url.to_owned())
+            }),
             KeyCode::Backspace if manual_input => {
                 self.config_auth.input_mut().pop();
                 AppAction::Continue
@@ -823,14 +823,14 @@ impl App {
         (!value.is_empty()).then_some(value.as_str())
     }
 
-    pub(crate) const fn workspace_binding_selection(&self) -> usize {
-        self.workspace_binding_selection
+    pub(crate) const fn remote_selection(&self) -> usize {
+        self.remote_selection
     }
 
-    pub(crate) fn has_workspace_bindings(&self) -> bool {
+    pub(crate) fn has_remotes(&self) -> bool {
         self.client_snapshot
             .as_ref()
-            .is_some_and(|snapshot| !snapshot.config.workspace_bindings.is_empty())
+            .is_some_and(|snapshot| !snapshot.config.remotes.is_empty())
     }
 
     #[allow(
@@ -895,7 +895,9 @@ impl App {
                         && self.sessions_section.detail_session_id().is_none()
                     {
                         return AppAction::ClientCommands(vec![
-                            ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
+                            ClientCommand::ReleaseInteractions {
+                                session_id: session_id.clone(),
+                            },
                             ClientCommand::ReleaseSessionTimelineWatchInterest {
                                 session_id: session_id.clone(),
                             },
@@ -954,7 +956,7 @@ impl App {
                         ConfigTab::InferenceDefaults => {
                             self.inference_defaults_section.open_create_form();
                         }
-                        ConfigTab::WorkspaceBindings => {}
+                        ConfigTab::Remotes => {}
                     }
                     return AppAction::Continue;
                 }
@@ -973,7 +975,9 @@ impl App {
                     self.screen = AppScreen::Config;
                     let mut commands = Vec::new();
                     if let Some(session_id) = detail_session_id {
-                        commands.push(ClientCommand::ReleaseInteractions { session_id: session_id.clone() });
+                        commands.push(ClientCommand::ReleaseInteractions {
+                            session_id: session_id.clone(),
+                        });
                         commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         });
@@ -1071,7 +1075,9 @@ impl App {
 
                 detail_session_id.map_or(AppAction::Continue, |session_id| {
                     AppAction::ClientCommands(vec![
-                        ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
+                        ClientCommand::ReleaseInteractions {
+                            session_id: session_id.clone(),
+                        },
                         ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         },
@@ -1135,7 +1141,9 @@ impl App {
                 }
                 if matches!(self.screen, AppScreen::Sessions | AppScreen::SessionData) {
                     if let Some(session_id) = self.sessions_section.clear_detail_route() {
-                        commands.push(ClientCommand::ReleaseInteractions { session_id: session_id.clone() });
+                        commands.push(ClientCommand::ReleaseInteractions {
+                            session_id: session_id.clone(),
+                        });
                         commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         });
@@ -1345,9 +1353,9 @@ impl App {
             if let Some(config) = snapshot.config.current.as_ref() {
                 self.provider_section.sync_selection(config.providers.len());
                 self.mcp_section.sync_selection(config.mcp_servers.len());
-                self.workspace_binding_selection = self
-                    .workspace_binding_selection
-                    .min(snapshot.config.workspace_bindings.len().saturating_sub(1));
+                self.remote_selection = self
+                    .remote_selection
+                    .min(snapshot.config.remotes.len().saturating_sub(1));
                 self.inference_defaults_section.sync_selection(Some(config));
             }
 
@@ -1369,13 +1377,17 @@ impl App {
 
         commands.extend(match (detail_before, detail_after) {
             (None, Some(session_id)) => vec![
-                ClientCommand::RetainInteractions { session_id: session_id.clone() },
+                ClientCommand::RetainInteractions {
+                    session_id: session_id.clone(),
+                },
                 register_timeline_watch_command(session_id.clone()),
                 ClientCommand::RegisterSessionRoutineInvocationWatchInterest { session_id },
             ],
             (Some(session_id), None) => {
                 vec![
-                    ClientCommand::ReleaseInteractions { session_id: session_id.clone() },
+                    ClientCommand::ReleaseInteractions {
+                        session_id: session_id.clone(),
+                    },
                     ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: session_id.clone(),
                     },
@@ -1384,14 +1396,18 @@ impl App {
             }
             (Some(old_session_id), Some(new_session_id)) if old_session_id != new_session_id => {
                 vec![
-                    ClientCommand::ReleaseInteractions { session_id: old_session_id.clone() },
+                    ClientCommand::ReleaseInteractions {
+                        session_id: old_session_id.clone(),
+                    },
                     ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: old_session_id.clone(),
                     },
                     ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
                         session_id: old_session_id,
                     },
-                    ClientCommand::RetainInteractions { session_id: new_session_id.clone() },
+                    ClientCommand::RetainInteractions {
+                        session_id: new_session_id.clone(),
+                    },
                     register_timeline_watch_command(new_session_id.clone()),
                     ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
                         session_id: new_session_id,
@@ -1409,7 +1425,7 @@ impl App {
         self.active_config_tab = ConfigTab::Providers;
         self.provider_section = ProviderSection::new();
         self.mcp_section = McpSection::new();
-        self.workspace_binding_selection = 0;
+        self.remote_selection = 0;
         self.inference_defaults_section = InferenceDefaultsSection::new();
         self.sessions_section = SessionsSection::new();
         self.routines_section = RoutinesSection::new();
@@ -1438,7 +1454,7 @@ impl App {
             ConfigTab::Providers => self.provider_section.has_overlay(),
             ConfigTab::Mcp => self.mcp_section.has_overlay(),
             ConfigTab::InferenceDefaults => self.inference_defaults_section.has_overlay(),
-            ConfigTab::WorkspaceBindings => false,
+            ConfigTab::Remotes => false,
         }
     }
 
@@ -1453,7 +1469,7 @@ impl App {
             ConfigTab::Providers => self.provider_section.dismiss_overlay(),
             ConfigTab::Mcp => self.mcp_section.dismiss_overlay(),
             ConfigTab::InferenceDefaults => self.inference_defaults_section.dismiss_overlay(),
-            ConfigTab::WorkspaceBindings => false,
+            ConfigTab::Remotes => false,
         }
     }
 
@@ -1470,12 +1486,11 @@ impl App {
         // is active (overlays consume Tab for their own field navigation).
         if key.code == KeyCode::Tab && !self.active_section_has_overlay() {
             let next = self.active_config_tab.next();
-            self.active_config_tab =
-                if next == ConfigTab::WorkspaceBindings && !self.has_workspace_bindings() {
-                    next.next()
-                } else {
-                    next
-                };
+            self.active_config_tab = if next == ConfigTab::Remotes && !self.has_remotes() {
+                next.next()
+            } else {
+                next
+            };
             return AppAction::Continue;
         }
 
@@ -1502,14 +1517,14 @@ impl App {
             ConfigTab::Providers => self.provider_section.selected_auth_target(config.as_ref()),
             ConfigTab::Mcp => self.mcp_section.selected_auth_target(config.as_ref()),
             ConfigTab::InferenceDefaults => None,
-            ConfigTab::WorkspaceBindings => self.client_snapshot.as_ref().and_then(|snapshot| {
+            ConfigTab::Remotes => self.client_snapshot.as_ref().and_then(|snapshot| {
                 snapshot
                     .config
-                    .workspace_bindings
+                    .remotes
                     .keys()
-                    .nth(self.workspace_binding_selection)
+                    .nth(self.remote_selection)
                     .map(|key| ClientAuthTarget {
-                        kind: "workspaceBinding".to_owned(),
+                        kind: "remote".to_owned(),
                         key: key.clone(),
                     })
             }),
@@ -1532,20 +1547,19 @@ impl App {
             ConfigTab::InferenceDefaults => self
                 .inference_defaults_section
                 .handle_key(key, config.as_ref()),
-            ConfigTab::WorkspaceBindings => {
+            ConfigTab::Remotes => {
                 let Some(snapshot) = self.client_snapshot.as_ref() else {
                     return AppAction::Continue;
                 };
                 match key.code {
                     KeyCode::Up => {
-                        self.workspace_binding_selection =
-                            self.workspace_binding_selection.saturating_sub(1);
+                        self.remote_selection = self.remote_selection.saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        self.workspace_binding_selection = self
-                            .workspace_binding_selection
+                        self.remote_selection = self
+                            .remote_selection
                             .saturating_add(1)
-                            .min(snapshot.config.workspace_bindings.len().saturating_sub(1));
+                            .min(snapshot.config.remotes.len().saturating_sub(1));
                     }
                     KeyCode::Char('s') if snapshot.auth.list.status != "loading" => {
                         return AppAction::ClientCommand(ClientCommand::RequestAuthStatuses);
@@ -1640,7 +1654,9 @@ impl App {
                 };
                 let source_session = detail_session_id.clone();
                 if let Some(session_id) = detail_session_id {
-                    commands.push(ClientCommand::ReleaseInteractions { session_id: session_id.clone() });
+                    commands.push(ClientCommand::ReleaseInteractions {
+                        session_id: session_id.clone(),
+                    });
                     commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: session_id.clone(),
                     });
@@ -1679,7 +1695,9 @@ impl App {
                         if old_session_id != new_session_id =>
                     {
                         AppAction::ClientCommands(vec![
-                            ClientCommand::ReleaseInteractions { session_id: old_session_id.clone() },
+                            ClientCommand::ReleaseInteractions {
+                                session_id: old_session_id.clone(),
+                            },
                             ClientCommand::ReleaseSessionTimelineWatchInterest {
                                 session_id: old_session_id.clone(),
                             },

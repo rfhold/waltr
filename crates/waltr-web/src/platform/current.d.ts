@@ -1,7 +1,7 @@
 declare module "virtual:waltr-platform" {
-  import type { ClientAdapterLoader } from "./client";
+  import type { ClientAdapter } from "./client";
 
-  export const loadClientAdapter: ClientAdapterLoader;
+  export const loadClientAdapter: (destination?: string) => Promise<ClientAdapter>;
 }
 
 declare const __WALTR_BUILD_PLATFORM__: "browser" | "tauri";

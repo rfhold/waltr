@@ -159,9 +159,6 @@ mod tests {
             "dispose_runtime",
             "open_external_url",
             "open_authorization_attempt",
-            "list_servers",
-            "save_server",
-            "remove_server",
             "start_access_login",
             "logout_access",
         ];

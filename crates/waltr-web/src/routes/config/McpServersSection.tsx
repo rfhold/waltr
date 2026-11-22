@@ -11,6 +11,7 @@ import {
 import type { Accessor, ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { ownerPath } from "../../app/destination";
 import { ActionList, ActionRow, ConfirmAction, Dialog, Field, InlineAlert } from "../../components/ui";
 import type {
   ClientCommand,
@@ -63,7 +64,7 @@ export function McpServersSection(props: ParentProps & {
   const [deleteServer, setDeleteServer] = createSignal<string>();
   const [operationError, setOperationError] = createSignal<string>();
   const [operationPending, setOperationPending] = createSignal(false);
-  const routeServerName = createMemo(() => serverNameFromEditPath(location.pathname));
+  const routeServerName = createMemo(() => serverNameFromEditPath(ownerPath(location.pathname)));
   const visibleServerName = createMemo(() => routeServerName() ?? selectedServer());
 
   createEffect(() => {

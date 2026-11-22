@@ -24,7 +24,7 @@ pub(crate) struct State {
     pub credentials: Option<waltr_client::NativeCredentialProvider>,
     pub(super) catalog: Option<catalog::Catalog>,
     pub(super) pinned: Option<catalog::Pin>,
-    shortcut_active_profile: Option<String>,
+    scoped_view: bool,
     shortcut_catalogs: BTreeMap<String, ShortcutRoute>,
     shortcut_pin: Option<(String, catalog::Pin, CancellationToken)>,
 }
@@ -125,20 +125,10 @@ impl Host {
             telemetry::admission("hold", "unavailable");
             return Err("Native audio is unavailable".into());
         }
-        let destination = binding.routine.destination.as_deref();
+        let destination = binding.routine.destination.as_deref().unwrap_or("local");
         let target = match destination {
-            None => None,
-            Some(id) if state.shortcut_active_profile.as_deref() == Some(id) => {
-                if !state
-                    .credentials
-                    .as_ref()
-                    .is_some_and(waltr_client::NativeCredentialProvider::has_bearer_token)
-                {
-                    return Err("Shortcut destination is not authenticated".into());
-                }
-                None
-            }
-            Some(id) => Some(
+            "local" if !state.scoped_view => None,
+            id => Some(
                 state
                     .shortcut_catalogs
                     .get(id)
@@ -242,11 +232,7 @@ impl Host {
         let token = CancellationToken::new();
         state.active = Some(token.clone());
         if transport.is_some() {
-            state.shortcut_pin = binding
-                .routine
-                .destination
-                .clone()
-                .map(|id| (id, pinned, token.clone()));
+            state.shortcut_pin = Some((destination.to_owned(), pinned, token.clone()));
             state.pinned = None;
         } else {
             state.shortcut_pin = None;
@@ -279,10 +265,10 @@ impl Host {
         drop(state);
         Ok(result)
     }
-    pub(crate) fn shortcut_active_profile(&self, generation: u64, id: Option<String>) {
+    pub(crate) fn scoped_view(&self, generation: u64, scoped: bool) {
         let mut state = self.lock();
         if state.generation == generation {
-            state.shortcut_active_profile = id;
+            state.scoped_view = scoped;
         }
     }
 
@@ -373,7 +359,7 @@ impl Held {
 
     pub(crate) fn alternate_destination(&self) -> Option<&str> {
         self.transport.as_ref()?;
-        self.destination()
+        Some(self.destination().unwrap_or("local"))
     }
 
     #[cfg(test)]
@@ -420,7 +406,7 @@ impl Held {
             .transport
             .clone()
             .unwrap_or_else(|| active_transport.clone());
-        let preflight = self.destination().map(|_| &transport);
+        let preflight = self.alternate_destination().map(|_| &transport);
         self.run_with_checks(
             &transport,
             permissions,
@@ -485,6 +471,17 @@ impl Held {
         typing: &dyn waltr_desktop::typing::Factory,
         preflight: Option<&waltr_client::NativeGrpcTransport>,
     ) {
+        if let Some(transport) = preflight
+            && !self.verify_destination(transport).await
+        {
+            if self.token.is_cancelled() {
+                self.diagnostics.fail("invalidated");
+            } else {
+                self.diagnostics.fail("destination_unavailable");
+                self.activity.fail();
+            }
+            return;
+        }
         let grant = tokio::select! { biased;
             () = self.token.cancelled() => PermissionResult::Cancelled,
             grant = permissions.request(self.generation, u64::MAX) => grant,
@@ -501,17 +498,6 @@ impl Held {
                     .is_none_or(|(provider, revision)| provider.credential_revision() == *revision)
         };
         if grant == PermissionResult::Granted && valid() {
-            if let Some(transport) = preflight
-                && !self.verify_destination(transport).await
-            {
-                if valid() {
-                    self.diagnostics.fail("destination_unavailable");
-                    self.activity.fail();
-                } else {
-                    self.diagnostics.fail("invalidated");
-                }
-                return;
-            }
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             let playback = self.binding.playback.as_ref().map(|_| {
                 crate::native_media::hold_playback::Sink::new(

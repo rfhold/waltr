@@ -13,16 +13,16 @@ use crate::{
 
 use super::*;
 
-const BINDING: &str = "workspace-bindings/first.yaml";
+const BINDING: &str = "remotes/first.yaml";
 const FIRST: &str = "apiVersion: waltr.dev/v1alpha1
-kind: WorkspaceBinding
+kind: Remote
 metadata: {name: first}
-spec: {endpoint: 'http://127.0.0.1:1234', machineId: first, exportRoot: /first, mcpStdioServers: [exported]}
+spec: {endpoint: 'http://127.0.0.1:1234', binding: {machineId: first, exportRoot: /first, mcpStdioServers: [exported]}}
 ";
 const UNRELATED: &str = "apiVersion: waltr.dev/v1alpha1
-kind: WorkspaceBinding
+kind: Remote
 metadata: {name: unrelated}
-spec: {endpoint: 'http://127.0.0.1:1234', machineId: unrelated, exportRoot: /unrelated}
+spec: {endpoint: 'http://127.0.0.1:2345'}
 ";
 const SERVER: &str = "mcp-servers/exported.yaml";
 const STDIO: &str = "apiVersion: waltr.dev/v1alpha1
@@ -78,8 +78,8 @@ async fn ack(tx: &mpsc::Sender<proto::ConnectRequest>, request_id: String) {
     .unwrap();
 }
 
-fn test_lease(access: &str, authority: &str) -> WorkspaceBindingCredentialLease {
-    WorkspaceBindingCredentialLease {
+fn test_lease(access: &str, authority: &str) -> RemoteCredentialLease {
+    RemoteCredentialLease {
         access_token: access.into(),
         expires_at_ms: i64::try_from(
             (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::from_secs(60))
@@ -94,7 +94,7 @@ fn test_lease(access: &str, authority: &str) -> WorkspaceBindingCredentialLease 
 async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
     let catalog = resource_state_with_overrides(&[
         (BINDING, FIRST),
-        ("workspace-bindings/unrelated.yaml", UNRELATED),
+        ("remotes/unrelated.yaml", UNRELATED),
         (SERVER, STDIO),
         (OTHER_SERVER, &STDIO.replace("exported", "other")),
     ]);
@@ -151,15 +151,17 @@ async fn export_lifecycle_rotates_and_stops_independently_of_unrelated_lease() {
                 let current = current.clone();
                 async move {
                     if key == "unrelated" {
-                        pending::<Option<WorkspaceBindingCredentialLease>>().await
+                        pending::<Option<RemoteCredentialLease>>().await
                     } else {
-                        current.lock().unwrap().as_ref().map(|lease| {
-                            WorkspaceBindingCredentialLease {
+                        current
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|lease| RemoteCredentialLease {
                                 access_token: lease.access_token.clone(),
                                 expires_at_ms: lease.expires_at_ms,
                                 authority_id: lease.authority_id.clone(),
-                            }
-                        })
+                            })
                     }
                 }
             }

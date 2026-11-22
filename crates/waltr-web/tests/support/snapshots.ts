@@ -26,7 +26,7 @@ export function snapshotWithConfig(
     catalog: emptyCatalogSnapshot(),
     config: {
       current: config,
-      workspaceBindings: {},
+      remotes: {},
       resourceBaselines: resourceBaselines(config),
       load: operationSnapshot("idle"),
       patch: operationSnapshot("idle"),

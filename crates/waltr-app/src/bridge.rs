@@ -17,6 +17,7 @@ use tracing::Instrument as _;
 use waltr_client::{
     AuthAttemptSnapshot, ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, NativeCredentialProvider, NativeGrpcTransport,
+    WaltrTransport as _,
 };
 
 use crate::{
@@ -449,10 +450,6 @@ enum HostRequest {
     MediaRaw(crate::native_media::RawRequest),
     Dictation(Box<crate::dictation::Job>),
     Hold(crate::native_audio::Held),
-    RetireShortcutDestination {
-        id: String,
-        reply: oneshot::Sender<()>,
-    },
     Access(waltr_client::NativeAccessAction),
     StartAccess {
         action: waltr_client::NativeAccessAction,
@@ -775,19 +772,19 @@ impl fmt::Debug for RuntimeBridge {
 #[derive(Clone)]
 pub(crate) struct RuntimeTarget {
     pub id: String,
+    pub destination: Option<String>,
     pub endpoint: Option<String>,
     pub access: Option<crate::native_auth::AccessBinding>,
     pub app: Option<tauri::AppHandle>,
-    pub profiles: Option<Arc<crate::server_profiles::ServerProfiles>>,
 }
 impl Default for RuntimeTarget {
     fn default() -> Self {
         Self {
             id: "local".into(),
+            destination: None,
             endpoint: None,
             access: None,
             app: None,
-            profiles: None,
         }
     }
 }
@@ -813,13 +810,6 @@ impl RuntimeBridge {
             .selected
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = target;
-    }
-    pub(crate) fn selected_id(&self) -> String {
-        self.selected
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .id
-            .clone()
     }
     pub(crate) fn is_remote(&self) -> bool {
         self.selected
@@ -1131,49 +1121,6 @@ impl RuntimeBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = destinations;
     }
 
-    pub(crate) async fn retire_shortcut_destination(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        if !self
-            .shortcut_destinations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(id)
-        {
-            return Ok(());
-        }
-        let (requests, retiring) = {
-            // Retirement publishes its barrier under this lock before detaching a generation.
-            let retiring = self
-                .retiring
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let requests = self
-                .running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(|running| running.requests.clone());
-            (requests, retiring.clone())
-        };
-        if let Some(requests) = requests {
-            let (reply, result) = oneshot::channel();
-            let error = || "Shortcut destination cleanup could not be verified".to_owned();
-            requests
-                .send(HostRequest::RetireShortcutDestination { id: id.to_owned(), reply })
-                .await
-                .map_err(|_| error())?;
-            result.await.map_err(|_| error())?;
-        }
-        if retiring.is_empty()
-            || tokio::task::spawn_blocking(move || retiring.iter().all(|retirement| retirement.wait()))
-                .await
-                .unwrap_or(false)
-        {
-            Ok(())
-        } else {
-            Err("Shortcut destination cleanup could not be verified".into())
-        }
-    }
     #[allow(
         clippy::significant_drop_tightening,
         reason = "hold the generation lock through edge admission and enqueue"
@@ -1879,7 +1826,6 @@ async fn run_generation(
                 Some(HostRequest::Media(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::MediaRaw(request)) => { let _sent = request.reply.send(Err("Native server is not ready".into())); },
                 Some(HostRequest::Access(_) | HostRequest::Dictation(_) | HostRequest::Hold(_)) => {},
-                Some(HostRequest::RetireShortcutDestination { reply, .. }) => { drop(reply.send(())); },
                 Some(HostRequest::LogoutAccess { reply } | HostRequest::StartAccess { reply, .. }) => { drop(reply.send(Err("Native server is not ready".into()))); },
                 Some(HostRequest::Dispatch { reply, .. }) => {
                     drop(reply.send(Err("embedded server is not ready".to_owned())));
@@ -1922,22 +1868,52 @@ fn spawn_shortcut_destinations(
     target: &RuntimeTarget,
     audio: &Arc<crate::native_audio::Host>,
     generation: u64,
+    entry: &NativeGrpcTransport,
 ) -> BTreeMap<String, ShortcutDestinationTask> {
     use tauri::Manager as _;
-    let (Some(app), Some(profiles)) = (&target.app, &target.profiles) else {
+    let Some(app) = &target.app else {
         return BTreeMap::new();
     };
     let bridge = app.state::<Arc<RuntimeBridge>>();
     let ids = bridge.shortcut_destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = &app.state::<crate::CredentialRoot>().0;
-    ids.iter().filter(|id| *id != &target.id).filter_map(|id| {
-        let profile = profiles.get(id).ok()?;
+    ids.iter().filter_map(|id| {
         let stop = tokio_util::sync::CancellationToken::new();
-        let watcher = tokio::task::spawn_local(crate::native_auth::watch_shortcut_destination(
-            profile, root.clone(), audio.clone(), generation, stop.clone(),
+        let watcher = tokio::task::spawn_local(watch_shortcut_destination(
+            id.clone(), entry.clone(), audio.clone(), generation, stop.clone(),
         ));
         Some((id.clone(), ShortcutDestinationTask { stop, watcher, held: None }))
     }).collect()
+}
+
+#[allow(clippy::future_not_send, reason = "definition watch is LocalSet-owned")]
+async fn watch_shortcut_destination(
+    destination: String,
+    entry: NativeGrpcTransport,
+    audio: Arc<crate::native_audio::Host>,
+    generation: u64,
+    stop: tokio_util::sync::CancellationToken,
+) {
+    use futures_util::StreamExt as _;
+    let credentials = entry.credential_provider();
+    let watch = async {
+        loop {
+            let Ok(transport) = entry.for_destination(&destination) else { return; };
+            let revision = credentials.credential_revision();
+            if let Ok(mut stream) = transport.watch_manual_routines("native-shortcut-watch".into()).await {
+                while let Some(Ok(snapshot)) = stream.next().await {
+                    audio.observe_shortcut(generation, &destination, Some((snapshot, transport.clone(), revision)));
+                }
+            }
+            audio.observe_shortcut(generation, &destination, None);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => {},
+        () = watch => {},
+    }
+    audio.observe_shortcut(generation, &destination, None);
 }
 
 #[allow(
@@ -1974,8 +1950,15 @@ async fn run_connected_generation(
         });
         return ConnectedExit::Stopped;
     }
-    let transport =
+    let entry_transport =
         NativeGrpcTransport::with_credential_provider(connection.endpoint, credentials.clone());
+    let transport = match target.destination.as_deref() {
+        Some(destination) => match entry_transport.for_destination(destination) {
+            Ok(transport) => transport,
+            Err(_) => return ConnectedExit::Stopped,
+        },
+        None => entry_transport.clone(),
+    };
     let audio_transport = transport.clone();
     let runtime = match handoff_attempt_for_server(authorization_handoff, connection.generation) {
         Some(attempt) => ClientRuntime::with_transport_and_pending_auth_attempt(transport, attempt),
@@ -2036,12 +2019,9 @@ async fn run_connected_generation(
         })
         .unwrap_or_default();
     audio.credentials(credentials.clone());
-    audio.audio.shortcut_active_profile(
-        publisher.generation,
-        target.access.as_ref().map(|_| target.id.clone()),
-    );
+    audio.audio.scoped_view(publisher.generation, target.destination.is_some());
     let mut shortcut_destinations =
-        spawn_shortcut_destinations(&target, &audio.audio, publisher.generation);
+        spawn_shortcut_destinations(&target, &audio.audio, publisher.generation, &entry_transport);
     audio.audio.activity.bind(publisher.generation);
     let mut audio_failures = audio.audio.activity.failures();
     audio.audio.observe(&stream.snapshot());
@@ -2049,7 +2029,7 @@ async fn run_connected_generation(
         &audio,
         &shortcut_epoch,
         publisher.generation,
-        snapshot_connected(&stream.snapshot()),
+        target.destination.is_some() || snapshot_connected(&stream.snapshot()),
     );
     let monitor_stop = tokio_util::sync::CancellationToken::new();
     let monitoring = monitor_stop.clone();
@@ -2072,18 +2052,9 @@ async fn run_connected_generation(
     );
     let media = media.with_current_generation(publisher.active_generation.clone());
     let mut media_tasks = tokio::task::JoinSet::new();
-    let mut connected_recorded = false;
     let exit = loop {
         if !publisher.is_current() {
             break ConnectedExit::Stopped;
-        }
-        if !connected_recorded && snapshot_connected(&stream.snapshot()) {
-            if let (Some(profiles), Some(app)) = (&target.profiles, &target.app) {
-                use tauri::Manager as _;
-                let bridge = app.state::<Arc<RuntimeBridge>>();
-                drop(bridge.with_current(publisher.generation, || profiles.connected(&target.id)));
-            }
-            connected_recorded = true;
         }
         tokio::select! {
             _ = stop.changed() => break ConnectedExit::Stopped,
@@ -2124,7 +2095,7 @@ async fn run_connected_generation(
                         let mut started = false;
                         if let Ok(snapshot) = result {
                             reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
-                            audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
+                            audio_access(&audio, &shortcut_epoch, publisher.generation, target.destination.is_some() || snapshot_connected(&snapshot));
                             access_host.observe(access.as_ref(), &credentials, &snapshot, started_probe).await;
                             started = publisher.publish_state(BridgePayload::State { snapshot: Box::new(presentation.snapshot(&snapshot)) }).is_some()
                                 && snapshot.access.active_attempt_id.is_some();
@@ -2186,13 +2157,6 @@ async fn run_connected_generation(
                         });
                     }
                 }
-                Some(HostRequest::RetireShortcutDestination { id, reply }) => {
-                    audio.audio.observe_shortcut(publisher.generation, &id, None);
-                    if let Some(destination) = shortcut_destinations.remove(&id) {
-                        destination.stop().await;
-                    }
-                    drop(reply.send(()));
-                }
                 Some(HostRequest::Dictation(job)) => {
                     if let Some(app) = target.app.clone() {
                         let transport = audio_transport.clone();
@@ -2220,10 +2184,7 @@ async fn run_connected_generation(
                             if let Some(coordinator) = access.take() { coordinator.stop().await; }
                             if !publisher.is_current() { return Err("Native client generation was replaced".into()); }
                             let _ = credentials.clear_bearer_token();
-                            let root = target.app.as_ref().map(|app| {
-                                use tauri::Manager as _;
-                                app.state::<crate::CredentialRoot>().0.clone()
-                            }).or_else(|| target.access.as_ref().map(|binding| binding.root.clone()));
+                            let root = target.access.as_ref().map(|binding| binding.root.clone());
                             let deleted = if let Some(root) = root {
                                 crate::credential_store::CredentialStore::delete_server(root, &target.id).await.map_err(|_| "Secure credentials could not be removed".to_owned())
                             } else { Ok(()) };
@@ -2314,7 +2275,7 @@ async fn run_connected_generation(
                     };
                     if let Ok(snapshot) = &result {
                         reconcile_consumers(&media, &audio, snapshot, &mut audio_tasks, publisher.generation).await;
-                        audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(snapshot));
+                        audio_access(&audio, &shortcut_epoch, publisher.generation, target.destination.is_some() || snapshot_connected(snapshot));
                         access_host.observe(access.as_ref(), &credentials, snapshot, started_probe).await;
                     }
                     let result = result.and_then(|snapshot| {
@@ -2330,7 +2291,7 @@ async fn run_connected_generation(
             },
             snapshot = stream.next() => {
                 reconcile_consumers(&media, &audio, &snapshot, &mut audio_tasks, publisher.generation).await;
-                audio_access(&audio, &shortcut_epoch, publisher.generation, snapshot_connected(&snapshot));
+                audio_access(&audio, &shortcut_epoch, publisher.generation, target.destination.is_some() || snapshot_connected(&snapshot));
                 access_host.observe(access.as_ref(), &credentials, &snapshot, false).await;
                 publisher.publish_state(BridgePayload::State {
                     snapshot: Box::new(presentation.snapshot(&snapshot)),

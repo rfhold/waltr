@@ -120,10 +120,12 @@ message LogoutResponse {
 }
 
 message AuthTarget {
+  reserved 3;
+  reserved "workspace_binding_key";
   oneof target {
     string provider_key = 1;
     string mcp_server_key = 2;
-    string workspace_binding_key = 3;
+    string remote_key = 4;
   }
 }
 

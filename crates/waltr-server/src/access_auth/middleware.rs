@@ -19,10 +19,14 @@ use waltr::grpc::waltr::auth::v1::{
     AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
 };
 
-use crate::routine::telemetry::{AdmissionStage, admission_result};
+use crate::{
+    local_admission::ValidatedLocalOrigin,
+    remote_routes::{RemoteRoutes, take_destination},
+    routine::telemetry::{AdmissionStage, admission_result},
+};
 
 use super::{
-    AccessAuthenticator, RequestAuthFailure,
+    AccessAuthenticator, AuthenticationMethod, RequestAuthFailure,
     lease::{LeaseEnd, LeaseMonitor},
 };
 
@@ -91,13 +95,19 @@ where
 #[derive(Clone, Debug)]
 pub struct GrpcAccessAuthLayer {
     authenticator: AccessAuthenticator,
+    remotes: Option<RemoteRoutes>,
 }
 
 impl GrpcAccessAuthLayer {
     /// Create a gRPC access-authentication layer.
     #[must_use]
     pub const fn new(authenticator: AccessAuthenticator) -> Self {
-        Self { authenticator }
+        Self { authenticator, remotes: None }
+    }
+
+    pub(crate) fn with_remotes(mut self, remotes: RemoteRoutes) -> Self {
+        self.remotes = Some(remotes);
+        self
     }
 }
 
@@ -108,6 +118,7 @@ impl<S> Layer<S> for GrpcAccessAuthLayer {
         GrpcAccessAuthService {
             inner,
             authenticator: self.authenticator.clone(),
+            remotes: self.remotes.clone(),
         }
     }
 }
@@ -117,6 +128,7 @@ impl<S> Layer<S> for GrpcAccessAuthLayer {
 pub struct GrpcAccessAuthService<S> {
     inner: S,
     authenticator: AccessAuthenticator,
+    remotes: Option<RemoteRoutes>,
 }
 
 impl<S> Service<Request<tonic::body::Body>> for GrpcAccessAuthService<S>
@@ -140,6 +152,7 @@ where
 
     fn call(&mut self, mut request: Request<tonic::body::Body>) -> Self::Future {
         let authenticator = self.authenticator.clone();
+        let remotes = self.remotes.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
@@ -168,7 +181,44 @@ where
             };
             match result {
                 Ok(principal) => {
-                    let monitor = principal.lease_monitor();
+                    let mut monitor = principal.lease_monitor();
+                    let destination = match take_destination(request.headers_mut()) {
+                        Ok(destination) => destination,
+                        Err(status) => return Ok(status.into_http()),
+                    };
+                    if let Some(destination) = destination {
+                        let local = request.extensions().get::<ValidatedLocalOrigin>().cloned();
+                        if principal.method() == AuthenticationMethod::AnonymousDisabled && local.is_none() {
+                            return Ok(tonic::Status::permission_denied(ACCESS_AUTH_REQUIRED).into_http());
+                        }
+                        let Some(remotes) = remotes else {
+                            return Ok(tonic::Status::unimplemented("Remote routing is unavailable").into_http());
+                        };
+                        let entry_lifetime = local.as_ref().map(|local| local.0.clone());
+                        let response = tokio::select! {
+                            biased;
+                            () = async {
+                                match &local {
+                                    Some(local) => local.0.cancelled().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => return Ok(tonic::Status::cancelled("entry server stopped").into_http()),
+                            end = async {
+                                match monitor.as_mut() {
+                                    Some(monitor) => std::future::poll_fn(|cx| monitor.poll(cx)).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                let headers = AuthenticatedGrpcBody::terminal_trailers(end);
+                                let mut response = Response::new(tonic::body::Body::empty());
+                                *response.headers_mut() = headers;
+                                response.headers_mut().insert(header::CONTENT_TYPE, "application/grpc".parse().expect("valid gRPC media type"));
+                                return Ok(response);
+                            }
+                            response = remotes.forward(destination, request, entry_lifetime) => response,
+                        };
+                        return Ok(guard_response(response, monitor));
+                    }
                     request.extensions_mut().insert(principal);
                     let response = inner.call(request).await?;
                     Ok(guard_response(response, monitor))

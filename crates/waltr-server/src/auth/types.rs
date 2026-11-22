@@ -51,9 +51,9 @@ pub enum AuthTarget {
         /// MCP server key from config.
         key: String,
     },
-    /// Remote Waltr API credential for a workspace binding.
-    WorkspaceBinding {
-        /// Workspace binding resource name.
+    /// Remote Waltr API credential for a remote.
+    Remote {
+        /// Remote resource name.
         key: String,
     },
 }
@@ -71,10 +71,10 @@ impl AuthTarget {
         Self::McpServer { key: key.into() }
     }
 
-    /// Create a workspace binding auth target.
+    /// Create a remote auth target.
     #[must_use]
-    pub fn workspace_binding(key: impl Into<String>) -> Self {
-        Self::WorkspaceBinding { key: key.into() }
+    pub fn remote(key: impl Into<String>) -> Self {
+        Self::Remote { key: key.into() }
     }
 
     /// Stable credential-store key for this target.
@@ -83,7 +83,7 @@ impl AuthTarget {
         match self {
             Self::Provider { key } => format!("provider:{key}"),
             Self::McpServer { key } => format!("mcp:{key}"),
-            Self::WorkspaceBinding { key } => format!("workspace-binding:{key}"),
+            Self::Remote { key } => format!("remote:{key}"),
         }
     }
 
@@ -91,9 +91,7 @@ impl AuthTarget {
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Provider { key } | Self::McpServer { key } | Self::WorkspaceBinding { key } => {
-                key
-            }
+            Self::Provider { key } | Self::McpServer { key } | Self::Remote { key } => key,
         }
     }
 }
@@ -106,8 +104,8 @@ impl From<AuthTarget> for waltr_agent::AuthTarget {
                 namespace: "mcp".into(),
                 key,
             },
-            AuthTarget::WorkspaceBinding { key } => Self::Host {
-                namespace: "workspace-binding".into(),
+            AuthTarget::Remote { key } => Self::Host {
+                namespace: "remote".into(),
                 key,
             },
         }
@@ -122,10 +120,8 @@ impl TryFrom<waltr_agent::AuthTarget> for AuthTarget {
             waltr_agent::AuthTarget::Host { namespace, key } if namespace == "mcp" => {
                 Ok(Self::McpServer { key })
             }
-            waltr_agent::AuthTarget::Host { namespace, key }
-                if namespace == "workspace-binding" =>
-            {
-                Ok(Self::WorkspaceBinding { key })
+            waltr_agent::AuthTarget::Host { namespace, key } if namespace == "remote" => {
+                Ok(Self::Remote { key })
             }
             _ => Err("unknown host authentication target"),
         }

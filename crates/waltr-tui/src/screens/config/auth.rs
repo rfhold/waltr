@@ -262,8 +262,7 @@ impl ConfigAuthState {
                 SectionAction::ClientCommand(ClientCommand::BeginAuth { target })
             }
             KeyCode::Char('f')
-                if target.kind != "workspaceBinding"
-                    && status.is_some_and(|status| status.can_refresh) =>
+                if target.kind != "remote" && status.is_some_and(|status| status.can_refresh) =>
             {
                 self.track(AuthOperationKind::Refresh, target.clone());
                 SectionAction::ClientCommand(ClientCommand::RefreshAuth { target })
@@ -330,7 +329,7 @@ pub(super) fn status_for<'a>(
 ) -> Option<&'a AuthStatusSnapshot> {
     let prefix = match target.kind.as_str() {
         "mcpServer" => "mcp",
-        "workspaceBinding" => "workspaceBinding",
+        "remote" => "remote",
         _ => "provider",
     };
     statuses.get(&format!("{prefix}:{}", target.key))
@@ -344,7 +343,7 @@ pub(super) fn status_can_reset(status: &AuthStatusSnapshot) -> bool {
 }
 
 pub(super) fn status_can_authorize(status: &AuthStatusSnapshot) -> bool {
-    if status.target.kind == "workspaceBinding" {
+    if status.target.kind == "remote" {
         return status.kind != "oauthConfigured"
             && status
                 .supported_methods
@@ -368,27 +367,27 @@ fn target_exists(snapshot: &ClientSnapshot, target: &ClientAuthTarget) -> bool {
     };
     match target.kind.as_str() {
         "mcpServer" => config.mcp_servers.contains_key(&target.key),
-        "workspaceBinding" => snapshot.config.workspace_bindings.contains_key(&target.key),
+        "remote" => snapshot.config.remotes.contains_key(&target.key),
         _ => config.providers.contains_key(&target.key),
     }
 }
 
-pub(super) fn render_workspace_bindings(
+pub(super) fn render_remotes(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     snapshot: &ClientSnapshot,
 ) {
-    let bindings = &snapshot.config.workspace_bindings;
-    let Some((key, binding)) = bindings.iter().nth(app.workspace_binding_selection()) else {
+    let bindings = &snapshot.config.remotes;
+    let Some((key, binding)) = bindings.iter().nth(app.remote_selection()) else {
         frame.render_widget(
-            Paragraph::new("No workspace bindings configured.").style(THEME.panel_style()),
+            Paragraph::new("No remotes configured.").style(THEME.panel_style()),
             area,
         );
         return;
     };
     let target = ClientAuthTarget {
-        kind: "workspaceBinding".to_owned(),
+        kind: "remote".to_owned(),
         key: key.clone(),
     };
     let auth = app.config_auth_state();
@@ -404,7 +403,12 @@ pub(super) fn render_workspace_bindings(
     let mut details = vec![
         Line::from(format!(
             "{} · {}",
-            clean(&binding.machine_id),
+            clean(
+                binding
+                    .machine_id
+                    .as_deref()
+                    .unwrap_or("no workspace export")
+            ),
             clean(&binding.endpoint)
         )),
         Line::from(format!("Authentication: {label}")),
@@ -425,7 +429,7 @@ pub(super) fn render_workspace_bindings(
         (u16::try_from(details.len()).unwrap_or(4) + 1).min(area.height.saturating_sub(1));
     let [list_area, detail_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(detail_height)]).areas(area);
-    let mut selection = ListState::default().with_selected(Some(app.workspace_binding_selection()));
+    let mut selection = ListState::default().with_selected(Some(app.remote_selection()));
     frame.render_stateful_widget(
         List::new(bindings.keys().map(|key| clean(key)))
             .highlight_style(THEME.focus_style())
@@ -441,7 +445,7 @@ pub(super) fn render_workspace_bindings(
     if let Some(target) = auth
         .reset_target
         .as_ref()
-        .filter(|target| target.kind == "workspaceBinding")
+        .filter(|target| target.kind == "remote")
     {
         let overlay = ui::centered_percent_rect(area, 85, 8);
         frame.render_widget(Clear, overlay);

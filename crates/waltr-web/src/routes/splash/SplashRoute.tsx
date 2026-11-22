@@ -1,7 +1,6 @@
 import { createMemo } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { ServerControls } from "../../app/ServerControls";
 import { logoText } from "./splash";
 
 export function SplashRoute() {
@@ -34,7 +33,6 @@ export function SplashRoute() {
       <p class="splash__status" role="status" aria-live="polite">
         {status()}
       </p>
-      <ServerControls failed={Boolean(app.clientError() || app.clientLoadError())} />
     </main>
   );
 }

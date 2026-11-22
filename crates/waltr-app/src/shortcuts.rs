@@ -28,7 +28,7 @@ impl Owner {
             config
                 .keybinds
                 .iter()
-                .filter_map(|binding| binding.routine.destination.clone())
+                .map(|binding| binding.routine.destination.clone().unwrap_or_else(|| "local".into()))
                 .collect(),
         );
         if config.keybinds.is_empty() {

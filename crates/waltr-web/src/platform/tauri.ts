@@ -47,16 +47,7 @@ type TauriApi = {
   listen: typeof listen;
 };
 
-export type ServerProfile = { id: string; name: string; url?: string };
-export type ServerRegistry = { servers: ServerProfile[]; lastConnectedId: string | null };
-
-export const serverRegistry = {
-  list: () => invoke<ServerRegistry>("list_servers"),
-  save: (url: string, name?: string) => invoke<ServerProfile>("save_server", { url, name }),
-  remove: (serverId: string) => invoke<void>("remove_server", { serverId }),
-};
-
-export async function loadTauriClient(api: TauriApi = { invoke, listen }, serverId?: string): Promise<ClientAdapter> {
+export async function loadTauriClient(api: TauriApi = { invoke, listen }, destination?: string): Promise<ClientAdapter> {
   let currentSnapshot: ClientSnapshot | undefined;
   let dictation: DictationHost | undefined;
   let dictationSupported = false;
@@ -188,7 +179,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         return;
       }
 
-      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown; dictation?: boolean; routineMedia?: boolean }>("start_runtime", { serverId });
+      const runtime = await api.invoke<{ generation: number; nativeApps?: unknown; dictation?: boolean; routineMedia?: boolean }>("start_runtime", { destination });
       if (disposed) {
         await api.invoke("dispose_runtime", { generation: runtime.generation });
         return;
@@ -241,7 +232,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
     snapshot: () => currentSnapshot,
     get dictation() { return dictation; },
     get media() { return media; },
-    dictationPreferenceScope: `native:${serverId ?? "local"}`,
+    dictationPreferenceScope: `native:${destination ?? "local"}`,
     start,
     subscribe: (listener) => {
       snapshotListeners.add(listener);
@@ -278,24 +269,6 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
         if (!disposed && generation === requestedGeneration && audioFailure?.diagnosticId === diagnosticId) publishAudioFailure(undefined);
       },
     },
-    access: serverId && serverId !== "local" ? {
-      openLogin: async () => {
-        if (disposed || generation === undefined) throw new Error("Native client is not ready");
-        dictation?.cancel();
-        await api.invoke("start_access_login", { generation });
-      },
-      startNativeLogin: async (method) => {
-        if (disposed || generation === undefined || generation !== announcedGeneration) throw new Error("Native client is not ready");
-        dictation?.cancel();
-        await api.invoke("start_access_login", { generation, method });
-      },
-      logout: async () => {
-        if (disposed || generation === undefined) throw new Error("Native client is not ready");
-        dictation?.cancel();
-        await api.invoke("logout_access", { generation });
-        return true;
-      },
-    } : undefined,
     openAuthorizationAttempt: async (attemptId) => {
       if (disposed || generation === undefined) throw new Error("Native client is not ready");
       await api.invoke("open_authorization_attempt", { attemptId, generation });
@@ -307,7 +280,7 @@ export async function loadTauriClient(api: TauriApi = { invoke, listen }, server
   };
 }
 
-export const loadClientAdapter = loadTauriClient;
+export const loadClientAdapter = (destination?: string) => loadTauriClient(undefined, destination);
 
 function canAnnounceGeneration(event: BridgeEvent) {
   return event.sequence === 0

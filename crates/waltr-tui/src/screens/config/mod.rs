@@ -128,8 +128,8 @@ pub enum ConfigTab {
     Mcp,
     /// Inference defaults configuration section.
     InferenceDefaults,
-    /// Outbound workspace binding authorization.
-    WorkspaceBindings,
+    /// Outbound remote authorization.
+    Remotes,
 }
 
 impl ConfigTab {
@@ -138,7 +138,7 @@ impl ConfigTab {
         Self::Providers,
         Self::Mcp,
         Self::InferenceDefaults,
-        Self::WorkspaceBindings,
+        Self::Remotes,
     ];
 
     /// The tab's display label.
@@ -148,7 +148,7 @@ impl ConfigTab {
             Self::Providers => "Providers",
             Self::Mcp => "MCP Servers",
             Self::InferenceDefaults => "Inference",
-            Self::WorkspaceBindings => "Workspace Bindings",
+            Self::Remotes => "Remotes",
         }
     }
 
@@ -158,8 +158,8 @@ impl ConfigTab {
         match self {
             Self::Providers => Self::Mcp,
             Self::Mcp => Self::InferenceDefaults,
-            Self::InferenceDefaults => Self::WorkspaceBindings,
-            Self::WorkspaceBindings => Self::Providers,
+            Self::InferenceDefaults => Self::Remotes,
+            Self::Remotes => Self::Providers,
         }
     }
 }
@@ -188,7 +188,7 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let config_loaded = snapshot.is_some_and(|snapshot| snapshot.config.current.is_some());
     frame.render_widget(
-        tab_strip(active_tab, config_loaded, app.has_workspace_bindings()),
+        tab_strip(active_tab, config_loaded, app.has_remotes()),
         tabs_area,
     );
     ui::render_panel_gap(frame, tabs_gap);
@@ -246,9 +246,9 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             section.render_overlay(frame, modal_area, config);
         }
-        ConfigTab::WorkspaceBindings => {
+        ConfigTab::Remotes => {
             if !pending && let Some(snapshot) = snapshot {
-                auth::render_workspace_bindings(frame, content_area, app, snapshot);
+                auth::render_remotes(frame, content_area, app, snapshot);
             }
         }
     }
@@ -264,9 +264,7 @@ const fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
         ConfigTab::InferenceDefaults => {
             "Esc back  Tab switch  m model  r reason  Enter save  Del clear"
         }
-        ConfigTab::WorkspaceBindings => {
-            "Esc back Tab switch ↑/↓ select a authorize r reset s retry status"
-        }
+        ConfigTab::Remotes => "Esc back Tab switch ↑/↓ select a authorize r reset s retry status",
     }
 }
 
@@ -338,14 +336,14 @@ fn tab_strip(active: ConfigTab, config_loaded: bool, has_bindings: bool) -> Para
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
     for tab in ConfigTab::ALL {
-        if tab == ConfigTab::WorkspaceBindings && !has_bindings && active != tab {
+        if tab == ConfigTab::Remotes && !has_bindings && active != tab {
             continue;
         }
         spans.push(ui::tab_label(tab.label(), tab == active));
         spans.push(Span::raw(" "));
     }
     if config_loaded {
-        let reset = if has_bindings || active == ConfigTab::WorkspaceBindings {
+        let reset = if has_bindings || active == ConfigTab::Remotes {
             "R Reset"
         } else {
             "R Reset configuration"

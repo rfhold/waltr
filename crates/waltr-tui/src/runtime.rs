@@ -77,7 +77,7 @@ pub async fn run_with_options(
 ) -> io::Result<()> {
     Box::pin(tokio::task::LocalSet::new().run_until(async {
         let (events, commands, native_auth, runtime) =
-            RuntimeEvents::start(options.client_endpoint);
+            RuntimeEvents::start(options.client_endpoint)?;
         let mut runtime = runtime;
         let result = Box::pin(run_with_events(
             terminal,
@@ -167,14 +167,20 @@ struct RuntimeEvents {
 }
 
 impl RuntimeEvents {
-    fn start(client_endpoint: Option<String>) -> RuntimeChannels {
+    fn start(client_endpoint: Option<String>) -> io::Result<RuntimeChannels> {
         let (events, receiver) = mpsc::channel(EVENT_BUFFER);
         let (commands, command_receiver) = mpsc::channel(EVENT_BUFFER);
         let (native_actions, native_action_receiver) = mpsc::channel(8);
         let endpoint = client_endpoint_or_default(client_endpoint);
         let credentials = NativeCredentialProvider::new();
-        let media =
-            crate::media::Broker::new(endpoint.clone(), credentials.clone(), events.clone());
+        let mut transport = NativeGrpcTransport::with_credential_provider(endpoint.clone(), credentials.clone());
+        match std::env::var("WALTR_DESTINATION") {
+            Ok(destination) => transport = transport.for_destination(&destination)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid WALTR_DESTINATION"))?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+        }
+        let media = crate::media::Broker::new(transport.clone(), credentials.clone(), events.clone());
         let tasks = vec![
             spawn_tick_events(events.clone()),
             spawn_input_events(events.clone()),
@@ -182,8 +188,7 @@ impl RuntimeEvents {
             spawn_client_events(
                 events.clone(),
                 command_receiver,
-                endpoint.clone(),
-                credentials.clone(),
+                transport,
                 native_actions.clone(),
             ),
             native_auth::spawn(
@@ -195,7 +200,7 @@ impl RuntimeEvents {
             ),
         ];
 
-        (receiver, commands, native_actions, Self { tasks, media })
+        Ok((receiver, commands, native_actions, Self { tasks, media }))
     }
 
     fn abort(self) {
@@ -269,12 +274,10 @@ fn spawn_ctrl_c_events(events: mpsc::Sender<io::Result<AppEvent>>) -> tokio::tas
 fn spawn_client_events(
     events: mpsc::Sender<io::Result<AppEvent>>,
     mut commands: mpsc::Receiver<RuntimeClientCommand>,
-    client_endpoint: String,
-    credentials: NativeCredentialProvider,
+    transport: NativeGrpcTransport,
     native_auth: mpsc::Sender<NativeAuthAction>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let transport = NativeGrpcTransport::with_credential_provider(client_endpoint, credentials);
         let mut client = ClientRuntime::with_transport(transport).into_state_stream(sleep_millis);
         let mut previous_attempt_id = None;
 

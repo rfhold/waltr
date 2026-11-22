@@ -32,7 +32,7 @@ pub use coordination::event::{
     ConfigEffect, ConfigEvent, ProviderEditBaseline, ResourceWrite, RoutineEffect, RoutineEvent,
     SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
-pub use coordination::runtime::WorkspaceBindingView;
+pub use coordination::runtime::RemoteView;
 pub use coordination::runtime::{
     AccessSnapshot, AuthAttemptSnapshot, AuthSnapshot, AuthStatusSnapshot,
     AuthenticationFailureSnapshot, CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot,
@@ -71,10 +71,10 @@ pub use native_access::{
 pub use routine::*;
 pub use transport::{
     AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
-    GenericAuthAttemptStatus, InteractionWatchStream, RoutineDefinitionWatchStream, RoutineInteractionTransport,
-    RoutineInvocationWatchStream, SessionTimelinePage, SessionTimelineProjectionMode,
-    SessionTimelineWatchEvent, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
-    WaltrTransport,
+    GenericAuthAttemptStatus, InteractionWatchStream, RoutineDefinitionWatchStream,
+    RoutineInteractionTransport, RoutineInvocationWatchStream, SessionTimelinePage,
+    SessionTimelineProjectionMode, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
+    SessionWatchEvent, SessionWatchUpdate, WaltrTransport,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
@@ -82,18 +82,19 @@ pub use view::{
     CatalogMatchConfidenceView, CatalogMatchSourceView, CatalogMatchView,
     CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
     CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSummaryView, ConfigView,
-    InferenceDefaultsView, InferenceProviderSettingsView,
-    InferenceSettingsMatchView, InferenceSettingsView, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
-    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    InferenceDefaultsView, InferenceProviderSettingsView, InferenceSettingsMatchView,
+    InferenceSettingsView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
+    ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
     ProviderView, SelectableAgentView, SessionAssociationsView, SessionCapabilitiesView,
     SessionCoordinationPhaseView, SessionCoordinationReasonView, SessionCoordinationView,
-    SessionDictationView, SpeechDefaultsView, SpeechSelectionView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
+    SessionDictationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
     SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
-    SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
-    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
-    TimelineStatusView, TimestampView, WorkspaceSelection,
+    SessionSuspensionKindView, SessionTimelineView, SessionView, SpeechDefaultsView,
+    SpeechSelectionView, SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView,
+    WorkspaceSelection,
 };
 pub use waltr::grpc::waltr::catalog::v1::{
     CatalogDefaultField, CatalogDriftField, CatalogDriftSeverity, CatalogMatch,
@@ -113,17 +114,16 @@ pub use waltr::grpc::waltr::resource::v1::{
     ResourceOrigin, ResourceValue,
 };
 pub use waltr::grpc::waltr::session::v1::{
-    InferenceProviderSettings, InferenceSettings,
-    InferenceSettingsMatch, InferenceSettingsRequest, ListAgentsResponse, PendingWork,
-    PendingWorkStatus, ProjectedTimelineEvent, RollbackTarget, SearchSessionTemplatesRequest,
-    SearchSessionTemplatesResponse, SelectableAgent, SessionCapabilities, SessionCoordinationPhase,
-    SessionCoordinationReason, SessionCoordinationState, SessionMetrics, SessionPhase,
-    SessionProgress, SessionProgressPhase, SessionPromptDisposition, SessionRunStage,
-    SessionStatus, SessionSummary, SessionTemplateKind, SessionTemplateOption,
-    SessionTemplateSearchTarget, Suspension, SuspensionKind, TimelineContent, TimelineDirection,
-    TimelineEvent, TimelineEventKind, TimelinePresentation, TimelineProjectionMetadata,
-    TimelineQuery, TimelineStatus, TimelineTruncation, projected_timeline_event, rollback_target,
-    search_session_templates_response,
+    InferenceProviderSettings, InferenceSettings, InferenceSettingsMatch, InferenceSettingsRequest,
+    ListAgentsResponse, PendingWork, PendingWorkStatus, ProjectedTimelineEvent, RollbackTarget,
+    SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SelectableAgent,
+    SessionCapabilities, SessionCoordinationPhase, SessionCoordinationReason,
+    SessionCoordinationState, SessionMetrics, SessionPhase, SessionProgress, SessionProgressPhase,
+    SessionPromptDisposition, SessionRunStage, SessionStatus, SessionSummary, SessionTemplateKind,
+    SessionTemplateOption, SessionTemplateSearchTarget, Suspension, SuspensionKind,
+    TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind, TimelinePresentation,
+    TimelineProjectionMetadata, TimelineQuery, TimelineStatus, TimelineTruncation,
+    projected_timeline_event, rollback_target, search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 

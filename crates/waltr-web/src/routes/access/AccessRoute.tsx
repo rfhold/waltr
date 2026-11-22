@@ -1,7 +1,6 @@
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { ServerControls } from "../../app/ServerControls";
 import { InlineAlert } from "../../components/ui";
 import type { NativeLoginMethod } from "../../platform/client";
 
@@ -159,7 +158,6 @@ export function AccessRoute(props: {
             {(start) => <NativeSignIn start={start()} claimAutomaticNativeLogin={props.claimAutomaticNativeLogin} />}
           </Show>
         </Show>
-        <ServerControls />
       </section>
     </main>
   );

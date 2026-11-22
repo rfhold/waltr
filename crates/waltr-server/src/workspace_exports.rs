@@ -1,4 +1,4 @@
-//! Reconcile server-owned workspace bindings on the current private worker stream.
+//! Reconcile server-owned remotes on the current private worker stream.
 
 use std::{
     collections::BTreeMap,
@@ -21,8 +21,8 @@ use crate::{
     agent_host::sandbox_gateway::{
         WorkspaceExportConnection, WorkspaceExportControl, stdio_launch,
     },
-    auth::{AuthService, WorkspaceBindingCredentialLease},
-    resource_catalog::{PublishedState, WorkspaceBinding},
+    auth::{AuthService, RemoteCredentialLease},
+    resource_catalog::{PublishedState, Remote, RemoteBinding},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -49,7 +49,7 @@ impl WorkspaceExports {
             move |key, url| {
                 let auth = auth.clone();
                 async move {
-                    auth.workspace_binding_credential_lease(&key, &url)
+                    auth.remote_credential_lease(&key, &url)
                         .await
                         .unwrap_or(None)
                 }
@@ -102,7 +102,7 @@ struct LeaseVersion {
 }
 
 impl LeaseVersion {
-    fn current(lease: &WorkspaceBindingCredentialLease) -> Option<Self> {
+    fn current(lease: &RemoteCredentialLease) -> Option<Self> {
         // Round down to avoid granting even a fractional second beyond the OAuth lease.
         let expires = u64::try_from(lease.expires_at_ms).ok()? / 1000;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -115,15 +115,17 @@ impl LeaseVersion {
 }
 
 struct ObservedBinding {
-    spec: WorkspaceBinding,
+    remote: Remote,
+    binding: RemoteBinding,
     incarnation: Option<Uuid>,
     definitions: Vec<config_proto::McpServer>,
     launches: Vec<McpStdioLaunch>,
 }
 
 impl ObservedBinding {
-    fn new(snapshot: &AgentDefinitionSnapshot, key: &str, spec: &WorkspaceBinding) -> Option<Self> {
-        let definitions = spec
+    fn new(snapshot: &AgentDefinitionSnapshot, key: &str, spec: &Remote) -> Option<Self> {
+        let binding = spec.binding()?;
+        let definitions = binding
             .mcp_stdio_servers()
             .iter()
             .map(|name| {
@@ -135,22 +137,23 @@ impl ObservedBinding {
                     .filter(|server| server.r#type == config_proto::McpServerType::Stdio as i32)
             })
             .collect::<Option<Vec<_>>>()?;
-        let launches = spec
+        let launches = binding
             .mcp_stdio_servers()
             .iter()
             .zip(&definitions)
             .map(|(name, server)| stdio_launch(name, &server.command))
             .collect::<Option<Vec<_>>>()?;
         Some(Self {
-            spec: spec.clone(),
-            incarnation: snapshot.workspace_binding_incarnation(key),
+            remote: spec.clone(),
+            binding: binding.clone(),
+            incarnation: snapshot.remote_incarnation(key),
             definitions,
             launches,
         })
     }
 
     fn definitions_current(&self, configuration: &config_proto::Configuration) -> bool {
-        self.spec
+        self.binding
             .mcp_stdio_servers()
             .iter()
             .zip(&self.definitions)
@@ -158,15 +161,12 @@ impl ObservedBinding {
     }
 
     fn is_current(&self, snapshot: &AgentDefinitionSnapshot, key: &str) -> bool {
-        self.incarnation == snapshot.workspace_binding_incarnation(key)
+        self.incarnation == snapshot.remote_incarnation(key)
             && self.definitions_current(snapshot.configuration())
             && snapshot
-                .workspace_bindings()
+                .remotes()
                 .get(key)
-                .is_some_and(|binding| {
-                    self.spec == *binding
-                        && self.spec.export_root().as_os_str() == binding.export_root().as_os_str()
-                })
+                .is_some_and(|remote| self.remote == *remote)
     }
 }
 
@@ -191,7 +191,7 @@ async fn supervise<F, Lease>(
     lease: F,
 ) where
     F: Fn(String, Url) -> Lease + Sync,
-    Lease: Future<Output = Option<WorkspaceBindingCredentialLease>>,
+    Lease: Future<Output = Option<RemoteCredentialLease>>,
 {
     let mut readiness = control.readiness();
     while !stop.is_cancelled() {
@@ -214,7 +214,7 @@ async fn reconcile<F, Lease>(
     lease: &F,
 ) where
     F: Fn(String, Url) -> Lease,
-    Lease: Future<Output = Option<WorkspaceBindingCredentialLease>>,
+    Lease: Future<Output = Option<RemoteCredentialLease>>,
 {
     let mut publications = catalog.subscribe();
     let mut desired = BTreeMap::<String, BindingPoll>::new();
@@ -234,7 +234,7 @@ async fn reconcile<F, Lease>(
         }
         let snapshot = catalog.snapshot();
         desired.retain(|key, poll| poll.binding.is_current(&snapshot, key));
-        for (key, binding) in snapshot.workspace_bindings() {
+        for (key, binding) in snapshot.remotes() {
             if let std::collections::btree_map::Entry::Vacant(entry) = desired.entry(key.clone())
                 && let Some(binding) = ObservedBinding::new(&snapshot, key, binding)
             {
@@ -263,7 +263,7 @@ async fn reconcile<F, Lease>(
             poll.due = None;
             let key = key.clone();
             let binding = poll.binding.clone();
-            let request = lease(key.clone(), binding.spec.endpoint().clone());
+            let request = lease(key.clone(), binding.remote.endpoint().clone());
             polls.push(async move {
                 let result = tokio::time::timeout(LEASE_TIMEOUT, request)
                     .await
@@ -331,7 +331,7 @@ async fn observe_lease(
     installed: &mut BTreeMap<String, Installed>,
     key: String,
     binding: Arc<ObservedBinding>,
-    lease: Option<WorkspaceBindingCredentialLease>,
+    lease: Option<RemoteCredentialLease>,
 ) {
     let Some((lease, version)) =
         lease.and_then(|lease| LeaseVersion::current(&lease).map(|version| (lease, version)))
@@ -362,9 +362,9 @@ async fn observe_lease(
             .await
     } else {
         let export = WorkspaceExport {
-            endpoint: binding.spec.endpoint().to_string(),
-            machine_id: binding.spec.machine_id().to_owned(),
-            export_root: binding.spec.export_root().to_owned(),
+            endpoint: binding.remote.endpoint().to_string(),
+            machine_id: binding.binding.machine_id().to_owned(),
+            export_root: binding.binding.export_root().to_owned(),
         };
         connection
             .apply(

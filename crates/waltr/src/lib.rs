@@ -22,6 +22,8 @@ pub mod config;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 
+pub mod destination;
+
 /// Returns the package name for this crate.
 #[must_use]
 pub const fn crate_name() -> &'static str {

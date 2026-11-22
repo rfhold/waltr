@@ -26,9 +26,7 @@ mod native_auth;
 mod observability;
 mod policy;
 mod server_controller;
-mod server_profiles;
 
-struct CredentialRoot(std::path::PathBuf);
 
 #[cfg(all(
     feature = "native-apps-test",
@@ -86,20 +84,6 @@ async fn retire_native_assets(app: &tauri::AppHandle, generation: Option<u64>) {
     }
 }
 
-#[tauri::command]
-fn list_servers(
-    profiles: State<'_, Arc<server_profiles::ServerProfiles>>,
-) -> server_profiles::ServerList {
-    profiles.list()
-}
-#[tauri::command]
-fn save_server(
-    profiles: State<'_, Arc<server_profiles::ServerProfiles>>,
-    url: String,
-    name: Option<String>,
-) -> Result<server_profiles::ServerProfile, String> {
-    profiles.save(&url, name)
-}
 async fn stop_runtime_tasks(bridge: Arc<RuntimeBridge>) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
@@ -113,37 +97,14 @@ async fn stop_runtime_tasks(bridge: Arc<RuntimeBridge>) -> Result<(), String> {
         .map_err(|_| "Native runtime could not stop".to_owned())
 }
 #[tauri::command]
-async fn remove_server(
-    app: tauri::AppHandle,
-    selection: State<'_, RuntimeSelection>,
-    profiles: State<'_, Arc<server_profiles::ServerProfiles>>,
-    bridge: State<'_, Arc<RuntimeBridge>>,
-    server_id: String,
-) -> Result<(), String> {
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let _ = &app;
-    if server_id == "local" {
-        return Err("Local cannot be removed".into());
-    }
-    let _operation = selection.operation.lock().await;
-    if bridge.selected_id() == server_id {
-        selection.ticket.fetch_add(1, Ordering::AcqRel);
-        stop_runtime_tasks(Arc::clone(bridge.inner())).await?;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        retire_native_assets(&app, None).await;
-    }
-    bridge.inner().retire_shortcut_destination(&server_id).await?;
-    credential_store::CredentialStore::delete_server(app.state::<CredentialRoot>().0.clone(), &server_id)
-        .await
-        .map_err(|_| "Secure credentials could not be removed")?;
-    profiles.remove(&server_id)
-}
-#[tauri::command]
 async fn start_access_login(
     bridge: State<'_, Arc<RuntimeBridge>>,
     generation: u64,
     method: Option<AccessLoginMethod>,
 ) -> Result<(), String> {
+    if !bridge.is_remote() {
+        return Err("Authorize destinations in Config → Remotes".into());
+    }
     bridge
         .access_action(
             generation,
@@ -166,6 +127,9 @@ async fn logout_access(
     bridge: State<'_, Arc<RuntimeBridge>>,
     generation: u64,
 ) -> Result<(), String> {
+    if !bridge.is_remote() {
+        return Err("Sign out of destinations in Config → Remotes".into());
+    }
     bridge
         .access_action(generation, waltr_client::NativeAccessAction::Logout)
         .await
@@ -262,6 +226,7 @@ impl MobileStartCoordination {
     }
 }
 
+#[cfg(test)]
 async fn anonymous_status_available(endpoint: &str) -> bool {
     use futures_util::StreamExt as _;
     use waltr_client::WaltrTransport as _;
@@ -284,6 +249,7 @@ async fn anonymous_status_available(endpoint: &str) -> bool {
     .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn run_native_status_probe(probe: impl std::future::Future<Output = bool>) -> bool {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -356,8 +322,12 @@ mod native_bootstrap_tests {
 async fn start_runtime(
     app: tauri::AppHandle,
     bridge: State<'_, Arc<RuntimeBridge>>,
-    server_id: Option<String>,
+    destination: Option<String>,
 ) -> Result<RuntimeStarted, String> {
+    let destination = destination.filter(|name| name != waltr::destination::LOCAL);
+    if destination.as_deref().is_some_and(|selector| waltr::destination::pinned(selector).is_none()) {
+        return Err("Invalid Remote destination".to_owned());
+    }
     let selection = app.state::<RuntimeSelection>();
     let ticket = selection
         .ticket
@@ -367,72 +337,18 @@ async fn start_runtime(
     if selection.ticket.load(Ordering::Acquire) != ticket {
         return Err("Native start was cancelled".into());
     }
-    let profile = app
-        .state::<Arc<server_profiles::ServerProfiles>>()
-        .get(server_id.as_deref().unwrap_or("local"))?;
     stop_runtime_tasks(Arc::clone(bridge.inner())).await?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     retire_native_assets(&app, None).await;
-    let access = if let Some(endpoint) = &profile.url {
-        #[cfg(target_os = "android")]
-        let callback = waltr_client::NativeCallbackPolicy::External;
-        #[cfg(not(target_os = "android"))]
-        let callback = waltr_client::NativeCallbackPolicy::Loopback(
-            waltr_client::NativeLoopbackPolicy::Ephemeral,
-        );
-        match waltr_client::discover_native_access_config(endpoint, callback).await {
-            Ok(bootstrap) => {
-                tracing::info!(
-                    event = "native.auth.discovery",
-                    category = "success",
-                    generation = ticket
-                );
-                Some(native_auth::AccessBinding::from_bootstrap(
-                    profile.id.clone(),
-                    bootstrap,
-                    app.state::<CredentialRoot>().0.clone(),
-                ).await?)
-            }
-            Err(_) => {
-                tracing::warn!(
-                    event = "native.auth.discovery",
-                    category = "failed",
-                    generation = ticket
-                );
-                // Disabled-auth servers admit anonymous status; discovery failure alone is ambiguous.
-                if !anonymous_status_available(endpoint).await {
-                    return Err("Native access discovery failed. Retry connection.".into());
-                }
-                tracing::info!(
-                    event = "native.auth.discovery",
-                    category = "anonymous_fallback",
-                    generation = ticket
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
     if selection.ticket.load(Ordering::Acquire) != ticket {
         return Err("Native start was cancelled".into());
     }
     bridge.select(bridge::RuntimeTarget {
-        id: profile.id,
-        endpoint: profile.url,
-        access,
+        destination,
         app: Some(app.clone()),
-        profiles: Some(Arc::clone(
-            app.state::<Arc<server_profiles::ServerProfiles>>().inner(),
-        )),
+        ..Default::default()
     });
-    #[cfg(target_os = "android")]
-    if bridge.is_remote() {
-        tauri::wry::prelude::dispatch(|env, activity, _| {
-            drop(env.call_method(activity, "selectRemoteServer", "()V", &[]));
-        });
-    }
-    if !bridge.is_remote() {
+    {
         #[cfg(not(target_os = "android"))]
         {
             let data = app
@@ -1108,15 +1024,6 @@ pub fn run() {
             app.manage(server);
             app.manage(RuntimeSelection::default());
             app.manage(audio_permissions::host(app.handle(), 0));
-            app.manage(CredentialRoot(app.path().app_data_dir().map_err(std::io::Error::other)?.join("native-refresh-v1")));
-            let registry = app
-                .path()
-                .app_data_dir()
-                .map_err(std::io::Error::other)?
-                .join("servers.json");
-            app.manage(Arc::new(
-                server_profiles::ServerProfiles::open(registry).map_err(std::io::Error::other)?,
-            ));
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             app.manage(NativeAssetOwner(tokio::sync::Mutex::new(None)));
 
@@ -1180,9 +1087,6 @@ pub fn run() {
             dictation_finish,
             dictation_status,
             dictation_cancel,
-            list_servers,
-            save_server,
-            remove_server,
             start_access_login,
             logout_access,
             client_dispatch,

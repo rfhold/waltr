@@ -38,11 +38,10 @@ use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClien
 use waltr::grpc::waltr::session::v1::interaction_service_client::InteractionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 
+use std::sync::{Arc, OnceLock};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, RwLock};
-#[cfg(not(target_arch = "wasm32"))]
+use std::sync::RwLock;
 use tonic::metadata::AsciiMetadataValue;
-#[cfg(not(target_arch = "wasm32"))]
 use tonic::service::{Interceptor, interceptor::InterceptedService};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
 use tower::Layer as _;
@@ -354,6 +353,45 @@ struct RequestCredentials {
     credential_revision: u64,
     #[cfg(not(target_arch = "wasm32"))]
     authorization: Option<AsciiMetadataValue>,
+}
+
+#[derive(Clone, Debug)]
+struct Destination {
+    name: String,
+    pin: Arc<OnceLock<AsciiMetadataValue>>,
+}
+
+impl Destination {
+    fn parse(selector: &str) -> Result<Option<Self>, ClientError> {
+        use waltr::destination::{LOCAL, is_remote_name, pinned};
+        let invalid = || ClientError::new("Invalid Remote destination");
+        if selector == LOCAL {
+            return Ok(None);
+        }
+        let (name, pin) = if let Some((name, _)) = pinned(selector) {
+            (name, Some(selector.parse::<AsciiMetadataValue>().map_err(|_| invalid())?))
+        } else if is_remote_name(selector) {
+            (selector, None)
+        } else {
+            return Err(invalid());
+        };
+        let pin = Arc::new(pin.map_or_else(OnceLock::new, OnceLock::from));
+        Ok(Some(Self { name: name.into(), pin }))
+    }
+
+    fn request(&self) -> waltr::grpc::waltr::auth::v1::GetAuthStatusRequest {
+        use waltr::grpc::waltr::auth::v1::{AuthTarget, GetAuthStatusRequest, auth_target::Target};
+        GetAuthStatusRequest { target: Some(AuthTarget { target: Some(Target::RemoteKey(self.name.clone())) }) }
+    }
+
+    fn metadata(&self, status: waltr::grpc::waltr::auth::v1::GetAuthStatusResponse) -> Result<AsciiMetadataValue, ClientError> {
+        let status = status.status.ok_or_else(|| ClientError::new("Remote authorization is required"))?;
+        let id = status.metadata.get(waltr::destination::ROUTE_ID)
+            .ok_or_else(|| ClientError::new("Remote authorization is required"))?;
+        let value = format!("{}@{id}", self.name);
+        waltr::destination::pinned(&value).ok_or_else(|| ClientError::new("Invalid Remote authorization"))?;
+        value.parse().map_err(|_| ClientError::new("Invalid Remote authorization"))
+    }
 }
 
 impl RequestCredentials {
@@ -709,6 +747,7 @@ pub struct NativeGrpcTransport {
     endpoint: String,
     credentials: NativeCredentialProvider,
     shortcut_machine: Option<String>,
+    destination: Option<Destination>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-tracing"))]
@@ -968,24 +1007,22 @@ impl NativeCredentialProvider {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone)]
-struct NativeBearerInterceptor {
+#[derive(Clone, Default)]
+struct RequestMetadata {
     authorization: Option<AsciiMetadataValue>,
+    destination: Option<AsciiMetadataValue>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl std::fmt::Debug for NativeBearerInterceptor {
+impl std::fmt::Debug for RequestMetadata {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("NativeBearerInterceptor")
+            .debug_struct("RequestMetadata")
             .field("has_bearer_token", &self.authorization.is_some())
             .finish()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Interceptor for NativeBearerInterceptor {
+impl Interceptor for RequestMetadata {
     fn call(
         &mut self,
         mut request: tonic::Request<()>,
@@ -994,6 +1031,9 @@ impl Interceptor for NativeBearerInterceptor {
             request
                 .metadata_mut()
                 .insert("authorization", authorization);
+        }
+        if let Some(destination) = self.destination.clone() {
+            request.metadata_mut().insert(waltr::destination::HEADER, destination);
         }
         Ok(request)
     }
@@ -1019,6 +1059,7 @@ impl NativeGrpcTransport {
             endpoint: endpoint.into(),
             credentials: NativeCredentialProvider::new(),
             shortcut_machine: None,
+            destination: None,
         }
     }
 
@@ -1032,7 +1073,19 @@ impl NativeGrpcTransport {
             endpoint: endpoint.into(),
             credentials,
             shortcut_machine: None,
+            destination: None,
         }
+    }
+
+    /// Scope every typed RPC, including media, to a named destination through the same entry.
+    ///
+    /// # Errors
+    /// Rejects invalid Remote names.
+    pub fn for_destination(&self, destination: &str) -> Result<Self, ClientError> {
+        let mut transport = self.clone();
+        transport.destination = Destination::parse(destination)?;
+        transport.shortcut_machine = None;
+        Ok(transport)
     }
 
     /// Bind a shortcut-only transport to a checked export at the same exact origin.
@@ -1141,25 +1194,45 @@ impl NativeGrpcTransport {
     }
 
     #[cfg(test)]
-    fn interceptor(&self) -> NativeBearerInterceptor {
-        NativeBearerInterceptor {
+    fn interceptor(&self) -> RequestMetadata {
+        RequestMetadata {
             authorization: self.credentials.read_state().authorization.clone(),
+            destination: self.destination.as_ref().and_then(|destination| destination.pin.get().cloned()),
         }
     }
 
-    fn interceptor_for(credentials: &RequestCredentials) -> NativeBearerInterceptor {
-        NativeBearerInterceptor {
+    async fn interceptor_for(&self, channel: &NativeChannel, credentials: &RequestCredentials) -> Result<RequestMetadata, ClientError> {
+        let mut metadata = RequestMetadata {
             authorization: credentials.authorization.clone(),
+            destination: None,
+        };
+        if let Some(destination) = &self.destination {
+            metadata.destination = Some(if let Some(pin) = destination.pin.get() {
+                pin.clone()
+            } else {
+                let mut client = AuthServiceClient::with_interceptor(channel.clone(), metadata.clone());
+                let response = client.get_auth_status(destination.request()).await
+                    .map_err(|error| status_error(&error, credentials))?;
+                let pin = destination.metadata(response.into_inner())?;
+                destination.pin.get_or_init(|| pin).clone()
+            });
         }
+        Ok(metadata)
+    }
+
+    async fn scoped_channel(&self, credentials: &RequestCredentials) -> Result<InterceptedService<NativeChannel, RequestMetadata>, ClientError> {
+        let channel = self.channel().await?;
+        let metadata = self.interceptor_for(&channel, credentials).await?;
+        Ok(InterceptedService::new(channel, metadata))
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RemoteTransport for NativeGrpcTransport {
     async fn interaction_client(&self, credentials: &RequestCredentials) -> Result<InteractionServiceClient<Self::Inner>, ClientError> {
-        Ok(InteractionServiceClient::with_interceptor(self.channel().await?, Self::interceptor_for(credentials)))
+        Ok(InteractionServiceClient::new(self.scoped_channel(credentials).await?))
     }
-    type Inner = InterceptedService<NativeChannel, NativeBearerInterceptor>;
+    type Inner = InterceptedService<NativeChannel, RequestMetadata>;
 
     fn request_credentials(&self) -> RequestCredentials {
         self.credentials.request_credentials()
@@ -1169,60 +1242,42 @@ impl RemoteTransport for NativeGrpcTransport {
         &self,
         credentials: &RequestCredentials,
     ) -> Result<ResourceServiceClient<Self::Inner>, ClientError> {
-        Ok(ResourceServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
+        Ok(ResourceServiceClient::new(self.scoped_channel(credentials).await?))
     }
 
     async fn auth_client(
         &self,
         credentials: &RequestCredentials,
     ) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
-        Ok(AuthServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
+        Ok(AuthServiceClient::new(self.scoped_channel(credentials).await?))
     }
 
     async fn catalog_client(
         &self,
         credentials: &RequestCredentials,
     ) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
-        Ok(CatalogServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
+        Ok(CatalogServiceClient::new(self.scoped_channel(credentials).await?))
     }
 
     async fn status_client(
         &self,
         credentials: &RequestCredentials,
     ) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
-        Ok(StatusServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
+        Ok(StatusServiceClient::new(self.scoped_channel(credentials).await?))
     }
 
     async fn session_client(
         &self,
         credentials: &RequestCredentials,
     ) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
-        Ok(SessionServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
+        Ok(SessionServiceClient::new(self.scoped_channel(credentials).await?))
     }
 
     async fn routine_client(
         &self,
         credentials: &RequestCredentials,
     ) -> Result<RoutineServiceClient<Self::Inner>, ClientError> {
-        Ok(RoutineServiceClient::with_interceptor(
-            self.channel().await?,
-            Self::interceptor_for(credentials),
-        ))
+        Ok(RoutineServiceClient::new(self.scoped_channel(credentials).await?))
     }
 }
 
@@ -1233,6 +1288,7 @@ impl RemoteTransport for NativeGrpcTransport {
 #[derive(Clone, Debug, Default)]
 pub struct WasmGrpcTransport {
     api_base: String,
+    destination: Option<Destination>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1242,16 +1298,44 @@ impl WasmGrpcTransport {
     pub fn new(api_base: impl Into<String>) -> Self {
         Self {
             api_base: api_base.into(),
+            destination: None,
         }
+    }
+
+    /// Scope same-origin gRPC-web calls to a Remote without changing the origin.
+    ///
+    /// # Errors
+    /// Rejects invalid Remote names.
+    pub fn for_destination(mut self, destination: &str) -> Result<Self, ClientError> {
+        self.destination = Destination::parse(destination)?;
+        Ok(self)
+    }
+
+    async fn channel(&self) -> Result<InterceptedService<tonic_web_wasm_client::Client, RequestMetadata>, ClientError> {
+        let channel = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let selection = if let Some(destination) = &self.destination {
+            Some(if let Some(pin) = destination.pin.get() {
+                pin.clone()
+            } else {
+                let response = AuthServiceClient::new(tonic_web_wasm_client::Client::new(self.api_base.clone()))
+                    .get_auth_status(destination.request()).await
+                    .map_err(|error| status_error(&error, &RequestCredentials::default()))?;
+                let pin = destination.metadata(response.into_inner())?;
+                destination.pin.get_or_init(|| pin).clone()
+            })
+        } else {
+            None
+        };
+        Ok(InterceptedService::new(channel, RequestMetadata { authorization: None, destination: selection }))
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl RemoteTransport for WasmGrpcTransport {
     async fn interaction_client(&self, _: &RequestCredentials) -> Result<InteractionServiceClient<Self::Inner>, ClientError> {
-        Ok(InteractionServiceClient::new(tonic_web_wasm_client::Client::new(self.api_base.clone())))
+        Ok(InteractionServiceClient::new(self.channel().await?))
     }
-    type Inner = tonic_web_wasm_client::Client;
+    type Inner = InterceptedService<tonic_web_wasm_client::Client, RequestMetadata>;
 
     fn request_credentials(&self) -> RequestCredentials {
         RequestCredentials::default()
@@ -1261,7 +1345,7 @@ impl RemoteTransport for WasmGrpcTransport {
         &self,
         _: &RequestCredentials,
     ) -> Result<ResourceServiceClient<Self::Inner>, ClientError> {
-        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let transport = self.channel().await?;
         Ok(ResourceServiceClient::new(transport))
     }
 
@@ -1269,7 +1353,7 @@ impl RemoteTransport for WasmGrpcTransport {
         &self,
         _: &RequestCredentials,
     ) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
-        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let transport = self.channel().await?;
         Ok(AuthServiceClient::new(transport))
     }
 
@@ -1277,7 +1361,7 @@ impl RemoteTransport for WasmGrpcTransport {
         &self,
         _: &RequestCredentials,
     ) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
-        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let transport = self.channel().await?;
         Ok(CatalogServiceClient::new(transport))
     }
 
@@ -1285,7 +1369,7 @@ impl RemoteTransport for WasmGrpcTransport {
         &self,
         _: &RequestCredentials,
     ) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
-        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let transport = self.channel().await?;
         Ok(StatusServiceClient::new(transport))
     }
 
@@ -1293,7 +1377,7 @@ impl RemoteTransport for WasmGrpcTransport {
         &self,
         _: &RequestCredentials,
     ) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
-        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let transport = self.channel().await?;
         Ok(SessionServiceClient::new(transport))
     }
 
@@ -1301,7 +1385,7 @@ impl RemoteTransport for WasmGrpcTransport {
         &self,
         _: &RequestCredentials,
     ) -> Result<RoutineServiceClient<Self::Inner>, ClientError> {
-        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        let transport = self.channel().await?;
         Ok(RoutineServiceClient::new(transport))
     }
 }
@@ -1668,8 +1752,9 @@ mod tests {
         credentials
             .replace_bearer_token("stream-token")
             .expect("token should be valid metadata");
-        let mut interceptor = NativeBearerInterceptor {
+        let mut interceptor = RequestMetadata {
             authorization: credentials.request_credentials().authorization,
+            destination: Some("home@0123456789abcdef0123456789abcdef".parse().unwrap()),
         };
 
         let unary = interceptor
@@ -1687,6 +1772,8 @@ mod tests {
             streaming.metadata().get("authorization").unwrap(),
             "Bearer stream-token"
         );
+        assert_eq!(unary.metadata().get(waltr::destination::HEADER).unwrap(), "home@0123456789abcdef0123456789abcdef");
+        assert_eq!(streaming.metadata().get(waltr::destination::HEADER).unwrap(), "home@0123456789abcdef0123456789abcdef");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

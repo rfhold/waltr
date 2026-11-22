@@ -8,6 +8,7 @@ use crate::{
     },
 };
 use axum::{Form, extract::State, http::StatusCode, response::IntoResponse, routing::post};
+use prost::Message as _;
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -21,7 +22,10 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use tonic::{Code, Request as GrpcRequest, Status, transport::Channel};
+use tonic::{
+    Code, Request as GrpcRequest, Status, service::interceptor::InterceptedService,
+    transport::Channel,
+};
 use waltr::grpc::waltr::{
     auth::v1::{
         AuthAttemptLifecycle, AuthCompletionMode, AuthMethod, AuthStatusKind, AuthTarget,
@@ -33,15 +37,17 @@ use waltr::grpc::waltr::{
         resource_service_client::ResourceServiceClient,
     },
     session::v1::{
-        CreateSessionRequest, WorkspaceSelection, session_service_client::SessionServiceClient,
+        CreateSessionRequest, ListSessionsResponse, WorkspaceSelection,
+        session_service_client::SessionServiceClient,
     },
+    status::v1::{WatchStatusRequest, status_service_client::StatusServiceClient},
 };
 
 mod stdio_mcp;
 
 const MACHINE: &str = "exporting-machine";
 const BINDING: &str = "test-binding";
-const RESOURCE: &str = "workspace-bindings/test-binding.yaml";
+const RESOURCE: &str = "remotes/test-binding.yaml";
 const PROJECT: &str = "project";
 const SENTINEL: &str = "sentinel.txt";
 const CONTENTS: &str = "only the exporting worker has this file";
@@ -49,12 +55,32 @@ const SUBJECT: &str = "test-user";
 const SCOPE: &str = "waltr:read";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEADLINE: Duration = Duration::from_secs(15);
-const TEST: &str = "app::tests::workspace_binding::workspace_binding_authorizes_exports_refreshes_and_stops_without_fallback";
-const EXPORTER_ROOT: &str = "WALTR_WORKSPACE_BINDING_TEST_EXPORTER_ROOT";
+const TEST: &str =
+    "app::tests::remote::remote_authorizes_exports_refreshes_and_stops_without_fallback";
+const EXPORTER_ROOT: &str = "WALTR_REMOTE_TEST_EXPORTER_ROOT";
 const EXPORTER_ADDRESS: &str = "exporter-address";
+const ENTRY_BEARER: &str = "fixture-entry-generation";
+
+fn entry(request: GrpcRequest<()>) -> Result<GrpcRequest<()>, Status> {
+    let mut request = request;
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer fixture-entry-generation".parse().unwrap(),
+    );
+    Ok(request)
+}
+
+fn routed<T>(value: T, name: &str) -> GrpcRequest<T> {
+    let mut request = GrpcRequest::new(value);
+    request.set_timeout(DEADLINE);
+    request
+        .metadata_mut()
+        .insert(waltr::destination::HEADER, name.parse().unwrap());
+    request
+}
 
 #[tokio::test]
-async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallback() {
+async fn remote_authorizes_exports_refreshes_and_stops_without_fallback() {
     if let Some(root) = std::env::var_os(EXPORTER_ROOT) {
         serve_exporter(Path::new(&root)).await;
         return;
@@ -117,15 +143,42 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         destination_db,
         access,
         stdio_mcp::Role::Destination,
+        None,
     )
     .await;
     let machines = destination.machines.clone();
     let destination = RunningApp::start(destination, listener).await;
     let mut exporter = start_exporter(&root);
-    let exporter_channel = connect(&exporter_address(&root, &mut exporter).await).await;
+    let exporter_endpoint = exporter_address(&root, &mut exporter).await;
+    let exporter_channel = connect(&exporter_endpoint).await;
 
-    let mut config = ResourceServiceClient::new(exporter_channel.clone());
-    let mut auth = AuthServiceClient::new(exporter_channel);
+    let mut config = ResourceServiceClient::with_interceptor(exporter_channel.clone(), entry);
+    let mut auth =
+        AuthServiceClient::with_interceptor(exporter_channel.clone(), entry as fn(_) -> _);
+    let mut routed_sessions =
+        SessionServiceClient::with_interceptor(exporter_channel.clone(), entry);
+    let mut unauthenticated = StatusServiceClient::new(exporter_channel.clone());
+    let mut routed_status = StatusServiceClient::with_interceptor(exporter_channel, entry);
+    let rejected = match unauthenticated
+        .watch_status(routed(WatchStatusRequest {}, BINDING))
+        .await
+    {
+        Err(status) => status,
+        Ok(reply) => reply.into_inner().message().await.unwrap_err(),
+    };
+    assert_eq!(rejected.code(), Code::Unauthenticated);
+    let mut ambiguous = routed(WatchStatusRequest {}, BINDING);
+    ambiguous
+        .metadata_mut()
+        .append(waltr::destination::HEADER, "local".parse().unwrap());
+    assert_eq!(
+        routed_status
+            .watch_status(ambiguous)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument,
+    );
     let mut sessions = SessionServiceClient::new(destination.channel.clone());
     let absent = config
         .inspect_resource(InspectResourceRequest {
@@ -141,7 +194,7 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
         .replace_resource(ReplaceResourceRequest {
             path: RESOURCE.into(),
             source: format!(
-                "apiVersion: waltr.dev/v1alpha1\nkind: WorkspaceBinding\nmetadata: {{name: {BINDING}}}\nspec:\n  endpoint: {endpoint}\n  machineId: {MACHINE}\n  exportRoot: '{}'\n  mcpStdioServers: [{}]\n",
+                "apiVersion: waltr.dev/v1alpha1\nkind: Remote\nmetadata: {{name: {BINDING}}}\nspec:\n  endpoint: {endpoint}\n  binding:\n    machineId: {MACHINE}\n    exportRoot: '{}'\n    mcpStdioServers: [{}]\n",
                 export_root.display(),
                 stdio_mcp::SERVER,
             ),
@@ -162,6 +215,14 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     assert_eq!(status.kind, AuthStatusKind::NotConfigured as i32);
     assert_eq!(status.supported_methods, [AuthMethod::OauthDevice as i32]);
     assert_eq!(idp.device_starts.load(Ordering::Acquire), 0);
+    assert_eq!(
+        routed_status
+            .watch_status(routed(WatchStatusRequest {}, BINDING))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+    );
     assert_offline(
         sessions
             .create_session(selection(MACHINE, &bearer))
@@ -170,11 +231,53 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     );
 
     let initial_expiry = authorize(&mut auth, &idp).await;
+    let selector = route_selector(&mut auth).await;
     wait_for("exported machine claim", || {
         machines.owns_live(MACHINE, &account)
     })
     .await;
     assert_selection(&mut sessions, MACHINE, &bearer).await;
+    let remote_session = routed_sessions
+        .create_session(routed(selection(MACHINE, &bearer).into_inner(), &selector))
+        .await
+        .unwrap()
+        .into_inner()
+        .session
+        .unwrap();
+    assert_eq!(remote_session.workspace.unwrap().machine_id, MACHINE);
+    let listed = grpc_web_list_sessions(&exporter_endpoint, &selector).await;
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.id == remote_session.id)
+    );
+    let mut remote_status = routed_status
+        .watch_status(routed(WatchStatusRequest {}, &selector))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        remote_status
+            .message()
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .unwrap()
+            .ready
+    );
+    assert_eq!(
+        routed_status
+            .watch_status(routed(
+                WatchStatusRequest {},
+                &format!("missing@{}", selector.split_once('@').unwrap().1)
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound,
+    );
     let other = idp.access_token("different-user", Duration::from_hours(1));
     assert_offline(
         sessions
@@ -187,22 +290,56 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     mcp.assert_denied(&other).await;
     mcp.assert_marker(&bearer).await;
 
-    let refreshed = auth
-        .refresh_auth(RefreshAuthRequest { target: target() })
-        .await
-        .unwrap()
-        .into_inner()
-        .status
-        .unwrap();
+    let mut refresh_client = auth.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_client.refresh_auth(RefreshAuthRequest { target: target() }).await
+    });
+    wait_for("issuer receives a claimed refresh", || {
+        idp.refreshes.load(Ordering::Acquire) == 1
+    }).await;
+    refresh.abort();
+    assert!(refresh.await.unwrap_err().is_cancelled());
+    idp.release_refresh.notify_one();
+    let refreshed = timeout(DEADLINE, async {
+        loop {
+            let status = auth.get_auth_status(GetAuthStatusRequest { target: target() })
+                .await.unwrap().into_inner().status.unwrap();
+            if status.expires_at_ms > initial_expiry {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("refresh commits after the initiating RPC disconnects");
     assert_eq!(idp.refreshes.load(Ordering::Acquire), 1);
     assert_eq!(refreshed.kind, AuthStatusKind::OauthConfigured as i32);
     assert!(refreshed.expires_at_ms > initial_expiry);
+    assert_eq!(selector, route_selector(&mut auth).await);
+    assert_eq!(
+        auth.logout(routed(LogoutRequest { target: target() }, &selector))
+            .await.unwrap_err().code(),
+        Code::FailedPrecondition,
+    );
+    assert_eq!(
+        config.reset_resource(routed(ResetResourceRequest {
+            path: RESOURCE.into(),
+            expected_etag: binding.persisted_etag.clone(),
+        }, &selector)).await.unwrap_err().code(),
+        Code::FailedPrecondition,
+    );
     assert_selection(&mut sessions, MACHINE, &bearer).await;
     assert_sentinel(&machines, &account).await;
 
     auth.logout(LogoutRequest { target: target() })
         .await
         .unwrap();
+    assert_eq!(
+        timeout(DEADLINE, remote_status.message())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+    );
     wait_for("logout to retire the machine claim", || {
         !machines.owns_live(MACHINE, &account)
     })
@@ -217,6 +354,15 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     assert_selection(&mut sessions, "local", &bearer).await;
 
     let _new_expiry = authorize(&mut auth, &idp).await;
+    assert_ne!(selector, route_selector(&mut auth).await);
+    assert_eq!(
+        routed_sessions
+            .create_session(routed(selection(MACHINE, &bearer).into_inner(), &selector))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+    );
     wait_for(
         "explicit reauthorization to restore the machine claim",
         || machines.owns_live(MACHINE, &account),
@@ -260,6 +406,44 @@ async fn workspace_binding_authorizes_exports_refreshes_and_stops_without_fallba
     timeout(DEADLINE, idp_task).await.unwrap().unwrap();
 }
 
+async fn route_selector(auth: &mut EntryAuth) -> String {
+    let status = auth
+        .get_auth_status(GetAuthStatusRequest { target: target() })
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+    format!(
+        "{BINDING}@{}",
+        status.metadata[waltr::destination::ROUTE_ID]
+    )
+}
+
+async fn grpc_web_list_sessions(endpoint: &str, selector: &str) -> ListSessionsResponse {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{endpoint}/waltr.session.v1.SessionService/ListSessions"
+        ))
+        .timeout(DEADLINE)
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .header("authorization", format!("Bearer {ENTRY_BEARER}"))
+        .header(waltr::destination::HEADER, selector)
+        .body(vec![0_u8; 5])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(response[0], 0);
+    let length = u32::from_be_bytes(response[1..5].try_into().unwrap()) as usize;
+    ListSessionsResponse::decode(&response[5..5 + length]).unwrap()
+}
+
 fn start_exporter(root: &Path) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST, "--nocapture"])
@@ -300,6 +484,10 @@ async fn serve_exporter(root: &Path) {
             persistence().await,
             AccessAuthenticator::disabled(),
             stdio_mcp::Role::Exporter,
+            Some(LocalAdmission {
+                bearer: LocalBearer::new(ENTRY_BEARER).unwrap(),
+                self_mcp_url: format!("{address}/mcp"),
+            }),
         )
         .await,
         listener,
@@ -318,7 +506,11 @@ async fn serve_exporter(root: &Path) {
     app.shutdown().await;
 }
 
-async fn authorize(auth: &mut AuthServiceClient<Channel>, idp: &DeviceIssuer) -> i64 {
+type EntryAuth = AuthServiceClient<
+    InterceptedService<Channel, fn(GrpcRequest<()>) -> Result<GrpcRequest<()>, Status>>,
+>;
+
+async fn authorize(auth: &mut EntryAuth, idp: &DeviceIssuer) -> i64 {
     let begin = auth
         .begin_auth(BeginAuthRequest {
             target: target(),
@@ -367,7 +559,7 @@ async fn authorize(auth: &mut AuthServiceClient<Channel>, idp: &DeviceIssuer) ->
 
 fn target() -> Option<AuthTarget> {
     Some(AuthTarget {
-        target: Some(Target::WorkspaceBindingKey(BINDING.into())),
+        target: Some(Target::RemoteKey(BINDING.into())),
     })
 }
 
@@ -457,6 +649,7 @@ async fn application(
     persistence: Persistence,
     access_authenticator: AccessAuthenticator,
     role: stdio_mcp::Role,
+    local_admission: Option<LocalAdmission>,
 ) -> ServerApplication {
     std::fs::create_dir_all(config_root.join(".waltr/resources/mcp-servers")).unwrap();
     std::fs::write(
@@ -476,9 +669,9 @@ async fn application(
             catalog_loader,
             access_authenticator,
             mcp_oauth: None,
-            outbound_oauth: OutboundOAuthConfig::default().with_workspace_binding_loopback(),
+            outbound_oauth: OutboundOAuthConfig::default().with_remote_loopback(),
             agent_state: None,
-            local_admission: None,
+            local_admission,
             workspace_root: workspace_root.into(),
             sandbox_socket: None,
             routine_authority,
@@ -548,6 +741,7 @@ struct DeviceIssuer {
     device_starts: AtomicUsize,
     approved: AtomicBool,
     refreshes: AtomicUsize,
+    release_refresh: tokio::sync::Notify,
 }
 
 impl DeviceIssuer {
@@ -559,6 +753,7 @@ impl DeviceIssuer {
             device_starts: AtomicUsize::new(0),
             approved: AtomicBool::new(false),
             refreshes: AtomicUsize::new(0),
+            release_refresh: tokio::sync::Notify::new(),
         });
         let router = Router::new()
             .route("/.well-known/openid-configuration", get(Self::metadata))
@@ -626,6 +821,7 @@ impl DeviceIssuer {
             assert_eq!(form["refresh_token"], "fixture-refresh-token");
             let access_token = issuer.access_token(SUBJECT, Duration::from_mins(10));
             issuer.refreshes.fetch_add(1, Ordering::AcqRel);
+            issuer.release_refresh.notified().await;
             return Json(json!({
                 "access_token": access_token, "token_type": "Bearer", "expires_in": 600,
             }))

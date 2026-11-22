@@ -62,13 +62,13 @@ describe("config authentication status", () => {
 });
 
 describe("config authentication actions", () => {
-  test("workspace binding starts only from Authorize and follows device status without manual completion", async () => {
-    const target = { kind: "workspaceBinding", key: "export" };
+  test("remote starts only from Authorize and follows device status without manual completion", async () => {
+    const target = { kind: "remote", key: "export" };
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithConfig(claudeConfig());
-    snapshot.config.workspaceBindings.export = { endpoint: "https://destination.example", machineId: "worker" };
-    const status = authStatus("workspaceBinding", "export", "notConfigured", { supportedMethods: ["oauthDevice"] });
-    snapshot.auth.statuses["workspaceBinding:export"] = status;
+    snapshot.config.remotes.export = { endpoint: "https://destination.example", machineId: "worker" };
+    const status = authStatus("remote", "export", "notConfigured", { supportedMethods: ["oauthDevice"] });
+    snapshot.auth.statuses["remote:export"] = status;
     let setSnapshot!: (snapshot: ClientSnapshot) => void;
     let pending!: ClientSnapshot;
     renderWithAppState(() => <ShellRouteWithChildren />, {
@@ -103,7 +103,7 @@ describe("config authentication actions", () => {
       },
     });
 
-    fireEvent.click(screen.getByRole("tab", { name: "Workspace Bindings" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Remotes" }));
     expect(await screen.findByText("Not connected")).toBeTruthy();
     expect(commands.some((command) => command.type === "beginAuth")).toBe(false);
     expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull();
@@ -121,7 +121,7 @@ describe("config authentication actions", () => {
       auth: {
         ...pending.auth,
         activeAttempt: { ...pending.auth.activeAttempt!, lifecycle: "succeeded" },
-        statuses: { "workspaceBinding:export": { ...status, kind: "oauthConfigured" } },
+        statuses: { "remote:export": { ...status, kind: "oauthConfigured" } },
       },
     });
     expect(await screen.findByText("Connected")).toBeTruthy();
@@ -418,7 +418,7 @@ function mcpAuthSnapshot(url: string): ClientSnapshot {
 }
 
 function authStatus(
-  targetKind: "provider" | "mcpServer" | "workspaceBinding",
+  targetKind: "provider" | "mcpServer" | "remote",
   key: string,
   kind: string,
   overrides: Partial<AuthStatusSnapshot> = {},

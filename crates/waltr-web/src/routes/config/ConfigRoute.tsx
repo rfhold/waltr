@@ -3,6 +3,7 @@ import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, o
 import type { ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { ownerPath, remoteScope } from "../../app/destination";
 import { ConfirmAction, InlineAlert, TabPanel, Tabs } from "../../components/ui";
 import type { TabItem } from "../../components/ui";
 import type { ClientCommand } from "../../generated/waltr-client";
@@ -19,18 +20,20 @@ export {
 } from "./ProvidersSection";
 export { ConfigMcpCreateRoute, ConfigMcpEditRoute } from "./McpServersSection";
 
-type ConfigTabId = "providers" | "mcp" | "defaults" | "workspaceBindings";
+type ConfigTabId = "providers" | "mcp" | "defaults" | "remotes";
 
 const CONFIG_TABS: readonly TabItem<ConfigTabId>[] = [
   { id: "providers", label: "Providers", href: "/config/provider" },
   { id: "mcp", label: "MCP Servers", href: "/config/mcp" },
   { id: "defaults", label: "Defaults", href: "/config/defaults" },
-  { id: "workspaceBindings", label: "Workspace Bindings", href: "/config/workspace-bindings" },
+  { id: "remotes", label: "Remotes", href: "/config/remotes" },
 ];
 
 export function ConfigRoute(props: ParentProps) {
   const app = useAppState();
   const location = useLocation();
+  const path = () => ownerPath(location.pathname);
+  const isEntry = () => !remoteScope(location.pathname);
   const navigate = useNavigate();
   const snapshot = createMemo(() => app.snapshot());
   const watchedConfig = createMemo(() =>
@@ -39,7 +42,7 @@ export function ConfigRoute(props: ParentProps) {
       : undefined,
   );
   const resourceBaselines = createMemo(() => snapshot()?.config.resourceBaselines ?? {});
-  const workspaceBindings = createMemo(() => snapshot()?.config.workspaceBindings ?? {});
+  const remotes = createMemo(() => snapshot()?.config.remotes ?? {});
   const error = createMemo(
     () => snapshot()?.config.watch.error ?? snapshot()?.config.load?.error,
   );
@@ -50,25 +53,25 @@ export function ConfigRoute(props: ParentProps) {
   const [resetError, setResetError] = createSignal<string>();
   const [resetSucceeded, setResetSucceeded] = createSignal(false);
   const routeTab = createMemo<ConfigTabId | undefined>(() => {
-    if (location.pathname.startsWith("/config/mcp")) {
+    if (path().startsWith("/config/mcp")) {
       return "mcp";
     }
-    if (location.pathname.startsWith("/config/defaults")) {
+    if (path().startsWith("/config/defaults")) {
       return "defaults";
     }
-    if (location.pathname.startsWith("/config/provider")) {
+    if (path().startsWith("/config/provider")) {
       return "providers";
     }
-    if (location.pathname === "/config/workspace-bindings") {
-      return "workspaceBindings";
+    if (path() === "/config/remotes") {
+      return "remotes";
     }
     return undefined;
   });
   const visibleTab = createMemo(() => activeTab());
   const visibleTabs = createMemo(() =>
-    Object.keys(workspaceBindings()).length > 0 || visibleTab() === "workspaceBindings"
+    isEntry()
       ? CONFIG_TABS
-      : CONFIG_TABS.filter((tab) => tab.id !== "workspaceBindings"),
+      : CONFIG_TABS.filter((tab) => tab.id !== "remotes"),
   );
   createEffect(on(routeTab, (tab) => {
     if (tab) {
@@ -124,7 +127,7 @@ export function ConfigRoute(props: ParentProps) {
 
   return (
     <section class="config" aria-labelledby="config-title">
-      <ShowRedirect when={location.pathname === "/config" || location.pathname === "/config/"} />
+      <ShowRedirect when={path() === "/config" || path() === "/config/" || (!isEntry() && path() === "/config/remotes")} />
       <header class="config__header">
         <div class="config__heading">
           <p class="eyebrow">Configuration</p>
@@ -210,15 +213,19 @@ export function ConfigRoute(props: ParentProps) {
           <Match when={visibleTab() === "defaults"}>
             <InferenceDefaultsSection watchedConfig={watchedConfig} />
           </Match>
-          <Match when={visibleTab() === "workspaceBindings"}>
-            <section aria-labelledby="workspace-bindings-title">
-              <h2 id="workspace-bindings-title">Workspace bindings</h2>
-              <For each={Object.keys(workspaceBindings())} fallback={<p>No workspace bindings configured.</p>}>
+          <Match when={visibleTab() === "remotes"}>
+            <section aria-labelledby="remotes-title">
+              <h2 id="remotes-title">Remotes</h2>
+              <For each={Object.keys(remotes())} fallback={<p>No remotes configured.</p>}>
                 {(key) => (
                   <article>
                     <h3>{key}</h3>
-                    <p>{workspaceBindings()[key]?.machineId} · {workspaceBindings()[key]?.endpoint}</p>
-                    <AuthStatusPanel target={{ kind: "workspaceBinding", key }} />
+                    <p>{remotes()[key]?.endpoint}</p>
+                    <Show when={remotes()[key]?.machineId}>{(machine) => <p>Workspace export: {machine()}</p>}</Show>
+                    <AuthStatusPanel target={{ kind: "remote", key }} />
+                    <Show when={snapshot()?.auth.statuses[`remote:${key}`]?.metadata.remoteRouteId}>
+                      {id => <a rel="external" href={`/remote/${encodeURIComponent(key)}~${id()}/`}>Open {key}</a>}
+                    </Show>
                   </article>
                 )}
               </For>

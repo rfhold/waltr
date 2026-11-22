@@ -14,16 +14,15 @@ use waltr_client::{
     AccessSnapshot, AccessStatus, AuthSnapshot, AuthStatusSnapshot, AuthenticationFailureSnapshot,
     CatalogMatchSourceView, CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot,
     CatalogSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
-    ConfigSnapshot, ConfigView, McpAuthorizationContextSnapshot,
-    McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
-    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
-    OperationSnapshot, ProjectedTimelineEntryView, ProviderKindView, ProviderView,
-    ResourceEditBaselineView, RoutineDefinitionSnapshot, RoutineHistorySnapshot, RoutineSnapshot,
-    SelectableAgentView, SessionAgentCatalogSnapshot, SessionCapabilitiesView, SessionPhaseView,
-    SessionProgressPhaseView, SessionProgressView, SessionPromptDispositionView,
-    SessionRunStageView, SessionSnapshot, SessionStatusView, SessionTimelineView, SessionView,
-    StatusSnapshot, TimelineContentView, TimelineEventKindView, TimelineEventView,
-    TimelinePresentationView, TimelineStatusView, TimestampView,
+    ConfigSnapshot, ConfigView, McpAuthorizationContextSnapshot, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, OperationCollectionSnapshot, OperationSnapshot, ProjectedTimelineEntryView,
+    ProviderKindView, ProviderView, ResourceEditBaselineView, RoutineDefinitionSnapshot,
+    RoutineHistorySnapshot, RoutineSnapshot, SelectableAgentView, SessionAgentCatalogSnapshot,
+    SessionCapabilitiesView, SessionPhaseView, SessionProgressPhaseView, SessionProgressView,
+    SessionPromptDispositionView, SessionRunStageView, SessionSnapshot, SessionStatusView,
+    SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -319,7 +318,9 @@ pub(crate) fn mask_replacement_entry(
 
 pub(crate) fn expected_register_timeline_command(session_id: &str) -> AppAction {
     AppAction::ClientCommands(vec![
-        ClientCommand::RetainInteractions { session_id: session_id.to_owned() },
+        ClientCommand::RetainInteractions {
+            session_id: session_id.to_owned(),
+        },
         ClientCommand::RegisterSessionTimelineWatchInterest {
             session_id: session_id.to_owned(),
             after_cursor: None,
@@ -857,7 +858,7 @@ pub(crate) fn ready_snapshot() -> ClientSnapshot {
         },
         config: ConfigSnapshot {
             current: None,
-            workspace_bindings: BTreeMap::new(),
+            remotes: BTreeMap::new(),
             resource_baselines: BTreeMap::new(),
             load: OperationSnapshot {
                 status: "idle",

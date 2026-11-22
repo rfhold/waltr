@@ -492,7 +492,7 @@ pub enum ClientCommand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientAuthTarget {
-    /// Target kind: `provider`, `mcpServer`, or `workspaceBinding`.
+    /// Target kind: `provider`, `mcpServer`, or `remote`.
     pub kind: String,
     /// Config key for the target.
     pub key: String,
@@ -755,7 +755,7 @@ pub struct AuthStatusSnapshot {
     /// Credential expiry in Unix milliseconds, or zero when unknown.
     #[serde(rename = "expiresAtMs")]
     pub expires_at_ms: i64,
-    /// Non-secret provider or MCP metadata.
+    /// Non-secret authorization metadata.
     pub metadata: BTreeMap<String, String>,
     /// Sanitized status detail.
     pub message: String,
@@ -1051,8 +1051,8 @@ impl From<&RollbackTarget> for RollbackTargetView {
 pub struct ConfigSnapshot {
     /// Last known configuration snapshot.
     pub current: Option<ConfigView>,
-    /// Active workspace bindings keyed by their catalog resource name.
-    pub workspace_bindings: BTreeMap<String, WorkspaceBindingView>,
+    /// Active remotes keyed by their catalog resource name.
+    pub remotes: BTreeMap<String, RemoteView>,
     /// Resource-slot write baselines keyed by canonical path.
     pub resource_baselines: BTreeMap<String, ResourceEditBaselineView>,
     /// Configuration load operation snapshot.
@@ -1065,32 +1065,47 @@ pub struct ConfigSnapshot {
     pub watch: OperationSnapshot,
 }
 
-/// Public configuration for an outbound workspace binding.
+/// Public configuration for an outbound remote.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceBindingView {
+pub struct RemoteView {
     /// Destination server API root.
     pub endpoint: String,
     /// Requested machine identifier at the destination.
-    pub machine_id: String,
+    pub machine_id: Option<String>,
 }
 
-impl TryFrom<&waltr::grpc::waltr::resource::v1::Resource> for WorkspaceBindingView {
+impl TryFrom<&waltr::grpc::waltr::resource::v1::Resource> for RemoteView {
     type Error = ();
 
-    fn try_from(resource: &waltr::grpc::waltr::resource::v1::Resource) -> Result<Self, Self::Error> {
+    fn try_from(
+        resource: &waltr::grpc::waltr::resource::v1::Resource,
+    ) -> Result<Self, Self::Error> {
         use waltr::grpc::waltr::resource::v1::{ResourceKind, resource_value::Kind};
-        if resource.kind != ResourceKind::WorkspaceBinding as i32 || resource.name.is_empty() {
+        if resource.kind != ResourceKind::Remote as i32 || resource.name.is_empty() {
             return Err(());
         }
         let fields = &resource.effective_value.as_ref().ok_or(())?.fields;
-        let string = |key| match fields.get(key).and_then(|value| value.kind.as_ref()) {
-            Some(Kind::StringValue(value)) if !value.is_empty() => Ok(value.clone()),
-            _ => Err(()),
+        let Some(Kind::StringValue(endpoint)) =
+            fields.get("endpoint").and_then(|value| value.kind.as_ref())
+        else {
+            return Err(());
+        };
+        let machine_id = match fields.get("binding").and_then(|value| value.kind.as_ref()) {
+            Some(Kind::ObjectValue(binding)) => match binding
+                .fields
+                .get("machineId")
+                .and_then(|value| value.kind.as_ref())
+            {
+                Some(Kind::StringValue(machine)) => Some(machine.clone()),
+                _ => return Err(()),
+            },
+            None => None,
+            _ => return Err(()),
         };
         Ok(Self {
-            endpoint: string("endpoint")?,
-            machine_id: string("machineId")?,
+            endpoint: endpoint.clone(),
+            machine_id,
         })
     }
 }
@@ -1328,6 +1343,13 @@ impl fmt::Debug for ClientRuntime {
 }
 
 impl ClientRuntime {
+    /// Create a same-origin browser runtime for a named destination.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn with_destination(endpoint: String, destination: &str) -> Result<Self, ClientError> {
+        let transport = crate::DefaultGrpcTransport::new(endpoint).for_destination(destination)?;
+        Ok(Self::with_transport(transport))
+    }
+
     /// Create a runtime from a runtime-owned default transport.
     #[must_use]
     pub fn with_transport(transport: crate::DefaultGrpcTransport) -> Self {
@@ -2501,7 +2523,10 @@ impl ClientStateStream {
             ClientCommand::CreateSession { agent_name } => {
                 self.runtime.reducer.create_session(agent_name)
             }
-            ClientCommand::CreateSessionWithWorkspace { agent_name, workspace } => self
+            ClientCommand::CreateSessionWithWorkspace {
+                agent_name,
+                workspace,
+            } => self
                 .runtime
                 .reducer
                 .create_session_with_workspace(agent_name, Some(workspace)),
@@ -3407,14 +3432,14 @@ impl ClientSnapshot {
             },
             config: ConfigSnapshot {
                 current: state.config.current.clone().map(ConfigView::from),
-                workspace_bindings: state
+                remotes: state
                     .config
                     .catalog
                     .as_ref()
                     .into_iter()
                     .flat_map(|catalog| &catalog.resources)
                     .filter_map(|resource| {
-                        WorkspaceBindingView::try_from(resource)
+                        RemoteView::try_from(resource)
                             .ok()
                             .map(|binding| (resource.name.clone(), binding))
                     })
@@ -3714,9 +3739,7 @@ impl ClientAuthTarget {
             "mcpServer" | "mcp_server" => {
                 waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(self.key)
             }
-            "workspaceBinding" => {
-                waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(self.key)
-            }
+            "remote" => waltr::grpc::waltr::auth::v1::auth_target::Target::RemoteKey(self.key),
             _ => waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(self.key),
         };
 
@@ -3750,8 +3773,8 @@ fn pending_auth_attempt_state(attempt: AuthAttemptSnapshot) -> Option<AuthAttemp
     let device = completion_mode == AuthCompletionMode::ServerDevicePoll;
     if !matches!(
         attempt.target.kind.as_str(),
-        "provider" | "mcpServer" | "workspaceBinding"
-    ) || (attempt.target.kind == "workspaceBinding") != device
+        "provider" | "mcpServer" | "remote"
+    ) || (attempt.target.kind == "remote") != device
         || attempt.target.key.is_empty()
     {
         return None;
@@ -3813,12 +3836,10 @@ impl From<AuthTarget> for ClientAuthTarget {
                 kind: "mcpServer".to_owned(),
                 key,
             },
-            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(key)) => {
-                Self {
-                    kind: "workspaceBinding".to_owned(),
-                    key,
-                }
-            }
+            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::RemoteKey(key)) => Self {
+                kind: "remote".to_owned(),
+                key,
+            },
             None => Self {
                 kind: "unknown".to_owned(),
                 key: String::new(),
@@ -3910,7 +3931,9 @@ fn auth_status_metadata_is_safe(
             "registration_method" => value.len() <= 64,
             _ => false,
         },
-        waltr::grpc::waltr::auth::v1::auth_target::Target::WorkspaceBindingKey(_) => false,
+        waltr::grpc::waltr::auth::v1::auth_target::Target::RemoteKey(_) => {
+            key == waltr::destination::ROUTE_ID && waltr::destination::is_route_id(value)
+        }
     }
 }
 
@@ -4278,7 +4301,7 @@ mod tests {
         ));
 
         let mut pending_device = pending_attempt("serverDevicePoll");
-        pending_device.target.kind = "workspaceBinding".to_owned();
+        pending_device.target.kind = "remote".to_owned();
         pending_device.verification_url = "https://issuer.example/verify".to_owned();
         pending_device.user_code = "ABCD-EFGH".to_owned();
         let device = ClientRuntime::with_transport_and_pending_auth_attempt(
@@ -5049,11 +5072,14 @@ mod tests {
             }))
             .unwrap();
             let update = stream.begin_session_command(command);
-            let [ClientEffect::Session(SessionEffect::Create {
-                agent_name,
-                workspace: Some(selection),
-                ..
-            })] = update.effects() else {
+            let [
+                ClientEffect::Session(SessionEffect::Create {
+                    agent_name,
+                    workspace: Some(selection),
+                    ..
+                }),
+            ] = update.effects()
+            else {
                 panic!("expected bound session create");
             };
             assert_eq!(agent_name, agent);

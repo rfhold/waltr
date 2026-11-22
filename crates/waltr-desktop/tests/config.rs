@@ -8,7 +8,7 @@ use waltr_desktop::{
 const VALID: &str = "version: 1\nkeybinds:\n  - id: dictate-copy\n    key: Ctrl+Alt+Space\n    mode: hold\n    routine: { name: audio-transcribe-cleanup, trigger: dictate, input: audio, output: clean-text }\n    audio: { device: default, sampleRateHz: 24000, channels: 1 }\n    command: { argv: [pbcopy], stdin: '{{ text }}', timeoutSeconds: 10 }\n";
 
 #[test]
-fn destination_is_an_optional_saved_remote_profile_id() {
+fn destination_is_an_optional_exact_remote_name() {
     let config = config::parse(VALID.as_bytes()).unwrap();
     assert_eq!(config.keybinds[0].routine.destination, None);
 
@@ -18,10 +18,11 @@ fn destination_is_an_optional_saved_remote_profile_id() {
             &format!("output: clean-text, destination: {value} }}"),
         )
     };
-    let id = "adef0123456789abcdef0123456789ab";
-    let config = config::parse(yaml(id).as_bytes()).unwrap();
-    assert_eq!(config.keybinds[0].routine.destination.as_deref(), Some(id));
-    for value in ["local", "https://host.example", "null", "''", "short"] {
+    for name in ["home", "local", "office-mac"] {
+        let config = config::parse(yaml(name).as_bytes()).unwrap();
+        assert_eq!(config.keybinds[0].routine.destination.as_deref(), Some(name));
+    }
+    for value in ["https://host.example", "null", "''", "name/other", "'..'"] {
         assert!(config::parse(yaml(value).as_bytes()).is_err(), "{value}");
     }
 }

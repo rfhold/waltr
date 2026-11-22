@@ -5,7 +5,7 @@ import { Dialog, Field, InlineAlert } from "../../components/ui";
 import type { AuthAttemptSnapshot, ClientAuthTarget } from "../../generated/waltr-client";
 
 function targetLabel(target: ClientAuthTarget) {
-  if (target.kind === "workspaceBinding") return `workspace binding ${target.key}`;
+  if (target.kind === "remote") return `remote ${target.key}`;
   return target.kind === "mcpServer" ? `MCP server ${target.key}` : `provider ${target.key}`;
 }
 

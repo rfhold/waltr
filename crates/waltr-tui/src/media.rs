@@ -146,12 +146,12 @@ pub(crate) struct Broker {
 }
 impl Broker {
     pub(crate) fn new(
-        endpoint: String,
+        transport: NativeGrpcTransport,
         credentials: NativeCredentialProvider,
         events: mpsc::Sender<std::io::Result<crate::event::AppEvent>>,
     ) -> Self {
         Self {
-            transport: NativeGrpcTransport::with_credential_provider(endpoint, credentials.clone()),
+            transport,
             credentials,
             events,
             owner: None,

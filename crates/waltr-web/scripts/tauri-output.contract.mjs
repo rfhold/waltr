@@ -26,6 +26,7 @@ for (const route of [
   "/sessions/session-a",
   "/routines/invocation-a",
   "/config/provider/edit/provider-a/models/edit/model-a",
+  "/remote/home~0123456789abcdef0123456789abcdef/sessions/session-a",
 ]) {
   const routeUrl = new URL(route, "tauri://localhost");
   const documentBase = new URL("/", routeUrl);

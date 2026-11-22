@@ -5,7 +5,6 @@ import type { AuthAttemptSnapshot, ClientCommand, ClientSnapshot } from "../../s
 import type { AccessDiagnostic, AccessOperations, ClientAdapter } from "../../src/platform/client";
 import { AppStateProvider } from "../../src/app/state";
 import { AppLayout } from "../../src/routes/layouts/AppLayout";
-import { ServerSelectionContext } from "../../src/app/serverSelection";
 import { AccessRoute, waltrSignInUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
 import { ShellRouteWithChildren, testHistory } from "../support/routes";
@@ -779,7 +778,7 @@ describe("Waltr access", () => {
   });
 
   test.each(["logout success", "logout failure", "dispatch failure"] as const)(
-    "switching servers fences a pending %s from the replacement shell",
+    "unmounting fences a pending %s from the replacement shell",
     async (stage) => {
       const reload = vi.fn();
       const commands: ClientCommand[] = [];
@@ -796,9 +795,7 @@ describe("Waltr access", () => {
         logout: vi.fn(() => stage === "dispatch failure" ? Promise.resolve(true) : pendingLogout),
       };
       const oldView = renderWithAppState(() => (
-        <ServerSelectionContext.Provider value={{ switchServer: () => oldView.unmount(), retry: vi.fn() }}>
-          <ShellRouteWithChildren reload={reload} />
-        </ServerSelectionContext.Provider>
+        <ShellRouteWithChildren reload={reload} />
       ), {
         snapshot: accessSnapshot("authenticated"),
         commands,
@@ -810,9 +807,7 @@ describe("Waltr access", () => {
       if (stage === "dispatch failure") {
         await waitFor(() => expect(commands).toContainEqual({ type: "logoutWaltr" }));
       }
-      const switchButton = screen.getByRole("button", { name: "Switch server" });
-      expect(switchButton).toHaveProperty("disabled", false);
-      fireEvent.click(switchButton);
+      oldView.unmount();
       const replacementCommands: ClientCommand[] = [];
       renderWithAppState(() => <><ShellRouteWithChildren reload={reload} /><input aria-label="Replacement draft" /></>, {
         snapshot: accessSnapshot("authenticated"),

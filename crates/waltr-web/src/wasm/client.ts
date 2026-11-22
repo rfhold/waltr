@@ -10,10 +10,10 @@ import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 import type { ClientAdapter, ClientSnapshotListener } from "../platform/client";
 import { browserDictation } from "../platform/browser-dictation";
 
-export async function loadBrowserClient(): Promise<ClientAdapter> {
+export async function loadBrowserClient(destination?: string): Promise<ClientAdapter> {
   await init();
 
-  const client = WaltrClient.forCurrentOrigin();
+  const client = destination === undefined ? WaltrClient.forCurrentOrigin() : WaltrClient.forDestination(destination);
   let currentSnapshot: ClientSnapshot | undefined;
   const dictation = browserDictation(client, () => currentSnapshot);
   let currentSnapshotJson: string | undefined;

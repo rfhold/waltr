@@ -41,7 +41,7 @@ pub(super) const fn proto_kind(kind: ResourceKind) -> resource_proto::ResourceKi
         ResourceKind::McpServer => resource_proto::ResourceKind::McpServer,
         ResourceKind::Defaults => resource_proto::ResourceKind::Defaults,
         ResourceKind::Routine => resource_proto::ResourceKind::Routine,
-        ResourceKind::WorkspaceBinding => resource_proto::ResourceKind::WorkspaceBinding,
+        ResourceKind::Remote => resource_proto::ResourceKind::Remote,
     }
 }
 
@@ -79,7 +79,7 @@ fn json_prost_value(value: &serde_json::Value) -> resource_proto::ResourceValue 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResourceMetadata {
-    name: String,
+    pub(super) name: String,
 }
 
 #[derive(Deserialize)]
@@ -208,7 +208,13 @@ struct SpeechSelectionSpec {
 
 impl From<SpeechSelectionSpec> for config_proto::SpeechSelection {
     fn from(value: SpeechSelectionSpec) -> Self {
-        Self { provider: value.provider, model: value.model, voice: value.voice, language: value.language, rate: value.rate }
+        Self {
+            provider: value.provider,
+            model: value.model,
+            voice: value.voice,
+            language: value.language,
+            rate: value.rate,
+        }
     }
 }
 
@@ -453,17 +459,23 @@ pub(super) fn materialize_defaults(
         Ok(config_proto::SessionDictation { routine: selection.routine, trigger: selection.trigger, input: selection.input, output: selection.output })
     }).transpose()?;
     Ok((
-        resource.spec.inference.map(|inference| config_proto::InferenceDefaults {
-            provider_key: inference.provider,
-            model_key: inference.model,
-            reasoning_effort: inference.reasoning_effort,
-        }),
+        resource
+            .spec
+            .inference
+            .map(|inference| config_proto::InferenceDefaults {
+                provider_key: inference.provider,
+                model_key: inference.model,
+                reasoning_effort: inference.reasoning_effort,
+            }),
         dictation,
-        resource.spec.speech.map(|speech| config_proto::SpeechDefaults {
-            stt: speech.stt.map(Into::into),
-            diarize: speech.diarize.map(Into::into),
-            tts: speech.tts.map(Into::into),
-        }),
+        resource
+            .spec
+            .speech
+            .map(|speech| config_proto::SpeechDefaults {
+                stt: speech.stt.map(Into::into),
+                diarize: speech.diarize.map(Into::into),
+                tts: speech.tts.map(Into::into),
+            }),
     ))
 }
 

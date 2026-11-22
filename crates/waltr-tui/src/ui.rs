@@ -269,7 +269,7 @@ fn display_text(value: &str) -> String {
 fn auth_target_label(target: &waltr_client::ClientAuthTarget) -> String {
     match target.kind.as_str() {
         "mcpServer" => format!("MCP server {}", target.key),
-        "workspaceBinding" => format!("workspace binding {}", display_text(&target.key)),
+        "remote" => format!("remote {}", display_text(&target.key)),
         _ => format!("provider {}", target.key),
     }
 }

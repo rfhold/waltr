@@ -108,7 +108,7 @@ pub(super) fn validate_resource_source(
             | ResourceKind::McpServer
             | ResourceKind::Defaults
             | ResourceKind::Routine
-            | ResourceKind::WorkspaceBinding
+            | ResourceKind::Remote
     ) {
         let header: ResourceHeader = serde_yaml_ng::from_str(source).map_err(|source| {
             AgentDefinitionLoadError::ResourceYaml {
@@ -210,7 +210,7 @@ pub(super) fn validate_resource_path(
         "mcp-servers" => ResourceKind::McpServer,
         "defaults" if name == "default" => ResourceKind::Defaults,
         "routines" => ResourceKind::Routine,
-        "workspace-bindings" => ResourceKind::WorkspaceBinding,
+        "remotes" => ResourceKind::Remote,
         _ => {
             return Err(AgentDefinitionLoadError::InvalidResourcePath(
                 path.to_owned(),
@@ -237,7 +237,7 @@ fn parse_resource_kind(kind: &str) -> Option<ResourceKind> {
         "McpServer" => Some(ResourceKind::McpServer),
         "Defaults" => Some(ResourceKind::Defaults),
         "Routine" => Some(ResourceKind::Routine),
-        "WorkspaceBinding" => Some(ResourceKind::WorkspaceBinding),
+        "Remote" => Some(ResourceKind::Remote),
         _ => None,
     }
 }
@@ -294,7 +294,7 @@ pub(super) fn discover_persisted_for(
                         | "mcp-servers"
                         | "defaults"
                         | "routines"
-                        | "workspace-bindings"
+                        | "remotes"
                 )
             )
         } else {
@@ -316,7 +316,7 @@ pub(super) fn discover_persisted_for(
             "mcp-servers",
             "defaults",
             "routines",
-            "workspace-bindings",
+            "remotes",
         ]
     } else {
         &["agents", "features", "permissions"]

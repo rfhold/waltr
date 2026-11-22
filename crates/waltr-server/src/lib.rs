@@ -24,6 +24,7 @@ pub mod persistence;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 mod readiness;
+mod remote_routes;
 pub mod resource_catalog;
 pub mod resource_error;
 pub mod routine;

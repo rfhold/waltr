@@ -8,6 +8,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+waltr.workspace = true
 waltr-client.workspace = true
 unicode-segmentation = "1.13.2"
 waltr-audio-io.workspace = true

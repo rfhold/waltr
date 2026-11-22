@@ -17,14 +17,14 @@ pub use config::{
     SessionDictationView, SpeechDefaultsView, SpeechSelectionView,
 };
 pub use session::{
-    InferenceProviderSettingsView, InferenceSettingsMatchView,
-    InferenceSettingsView, ProjectedTimelineEntryView, SelectableAgentView,
-    SessionAssociationsView, SessionCapabilitiesView, SessionCoordinationPhaseView,
-    SessionCoordinationReasonView, SessionCoordinationView, SessionMetricsView, SessionPhaseView,
-    SessionProgressPhaseView, SessionProgressView, SessionPromptDispositionView,
-    SessionRunStageView, SessionStatusView, SessionSuspensionKindView, SessionTimelineView,
-    SessionView, SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView, WorkspaceSelection,
+    InferenceProviderSettingsView, InferenceSettingsMatchView, InferenceSettingsView,
+    ProjectedTimelineEntryView, SelectableAgentView, SessionAssociationsView,
+    SessionCapabilitiesView, SessionCoordinationPhaseView, SessionCoordinationReasonView,
+    SessionCoordinationView, SessionMetricsView, SessionPhaseView, SessionProgressPhaseView,
+    SessionProgressView, SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
+    SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
+    TimelineStatusView, TimestampView, WorkspaceSelection,
 };
 
 #[cfg(test)]
@@ -74,9 +74,23 @@ mod tests {
             mcp_servers: HashMap::new(),
             inference_defaults: None,
             speech_defaults: Some(waltr::grpc::waltr::config::v1::SpeechDefaults {
-                stt: Some(waltr::grpc::waltr::config::v1::SpeechSelection { provider: "stt".into(), model: "plain".into(), ..Default::default() }),
-                diarize: Some(waltr::grpc::waltr::config::v1::SpeechSelection { provider: "stt".into(), model: "speakers".into(), ..Default::default() }),
-                tts: Some(waltr::grpc::waltr::config::v1::SpeechSelection { provider: "tts".into(), model: "reader".into(), voice: Some("voice".into()), language: Some("en-US".into()), rate: Some(1.25) }),
+                stt: Some(waltr::grpc::waltr::config::v1::SpeechSelection {
+                    provider: "stt".into(),
+                    model: "plain".into(),
+                    ..Default::default()
+                }),
+                diarize: Some(waltr::grpc::waltr::config::v1::SpeechSelection {
+                    provider: "stt".into(),
+                    model: "speakers".into(),
+                    ..Default::default()
+                }),
+                tts: Some(waltr::grpc::waltr::config::v1::SpeechSelection {
+                    provider: "tts".into(),
+                    model: "reader".into(),
+                    voice: Some("voice".into()),
+                    language: Some("en-US".into()),
+                    rate: Some(1.25),
+                }),
             }),
             session_dictation: Some(waltr::grpc::waltr::config::v1::SessionDictation {
                 routine: "dictation".into(),
@@ -319,7 +333,7 @@ mod tests {
             OperationSnapshot::decl(),
             ResourceEditBaselineView::decl(),
             ConfigSnapshot::decl(),
-            crate::coordination::runtime::WorkspaceBindingView::decl(),
+            crate::coordination::runtime::RemoteView::decl(),
             StatusSnapshot::decl(),
             SessionAgentCatalogSnapshot::decl(),
             SessionSnapshot::decl(),

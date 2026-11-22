@@ -245,9 +245,7 @@ mod tests {
     fn workspace_device_authorization_follows_explicit_begin_and_polls_to_connected() {
         let mut client = Client::new();
         let binding = AuthTarget {
-            target: Some(auth_target::Target::WorkspaceBindingKey(
-                "remote".to_owned(),
-            )),
+            target: Some(auth_target::Target::RemoteKey("remote".to_owned())),
         };
         let listed = client.apply(ClientEvent::Auth(AuthEvent::Listed(vec![
             crate::AuthStatus {
@@ -337,7 +335,7 @@ mod tests {
         }));
         assert!(completed.effects().is_empty());
         assert_eq!(
-            client.state().auth.statuses["workspaceBinding:remote"].kind,
+            client.state().auth.statuses["remote:remote"].kind,
             waltr::grpc::waltr::auth::v1::AuthStatusKind::OauthConfigured as i32
         );
     }

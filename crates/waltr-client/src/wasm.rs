@@ -59,6 +59,19 @@ impl WaltrClient {
     pub fn new(endpoint: Option<String>) -> Self {
         let endpoint = normalize_endpoint(endpoint);
         let runtime = ClientRuntime::for_endpoint(endpoint.clone());
+        Self::with_runtime(endpoint, runtime)
+    }
+
+    /// Route browser requests through the current origin to an exact Remote name.
+    #[wasm_bindgen(js_name = forDestination)]
+    pub fn for_destination(destination: &str) -> Result<WaltrClient, JsValue> {
+        let endpoint = normalize_endpoint(None);
+        let runtime = ClientRuntime::with_destination(endpoint.clone(), destination)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        Ok(Self::with_runtime(endpoint, runtime))
+    }
+
+    fn with_runtime(endpoint: String, runtime: ClientRuntime) -> Self {
         let interaction_transport = runtime.interaction_transport();
         let runtime = runtime.into_state_stream(browser_sleep);
         let latest_snapshot = Rc::new(RefCell::new(

@@ -8,7 +8,7 @@ use url::{Position, Url};
 use crate::access_auth::{AccessAuthHttpClient, OidcVerifier};
 
 use super::super::{
-    OAuthTokenSet, WorkspaceBindingOAuthContext,
+    OAuthTokenSet, RemoteOAuthContext,
     outbound_http::{OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body},
 };
 
@@ -43,7 +43,7 @@ struct IssuerMetadata {
 }
 
 pub(super) struct DeviceStart {
-    pub(super) context: WorkspaceBindingOAuthContext,
+    pub(super) context: RemoteOAuthContext,
     pub(super) device_code: String,
     pub(super) user_code: String,
     pub(super) verification_url: Url,
@@ -77,7 +77,7 @@ pub(super) async fn begin(
     };
     if policy.validate_url(&protected.resource)? != *endpoint {
         return Err(Status::failed_precondition(
-            "protected resource does not match the workspace binding API root",
+            "protected resource does not match the remote API root",
         ));
     }
     let native = protected.waltr_native_client;
@@ -144,7 +144,7 @@ pub(super) async fn begin(
     let device: DeviceAuthorization = decode(response).await?;
     let verification_url = device.display_url(policy, &authorization)?;
     Ok(DeviceStart {
-        context: WorkspaceBindingOAuthContext {
+        context: RemoteOAuthContext {
             endpoint: endpoint.clone(),
             binding_fingerprint,
             publication_incarnation,
@@ -284,7 +284,7 @@ pub(super) enum DevicePoll {
 
 pub(super) async fn poll(
     policy: &OutboundHttpPolicy,
-    context: &WorkspaceBindingOAuthContext,
+    context: &RemoteOAuthContext,
     device_code: &str,
 ) -> Result<DevicePoll, Status> {
     let (url, client) = policy.client_for(context.token_endpoint.as_str())?;
@@ -335,14 +335,12 @@ pub(super) enum RefreshExchangeError {
 
 impl RefreshExchangeError {
     pub(super) fn outcome_unknown() -> Self {
-        Self::Uncertain(Status::unavailable(
-            "workspace binding refresh outcome is unknown",
-        ))
+        Self::Uncertain(Status::unavailable("remote refresh outcome is unknown"))
     }
 
     pub(super) fn into_status(self) -> Status {
         match self {
-            Self::Connect => Status::unavailable("workspace binding refresh connection failed"),
+            Self::Connect => Status::unavailable("remote refresh connection failed"),
             Self::Uncertain(status) => status,
         }
     }
@@ -351,7 +349,7 @@ impl RefreshExchangeError {
 impl RefreshRequest {
     pub(super) async fn prepare(
         policy: &OutboundHttpPolicy,
-        context: &WorkspaceBindingOAuthContext,
+        context: &RemoteOAuthContext,
     ) -> Result<Self, Status> {
         let (url, client) = policy.client_for(context.token_endpoint.as_str())?;
         let verifier = verifier(policy, context).await?;
@@ -364,7 +362,7 @@ impl RefreshRequest {
 
     pub(super) async fn exchange(
         self,
-        context: &WorkspaceBindingOAuthContext,
+        context: &RemoteOAuthContext,
         refresh_token: &str,
     ) -> Result<OAuthTokenSet, RefreshExchangeError> {
         let response = self
@@ -386,7 +384,7 @@ impl RefreshRequest {
             })?;
         if !response.status().is_success() {
             return Err(RefreshExchangeError::Uncertain(Status::unauthenticated(
-                "workspace binding refresh was rejected",
+                "remote refresh was rejected",
             )));
         }
         let token: TokenResponse = decode(response)
@@ -412,7 +410,7 @@ impl TokenResponse {
     pub(super) async fn validate_initial(
         self,
         policy: &OutboundHttpPolicy,
-        context: &mut WorkspaceBindingOAuthContext,
+        context: &mut RemoteOAuthContext,
     ) -> Result<OAuthTokenSet, Status> {
         let verifier = verifier(policy, context).await?;
         let (subject, token) = self.validate(&verifier, context, None).await?;
@@ -423,7 +421,7 @@ impl TokenResponse {
     async fn validate(
         self,
         verifier: &OidcVerifier,
-        context: &WorkspaceBindingOAuthContext,
+        context: &RemoteOAuthContext,
         prior_refresh: Option<&str>,
     ) -> Result<(String, OAuthTokenSet), Status> {
         let invalid =
@@ -449,9 +447,7 @@ impl TokenResponse {
         if principal.issuer() != context.issuer
             || (!context.subject.is_empty() && principal.subject() != context.subject)
         {
-            return Err(Status::unauthenticated(
-                "workspace binding OAuth account changed",
-            ));
+            return Err(Status::unauthenticated("remote OAuth account changed"));
         }
         let jwt_expiry = principal.bearer_expires_at().ok_or_else(invalid)?;
         let expiry = self
@@ -480,7 +476,7 @@ impl TokenResponse {
 
 async fn verifier(
     policy: &OutboundHttpPolicy,
-    context: &WorkspaceBindingOAuthContext,
+    context: &RemoteOAuthContext,
 ) -> Result<OidcVerifier, Status> {
     let url = policy.validate_url(context.jwks_uri.as_str())?;
     let client = AccessAuthHttpClient::build(OutboundHttpPolicy::client_builder())
@@ -493,7 +489,7 @@ async fn verifier(
         Some(&context.client_id),
     )
     .await
-    .map_err(|_| Status::unavailable("workspace binding issuer signing keys are unavailable"))
+    .map_err(|_| Status::unavailable("remote issuer signing keys are unavailable"))
 }
 
 async fn get(policy: &OutboundHttpPolicy, url: &str) -> Result<Response, Status> {

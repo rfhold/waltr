@@ -80,10 +80,7 @@ where
 {
     let credentials = transport.request_credentials();
     let mut client = transport.auth_client(&credentials).await?;
-    let method = if matches!(
-        target.target,
-        Some(auth_target::Target::WorkspaceBindingKey(_))
-    ) {
+    let method = if matches!(target.target, Some(auth_target::Target::RemoteKey(_))) {
         AuthMethod::OauthDevice
     } else {
         AuthMethod::OauthManual
