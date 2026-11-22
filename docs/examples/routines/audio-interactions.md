@@ -49,7 +49,7 @@ Add this binding to the `keybinds` list in `~/.config/waltr/client.yaml` (or `$X
   playback: {}
 ```
 
-The shortcut uses the connected server. To send it to another saved server profile, add `destination: preview` inside `routine`, using that profile's ID. Sign in to that profile first; the shortcut does not switch profiles or start a login.
+The shortcut uses Local by default. For a Remote named `home`, add `destination: home` inside `routine`. Authorize `home` in **Config → Remotes** first. The shortcut does not start a login or select a workspace.
 
 Tap Ctrl+Alt+A, ask a question, then pause for about one second to finish recording. Playback starts when the answer is ready.
 If the mic detects no speech within five seconds, the shortcut stops without sending a request.

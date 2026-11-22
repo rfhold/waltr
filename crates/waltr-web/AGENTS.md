@@ -34,9 +34,9 @@ See [macOS Apps verification](../../docs/testing.md#macos-native-apps-verificati
 
 Hosted Waltr access navigates to server-owned `/oidc/sign-in` with a safe local return path. `/oidc/login` remains the same-device fallback. Browser code never handles provider tokens or the HttpOnly Waltr session cookie. Logout is same-origin POST before dispatching shared protected-state clearing. Keep this UI separate from provider/upstream-MCP `OAuthDialog`; server-callback MCP attempts poll shared lifecycle state and never expose token or PKCE material.
 
-Route access and readiness only from authoritative shared snapshots; do not add an embedded or topology bypass. `ClientAdapter.access` is a generic optional capability. The browser supplies server login and same-origin logout; Tauri supplies native access operations only for an explicit non-`local` server ID. Without access operations, login-required snapshots show no sign-in action and authenticated shells show no sign-out action.
+Route access and readiness only from authoritative shared snapshots. The browser supplies entry login and same-origin logout. Tauri uses embedded admission and exposes neither operation.
 
-`App.tsx` lazy-loads `NativeApp` only for Tauri, except injected loaders and fixtures. `ServerPicker` uses Rust registry IPC for URL plus optional name, explicit first choice, and last-successful-server reconnect. Keep selection outside shared server state. Switch and retry dispose the adapter, remount the keyed provider/router, and reset the route to `/`. Preserve Switch server across startup, access, and authenticated shell surfaces, plus Retry connection on startup failure. See [native server selection](../../docs/architecture/clients.md#native-server-selection-frontend).
+Use document navigation for entry and Remote scope changes so the adapter and router mount together. Keep the Remote authorization ID in destination URLs; never resolve an old detail link against a new grant. See [Destinations](../../docs/architecture/clients.md#destinations).
 
 Pass the exact current generation to native dispatch, access, opener, and disposal IPC. Dispose late startup by its returned generation; never issue unqualified disposal. Keep platform events adapter-private and reject stale recovery or command results.
 

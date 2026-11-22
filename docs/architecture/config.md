@@ -31,7 +31,7 @@ The persisted catalog root is `.waltr/resources`. It accepts these canonical pat
 | `mcp-servers/<name>.yaml` | `McpServer` |
 | `defaults/default.yaml` | `Defaults` |
 | `routines/<name>.yaml` | `Routine` |
-| `workspace-bindings/<name>.yaml` | `WorkspaceBinding` |
+| `remotes/<name>.yaml` | `Remote` |
 
 Each file contains one strict YAML document. The category fixes `kind`. The filename stem must equal `metadata.name`.
 
@@ -45,7 +45,7 @@ Waltr does not merge resource fields. Waltr does not support aggregate patches, 
 
 ## Resource Schemas
 
-Agent, feature, permission, provider, MCP server, defaults and workspace binding resources use `apiVersion: waltr.dev/v1alpha1`. Production Routine resources use `apiVersion: waltr.routine/v1` with top-level `name` and `description`. The catalog rejects unknown fields and invalid path, kind, or name identities. Production rejects legacy Routine DSL overrides. Replace unsupported resources with reviewed current-schema definitions; no converter or fallback exists.
+Agent, feature, permission, provider, MCP server, defaults and remote resources use `apiVersion: waltr.dev/v1alpha1`. Production Routine resources use `apiVersion: waltr.routine/v1` with top-level `name` and `description`. The catalog rejects unknown fields and invalid path, kind, or name identities. Production rejects legacy Routine DSL overrides. Replace unsupported resources with reviewed current-schema definitions; no converter or fallback exists.
 
 Agent, feature, and permission syntax is documented in [Agent Architecture](agent.md#agent-definitions).
 
@@ -55,7 +55,7 @@ A provider catalog selector names a models.dev provider and an `include` list. O
 
 `McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command. Both forms belong to the ordinary catalog schema in every host build.
 
-`WorkspaceBinding` uses `spec.endpoint`, `spec.machineId`, and `spec.exportRoot`. Optional `spec.mcpStdioServers` lists exact stdio `McpServer` names from the exporter's catalog and defaults to empty. The catalog rejects duplicate destination and machine pairs without access to the worker filesystem. Start authorization from Config; credentials are not part of the resource. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
+`Remote` uses `spec.endpoint` and an optional `spec.binding`. A binding contains `machineId`, `exportRoot`, and an optional `mcpStdioServers` list of exact stdio names from the exporter's catalog. The catalog allows one Remote per normalized endpoint. The Remote name selects a destination; the binding's machine ID selects a worker there. Start authorization from Config. The server holds one OAuth grant per Remote; credentials are not part of the resource. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
 
 `Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
 Optional `spec.sessionDictation` selects the session composer's default interaction Routine and ports:

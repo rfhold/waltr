@@ -12,7 +12,7 @@ Waltr client architecture keeps server data coordination in `crates/waltr-client
 | `crates/waltr-desktop/` | Desktop startup configuration, microphone shortcut lifecycle, global shortcuts, and trusted local commands. |
 | `crates/waltr-web/` | Shared Solid routes, forms, transitions, and DOM state; build-time platform selection between hosted browser WASM and Tauri IPC adapters. |
 | `crates/waltr-tui/` | Terminal routes, input handling, rendering, snapshots, environment configuration, and terminal effects around shared native access. |
-| `crates/waltr-app/` | Server profiles, lazy embedded server, native access and secure credentials, Rust client runtime, ordered IPC, navigation policy, and platform packaging. |
+| `crates/waltr-app/` | Embedded entry server, Rust client runtime, ordered IPC, navigation policy, and platform packaging. |
 
 Client shells should not duplicate server data state machines. They consume `waltr-client` snapshots and dispatch `waltr-client` commands, then adapt the resulting state to their UI surfaces.
 
@@ -508,13 +508,13 @@ The stream form coordinates startup and long-lived watches. It waits for status 
 The hosted browser build compiles `waltr-client` to WASM and owns a deterministic adapter disposal path.
 Vite `tauri` mode selects `crates/waltr-web/src/platform/tauri.ts` and emits relative local assets with no WASM import.
 Both browser and Tauri build scripts generate shared WASM artifacts as a prerequisite; Tauri bundles contain no WASM output.
-`crates/waltr-app` hosts one Rust `ClientStateStream` for the selected Local or remote server.
+`crates/waltr-app` hosts one Rust `ClientStateStream` for the current view.
 
-Local selection starts `waltr-server` on demand on an ephemeral IPv4 loopback port. Rust keeps its endpoint and random 256-bit bearer outside IPC and WebView state. Remote selection starts no embedded server and uses native gRPC with optional discovered access configuration.
+The app starts `waltr-server` on demand on an ephemeral IPv4 loopback port. Rust keeps its endpoint and random 256-bit bearer outside IPC and WebView state. Every view connects to that server.
 
 Before publication, Rust removes the exact endpoint and bearer from every serialized client snapshot. This projection does not mutate shared client state.
 
-Web routes use the authoritative shared access and readiness snapshots without a topology override. `ClientAdapter.access` is an optional generic capability. The hosted browser supplies server login and same-origin logout; Tauri supplies native access operations only for an explicit non-`local` server ID. Local admission supplies neither operation. Without access operations, login-required snapshots show no sign-in action and authenticated shells show no sign-out action. Provider and upstream-MCP authorization remains independent.
+Web routes use the authoritative shared access and readiness snapshots. The hosted browser supplies server login and same-origin logout. Tauri's embedded admission supplies neither operation. Provider and upstream-MCP authorization remain independent.
 
 The Tauri bridge preserves these lifecycle invariants:
 
@@ -524,9 +524,8 @@ The Tauri bridge preserves these lifecycle invariants:
 - The uncoalesced initial event arrives before later updates. Eligible snapshots use bounded latest-value coalescing; native `platform` startup controls use a bounded ordered lane and remain adapter-private sequencing inputs rather than app context or route presentation.
 - Commands enter one bounded FIFO and are dispatched in order. Events have monotonic sequences, gaps recover through current state, and stale-generation output is rejected in Rust and TypeScript.
 - Disposal invalidates publication, stops the client runtime, clears its local bearer provider, removes listeners, and rejects later native output.
-- In Local mode, Android activity pause stops only the client runtime. The foreground service keeps the embedded server alive best effort.
-- Local activity resume creates a fresh client generation against the current embedded server generation.
-- In remote mode, activity pause preserves the client generation and its native OAuth attempt. Remote resume requests no local server or notification.
+- Android activity pause stops only the client runtime. The foreground service keeps the embedded server alive best effort.
+- Activity resume creates a fresh client generation against the current embedded server generation.
 - The Android foreground notification exposes a Stop server action. The action requests the current nonblocking native server stop, removes the notification, and stops the service.
 - The Stop command uses `START_NOT_STICKY`. Ordinary service startup remains `START_STICKY`; task-removal continuity remains best effort.
 - Stop persists no disabled setting. A later Local selection or Local activity resume can start a fresh embedded server generation.
@@ -534,14 +533,14 @@ The Tauri bridge preserves these lifecycle invariants:
 - Android Local lifecycle callbacks signal client stop and enqueue retirement without a join. The managed reaper completes teardown off-callback.
 - Server-controller reaper threads separately join exact embedded server generations; client teardown does not change that server contract.
 - A fresh Android Local generation applies current notification permission before it considers a current server connection.
-- A permission-required Local generation remains disconnected until a permission transition permits connection. Remote generations bypass this gate.
+- A permission-required generation remains disconnected until a permission transition permits connection.
 - Notification permission changes publish an adapter-private startup control event to active generations.
 - Each Android lifecycle ticket owns one exact bridge generation after successful start.
 - Suspend invalidates the active start ticket and exact active generation. Resume creates a replacement ticket.
 - A stale or suspended completion stops only its own generation. It cannot stop or claim a replacement generation.
 - The hosted WASM adapter also stops polling, frees its Rust client, clears listeners, and rejects work after disposal.
 
-The embedded server has an independent process-owned lifecycle. Setup creates only its controller; Local selection starts the server. Switching to remote retains an active local server and its durable state. Desktop app exit stops it. Android local service startup alone requires notification permission; remote selection neither starts that service nor requests permission.
+The embedded server has an independent process-owned lifecycle. Setup creates only its controller. A change of view retains the server and its durable state. Desktop app exit stops it. Android requires notification permission for service startup.
 
 A nonblocking server stop moves the exact current generation to `Stopping` and detaches its thread while holding the controller lock. Its reaper joins only that detached generation and publishes `Stopped` or `Failed` only after the join completes.
 
@@ -557,19 +556,13 @@ The app host explicitly enables the curated models.dev seed. Embedded startup re
 
 Generation-bound outbound MCP attempts and credentials do not reopen. Same-generation reauthorization can reuse its valid DCR registration; a replacement generation requires reauthorization and fresh DCR when applicable. Status and cancel report not found for an attempt from an older generation.
 
-## Native Server Selection Frontend
+## Destinations
 
-[`App.tsx`](../../crates/waltr-web/src/app/App.tsx) lazy-loads [`NativeApp`](../../crates/waltr-web/src/app/NativeApp.tsx) only in Tauri builds. Injected adapter loaders and fixture routes retain the direct provider/router path. Hosted browser builds do not load the native picker boundary.
+The entry server is the embedded server in Tauri, the current origin in a hosted browser, and the configured endpoint in the TUI. Open a named Remote from **Config → Remotes** in the web shell, or set `WALTR_DESTINATION` for the TUI. Remote web views carry the destination in the URL. Unqualified URLs and shortcuts with no destination use the entry server.
 
-[`ServerPicker`](../../crates/waltr-web/src/app/ServerPicker.tsx) reads the Rust registry through [`platform/tauri.ts`](../../crates/waltr-web/src/platform/tauri.ts). First launch requires an explicit choice. On initial registry load, a valid `lastConnectedId` reconnects the last successful server without a registry write from the frontend.
+The shared transport sends `waltr-destination: <name>@<id>` on destination-scoped calls, including watch streams and Routine media. Typed API callers obtain `<id>` from `GetAuthStatus` for the entry server's `RemoteKey` target, in `metadata.remoteRouteId`. The ID binds the view to a grant, survives token refresh, and is not a credential. A new grant requires a fresh view. Remote resource writes and Remote authorization controls stay at the entry.
 
-The picker lists the built-in Local profile and saved remote profiles. It passes the endpoint text to the Rust registry and accepts an optional name of at most 100 characters. The registry requires a URL without credentials, query, or fragment and requires HTTPS except for `localhost`, `127.0.0.1`, or `[::1]`. It normalizes URLs and deduplicates profiles by endpoint. The frontend accepts no client secret or token. Registry failures use fixed messages and a list retry action. The picker offers removal only for remote profiles.
-
-[`ServerProfiles`](../../crates/waltr-app/src/server_profiles.rs) atomically persists app-data `servers.json`. Only an authenticated shared snapshot records `lastConnectedId`; a save or failed connection does not. Remote profiles have opaque stable IDs. Local has the fixed nonremovable ID `local` and no public endpoint.
-
-Selection creates a fresh adapter loader and resets the route, query, and fragment to `/`. Switch server clears selection and reloads the registry. Retry connection remounts the same selection. The keyed provider/router boundary disposes the old adapter and clears drafts and server-specific UI state. Neither action invokes profile removal or logout.
-
-[`ServerControls`](../../crates/waltr-web/src/app/ServerControls.tsx) and [`serverSelection`](../../crates/waltr-web/src/app/serverSelection.tsx) keep selection operations outside shared server state. Switch server remains available during startup, access checks/login, and the authenticated shell. Startup load or connection failures also expose Retry connection. Access routes still derive login progress and failure from shared snapshots.
+The entry server authenticates callers and uses its own OAuth grant for one-hop forwarding. Entry credentials never leave the entry server. An unavailable destination does not fall back to the entry server or replay requests. Public MCP access remains direct. Session MCP Apps receive typed content through the client transport and render in the entry client's isolated container.
 
 ### Frontend IPC Contract
 
@@ -577,15 +570,11 @@ The adapter listens before runtime start and preserves generation/sequence check
 
 | IPC command | Arguments |
 | --- | --- |
-| `list_servers` | None. |
-| `save_server` | `{ url, name }`. |
-| `remove_server` | `{ serverId }`. |
-| `start_runtime` | `{ serverId }`; returns the generation and platform-gated `dictation` capability. |
+| `start_runtime` | `{ destination? }`; connects to the embedded server and returns the generation and platform-gated `dictation` capability. |
 | `dictation_start` | `{ generation, operationId, selection: { routine, trigger, input, output }, sessionId }`; session identity stays local. |
 | `dictation_finish`, `dictation_status`, `dictation_cancel` | `{ generation, operationId }`; no media crosses IPC. |
 | `client_state` | `{ afterSequence }`; the adapter validates the returned generation. |
 | `client_dispatch` | `{ command, generation }`. |
-| `start_access_login`, `logout_access` | `{ generation }`; only explicit remote selections expose these access operations. |
 | `open_authorization_attempt` | `{ attemptId, generation }`. |
 | `open_external_url` | `{ url, generation }`. |
 | `dispose_runtime` | `{ generation }`. |
@@ -745,7 +734,7 @@ It grants no requested external CSP origins or browser permissions, and ignores 
 
 Normal Apple Silicon macOS builds enable Apps without a diagnostic feature, separate profile, or prior isolation report.
 Target-specific Cargo dependencies select container assets, served app assets, and the WKWebView adapter.
-Rust starts a separate trusted loopback asset listener for each selected client runtime, for Local and remote profiles alike.
+Rust uses a separate trusted loopback asset listener for the isolated App container.
 The listener serves no API and receives no API bearer.
 Runtime switch or disposal detaches the exact WK navigation policy and shuts down its asset listener.
 Apps assets do not require the embedded server.
@@ -820,13 +809,13 @@ The transport decodes version-1 `AuthenticationFailure` protobuf status details.
 
 Expiry or failed native refresh clears protected config, status, sessions, timelines, streams, and in-flight protected operation state. It preserves watch interests and reload intent, but invalidates the status watch epoch so late events from an old credential cannot reauthenticate the client. Login completion starts a new status epoch. A current-epoch protected status event establishes authentication, then child watches reopen according to interest and config/session collections reload. Explicit logout also clears watch interests.
 
-Native transports attach the current in-memory bearer credential to each unary request and newly opened stream. Remote native credential leases use monotonic generations. Tauri Local installs its process-generation bearer before the client stream starts. Remote Tauri uses the shared access coordinator. Browser gRPC-web relies on same-origin cookies.
+Native transports attach the current in-memory bearer to each unary request and newly opened stream. Native credential leases use monotonic generations. Tauri installs its embedded process-generation bearer before the client stream starts. Browser gRPC-web relies on same-origin cookies.
 
 Remote native HTTPS uses rustls with the ring provider, TLS 1.2 or 1.3, and bundled Mozilla roots. Only Tauri Local uses host-created HTTP loopback instead. Native OTLP export keeps the bundled-root policy. Hosted browser and WebView Faro retain platform trust.
 
-Remote native logout clears its in-memory credential and follows the native access store contract. The Tauri frontend exposes logout for remote selections only; local admission supplies no user access operations.
+TUI logout clears its in-memory entry credential. The embedded app supplies no entry login or logout. Remote authorization and sign-out use **Config → Remotes**.
 
-Hosted browser sign-in uses the server's public sign-in page and a validated local return path. The browser calls `/oidc/logout` with same-origin credentials. The TUI supplies environment-derived native configuration, terminal presentation, and browser launch. The Tauri host supplies lazy Local ownership, native refresh-token persistence, and OS browser launch. Remote native sign-in presents a locally generated QR code and manual verification details; **Sign in on this device** uses the existing browser callback. Native control events remain adapter-private sequence inputs. The generation-scoped restoration diagnostic presents “Restoring sign-in…” instead of starting a new grant or showing expired-session actions. Shared snapshots alone still authorize routes and protected watches. See [Access Authentication](access-authentication.md#tauri-native-host-adapter) for callback, storage, refresh, sign-out, and removal contracts.
+Hosted browser sign-in uses the server's public sign-in page and a validated local return path. The browser calls `/oidc/logout` with same-origin credentials. The TUI supplies environment-derived native configuration, terminal presentation, and browser launch. See [Access Authentication](access-authentication.md) for entry admission and outbound Remote authorization.
 
 Outbound provider/MCP authorization remains separate from Waltr access and begins only through an explicit Config action. One generic target-scoped command family lists and reads sanitized status, begins and completes authorization, inspects or cancels attempts, forces refresh, and resets credentials for either target kind. The shared reducer exports statuses and keyed operation results alongside an opaque attempt ID, authorization URL, expiry, completion mode, registration method, lifecycle, and sanitized failure reason. For server-callback attempts the shared runtime polls `PollAuthAttempt`; shells render snapshots and can cancel the explicit attempt. Manual attempts submit the final redirect URL or code. Session surfaces require an explicit retry after authentication.
 
@@ -874,7 +863,7 @@ Browser, TUI, and Tauri implementations should follow these rules:
 - Keep Waltr access state distinct from provider/upstream-MCP `AuthTarget` state, and ignore stale login attempts, credential leases, and watch epochs.
 - Keep WebView telemetry and native Rust telemetry separate. The hosted WebView owns same-origin propagation; the native transport owns Tauri gRPC propagation.
 - Preserve the Tauri secret boundary, native target limits, fixed panic payload exclusions, and hardened exporter transport. Treat standard Faro data as high-detail personal-use telemetry.
-- Keep Tauri's private Local endpoint and all access credentials in Rust. IPC exposes public profiles, snapshots, commands, asset bootstrap, and bounded controls. Native controls stay outside route presentation.
+- Keep Tauri's private Local endpoint and all access credentials in Rust. IPC exposes snapshots, commands, asset bootstrap, and bounded controls. Native controls stay outside route presentation.
 - Redact the endpoint and bearer from every Tauri snapshot. Redact any authorization URL that contains the endpoint.
 - Open a redacted authorization URL only through the opaque current attempt-ID command. Keep the full URL in Rust.
 - Keep remote content out of privileged WebViews. Tauri main-WebView navigation is restricted to packaged local content, new windows are denied, and Rust opens only credential-free HTTPS URLs that pass its external URL policy.

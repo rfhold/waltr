@@ -19,7 +19,6 @@
 | [src/audio_permissions.rs](src/audio_permissions.rs) | Audio-only permission tickets, foreground policy, and stale-grant rejection. |
 | [src/audio_permissions_macos.rs](src/audio_permissions_macos.rs) | Apple Silicon AVFoundation audio-only permission adapter. |
 | [../../docs/architecture/clients.md#native-app-audio-composition](../../docs/architecture/clients.md#native-app-audio-composition) | Native audio ownership, IPC, lifecycle, and platform capability contract. |
-| [src/server_profiles.rs](src/server_profiles.rs) | Nonsecret profile registry, strict endpoint normalization, and last-success persistence. |
 | [src/native_auth.rs](src/native_auth.rs) | Verified discovery binding and native authorization browser policy. |
 | [src/credential_store.rs](src/credential_store.rs) | Identity-bound desktop local-file/AndroidKeyStore refresh persistence and server-wide deletion fences. |
 | [src/credential_store/localfile.rs](src/credential_store/localfile.rs) | Unix private files, atomic replacement, and cross-process revocation epochs. |
@@ -40,9 +39,9 @@
 
 # Boundaries
 
-This crate owns the Tauri shell, server profiles, lazy embedded server, native client transport, access host adapters, secure credentials, and IPC.
+This crate owns the Tauri shell, embedded server lifecycle, native client transport, and IPC.
 
-Local uses the private generation bearer. Remote profiles use shared native access after verified URL-only discovery. See [native access](../../docs/architecture/access-authentication.md#tauri-native-host-adapter) and [server selection](../../docs/architecture/clients.md#native-server-selection-frontend).
+The native client always connects to the embedded entry server using its private generation bearer. A named [destination](../../docs/architecture/clients.md#destinations) scopes a view or shortcut without changing the connection.
 
 Keep the ephemeral loopback endpoint and random 256-bit local bearer in Rust. Never expose either value through IPC, logs, telemetry, Kotlin, or WebView state.
 
@@ -99,19 +98,7 @@ Keep the tray optional and its menu limited to status, Open Waltr, and Quit.
 Preserve normal window-close and exit behavior.
 See [external text](../../docs/architecture/clients.md#live-external-text) and [platform prerequisites](../../docs/deployment.md#desktop-tray-and-external-text) for canonical constraints.
 
-Start the embedded server only for Local selection. Retain an active local server across remote switches. Remote selection requests no Android service or notification.
-
-Keep profiles nonsecret in app-data `servers.json`. Record last success only from an authenticated shared snapshot. Never remove Local.
-
-Bind refresh storage to server ID, normalized endpoint, exact discovered issuer, client ID, effective scope set, and audience. macOS/Linux use native-owned app-data local files with validated owner-only permissions, descriptor-relative no-follow access, atomic replacement, and durable cross-process generation fences. Android retains AndroidKeyStore-encrypted atomic files. Windows reports unavailable pending separate ACL work. Add no backend selector, keyring, migration, or fallback. See the canonical native-access storage contract for the trusted ancestor and failed durable-revocation limits.
-
-Keep the credential root native-owned and pass it through initial binding, fresh sign-in, logout, and removal. Never expose tokens, credential paths, or raw filesystem errors through IPC, profiles, or logs.
-
-Stop auth tasks before server-wide credential deletion. Fence old store handles against detached writes. Delete secure credentials before profile removal; preserve the registry entry on deletion failure. Switch and ordinary disposal retain refresh credentials.
-
-Forward only bounded warm Android intents to the current coordinator. Keep exact callback/state validation in shared native access. Do not restore cold-start OAuth attempts.
-
-Keep native access progress private to IPC sequencing; web presentation follows shared snapshots.
+Start the embedded entry server for every client view. Changing view destination does not stop that server. Do not expose its bearer or outbound Remote credentials through IPC or logs.
 
 Use explicit app data and config roots for all embedded state. Resource overrides live exactly at app config `server/.waltr/resources`.
 
@@ -123,7 +110,7 @@ Desktop and Android load the same ordinary bundled and persisted resource catalo
 
 Android notification permission gates foreground-service startup. The non-exported same-process `specialUse` service owns the server and survives activity pause or task removal best effort.
 
-Local activity pause stops only the client runtime. Local resume creates a fresh client generation against the current server generation. Remote pause preserves its runtime and native OAuth attempt; remote resume requests no local server.
+Activity pause stops only the client runtime. Resume creates a fresh client generation against the current embedded server generation.
 
 Suspend may preserve one unexpired pending outbound authorization attempt for only the immediate replacement client generation against the same server generation. Keep that handoff process-local, single-use, stale-safe, and secret-safe; ordinary stop, disposal, terminal state, skipped generations, and server replacement must clear it.
 

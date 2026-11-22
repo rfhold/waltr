@@ -98,21 +98,24 @@ The exporting server's worker opens an outbound HTTP/2 connection. The destinati
 
 **Destination.** The [OIDC deployment](#oidc-access-domains) serves `/waltr.sandbox.v1.SandboxService/Connect` on the main API listener. Configure the HTTPS proxy to forward this bidirectional gRPC stream over HTTP/2 and preserve its `Authorization` header. The destination's advertised native OAuth client must support the device grant.
 
-**Exporter.** Add `.waltr/resources/workspace-bindings/laptop.yaml` to the exporting server's configuration:
+**Exporter.** Add `.waltr/resources/remotes/home.yaml` to the exporting server's configuration:
 
 ```yaml
 apiVersion: waltr.dev/v1alpha1
-kind: WorkspaceBinding
+kind: Remote
 metadata:
-  name: laptop
+  name: home
 spec:
   endpoint: https://waltr.example
-  machineId: laptop
-  exportRoot: ~/repos
-  mcpStdioServers: []
+  binding:
+    machineId: laptop
+    exportRoot: ~/repos
+    mcpStdioServers: []
 ```
 
-On the exporting server, select the binding in Config and choose **Authorize**. Follow the device sign-in instructions for the destination. The exporting server keeps and refreshes the grant outside YAML. Reset authorization or remove the binding to stop the export. Desktop profile switches do not stop a running server's exports.
+On the exporting server, open **Config → Remotes** and authorize `home`. Follow the destination's device sign-in instructions. One OAuth account covers both routed calls and the optional workspace binding. Omit `binding` if you only need routing. Remove `binding` to stop exporting, or sign out of the Remote to revoke both uses.
+
+Use `destination: home` in a desktop shortcut and `workspace.machine: laptop` when selecting the worker. The Remote name selects a server; the machine ID selects a workspace on that server. Replace old `WorkspaceBinding` files and profile IDs by hand. There is no config migration.
 
 Use HTTPS without a path prefix, URL credentials, query, or fragment. A machine ID identifies one peer at that destination; use 1–128 ASCII letters, digits, periods, underscores, or hyphens. `local` is reserved. The worker resolves `exportRoot` in its own filesystem and expands `~` against its own home. The root sets the starting location, not a sandbox. The tool policy can allow paths outside it, and shell commands inherit the worker's operating-system permissions and mounts. For a sidecar, mount the directory in the worker.
 
@@ -683,11 +686,7 @@ Use [Telemetry Smoke Checks](runbooks/telemetry-smoke.md) after a build and runt
 
 ## Tauri Application
 
-`crates/waltr-app/` always loads packaged local `crates/waltr-web/` assets and runs the shared client in Rust. The picker selects Local or a saved remote profile. First launch requires a choice; later launches reconnect the last server that reached an authenticated shared snapshot.
-
-App-data `servers.json` stores only nonsecret profiles and the last successful ID. Rust requires HTTPS except for exact loopback hosts and rejects URL credentials, queries, and fragments. Profile saves do not connect automatically. Switch server disposes the selected client and clears server-specific routes and drafts. Retry connection remounts the same selection.
-
-Local starts the embedded `waltr-server` lazily on an ephemeral IPv4 loopback endpoint. Switching away retains an active local server and its state. Remote selection starts no embedded server or Android foreground service and requests no notification permission.
+`crates/waltr-app/` loads packaged web assets and runs the shared client in Rust. It connects to the embedded `waltr-server` on an ephemeral IPv4 loopback endpoint, including when a view or shortcut targets a configured Remote. The app no longer reads a saved server registry.
 
 Each server generation receives a random 256-bit local bearer. Rust keeps the endpoint and bearer out of IPC, WebView state, logs, and telemetry.
 

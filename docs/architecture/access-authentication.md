@@ -67,7 +67,7 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 
 API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before each stateless MCP request dispatch.
 
-An OIDC access-authenticated server serves `/waltr.sandbox.v1.SandboxService/Connect` on the main API listener. It accepts the native API OAuth bearer, not browser cookies or the private self-MCP credential. A `WorkspaceBinding` uses the destination's device authorization flow for that API. The exporting server keeps the grant; its worker receives only the expiring access token over the private worker connection. The destination binds the live machine claim to the verified issuer and subject, and the stream cannot outlive the bearer. If a Routine request claims an origin, the destination compares the caller's OAuth account with the live claim. A machine claim grants no tool permission. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
+An OIDC access-authenticated server serves `/waltr.sandbox.v1.SandboxService/Connect` on the main API listener. It accepts the native API OAuth bearer, not browser cookies or the private self-MCP credential. A `Remote` uses the destination's device authorization flow for that API. The exporting server keeps the grant; its worker receives only the expiring access token over the private worker connection. The destination binds the live machine claim to the verified issuer and subject, and the stream cannot outlive the bearer. If a Routine request claims an origin, the destination compares the caller's OAuth account with the live claim. A machine claim grants no tool permission. See [workspace exports](../deployment.md#export-a-workspace-to-another-waltr-server).
 
 ## Standalone Private Self-MCP Admission
 
@@ -99,7 +99,7 @@ Explicit async shutdown remains the completion boundary for callers that require
 
 ## Embedded Local Admission
 
-Tauri starts an access-disabled embedded server only after Local selection, on a prebound ephemeral `127.0.0.1` port. Local admission uses no browser or native Waltr access OAuth. Remote profiles use the separate [native host adapter](#tauri-native-host-adapter).
+Tauri starts its embedded server on demand on a prebound ephemeral `127.0.0.1` port. Local admission uses no browser or native Waltr access OAuth. That server owns outbound [Remote authorization](#server-owned-remote-authorization).
 
 `waltr-app` creates a random 256-bit bearer for each embedded server generation. Rust retains both the endpoint and bearer.
 
@@ -216,37 +216,11 @@ Compensation restores the previous refresh token or deletes only the matching at
 
 This remote native boundary does not change hosted browser access. Hosted browser navigation and gRPC-web remain same-origin and cookie-based.
 
-### Tauri Native Host Adapter
+### Server-Owned Remote Authorization
 
-[`waltr-app`](../../crates/waltr-app/src/lib.rs) discovers native configuration for each remote selection through the URL-only bootstrap helper. If discovery fails, a ten-second anonymous status probe distinguishes public access from an unusable native bootstrap. A successful status response permits the remote runtime without a native coordinator. Otherwise, startup returns a fixed public explanation with Retry connection and Switch server actions. Local selection skips discovery. Authenticated older servers require compatible bootstrap metadata; the app exposes no explicit client-configuration form.
+The Tauri app uses only [embedded Local admission](#embedded-local-admission). The entry server discovers the destination's native API and uses its OAuth device flow. **Config → Remotes** exposes the authorization status and actions. The entry server stores one grant per Remote and uses its access token for both routed RPCs and the optional workspace export.
 
-The desktop and Android access screen starts phone sign-in after saved-session restoration finishes and sign-in is required. Rust encodes the QR locally and sends only bounded presentation data to the packaged WebView. The same-device option uses an ephemeral loopback callback on desktop and `dev.waltr.app:/oauth2redirect` on Android. Rust opens the validated authorization URL through the operating system and retains the protocol state outside snapshots.
-
-Android [`MainActivity`](../../crates/waltr-app/gen/android/app/src/main/java/dev/waltr/app/MainActivity.kt) forwards bounded warm `ACTION_VIEW` intents from `onNewIntent` to the current Rust generation. The shared coordinator validates the exact redirect, state, and code/error parameters. Remote activity pause preserves that generation so browser return can complete the same attempt. Cold-start intents do not restore an attempt; initial intent data has no callback handoff. Process death loses pending state and requires a new login.
-
-[`CredentialStore`](../../crates/waltr-app/src/credential_store.rs) namespaces refresh tokens by saved server ID, normalized endpoint, exact discovered issuer, client ID, effective scope set, and audience. A new runtime uses current verified discovery before it constructs that namespace. The nonsecret `servers.json` registry stores profiles and the last successful server, never tokens or issuer caches.
-
-| Platform | Refresh-token persistence |
-| --- | --- |
-| macOS and Linux | Native-owned local files under app-data `native-refresh-v1`, with hashed per-server directories and identity accounts. |
-| Android | Atomic encrypted files under `noBackupFilesDir`, with per-server non-exportable AndroidKeyStore AES-256-GCM keys and identity-bound authenticated data. |
-| Windows and other targets | Persistence returns unavailable pending a separate Windows ACL implementation. No file fallback exists. |
-
-Android initializes its application-context [`SecureTokenStore`](../../crates/waltr-app/gen/android/app/src/main/java/dev/waltr/app/SecureTokenStore.kt) through JNI. Store work uses blocking workers, not activity callbacks. Release ProGuard rules preserve the store and JNI entry points. Both platform adapters return bounded errors without secret text.
-
-The coordinator restores a stored refresh token, refreshes access near expiry, and persists token rotation. Access tokens remain in process memory. Storage failures emit bounded native diagnostics; interactive access can remain process-local when a bound store becomes unavailable. Without a refresh token, access expires at its declared lifetime. Desktop upgrades require a fresh sign-in: there is no Keychain backend, migration, legacy read, or legacy deletion.
-
-Desktop credential directories are created and validated as owner-only `0700`; records and same-directory exclusive random temporary files are `0600` at creation. Existing foreign-owned, permissive, symlink, hard-linked, and nonregular records are rejected rather than repaired. The native-supplied app-data directory is the trusted ancestor boundary; this does not defend against a fully hostile same-user process replacing ancestors. Descendants use safe descriptor-relative no-follow operations. Reads are bounded, and replacement writes and syncs a new file, renames it atomically, then syncs its directory without truncating the prior record. Refresh-token files are plaintext protected by these filesystem permissions, not encrypted by an OS keyring. Keep the app-data directory private and exclude credentials from exports and backups that are not independently protected.
-
-macOS also rejects every extended ACL on credential directories, records, and temporary files before token writes. The isolated `waltr-file-acl` crate inspects open descriptors through Apple APIs; it never repairs ACLs. ACL absence requires a valid empty ACL or successful descriptor security metadata with no ACL. `ENOENT` alone does not prove absence. Inspection failures produce only the bounded unavailable category.
-
-On Linux, standard POSIX access ACL entries for named users and groups remain subject to the mask in the group mode bits. Exact `0700`/`0600` modes mask those entries to zero; other permissions remain zero. Default ACLs govern inheritance, and creation modes bound each child's effective access ACL. This policy does not claim guarantees for non-POSIX filesystem ACL behavior, privileged users, or hostile same-UID processes.
-
-Every desktop operation holds the server namespace's filesystem lock and checks a persistent generation. Cross-process lock contention returns unavailable without retrying or waiting indefinitely; the existing in-process lock still serializes local operations. Server-wide deletion commits and syncs the next generation before deleting owned hashed records and staging files; lock and generation files remain. Old handles in all cooperating processes are then stale even if later token deletion fails. If generation advancement or sync fails, logout fails and the credential/profile is preserved; the local in-process fence still advances, but other processes' old handles may remain valid because durable revocation did not commit. Partial commits may conservatively invalidate more handles and are never rolled back. No required failure is reported as successful logout or profile removal.
-
-Generation-scoped native restoration progress begins before loading the stored token and ends on every completion or preemption path. While pending, the access screen announces “Restoring sign-in…” and hides premature expired-session errors and sign-in actions. Successful restoration goes through the ordinary status reprobe before its indicator clears; presentation never grants access or bypasses shared status/watch epochs. Genuine terminal failure remains visible afterward.
-
-Sign out stops the coordinator, clears the in-memory bearer and shared protected state, and deletes every credential identity for that server. Removal stops an active selection and deletes its secure credentials before the registry entry. Deletion invalidates old store handles so detached writes cannot recreate credentials. A deletion failure reports an error; profile removal preserves the registry entry. Switching or ordinary runtime disposal retains refresh tokens for later restore. Local admission retains its separate process-generation bearer contract.
+A caller needs authenticated access to the entry server. The routed call has the identity of the Remote's authorized account at the destination. The entry server sends neither the original bearer nor the browser cookie. The destination never receives embedded Local admission. Old desktop profile credentials and old workspace-binding credentials do not authorize a Remote.
 
 ## MCP Flow
 

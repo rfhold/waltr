@@ -36,7 +36,7 @@ One application-owned `InvocationService` serves public RPCs, semantic events, c
 
 ### Select the desktop shortcut's workspace
 
-A desktop shortcut runs on the connected server unless its `routine.destination` names a saved server profile. The destination uses that profile's saved login; the app does not switch its active connection or fall back to another server. The shortcut destination does not select a workspace.
+A desktop shortcut runs on Local unless `routine.destination` names a Remote. The embedded server forwards the call under the Remote's OAuth account. The app checks the destination before it requests microphone access. It does not fall back to another server. The destination does not select a workspace.
 
 The Routine can select an exported machine explicitly. If an API caller supplies an origin machine, Waltr records it only when the [OAuth account](access-authentication.md#hosted-public-and-protected-surfaces) owns the live claim. `invocation.context` exposes that value as `originMachineId`. Without an authenticated origin, the property is absent.
 
