@@ -247,21 +247,6 @@ impl PendingTransport {
         }
         Ok(())
     }
-    pub(super) async fn selected_text(&self) -> Result<Vec<p::TextResultDescriptor>, Status> {
-        let binding = self.binding().map_err(wire::error)?;
-        self.store
-            .get(
-                ObservationScope {
-                    principal: self.principal.clone(),
-                    source_session: None,
-                },
-                binding.id().into(),
-            )
-            .await
-            .map_err(wire::error)?
-            .ok_or_else(|| Status::unavailable("terminal view unavailable"))
-            .map(|view| view.text_results.into_iter().map(wire::text).collect())
-    }
     #[allow(
         clippy::too_many_arguments,
         reason = "all process and principal resource pools are explicitly injected"

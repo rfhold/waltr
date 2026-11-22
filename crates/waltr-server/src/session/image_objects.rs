@@ -10,7 +10,9 @@ use std::{
 
 use tracing::instrument::WithSubscriber;
 use waltr_agent::{
-    MAX_TRANSIENT_ATTACHMENT_BYTES, MessageImageDescriptor, MessageImageFormat, S3SessionWriteMode,
+    MAX_TRANSIENT_ATTACHMENT_BYTES, MessageImageDescriptor, MessageImageFormat,
+    MessageImageLoadError, MessageImageLoadFuture, MessageImageLocation, MessageImageReference,
+    MessageImageResolver, S3SessionWriteMode, TransientAttachmentBuffer,
 };
 
 use crate::routine_objects::{
@@ -20,6 +22,61 @@ use crate::routine_objects::{
 mod capacity;
 
 use capacity::{Capacity, SAVED_IMAGE_BYTES_PER_PRINCIPAL};
+
+pub(crate) fn quota_identity(principal: &crate::access_auth::AuthenticatedPrincipal) -> String {
+    // Length framing keeps the exact issuer/subject pair unambiguous.
+    format!(
+        "{}:{}{}",
+        principal.issuer().len(),
+        principal.issuer(),
+        principal.subject()
+    )
+}
+
+pub(crate) struct SavedImageResolver {
+    objects: SessionImageObjects,
+    slots: tokio::sync::Semaphore,
+}
+
+impl SavedImageResolver {
+    pub(crate) fn new(objects: SessionImageObjects) -> Self {
+        Self {
+            objects,
+            slots: tokio::sync::Semaphore::new(8),
+        }
+    }
+}
+
+impl MessageImageResolver for SavedImageResolver {
+    fn load<'a>(
+        &'a self,
+        _location: MessageImageLocation<'a>,
+        image: MessageImageReference,
+        target: &'a mut TransientAttachmentBuffer,
+    ) -> MessageImageLoadFuture<'a> {
+        Box::pin(async move {
+            let MessageImageReference::Saved(image) = image else {
+                return Err(MessageImageLoadError::Missing);
+            };
+            let _permit = self
+                .slots
+                .try_acquire()
+                .map_err(|_| MessageImageLoadError::Unavailable)?;
+            let bytes = self.objects.get(image).await.map_err(|error| match error {
+                ImageObjectError::Missing => MessageImageLoadError::Missing,
+                ImageObjectError::Invalid | ImageObjectError::Corrupt => {
+                    MessageImageLoadError::Corrupt
+                }
+                ImageObjectError::Capacity | ImageObjectError::Unavailable => {
+                    MessageImageLoadError::Unavailable
+                }
+            })?;
+            target
+                .append(&bytes)
+                .map_err(|_| MessageImageLoadError::Corrupt)
+        })
+    }
+}
 
 /// Internal image-store failure, with no object key or payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -515,6 +515,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 let helper_factory = factory.clone();
                 let helper_inference = inference.clone();
                 let helper_principal = request.principal.clone();
+                let helper_authenticated = request.authenticated.clone();
                 let helper_restriction = restriction.clone();
                 let helper_catalog = snapshot.clone();
                 let source_bundle = bundle.clone();
@@ -529,6 +530,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                             None,
                             helper_principal.clone(),
                         )?
+                        .with_image_principal(&helper_authenticated)
                         .with_catalog(helper_catalog.clone(), helper_inference.clone())
                         .with_source_definition(source_bundle.clone())
                         .with_permission_restriction(helper_restriction.clone()),
@@ -576,6 +578,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
                 copy,
                 request.principal.clone(),
             )?
+            .with_image_principal(&request.authenticated)
             .with_catalog(snapshot.clone(), inference.clone())
             .with_source_definition(bundle.clone());
             let helpers = Arc::new(

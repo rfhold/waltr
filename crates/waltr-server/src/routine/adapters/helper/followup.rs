@@ -32,7 +32,8 @@ struct Target<S: SessionStore + Clone + Send + Sync + 'static> {
     state: Arc<tokio::sync::Mutex<State>>,
     changed: Arc<Notify>,
     result: ResultWait,
-    images: Arc<images::LiveImages>,
+    image_objects: Option<crate::session::image_objects::SessionImageObjects>,
+    image_quota_identity: Option<Arc<str>>,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for Target<S> {
     fn clone(&self) -> Self {
@@ -46,7 +47,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for Target<S> {
             state: self.state.clone(),
             changed: self.changed.clone(),
             result: self.result.clone(),
-            images: self.images.clone(),
+            image_objects: self.image_objects.clone(),
+            image_quota_identity: self.image_quota_identity.clone(),
         }
     }
 }
@@ -93,7 +95,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperTarget for Target<S>
     fn submit(&self, content: HelperContent) -> PortFuture<()> {
         let this = self.clone();
         Box::pin(async move {
-            let pending = images::prepare(content, None)?;
             let mut state = this.state.lock().await;
             if state.sealed
                 || this.cancel.is_cancelled()
@@ -102,7 +103,16 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperTarget for Target<S>
             {
                 return Err(PortError::Denied);
             }
-            let (message, pending) = this.images.retain(pending)?;
+            let message = tokio::select! {
+                biased;
+                () = this.cancel.cancelled() => return Err(PortError::Unavailable),
+                result = tokio::time::timeout_at(this.deadline, images::prepare(
+                    content,
+                    None,
+                    this.image_objects.as_ref(),
+                    this.image_quota_identity.as_deref(),
+                )) => result.map_err(|_| PortError::Unavailable)??,
+            };
             let submission = this
                 .sessions
                 .submit_owned_next_turn_message(
@@ -113,7 +123,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperTarget for Target<S>
                 )
                 .await
                 .map_err(|_| PortError::Unavailable)?;
-            pending.accepted();
             state.waits.push(wait(submission));
             this.changed.notify_one();
             Ok(())
@@ -201,7 +210,6 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
     record: &SessionRecord,
     runtime: AgentRuntime,
     input: Option<waltr_agent::TransientInput>,
-    images: Arc<images::LiveImages>,
     limits: AgentRunLimits,
     cancel: CancellationToken,
     deadline: tokio::time::Instant,
@@ -257,7 +265,8 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
         })),
         changed: Arc::new(Notify::new()),
         result: opening.result,
-        images,
+        image_objects: runner.factory.session_image_objects().cloned(),
+        image_quota_identity: runner.image_quota_identity.clone(),
     };
     if opening.ready.send(Arc::new(target.clone())).is_err() {
         cancel.cancel();

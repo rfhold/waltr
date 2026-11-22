@@ -147,7 +147,7 @@ fn envelope_charge(
     }
     Err(TextResultError::Invalid)
 }
-fn decode_descriptor(record: &str) -> Result<TextResultDescriptor, TextResultError> {
+pub(super) fn decode_descriptor(record: &str) -> Result<TextResultDescriptor, TextResultError> {
     if record.len() > 1024 {
         return Err(TextResultError::Unavailable);
     }

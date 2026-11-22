@@ -1076,6 +1076,9 @@ async fn vertical_with_recognition(
         waltr_agent::provider::OpenAiChatCompletions::new("fake").with_url(provider.url.clone()),
     );
     let broker = InteractionBroker::new();
+    let image_root = root.join("session-images-fixture");
+    let image_objects = crate::session::image_objects::SessionImageObjects::filesystem(&image_root)
+        .unwrap();
     let factory = Arc::new(
         AgentSessionRuntimeFactory::new(
             sandbox.handle(),
@@ -1083,6 +1086,7 @@ async fn vertical_with_recognition(
             FileCredentialStore::new(root.join("unused-auth.json")),
             catalog.resolved("media").unwrap().clone(),
         )
+        .with_session_image_objects(image_objects)
         .with_agent_catalog_provider(move || catalog.clone())
         .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(model(), native.clone())))
         .with_capability_policy(ServerPermissionPolicy::sessions(broker.clone())),
@@ -1154,7 +1158,8 @@ async fn vertical_with_recognition(
         None,
         "owner".into(),
     )
-    .unwrap();
+    .unwrap()
+    .with_image_principal(&crate::access_auth::AuthenticatedPrincipal::anonymous_disabled());
     let helpers = Arc::new(match helper_catalog {
         Some(catalog) => {
             assert!(models.is_empty());
@@ -1624,6 +1629,36 @@ async fn vertical_with_recognition(
         );
     }
     assert!(driver.joined.load(Ordering::SeqCst));
+    if program.contains("name: media-image-turns") {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let summaries = sessions.store().list().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        let record = sessions.store().load(&summaries[0].id).await.unwrap();
+        let image_parts = record
+            .timeline_events()
+            .filter_map(|event| match &event.content {
+                TimelineContent::UserMessage { message } => Some(message.parts()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                UserMessagePart::Image { image } => Some(*image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let reopened = crate::session::image_objects::SessionImageObjects::filesystem(&image_root)
+            .unwrap();
+        assert_eq!(image_parts.len(), 2);
+        for (reference, encoded) in image_parts.into_iter().zip([TOOL_PNG, &next_fixture_png()]) {
+            let MessageImageReference::Saved(descriptor) = reference else {
+                panic!("saved helper message contained an invocation image");
+            };
+            assert_eq!(
+                reopened.get(descriptor).await.unwrap(),
+                STANDARD.decode(encoded).unwrap()
+            );
+        }
+    }
     if repeated && outcome.status == Some(Status::Succeeded) {
         let captures = captures.lock().unwrap();
         assert_eq!(

@@ -138,9 +138,11 @@ Each invocation pins one catalog snapshot. Speech calls accept `speech: {from: '
 
 Helpers accept `input: {text: true, maxBytes: 8388608}`. The server enforces this 8 MiB maximum and validates model implementation capabilities. JavaScript declarations grant no image or PDF support, tools, credentials, or capture permission. The host resolves credentials from the pinned catalog. Catalog reloads affect subsequent invocations.
 
-`helper.run`, `helper.open`, and `helper.submit` take ordered `content` parts. Image parts name a bound resource; they do not contain bytes. A follow-up can attach another image without moving the opening image to the new turn. The provider adapter encodes supported image formats without a per-model allowlist. An invocation-only image remains available while the invocation lives; saved message images follow the ordinary session rules.
+`helper.run`, `helper.open`, and `helper.submit` take ordered `content` parts. Image parts name a bound resource; they do not contain bytes. A follow-up can attach another image and preserve the opening image on its original turn. The provider adapter encodes supported image formats without a per-model allowlist. Bound resources stay available for the live invocation. When a helper creates or appends a saved session message, the server verifies and stores its images before the message commit. It applies the same image quotas as ordinary session messages.
 
 Capture, playback and codec conversion belong to clients. Opaque upload/read grants do not expose native paths. Supported image/document inputs remain PNG, JPEG, WebP, PDF and UTF-8; video is excluded. Output leases are bounded, non-renewable and do not authorize replay. Durable selected text uses the accepted separate text-result budget, not an unbounded protobuf result.
+
+The terminal transaction returns committed text descriptors with the final status. Live output uses that receipt and does not reload the historical Routine program object.
 
 ### Invocation-Local Helper Tools
 

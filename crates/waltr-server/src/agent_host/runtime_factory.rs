@@ -352,7 +352,10 @@ pub struct ServerAgentRuntimeFactory {
     catalog: Option<AgentDefinitionCatalog>,
     catalog_provider: Option<AgentCatalogProvider>,
     providers: waltr_agent::AgentSessionRuntimeFactory,
-    message_image_resolver: Option<Arc<dyn waltr_agent::MessageImageResolver>>,
+    session_images: Option<(
+        crate::session::image_objects::SessionImageObjects,
+        Arc<crate::session::image_objects::SavedImageResolver>,
+    )>,
     mcp_connection_resolver: Option<McpConnectionResolver>,
     mcp_resource_state: Option<crate::agent_definition::AgentDefinitionState>,
     code_tool_provider: Option<CodeToolProvider>,
@@ -391,16 +394,25 @@ impl std::fmt::Debug for ServerAgentRuntimeFactory {
 }
 
 impl ServerAgentRuntimeFactory {
-    pub(crate) fn with_message_image_resolver(
+    pub(crate) fn with_session_image_objects(
         mut self,
-        resolver: Arc<dyn waltr_agent::MessageImageResolver>,
+        objects: crate::session::image_objects::SessionImageObjects,
     ) -> Self {
-        self.message_image_resolver = Some(resolver);
+        let resolver = crate::session::image_objects::SavedImageResolver::new(objects.clone());
+        self.session_images = Some((objects, Arc::new(resolver)));
         self
     }
 
+    pub(crate) fn session_image_objects(
+        &self,
+    ) -> Option<&crate::session::image_objects::SessionImageObjects> {
+        self.session_images.as_ref().map(|(objects, _)| objects)
+    }
+
     pub(crate) fn message_image_resolver(&self) -> Option<Arc<dyn waltr_agent::MessageImageResolver>> {
-        self.message_image_resolver.clone()
+        self.session_images
+            .as_ref()
+            .map(|(_, resolver)| resolver.clone() as Arc<dyn waltr_agent::MessageImageResolver>)
     }
 
     /// Compose provider inference with this server-owned host runtime and lifecycle.
@@ -576,7 +588,7 @@ impl ServerAgentRuntimeFactory {
             catalog: None,
             catalog_provider: None,
             providers,
-            message_image_resolver: None,
+            session_images: None,
             mcp_connection_resolver: None,
             mcp_resource_state: None,
             code_tool_provider: None,
@@ -1192,8 +1204,8 @@ impl ServerAgentRuntimeFactory {
             builder = builder.with_tool(tool);
         }
         let (mut runtime, dispatcher) = builder.build_with_dispatcher();
-        if let Some(resolver) = &factory.message_image_resolver {
-            runtime = runtime.with_message_image_resolver(resolver.clone());
+        if let Some(resolver) = factory.message_image_resolver() {
+            runtime = runtime.with_message_image_resolver(resolver);
         }
         Ok((runtime, dispatcher))
     }

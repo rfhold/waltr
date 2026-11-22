@@ -365,7 +365,7 @@ impl InvocationStore for FaultStore {
         state: Status,
         result: Option<Value>,
         now: i64,
-    ) -> PortFuture<Status> {
+    ) -> PortFuture<crate::routine::ports::TerminalReceipt> {
         if *self.fault.lock().unwrap() == Fault::Terminal {
             return Box::pin(async { Err(PortError::Unavailable) });
         }
@@ -894,7 +894,8 @@ async fn script_concurrent_journal_failure_fences_policy_and_intent_waiters() {
                 .store
                 .terminal(id.clone(), Status::Failed, None, 3)
                 .await
-                .unwrap(),
+                .unwrap()
+                .status,
             Status::Uncertain
         );
         assert!(

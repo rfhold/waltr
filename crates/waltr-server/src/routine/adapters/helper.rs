@@ -179,6 +179,7 @@ pub struct CoordinatorHelperRunner<S: SessionStore + Clone + Send + Sync + 'stat
     input_models: BTreeMap<(String, String), waltr_agent::TransientModelCapabilities>,
     source: Option<SessionCopy>,
     principal: String,
+    image_quota_identity: Option<Arc<str>>,
     named: Arc<Mutex<Option<BTreeMap<String, AgentDefinitionBundle>>>>,
     owners: Arc<tokio::sync::Mutex<OwnerState<S>>>,
     runtime: tokio::runtime::Handle,
@@ -211,6 +212,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for CoordinatorHelpe
             input_models: self.input_models.clone(),
             source: self.source.clone(),
             principal: self.principal.clone(),
+            image_quota_identity: self.image_quota_identity.clone(),
             named: self.named.clone(),
             owners: self.owners.clone(),
             runtime: self.runtime.clone(),
@@ -289,6 +291,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             input_models: BTreeMap::new(),
             source,
             principal,
+            image_quota_identity: None,
             named: Arc::new(Mutex::new(None)),
             owners: Arc::new(tokio::sync::Mutex::new(OwnerState {
                 closed: false,
@@ -299,6 +302,15 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             origin_guard: None,
             groups: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    pub(crate) fn with_image_principal(
+        mut self,
+        principal: &crate::access_auth::AuthenticatedPrincipal,
+    ) -> Self {
+        self.image_quota_identity =
+            Some(crate::session::image_objects::quota_identity(principal).into());
+        self
     }
 
     /// Retain normal permission and Skills consent inside the original owned helper run.
@@ -816,12 +828,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                     )
                 }
             };
-            let prepared = images::prepare(request.content, prefix)?;
-            let messages = vec![SessionStartMessage::from(prepared.message.clone())];
-            create.start = match this.source.clone() {
-                Some(copy) => SessionStart::Copy { copy, messages },
-                None => SessionStart::Fresh { messages },
-            };
             let mut owners = this.owners.lock().await;
             if owners.closed || owners.owners.len() >= 64 {
                 return Err(PortError::Denied);
@@ -833,6 +839,26 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                 .as_ref()
                 .map(|streams| streams.claim(&request.selection))
                 .transpose()?;
+            if matches!(request.selection, HelperSelection::Restricted { .. })
+                && request.workspace.is_some()
+            {
+                return Err(PortError::Invalid);
+            }
+            let message = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(PortError::Unavailable),
+                result = tokio::time::timeout_at(started + request.deadline, images::prepare(
+                    request.content,
+                    prefix,
+                    this.factory.session_image_objects(),
+                    this.image_quota_identity.as_deref(),
+                )) => result.map_err(|_| PortError::Unavailable)??,
+            };
+            let messages = vec![SessionStartMessage::from(message)];
+            create.start = match this.source.clone() {
+                Some(copy) => SessionStart::Copy { copy, messages },
+                None => SessionStart::Fresh { messages },
+            };
             let sessions = this.sessions.clone().with_session_event_sink(Arc::new(
                 crate::agent_host::session_roles::PrivateCreationEvents,
             ));
@@ -888,12 +914,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             );
             owners.owners.push(owner.clone());
             drop(owners);
-            let images = Arc::new(images::LiveImages::new(
-                &session.record,
-                this.factory.message_image_resolver(),
-                prepared,
-            ));
-            let _image_lifetime = images::ImageLifetime(images.clone());
             let remaining = request
                 .deadline
                 .checked_sub(started.elapsed())
@@ -984,7 +1004,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                             .map_err(|error| helper_failure("runtime_assembly", runtime_category(&error), Some(&id), PortError::Unavailable))?.0,
                 },
             };
-            runtime = runtime.with_message_image_resolver(images.clone());
+            if let Some(resolver) = factory.message_image_resolver() {
+                runtime = runtime.with_message_image_resolver(resolver);
+            }
             let accepted = Arc::new(Mutex::new(None));
             if let Some(guard) = this.origin_guard.clone() {
                 let guard_id = id.clone();
@@ -1118,7 +1140,6 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                         &session.record,
                         runtime.with_completion_validation(validation),
                         input,
-                        images,
                         limits,
                         run_cancellation.clone(),
                         started + request.deadline,

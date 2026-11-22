@@ -97,6 +97,7 @@ struct Bind {
     sessions: SessionCoordinator<MemorySessionStore>,
     factory: Arc<AgentSessionRuntimeFactory>,
     inference: InferenceSettings,
+    principal: Option<AuthenticatedPrincipal>,
     workspace_principal: media::snapshot::WorkspacePool,
     workspace_process: media::snapshot::WorkspacePool,
     result_principal: ResultPool,
@@ -120,6 +121,10 @@ impl MediaBindingFactory for Bind {
             binding.principal().into(),
         )
         .map(|h| {
+            let h = match &self.principal {
+                Some(principal) => h.with_image_principal(principal),
+                None => h,
+            };
             Arc::new(h.with_input_models(BTreeMap::from([(
                 (
                     self.inference.provider.key.clone(),
@@ -190,6 +195,7 @@ impl StartPolicy for Policy {
             let factory: Arc<dyn HostFactory> = match request.transport {
                 Some(pending) => {
                     let mut bind = bind.as_ref().clone();
+                    bind.principal = Some(request.authenticated.clone());
                     bind.factory = Arc::new(bind.factory.as_ref().clone().with_workspace_account(
                         WorkspaceAccount::from_principal(&request.authenticated),
                     ));
@@ -419,7 +425,7 @@ impl InvocationStore for GatedStore {
         admit_with_projection(admission: crate::routine::history::Admission, source: Option<String>, projection: Option<serde_json::Value>) -> ();
         dispatch_intent(intent: crate::routine::history::Operation) -> ();
         operation_done(id: String, status: crate::routine::history::OperationStatus, result: Option<serde_json::Value>, now: i64) -> ();
-        terminal(id: String, status: crate::routine::history::Status, result: Option<serde_json::Value>, now: i64) -> crate::routine::history::Status;
+        terminal(id: String, status: crate::routine::history::Status, result: Option<serde_json::Value>, now: i64) -> TerminalReceipt;
         get(id: String) -> Option<crate::routine::history::Invocation>;
         list(after: i64, limit: u32) -> Vec<crate::routine::history::Invocation>;
         operations(invocation: String, after: i64, limit: u32) -> Vec<crate::routine::history::Operation>;
@@ -589,6 +595,9 @@ impl Fixture {
                 agents.resolved("media").unwrap().clone(),
             )
             .with_workspace_machines(machines.clone())
+            .with_session_image_objects(crate::session::image_objects::SessionImageObjects::memory(
+                64 * 1024 * 1024,
+            ))
             .with_agent_catalog_provider(move || agents.clone())
             .with_runtime_provider(move |_| {
                 Ok(AgentRuntimeProvider::new(
@@ -616,6 +625,7 @@ impl Fixture {
             .with_runtime_factory(factory.session_factory(sessions));
         let text = persistence.script_text_result_store();
         let bind = Arc::new(Bind {
+            principal: None,
             blobs: blobs.clone(),
             text: text.clone(),
             speech,
@@ -2277,6 +2287,9 @@ async fn routine_http_open_upload_native_helpers_and_durable_text() {
             .await
             .unwrap()
             .into_inner();
+        let programs = fixture._directory.path().join("routine-objects/program");
+        let offline = programs.with_file_name("program-offline");
+        tokio::fs::rename(&programs, &offline).await.unwrap();
         client
             .send_input_batch(fixture.request(p::SendInputBatchRequest {
                 credentials: Some(credentials.clone()),
@@ -2316,6 +2329,7 @@ async fn routine_http_open_upload_native_helpers_and_durable_text() {
         let terminal = terminal.unwrap();
         assert!(terminal.cleanup_complete);
         assert_eq!(terminal.status, p::InvocationStatus::Succeeded as i32);
+        tokio::fs::rename(&offline, &programs).await.unwrap();
         let history = client
             .get_invocation(fixture.request(p::GetInvocationRequest {
                 invocation_id: invocation_id.clone(),
@@ -2325,6 +2339,7 @@ async fn routine_http_open_upload_native_helpers_and_durable_text() {
             .into_inner();
         let record = history.invocation.unwrap();
         assert_eq!(record.text_results.len(), 1);
+        assert_eq!(terminal.text_results, record.text_results);
         assert_eq!(record.helpers.len(), 1);
         let read = client
             .read_text_result(fixture.request(p::ReadTextResultRequest {

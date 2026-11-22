@@ -616,7 +616,7 @@ impl AttachmentRegistry {
         let guard = CancelOnDrop(Some(entry.pending.control.clone()));
         let state = OutputState {
             terminal: entry.terminal.subscribe(),
-            entry,
+            _entry: entry,
             receiver,
             previous: None,
             accepted: Some(accepted),
@@ -660,15 +660,12 @@ impl AttachmentRegistry {
                         state.guard.disarm_in_place();
                         return Some((Err(error), state));
                     }
-                    let text_results = match state.entry.pending.selected_text().await {
-                        Ok(descriptors) => descriptors,
-                        Err(error) => {
-                            state.done = true;
-                            return Some((Err(error), state));
-                        }
-                    };
                     state.done = true;
                     state.guard.disarm_in_place();
+                    let Some(text_results) = outcome.text_results.as_ref() else {
+                        return Some((Err(Status::unavailable("terminal receipt unavailable")), state));
+                    };
+                    let text_results = text_results.iter().cloned().map(wire::text).collect();
                     let output = p::OutputEvent {
                         event: Some(p::output_event::Event::Terminal(p::InteractionTerminal {
                             status: status(&outcome),
@@ -725,7 +722,7 @@ impl Drop for AttachmentRegistry {
     }
 }
 struct OutputState {
-    entry: Arc<Attachment>,
+    _entry: Arc<Attachment>,
     receiver: mpsc::Receiver<OutputFrame>,
     terminal: watch::Receiver<Option<Outcome>>,
     previous: Option<OutputFrame>,

@@ -3,8 +3,9 @@ use super::PersistencePool;
 use crate::routine::{
     definition::{API_VERSION, MAX_ENVELOPE_BYTES, identifier, revision_id},
     history::{Admission, Invocation, Operation, OperationStatus, Status},
-    ports::{InvocationStore, PortError, PortFuture},
+    ports::{InvocationStore, PortError, PortFuture, TerminalReceipt},
     service::bounded_projection,
+    text_results::MAX_RESULTS,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -52,6 +53,23 @@ mod observation;
 
 fn sql_error(_: sqlx::Error) -> PortError {
     PortError::Unavailable
+}
+
+fn terminal_sql_error(step: &'static str) -> impl FnOnce(sqlx::Error) -> PortError {
+    move |error| {
+        let category = match error {
+            sqlx::Error::PoolTimedOut => "pool_timeout",
+            sqlx::Error::PoolClosed => "pool_closed",
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => "connection",
+            sqlx::Error::Database(_) => "database",
+            _ => "other",
+        };
+        tracing::warn!(
+            target: "waltr_server::routine::telemetry",
+            step, category, "Routine terminal database operation failed"
+        );
+        PortError::Unavailable
+    }
 }
 fn encode<T: Serialize>(value: &T, cap: usize) -> Result<String, PortError> {
     let result = serde_json::to_string(value).map_err(|_| PortError::Invalid)?;
@@ -277,7 +295,7 @@ impl InvocationStore for SqlInvocationStore {
         state: Status,
         result: Option<Value>,
         now: i64,
-    ) -> PortFuture<Status> {
+    ) -> PortFuture<TerminalReceipt> {
         let pool = self.pool.clone();
         Box::pin(async move {
             if !state.terminal() || (state != Status::Succeeded && result.is_some()) {
@@ -285,13 +303,13 @@ impl InvocationStore for SqlInvocationStore {
             }
             let result = result_json(&result, 65_536)?;
             backend!(pool, |pool, schema| {
-                let mut tx = pool.begin().await.map_err(sql_error)?;
+                let mut tx = pool.begin().await.map_err(terminal_sql_error("begin"))?;
                 changed(sqlx::query(&format!("UPDATE {schema}script_invocations SET status=status WHERE id=$1 AND status IN ('admitted','running')"))
-                    .bind(&id).execute(&mut *tx).await.map_err(sql_error)?.rows_affected())?;
+                    .bind(&id).execute(&mut *tx).await.map_err(terminal_sql_error("lock"))?.rows_affected())?;
                 sqlx::query(&format!("UPDATE {schema}script_operations SET status='uncertain',updated_ms=$2 WHERE invocation=$1 AND status='dispatched'"))
-                    .bind(&id).bind(now).execute(&mut *tx).await.map_err(sql_error)?;
+                    .bind(&id).bind(now).execute(&mut *tx).await.map_err(terminal_sql_error("settle_operations"))?;
                 let uncertain: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {schema}script_operations WHERE invocation=$1 AND status='uncertain'"))
-                    .bind(&id).fetch_one(&mut *tx).await.map_err(sql_error)?;
+                    .bind(&id).fetch_one(&mut *tx).await.map_err(terminal_sql_error("count_uncertain"))?;
                 let actual = if uncertain.0 > 0 {
                     Status::Uncertain
                 } else {
@@ -303,9 +321,23 @@ impl InvocationStore for SqlInvocationStore {
                     None
                 };
                 changed(sqlx::query(&format!("UPDATE {schema}script_invocations SET status=$2,result=$3,updated_ms=$4 WHERE id=$1 AND status IN ('admitted','running')"))
-                    .bind(&id).bind(actual.as_str()).bind(&result).bind(now).execute(&mut *tx).await.map_err(sql_error)?.rows_affected())?;
-                tx.commit().await.map_err(sql_error)?;
-                Ok(actual)
+                    .bind(&id).bind(actual.as_str()).bind(&result).bind(now).execute(&mut *tx).await.map_err(terminal_sql_error("write"))?.rows_affected())?;
+                let rows: Vec<(String,)> = sqlx::query_as(&format!("SELECT descriptor FROM {schema}script_text_results WHERE invocation=$1 ORDER BY name LIMIT $2"))
+                    .bind(&id).bind(i64::try_from(MAX_RESULTS + 1).map_err(|_| PortError::Invalid)?)
+                    .fetch_all(&mut *tx).await.map_err(terminal_sql_error("read_descriptors"))?;
+                tx.commit().await.map_err(terminal_sql_error("commit"))?;
+                let text_results = (rows.len() <= MAX_RESULTS).then(|| {
+                    rows.into_iter().map(|(descriptor,)| {
+                        super::script_text_result::decode_descriptor(&descriptor)
+                    }).collect::<Result<Vec<_>, _>>().ok()
+                }).flatten();
+                if text_results.is_none() {
+                    tracing::warn!(
+                        target: "waltr_server::routine::telemetry",
+                        "Routine terminal descriptor projection failed"
+                    );
+                }
+                Ok(TerminalReceipt { status: actual, text_results })
             })
         })
     }
@@ -467,7 +499,8 @@ mod tests {
                     105
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .status,
             Status::Uncertain
         );
         let row = store.get("first".into()).await.unwrap().unwrap();
@@ -502,7 +535,7 @@ mod tests {
             store.dispatch_intent(intent("race", "racing-operation")),
             store.terminal("race".into(), Status::Succeeded, None, 114)
         );
-        let terminal = terminal.unwrap();
+        let terminal = terminal.unwrap().status;
         if dispatched.is_ok() {
             assert_eq!(terminal, Status::Uncertain);
         } else {

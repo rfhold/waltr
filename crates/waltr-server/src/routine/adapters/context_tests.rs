@@ -1334,7 +1334,7 @@ async fn generic_commit_receipt_rejects_missing_failed_and_externally_stale_work
     let context = CoordinatorContext::pin(sessions.clone(), &id, "owner", false).await.unwrap();
     assert!(context.execute(operation("context.original", json!({})), CancellationToken::new()).await.is_err());
     let invocation = InvocationIdentity { routine: "ordinary".into(), revision: "revision".into(), entrypoint: "run".into() };
-    let mut outcome = Outcome { id: "invocation".into(), status: Some(Status::Succeeded), result: Some(json!("committed result")), cleanup_complete: true, provider_rejection: None };
+    let mut outcome = Outcome { id: "invocation".into(), status: Some(Status::Succeeded), result: Some(json!("committed result")), cleanup_complete: true, text_results: Some(Vec::new()), provider_rejection: None };
     assert!(matches!(context.committed_receipt(invocation.clone(), &outcome).await, Err(PortError::Conflict)));
     let snapshot = context.execute(operation("context.snapshot", json!({})), CancellationToken::new()).await.unwrap();
     context.execute(operation("context.transact", json!({"source":"effective", "expectedRevision":snapshot["revision"],

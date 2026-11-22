@@ -2,6 +2,7 @@
 use super::{
     definition::Definition,
     history::{Admission, Caller, Invocation, Operation, OperationStatus, Status},
+    text_results::TextResultDescriptor,
 };
 use serde_json::Value;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -9,6 +10,15 @@ use waltr_script::{HostContext, HostDispatcher, HostReply, HostRequest};
 
 /// Owned Send future for object-safe consumer ports.
 pub type PortFuture<T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'static>>;
+
+/// Status and selected text descriptors from one verified terminal transaction.
+#[derive(Debug)]
+pub struct TerminalReceipt {
+    /// Actual terminal status after settling unfinished operations.
+    pub status: Status,
+    /// Committed descriptors ordered by name, or absent if projection failed.
+    pub text_results: Option<Vec<TextResultDescriptor>>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Trusted boundary errors, without adapter payloads or credentials.
 pub enum PortError {
@@ -96,7 +106,7 @@ pub trait InvocationStore: Send + Sync {
         status: Status,
         result: Option<Value>,
         now: i64,
-    ) -> PortFuture<Status>;
+    ) -> PortFuture<TerminalReceipt>;
     /// Read one bounded observation; no source or authority materialization.
     fn get(&self, id: String) -> PortFuture<Option<Invocation>>;
     /// Ascending immutable admission cursor, limit 1..=100, no implicit watch/cache.

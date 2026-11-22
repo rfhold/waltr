@@ -956,7 +956,7 @@ async fn postgres_script_observations_follow_commit_order() {
     assert_eq!(sequence_while_lifecycle_blocked, sequence_before_lifecycle);
     lock_holder.commit().await.expect("release lifecycle lock");
     assert!(matches!(
-        lifecycle.await.expect("join lifecycle allocator"),
+        lifecycle.await.expect("join lifecycle allocator").status,
         crate::routine::history::Status::Succeeded
     ));
     let completed_cursor: i64 =

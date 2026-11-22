@@ -277,8 +277,15 @@ impl TransientAttachment {
     /// Return a verified descriptor for a supported image, without exposing its bytes.
     #[must_use]
     pub fn image_descriptor(&self) -> Option<crate::MessageImageDescriptor> {
+        let (format, bytes) = self.image_source()?;
+        crate::MessageImageDescriptor::for_bytes(format, bytes)
+    }
+
+    /// Borrow the encoded image source for host-side verification and storage.
+    #[must_use]
+    pub fn image_source(&self) -> Option<(crate::MessageImageFormat, &[u8])> {
         let format = crate::MessageImageFormat::from_media_type(self.0.kind.media_type())?;
-        crate::MessageImageDescriptor::for_bytes(format, &self.0.bytes)
+        Some((format, &self.0.bytes))
     }
 
     /// Copy this payload into a precharged buffer of the same kind.

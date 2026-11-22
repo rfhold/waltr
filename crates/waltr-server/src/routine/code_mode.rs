@@ -939,6 +939,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 None,
                 caller.principal.clone(),
             )?
+            .with_image_principal(&grant.principal)
             .with_source_definition(if public_only { None } else { record.agent_definition.clone() })
             .with_permission_restriction(grant.profile.restriction.clone())
             .with_origin_guard(move || {

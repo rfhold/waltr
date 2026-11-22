@@ -134,6 +134,7 @@ fn text_result_private_child() {
             };
             locking(&path, &backend, &store).await;
             cancellation_and_ack(&backend, &store).await;
+            invalid_terminal_descriptor_preserves_durable_status(&pool, &backend, &store).await;
             insert_failure(&pool, &backend, &store).await;
             source_and_future_lifecycle(&backend, &store).await;
             reader_credit(&backend, &store).await;
@@ -237,9 +238,11 @@ async fn locking(path: &Path, backend: &PersistencePool, store: &SqlTextResultSt
     assert!(poll_fn(|cx| Poll::Ready(terminal.as_mut().poll(cx).is_pending())).await);
     gate.release();
     let (published, terminalized, ()) = tokio::join!(publishing, terminal, waiter);
-    assert!(published.is_ok());
-    assert_eq!(terminalized.unwrap(), Status::Failed);
-    assert_eq!(store.list(scope(id)).await.unwrap().len(), 1);
+    let published = published.unwrap();
+    let terminalized = terminalized.unwrap();
+    assert_eq!(terminalized.status, Status::Failed);
+    assert_eq!(terminalized.text_results, Some(vec![published.clone()]));
+    assert_eq!(store.list(scope(id)).await.unwrap(), vec![published]);
     drop(gate);
     terminal_pool.close().await;
 
@@ -249,7 +252,8 @@ async fn locking(path: &Path, backend: &PersistencePool, store: &SqlTextResultSt
         history
             .terminal(id.into(), Status::Failed, None, 4)
             .await
-            .unwrap(),
+            .unwrap()
+            .status,
         Status::Failed
     );
     let input = source(b"never requested".to_vec(), 4);
@@ -341,11 +345,48 @@ async fn cancellation_and_ack(backend: &PersistencePool, store: &SqlTextResultSt
                     .unwrap_err(),
                 TextResultError::Conflict
             );
+            if stage == Stage::Committed {
+                let history = SqlInvocationStore::new(backend.clone());
+                let receipt = history
+                    .terminal(id.into(), Status::Uncertain, None, 3)
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.status, Status::Uncertain);
+                assert_eq!(receipt.text_results, Some(descriptors));
+            }
         }
         assert_all_credit_free();
     }
     println!(
         "commit: pre-check cancellation rolled back; post-check cancellation committed; real commit lost ACK recovered once"
+    );
+}
+
+async fn invalid_terminal_descriptor_preserves_durable_status(
+    pool: &sqlx::SqlitePool,
+    backend: &PersistencePool,
+    store: &SqlTextResultStore,
+) {
+    let id = "invalid-terminal-descriptor";
+    running(backend, id).await;
+    publish(store, id, "selected", b"answer".to_vec(), 4)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE script_text_results SET descriptor='{}' WHERE invocation=$1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let history = SqlInvocationStore::new(backend.clone());
+    let receipt = history
+        .terminal(id.into(), Status::Failed, None, 3)
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, Status::Failed);
+    assert!(receipt.text_results.is_none());
+    assert_eq!(
+        InvocationStore::get(&history, id.into()).await.unwrap().unwrap().status,
+        Status::Failed
     );
 }
 

@@ -248,7 +248,7 @@ impl super::super::ports::InvocationStore for AdmissionAckStore {
         status: super::super::history::Status,
         result: Option<Value>,
         now: i64,
-    ) -> PortFuture<super::super::history::Status> {
+    ) -> PortFuture<super::super::ports::TerminalReceipt> {
         self.inner.terminal(id, status, result, now)
     }
     fn get(&self, id: String) -> PortFuture<Option<super::super::history::Invocation>> {

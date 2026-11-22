@@ -36,6 +36,7 @@ pub struct Outcome {
     pub result: Option<Value>,
     /// Engine cleanup and required owner finalization both verified.
     pub cleanup_complete: bool,
+    pub(crate) text_results: Option<Vec<super::text_results::TextResultDescriptor>>,
     pub(crate) provider_rejection: Option<ProviderRejection>,
 }
 struct Completion {
@@ -367,6 +368,7 @@ impl InvocationService {
                                 status: None,
                                 result: None,
                                  cleanup_complete: false,
+                                 text_results: None,
                                  provider_rejection: None,
                             });
                         entry.completion.notify.notify_waiters();
@@ -436,6 +438,7 @@ impl InvocationService {
                         status: None,
                         result: None,
                         cleanup_complete: false,
+                        text_results: None,
                         provider_rejection: None,
                     });
                     completion.notify.notify_waiters();
@@ -447,6 +450,7 @@ impl InvocationService {
                         status: None,
                         result: None,
                         cleanup_complete: task_reusable.load(Ordering::Acquire),
+                        text_results: None,
                         provider_rejection: None,
                     });
                     completion.notify.notify_waiters();
@@ -530,6 +534,7 @@ impl InvocationService {
                                      status: None,
                                      result: None,
                                      cleanup_complete: false,
+                                     text_results: None,
                                      provider_rejection: None,
                                  });
                             entry.completion.notify.notify_waiters();
@@ -856,6 +861,7 @@ async fn run(
                     status: None,
                     result: None,
                     cleanup_complete: false,
+                    text_results: None,
                     provider_rejection: None,
                 },
                 false,
@@ -1012,18 +1018,20 @@ async fn execute(
     if durable.is_none() {
         super::telemetry::failure("terminal", "persistence");
     }
+    let status = durable.as_ref().map(|receipt| receipt.status);
     let outcome = Outcome {
         id: id.into(),
-        status: durable,
-        result: if durable == Some(Status::Succeeded) {
+        status,
+        result: if status == Some(Status::Succeeded) {
             result
         } else {
             None
         },
         cleanup_complete: cleanup && finalized,
-        provider_rejection: provider_rejection.filter(|_| durable == Some(Status::Failed)),
+        text_results: durable.and_then(|receipt| receipt.text_results),
+        provider_rejection: provider_rejection.filter(|_| status == Some(Status::Failed)),
     };
-    (outcome, cleanup && finalized && durable.is_some())
+    (outcome, cleanup && finalized && status.is_some())
 }
 
 tokio::task_local! {

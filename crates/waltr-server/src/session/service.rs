@@ -209,9 +209,7 @@ where
             credential_store,
             default_agent_definition,
         )
-        .with_message_image_resolver(Arc::new(image_rpc::SavedImageResolver::new(
-            image_objects.clone(),
-        )))
+        .with_session_image_objects(image_objects.clone())
         .with_workspace_machines(workspace_machines)
         .with_capability_policy(policy);
         let runtime_factory = match &agent_catalog {

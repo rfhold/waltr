@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     remote_routes::IMAGE_UPLOAD_ROUTE_HEADER,
     session::{
-        image_objects::ImageObjectError,
+        image_objects::{ImageObjectError, quota_identity},
         image_uploads::{ImageUploadError, ImageUploadId, ImageUploadScope},
     },
 };
@@ -10,59 +10,12 @@ use waltr::grpc::waltr::session::v1::{
     MessageImageFormat as WireFormat, UserMessageInputPart, user_message_input_part::Part,
 };
 use waltr_agent::{
-    MessageImageDescriptor, MessageImageFormat, MessageImageLoadError, MessageImageLoadFuture,
-    MessageImageLocation, MessageImageReference, MessageImageResolver, SessionRecord,
-    TimelineItemId, TransientAttachmentBuffer, UserMessage, UserMessagePart,
-    has_user_message_content,
+    MessageImageDescriptor, MessageImageFormat, MessageImageReference, SessionRecord,
+    TimelineItemId, UserMessage, UserMessagePart, has_user_message_content,
 };
 
 const IMAGE_CHUNK_BYTES: usize = 64 * 1024;
 type ImageStream = Pin<Box<dyn Stream<Item = Result<ReadMessageImageResponse, Status>> + Send>>;
-
-pub(super) struct SavedImageResolver {
-    objects: SessionImageObjects,
-    slots: tokio::sync::Semaphore,
-}
-
-impl SavedImageResolver {
-    pub(super) fn new(objects: SessionImageObjects) -> Self {
-        Self {
-            objects,
-            slots: tokio::sync::Semaphore::new(8),
-        }
-    }
-}
-
-impl MessageImageResolver for SavedImageResolver {
-    fn load<'a>(
-        &'a self,
-        _location: MessageImageLocation<'a>,
-        image: MessageImageReference,
-        target: &'a mut TransientAttachmentBuffer,
-    ) -> MessageImageLoadFuture<'a> {
-        Box::pin(async move {
-            let MessageImageReference::Saved(image) = image else {
-                return Err(MessageImageLoadError::Missing);
-            };
-            let _permit = self
-                .slots
-                .try_acquire()
-                .map_err(|_| MessageImageLoadError::Unavailable)?;
-            let bytes = self.objects.get(image).await.map_err(|error| match error {
-                ImageObjectError::Missing => MessageImageLoadError::Missing,
-                ImageObjectError::Invalid | ImageObjectError::Corrupt => {
-                    MessageImageLoadError::Corrupt
-                }
-                ImageObjectError::Capacity | ImageObjectError::Unavailable => {
-                    MessageImageLoadError::Unavailable
-                }
-            })?;
-            target
-                .append(&bytes)
-                .map_err(|_| MessageImageLoadError::Corrupt)
-        })
-    }
-}
 
 impl<S: SessionStore + Clone + Send + Sync + 'static> SessionService<S> {
     pub(super) fn ensure_image_upload_reaper(&self) {
@@ -126,13 +79,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> SessionService<S> {
                 marker.to_owned()
             }
         };
-        // Length framing keeps the exact issuer/subject pair unambiguous.
-        let identity = format!(
-            "{}:{}{}",
-            principal.issuer().len(),
-            principal.issuer(),
-            principal.subject()
-        );
+        let identity = quota_identity(principal);
         Ok((
             ImageUploadScope::new(identity, route, id, incarnation.clone()),
             incarnation,
