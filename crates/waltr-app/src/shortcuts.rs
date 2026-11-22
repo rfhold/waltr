@@ -253,6 +253,14 @@ mod tests {
         }
     }
     #[derive(Default)]
+    struct PermissionProbe(AtomicBool);
+    impl PermissionBackend for PermissionProbe {
+        fn request(&self, _ticket: u64, reply: PermissionReply) {
+            self.0.store(true, Ordering::Release);
+            reply.complete(PermissionResult::Granted);
+        }
+    }
+    #[derive(Default)]
     struct CaptureProbe(AtomicBool);
     impl capture::Factory for CaptureProbe {
         fn open(
@@ -376,25 +384,36 @@ mod tests {
             .clone();
         drop(watch);
 
-        let bridge = RuntimeBridge::new(EmbeddedServerController::default());
-        let mut receive = bridge.synthetic_shortcut_generation(1);
-        bridge.synthetic_shortcut_destination(
-            1,
-            DESTINATION,
-            Some((observation, transport, credentials.credential_revision())),
-        );
-        let mut binding = destination_binding(Some(DESTINATION));
-        Arc::get_mut(&mut binding).unwrap().routine.name = name.into();
-        let epoch = destination_epoch(&bridge).await;
-        let _control = bridge.shortcut_press(epoch, binding).unwrap();
-        let held = receive().unwrap();
-        assert_eq!(held.invocation().selection.revision, revision);
-        let factory = Arc::new(CaptureProbe::default());
-        let permissions = AudioPermissions::new(1, true, Arc::new(Grant));
-        let unreachable_active = NativeGrpcTransport::new("http://127.0.0.1:1");
-        held.run_routed(&unreachable_active, &permissions, factory.clone())
-            .await;
-        assert!(factory.0.load(Ordering::Acquire));
+        for released in [false, true] {
+            let bridge = RuntimeBridge::new(EmbeddedServerController::default());
+            let mut receive = bridge.synthetic_shortcut_generation(1);
+            bridge.synthetic_shortcut_destination(
+                1,
+                DESTINATION,
+                Some((
+                    observation.clone(),
+                    transport.clone(),
+                    credentials.credential_revision(),
+                )),
+            );
+            let mut binding = destination_binding(Some(DESTINATION));
+            Arc::get_mut(&mut binding).unwrap().routine.name = name.into();
+            let epoch = destination_epoch(&bridge).await;
+            let (control, _) = bridge.shortcut_press(epoch, binding).unwrap();
+            let held = receive().unwrap();
+            assert_eq!(held.invocation().selection.revision, revision);
+            if released {
+                control.release();
+            }
+            let factory = Arc::new(CaptureProbe::default());
+            let permission = Arc::new(PermissionProbe::default());
+            let permissions = AudioPermissions::new(1, true, permission.clone());
+            let unreachable_active = NativeGrpcTransport::new("http://127.0.0.1:1");
+            held.run_routed(&unreachable_active, &permissions, factory.clone())
+                .await;
+            assert_eq!(permission.0.load(Ordering::Acquire), !released);
+            assert_eq!(factory.0.load(Ordering::Acquire), !released);
+        }
     }
 
     fn destination_binding(destination: Option<&str>) -> Arc<config::Keybind> {

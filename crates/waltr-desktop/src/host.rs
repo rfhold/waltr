@@ -243,6 +243,14 @@ impl Hold {
     pub fn cancellation(&self) -> CancellationToken {
         self.control.cancel.clone()
     }
+    /// Key-up signal for a one-shot hold; repeated capture has its own release lane.
+    #[must_use]
+    pub fn one_shot_release(&self) -> Option<CancellationToken> {
+        self.control
+            .repeated
+            .is_none()
+            .then(|| self.control.release.clone())
+    }
     /// Attach optional diagnostics without altering existing callers.
     #[must_use]
     pub fn observed(mut self, observer: Observer) -> Self {

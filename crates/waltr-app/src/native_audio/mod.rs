@@ -348,6 +348,32 @@ pub struct Held {
     credential: Option<(waltr_client::NativeCredentialProvider, u64)>,
     activity: crate::activity::ActivityLease,
 }
+
+struct UnreleasedCapture {
+    factory: Arc<dyn capture::Factory>,
+    release: CancellationToken,
+}
+
+impl capture::Factory for UnreleasedCapture {
+    fn open(
+        &self,
+        config: waltr_audio_io::Config,
+    ) -> Result<Box<dyn capture::Source>, capture::Error> {
+        if self.release.is_cancelled() {
+            return Err(capture::Error::Cancelled);
+        }
+        self.factory.open(config)
+    }
+}
+
+async fn wait_for_release(release: Option<&CancellationToken>) {
+    if let Some(release) = release {
+        release.cancelled().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 #[allow(
     clippy::future_not_send,
     reason = "native interaction transports are LocalSet-owned"
@@ -383,7 +409,9 @@ impl Held {
         let outcome = tokio::select! {
             biased;
             () = self.token.cancelled() => "cancelled",
-            result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            // A cold relay connection and the destination's signing-key fetch
+            // both happen before it can return the first snapshot.
+            result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 let Some(invocation) = &self.binding.resolved else { return "definition_mismatch"; };
                 if !current() { return "invalidated"; }
                 let Ok(mut stream) = transport.watch_manual_routines("native-shortcut-check".into()).await else { return "watch_open_failed"; };
@@ -477,21 +505,40 @@ impl Held {
         typing: &dyn waltr_desktop::typing::Factory,
         preflight: Option<&waltr_client::NativeGrpcTransport>,
     ) {
-        if let Some(transport) = preflight
-            && !self.verify_destination(transport).await
-        {
-            if self.token.is_cancelled() {
-                self.diagnostics.fail("invalidated");
-            } else {
-                self.diagnostics.fail("destination_unavailable");
-                self.activity.fail();
+        let release = (preflight.is_some() && self.binding.mode == waltr_desktop::config::Mode::Hold)
+            .then(|| self.hold.one_shot_release())
+            .flatten();
+        if let Some(transport) = preflight {
+            let ready = tokio::select! {
+                biased;
+                () = wait_for_release(release.as_ref()) => {
+                    self.diagnostics.fail("cancelled");
+                    return;
+                }
+                ready = self.verify_destination(transport) => ready,
+            };
+            if !ready {
+                if self.token.is_cancelled() {
+                    self.diagnostics.fail("invalidated");
+                } else {
+                    self.diagnostics.fail("destination_unavailable");
+                    self.activity.fail();
+                }
+                return;
             }
-            return;
         }
         let grant = tokio::select! { biased;
             () = self.token.cancelled() => PermissionResult::Cancelled,
+            () = wait_for_release(release.as_ref()) => {
+                self.diagnostics.fail("cancelled");
+                return;
+            }
             grant = permissions.request(self.generation, u64::MAX) => grant,
         };
+        if release.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            self.diagnostics.fail("cancelled");
+            return;
+        }
         self.diagnostics.permission(grant);
         let valid = || {
             let state = self.host.lock();
@@ -504,6 +551,13 @@ impl Held {
                     .is_none_or(|(provider, revision)| provider.credential_revision() == *revision)
         };
         if grant == PermissionResult::Granted && valid() {
+            let factory: Arc<dyn capture::Factory> = match &release {
+                Some(release) => Arc::new(UnreleasedCapture {
+                    factory,
+                    release: release.clone(),
+                }),
+                None => factory,
+            };
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             let playback = self.binding.playback.as_ref().map(|_| {
                 crate::native_media::hold_playback::Sink::new(
@@ -536,6 +590,14 @@ impl Held {
                     playback,
                 )
                 .await;
+            let result = match result {
+                Err(waltr_desktop::host::Error::Capture(capture::Error::Cancelled))
+                    if release.as_ref().is_some_and(CancellationToken::is_cancelled) =>
+                {
+                    Err(waltr_desktop::host::Error::Cancelled)
+                }
+                result => result,
+            };
             self.diagnostics.primary(result);
             if result.is_err_and(|error| {
                 !matches!(
