@@ -47,6 +47,11 @@ where
 
     fn call(&mut self, mut request: http::Request<RequestBody>) -> Self::Future {
         let method = method_attributes(request.uri().path());
+        let owner = if request.headers().contains_key(waltr::destination::HEADER) {
+            "remote"
+        } else {
+            "entry"
+        };
         let span = tracing::info_span!(
             "waltr.grpc.client",
             otel.name = method.operation,
@@ -55,6 +60,7 @@ where
             rpc.system = "grpc",
             rpc.service = method.service,
             rpc.method = method.method,
+            owner.scope = owner,
             rpc.grpc.status_code = Empty,
             waltr.operation = method.operation,
             waltr.grpc.duration_ms = Empty,

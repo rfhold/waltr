@@ -181,7 +181,7 @@ where
             };
             match result {
                 Ok(principal) => {
-                    let mut monitor = principal.lease_monitor();
+                    let monitor = principal.lease_monitor();
                     let destination = match take_destination(request.headers_mut()) {
                         Ok(destination) => destination,
                         Err(status) => return Ok(status.into_http()),
@@ -194,34 +194,12 @@ where
                         let Some(remotes) = remotes else {
                             return Ok(tonic::Status::unimplemented("Remote routing is unavailable").into_http());
                         };
-                        let entry_lifetime = local.as_ref().map(|local| local.0.clone());
-                        let response = tokio::select! {
-                            biased;
-                            () = async {
-                                match &local {
-                                    Some(local) => local.0.cancelled().await,
-                                    None => std::future::pending().await,
-                                }
-                            } => return Ok(tonic::Status::cancelled("entry server stopped").into_http()),
-                            end = async {
-                                match monitor.as_mut() {
-                                    Some(monitor) => std::future::poll_fn(|cx| monitor.poll(cx)).await,
-                                    None => std::future::pending().await,
-                                }
-                            } => {
-                                let headers = AuthenticatedGrpcBody::terminal_trailers(end);
-                                let mut response = Response::new(tonic::body::Body::empty());
-                                *response.headers_mut() = headers;
-                                response.headers_mut().insert(header::CONTENT_TYPE, "application/grpc".parse().expect("valid gRPC media type"));
-                                return Ok(response);
-                            }
-                            response = remotes.forward(destination, request, entry_lifetime) => response,
-                        };
-                        return Ok(guard_response(response, monitor));
+                        let entry_lifetime = local.map(|local| local.0);
+                        return Ok(remotes.forward(destination, request, entry_lifetime, monitor).await);
                     }
                     request.extensions_mut().insert(principal);
                     let response = inner.call(request).await?;
-                    Ok(guard_response(response, monitor))
+                    Ok(guard_response(response, monitor, None))
                 }
                 Err(RequestAuthFailure::Internal) => Ok(access_auth_status(
                     tonic::Code::Unavailable,
@@ -261,9 +239,17 @@ fn access_auth_status(
     tonic::Status::with_details(code, message, failure.encode_to_vec().into())
 }
 
-fn guard_response(
+pub(crate) fn lease_end_response(end: LeaseEnd) -> Response<tonic::body::Body> {
+    let mut response = Response::new(tonic::body::Body::empty());
+    *response.headers_mut() = AuthenticatedGrpcBody::terminal_trailers(end);
+    response.headers_mut().insert(header::CONTENT_TYPE, "application/grpc".parse().expect("valid gRPC media type"));
+    response
+}
+
+pub(crate) fn guard_response(
     response: Response<tonic::body::Body>,
     monitor: Option<LeaseMonitor>,
+    relay_span: Option<tracing::Span>,
 ) -> Response<tonic::body::Body> {
     let Some(monitor) = monitor else {
         return response;
@@ -274,7 +260,7 @@ fn guard_response(
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        tonic::body::Body::new(AuthenticatedGrpcBody::new(body, monitor)),
+        tonic::body::Body::new(AuthenticatedGrpcBody::new(body, monitor, relay_span)),
     )
 }
 
@@ -283,15 +269,26 @@ struct AuthenticatedGrpcBody {
     source: Option<Pin<Box<tonic::body::Body>>>,
     monitor: LeaseMonitor,
     terminal_sent: bool,
+    relay_span: Option<tracing::Span>,
 }
 
 impl AuthenticatedGrpcBody {
-    fn new(source: tonic::body::Body, monitor: LeaseMonitor) -> Self {
+    fn new(source: tonic::body::Body, monitor: LeaseMonitor, relay_span: Option<tracing::Span>) -> Self {
         Self {
             source: Some(Box::pin(source)),
             monitor,
             terminal_sent: false,
+            relay_span,
         }
+    }
+
+    fn terminate(&mut self, end: LeaseEnd) -> Frame<<Self as HttpBody>::Data> {
+        if let Some(span) = &self.relay_span {
+            span.record("stage", "entry_guard");
+        }
+        self.source = None;
+        self.terminal_sent = true;
+        Frame::trailers(Self::terminal_trailers(end))
     }
 
     fn terminal_trailers(end: LeaseEnd) -> axum::http::HeaderMap {
@@ -326,9 +323,7 @@ impl HttpBody for AuthenticatedGrpcBody {
             return Poll::Ready(None);
         }
         if let Poll::Ready(end) = self.monitor.poll(context) {
-            self.source = None;
-            self.terminal_sent = true;
-            return Poll::Ready(Some(Ok(Frame::trailers(Self::terminal_trailers(end)))));
+            return Poll::Ready(Some(Ok(self.terminate(end))));
         }
         let source_result = {
             let Some(source) = self.source.as_mut() else {
@@ -337,9 +332,7 @@ impl HttpBody for AuthenticatedGrpcBody {
             source.as_mut().poll_frame(context)
         };
         if let Poll::Ready(end) = self.monitor.poll(context) {
-            self.source = None;
-            self.terminal_sent = true;
-            return Poll::Ready(Some(Ok(Frame::trailers(Self::terminal_trailers(end)))));
+            return Poll::Ready(Some(Ok(self.terminate(end))));
         }
         match source_result {
             Poll::Ready(None) => {
@@ -524,7 +517,7 @@ mod tests {
             registry,
             token_digest,
         });
-        let mut body = Box::pin(AuthenticatedGrpcBody::new(source, monitor));
+        let mut body = Box::pin(AuthenticatedGrpcBody::new(source, monitor, None));
 
         assert_unauthenticated_terminal(&mut body).await;
         assert_eq!(polls.load(Ordering::SeqCst), 1);
@@ -535,7 +528,7 @@ mod tests {
         let source = tonic::body::Body::new(ReadyBody {
             polls: Arc::clone(&polls),
         });
-        let mut body = Box::pin(AuthenticatedGrpcBody::new(source, monitor));
+        let mut body = Box::pin(AuthenticatedGrpcBody::new(source, monitor, None));
 
         assert_unauthenticated_terminal(&mut body).await;
         assert_eq!(polls.load(Ordering::SeqCst), 0);
@@ -569,7 +562,7 @@ mod tests {
         let monitor = LeaseMonitor::bearer(SystemTime::now() + Duration::from_secs(1));
 
         assert!(
-            guard_response(response, Some(monitor))
+            guard_response(response, Some(monitor), None)
                 .body()
                 .is_end_stream()
         );

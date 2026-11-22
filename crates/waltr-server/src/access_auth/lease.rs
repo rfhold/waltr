@@ -168,7 +168,7 @@ impl BrowserSessionRevalidator for AccessAuthStore {
     }
 }
 
-pub(super) enum LeaseMonitor {
+pub(crate) enum LeaseMonitor {
     Bearer {
         deadline: Instant,
         expiry: Pin<Box<Sleep>>,
@@ -198,13 +198,13 @@ impl fmt::Debug for LeaseMonitor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum LeaseEnd {
+pub(crate) enum LeaseEnd {
     Unauthenticated,
     Unavailable,
 }
 
 impl LeaseMonitor {
-    pub(super) fn bearer(expires_at: SystemTime) -> Self {
+    pub(crate) fn bearer(expires_at: SystemTime) -> Self {
         let deadline = monotonic_deadline(expires_at);
         Self::Bearer {
             deadline,
@@ -237,7 +237,7 @@ impl LeaseMonitor {
         }
     }
 
-    pub(super) fn poll(&mut self, context: &mut Context<'_>) -> Poll<LeaseEnd> {
+    pub(crate) fn poll(&mut self, context: &mut Context<'_>) -> Poll<LeaseEnd> {
         match self {
             Self::Bearer { deadline, expiry } => {
                 if Instant::now() >= *deadline {

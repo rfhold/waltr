@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { BrowserConfig } from "@grafana/faro-web-sdk";
+import { TransportItemType, type BrowserConfig } from "@grafana/faro-web-sdk";
 
 import { telemetryEnabledForBuild } from "../src/build";
 import { telemetryAppName } from "../src/platform/client";
@@ -45,6 +45,12 @@ describe("telemetry", () => {
     expect(normalizeApplicationView("/sessions/private-session?token=secret#turn-4")).toBe("/sessions/:session");
     expect(normalizeApplicationView("/config/provider/edit/private/models/edit/secret-model")).toBe("/config/provider/edit/:provider/models/edit/:model");
     expect(normalizeApplicationView("/unexpected/user-content")).toBe("/unknown");
+    const scope = "/remote/private-name~1234567890abcdef1234567890abcdef";
+    expect(normalizeApplicationView(`${scope}/`)).toBe("/remote/:destination");
+    expect(normalizeApplicationView(`${scope}/config/provider/edit/codex`)).toBe("/remote/:destination/config/provider/edit/:provider");
+    expect(normalizeApplicationView(`${scope}/sessions/private-session`)).toBe("/remote/:destination/sessions/:session");
+    expect(normalizeApplicationView("/config/remotes")).toBe("/config/remotes");
+    expect(normalizeApplicationView("/remote/private-name/sessions")).toBe("/unknown");
   });
 
   it("does not initialize or send in tests when production is disabled", () => {
@@ -74,11 +80,10 @@ describe("telemetry", () => {
   it("uses standard Faro instrumentation while excluding native requests", () => {
     const browser = createFaroConfig({ platform: "browser", version: "0.1.0", origin: "https://waltr.example" });
     const tauri = createFaroConfig({ platform: "tauri", version: "0.1.0", origin: "http://tauri.localhost" });
-    expect(browser.beforeSend).toBeUndefined();
     expect(browser.ignoreUrls).toBeUndefined();
-    expect(browser.experimental?.trackNavigation).toBe(true);
+    expect(browser.experimental?.trackNavigation).toBe(false);
     expect(tauri.ignoreUrls).toHaveLength(1);
-    expect(tauri.experimental?.trackNavigation).toBe(true);
+    expect(tauri.experimental?.trackNavigation).toBe(false);
     expect((tauri.ignoreUrls?.[0] as RegExp).test("http://127.0.0.1:43123/waltr.Client/Watch")).toBe(true);
     expect(browser.instrumentations?.map(({ name }) => name)).toEqual(expect.arrayContaining([
       "@grafana/faro-web-sdk:instrumentation-console",
@@ -86,5 +91,19 @@ describe("telemetry", () => {
       "@grafana/faro-web-sdk:instrumentation-session",
       "@grafana/faro-web-sdk:instrumentation-user-action",
     ]));
+    for (const config of [browser, tauri]) {
+      expect(config.instrumentations?.map(({ name }) => name)).not.toContain("@grafana/faro-web-sdk:instrumentation-performance");
+      expect(config.instrumentations?.map(({ name }) => name)).not.toContain("@grafana/faro-web-sdk:instrumentation-csp");
+      const payload = {
+        timestamp: "2026-01-01T00:00:00Z", type: "Error", value: "Source unavailable",
+        stacktrace: { frames: [{
+          filename: "https://waltr.example/remote/private~1234567890abcdef1234567890abcdef/sessions/private-session?token=secret",
+          function: "?",
+        }] },
+      };
+      const item = config.beforeSend!({ type: TransportItemType.EXCEPTION, payload, meta: {} });
+      expect(JSON.stringify(item)).not.toMatch(/private|abcde|secret/);
+      expect(payload.stacktrace.frames[0]?.filename).toBe("/remote/:destination/sessions/:session");
+    }
   });
 });

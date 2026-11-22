@@ -3,12 +3,17 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::http::{HeaderMap, Request, Response};
 use futures_util::StreamExt;
 use http_body::{Body as _, Frame};
+use opentelemetry::{
+    propagation::{Extractor, Injector, TextMapPropagator},
+    trace::TraceContextExt as _,
+};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use prost::Message;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +25,8 @@ use tonic::{
     server::{Grpc, ServerStreamingService, StreamingService, UnaryService},
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
+use tracing::Instrument as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use waltr::{
     destination,
     grpc::waltr::{
@@ -29,6 +36,7 @@ use waltr::{
 };
 
 use crate::{
+    access_auth::{LeaseMonitor, guard_response, lease_end_response},
     agent_definition::AgentDefinitionState,
     auth::{AuthService, RemoteCredentialLease, now_ms, remote_route_id},
     resource_catalog::PublishedState,
@@ -50,11 +58,64 @@ impl RemoteRoutes {
         selector: String,
         request: Request<Body>,
         entry_lifetime: Option<Arc<CancellationToken>>,
+        mut monitor: Option<LeaseMonitor>,
     ) -> Response<Body> {
-        match self.route(&selector, request, entry_lifetime).await {
-            Ok(response) => response,
-            Err(status) => status.into_http(),
+        let Some((service, method, shape)) = descriptor(request.uri().path()) else {
+            return Status::unimplemented("RPC does not support a Remote destination").into_http();
+        };
+        let mut telemetry = RelayTelemetry::new(service, method, shape, request.headers());
+        let span = telemetry.span.clone();
+        async {
+            let result = tokio::select! {
+                biased;
+                () = async {
+                    match &entry_lifetime {
+                        Some(lifetime) => lifetime.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    telemetry.stage("entry_guard");
+                    Err(Status::cancelled("entry server stopped"))
+                },
+                end = async {
+                    match monitor.as_mut() {
+                        Some(monitor) => std::future::poll_fn(|cx| monitor.poll(cx)).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    telemetry.stage("entry_guard");
+                    Ok(lease_end_response(end))
+                },
+                response = self.route(&selector, request, entry_lifetime.clone(), &mut telemetry) => response,
+            };
+            match result {
+                Ok(response) => {
+                    let response = guard_response(response, monitor, Some(telemetry.span.clone()));
+                    match grpc_code(response.headers()) {
+                        Some(code) => telemetry.finish(code),
+                        None if response.body().is_end_stream() => {
+                            telemetry.finish(tonic::Code::Unknown)
+                        }
+                        None => {}
+                    }
+                    let (parts, body) = response.into_parts();
+                    Response::from_parts(
+                        parts,
+                        Body::new(ObservedBody {
+                            body,
+                            telemetry,
+                            first: true,
+                        }),
+                    )
+                }
+                Err(status) => {
+                    telemetry.finish(status.code());
+                    status.into_http()
+                }
+            }
         }
+        .instrument(span)
+        .await
     }
 
     async fn route(
@@ -62,12 +123,8 @@ impl RemoteRoutes {
         selector: &str,
         request: Request<Body>,
         entry_lifetime: Option<Arc<CancellationToken>>,
+        telemetry: &mut RelayTelemetry,
     ) -> Result<Response<Body>, Status> {
-        if !supported(request.uri().path()) {
-            return Err(Status::unimplemented(
-                "RPC does not support a Remote destination",
-            ));
-        }
         let (name, expected) = destination::pinned(selector).ok_or_else(|| {
             Status::failed_precondition("Resolve the Remote authorization before routing")
         })?;
@@ -81,7 +138,11 @@ impl RemoteRoutes {
         let incarnation = snapshot.remote_incarnation(name);
         drop(snapshot);
 
-        let (lease, lifetime) = self.auth.remote_route_lease(name, &endpoint, expected).await?;
+        telemetry.stage("grant");
+        let (lease, lifetime) = self
+            .auth
+            .remote_route_lease(name, &endpoint, expected)
+            .await?;
         if remote_route_id(&lease.authority_id).as_deref() != Some(expected) {
             return Err(Status::failed_precondition(
                 "Remote authorization changed; reopen the destination",
@@ -107,12 +168,29 @@ impl RemoteRoutes {
                 .tls_config(ClientTlsConfig::new().with_webpki_roots())
                 .map_err(|_| Status::internal("Remote TLS could not be configured"))?;
         }
-        let outbound = Outbound::new(endpoint_builder.connect_lazy(), lease, request.headers())?;
+        let outbound = Outbound::new(
+            ObservedChannel {
+                channel: endpoint_builder.connect_lazy(),
+                span: telemetry.span.clone(),
+                started: telemetry.started,
+            },
+            lease,
+            request.headers(),
+        )?;
+        telemetry.stage("dispatch");
+        let dispatch_started = Instant::now();
         let response = tokio::select! {
             biased;
-            status = guard.ended() => return Err(status),
+            status = guard.ended() => {
+                telemetry.stage("route_guard");
+                return Err(status);
+            },
             response = dispatch(outbound, request) => response,
         };
+        telemetry.span.record(
+            "dispatch_ms",
+            u64::try_from(dispatch_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         if response.body().is_end_stream() {
             return Ok(response);
         }
@@ -122,6 +200,7 @@ impl RemoteRoutes {
             Body::new(GuardedBody {
                 source: Some(body),
                 ended: Box::pin(async move { guard.ended().await }),
+                span: telemetry.span.clone(),
             }),
         ))
     }
@@ -191,6 +270,315 @@ impl RouteGuard {
 struct GuardedBody {
     source: Option<Body>,
     ended: Pin<Box<dyn Future<Output = Status> + Send>>,
+    span: tracing::Span,
+}
+
+struct TraceHeader<'a>(&'a HeaderMap);
+
+impl Extractor for TraceHeader<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        (key == "traceparent")
+            .then(|| self.0.get(key)?.to_str().ok())
+            .flatten()
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent"]
+    }
+}
+
+#[derive(Default)]
+struct OutboundTrace(Option<AsciiMetadataValue>);
+
+impl Injector for OutboundTrace {
+    fn set(&mut self, key: &str, value: String) {
+        if key == "traceparent" {
+            self.0 = value.parse().ok();
+        }
+    }
+}
+
+struct RelayTelemetry {
+    span: tracing::Span,
+    started: Instant,
+    finished: bool,
+}
+
+impl RelayTelemetry {
+    fn new(
+        service: &'static str,
+        method: &'static str,
+        shape: &'static str,
+        headers: &HeaderMap,
+    ) -> Self {
+        let span = tracing::info_span!(
+            "waltr.remote.relay",
+            rpc.service = service,
+            rpc.method = method,
+            rpc.shape = shape,
+            owner.scope = "remote",
+            stage = "resolve",
+            dispatch_ms = tracing::field::Empty,
+            headers_ms = tracing::field::Empty,
+            first_data_ms = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            rpc.grpc.status_code = tracing::field::Empty
+        );
+        if !tracing::Span::current()
+            .context()
+            .span()
+            .span_context()
+            .is_valid()
+        {
+            let parent = TraceContextPropagator::new().extract(&TraceHeader(headers));
+            if parent.span().span_context().is_valid() {
+                let _ = span.set_parent(parent);
+            }
+        }
+        Self {
+            span,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn stage(&self, stage: &'static str) {
+        self.span.record("stage", stage);
+    }
+
+    fn elapsed(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn finish(&mut self, code: tonic::Code) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.record("elapsed_ms", self.elapsed());
+        self.span.record("rpc.grpc.status_code", code as i64);
+        let outcome = match code {
+            tonic::Code::Ok => "ok",
+            tonic::Code::Cancelled => "cancelled",
+            _ => "failed",
+        };
+        self.span.record("outcome", outcome);
+        if code != tonic::Code::Ok && code != tonic::Code::Cancelled {
+            self.span
+                .set_status(opentelemetry::trace::Status::error("Remote RPC failed"));
+        }
+    }
+}
+
+impl Drop for RelayTelemetry {
+    fn drop(&mut self) {
+        self.finish(tonic::Code::Cancelled);
+    }
+}
+
+struct ObservedBody {
+    body: Body,
+    telemetry: RelayTelemetry,
+    first: bool,
+}
+
+fn grpc_code(headers: &HeaderMap) -> Option<tonic::Code> {
+    headers
+        .get("grpc-status")
+        .map(|value| tonic::Code::from_bytes(value.as_bytes()))
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use opentelemetry::{KeyValue, trace::TracerProvider as _};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing_subscriber::prelude::*;
+
+    #[tokio::test]
+    async fn remote_relay_generates_child_context_and_records_stream_outcomes() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("remote-test"))),
+        );
+        let trace_id = "0123456789abcdef0123456789abcdef";
+        let incoming = format!("00-{trace_id}-0123456789abcdef-01");
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", incoming.parse().unwrap());
+        for key in [
+            "tracestate",
+            "baggage",
+            "authorization",
+            "cookie",
+            destination::HEADER,
+        ] {
+            headers.insert(key, "private-input".parse().unwrap());
+        }
+        let observed = RelayTelemetry::new(
+            "waltr.StatusService",
+            "WatchStatus",
+            "server_stream",
+            &headers,
+        );
+        let outgoing = observed.span.in_scope(|| {
+            Outbound::new(
+                ObservedChannel {
+                    channel: Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                    span: observed.span.clone(),
+                    started: observed.started,
+                },
+                RemoteCredentialLease {
+                    access_token: "test-bearer".into(),
+                    expires_at_ms: 0,
+                    authority_id: "private-grant".into(),
+                },
+                &headers,
+            )
+            .unwrap()
+            .request(())
+        });
+        let metadata = outgoing.metadata();
+        let child = metadata.get("traceparent").unwrap().to_str().unwrap();
+        assert!(child.starts_with(&format!("00-{trace_id}-")));
+        assert_ne!(child, incoming);
+        assert_eq!(metadata.get("authorization").unwrap(), "Bearer test-bearer");
+        for key in ["tracestate", "baggage", "cookie", destination::HEADER] {
+            assert!(!metadata.contains_key(key), "{key}");
+        }
+        let serving_id = child.split('-').nth(2).unwrap().to_owned();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        struct Frames(std::vec::IntoIter<Frame<axum::body::Bytes>>);
+        impl http_body::Body for Frames {
+            type Data = axum::body::Bytes;
+            type Error = Status;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Status>>> {
+                Poll::Ready(self.0.next().map(Ok))
+            }
+        }
+        let mut response = ObservedBody {
+            body: Body::new(Frames(
+                vec![Frame::data("test".into()), Frame::trailers(trailers)].into_iter(),
+            )),
+            telemetry: observed,
+            first: true,
+        };
+        while std::future::poll_fn(|cx| Pin::new(&mut response).poll_frame(cx))
+            .await
+            .is_some()
+        {}
+        drop(response);
+
+        headers.insert("traceparent", "invalid".parse().unwrap());
+        drop(RelayTelemetry::new(
+            "waltr.StatusService",
+            "WatchStatus",
+            "server_stream",
+            &headers,
+        ));
+        let revoked = RelayTelemetry::new(
+            "waltr.StatusService",
+            "WatchStatus",
+            "server_stream",
+            &headers,
+        );
+        let response = guard_response(
+            Response::new(Body::new(Frames(
+                vec![Frame::data("not sent".into())].into_iter(),
+            ))),
+            Some(LeaseMonitor::bearer(std::time::SystemTime::UNIX_EPOCH)),
+            Some(revoked.span.clone()),
+        );
+        let mut response = ObservedBody {
+            body: response.into_body(),
+            telemetry: revoked,
+            first: true,
+        };
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut response).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.trailers_ref().and_then(grpc_code),
+            Some(tonic::Code::Unauthenticated)
+        );
+        drop(response);
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].name, "waltr.remote.relay");
+        assert_eq!(spans[0].span_context.span_id().to_string(), serving_id);
+        assert_eq!(spans[0].parent_span_id.to_string(), "0123456789abcdef");
+        assert!(
+            spans[0]
+                .attributes
+                .iter()
+                .any(|field| field.key.as_str() == "first_data_ms")
+        );
+        assert!(
+            spans[0]
+                .attributes
+                .contains(&KeyValue::new("outcome", "ok"))
+        );
+        assert!(
+            spans[1]
+                .attributes
+                .contains(&KeyValue::new("outcome", "cancelled"))
+        );
+        assert_ne!(spans[1].span_context.trace_id().to_string(), trace_id);
+        assert!(
+            spans[2]
+                .attributes
+                .contains(&KeyValue::new("stage", "entry_guard"))
+        );
+        assert!(spans[2].attributes.contains(&KeyValue::new(
+            "rpc.grpc.status_code",
+            tonic::Code::Unauthenticated as i64
+        )));
+        assert!(!format!("{spans:?}").contains("private-"));
+    }
+}
+
+impl http_body::Body for ObservedBody {
+    type Data = axum::body::Bytes;
+    type Error = Status;
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Status>>> {
+        let frame = Pin::new(&mut self.body).poll_frame(cx);
+        match &frame {
+            Poll::Ready(Some(Ok(frame))) => {
+                if self.first && frame.is_data() {
+                    self.first = false;
+                    self.telemetry
+                        .span
+                        .record("first_data_ms", self.telemetry.elapsed());
+                    self.telemetry.stage("response_body");
+                }
+                if let Some(trailers) = frame.trailers_ref() {
+                    let code = grpc_code(trailers).unwrap_or(tonic::Code::Unknown);
+                    self.telemetry.finish(code);
+                }
+            }
+            Poll::Ready(Some(Err(status))) => self.telemetry.finish(status.code()),
+            Poll::Ready(None) => self.telemetry.finish(tonic::Code::Unknown),
+            Poll::Pending => {}
+        }
+        frame
+    }
 }
 
 impl http_body::Body for GuardedBody {
@@ -206,6 +594,7 @@ impl http_body::Body for GuardedBody {
         }
         if let Poll::Ready(status) = self.ended.as_mut().poll(cx) {
             self.source = None;
+            self.span.record("stage", "route_guard");
             let mut headers = status.into_http::<()>().into_parts().0.headers;
             headers.remove(axum::http::header::CONTENT_TYPE);
             return Poll::Ready(Some(Ok(Frame::trailers(headers))));
@@ -215,15 +604,47 @@ impl http_body::Body for GuardedBody {
 }
 
 #[derive(Clone)]
-struct Outbound {
+struct ObservedChannel {
     channel: Channel,
+    span: tracing::Span,
+    started: Instant,
+}
+
+impl tower::Service<Request<Body>> for ObservedChannel {
+    type Response = Response<Body>;
+    type Error = tonic::transport::Error;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.channel.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let response = self.channel.call(request);
+        let span = self.span.clone();
+        let started = self.started;
+        Box::pin(async move {
+            let response = response.await?;
+            span.record(
+                "headers_ms",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            Ok(response)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct Outbound {
+    channel: ObservedChannel,
     authorization: AsciiMetadataValue,
     grpc_timeout: Option<AsciiMetadataValue>,
+    traceparent: Option<AsciiMetadataValue>,
 }
 
 impl Outbound {
     fn new(
-        channel: Channel,
+        channel: ObservedChannel,
         lease: RemoteCredentialLease,
         headers: &HeaderMap,
     ) -> Result<Self, Status> {
@@ -234,10 +655,14 @@ impl Outbound {
         let grpc_timeout = headers
             .get("grpc-timeout")
             .and_then(|header| AsciiMetadataValue::try_from(header.as_bytes()).ok());
+        let mut trace = OutboundTrace::default();
+        TraceContextPropagator::new()
+            .inject_context(&tracing::Span::current().context(), &mut trace);
         Ok(Self {
             channel,
             authorization,
             grpc_timeout,
+            traceparent: trace.0,
         })
     }
 
@@ -250,6 +675,11 @@ impl Outbound {
             request
                 .metadata_mut()
                 .insert("grpc-timeout", timeout.clone());
+        }
+        if let Some(traceparent) = &self.traceparent {
+            request
+                .metadata_mut()
+                .insert("traceparent", traceparent.clone());
         }
         request
     }
@@ -464,8 +894,11 @@ macro_rules! routes {
     ($($service:literal => $client:path {
         $($shape:ident $rpc:literal => $method:ident($input:path);)*
     })*) => {
-        fn supported(path: &str) -> bool {
-            matches!(path, $($(concat!("/", $service, "/", $rpc))|*)|*)
+        fn descriptor(path: &str) -> Option<(&'static str, &'static str, &'static str)> {
+            match path {
+                $($(concat!("/", $service, "/", $rpc) => Some(($service, $rpc, stringify!($shape))),)*)*
+                _ => None,
+            }
         }
 
         async fn dispatch(outbound: Outbound, request: Request<Body>) -> Response<Body> {
@@ -479,7 +912,7 @@ macro_rules! routes {
 }
 
 routes! {
-    "waltr.session.v1.SessionService" => session::session_service_client::SessionServiceClient<Channel> {
+    "waltr.session.v1.SessionService" => session::session_service_client::SessionServiceClient<ObservedChannel> {
         unary "OpenSessionMcpApp" => open_session_mcp_app(session::OpenSessionMcpAppRequest);
         unary "CallSessionMcpAppTool" => call_session_mcp_app_tool(session::CallSessionMcpAppToolRequest);
         unary "CloseSessionMcpApp" => close_session_mcp_app(session::CloseSessionMcpAppRequest);
@@ -499,12 +932,12 @@ routes! {
         unary "ContinueSession" => continue_session(session::ContinueSessionRequest);
         unary "SearchSessionTemplates" => search_session_templates(session::SearchSessionTemplatesRequest);
     }
-    "waltr.session.v1.InteractionService" => session::interaction_service_client::InteractionServiceClient<Channel> {
+    "waltr.session.v1.InteractionService" => session::interaction_service_client::InteractionServiceClient<ObservedChannel> {
         unary "GetInteractions" => get_interactions(session::GetInteractionsRequest);
         stream "WatchInteractions" => watch_interactions(session::WatchInteractionsRequest);
         unary "RespondInteraction" => respond_interaction(session::RespondInteractionRequest);
     }
-    "waltr.routine.v2.RoutineService" => routine::routine_service_client::RoutineServiceClient<Channel> {
+    "waltr.routine.v2.RoutineService" => routine::routine_service_client::RoutineServiceClient<ObservedChannel> {
         stream "WatchDefinitions" => watch_definitions(routine::WatchDefinitionsRequest);
         unary "StartInvocation" => start_invocation(routine::StartInvocationRequest);
         unary "ListInvocations" => list_invocations(routine::ListInvocationsRequest);
@@ -527,19 +960,19 @@ routes! {
         stream "ReadBlob" => read_blob(routine::ReadBlobRequest);
         unary "CloseBlobRead" => close_blob_read(routine::CloseBlobReadRequest);
     }
-    "waltr.resource.v1.ResourceService" => resource::resource_service_client::ResourceServiceClient<Channel> {
+    "waltr.resource.v1.ResourceService" => resource::resource_service_client::ResourceServiceClient<ObservedChannel> {
         unary "GetResourceCatalog" => get_resource_catalog(resource::GetResourceCatalogRequest);
         stream "WatchResourceCatalog" => watch_resource_catalog(resource::WatchResourceCatalogRequest);
         unary "InspectResource" => inspect_resource(resource::InspectResourceRequest);
         unary "ReplaceResource" => replace_resource(resource::ReplaceResourceRequest);
         unary "ResetResource" => reset_resource(resource::ResetResourceRequest);
     }
-    "waltr.catalog.v1.CatalogService" => catalog::catalog_service_client::CatalogServiceClient<Channel> {
+    "waltr.catalog.v1.CatalogService" => catalog::catalog_service_client::CatalogServiceClient<ObservedChannel> {
         unary "SearchCatalogModels" => search_catalog_models(catalog::SearchCatalogModelsRequest);
         unary "SuggestCatalogMatches" => suggest_catalog_matches(catalog::SuggestCatalogMatchesRequest);
         unary "GetModelCatalogDrift" => get_model_catalog_drift(catalog::GetModelCatalogDriftRequest);
     }
-    "waltr.auth.v1.AuthService" => auth::auth_service_client::AuthServiceClient<Channel> {
+    "waltr.auth.v1.AuthService" => auth::auth_service_client::AuthServiceClient<ObservedChannel> {
         unary "ListAuthStatuses" => list_auth_statuses(auth::ListAuthStatusesRequest);
         unary "GetAuthStatus" => get_auth_status(auth::GetAuthStatusRequest);
         unary "BeginAuth" => begin_auth(auth::BeginAuthRequest);
@@ -549,7 +982,7 @@ routes! {
         unary "RefreshAuth" => refresh_auth(auth::RefreshAuthRequest);
         unary "Logout" => logout(auth::LogoutRequest);
     }
-    "waltr.status.v1.StatusService" => status::status_service_client::StatusServiceClient<Channel> {
+    "waltr.status.v1.StatusService" => status::status_service_client::StatusServiceClient<ObservedChannel> {
         stream "WatchStatus" => watch_status(status::WatchStatusRequest);
         unary "GetFeatureStatus" => get_feature_status(status::GetFeatureStatusRequest);
     }

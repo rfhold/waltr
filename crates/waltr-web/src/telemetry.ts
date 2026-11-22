@@ -6,6 +6,7 @@ import {
 } from "@grafana/faro-web-sdk";
 import { TracingInstrumentation } from "@grafana/faro-web-tracing";
 
+import { remoteScope } from "./app/destination";
 import { telemetryAppName, type BuildPlatform } from "./platform/client";
 
 const COLLECTOR_URL = "https://faro.holdenitdown.net/collect";
@@ -59,10 +60,22 @@ export function createFaroConfig(options: {
       environment: "production",
     },
     instrumentations: [
-      ...getWebInstrumentations(),
+      ...getWebInstrumentations({
+        enablePerformanceInstrumentation: false,
+        enableContentSecurityPolicyInstrumentation: false,
+      }),
       new TracingInstrumentation(),
     ],
-    experimental: { trackNavigation: true },
+    // Faro's automatic navigation event includes raw fromUrl and toUrl.
+    experimental: { trackNavigation: false },
+    beforeSend: (item) => {
+      if (item.type !== "exception" || !("stacktrace" in item.payload)) return item;
+      for (const frame of item.payload.stacktrace?.frames ?? []) {
+        const path = applicationPathname(frame.filename);
+        if (/^\/remote(?:\/|$)/.test(path)) frame.filename = normalizeApplicationView(path);
+      }
+      return item;
+    },
     // Native requests carry adapter-private loopback coordinates and bearer credentials.
     ignoreUrls: options.platform === "tauri" ? [/.*/] : undefined,
     pageTracking: {
@@ -97,6 +110,15 @@ export function reportApplicationError(category: "startup" | "dispatch" | "recov
 
 export function normalizeApplicationView(pathname: string): string {
   const path = applicationPathname(pathname).split(/[?#]/, 1)[0].replace(/\/{2,}/g, "/");
+  const remote = remoteScope(path);
+  if (remote?.selector) {
+    const view = normalizeOwnerView(path.slice(remote.base.length) || "/");
+    return view === "/" ? "/remote/:destination" : `/remote/:destination${view}`;
+  }
+  return normalizeOwnerView(path);
+}
+
+function normalizeOwnerView(path: string): string {
   if (path === "/" || path === "/sessions" || path === "/sessions/data" || path === "/routines") return path;
   if (/^\/sessions\/[^/]+\/?$/.test(path)) return "/sessions/:session";
   if (/^\/routines\/[^/]+\/?$/.test(path)) return "/routines/:invocation";
@@ -106,7 +128,7 @@ export function normalizeApplicationView(pathname: string): string {
   if (/^\/config\/provider\/create\/models\/edit\/[^/]+\/?$/.test(path)) return "/config/provider/create/models/edit/:model";
   if (/^\/config\/provider\/edit\/[^/]+\/models\/create\/?$/.test(path)) return "/config/provider/edit/:provider/models/create";
   if (/^\/config\/provider\/edit\/[^/]+\/models\/edit\/[^/]+\/?$/.test(path)) return "/config/provider/edit/:provider/models/edit/:model";
-  if (path === "/config/mcp" || path === "/config/mcp/create" || path === "/config/defaults") return path;
+  if (path === "/config/mcp" || path === "/config/mcp/create" || path === "/config/defaults" || path === "/config/remotes") return path;
   if (/^\/config\/mcp\/edit\/[^/]+\/?$/.test(path)) return "/config/mcp/edit/:server";
   return "/unknown";
 }

@@ -56,6 +56,7 @@ impl Operation {
         let span = tracing::info_span!(target: TARGET, "native.audio.operation", entrypoint,
             diagnostic_id = id, outcome = tracing::field::Empty, category = tracing::field::Empty,
             elapsed_ms = tracing::field::Empty, stage = tracing::field::Empty,
+            preflight = tracing::field::Empty,
             capture_cleanup = tracing::field::Empty, typing_cleanup = tracing::field::Empty,
             failure_stage = tracing::field::Empty, invocation_id = tracing::field::Empty, bytes_received = 0_u64, bytes_received_scope = "selected_stream_payload");
         Self(Arc::new(Inner {
@@ -120,6 +121,9 @@ impl Operation {
             snapshot.primary = category;
             snapshot.failure_stage = snapshot.stage;
         }
+    }
+    pub(crate) fn destination_preflight(&self, outcome: &'static str) {
+        self.0.span.record("preflight", outcome);
     }
     #[cfg(test)]
     pub fn stage(&self, stage: Stage) {

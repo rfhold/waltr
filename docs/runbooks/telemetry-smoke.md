@@ -27,6 +27,23 @@ These checks complement deterministic tests. They verify one active runtime and 
 7. In the metrics data source, run `waltr_app_startups`. Confirm a recent sample for service `waltr-app-native`.
 8. In Pyroscope Explore, select a process CPU profile and use `{service_name="waltr-server"}`. Confirm samples from the standalone server.
 
+## Remote Relay
+
+Open a Remote from the server sidebar. Load a provider status or open the Routines list.
+In Tempo Explore, run `{ name = "waltr.remote.relay" }`. Filter by `span.rpc.method` to isolate the call.
+For a native comparison, run `{ span.rpc.method = "ListAuthStatuses" && span.owner.scope = "entry" }`.
+Native Remote calls show `owner.scope = "remote"`.
+
+Open a relay trace. The relay generates the downstream `traceparent` from its own span.
+Check the destination server span for the same trace ID and the relay span as parent.
+An unavailable destination can end the relay before any destination span appears.
+The relay records canonical gRPC status, not HTTP status, plus `headers_ms`, `dispatch_ms`, `first_data_ms`, and `elapsed_ms`.
+`headers_ms` measures from relay start to the downstream HTTP response headers. A connection failure leaves it absent.
+`dispatch_ms` measures typed dispatch up to the entry response. It includes unary decode or a local transport error; it does not prove downstream receipt.
+Absent `first_data_ms` means the relay did not observe a response data frame.
+The relay does not export destination names, grant IDs, endpoint URLs, or status messages.
+Faro reports normalized view labels. It disables automatic navigation, performance-entry, and CSP events that include raw URLs.
+
 ## Native Audio Diagnostics
 
 Rebuild and relaunch the native app before these checks. An older packaged binary does not emit these events.
@@ -43,6 +60,9 @@ The private `native_audio_telemetry` module preserves the app target `waltr_app_
 
 The span `native.audio.operation` covers permission, capture, RPC, output actions, and owned cleanup.
 It retains the summary fields and parents the native gRPC spans through async instrumentation.
+For a named shortcut, check `preflight` on that span before interpreting a `destination_unavailable` result.
+`deadline` means the three-second check expired. `watch_open_failed`, `watch_failed`, and `empty_watch` identify separate watch failures.
+`definition_mismatch` means the observed definition did not match the pinned shortcut. `cancelled`, `invalidated`, and `ready` identify the other exits.
 The diagnostic identifier counts operations within this process; it never copies IPC, binding, routine, device, or client identifiers.
 
 Milestone semantics:

@@ -209,6 +209,7 @@ fn safe_trace_target(metadata: &tracing::Metadata<'_>) -> bool {
                 && matches!(
                     metadata.target(),
                     "waltr_server::routine::telemetry" | "waltr_audio::telemetry"
+                        | "waltr_server::remote_routes"
                 )))
 }
 

@@ -14,6 +14,8 @@ mod store;
 pub use config::{AccessAuthConfig, AccessAuthConfigError, AccessAuthMode, OidcConfig};
 pub use handlers::{access_auth_router, api_protected_resource};
 pub use middleware::{GrpcAccessAuthLayer, GrpcTransportLayer, require_browser_session};
+pub(crate) use lease::LeaseMonitor;
+pub(crate) use middleware::{guard_response, lease_end_response};
 pub use oidc::{
     AccessAuthHttpClient, AuthorizationCode, DiscoveredOidcProvider, OidcError, OidcTokenResponse,
     OidcVerifier, TokenEndpointAuthMethod,

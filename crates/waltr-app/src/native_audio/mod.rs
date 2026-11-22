@@ -380,20 +380,26 @@ impl Held {
                         provider.credential_revision() == *revision && provider.has_bearer_token()
                     })
         };
-        let Some(invocation) = &self.binding.resolved else {
-            return false;
-        };
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
-            () = self.token.cancelled() => false,
+            () = self.token.cancelled() => "cancelled",
             result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                if !current() { return false; }
-                let Ok(mut stream) = transport.watch_manual_routines("native-shortcut-check".into()).await else { return false; };
-                let Some(Ok(snapshot)) = stream.next().await else { return false; };
+                let Some(invocation) = &self.binding.resolved else { return "definition_mismatch"; };
+                if !current() { return "invalidated"; }
+                let Ok(mut stream) = transport.watch_manual_routines("native-shortcut-check".into()).await else { return "watch_open_failed"; };
+                let snapshot = match stream.next().await {
+                    Some(Ok(snapshot)) => snapshot,
+                    Some(Err(_)) => return "watch_failed",
+                    None => return "empty_watch",
+                };
                 let catalog = catalog::Catalog::from_definitions(snapshot);
-                current() && catalog.current(&catalog.pin(invocation.clone(), false))
-            }) => result.unwrap_or(false),
-        }
+                if !current() { "invalidated" }
+                else if catalog.current(&catalog.pin(invocation.clone(), false)) { "ready" }
+                else { "definition_mismatch" }
+            }) => result.unwrap_or("deadline"),
+        };
+        self.diagnostics.destination_preflight(outcome);
+        outcome == "ready"
     }
 
     pub(crate) async fn run_routed(
