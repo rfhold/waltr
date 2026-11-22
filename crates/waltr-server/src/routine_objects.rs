@@ -1,5 +1,5 @@
-//! Immutable Routine payloads. Unreferenced objects are retained; no deletion or replay API.
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+//! Immutable host payloads. Unreferenced objects are retained; no deletion or replay API.
+use std::{future::Future, io::ErrorKind, path::PathBuf, pin::Pin, sync::Arc};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -13,15 +13,28 @@ impl std::fmt::Display for ObjectError {
 impl std::error::Error for ObjectError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Namespace { Program, Text }
+pub enum Namespace {
+    Program,
+    Text,
+    /// Saved session message images, separate from Routine objects.
+    MessageImage,
+}
 impl Namespace {
-    fn name(self) -> &'static str { match self { Self::Program => "program", Self::Text => "text" } }
-    fn limit(self) -> usize { match self { Self::Program => 131072, Self::Text => 1048576 } }
+    fn name(self) -> &'static str { match self { Self::Program => "program", Self::Text => "text", Self::MessageImage => "image" } }
+    fn limit(self) -> usize { match self { Self::Program => 131072, Self::Text => 1048576, Self::MessageImage => waltr_agent::MAX_TRANSIENT_ATTACHMENT_BYTES } }
 }
 
 /// Host-internal reference, never an authorization capability or caller-provided path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ObjectRef { pub namespace: Namespace, pub sha256: String, pub bytes: u64 }
+impl std::fmt::Debug for ObjectRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectRef")
+            .field("namespace", &self.namespace)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
 impl ObjectRef {
     pub fn new(namespace: Namespace, sha256: String, bytes: u64) -> Result<Self, ObjectError> {
         if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) || bytes > namespace.limit() as u64 {
@@ -50,6 +63,39 @@ pub trait ImmutableObjects: Send + Sync {
 
 #[derive(Clone)]
 pub struct FilesystemObjects { root: PathBuf }
+
+// Create and own the pending file in the same blocking operation, so a
+// cancelled await cannot leave an unowned file behind.
+struct PendingFile(Option<PathBuf>);
+impl PendingFile {
+    fn create(path: PathBuf) -> std::io::Result<(std::fs::File, Self)> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        Ok((file, Self(Some(path))))
+    }
+    fn path(&self) -> &std::path::Path {
+        self.0.as_deref().expect("pending file still owned")
+    }
+    async fn remove(mut self) -> std::io::Result<()> {
+        tokio::fs::remove_file(self.path()).await?;
+        self.0 = None;
+        Ok(())
+    }
+}
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            drop(std::fs::remove_file(path));
+        }
+    }
+}
+
 impl FilesystemObjects {
     /// Root must be an absolute path for durable storage.
     pub fn new(root: PathBuf) -> Result<Self, ObjectError> {
@@ -69,21 +115,20 @@ impl ImmutableObjects for FilesystemObjects {
             builder.create(&directory).await.map_err(|_| ObjectError::Unavailable)?;
             let path = self.root.join(reference.key());
             let temporary = directory.join(format!(".pending-{}", uuid::Uuid::new_v4()));
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let mut file = options.open(&temporary).await.map_err(|_| ObjectError::Unavailable)?;
+            let (file, pending) = tokio::task::spawn_blocking(move || PendingFile::create(temporary))
+                .await.map_err(|_| ObjectError::Unavailable)?
+                .map_err(|_| ObjectError::Unavailable)?;
+            let mut file = tokio::fs::File::from_std(file);
             file.write_all(bytes).await.map_err(|_| ObjectError::Unavailable)?;
             file.sync_all().await.map_err(|_| ObjectError::Unavailable)?;
             drop(file);
-            match tokio::fs::hard_link(&temporary, &path).await {
+            match tokio::fs::hard_link(pending.path(), &path).await {
                 Ok(()) => {},
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
                 Err(_) => return Err(ObjectError::Unavailable),
             }
-            tokio::fs::remove_file(&temporary).await.map_err(|_| ObjectError::Unavailable)?;
-            // Persist the namespace and its parent directory entries before publishing SQL.
+            pending.remove().await.map_err(|_| ObjectError::Unavailable)?;
+            // Persist directory entries before the owning record can refer to the object.
             for dir in directory.ancestors() {
                 tokio::fs::File::open(dir).await.map_err(|_| ObjectError::Unavailable)?.sync_all().await.map_err(|_| ObjectError::Unavailable)?;
             }
@@ -94,10 +139,7 @@ impl ImmutableObjects for FilesystemObjects {
         Box::pin(async move {
             ObjectRef::new(reference.namespace, reference.sha256.clone(), reference.bytes)?;
             let file = tokio::fs::File::open(self.root.join(reference.key())).await.map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { ObjectError::Missing } else { ObjectError::Unavailable })?;
-            let mut bytes = Vec::with_capacity(reference.bytes as usize);
-            file.take(reference.bytes + 1).read_to_end(&mut bytes).await.map_err(|_| ObjectError::Unavailable)?;
-            reference.verify(&bytes)?;
-            Ok(bytes)
+            read_verified(reference, file).await
         })
     }
 }
@@ -109,7 +151,13 @@ impl S3Objects {
         if bucket.trim().is_empty() || prefix.is_empty() || prefix.starts_with('/') || prefix.split('/').any(|p| p.is_empty() || p == "." || p == "..") { return Err(ObjectError::Invalid); }
         Ok(Self { client, bucket, prefix })
     }
-    fn key(&self, reference: &ObjectRef) -> String { format!("{}/routine-objects/{}", self.prefix, reference.key()) }
+    fn key(&self, reference: &ObjectRef) -> String {
+        if reference.namespace == Namespace::MessageImage {
+            format!("{}.waltr-message-objects/{}", self.prefix, reference.key())
+        } else {
+            format!("{}/routine-objects/{}", self.prefix, reference.key())
+        }
+    }
 }
 impl ImmutableObjects for S3Objects {
     fn put<'a>(&'a self, reference: &'a ObjectRef, bytes: &'a [u8]) -> ObjectFuture<'a, ()> {
@@ -128,12 +176,28 @@ impl ImmutableObjects for S3Objects {
             ObjectRef::new(reference.namespace, reference.sha256.clone(), reference.bytes)?;
             let result = self.client.get_object().bucket(&self.bucket).key(self.key(reference)).send().await.map_err(|e| if e.raw_response().map(|r| r.status().as_u16()) == Some(404) { ObjectError::Missing } else { ObjectError::Unavailable })?;
             if result.content_length() != Some(reference.bytes as i64) { return Err(ObjectError::Corrupt); }
-            let mut bytes = Vec::with_capacity(reference.bytes as usize);
-            result.body.into_async_read().take(reference.bytes + 1).read_to_end(&mut bytes).await.map_err(|_| ObjectError::Unavailable)?;
-            reference.verify(&bytes)?;
-            Ok(bytes)
+            read_verified(reference, result.body.into_async_read()).await
         })
     }
+}
+
+async fn read_verified(
+    reference: &ObjectRef,
+    mut source: impl tokio::io::AsyncRead + Unpin,
+) -> Result<Vec<u8>, ObjectError> {
+    let mut bytes = vec![0; reference.bytes as usize];
+    source.read_exact(&mut bytes).await.map_err(|error| {
+        if error.kind() == ErrorKind::UnexpectedEof {
+            ObjectError::Corrupt
+        } else {
+            ObjectError::Unavailable
+        }
+    })?;
+    if source.read(&mut [0]).await.map_err(|_| ObjectError::Unavailable)? != 0 {
+        return Err(ObjectError::Corrupt);
+    }
+    reference.verify(&bytes)?;
+    Ok(bytes)
 }
 
 /// Standalone environment adapter; embedded callers construct a filesystem store explicitly.

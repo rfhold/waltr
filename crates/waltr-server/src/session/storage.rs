@@ -2,12 +2,13 @@
 
 use std::{env, error::Error, fmt, path::PathBuf};
 
+use super::image_objects::SessionImageObjects;
 use aws_sdk_s3::{
     Client,
     config::{Credentials, Region},
 };
-use waltr_agent::{S3SessionStore, S3SessionWriteMode};
 use url::Url;
+use waltr_agent::{S3SessionStore, S3SessionWriteMode};
 
 const ENV_SESSION_STORE: &str = "WALTR_SESSION_STORE";
 const ENV_FILESYSTEM_ROOT: &str = "WALTR_SESSION_FILESYSTEM_ROOT";
@@ -69,21 +70,47 @@ impl fmt::Debug for S3SessionStorageConfig {
 }
 
 impl S3SessionStorageConfig {
-    pub(super) fn into_store(self) -> S3SessionStore {
-        S3SessionStore::new_with_write_mode(
-            s3_client(self.endpoint.to_string(), self.region, self.access_key_id, self.secret_access_key, self.force_path_style),
-            self.bucket,
-            self.prefix,
+    pub(super) fn into_stores(
+        self,
+    ) -> Result<(S3SessionStore, SessionImageObjects), SessionStorageConfigError> {
+        let client = s3_client(
+            self.endpoint.to_string(),
+            self.region,
+            self.access_key_id,
+            self.secret_access_key,
+            self.force_path_style,
+        );
+        let images = SessionImageObjects::s3(
+            client.clone(),
+            self.bucket.clone(),
+            self.prefix.clone(),
             self.write_mode,
         )
+        .map_err(|_| SessionStorageConfigError::Invalid {
+            variable: ENV_S3_PREFIX,
+            requirement: "must identify a usable session image namespace",
+        })?;
+        let sessions =
+            S3SessionStore::new_with_write_mode(client, self.bucket, self.prefix, self.write_mode);
+        Ok((sessions, images))
     }
 }
 
-pub(crate) fn s3_client(endpoint: String, region: String, access_key: String, secret_key: String, force_path_style: bool) -> Client {
+pub(crate) fn s3_client(
+    endpoint: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    force_path_style: bool,
+) -> Client {
     let credentials = Credentials::new(access_key, secret_key, None, None, "waltr-s3");
-    let config = aws_sdk_s3::Config::builder().behavior_version_latest()
-        .endpoint_url(endpoint).region(Region::new(region)).credentials_provider(credentials)
-        .force_path_style(force_path_style).build();
+    let config = aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .endpoint_url(endpoint)
+        .region(Region::new(region))
+        .credentials_provider(credentials)
+        .force_path_style(force_path_style)
+        .build();
     Client::from_conf(config)
 }
 
@@ -339,7 +366,9 @@ mod tests {
         assert_eq!(config.prefix, "production/sessions");
         assert!(config.force_path_style);
         assert_eq!(config.write_mode, S3SessionWriteMode::ConditionalEtagCas);
-        let _store = config.into_store();
+        let _stores = config
+            .into_stores()
+            .expect("valid session and image stores");
     }
 
     #[test]

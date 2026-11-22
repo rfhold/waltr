@@ -33,6 +33,7 @@ Tests inject independent in-memory databases or temporary file-backed SQLite dat
 | Waltr SQL | App data `server/waltr.sqlite3` |
 | MCP SQL | App data `server/mcp.sqlite3` |
 | Filesystem sessions | App data `server/sessions/` |
+| Saved session images | App data `server/sessions.waltr-message-objects/image/` |
 | Routine payload objects | App data `server/routine-objects/` |
 | Agent workspace | App data `workspace/` |
 | models.dev cache | App data `server/models/api.json` |
@@ -117,6 +118,18 @@ MCP V4 adds OIDC resource-owner provenance. It does not move Waltr browser-sessi
 Never edit an applied migration. Schema corrections require a new forward-only migration in both backend directories; SQLx rejects changed checksums on reopen.
 
 The MCP database and every wrapping-key version still referenced by an encrypted signing row are one backup and recovery unit. Cleanup runs every five minutes in batches of 256 and is advisory. Signing maintenance runs every 24 hours, atomically activates one candidate while retaining the prior public key for verification overlap, and rewraps retained private material with the active wrapping key.
+
+## Saved Session Images
+
+Session messages store ordered image descriptors, not image bytes. The session image store verifies length, format signature, and digest before publishing an immutable object. Only a committed reference on a visible message authorizes a client read. Timeline responses expose format and length, not storage keys. Submission acknowledges queue admission; it does not acknowledge a saved message.
+
+The memory session store has a process-local image budget. For filesystem sessions, the image namespace is a sibling named `<session-root-name>.waltr-message-objects/image/`. For S3 sessions it is `<session-prefix>.waltr-message-objects/image/` in the same bucket. Back up and restore the image namespace with its session records. Do not put an independent object expiration policy on it: other sessions can still refer to the same bytes after a copy.
+
+Uploads stage in bounded memory with an absolute lease. Filesystem and S3 stores charge the whole batch before publishing bytes, up to a cumulative 1 GiB per authenticated issuer and subject. Back up and restore `image-capacity-v1/` alongside `image/`. A submitted batch can consume capacity without producing a saved message; failed or uncertain writes, duplicate bytes, and deleted messages do not restore capacity. Existing images remain readable when the limit is reached.
+
+S3 `single-writer` rounds each batch up to 1 MiB and writes an immutable capacity entry. S3 `conditional-etag` uses an ETag-guarded counter. Both account for prior charges in either mode. Do not overlap writers during a mode change.
+
+Objects are published before the guarded session append, so interruption or an ambiguous append can leave unreferenced bytes. Removing a message revokes access through that reference; it does not delete the object. Record wipes do not remove the sibling image namespace. There is no automatic collection or backfill.
 
 ## Routine Payload Objects
 
