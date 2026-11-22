@@ -473,7 +473,8 @@ pub struct TimelineProjectionMetadata {
     #[prost(bool, tag="3")]
     pub has_more: bool,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectedTimelineEvent {
     #[prost(enumeration="TimelinePresentation", tag="3")]
     pub presentation: i32,
@@ -485,7 +486,8 @@ pub struct ProjectedTimelineEvent {
 }
 /// Nested message and enum types in `ProjectedTimelineEvent`.
 pub mod projected_timeline_event {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Eq, Hash)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         #[prost(message, tag="1")]
         Durable(super::TimelineEvent),
@@ -493,7 +495,8 @@ pub mod projected_timeline_event {
         Synthetic(super::SyntheticTimelineEvent),
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SyntheticTimelineEvent {
     #[prost(uint64, tag="1")]
     pub cursor: u64,
@@ -524,15 +527,106 @@ pub struct TimelineTruncation {
     #[prost(uint64, optional, tag="2")]
     pub after_cursor: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitUserMessageRequest {
     #[prost(string, tag="1")]
     pub session_id: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
-    pub text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag="3")]
+    pub parts: ::prost::alloc::vec::Vec<UserMessageInputPart>,
 }
+/// Acknowledges admission, not durable publication. Observe the timeline for the saved message.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubmitUserMessageResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct UserMessageInputPart {
+    #[prost(oneof="user_message_input_part::Part", tags="1, 2")]
+    pub part: ::core::option::Option<user_message_input_part::Part>,
+}
+/// Nested message and enum types in `UserMessageInputPart`.
+pub mod user_message_input_part {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[prost(skip_debug)]
+    pub enum Part {
+        #[prost(string, tag="1")]
+        Text(::prost::alloc::string::String),
+        /// A sealed upload for this session and the current access route. Single use.
+        #[prost(string, tag="2")]
+        ImageUploadId(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BeginMessageImageUploadRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(enumeration="MessageImageFormat", tag="2")]
+    pub format: i32,
+    #[prost(uint32, tag="3")]
+    pub size_bytes: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct BeginMessageImageUploadResponse {
+    #[prost(string, tag="1")]
+    pub upload_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct WriteMessageImageChunkRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub upload_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag="3")]
+    pub offset: u32,
+    /// A nonempty chunk of at most 64 KiB at the exact next offset.
+    #[prost(bytes="vec", tag="4")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteMessageImageChunkResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct SealMessageImageUploadRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub upload_id: ::prost::alloc::string::String,
+}
+/// Acknowledges verification only. The upload has no history or read authorization.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SealMessageImageUploadResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct AbortMessageImageUploadRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub upload_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AbortMessageImageUploadResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadMessageImageRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub item_id: ::prost::alloc::string::String,
+    /// Zero-based index among all ordered parts of the visible message.
+    #[prost(uint32, tag="3")]
+    pub part_index: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct ReadMessageImageResponse {
+    /// Nonempty chunks in order, each at most 64 KiB. Successful stream completion ends the image.
+    #[prost(bytes="vec", tag="1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InterruptSessionRequest {
@@ -653,7 +747,8 @@ pub struct TimelineQuery {
     #[prost(string, repeated, tag="4")]
     pub channels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TimelineEvent {
     #[prost(uint64, tag="1")]
     pub cursor: u64,
@@ -679,14 +774,16 @@ pub struct TimelineEvent {
     #[prost(string, tag="10")]
     pub metadata_json: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TimelineContent {
-    #[prost(oneof="timeline_content::Content", tags="1, 2, 3, 4, 5, 7, 8")]
+    #[prost(oneof="timeline_content::Content", tags="1, 2, 3, 4, 5, 7, 8, 9")]
     pub content: ::core::option::Option<timeline_content::Content>,
 }
 /// Nested message and enum types in `TimelineContent`.
 pub mod timeline_content {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Eq, Hash)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Content {
         #[prost(message, tag="1")]
         Empty(super::EmptyTimelineContent),
@@ -702,6 +799,8 @@ pub mod timeline_content {
         ContentRef(super::ContentRefTimelineContent),
         #[prost(message, tag="8")]
         Json(super::JsonTimelineContent),
+        #[prost(message, tag="9")]
+        UserMessage(super::UserMessageTimelineContent),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -716,6 +815,34 @@ pub struct TextDeltaTimelineContent {
 pub struct TextSnapshotTimelineContent {
     #[prost(string, tag="1")]
     pub text: ::prost::alloc::string::String,
+}
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UserMessageTimelineContent {
+    #[prost(message, repeated, tag="1")]
+    pub parts: ::prost::alloc::vec::Vec<UserMessageTimelinePart>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UserMessageTimelinePart {
+    #[prost(oneof="user_message_timeline_part::Part", tags="1, 2")]
+    pub part: ::core::option::Option<user_message_timeline_part::Part>,
+}
+/// Nested message and enum types in `UserMessageTimelinePart`.
+pub mod user_message_timeline_part {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Part {
+        #[prost(string, tag="1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag="2")]
+        Image(super::MessageImageInfo),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MessageImageInfo {
+    #[prost(enumeration="MessageImageFormat", tag="1")]
+    pub format: i32,
+    #[prost(uint32, tag="2")]
+    pub size_bytes: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ToolCallTimelineContent {
@@ -965,6 +1092,38 @@ impl TimelinePresentation {
             "TIMELINE_PRESENTATION_UNSPECIFIED" => Some(Self::Unspecified),
             "TIMELINE_PRESENTATION_DURABLE" => Some(Self::Durable),
             "TIMELINE_PRESENTATION_MASK_REPLACEMENT" => Some(Self::MaskReplacement),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MessageImageFormat {
+    Unspecified = 0,
+    Png = 1,
+    Jpeg = 2,
+    Webp = 3,
+}
+impl MessageImageFormat {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MESSAGE_IMAGE_FORMAT_UNSPECIFIED",
+            Self::Png => "MESSAGE_IMAGE_FORMAT_PNG",
+            Self::Jpeg => "MESSAGE_IMAGE_FORMAT_JPEG",
+            Self::Webp => "MESSAGE_IMAGE_FORMAT_WEBP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MESSAGE_IMAGE_FORMAT_UNSPECIFIED" => Some(Self::Unspecified),
+            "MESSAGE_IMAGE_FORMAT_PNG" => Some(Self::Png),
+            "MESSAGE_IMAGE_FORMAT_JPEG" => Some(Self::Jpeg),
+            "MESSAGE_IMAGE_FORMAT_WEBP" => Some(Self::Webp),
             _ => None,
         }
     }

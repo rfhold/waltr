@@ -43,6 +43,63 @@ pub mod waltr {
     pub mod session {
         pub mod v1 {
             include!("waltr/session/v1/waltr.session.v1.rs");
+
+            macro_rules! opaque_debug {
+                ($($message:ident),+ $(,)?) => {$(
+                    impl core::fmt::Debug for $message {
+                        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                            f.debug_struct(stringify!($message)).finish_non_exhaustive()
+                        }
+                    }
+                )+};
+            }
+
+            opaque_debug!(
+                UserMessageInputPart,
+                BeginMessageImageUploadResponse,
+                WriteMessageImageChunkRequest,
+                SealMessageImageUploadRequest,
+                AbortMessageImageUploadRequest,
+                ReadMessageImageResponse,
+            );
+
+            impl UserMessageInputPart {
+                /// Create a text part for the ordered message input.
+                #[must_use]
+                pub fn text(text: impl Into<String>) -> Self {
+                    Self {
+                        part: Some(user_message_input_part::Part::Text(text.into())),
+                    }
+                }
+            }
+
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+
+                #[test]
+                fn message_image_wire_values_omit_bytes_and_handles_from_debug() {
+                    let handle = "fixture-image-upload-handle";
+                    let message = SubmitUserMessageRequest {
+                        session_id: "fixture-session".into(),
+                        parts: vec![UserMessageInputPart {
+                            part: Some(user_message_input_part::Part::ImageUploadId(handle.into())),
+                        }],
+                    };
+                    let chunk = WriteMessageImageChunkRequest {
+                        upload_id: handle.into(),
+                        data: vec![173, 174, 175],
+                        ..Default::default()
+                    };
+                    let read = ReadMessageImageResponse {
+                        data: chunk.data.clone(),
+                    };
+                    assert!(!format!("{message:?}").contains(handle));
+                    assert!(!format!("{chunk:?}").contains(handle));
+                    assert!(!format!("{chunk:?}").contains("173"));
+                    assert!(!format!("{read:?}").contains("173"));
+                }
+            }
         }
     }
     pub mod resource {

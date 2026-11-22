@@ -22,6 +22,11 @@ service SessionService {
   rpc GetTimeline(GetTimelineRequest) returns (GetTimelineResponse);
   rpc WatchTimeline(WatchTimelineRequest) returns (stream WatchTimelineResponse);
   rpc SubmitUserMessage(SubmitUserMessageRequest) returns (SubmitUserMessageResponse);
+  rpc BeginMessageImageUpload(BeginMessageImageUploadRequest) returns (BeginMessageImageUploadResponse);
+  rpc WriteMessageImageChunk(WriteMessageImageChunkRequest) returns (WriteMessageImageChunkResponse);
+  rpc SealMessageImageUpload(SealMessageImageUploadRequest) returns (SealMessageImageUploadResponse);
+  rpc AbortMessageImageUpload(AbortMessageImageUploadRequest) returns (AbortMessageImageUploadResponse);
+  rpc ReadMessageImage(ReadMessageImageRequest) returns (stream ReadMessageImageResponse);
   rpc InterruptSession(InterruptSessionRequest) returns (InterruptSessionResponse);
   rpc RollbackSession(RollbackSessionRequest) returns (RollbackSessionResponse);
   rpc ContinueSession(ContinueSessionRequest) returns (ContinueSessionResponse);
@@ -240,11 +245,75 @@ message TimelineTruncation {
 
 message SubmitUserMessageRequest {
   string session_id = 1;
-  string text = 2;
+  reserved 2;
+  reserved "text";
+  repeated UserMessageInputPart parts = 3;
 }
 
+// Acknowledges admission, not durable publication. Observe the timeline for the saved message.
 message SubmitUserMessageResponse {}
 
+message UserMessageInputPart {
+  oneof part {
+    string text = 1;
+    // A sealed upload for this session and the current access route. Single use.
+    string image_upload_id = 2;
+  }
+}
+
+enum MessageImageFormat {
+  MESSAGE_IMAGE_FORMAT_UNSPECIFIED = 0;
+  MESSAGE_IMAGE_FORMAT_PNG = 1;
+  MESSAGE_IMAGE_FORMAT_JPEG = 2;
+  MESSAGE_IMAGE_FORMAT_WEBP = 3;
+}
+
+message BeginMessageImageUploadRequest {
+  string session_id = 1;
+  MessageImageFormat format = 2;
+  uint32 size_bytes = 3;
+}
+
+message BeginMessageImageUploadResponse {
+  string upload_id = 1;
+}
+
+message WriteMessageImageChunkRequest {
+  string session_id = 1;
+  string upload_id = 2;
+  uint32 offset = 3;
+  // A nonempty chunk of at most 64 KiB at the exact next offset.
+  bytes data = 4;
+}
+
+message WriteMessageImageChunkResponse {}
+
+message SealMessageImageUploadRequest {
+  string session_id = 1;
+  string upload_id = 2;
+}
+
+// Acknowledges verification only. The upload has no history or read authorization.
+message SealMessageImageUploadResponse {}
+
+message AbortMessageImageUploadRequest {
+  string session_id = 1;
+  string upload_id = 2;
+}
+
+message AbortMessageImageUploadResponse {}
+
+message ReadMessageImageRequest {
+  string session_id = 1;
+  string item_id = 2;
+  // Zero-based index among all ordered parts of the visible message.
+  uint32 part_index = 3;
+}
+
+message ReadMessageImageResponse {
+  // Nonempty chunks in order, each at most 64 KiB. Successful stream completion ends the image.
+  bytes data = 1;
+}
 
 
 message InterruptSessionRequest {
@@ -402,6 +471,7 @@ message TimelineContent {
     ToolResultTimelineContent tool_result = 5;
     ContentRefTimelineContent content_ref = 7;
     JsonTimelineContent json = 8;
+    UserMessageTimelineContent user_message = 9;
   }
 }
 
@@ -413,6 +483,22 @@ message TextDeltaTimelineContent {
 
 message TextSnapshotTimelineContent {
   string text = 1;
+}
+
+message UserMessageTimelineContent {
+  repeated UserMessageTimelinePart parts = 1;
+}
+
+message UserMessageTimelinePart {
+  oneof part {
+    string text = 1;
+    MessageImageInfo image = 2;
+  }
+}
+
+message MessageImageInfo {
+  MessageImageFormat format = 1;
+  uint32 size_bytes = 2;
 }
 
 message ToolCallTimelineContent {

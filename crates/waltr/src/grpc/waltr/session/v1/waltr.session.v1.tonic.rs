@@ -938,6 +938,151 @@ pub mod session_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn begin_message_image_upload(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BeginMessageImageUploadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BeginMessageImageUploadResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/BeginMessageImageUpload",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "BeginMessageImageUpload",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn write_message_image_chunk(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WriteMessageImageChunkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WriteMessageImageChunkResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/WriteMessageImageChunk",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "WriteMessageImageChunk",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn seal_message_image_upload(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SealMessageImageUploadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SealMessageImageUploadResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/SealMessageImageUpload",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "SealMessageImageUpload",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn abort_message_image_upload(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AbortMessageImageUploadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AbortMessageImageUploadResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/AbortMessageImageUpload",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "AbortMessageImageUpload",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn read_message_image(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadMessageImageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ReadMessageImageResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/ReadMessageImage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "ReadMessageImage",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
         pub async fn interrupt_session(
             &mut self,
             request: impl tonic::IntoRequest<super::InterruptSessionRequest>,
@@ -1171,6 +1316,50 @@ pub mod session_service_server {
             request: tonic::Request<super::SubmitUserMessageRequest>,
         ) -> std::result::Result<
             tonic::Response<super::SubmitUserMessageResponse>,
+            tonic::Status,
+        >;
+        async fn begin_message_image_upload(
+            &self,
+            request: tonic::Request<super::BeginMessageImageUploadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BeginMessageImageUploadResponse>,
+            tonic::Status,
+        >;
+        async fn write_message_image_chunk(
+            &self,
+            request: tonic::Request<super::WriteMessageImageChunkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WriteMessageImageChunkResponse>,
+            tonic::Status,
+        >;
+        async fn seal_message_image_upload(
+            &self,
+            request: tonic::Request<super::SealMessageImageUploadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SealMessageImageUploadResponse>,
+            tonic::Status,
+        >;
+        async fn abort_message_image_upload(
+            &self,
+            request: tonic::Request<super::AbortMessageImageUploadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AbortMessageImageUploadResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ReadMessageImage method.
+        type ReadMessageImageStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::ReadMessageImageResponse,
+                    tonic::Status,
+                >,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn read_message_image(
+            &self,
+            request: tonic::Request<super::ReadMessageImageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ReadMessageImageStream>,
             tonic::Status,
         >;
         async fn interrupt_session(
@@ -1926,6 +2115,254 @@ pub mod session_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/BeginMessageImageUpload" => {
+                    #[allow(non_camel_case_types)]
+                    struct BeginMessageImageUploadSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::BeginMessageImageUploadRequest>
+                    for BeginMessageImageUploadSvc<T> {
+                        type Response = super::BeginMessageImageUploadResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::BeginMessageImageUploadRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::begin_message_image_upload(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BeginMessageImageUploadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/WriteMessageImageChunk" => {
+                    #[allow(non_camel_case_types)]
+                    struct WriteMessageImageChunkSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::WriteMessageImageChunkRequest>
+                    for WriteMessageImageChunkSvc<T> {
+                        type Response = super::WriteMessageImageChunkResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WriteMessageImageChunkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::write_message_image_chunk(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WriteMessageImageChunkSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/SealMessageImageUpload" => {
+                    #[allow(non_camel_case_types)]
+                    struct SealMessageImageUploadSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::SealMessageImageUploadRequest>
+                    for SealMessageImageUploadSvc<T> {
+                        type Response = super::SealMessageImageUploadResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SealMessageImageUploadRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::seal_message_image_upload(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SealMessageImageUploadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/AbortMessageImageUpload" => {
+                    #[allow(non_camel_case_types)]
+                    struct AbortMessageImageUploadSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::AbortMessageImageUploadRequest>
+                    for AbortMessageImageUploadSvc<T> {
+                        type Response = super::AbortMessageImageUploadResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::AbortMessageImageUploadRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::abort_message_image_upload(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AbortMessageImageUploadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/ReadMessageImage" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadMessageImageSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::ServerStreamingService<
+                        super::ReadMessageImageRequest,
+                    > for ReadMessageImageSvc<T> {
+                        type Response = super::ReadMessageImageResponse;
+                        type ResponseStream = T::ReadMessageImageStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReadMessageImageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::read_message_image(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadMessageImageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
