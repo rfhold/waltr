@@ -1,6 +1,6 @@
 //! Invocation-local authority and joins; scheduling/history remain the ordinary coordinator's.
 use super::*;
-use crate::routine::ports::HelperTarget;
+use crate::routine::ports::{HelperContent, HelperTarget};
 use futures_util::{
     FutureExt,
     future::{BoxFuture, Shared},
@@ -32,6 +32,7 @@ struct Target<S: SessionStore + Clone + Send + Sync + 'static> {
     state: Arc<tokio::sync::Mutex<State>>,
     changed: Arc<Notify>,
     result: ResultWait,
+    images: Arc<images::LiveImages>,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for Target<S> {
     fn clone(&self) -> Self {
@@ -45,6 +46,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Clone for Target<S> {
             state: self.state.clone(),
             changed: self.changed.clone(),
             result: self.result.clone(),
+            images: self.images.clone(),
         }
     }
 }
@@ -54,7 +56,14 @@ fn wait(submission: waltr_agent::AgentSessionRunSubmission) -> RunWait {
             .handle
             .wait()
             .await
-            .map_err(|_| PortError::Uncertain)
+            .map_err(|error| match error {
+                waltr_agent::AgentSessionRunError::Agent(waltr_agent::LlmError::Api {
+                    status: Some(status), ..
+                }) if (400..=599).contains(&status) => PortError::ProviderRejected(
+                    crate::routine::ports::ProviderRejection { http_status: status },
+                ),
+                _ => PortError::Uncertain,
+            })
     }
     .boxed()
     .shared()
@@ -62,25 +71,29 @@ fn wait(submission: waltr_agent::AgentSessionRunSubmission) -> RunWait {
 async fn join(waits: Vec<RunWait>) -> Result<AgentSessionRunOutcome, PortError> {
     let mut last = None;
     let mut failure = false;
+    let mut rejected = None;
     for wait in waits {
         match wait.await {
             Ok(outcome) if outcome.status == SessionStatus::Finished => last = Some(outcome),
+            Err(error @ PortError::ProviderRejected(_)) => {
+                rejected.get_or_insert(error);
+            }
             _ => failure = true,
         }
     }
-    if failure {
+    if let Some(error) = rejected {
+        Err(error)
+    } else if failure {
         Err(PortError::Uncertain)
     } else {
         last.ok_or(PortError::Uncertain)
     }
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> HelperTarget for Target<S> {
-    fn submit(&self, prompt: String) -> PortFuture<()> {
+    fn submit(&self, content: HelperContent) -> PortFuture<()> {
         let this = self.clone();
         Box::pin(async move {
-            if prompt.trim().is_empty() || prompt.len() > 16384 {
-                return Err(PortError::Invalid);
-            }
+            let pending = images::prepare(content, None)?;
             let mut state = this.state.lock().await;
             if state.sealed
                 || this.cancel.is_cancelled()
@@ -89,16 +102,18 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperTarget for Target<S>
             {
                 return Err(PortError::Denied);
             }
+            let (message, pending) = this.images.retain(pending)?;
             let submission = this
                 .sessions
-                .submit_owned_next_turn_prompt(
+                .submit_owned_next_turn_message(
                     this.id.clone(),
                     &this.incarnation,
-                    prompt,
+                    message,
                     this.limits,
                 )
                 .await
                 .map_err(|_| PortError::Unavailable)?;
+            pending.accepted();
             state.waits.push(wait(submission));
             this.changed.notify_one();
             Ok(())
@@ -136,6 +151,7 @@ impl waltr_agent::AgentHostRuntimeFactory for PinnedRuntime {
                 || record.metadata.incarnation != self.record.metadata.incarnation
                 || record.agent_definition != self.record.agent_definition
                 || record.inference_settings != self.record.inference_settings
+                || record.active_masks() != self.record.active_masks()
             {
                 return Err(waltr_agent::LlmError::Protocol {
                     provider: "routine",
@@ -185,6 +201,7 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
     record: &SessionRecord,
     runtime: AgentRuntime,
     input: Option<waltr_agent::TransientInput>,
+    images: Arc<images::LiveImages>,
     limits: AgentRunLimits,
     cancel: CancellationToken,
     deadline: tokio::time::Instant,
@@ -240,6 +257,7 @@ pub(super) async fn run<S: SessionStore + Clone + Send + Sync + 'static>(
         })),
         changed: Arc::new(Notify::new()),
         result: opening.result,
+        images,
     };
     if opening.ready.send(Arc::new(target.clone())).is_err() {
         cancel.cancel();

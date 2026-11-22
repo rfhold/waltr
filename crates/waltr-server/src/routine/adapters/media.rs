@@ -1,7 +1,7 @@
 //! Host-owned media operations over the ordinary invocation and helper services.
 use super::authorized_tools::{
-    McpArguments, RoutineMcpPort, execute_mcp, is_tool_result, parse_mcp, tool_image_attachment,
-    tool_result_handle,
+    HelperParts, ImageAlias, ImageAliases, McpArguments, RoutineMcpPort, execute_mcp, has_images,
+    is_tool_result, parse_mcp, tool_image_attachment, tool_result_handle, valid_helper_parts,
 };
 #[cfg(test)]
 #[path = "script_routine_media_tests.rs"]
@@ -19,8 +19,9 @@ use crate::routine::{
         stream::{self, Chunk, Format, Reader, Streams, Text, Writer},
     },
     ports::{
-        HelperPayload, HelperRequest, HelperResult, HelperRunner, HostFactory, OperationPolicy,
-        PortError, PortFuture, PreparedHost, Reservation, SelectedEntrypoint,
+        HelperContent, HelperPayload, HelperRequest, HelperResult, HelperRunner, HelperSelection,
+        HostFactory, OperationPolicy, PortError, PortFuture, PreparedHost, Reservation,
+        SelectedEntrypoint,
     },
     text_results::{InvocationTextScope, TextResultStore, TextSource, TextSourceFuture},
 };
@@ -38,7 +39,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use waltr_agent::{
     CompletionDecision, CompletionObserver, CompletionObserverError, CompletionObserverFuture,
-    CompletionProposal, TransientInputBudget, TransientInputKind, TransientModelCapabilities,
+    CompletionProposal, TransientAttachment, TransientInputBudget, TransientInputKind,
+    TransientModelCapabilities, UserMessagePart,
 };
 use waltr_script::{
     CleanupFuture, HostContext, HostDispatcher, HostFuture, HostHandle, HostReply, HostRequest,
@@ -300,6 +302,7 @@ impl MediaHostFactory {
                 ..State::default()
             };
             let host = Arc::new(MediaHost {
+                image_aliases: ImageAliases::default(),
                 mcp,
                 binding,
                 definition,
@@ -470,6 +473,7 @@ enum Resource {
         target: Arc<dyn crate::routine::ports::HelperTarget>,
         credit: Arc<Vec<OwnedSemaphorePermit>>,
         completed: Arc<AtomicBool>,
+        input: TargetInput,
     },
     Capture(Arc<Capture>),
     TextFeed(Arc<TextFeed>),
@@ -484,6 +488,29 @@ enum Resource {
     },
     Blob(blob::CommittedBlob),
 }
+#[derive(Clone)]
+struct TargetInput {
+    helpers: Arc<dyn HelperRunner>,
+    selection: HelperSelection,
+    capture: Option<String>,
+    limits: super::helper::HelperInput,
+}
+
+impl TargetInput {
+    async fn capabilities(&self) -> Result<TransientModelCapabilities, waltr_script::Error> {
+        let mut capabilities = self
+            .helpers
+            .input_capabilities(self.selection.clone())
+            .await
+            .map_err(|_| waltr_script::Error::Denied)?;
+        capabilities.text &= self.limits.text;
+        self.helpers
+            .preflight_payload(self.selection.clone(), capabilities, self.capture.clone())
+            .await
+            .map_err(|_| waltr_script::Error::Denied)?;
+        Ok(capabilities)
+    }
+}
 struct TextFeed {
     writer: tokio::sync::Mutex<Option<(Writer, u64)>>,
     reader: Mutex<Option<Reader>>,
@@ -496,6 +523,7 @@ struct Capture {
 }
 #[derive(Clone)]
 struct MediaHost {
+    image_aliases: ImageAliases,
     mcp: Option<Arc<dyn RoutineMcpPort>>,
     tool_streams: Arc<super::tool_streams::ToolStreams>,
     cleanup: Arc<tokio::sync::Mutex<Cleanup>>,
@@ -553,6 +581,13 @@ impl MediaHost {
             .handle
             .as_ref()
             .ok_or(waltr_script::Error::Identity)?;
+        self.resource_handle(handle, context)
+    }
+    fn resource_handle(
+        &self,
+        handle: &HostHandle,
+        context: &HostContext,
+    ) -> Result<Resource, waltr_script::Error> {
         context.validate_handle(handle, handle.kind())?;
         self.state
             .lock()
@@ -667,8 +702,9 @@ impl MediaHost {
                     request.callback.is_some(),
                 )
                 .map_err(|_| waltr_script::Error::Denied)?;
+            self.image_aliases.validate(&helper.content)?;
             if request.operation == "helper.open"
-                && ((request.handle.is_some() && !is_tool_result(request))
+                && (request.handle.is_some()
                     || helper.source.is_some()
                     || helper.field.is_some()
                     || request.callback.is_some())
@@ -690,6 +726,14 @@ impl MediaHost {
                     .select_inference(&helper.inference)
                     .map_err(|_| waltr_script::Error::Invalid)?,
                 helper: Some(helper),
+                ..Arguments::default()
+            }
+        } else if request.operation == "helper.submit" {
+            let submit: SubmitArguments =
+                serde_json::from_value(request.arguments.clone().into_json())
+                    .map_err(|_| waltr_script::Error::Invalid)?;
+            Arguments {
+                content: Some(submit.content),
                 ..Arguments::default()
             }
         } else {
@@ -715,16 +759,44 @@ impl MediaHost {
                     .as_object()
                     .ok_or(waltr_script::Error::Invalid)?;
                 if request.operation == "helper.submit" {
-                    if keys.len() != 1
-                        || args
-                            .task
-                            .as_ref()
-                            .is_none_or(|task| task.trim().is_empty() || task.len() > 16384)
-                    {
+                    let parts = args.content.as_ref().ok_or(waltr_script::Error::Invalid)?;
+                    if keys.len() != 1 || !valid_helper_parts(parts) {
                         return Err(waltr_script::Error::Invalid);
                     }
+                    self.image_aliases.validate(parts)?;
                 } else if !keys.is_empty() {
                     return Err(waltr_script::Error::Invalid);
+                }
+            }
+            "helper.image.bind" => {
+                let alias: ImageAlias =
+                    serde_json::from_value(request.arguments.clone().into_json())
+                        .map_err(|_| waltr_script::Error::Invalid)?;
+                if !self
+                    .definition
+                    .envelope()
+                    .spec
+                    .capabilities
+                    .contains("helper.run")
+                    || request.callback.is_some()
+                    || !ImageAlias::valid_name(&alias.name)
+                {
+                    return Err(waltr_script::Error::Denied);
+                }
+                let handle = request
+                    .handle
+                    .as_ref()
+                    .ok_or(waltr_script::Error::Identity)?;
+                if is_tool_result(request) {
+                    self.mcp
+                        .as_ref()
+                        .ok_or(waltr_script::Error::Denied)?
+                        .results()
+                        .image(context, handle, 0)?;
+                } else if !matches!(self.resource(request, context)?,
+                    Resource::Blob(blob) if blob.metadata().image.is_some())
+                {
+                    return Err(waltr_script::Error::Denied);
                 }
             }
             "media.input.next" | "media.input.seal" | "media.input.acknowledge" => {
@@ -835,30 +907,14 @@ impl MediaHost {
                 }
             }
             "helper.run" | "helper.open" => {
-                if is_tool_result(request) {
-                    if self.mcp.is_none()
-                        || args
-                            .helper
-                            .as_ref()
-                            .is_some_and(|helper| helper.field.is_some())
+                if request.handle.is_some() {
+                    let profile = args.helper.as_ref().ok_or(waltr_script::Error::Invalid)?;
+                    if !matches!(profile.content.as_slice(), [UserMessagePart::Text { .. }])
+                        || matches!(self.resource(request, context)?,
+                            Resource::Blob(blob) if blob.metadata().image.is_some())
                     {
-                        return Err(waltr_script::Error::Denied);
+                        return Err(waltr_script::Error::Invalid);
                     }
-                    context.validate_handle(
-                        request
-                            .handle
-                            .as_ref()
-                            .ok_or(waltr_script::Error::Identity)?,
-                        "tools.result",
-                    )?;
-                } else if args
-                    .helper
-                    .as_ref()
-                    .is_some_and(|helper| helper.image_index.is_some())
-                {
-                    return Err(waltr_script::Error::Invalid);
-                } else if request.handle.is_some() {
-                    self.resource(request, context)?;
                 }
             }
             "media.select" | "media.publish" | "media.emit" | "media.lease" | "media.read"
@@ -958,6 +1014,12 @@ impl MediaHost {
         Ok(args)
     }
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitArguments {
+    content: HelperParts,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Arguments {
@@ -965,7 +1027,8 @@ struct Arguments {
     mcp: Option<McpArguments>,
     #[serde(skip)]
     operation_id: Option<String>,
-    task: Option<String>,
+    #[serde(skip)]
+    content: Option<HelperParts>,
     stream: Option<String>,
     outputs: Option<Vec<String>>,
     port: Option<String>,
@@ -1021,6 +1084,114 @@ impl OperationPolicy for MediaHost {
 }
 
 impl MediaHost {
+    async fn blob_attachment(
+        &self,
+        blob: &blob::CommittedBlob,
+        kind: TransientInputKind,
+        max_bytes: usize,
+        capabilities: TransientModelCapabilities,
+    ) -> Result<TransientAttachment, waltr_script::Error> {
+        if !supported(capabilities, kind) {
+            return Err(waltr_script::Error::Denied);
+        }
+        if blob.metadata().bytes > max_bytes as u64 {
+            return Err(waltr_script::Error::Limit);
+        }
+        let mut bytes = self
+            .bindings
+            .attachments
+            .attachment_buffer(kind, blob.metadata().bytes as usize)
+            .map_err(|_| waltr_script::Error::Limit)?;
+        #[cfg(test)]
+        BLOB_READER_OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let reader = self
+            .bindings
+            .blobs
+            .reader(self.scope(), blob.clone(), self.wait())
+            .await
+            .map_err(|_| waltr_script::Error::Identity)?;
+        let read = async {
+            loop {
+                let chunk = self
+                    .bindings
+                    .blobs
+                    .read(
+                        blob::ReadAccess::Invocation(self.scope()),
+                        reader.clone(),
+                        self.wait(),
+                    )
+                    .await
+                    .map_err(|_| waltr_script::Error::Identity)?;
+                bytes
+                    .append(&chunk.bytes)
+                    .map_err(|_| waltr_script::Error::Limit)?;
+                if chunk.eof {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        reader.close();
+        read?;
+        bytes.finish().map_err(|_| waltr_script::Error::Limit)
+    }
+
+    async fn message_parts(
+        &self,
+        parts: HelperParts,
+        capabilities: Option<TransientModelCapabilities>,
+        mut remaining: usize,
+        context: &HostContext,
+    ) -> Result<HelperContent, waltr_script::Error> {
+        let mut content = Vec::with_capacity(parts.len());
+        for part in parts {
+            content.push(match part {
+                UserMessagePart::Text { text } => UserMessagePart::Text { text },
+                UserMessagePart::Image { image } => {
+                    let capabilities = capabilities.ok_or(waltr_script::Error::Denied)?;
+                    let handle = self.image_aliases.get(&image.source)?;
+                    let (attachment, bytes) = if handle.kind() == "tools.result" {
+                        let result = self
+                            .mcp
+                            .as_ref()
+                            .ok_or(waltr_script::Error::Denied)?
+                            .results()
+                            .image(context, &handle, image.index)?;
+                        let image = result.image()?;
+                        (
+                            tool_image_attachment(
+                                image,
+                                capabilities,
+                                remaining,
+                                &self.bindings.attachments,
+                            )?,
+                            image.decoded_bytes(),
+                        )
+                    } else {
+                        let Resource::Blob(blob) = self.resource_handle(&handle, context)? else {
+                            return Err(waltr_script::Error::Identity);
+                        };
+                        let kind = match (blob.metadata().image, image.index) {
+                            (Some(blob::ImageFormat::Png), 0) => TransientInputKind::Png,
+                            (Some(blob::ImageFormat::Jpeg), 0) => TransientInputKind::Jpeg,
+                            (Some(blob::ImageFormat::WebP), 0) => TransientInputKind::WebP,
+                            _ => return Err(waltr_script::Error::Invalid),
+                        };
+                        (
+                            self.blob_attachment(&blob, kind, remaining, capabilities)
+                                .await?,
+                            blob.metadata().bytes,
+                        )
+                    };
+                    remaining -= bytes as usize;
+                    UserMessagePart::Image { image: attachment }
+                }
+            });
+        }
+        Ok(content)
+    }
+
     async fn execute(
         self: Arc<Self>,
         request: HostRequest,
@@ -1051,29 +1222,55 @@ impl MediaHost {
                         self.definition.limits(),
                     );
             }
+            "helper.image.bind" => {
+                let alias: ImageAlias = serde_json::from_value(request.arguments.into_json())
+                    .map_err(|_| waltr_script::Error::Invalid)?;
+                self.image_aliases.bind(
+                    alias.name,
+                    request.handle.ok_or(waltr_script::Error::Identity)?,
+                )?;
+                json!({"status":"completed"})
+            }
             "helper.submit" | "helper.idle" | "helper.seal" => {
                 let Resource::Target {
                     target,
                     credit,
                     completed,
+                    input,
                 } = self.resource(&request, &context)?
                 else {
                     return Err(waltr_script::Error::Identity);
                 };
                 match request.operation.as_str() {
-                    "helper.submit" => target
-                        .submit(args.task.ok_or(waltr_script::Error::Invalid)?)
-                        .await
-                        .map_err(|_| waltr_script::Error::Protocol)?,
+                    "helper.submit" => {
+                        let parts = args.content.ok_or(waltr_script::Error::Invalid)?;
+                        let capabilities = if has_images(&parts) {
+                            Some(input.capabilities().await?)
+                        } else {
+                            None
+                        };
+                        target
+                            .submit(
+                                self.message_parts(
+                                    parts,
+                                    capabilities,
+                                    input.limits.max_bytes,
+                                    &context,
+                                )
+                                .await?,
+                            )
+                            .await
+                            .map_err(|_| waltr_script::Error::Protocol)?;
+                    }
                     "helper.idle" => target
                         .idle()
                         .await
-                        .map_err(|_| waltr_script::Error::Protocol)?,
+                        .map_err(crate::routine::service::helper_script_error)?,
                     _ => {
                         let result = target
                             .seal()
                             .await
-                            .map_err(|_| waltr_script::Error::Protocol)?;
+                            .map_err(crate::routine::service::helper_script_error)?;
                         self.bindings
                             .driver
                             .record_helper(
@@ -1588,126 +1785,62 @@ impl MediaHost {
             }
             "helper.run" | "helper.open" => {
                 let profile = args.helper.ok_or(waltr_script::Error::Invalid)?;
-                let image = if is_tool_result(&request) {
-                    Some(
-                        self.mcp
-                            .as_ref()
-                            .ok_or(waltr_script::Error::Denied)?
-                            .results()
-                            .image(
-                                &context,
-                                request
-                                    .handle
-                                    .as_ref()
-                                    .ok_or(waltr_script::Error::Identity)?,
-                                profile.image_index.unwrap_or(0),
-                            )?,
-                    )
-                } else {
-                    None
-                };
                 let resource = request
                     .handle
                     .as_ref()
-                    .filter(|_| image.is_none())
                     .map(|_| self.resource(&request, &context))
                     .transpose()?;
                 let helpers = args
                     .helper_runner
                     .unwrap_or_else(|| self.bindings.helpers.clone());
-                let mut capabilities = if resource.is_some() || image.is_some() {
-                    helpers
-                        .input_capabilities(profile.selection.clone())
-                        .await
-                        .map_err(|_| waltr_script::Error::Denied)?
+                let input = TargetInput {
+                    helpers: helpers.clone(),
+                    selection: profile.selection.clone(),
+                    capture: profile.capture.clone(),
+                    limits: profile.input,
+                };
+                let capabilities = if resource.is_some() || has_images(&profile.content) {
+                    input.capabilities().await?
                 } else {
                     TransientModelCapabilities {
                         png: false,
                         jpeg: false,
                         webp: false,
                         pdf: false,
-                        text: true,
+                        text: input.limits.text,
                         max_body_bytes: 65536,
                     }
                 };
-                capabilities.text &= profile.input.text;
-                if resource.is_some() || image.is_some() {
-                    helpers
-                        .preflight_payload(
-                            profile.selection.clone(),
-                            capabilities,
-                            profile.capture.clone(),
-                        )
-                        .await
-                        .map_err(|_| waltr_script::Error::Denied)?;
-                }
                 let credit = self.charge(profile.completion_bytes)?;
+                let content = self
+                    .message_parts(
+                        profile.content,
+                        Some(capabilities),
+                        input.limits.max_bytes,
+                        &context,
+                    )
+                    .await?;
                 let attachment = match &resource {
                     Some(Resource::Blob(blob)) => {
-                        if blob.metadata().bytes > profile.input.max_bytes as u64 {
-                            return Err(waltr_script::Error::Limit);
-                        }
                         let kind = match (
                             &blob.metadata().image,
                             blob.metadata().content_type.as_str(),
                         ) {
-                            (Some(format), _) => match format {
-                                blob::ImageFormat::Png => TransientInputKind::Png,
-                                blob::ImageFormat::Jpeg => TransientInputKind::Jpeg,
-                                blob::ImageFormat::WebP => TransientInputKind::WebP,
-                            },
                             (None, "application/pdf") => TransientInputKind::Pdf,
                             (None, "text/plain") => TransientInputKind::Utf8,
                             _ => return Err(waltr_script::Error::Denied),
                         };
-                        if !supported(capabilities, kind) {
-                            return Err(waltr_script::Error::Denied);
-                        }
-                        let mut bytes = self
-                            .bindings
-                            .attachments
-                            .attachment_buffer(kind, blob.metadata().bytes as usize)
-                            .map_err(|_| waltr_script::Error::Limit)?;
-                        #[cfg(test)]
-                        BLOB_READER_OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let reader = self
-                            .bindings
-                            .blobs
-                            .reader(self.scope(), blob.clone(), self.wait())
-                            .await
-                            .map_err(|_| waltr_script::Error::Identity)?;
-                        let read = async {
-                            loop {
-                                let chunk = self
-                                    .bindings
-                                    .blobs
-                                    .read(
-                                        blob::ReadAccess::Invocation(self.scope()),
-                                        reader.clone(),
-                                        self.wait(),
-                                    )
-                                    .await
-                                    .map_err(|_| waltr_script::Error::Identity)?;
-                                bytes
-                                    .append(&chunk.bytes)
-                                    .map_err(|_| waltr_script::Error::Limit)?;
-                                if chunk.eof {
-                                    break;
-                                }
-                            }
-                            Ok(())
-                        }
-                        .await;
-                        reader.close();
-                        read?;
-                        Some(bytes.finish().map_err(|_| waltr_script::Error::Limit)?)
+                        Some(
+                            self.blob_attachment(blob, kind, input.limits.max_bytes, capabilities)
+                                .await?,
+                        )
                     }
                     Some(resource) => {
                         if !capabilities.text {
                             return Err(waltr_script::Error::Denied);
                         }
                         let text = resource_text(resource, profile.field.as_deref())?;
-                        if text.len() > profile.input.max_bytes {
+                        if text.len() > input.limits.max_bytes {
                             return Err(waltr_script::Error::Limit);
                         }
                         Some(
@@ -1717,17 +1850,7 @@ impl MediaHost {
                                 .map_err(|_| waltr_script::Error::Limit)?,
                         )
                     }
-                    None => image
-                        .as_ref()
-                        .map(|image| {
-                            tool_image_attachment(
-                                image.image()?,
-                                capabilities,
-                                profile.input.max_bytes,
-                                &self.bindings.attachments,
-                            )
-                        })
-                        .transpose()?,
+                    None => None,
                 };
                 let observer = request.callback.map(|callback| {
                     Arc::new(ProposalObserver {
@@ -1743,7 +1866,7 @@ impl MediaHost {
                             HelperRequest {
                                 workspace: profile.workspace.map(Into::into),
                                 selection: profile.selection,
-                                task: profile.task,
+                                content,
                                 capture: profile.capture,
                                 max_turns: profile.max_turns,
                                 deadline: Duration::from_millis(profile.deadline_ms),
@@ -1766,6 +1889,7 @@ impl MediaHost {
                             target,
                             credit,
                             completed: Arc::new(AtomicBool::new(false)),
+                            input,
                         },
                     );
                 }
@@ -1774,7 +1898,7 @@ impl MediaHost {
                         HelperRequest {
                             workspace: profile.workspace.map(Into::into),
                             selection: profile.selection.clone(),
-                            task: profile.task.clone(),
+                            content,
                             capture: profile.capture.clone(),
                             max_turns: profile.max_turns,
                             deadline: Duration::from_millis(profile.deadline_ms),
@@ -1802,7 +1926,7 @@ impl MediaHost {
                         self.cancel.clone(),
                     )
                     .await
-                    .map_err(|_| waltr_script::Error::Protocol)?;
+                    .map_err(crate::routine::service::helper_script_error)?;
                 self.bindings
                     .driver
                     .record_helper(
@@ -2157,7 +2281,7 @@ impl HostDispatcher for MediaHost {
                 state.active += 1;
             }
             let worker = this.clone();
-            let job = Arc::new(tokio::sync::Mutex::new(Some(tokio::spawn(async move {
+            let work = crate::routine::service::inherit_helper_rejection(async move {
                 let result = async {
                     let mut started = worker.startup.lock().await;
                     if !*started {
@@ -2186,7 +2310,8 @@ impl HostDispatcher for MediaHost {
                     .map_err(|_| waltr_script::Error::Cleanup)?
                     .active -= 1;
                 result
-            }))));
+            });
+            let job = Arc::new(tokio::sync::Mutex::new(Some(tokio::spawn(work))));
             jobs.push(job.clone());
             drop(jobs);
             let mut task = job.lock().await;

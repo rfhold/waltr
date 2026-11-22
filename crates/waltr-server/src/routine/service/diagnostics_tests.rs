@@ -55,6 +55,7 @@ fn diagnostics_host_early_returns_and_panics_are_classified() {
                         inner: Arc::new(PanicHost),
                         policy: Arc::new(TestPolicy),
                         failed: Arc::new(AtomicBool::new(failed)),
+                        provider_rejection: Arc::new(Mutex::new(None)),
                         cancel,
                     };
                     let context = HostContext::new(Limits::default()).unwrap();

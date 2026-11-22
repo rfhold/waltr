@@ -68,7 +68,7 @@ fn register<S: waltr_agent::SessionStore + Clone + 'static>(
 fn seed_trace(root: &std::path::Path) {
     seed(root);
     let value = serde_json::json!({"apiVersion":"waltr.routine/v1","kind":"Routine","name":"trace-probe","description":"Trace ownership fixture","spec":{
-        "source":"export default async function (input) { const response = (await host.call('helper.run', {selection:{kind:'named',name:'routine-title'},task:'SECRET_TRACE_INPUT',maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536})).result.response; if(input) throw new Error('SECRET_SCRIPT_ERROR'); return response; }",
+        "source":"export default async function (input) { const response = (await host.call('helper.run', {selection:{kind:'named',name:'routine-title'},content:[{type:'text',text:'SECRET_TRACE_INPUT'}],maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536})).result.response; if(input) throw new Error('SECRET_SCRIPT_ERROR'); return response; }",
         "entrypoints":{"run":{"trigger":"manual"}},"capabilities":["helper.run","helper.named.routine-title"],
         "parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"boolean"}},
         "result":{"schemaVersion":"waltr.value/v1","schema":{"type":"string","maxLength":64}}

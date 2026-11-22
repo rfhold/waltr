@@ -456,7 +456,9 @@ async fn fork_workflow_starts_exact_captured_destination_and_preserves_it_on_sta
                     selection: HelperSelection::Restricted {
                         profile: "compaction".into(),
                     },
-                    task: "summarize".into(),
+                    content: vec![waltr_agent::UserMessagePart::Text {
+                        text: "summarize".into(),
+                    }],
                     capture: None,
                     max_turns: 1,
                     deadline: Duration::from_secs(5),

@@ -338,6 +338,88 @@ pub(crate) fn is_tool_result(request: &HostRequest) -> bool {
         .is_some_and(|handle| handle.kind() == TOOL_RESULT_HANDLE)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImageAlias {
+    pub name: String,
+}
+
+impl ImageAlias {
+    pub(super) fn valid_name(name: &str) -> bool {
+        (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HelperImage {
+    pub source: String,
+    #[serde(default)]
+    pub index: usize,
+}
+
+pub(crate) type HelperParts = Vec<waltr_agent::UserMessagePart<HelperImage>>;
+
+#[derive(Clone, Default)]
+pub(super) struct ImageAliases(Arc<Mutex<std::collections::BTreeMap<String, HostHandle>>>);
+
+impl ImageAliases {
+    pub(super) fn bind(&self, name: String, handle: HostHandle) -> Result<(), waltr_script::Error> {
+        if !ImageAlias::valid_name(&name) {
+            return Err(waltr_script::Error::Invalid);
+        }
+        let mut aliases = self.0.lock().map_err(|_| waltr_script::Error::Cleanup)?;
+        if aliases.contains_key(&name) {
+            return Err(waltr_script::Error::Identity);
+        }
+        if aliases.len() >= 32 {
+            return Err(waltr_script::Error::Limit);
+        }
+        aliases.insert(name, handle);
+        Ok(())
+    }
+
+    pub(super) fn get(&self, name: &str) -> Result<HostHandle, waltr_script::Error> {
+        self.0
+            .lock()
+            .map_err(|_| waltr_script::Error::Cleanup)?
+            .get(name)
+            .cloned()
+            .ok_or(waltr_script::Error::Identity)
+    }
+
+    pub(super) fn validate(&self, parts: &HelperParts) -> Result<(), waltr_script::Error> {
+        if has_images(parts) {
+            let aliases = self.0.lock().map_err(|_| waltr_script::Error::Cleanup)?;
+            for part in parts {
+                if let waltr_agent::UserMessagePart::Image { image } = part
+                    && !aliases.contains_key(&image.source)
+                {
+                    return Err(waltr_script::Error::Identity);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn has_images(content: &HelperParts) -> bool {
+    content
+        .iter()
+        .any(|part| matches!(part, waltr_agent::UserMessagePart::Image { .. }))
+}
+
+pub(super) fn valid_helper_parts(content: &HelperParts) -> bool {
+    super::helper::valid_content(content)
+        && content.iter().all(|part| match part {
+            waltr_agent::UserMessagePart::Text { .. } => true,
+            waltr_agent::UserMessagePart::Image { image } => ImageAlias::valid_name(&image.source),
+        })
+}
+
 pub(crate) fn tool_image_attachment(
     image: &waltr_agent::ToolResultImage,
     capabilities: waltr_agent::TransientModelCapabilities,
@@ -491,6 +573,7 @@ impl RoutineAgentHostFactory {
                 .and_then(|context| context.snapshot_identity())
                 .map(|identity| identity.provenance());
             let adapter = Arc::new(AgentHost {
+                image_aliases: ImageAliases::default(),
                 bindings: bound,
                 capabilities: required,
                 limits: definition.limits().clone(),
@@ -548,6 +631,7 @@ fn known_capability(cap: &str) -> bool {
 }
 
 struct AgentHost {
+    image_aliases: ImageAliases,
     streams: Arc<super::tool_streams::ToolStreams>,
     children: Option<Arc<dyn ChildPort>>,
     mcp: Option<Arc<dyn RoutineMcpPort>>,
@@ -571,14 +655,13 @@ pub(crate) struct HelperArguments {
     pub input: super::helper::HelperInput,
     pub selection: HelperSelection,
     pub source: Option<String>,
-    pub task: String,
+    pub content: HelperParts,
     pub capture: Option<String>,
     pub max_turns: u64,
     pub deadline_ms: u64,
     pub response_bytes: usize,
     pub completion_bytes: usize,
     pub field: Option<String>,
-    pub image_index: Option<usize>,
 }
 impl HelperArguments {
     pub(crate) fn validate(
@@ -605,8 +688,7 @@ impl HelperArguments {
         {
             return Err(PortError::Denied);
         }
-        if self.task.is_empty()
-            || self.task.len() > 16384
+        if !valid_helper_parts(&self.content)
             || !(1..=64).contains(&self.max_turns)
             || !(1..=300000).contains(&self.deadline_ms)
             || !(1..=1048576).contains(&self.response_bytes)
@@ -687,6 +769,7 @@ enum Operation {
     Tool(ToolArguments),
     Mcp(McpArguments),
     ReadTool,
+    BindImage(ImageAlias),
     Schemas(SchemaArguments),
 }
 
@@ -697,13 +780,18 @@ impl AgentHost {
             || request.handle.is_some()
                 && !(self.mcp.is_some()
                     && is_tool_result(request)
-                    && matches!(request.operation.as_str(), "tools.read" | "helper.run"))
+                    && matches!(
+                        request.operation.as_str(),
+                        "tools.read" | "helper.image.bind"
+                    ))
             || !self
                 .capabilities
                 .contains(if request.operation == "helper.next" {
                     "helper.streams"
                 } else if request.operation == "tools.read" && self.mcp.is_some() {
                     "tools.execute"
+                } else if request.operation == "helper.image.bind" {
+                    "helper.run"
                 } else {
                     &request.operation
                 })
@@ -755,8 +843,8 @@ impl AgentHost {
                 let args: HelperArguments =
                     serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
                 args.validate(&self.capabilities, request.callback.is_some())?;
+                self.image_aliases.validate(&args.content).map_err(|_| PortError::Denied)?;
                 if args.field.is_some()
-                    || args.image_index.is_some() && !is_tool_result(request)
                     || args.response_bytes > 65536
                     || args.completion_bytes > 65536
                 {
@@ -769,6 +857,16 @@ impl AgentHost {
                         .resolve_source(source)?;
                 }
                 Ok(Operation::Helper(args))
+            }
+            "helper.image.bind"
+                if self.mcp.is_some() && is_tool_result(request) && request.callback.is_none() =>
+            {
+                let args: ImageAlias =
+                    serde_json::from_value(value).map_err(|_| PortError::Invalid)?;
+                if !ImageAlias::valid_name(&args.name) {
+                    return Err(PortError::Invalid);
+                }
+                Ok(Operation::BindImage(args))
             }
             "tools.read" if self.mcp.is_some() => {
                 tool_result_handle(request).map_err(|_| PortError::Invalid)?;
@@ -845,6 +943,7 @@ impl OperationPolicy for AgentHost {
                 Operation::Tool(args) => json!({"target":args.target,"callId":args.call_id}),
                 Operation::Mcp(args) => json!({"target":args.target}),
                 Operation::ReadTool => json!({"operation":"tools.read"}),
+                Operation::BindImage(_) => json!({"operation":"helper.image.bind"}),
                 Operation::Schemas(args) => json!({"targets":args.targets}),
             })
         })();
@@ -860,6 +959,7 @@ impl OperationPolicy for AgentHost {
                 | "tools.schemas"
                 | "children.call"
                 | "tools.read"
+                | "helper.image.bind"
         ) || name.starts_with("context.") && known_capability(name))
         {
             return Err(PortError::Denied);
@@ -904,6 +1004,7 @@ impl HostDispatcher for AgentHost {
         let children = self.children.clone();
         let mcp = self.mcp.clone();
         let streams = self.streams.clone();
+        let image_aliases = self.image_aliases.clone();
         Box::pin(async move {
             let value = match operation.map_err(|_| waltr_script::Error::Denied)? {
                 Operation::Next(args) => {
@@ -936,16 +1037,6 @@ impl HostDispatcher for AgentHost {
                     json!({"status":"completed","result":result})
                 }
                 Operation::Helper(args) => {
-                    let image = request
-                        .handle
-                        .as_ref()
-                        .map(|handle| {
-                            mcp.as_ref()
-                                .ok_or(waltr_script::Error::Denied)?
-                                .results()
-                                .image(&host_context, handle, args.image_index.unwrap_or(0))
-                        })
-                        .transpose()?;
                     let helpers = helpers
                         .select_inference(&args.inference)
                         .map_err(|_| waltr_script::Error::Invalid)?
@@ -970,7 +1061,7 @@ impl HostDispatcher for AgentHost {
                         text: args.input.text,
                         max_body_bytes: args.input.max_bytes.min(65536),
                     };
-                    let attachment = if let Some(image) = image {
+                    if has_images(&args.content) {
                         capabilities = helpers
                             .input_capabilities(args.selection.clone())
                             .await
@@ -984,15 +1075,30 @@ impl HostDispatcher for AgentHost {
                             )
                             .await
                             .map_err(|_| waltr_script::Error::Denied)?;
-                        Some(tool_image_attachment(
-                            image.image()?,
-                            capabilities,
-                            args.input.max_bytes,
-                            &budget,
-                        )?)
-                    } else {
-                        None
-                    };
+                    }
+                    let mut remaining = args.input.max_bytes;
+                    let content = args
+                        .content
+                        .into_iter()
+                        .map(|part| match part {
+                            waltr_agent::UserMessagePart::Text { text } => {
+                                Ok(waltr_agent::UserMessagePart::Text { text })
+                            }
+                            waltr_agent::UserMessagePart::Image { image } => {
+                                let source = image_aliases.get(&image.source)?;
+                                let image = mcp
+                                    .as_ref()
+                                    .ok_or(waltr_script::Error::Denied)?
+                                    .results()
+                                    .image(&host_context, &source, image.index)?;
+                                let image = image.image()?;
+                                let attachment =
+                                    tool_image_attachment(image, capabilities, remaining, &budget)?;
+                                remaining -= image.decoded_bytes() as usize;
+                                Ok(waltr_agent::UserMessagePart::Image { image: attachment })
+                            }
+                        })
+                        .collect::<Result<Vec<_>, waltr_script::Error>>()?;
                     let observer = request.callback.map(|callback| {
                         Arc::new(ScriptCompletionObserver {
                             callback,
@@ -1004,7 +1110,7 @@ impl HostDispatcher for AgentHost {
                             HelperRequest {
                                 workspace: args.workspace.map(Into::into),
                                 selection: args.selection,
-                                task: args.task,
+                                content,
                                 capture: args.capture,
                                 max_turns: args.max_turns,
                                 deadline: Duration::from_millis(args.deadline_ms),
@@ -1013,7 +1119,7 @@ impl HostDispatcher for AgentHost {
                             source,
                             Some(crate::routine::ports::HelperPayload {
                                 budget,
-                                attachments: attachment.into_iter().collect(),
+                                attachments: Vec::new(),
                                 capabilities,
                                 response_bytes: args.response_bytes,
                                 completion_bytes: args.completion_bytes,
@@ -1021,7 +1127,12 @@ impl HostDispatcher for AgentHost {
                             cancellation,
                         )
                         .await
-                        .map_err(|_| waltr_script::Error::Cleanup)?;
+                        .map_err(|error| match error {
+                            PortError::ProviderRejected(_) => {
+                                crate::routine::service::helper_script_error(error)
+                            }
+                            _ => waltr_script::Error::Cleanup,
+                        })?;
                     json!({"status":"accepted","result":result})
                 }
                 Operation::Tool(args) => {
@@ -1059,6 +1170,15 @@ impl HostDispatcher for AgentHost {
                         cancellation,
                     )
                     .await;
+                }
+                Operation::BindImage(args) => {
+                    let handle = request.handle.ok_or(waltr_script::Error::Identity)?;
+                    mcp.as_ref()
+                        .ok_or(waltr_script::Error::Denied)?
+                        .results()
+                        .image(&host_context, &handle, 0)?;
+                    image_aliases.bind(args.name, handle)?;
+                    json!({"status":"completed"})
                 }
                 Operation::ReadTool => {
                     return mcp.ok_or(waltr_script::Error::Denied)?.results().read(

@@ -454,7 +454,12 @@ fn store_error(error: waltr_agent::SessionStoreError) -> PortError {
     }
 }
 
-fn timeline_item(event: waltr_agent::AgentTimelineEvent) -> Result<Value, PortError> {
+fn timeline_item(mut event: waltr_agent::AgentTimelineEvent) -> Result<Value, PortError> {
+    if let waltr_agent::TimelineContent::UserMessage { message } = &event.content {
+        event.content = waltr_agent::TimelineContent::TextSnapshot {
+            text: message.text(),
+        };
+    }
     let mut value = serde_json::to_value(&event).map_err(|_| PortError::Invalid)?;
     value["cursor"] = json!(event.cursor.get().to_string());
     value["turn"] = json!(event.turn.to_string());

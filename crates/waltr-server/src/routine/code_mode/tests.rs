@@ -814,7 +814,7 @@ async fn reserved_admission_commit_with_lost_ack_never_starts_or_replays_source(
 
 #[tokio::test]
 async fn public_code_named_helper_retains_internal_upstream_and_live_permission_owner() {
-    let source = "const r=await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'Perform one operation',maxTurns:3,deadlineMs:10000,responseBytes:65536,completionBytes:65536}); if(r.status!=='accepted')throw new Error(r.status); return r.result.response;";
+    let source = "const r=await host.call('helper.run',{selection:{kind:'named',name:'worker'},content:[{type:'text',text:'Perform one operation'}],maxTurns:3,deadlineMs:10000,responseBytes:65536,completionBytes:65536}); if(r.status!=='accepted')throw new Error(r.status); return r.result.response;";
     let fixture = Fixture::new(true, "deny", source).await;
     let mut profile = fixture.public_adapter().await.grant.profile.clone();
     profile.helpers.insert("worker".into());
@@ -864,7 +864,7 @@ async fn public_code_named_helper_retains_internal_upstream_and_live_permission_
 }
 
 async fn stale_origin_cannot_approve_helper_effect(skills: bool, approve: bool) {
-    let source = "return await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'Load the skill and perform one operation',maxTurns:4,deadlineMs:10000,responseBytes:65536,completionBytes:65536});";
+    let source = "return await host.call('helper.run',{selection:{kind:'named',name:'worker'},content:[{type:'text',text:'Load the skill and perform one operation'}],maxTurns:4,deadlineMs:10000,responseBytes:65536,completionBytes:65536});";
     let fixture = Fixture::options(true, "deny", source, skills, false).await;
     let mut profile = fixture.adapter().await.grant.profile.clone();
     profile.helpers.insert("worker".into());
@@ -941,7 +941,7 @@ async fn helper_pending_consent_cancels_on_durable_origin_replacement_without_re
 
 #[tokio::test]
 async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_call_budget() {
-    let source = "return await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'work',maxTurns:1,deadlineMs:1000,responseBytes:65536,completionBytes:65536});";
+    let source = "return await host.call('helper.run',{selection:{kind:'named',name:'worker'},content:[{type:'text',text:'work'}],maxTurns:1,deadlineMs:1000,responseBytes:65536,completionBytes:65536});";
     let fixture = Fixture::options(true, "deny", source, false, true).await;
     let mut profile = fixture.adapter().await.grant.profile.clone();
     profile.helpers.insert("worker".into());
@@ -964,7 +964,7 @@ async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_cal
         "nested code must not gain the parent's host provider: {result}"
     );
     assert_eq!(fixture.second.load(Ordering::SeqCst), 0);
-    let source = "for(let i=0;i<256;i++)await host.call('tools.schemas',{targets:[]}); return await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'work',maxTurns:1,deadlineMs:1000,responseBytes:65536,completionBytes:65536});";
+    let source = "for(let i=0;i<256;i++)await host.call('tools.schemas',{targets:[]}); return await host.call('helper.run',{selection:{kind:'named',name:'worker'},content:[{type:'text',text:'work'}],maxTurns:1,deadlineMs:1000,responseBytes:65536,completionBytes:65536});";
     let result = adapter
         .call_internal(
             CodeInput::Execute {
@@ -998,7 +998,7 @@ async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_cal
 
 #[tokio::test]
 async fn helper_deadline_closes_pending_original_consent_without_effect_or_late_approval() {
-    let source = "return await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'work',maxTurns:2,deadlineMs:100,responseBytes:65536,completionBytes:65536});";
+    let source = "return await host.call('helper.run',{selection:{kind:'named',name:'worker'},content:[{type:'text',text:'work'}],maxTurns:2,deadlineMs:100,responseBytes:65536,completionBytes:65536});";
     let fixture = Fixture::new(true, "deny", source).await;
     let mut profile = fixture.adapter().await.grant.profile.clone();
     profile.helpers.insert("worker".into());
@@ -1032,7 +1032,7 @@ async fn helper_deadline_closes_pending_original_consent_without_effect_or_late_
 
 #[tokio::test]
 async fn real_js_named_helper_keeps_skills_and_permission_consent_in_original_run() {
-    let source = "const r=await host.call('helper.run',{selection:{kind:'named',name:'worker'},task:'Load the selected skill and perform one operation',maxTurns:4,deadlineMs:10000,responseBytes:65536,completionBytes:65536}); return r.result.response;";
+    let source = "const r=await host.call('helper.run',{selection:{kind:'named',name:'worker'},content:[{type:'text',text:'Load the selected skill and perform one operation'}],maxTurns:4,deadlineMs:10000,responseBytes:65536,completionBytes:65536}); return r.result.response;";
     let fixture = Fixture::options(true, "deny", source, true, false).await;
     let mut profile = fixture.adapter().await.grant.profile.clone();
     profile.helpers.insert("worker".into());

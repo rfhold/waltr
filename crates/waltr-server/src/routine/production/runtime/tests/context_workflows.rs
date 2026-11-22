@@ -494,7 +494,7 @@ async fn run_context_workflows(race: bool) {
             session_client
                 .submit_user_message(waltr::grpc::waltr::session::v1::SubmitUserMessageRequest {
                     session_id: "context-source".into(),
-                    text: "RUN_CONTEXT_TOOL".into(),
+                    parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text("RUN_CONTEXT_TOOL")],
                 })
                 .await
                 .unwrap();
@@ -638,7 +638,7 @@ async fn run_context_workflows(race: bool) {
     session_client
         .submit_user_message(waltr::grpc::waltr::session::v1::SubmitUserMessageRequest {
             session_id: "context-source".into(),
-            text: "RUN_CONFIGURATION_TOOL".into(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text("RUN_CONFIGURATION_TOOL")],
         })
         .await
         .unwrap();
@@ -723,7 +723,7 @@ async fn run_context_workflows(race: bool) {
     session_client
         .submit_user_message(waltr::grpc::waltr::session::v1::SubmitUserMessageRequest {
             session_id: "fresh-management-source".into(),
-            text: "RUN_FRESH_CONTEXT_TOOL".into(),
+            parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text("RUN_FRESH_CONTEXT_TOOL")],
         })
         .await
         .unwrap();
@@ -774,7 +774,7 @@ async fn run_context_workflows(race: bool) {
         session_client
             .submit_user_message(waltr::grpc::waltr::session::v1::SubmitUserMessageRequest {
                 session_id: id.into(),
-                text: prompt.into(),
+                parts: vec![waltr::grpc::waltr::session::v1::UserMessageInputPart::text(prompt)],
             })
             .await
             .unwrap();

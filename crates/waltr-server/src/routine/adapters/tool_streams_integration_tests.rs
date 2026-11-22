@@ -279,7 +279,7 @@ async fn tool_streams_real_js_progress_capture_coexistence_and_normal_history() 
         };
         let mut source = format!(
             r#"export default async function() {{
-            const helper = host.call('helper.run', {{selection:{selection},task:'work',capture:'verified',maxTurns:4,deadlineMs:5000,responseBytes:65536,completionBytes:65536}});
+            const helper = host.call('helper.run', {{selection:{selection},content:[{{type:'text',text:'work'}}],capture:'verified',maxTurns:4,deadlineMs:5000,responseBytes:65536,completionBytes:65536}});
             const first = await host.call('helper.next', {{stream:'segments'}});
             if (first.value.arguments.text !== 'first') throw new Error('first');
             const effect = host.call('tools.execute', {{target:{{server:'effects',tool:'blocked'}},callId:'blocked',arguments:{{}}}});
@@ -303,7 +303,7 @@ async fn tool_streams_real_js_progress_capture_coexistence_and_normal_history() 
             source = source.replace("await host.call('tools.execute', {target:{server:'effects',tool:'release'},callId:'release',arguments:{}});", "await effect;");
         } else if scenario == "undrained" || scenario == "cancel-send" {
             source = format!(
-                "export default async function() {{await host.call('helper.run', {{selection:{selection},task:'work',capture:'verified',maxTurns:4,deadlineMs:5000,responseBytes:65536,completionBytes:65536}}); return 'done';}}"
+                "export default async function() {{await host.call('helper.run', {{selection:{selection},content:[{{type:'text',text:'work'}}],capture:'verified',maxTurns:4,deadlineMs:5000,responseBytes:65536,completionBytes:65536}}); return 'done';}}"
             );
         } else if scenario == "cancel-receive" {
             source = "export default async function() {await host.call('helper.next',{stream:'segments'}); return 'done';}".into();
@@ -461,7 +461,9 @@ async fn tool_streams_live_ask_denial_has_no_queue_effect_and_allow_resumes_orig
                         profile: "writer".into(),
                     }
                 },
-                task: "work".into(),
+                content: vec![waltr_agent::UserMessagePart::Text {
+                    text: "work".into(),
+                }],
                 capture: None,
                 max_turns: 4,
                 deadline: Duration::from_secs(5),
@@ -611,7 +613,9 @@ async fn tool_streams_declarations_do_not_grant_permission_and_collisions_fail_c
                     selection: HelperSelection::Restricted {
                         profile: "writer".into()
                     },
-                    task: "work".into(),
+                    content: vec![waltr_agent::UserMessagePart::Text {
+                        text: "work".into()
+                    }],
                     capture: None,
                     max_turns: 4,
                     deadline: Duration::from_secs(2),

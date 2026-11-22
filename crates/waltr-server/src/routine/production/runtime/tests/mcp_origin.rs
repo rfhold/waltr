@@ -32,7 +32,7 @@ impl LlmStream for Provider {
                 waltr_agent::CompletionEvent::ToolCall(waltr_agent::ToolCall::new(
                     "mcp-origin-code",
                     "code",
-                    serde_json::json!({"action":"execute","source":"return await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},task:'MCP_LEASE_HELPER',maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536});"}),
+                    serde_json::json!({"action":"execute","source":"return await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},content:[{type:'text',text:'MCP_LEASE_HELPER'}],maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536});"}),
                 ))
             } else {
                 waltr_agent::CompletionEvent::Delta("Original run completed".into())
@@ -540,7 +540,7 @@ async fn run(revoke: bool, public_code: bool) {
     if public_code {
         let initial = sessions.store().list().await.unwrap().len();
         let default_helper = call(address, token, "code", serde_json::json!({"action":"execute","source":
-            "await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},inference:{from:'defaults'},task:'public defaults positive control',maxTurns:1,deadlineMs:1000,responseBytes:1024,completionBytes:1024});return true;"
+            "await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},inference:{from:'defaults'},content:[{type:'text',text:'public defaults positive control'}],maxTurns:1,deadlineMs:1000,responseBytes:1024,completionBytes:1024});return true;"
         })).await;
         let output = &default_helper["result"]["structuredContent"];
         assert_eq!(output["status"], "succeeded", "{default_helper:?}");
@@ -549,7 +549,7 @@ async fn run(revoke: bool, public_code: bool) {
         assert_eq!(sessions.store().list().await.unwrap().len(), initial + 1);
         let before = sessions.store().list().await.unwrap().len();
         let source_less = call(address, token, "code", serde_json::json!({"action":"execute","source":
-            "await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},inference:{from:'source-session'},task:'must not reach provider',maxTurns:1,deadlineMs:1000,responseBytes:1024,completionBytes:1024});"
+            "await host.call('helper.run',{selection:{kind:'named',name:'routine-title'},inference:{from:'source-session'},content:[{type:'text',text:'must not reach provider'}],maxTurns:1,deadlineMs:1000,responseBytes:1024,completionBytes:1024});"
         })).await;
         let output = &source_less["result"]["structuredContent"];
         assert_eq!(output["status"], "uncertain", "{source_less:?}");

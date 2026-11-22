@@ -26,6 +26,20 @@ pub enum PortError {
     Invalid,
     /// Cleanup or durable outcome cannot be verified.
     Uncertain,
+    /// The provider returned a definite HTTP rejection, without upstream payloads.
+    ProviderRejected(ProviderRejection),
+}
+
+/// Safe provider failure data for a Routine invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderRejection {
+    pub(crate) http_status: u16,
+}
+
+impl ProviderRejection {
+    pub(crate) fn projection(self) -> Value {
+        serde_json::json!({"category":"provider_rejected","httpStatus":self.http_status})
+    }
 }
 impl std::fmt::Display for PortError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,8 +237,8 @@ pub struct HelperRequest {
     pub workspace: Option<waltr::grpc::waltr::session::v1::WorkspaceSelection>,
     /// Pinned selection, not raw provider configuration.
     pub selection: HelperSelection,
-    /// Invocation-local task, at most 16384 bytes.
-    pub task: String,
+    /// Ordered text and invocation-owned still images.
+    pub content: HelperContent,
     /// Optional declared capture contract identity.
     pub capture: Option<String>,
     /// Total provider turns, including validation corrections.
@@ -234,6 +248,8 @@ pub struct HelperRequest {
     /// Optional neutral semantic observer.
     pub observer: Option<Arc<dyn waltr_agent::CompletionObserver>>,
 }
+/// Verified, bounded attachments are held only by the invocation.
+pub type HelperContent = Vec<waltr_agent::UserMessagePart<waltr_agent::TransientAttachment>>;
 impl std::fmt::Debug for HelperRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HelperRequest").finish_non_exhaustive()
@@ -270,7 +286,7 @@ pub struct HelperResult {
 
 /// Independently substitutable helper lifecycle; implementations must join on cleanup.
 pub trait HelperRunner: Send + Sync {
-    /// Open one invocation-owned text helper; additional prompts use its ordinary queue.
+    /// Open one invocation-owned helper; additional messages use its ordinary queue.
     fn open(
         &self,
         _request: HelperRequest,
@@ -393,7 +409,7 @@ pub trait HelperRunner: Send + Sync {
 /// Private exact-session submission authority, never a guest-supplied session ID.
 pub trait HelperTarget: Send + Sync {
     /// Return only after ordinary queue admission; at most sixteen follow-ups.
-    fn submit(&self, prompt: String) -> PortFuture<()>;
+    fn submit(&self, content: HelperContent) -> PortFuture<()>;
     /// Join all work accepted before this call, without closing speech streams.
     fn idle(&self) -> PortFuture<()>;
     /// Reject later submissions, join accepted work, and return final accepted output.
@@ -405,7 +421,7 @@ pub trait HelperTarget: Send + Sync {
 pub struct HelperPayload {
     /// Explicit process-wide attachment credit.
     pub budget: waltr_agent::TransientInputBudget,
-    /// Host-authorized native attachments retained through owned helper execution.
+    /// Separate host-authorized PDF/text resources retained through owned helper execution.
     pub attachments: Vec<waltr_agent::TransientAttachment>,
     /// Exact pinned model/API support.
     pub capabilities: waltr_agent::TransientModelCapabilities,

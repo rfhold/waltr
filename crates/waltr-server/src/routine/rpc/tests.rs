@@ -504,11 +504,19 @@ impl Fixture {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let captured = body["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool");
             let workspace_read = body["messages"].to_string().contains("ROUTINE_SENTINEL_TEST");
+            let followup_test = body["messages"].to_string().contains("ROUTINE_PROVIDER_REJECTION_FIXTURE");
+            let reject = body["messages"].to_string().contains("REJECT_FOLLOWUP_FIXTURE");
             seen.lock().unwrap().push(body);
-            let reply = if workspace_read && !captured {
+            if reject {
+                return (axum::http::StatusCode::BAD_REQUEST, [("content-type", "application/json")],
+                    r#"{"error":{"message":"PRIVATE_ROUTINE_UPSTREAM_BODY"}}"#.to_owned());
+            }
+            let reply = if followup_test {
+                serde_json::json!({"choices":[{"index":0,"delta":{"content":"accepted"},"finish_reason":"stop"}]})
+            } else if workspace_read && !captured {
                 serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"workspace-read","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"sentinel\"}"}}]},"finish_reason":"tool_calls"}]})
             } else if captured { serde_json::json!({"choices":[{"index":0,"delta":{"content":"accepted"},"finish_reason":"stop"}]}) } else { serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"inspection-capture","type":"function","function":{"name":"_helper_capture","arguments":"{\"chosen\":\"answer\"}"}}]},"finish_reason":"tool_calls"}]}) };
-            ([ ("content-type", "text/event-stream") ], format!("data: {reply}\n\ndata: [DONE]\n\n"))
+            (axum::http::StatusCode::OK, [ ("content-type", "text/event-stream") ], format!("data: {reply}\n\ndata: [DONE]\n\n"))
         } })).layer(axum::extract::DefaultBodyLimit::max(32*1024*1024));
         let provider_stop = CancellationToken::new();
         let stopped = provider_stop.clone();
@@ -649,6 +657,7 @@ impl Fixture {
                 BTreeSet::from([
                     "media.execute".into(),
                     "helper.run".into(),
+                    "helper.named.media".into(),
                     "helper.named.routine-inspect".into(),
                     "helper.named.workspace-reader".into(),
                     "helper.capture.inspection".into(),
@@ -1126,7 +1135,7 @@ spec:
         .replace("      return Object", "      await host.call('media.finish', {});\n      return Object");
     let sentinel_program = interactive.replace("origin-interactive", "origin-sentinel")
         .replace("[media.execute]", "[media.execute, helper.run, helper.named.workspace-reader]")
-        .replace("      await host.call('media.finish'", "      await host.call('helper.run', {selection:{kind:'named',name:'workspace-reader'},workspace:{machine:context.originMachineId ?? 'laptop',workingDirectory:'repo'},task:'ROUTINE_SENTINEL_TEST',maxTurns:3,deadlineMs:5000,responseBytes:1024,completionBytes:65536});\n      await host.call('media.finish'");
+        .replace("      await host.call('media.finish'", "      await host.call('helper.run', {selection:{kind:'named',name:'workspace-reader'},workspace:{machine:context.originMachineId ?? 'laptop',workingDirectory:'repo'},content:[{type:'text',text:'ROUTINE_SENTINEL_TEST'}],maxTurns:3,deadlineMs:5000,responseBytes:1024,completionBytes:65536});\n      await host.call('media.finish'");
     let fixture = Fixture::new(&[manual, &interactive, &sentinel_program]).await;
     let worker_root = tempfile::tempdir().unwrap();
     let export = worker_root.path().join("laptop-home");
@@ -2023,6 +2032,95 @@ async fn routine_http_snapshot_resume_mutation_order_and_atomic_get() {
 }
 
 #[tokio::test]
+async fn routine_live_output_reports_safe_helper_provider_rejection() {
+    if isolated("routine_live_output_reports_safe_helper_provider_rejection") {
+        return;
+    }
+    let program = r#"apiVersion: waltr.routine/v1
+kind: Routine
+name: helper-reject-rpc
+description: Exercise the live-output provider rejection.
+spec:
+  source: |
+    export default async function () {
+      const target = await host.call('helper.open', {
+        selection:{kind:'named',name:'media'},
+        content:[{type:'text',text:'ROUTINE_PROVIDER_REJECTION_FIXTURE'}],
+        maxTurns:4,deadlineMs:10000,responseBytes:4096,completionBytes:8192
+      });
+      await host.call('helper.idle', {}, null, null, target);
+      await host.call('helper.submit', {content:[
+        {type:'text',text:'REJECT_FOLLOWUP_FIXTURE'}, {type:'text',text:'private input'}
+      ]}, null, null, target);
+      await host.call('helper.seal', {}, null, null, target);
+      return true;
+    }
+  entrypoints: {run: {trigger: interactive}}
+  parameters: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {}, required: []}}
+  result: {schemaVersion: waltr.value/v1, schema: {type: boolean}}
+  capabilities: [media.execute, helper.run, helper.named.media]
+"#;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let fixture = Fixture::new(&[program]).await;
+        let mut client = fixture.client().await;
+        let mut selected = selection("helper-reject-rpc", "run");
+        selected.revision = client
+            .watch_definitions(fixture.request(p::WatchDefinitionsRequest {}))
+            .await.unwrap().into_inner()
+            .message().await.unwrap().unwrap()
+            .definitions.into_iter().find(|definition| definition.name == "helper-reject-rpc")
+            .unwrap().revision;
+        let response = client
+            .open_attachment(fixture.request(p::OpenAttachmentRequest {
+                open: Some(p::InteractionOpen {
+                    selection: Some(selected),
+                    inputs: vec![],
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let admitted = match response.admission.unwrap() {
+            p::open_attachment_response::Admission::Accepted(admitted) => admitted,
+            other => panic!("expected attached Routine, got {other:?}"),
+        };
+        let id = admitted.invocation.unwrap().invocation_id;
+        let mut output = client
+            .watch_live_output(fixture.request(p::WatchLiveOutputRequest {
+                credentials: admitted.credentials,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            output.message().await.unwrap().unwrap().output.unwrap().event,
+            Some(p::output_event::Event::Accepted(_))
+        ));
+        let error = output.message().await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "provider rejected helper request (HTTP 400)");
+        assert_eq!(
+            error.metadata().get("waltr-routine-error").unwrap(),
+            "provider_rejected"
+        );
+        let invocation = client
+            .get_invocation(fixture.request(p::GetInvocationRequest { invocation_id: id }))
+            .await
+            .unwrap()
+            .into_inner()
+            .invocation
+            .unwrap();
+        assert_eq!(invocation.status, p::InvocationStatus::Failed as i32);
+        assert!(invocation.result.is_none());
+        assert!(!format!("{error:?} {invocation:?}").contains("PRIVATE_ROUTINE_UPSTREAM_BODY"));
+        assert_eq!(fixture.bodies.lock().unwrap().len(), 2);
+        fixture.close().await;
+    })
+    .await
+    .expect("bounded Routine provider rejection");
+}
+
+#[tokio::test]
 async fn routine_http_open_upload_native_helpers_and_durable_text() {
     if isolated("routine_http_open_upload_native_helpers_and_durable_text") {
         return;
@@ -2075,6 +2173,11 @@ async fn routine_http_open_upload_native_helpers_and_durable_text() {
         };
         let mut selected = selection("native-inspect", "inspect");
         selected.revision = definition.revision.clone();
+        if mime == "image/png" {
+            selected.parameters = Some(p::StructuredValue {
+                json: br#"{"image":true}"#.to_vec(),
+            });
+        }
         let response = client
             .open_attachment(fixture.request(p::OpenAttachmentRequest {
                 open: Some(p::InteractionOpen {
@@ -2273,7 +2376,7 @@ async fn routine_abandoned_open_capacity_recovers_without_shutdown() {
 }
 async fn binary_output_control(shutdown_race: bool, capacity_race: bool) {
     let program = include_str!("../../../tests/fixtures/routines/native-inspect.yaml")
-        .replace("const helper = await host.call('helper.run', {selection: {kind: 'named', name: 'routine-inspect'}, task: 'Inspect the attached source. Capture the answer in chosen.', capture: 'inspection', maxTurns: 3, deadlineMs: 20000, responseBytes: 65536, completionBytes: 4194304}, null, null, source);", "await host.call('media.lease', {output: 'answer'}, null, null, source);")
+        .replace("const helper = input.image ? await host.call('helper.run', helperArgs) : await host.call('helper.run', helperArgs, null, null, source);", "await host.call('media.lease', {output: 'answer'}, null, null, source);")
         .replace("const answer = await host.call('media.select', {field: '/chosen'}, null, null, helper);", "")
         .replace("await host.call('media.publish', {name: 'answer'}, null, null, answer);", "")
         .replace("await host.call('media.emit', {output: 'answer'}, null, null, answer);", "")

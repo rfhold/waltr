@@ -33,7 +33,9 @@ use waltr_script::{CallbackRef, Limits, StructuredValue};
 
 const CAPTURE_TOOL: &str = "_helper_capture";
 mod followup;
+mod images;
 mod inference;
+pub(crate) use images::valid_content;
 pub use inference::{HelperInput, InferenceSelector};
 type OriginGuard = Arc<dyn Fn() -> PortFuture<()> + Send + Sync>;
 
@@ -95,6 +97,14 @@ fn owned_failure(error: waltr_agent::OwnedExecutionError, id: &SessionId) -> Por
     let category = match error {
         waltr_agent::OwnedExecutionError::Unavailable => "owned_unavailable",
         waltr_agent::OwnedExecutionError::Uncertain => "owned_uncertain",
+        waltr_agent::OwnedExecutionError::ProviderRejected { http_status } => {
+            return helper_failure(
+                "run",
+                "provider_rejected",
+                Some(id),
+                PortError::ProviderRejected(crate::routine::ports::ProviderRejection { http_status }),
+            );
+        }
     };
     helper_failure("run", category, Some(id), PortError::Uncertain)
 }
@@ -526,15 +536,22 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> HelperRunner for Coordinat
                 }
             };
             if this.catalog.is_some() {
-                // Every supported inference encoder implements UTF-8; image/PDF model support is not catalogued.
-                Ok(waltr_agent::TransientModelCapabilities {
-                    png: false,
-                    jpeg: false,
-                    webp: false,
-                    pdf: false,
-                    text: true,
-                    max_body_bytes: 32 * 1024 * 1024,
-                })
+                // Admission follows the wire encoder, not the model catalog.
+                match inference.provider.api {
+                    waltr_agent::ModelApi::AnthropicMessages
+                    | waltr_agent::ModelApi::OpenAiChatCompletions
+                    | waltr_agent::ModelApi::OpenAiResponses
+                    | waltr_agent::ModelApi::OpenAiResponsesWebSocket => {
+                        Ok(waltr_agent::TransientModelCapabilities {
+                            png: true,
+                            jpeg: true,
+                            webp: true,
+                            pdf: false,
+                            text: true,
+                            max_body_bytes: 32 * 1024 * 1024,
+                        })
+                    }
+                }
             } else {
                 this.input_models
                     .get(&(
@@ -749,19 +766,27 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             }) {
                 return Err(PortError::Invalid);
             }
-            if request.task.is_empty()
-                || request.task.len() > 16384
-                || !(1..=64).contains(&request.max_turns)
+            if !(1..=64).contains(&request.max_turns)
                 || request.deadline.is_zero()
                 || request.deadline > Duration::from_secs(300)
                 || cancellation.is_cancelled()
+                || payload.as_ref().is_some_and(|p| {
+                    !p.attachments.is_empty()
+                        && (!matches!(
+                            request.content.as_slice(),
+                            [waltr_agent::UserMessagePart::Text { .. }]
+                        ) || p
+                            .attachments
+                            .iter()
+                            .any(|attachment| attachment.image_descriptor().is_some()))
+                })
             {
                 return Err(PortError::Invalid);
             }
             let started = tokio::time::Instant::now();
             let capture = this.capture_contract(&request.selection, request.capture.as_deref())?;
             let mut create = SessionCreateRequest::new(SessionId::generate());
-            let (runtime, definition_identity, task) = match &request.selection {
+            let (runtime, definition_identity, prefix) = match &request.selection {
                 HelperSelection::Named { name } => {
                     let bundle = this
                         .named
@@ -776,7 +801,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                         Some(serde_json::to_value(bundle).map_err(|_| PortError::Invalid)?);
                     create.inference_settings =
                         Some(this.inference.clone().ok_or(PortError::Invalid)?);
-                    (None, identity, request.task)
+                    (None, identity, None)
                 }
                 HelperSelection::Restricted { profile } => {
                     let selected = this.restricted.get(profile).ok_or(PortError::Denied)?;
@@ -787,11 +812,12 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                     (
                         Some(selected.runtime.clone()),
                         format!("restricted:{profile}"),
-                        format!("{}\n{}", selected.prompt, request.task),
+                        Some(selected.prompt.as_str()),
                     )
                 }
             };
-            let messages = vec![SessionStartMessage::user(task).map_err(|_| PortError::Invalid)?];
+            let prepared = images::prepare(request.content, prefix)?;
+            let messages = vec![SessionStartMessage::from(prepared.message.clone())];
             create.start = match this.source.clone() {
                 Some(copy) => SessionStart::Copy { copy, messages },
                 None => SessionStart::Fresh { messages },
@@ -862,6 +888,12 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
             );
             owners.owners.push(owner.clone());
             drop(owners);
+            let images = Arc::new(images::LiveImages::new(
+                &session.record,
+                this.factory.message_image_resolver(),
+                prepared,
+            ));
+            let _image_lifetime = images::ImageLifetime(images.clone());
             let remaining = request
                 .deadline
                 .checked_sub(started.elapsed())
@@ -952,6 +984,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                             .map_err(|error| helper_failure("runtime_assembly", runtime_category(&error), Some(&id), PortError::Unavailable))?.0,
                 },
             };
+            runtime = runtime.with_message_image_resolver(images.clone());
             let accepted = Arc::new(Mutex::new(None));
             if let Some(guard) = this.origin_guard.clone() {
                 let guard_id = id.clone();
@@ -1085,6 +1118,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                         &session.record,
                         runtime.with_completion_validation(validation),
                         input,
+                        images,
                         limits,
                         run_cancellation.clone(),
                         started + request.deadline,
@@ -1131,7 +1165,15 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CoordinatorHelperRunner<S>
                     drop(outcome.await);
                     return Err(PortError::Uncertain);
                 }
-                result = &mut outcome => result.map_err(|_| PortError::Uncertain)?,
+                result = &mut outcome => match result {
+                    Err(error @ PortError::ProviderRejected(_)) => {
+                        if let Some(producer) = producer.as_mut() {
+                            producer.reject();
+                        }
+                        return Err(error);
+                    }
+                    result => result?,
+                },
             };
             if let Some(guard) = &this.origin_guard {
                 guard().await.map_err(|_| {

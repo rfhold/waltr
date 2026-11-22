@@ -24,8 +24,26 @@ pub(super) fn error(error: PortError) -> Status {
         PortError::Unavailable | PortError::Uncertain => {
             Status::unavailable("routine owner unavailable")
         }
+        PortError::ProviderRejected(rejection) => {
+            let mut status = Status::failed_precondition(format!(
+                "provider rejected helper request (HTTP {})",
+                rejection.http_status,
+            ));
+            status.metadata_mut().insert(
+                "waltr-routine-error",
+                tonic::metadata::MetadataValue::from_static("provider_rejected"),
+            );
+            status
+        }
     }
 }
+
+pub(crate) fn live_provider_rejection(outcome: &crate::routine::service::Outcome) -> Option<Status> {
+    outcome
+        .provider_rejection
+        .map(|rejection| error(PortError::ProviderRejected(rejection)))
+}
+
 pub(super) fn id(value: &str, max: usize) -> Result<(), Status> {
     if value.is_empty() || value.len() > max {
         Err(Status::invalid_argument("invalid identity"))

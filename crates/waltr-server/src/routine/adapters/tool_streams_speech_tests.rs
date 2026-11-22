@@ -172,7 +172,7 @@ async fn run_speech_example(undrained: bool) {
             r#"export default async function(input) {
             const feed = await host.call('media.text.open', {});
             const speech = host.call('media.synthesize', {output:'audio'}, null, null, feed);
-            const helper = host.call('helper.run', {selection:{kind:'named',name:'routine-speaker'},task:input.task,maxTurns:16,deadlineMs:25000,responseBytes:65536,completionBytes:65536});
+            const helper = host.call('helper.run', {selection:{kind:'named',name:'routine-speaker'},content:[{type:'text',text:input.task}],maxTurns:16,deadlineMs:25000,responseBytes:65536,completionBytes:65536});
             const first = await host.call('helper.next', {stream:'speech'});
             await host.call('media.text.write', {text:first.value.arguments.text}, null, null, feed);
             await helper;
@@ -496,7 +496,7 @@ async fn tool_streams_media_queue_termination_joins_and_preserves_reusable_capac
     for (index, source) in [
         "export default async function() { await host.call('helper.next', {stream:'speech'}); return true; }",
         "export default async function() { await host.call('media.finish', {}); return true; }",
-        "export default async function() { const next = host.call('helper.next', {stream:'speech'}); const helper = host.call('helper.run', {selection:{kind:'named',name:'routine-speaker'},task:'fail',maxTurns:1,deadlineMs:5000,responseBytes:1024,completionBytes:1024}); await Promise.all([next,helper]); return true; }",
+        "export default async function() { const next = host.call('helper.next', {stream:'speech'}); const helper = host.call('helper.run', {selection:{kind:'named',name:'routine-speaker'},content:[{type:'text',text:'fail'}],maxTurns:1,deadlineMs:5000,responseBytes:1024,completionBytes:1024}); await Promise.all([next,helper]); return true; }",
         "export default async function() { await host.call('media.finish', {}); return true; }",
     ]
     .into_iter()

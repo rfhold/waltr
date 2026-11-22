@@ -655,6 +655,11 @@ impl AttachmentRegistry {
                 }
                 let outcome = state.terminal.borrow().clone();
                 if let Some(outcome) = outcome {
+                    if let Some(error) = wire::live_provider_rejection(&outcome) {
+                        state.done = true;
+                        state.guard.disarm_in_place();
+                        return Some((Err(error), state));
+                    }
                     let text_results = match state.entry.pending.selected_text().await {
                         Ok(descriptors) => descriptors,
                         Err(error) => {

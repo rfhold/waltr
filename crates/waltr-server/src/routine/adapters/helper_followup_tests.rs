@@ -1,5 +1,6 @@
 use super::*;
 use crate::permission::{PermissionEffect, PermissionPolicy, PermissionToolSelector};
+use crate::routine::ports::HelperContent;
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -163,7 +164,7 @@ async fn open(
             HelperRequest {
                 workspace: None,
                 selection: selection(named),
-                task: "initial-question".into(),
+                content: text("initial-question"),
                 capture: None,
                 max_turns: 4,
                 deadline: Duration::from_secs(5),
@@ -196,8 +197,8 @@ async fn helper_target_uses_next_turn_history_and_keeps_stream_open_until_seal()
         let cancel = CancellationToken::new();
         let target = open(&runner, named, cancel.clone()).await;
         provider.entered.notified().await;
-        target.submit("followup-one".into()).await.unwrap();
-        target.submit("followup-two".into()).await.unwrap();
+        target.submit(text("followup-one")).await.unwrap();
+        target.submit(text("followup-two")).await.unwrap();
         let summaries = sessions.list().await.unwrap();
         assert_eq!(summaries.len(), 1);
         let id = summaries[0].id.clone();
@@ -242,7 +243,7 @@ async fn helper_target_uses_next_turn_history_and_keeps_stream_open_until_seal()
                 .is_none()
         );
         assert_eq!(
-            target.submit("too-late".into()).await,
+            target.submit(text("too-late")).await,
             Err(PortError::Denied)
         );
         let record = sessions.store().load(&id).await.unwrap();
@@ -269,8 +270,8 @@ async fn helper_target_cleanup_joins_active_provider_and_next_turn_prompts() {
     let (runner, sessions, provider, _, sandbox) = fixture(true).await;
     let target = open(&runner, true, CancellationToken::new()).await;
     provider.entered.notified().await;
-    target.submit("followup-one".into()).await.unwrap();
-    target.submit("followup-two".into()).await.unwrap();
+    target.submit(text("followup-one")).await.unwrap();
+    target.submit(text("followup-two")).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), runner.cleanup())
         .await
         .unwrap()
@@ -289,8 +290,8 @@ async fn helper_target_seal_race_rejects_or_joins_admitted_followup() {
     let (runner, sessions, provider, streams, sandbox) = fixture(true).await;
     let target = open(&runner, true, CancellationToken::new()).await;
     provider.entered.notified().await;
-    target.submit("followup-one".into()).await.unwrap();
-    target.submit("followup-two".into()).await.unwrap();
+    target.submit(text("followup-one")).await.unwrap();
+    target.submit(text("followup-two")).await.unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let seal = {
         let target = target.clone();
@@ -305,7 +306,7 @@ async fn helper_target_seal_race_rejects_or_joins_admitted_followup() {
         let barrier = barrier.clone();
         tokio::spawn(async move {
             barrier.wait().await;
-            target.submit("racing-followup".into()).await
+            target.submit(text("racing-followup")).await
         })
     };
     barrier.wait().await;
@@ -328,7 +329,7 @@ async fn helper_target_seal_race_rejects_or_joins_admitted_followup() {
         .is_some()
     {}
     assert_eq!(
-        target.submit("after-seal".into()).await,
+        target.submit(text("after-seal")).await,
         Err(PortError::Denied)
     );
     runner.cleanup().await.unwrap();
@@ -341,8 +342,8 @@ async fn helper_target_deadline_joins_next_turn_waiters_without_reset() {
     let (runner, sessions, provider, _, sandbox) = fixture(true).await;
     let target = open(&runner, true, CancellationToken::new()).await;
     provider.entered.notified().await;
-    target.submit("followup-one".into()).await.unwrap();
-    target.submit("followup-two".into()).await.unwrap();
+    target.submit(text("followup-one")).await.unwrap();
+    target.submit(text("followup-two")).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(7), target.seal())
             .await
@@ -369,16 +370,16 @@ async fn helper_target_submission_ceiling_is_lifetime_bounded() {
             1 => "followup-two".into(),
             _ => format!("followup-{index}"),
         };
-        target.submit(prompt).await.unwrap();
+        target.submit(text(prompt)).await.unwrap();
     }
     assert_eq!(
-        target.submit("over-limit".into()).await,
+        target.submit(text("over-limit")).await,
         Err(PortError::Denied)
     );
     provider.gate.add_permits(1);
     target.idle().await.unwrap();
     assert_eq!(
-        target.submit("still-over-limit".into()).await,
+        target.submit(text("still-over-limit")).await,
         Err(PortError::Denied)
     );
     target.seal().await.unwrap();
@@ -391,4 +392,8 @@ async fn helper_target_submission_ceiling_is_lifetime_bounded() {
     runner.cleanup().await.unwrap();
     sessions.shutdown().await;
     sandbox.shutdown().await;
+}
+
+fn text(text: impl Into<String>) -> HelperContent {
+    vec![waltr_agent::UserMessagePart::Text { text: text.into() }]
 }

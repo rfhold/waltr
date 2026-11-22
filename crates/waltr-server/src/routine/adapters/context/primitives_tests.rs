@@ -250,9 +250,10 @@ async fn create_uses_validated_immutable_source_even_when_source_changes_during_
         assert_eq!(destination.inference_settings, before.inference_settings);
         assert!(serde_json::to_string(&destination).unwrap().contains("source evidence"));
         assert!(!serde_json::to_string(&destination).unwrap().contains("later source bytes"));
-        assert_eq!(destination.journal.iter().filter_map(|event| match event {
-            SessionJournalEvent::PromptAppended { prompt } => Some(prompt.as_str()), _ => None,
-        }).collect::<Vec<_>>(), vec![message]);
+        assert_eq!(destination.timeline_events().filter_map(|event| match &event.content {
+            waltr_agent::TimelineContent::UserMessage { message } => Some(message.parts()),
+            _ => None,
+        }).collect::<Vec<_>>(), vec![&[waltr_agent::UserMessagePart::Text { text: message.into() }][..]]);
         assert_ne!(store.memory.load(&id).await.unwrap().revision.get().to_string(), snapshot["revision"].as_str().unwrap());
         assert_eq!(call(&*context, "context.create", json!({"source":"effective","copyHistory":true,
             "inheritDefinition":true,"inheritInference":true,"message":"before validation must conflict"})).await, Err(PortError::Conflict));

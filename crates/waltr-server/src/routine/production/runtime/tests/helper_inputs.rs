@@ -59,7 +59,7 @@ async fn resource_selected_capture_and_payload_use_assembled_normal_helper() {
             std::fs::write(agents.join(format!("{name}.yaml")), format!("apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{name: {name}}}\nspec:\n  systemPrompt: Normal resource-selected helper\n  permissions: [{{name: _helper_capture, permission: {permission}}}]\n")).unwrap();
             let source = format!(r#"export default async function () {{
                 const payload = await host.call('media.collect', {{port:'text',cap:65536}});
-                const result = await host.call('helper.run', {{selection:{{kind:'named',name:'{name}'}},task:'resource-selected task',capture:'declared',maxTurns:4,deadlineMs:10000,responseBytes:65536,completionBytes:65536}}, null, null, payload);
+                const result = await host.call('helper.run', {{selection:{{kind:'named',name:'{name}'}},content:[{{type:'text',text:'resource-selected task'}}],capture:'declared',maxTurns:4,deadlineMs:10000,responseBytes:65536,completionBytes:65536}}, null, null, payload);
                 const response = await host.call('media.read', {{field:'response'}}, null, null, result);
                 if (response.byteLength !== {response_bytes}) throw new Error('unexpected helper response');
                 const selected = await host.call('media.select', {{field:'/{key}'}}, null, null, result);

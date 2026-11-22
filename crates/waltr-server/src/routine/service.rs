@@ -4,7 +4,7 @@ use super::{
     history::{Admission, Caller, Operation, OperationStatus, Origin, Ownership, Revision, Status},
     ports::{
         Clock, HostFactory, InvocationStore, OperationPolicy, PortError, PreparedHost, Reservation,
-        SelectedEntrypoint,
+        ProviderRejection, SelectedEntrypoint,
     },
 };
 use futures_util::FutureExt;
@@ -36,6 +36,7 @@ pub struct Outcome {
     pub result: Option<Value>,
     /// Engine cleanup and required owner finalization both verified.
     pub cleanup_complete: bool,
+    pub(crate) provider_rejection: Option<ProviderRejection>,
 }
 struct Completion {
     outcome: Mutex<Option<Outcome>>,
@@ -365,7 +366,8 @@ impl InvocationService {
                                 id: id.clone(),
                                 status: None,
                                 result: None,
-                                cleanup_complete: false,
+                                 cleanup_complete: false,
+                                 provider_rejection: None,
                             });
                         entry.completion.notify.notify_waiters();
                     }
@@ -434,6 +436,7 @@ impl InvocationService {
                         status: None,
                         result: None,
                         cleanup_complete: false,
+                        provider_rejection: None,
                     });
                     completion.notify.notify_waiters();
                 }
@@ -444,6 +447,7 @@ impl InvocationService {
                         status: None,
                         result: None,
                         cleanup_complete: task_reusable.load(Ordering::Acquire),
+                        provider_rejection: None,
                     });
                     completion.notify.notify_waiters();
                 }
@@ -521,12 +525,13 @@ impl InvocationService {
                         clean &= joined.is_ok() && entry.reusable.load(Ordering::Acquire);
                         if joined.is_err() {
                             *entry.completion.outcome.lock().expect("completion mutex") =
-                                Some(Outcome {
-                                    id,
-                                    status: None,
-                                    result: None,
-                                    cleanup_complete: false,
-                                });
+                                 Some(Outcome {
+                                     id,
+                                     status: None,
+                                     result: None,
+                                     cleanup_complete: false,
+                                     provider_rejection: None,
+                                 });
                             entry.completion.notify.notify_waiters();
                         }
                     }
@@ -851,6 +856,7 @@ async fn run(
                     status: None,
                     result: None,
                     cleanup_complete: false,
+                    provider_rejection: None,
                 },
                 false,
             )
@@ -881,6 +887,7 @@ async fn execute(
     origin_machine_id: Option<String>,
 ) -> (Outcome, bool) {
     let failed = Arc::new(AtomicBool::new(false));
+    let provider_rejection = Arc::new(Mutex::new(None));
     let mut status = Status::Failed;
     let mut result = None;
     let mut cleanup = true;
@@ -904,6 +911,7 @@ async fn execute(
                 inner: prepared.dispatcher.clone(),
                 policy: prepared.policy.clone(),
                 failed: failed.clone(),
+                provider_rejection: provider_rejection.clone(),
                 cancel: cancel.clone(),
             });
             match shared.engine.start(
@@ -967,6 +975,11 @@ async fn execute(
     if !entered_engine {
         cleanup = prepared.reservation.abort().await.is_ok();
     }
+    let provider_rejection = *provider_rejection.lock().expect("provider rejection mutex");
+    if provider_rejection.is_some() && status != Status::Interrupted {
+        status = Status::Failed;
+        result = None;
+    }
     if cleanup && status == Status::Succeeded && prepared.reservation.validate_success().is_err() {
         super::telemetry::failure("result_validation", "value");
         status = Status::Failed;
@@ -1008,12 +1021,33 @@ async fn execute(
             None
         },
         cleanup_complete: cleanup && finalized,
+        provider_rejection: provider_rejection.filter(|_| durable == Some(Status::Failed)),
     };
     (outcome, cleanup && finalized && durable.is_some())
 }
 
 tokio::task_local! {
     static COMMITTED_OPERATION: (InvocationId, String);
+    static HELPER_REJECTION: Arc<Mutex<Option<ProviderRejection>>>;
+}
+
+pub(super) fn inherit_helper_rejection<F: Future>(work: F) -> impl Future<Output = F::Output> {
+    let rejection = HELPER_REJECTION.try_with(Arc::clone).ok();
+    async move {
+        match rejection {
+            Some(rejection) => HELPER_REJECTION.scope(rejection, work).await,
+            None => work.await,
+        }
+    }
+}
+
+pub(super) fn helper_script_error(error: PortError) -> waltr_script::Error {
+    if let PortError::ProviderRejected(rejection) = error {
+        let _ = HELPER_REJECTION.try_with(|value| {
+            value.lock().expect("helper rejection mutex").get_or_insert(rejection);
+        });
+    }
+    waltr_script::Error::Protocol
 }
 
 pub(super) fn committed_operation(context: &HostContext) -> Result<String, PortError> {
@@ -1037,6 +1071,7 @@ struct JournalHost {
     inner: Arc<dyn HostDispatcher>,
     policy: Arc<dyn OperationPolicy>,
     failed: Arc<AtomicBool>,
+    provider_rejection: Arc<Mutex<Option<ProviderRejection>>>,
     cancel: CancellationToken,
 }
 impl HostDispatcher for JournalHost {
@@ -1072,6 +1107,7 @@ impl HostDispatcher for JournalHost {
         let inner = self.inner.clone();
         let policy = self.policy.clone();
         let failed = self.failed.clone();
+        let provider_rejection = self.provider_rejection.clone();
         let invocation = self.id.clone();
         let cancel = self.cancel.clone();
         use tracing::Instrument as _;
@@ -1125,12 +1161,17 @@ impl HostDispatcher for JournalHost {
             }
             let name = request.operation.clone();
             stage = "dispatch";
-            let reply = tokio::select! {
+            let rejection = Arc::new(Mutex::new(None));
+            let (reply, rejection) = tokio::select! {
                 biased;
-                () = cancel.cancelled() => Err(waltr_script::Error::Cancelled),
+                () = cancel.cancelled() => (Err(waltr_script::Error::Cancelled), None),
                 reply = COMMITTED_OPERATION.scope(
                     (context.invocation(), id.clone()),
-                    async { inner.dispatch(request, context).await },
+                    HELPER_REJECTION.scope(rejection.clone(), async {
+                        let reply = inner.dispatch(request, context).await;
+                        let rejection = *rejection.lock().expect("helper rejection mutex");
+                        (reply, rejection)
+                    }),
                 ) => reply,
             };
             dispatch_error = reply.as_ref().err().copied();
@@ -1149,7 +1190,10 @@ impl HostDispatcher for JournalHost {
                         (OperationStatus::Uncertain, None)
                     }
                 },
-                Err(_) => (OperationStatus::Uncertain, None),
+                Err(_) => match rejection {
+                    Some(rejection) => (OperationStatus::Failed, Some(rejection.projection())),
+                    None => (OperationStatus::Uncertain, None),
+                },
             };
             if dispatch_error.is_none() { stage = "acknowledgment"; }
             if store
@@ -1161,6 +1205,9 @@ impl HostDispatcher for JournalHost {
                 failed.store(true, Ordering::Release);
                 cancel.cancel();
                 return Err(waltr_script::Error::Cleanup);
+            }
+            if let Some(rejection) = rejection {
+                provider_rejection.lock().expect("provider rejection mutex").get_or_insert(rejection);
             }
             reply
             }).catch_unwind().await;

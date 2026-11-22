@@ -43,7 +43,7 @@ async fn production_helpers_send_defaults_exact_source_and_disabled_reasoning() 
         std::fs::write(resources.join(".waltr/resources/agents/selector-source.yaml"), "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {name: selector-source}\nspec:\n  systemPrompt: Source\n").unwrap();
         let program = r#"export default async function () {
             for (const inference of [{from:'defaults'}, {provider:'exact-model',model:'selected',reasoningEffort:'low'}, {from:'source-session'}, {from:'source-session',reasoningEffort:null}]) {
-                await host.call('helper.run', {selection:{kind:'named',name:'routine-title'},inference,task:'Observe selected inference',maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536});
+                await host.call('helper.run', {selection:{kind:'named',name:'routine-title'},inference,content:[{type:'text',text:'Observe selected inference'}],maxTurns:1,deadlineMs:10000,responseBytes:65536,completionBytes:65536});
             }
             return true;
         }"#;

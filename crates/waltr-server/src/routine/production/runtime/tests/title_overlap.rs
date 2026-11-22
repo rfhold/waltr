@@ -71,7 +71,7 @@ pub(super) async fn run(address: std::net::SocketAddr, bearer: &str, provider: &
             .submit_user_message(request(
                 s::SubmitUserMessageRequest {
                     session_id: id.clone(),
-                    text: PROMPT.into(),
+                    parts: vec![s::UserMessageInputPart::text(PROMPT)],
                 },
                 header,
             ))

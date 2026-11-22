@@ -214,6 +214,18 @@ impl Producer {
     pub(crate) fn complete(&mut self) {
         self.completed = true;
     }
+
+    pub(crate) fn reject(&mut self) {
+        for queue in &self.queues {
+            if let Ok(mut state) = queue.state.lock() {
+                state.queue.clear();
+                state.bytes = 0;
+                state.closed = true;
+            }
+            queue.changed.notify_waiters();
+        }
+        self.complete();
+    }
 }
 #[cfg(test)]
 #[path = "tool_streams_tests.rs"]

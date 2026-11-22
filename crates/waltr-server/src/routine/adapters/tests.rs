@@ -295,7 +295,9 @@ impl HelperRunner for SubstitutePorts {
         _: tokio_util::sync::CancellationToken,
     ) -> PortFuture<HelperResult> {
         self.helpers.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(request.task, "task");
+        assert!(
+            matches!(request.content.as_slice(), [waltr_agent::UserMessagePart::Text { text }] if text == "task")
+        );
         Box::pin(async {
             Ok(HelperResult {
                 session_id: "fake-session".into(),
@@ -379,7 +381,7 @@ async fn independent_ports_keep_exact_capabilities_and_trusted_ask_disposition()
     for (operation, arguments, expected) in [
         (
             "helper.run",
-            json!({"selection":{"kind":"restricted","profile":"test"},"task":"task","maxTurns":1,"deadlineMs":1000,"responseBytes":65536,"completionBytes":65536}),
+            json!({"selection":{"kind":"restricted","profile":"test"},"content":[{"type":"text","text":"task"}],"maxTurns":1,"deadlineMs":1000,"responseBytes":65536,"completionBytes":65536}),
             "accepted",
         ),
         (
@@ -737,7 +739,7 @@ async fn vertical(named: bool, mutation: u8, invalid_capture: bool) {
     .unwrap();
     let source = r#"export default async function() {
         let proposals = 0;
-        const helper = await host.call('helper.run', {selection:{kind:'restricted',profile:'restricted'},source:'effective',task:'work',capture:'verified',maxTurns:3,deadlineMs:3000,responseBytes:65536,completionBytes:65536}, async proposal => {
+        const helper = await host.call('helper.run', {selection:{kind:'restricted',profile:'restricted'},source:'effective',content:[{type:'text',text:'work'}],capture:'verified',maxTurns:3,deadlineMs:3000,responseBytes:65536,completionBytes:65536}, async proposal => {
             const schemas = await host.call('tools.schemas', {targets:[{server:'exact.server',tool:'effect-name'}]});
             if (schemas.schemas.length !== 1) throw new Error('schema');
             if (proposals++ === 0) {

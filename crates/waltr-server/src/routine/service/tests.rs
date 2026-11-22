@@ -860,6 +860,7 @@ async fn script_concurrent_journal_failure_fences_policy_and_intent_waiters() {
                 gate: gate.clone(),
             }),
             failed: Arc::new(AtomicBool::new(false)),
+            provider_rejection: Arc::new(Mutex::new(None)),
             cancel: cancel.clone(),
         });
         let context = HostContext::new(Limits::default()).unwrap();

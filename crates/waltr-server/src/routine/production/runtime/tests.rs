@@ -474,7 +474,9 @@ async fn lifecycle_routes(address: std::net::SocketAddr, bearer: &str, provider:
         .submit_user_message(request(
             session::SubmitUserMessageRequest {
                 session_id: id.clone(),
-                text: "Check the shared production helper and completion boundary".into(),
+                parts: vec![session::UserMessageInputPart::text(
+                    "Check the shared production helper and completion boundary",
+                )],
             },
             header,
         ))
@@ -645,7 +647,13 @@ async fn lifecycle_routes(address: std::net::SocketAddr, bearer: &str, provider:
         .await
         .unwrap()
         .into_inner();
-    assert!(destination_raw.events.iter().any(|event| event.channel.as_deref() == Some("user_text") && matches!(event.content.as_ref().and_then(|value| value.content.as_ref()), Some(session::timeline_content::Content::TextSnapshot(value)) if value.text.contains("Preserve the exact technical handoff"))));
+    assert!(destination_raw.events.iter().any(|event| {
+        event.channel.as_deref() == Some("user_text")
+            && matches!(event.content.as_ref().and_then(|value| value.content.as_ref()),
+                Some(session::timeline_content::Content::UserMessage(value)) if value.parts.iter().any(|part|
+                    matches!(&part.part, Some(session::user_message_timeline_part::Part::Text(text))
+                        if text.contains("Preserve the exact technical handoff"))))
+    }));
     let raw_before = sessions
         .get_timeline(request(
             session::GetTimelineRequest {
@@ -864,7 +872,9 @@ async fn code_routes(address: std::net::SocketAddr, bearer: &str) {
         .submit_user_message(request(
             session::SubmitUserMessageRequest {
                 session_id: "production-code-session".into(),
-                text: "Execute the explicitly granted bounded code once".into(),
+                parts: vec![session::UserMessageInputPart::text(
+                    "Execute the explicitly granted bounded code once",
+                )],
             },
             header,
         ))
@@ -905,7 +915,9 @@ async fn code_routes(address: std::net::SocketAddr, bearer: &str) {
         .submit_user_message(request(
             session::SubmitUserMessageRequest {
                 session_id: "production-code-ungranted".into(),
-                text: "This session has no host code grant".into(),
+                parts: vec![session::UserMessageInputPart::text(
+                    "This session has no host code grant",
+                )],
             },
             header,
         ))
