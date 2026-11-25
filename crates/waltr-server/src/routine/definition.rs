@@ -624,7 +624,7 @@ mod nullable_tests {
         let engine = waltr_script::Engine::new(1).unwrap();
         let mut envelope: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/routines/title.json")).unwrap();
-        let target = json!({"server":"computer-use","tool":"screenshot_window"});
+        let target = json!({"server":"computer-use","tool":"capture"});
         envelope["spec"]["entrypoints"] = json!({"run":{"trigger":"manual"}});
         envelope["spec"]["capabilities"] = json!(["tools.execute"]);
         envelope["spec"]["mcpTools"] = json!([target]);

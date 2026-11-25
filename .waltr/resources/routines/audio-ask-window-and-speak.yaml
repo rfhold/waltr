@@ -1,15 +1,15 @@
 apiVersion: waltr.routine/v1
 kind: Routine
 name: audio-ask-window-and-speak
-description: Ask a spoken question about the focused Mac window, research the answer, and speak the findings.
+description: Ask a spoken question about the focused window and hear the answer.
 spec:
   source: |
     export default async function () {
       const first = await host.call('media.input.next', {port: 'question'});
       if (first === null) throw new Error('question required');
       const screenshot = host.call('tools.execute', {
-        target: {server: 'computer-use', tool: 'screenshot_window'},
-        arguments: {}, workspace: {machine: 'preview'}, result: 'handle'
+        target: {server: 'computer-use', tool: 'capture'},
+        arguments: {target: 'focused_window'}, workspace: {machine: 'preview'}, result: 'handle'
       });
       const [image, transcript] = await Promise.all([
         screenshot,
@@ -99,7 +99,7 @@ spec:
   - helper.named.routine-research-answer
   - helper.streams
   mcpTools:
-  - {server: computer-use, tool: screenshot_window}
+  - {server: computer-use, tool: capture}
   toolStreams:
     speech:
       selection: {kind: named, name: routine-research-answer}

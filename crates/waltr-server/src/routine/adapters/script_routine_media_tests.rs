@@ -1942,19 +1942,25 @@ impl RoutineMcpPort for ImageTool {
             assert!(!operation.is_empty());
             assert_eq!(request.target.server(), self.1);
             assert_eq!(request.target.tool(), self.2);
+            if self.1 == "computer-use" {
+                assert_eq!(json!(request.arguments), json!({"target": "focused_window"}));
+            }
             let encoded = if self.3.fetch_add(1, Ordering::SeqCst) == 0 {
                 TOOL_PNG.into()
             } else {
                 next_fixture_png()
             };
             let image = waltr_agent::ToolResultImage::new(&encoded, "image/png").unwrap();
+            let mut blocks = vec![waltr_agent::ToolResultContentBlock::Image(image)];
+            if self.1 == "computer-use" {
+                blocks.push(waltr_agent::ToolResultContentBlock::Text {
+                    text: r#"{"capture_id":"fixture","width":1,"height":1}"#.into(),
+                });
+            }
             Ok(waltr_agent::ToolResult::from_content(
                 operation,
                 self.2,
-                waltr_agent::ToolResultContent::from_blocks(vec![
-                    waltr_agent::ToolResultContentBlock::Image(image),
-                ])
-                .unwrap(),
+                waltr_agent::ToolResultContent::from_blocks(blocks).unwrap(),
                 false,
             ))
         })
@@ -2039,7 +2045,7 @@ async fn window_ask_attaches_image_to_initial_prompt_and_keeps_audio_followups()
                 ResultPool::process(),
             ),
             "computer-use",
-            "screenshot_window",
+            "capture",
             AtomicUsize::new(0),
         ))
     };
@@ -2127,7 +2133,7 @@ spec:
   source: |
     export default async function () {
       const shot = await host.call('tools.execute', {
-        target:{server:'computer-use',tool:'screenshot_window'}, arguments:{}, result:'handle'
+        target:{server:'computer-use',tool:'capture'}, arguments:{target:'focused_window'}, result:'handle'
       });
       await host.call('helper.image.bind', {name:'window'}, null, null, shot);
       await host.call('helper.run', {
@@ -2141,7 +2147,7 @@ spec:
   parameters: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {}, required: []}}
   result: {schemaVersion: waltr.value/v1, schema: {type: boolean}}
   capabilities: [media.execute, tools.execute, helper.run, helper.named.media]
-  mcpTools: [{server: computer-use, tool: screenshot_window}]
+  mcpTools: [{server: computer-use, tool: capture}]
 "#;
     let tools = Arc::new(ImageTool(
         super::super::authorized_tools::ToolResults::new(
@@ -2149,7 +2155,7 @@ spec:
             ResultPool::process(),
         ),
         "computer-use",
-        "screenshot_window",
+        "capture",
         AtomicUsize::new(0),
     ));
     let image = format!("data:image/png;base64,{TOOL_PNG}");
@@ -2182,7 +2188,7 @@ spec:
   source: |
     export default async function () {
       const screenshot = () => host.call('tools.execute', {
-        target:{server:'computer-use',tool:'screenshot_window'}, arguments:{}, result:'handle'
+        target:{server:'computer-use',tool:'capture'}, arguments:{target:'focused_window'}, result:'handle'
       });
       await host.call('helper.image.bind', {name:'initial'}, null, null, await screenshot());
       const target = await host.call('helper.open', {selection:{kind:'named',name:'media'},content:[
@@ -2203,7 +2209,7 @@ spec:
   parameters: {schemaVersion: waltr.value/v1, schema: {type: object, properties: {}, required: []}}
   result: {schemaVersion: waltr.value/v1, schema: {type: boolean}}
   capabilities: [media.execute, tools.execute, helper.run, helper.named.media]
-  mcpTools: [{server: computer-use, tool: screenshot_window}]
+  mcpTools: [{server: computer-use, tool: capture}]
 "#;
     let tools = || {
         Arc::new(ImageTool(
@@ -2212,7 +2218,7 @@ spec:
                 ResultPool::process(),
             ),
             "computer-use",
-            "screenshot_window",
+            "capture",
             AtomicUsize::new(0),
         ))
     };
