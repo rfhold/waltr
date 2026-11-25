@@ -28,17 +28,33 @@ fn destination_is_an_optional_exact_remote_name() {
 }
 
 #[test]
-fn documented_typing_example_uses_cleanup_routine() {
+fn documented_dictation_shortcuts_have_no_local_output_action() {
     let config =
         config::parse(include_str!("../../../docs/examples/client.yaml").as_bytes()).unwrap();
-    assert_eq!(config.keybinds.len(), 1);
-    let binding = &config.keybinds[0];
-    assert!(binding.typing.is_some());
-    assert!(binding.command.is_none());
-    assert_eq!(binding.routine.name, "audio-transcribe-cleanup");
-    assert_eq!(binding.routine.trigger, "dictate");
-    assert_eq!(binding.routine.input, "audio");
-    assert_eq!(binding.routine.output, "clean-text");
+    assert_eq!(config.keybinds.len(), 2);
+    for (binding, routine) in config.keybinds.iter().zip(["audio-transcribe", "audio-transcribe-cleanup"]) {
+        assert!(binding.command.is_none() && binding.playback.is_none());
+        assert_eq!(binding.routine.name, routine);
+        assert_eq!(binding.routine.trigger, "dictate");
+        assert_eq!(binding.routine.input, "audio");
+        assert_eq!(binding.routine.output, None);
+        assert_eq!(binding.routine.destination.as_deref(), Some("home"));
+    }
+}
+
+#[test]
+fn output_port_and_local_action_must_be_configured_together() {
+    let (prefix, _) = VALID.split_once("    command:").unwrap();
+    let terminal = prefix.replace(", output: clean-text", "");
+    assert!(config::parse(terminal.as_bytes()).is_ok());
+    for invalid in [
+        prefix.into(),
+        format!("{terminal}    playback: {{}}\n"),
+        format!("{terminal}    typing: {{}}\n"),
+        terminal.replace("input: audio", "input: audio, output: null"),
+    ] {
+        assert!(config::parse(invalid.as_bytes()).is_err(), "{invalid}");
+    }
 }
 
 #[test]
@@ -75,12 +91,15 @@ fn capture_modes_are_independent_of_the_output_action() {
         let prefix = prefix.replace("mode: hold", &format!("mode: {spelling}"));
         for action in [
             format!("command:{command}"),
-            "typing: {}\n".into(),
             "playback: {}\n".into(),
         ] {
             let config = config::parse(format!("{prefix}{action}").as_bytes()).unwrap();
             assert_eq!(config.keybinds[0].mode, mode);
         }
+        let terminal = prefix
+            .trim_end()
+            .replace(", output: clean-text", "");
+        assert_eq!(config::parse(terminal.as_bytes()).unwrap().keybinds[0].mode, mode);
     }
 }
 
@@ -113,14 +132,12 @@ fn conversation_notes_example_copies_only_final_notes() {
     .unwrap();
     assert_eq!(config.keybinds.len(), 1);
     let binding = &config.keybinds[0];
-    assert!(binding.typing.is_none());
     assert_eq!(binding.routine.name, "audio-conversation-notes");
     assert_eq!(binding.routine.trigger, "record-notes");
     assert_eq!(binding.routine.input, "audio");
-    assert_eq!(binding.routine.output, "notes");
-    let command = binding.command.as_ref().unwrap();
-    assert_eq!(command.argv, ["/usr/bin/pbcopy"]);
-    assert_eq!(command.stdin, "{{ text }}");
+    assert_eq!(binding.routine.output, None);
+    assert_eq!(binding.routine.destination.as_deref(), Some("home"));
+    assert!(binding.command.is_none() && binding.playback.is_none());
     assert_eq!(binding.audio.sample_rate_hz, 24000);
     assert_eq!(binding.audio.channels, 1);
     assert_eq!(binding.max_capture_seconds, Some(3600));

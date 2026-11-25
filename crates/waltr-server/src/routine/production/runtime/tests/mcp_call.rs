@@ -140,7 +140,9 @@ fn install(resources: &std::path::Path, http: &str) {
             }
             first = actual.result;
         }
-         const http = await call('routine-http','http.marker',{arguments:{},workspace:{machine:'unclaimed-machine',workingDirectory:'bound'}});
+         const routedHttp = await call('routine-http','http.marker',{arguments:{},workspace:{machine:'unclaimed-machine',workingDirectory:'bound'}});
+         if (routedHttp.status !== 'denied') throw Error('HTTP ignored explicit workspace');
+         const http = await call('routine-http','http.marker',{arguments:{}});
          const large = await call('routine-http','http.marker',{arguments:{large:true},result:'handle'});
          const projection = await host.call('tools.read', {}, null, null, large);
          if (projection.status !== 'completed' || projection.resultUnavailable !== 'limit') throw Error('completed effect lost on result limit');

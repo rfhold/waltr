@@ -32,7 +32,6 @@ struct State {
     primary: &'static str,
     failure_stage: &'static str,
     capture_cleanup: &'static str,
-    typing_cleanup: &'static str,
     rpc: Option<(&'static str, &'static str)>,
     terminal: bool,
 }
@@ -57,7 +56,7 @@ impl Operation {
             diagnostic_id = id, outcome = tracing::field::Empty, category = tracing::field::Empty,
             elapsed_ms = tracing::field::Empty, stage = tracing::field::Empty,
             preflight = tracing::field::Empty,
-            capture_cleanup = tracing::field::Empty, typing_cleanup = tracing::field::Empty,
+            capture_cleanup = tracing::field::Empty,
             failure_stage = tracing::field::Empty, invocation_id = tracing::field::Empty, bytes_received = 0_u64, bytes_received_scope = "selected_stream_payload");
         Self(Arc::new(Inner {
             span,
@@ -73,7 +72,6 @@ impl Operation {
                 primary: "none",
                 failure_stage: "none",
                 capture_cleanup: "not_needed",
-                typing_cleanup: "not_needed",
                 rpc: None,
                 terminal: false,
             }),
@@ -191,7 +189,6 @@ impl Operation {
                 // must not promote a cleanup-only failure into the primary category.
                 if matches!(snapshot.primary, "none" | "no_input")
                     && category != snapshot.capture_cleanup
-                    && category != snapshot.typing_cleanup
                 {
                     snapshot.primary = category;
                     snapshot.failure_stage = failure_stage;
@@ -208,9 +205,6 @@ impl Operation {
                 if snapshot.capture_cleanup == "not_needed" || snapshot.capture_cleanup == "ok" {
                     snapshot.capture_cleanup = result.map_or_else(capture_category, |()| "ok");
                 }
-            }
-            Diagnostic::TypingCleanup(result) => {
-                snapshot.typing_cleanup = result.map_or_else(typing_category, |()| "ok");
             }
             Diagnostic::SourceCleanup(result) => {
                 if result.is_err() && snapshot.primary == "none" {
@@ -254,18 +248,11 @@ impl Operation {
     pub(crate) fn completion(&self) -> Completion {
         let snapshot = self.lock();
         let category = snapshot.primary;
-        let cleanup_failed = [snapshot.capture_cleanup, snapshot.typing_cleanup]
-            .iter()
-            .any(|value| {
-                !matches!(
-                    *value,
-                    "ok" | "not_needed" | "cancelled" | "typing_guard_or_cancelled"
-                )
-            });
+        let cleanup_failed = capture_cleanup_failed(snapshot.capture_cleanup);
         if !cleanup_failed
             && matches!(
                 category,
-                "cancelled" | "invalidated" | "typing_guard_or_cancelled" | "no_input"
+                "cancelled" | "invalidated" | "no_input"
             )
         {
             Completion::Unchanged
@@ -293,7 +280,6 @@ impl Operation {
         let primary = snapshot.primary;
         let failure_stage = snapshot.failure_stage;
         let capture_cleanup = snapshot.capture_cleanup;
-        let typing_cleanup = snapshot.typing_cleanup;
         let stage = snapshot.stage;
         let invocation_id = snapshot.invocation_id;
         let invocation_id = invocation_id
@@ -302,16 +288,8 @@ impl Operation {
             .unwrap_or("unavailable");
         let bytes_received = snapshot.bytes_received;
         drop(snapshot);
-        let cleanup_failed = [capture_cleanup, typing_cleanup].iter().any(|value| {
-            !matches!(
-                *value,
-                "ok" | "not_needed" | "cancelled" | "typing_guard_or_cancelled"
-            )
-        });
-        let outcome = if matches!(
-            primary,
-            "cancelled" | "invalidated" | "typing_guard_or_cancelled"
-        ) {
+        let cleanup_failed = capture_cleanup_failed(capture_cleanup);
+        let outcome = if matches!(primary, "cancelled" | "invalidated") {
             "cancelled"
         } else if primary == "no_input" && !cleanup_failed {
             "no_input"
@@ -327,15 +305,14 @@ impl Operation {
         self.0.span.record("stage", stage);
         self.0.span.record("failure_stage", failure_stage);
         self.0.span.record("capture_cleanup", capture_cleanup);
-        self.0.span.record("typing_cleanup", typing_cleanup);
         if outcome == "failed" || cleanup_failed {
             tracing::event!(target: TARGET, parent: &self.0.span, tracing::Level::WARN, { event.name = "native.audio.finished",
                 entrypoint = self.0.entrypoint, diagnostic_id = self.0.id, invocation_id, bytes_received, bytes_received_scope = "selected_stream_payload", outcome = outcome, category = primary,
-                capture_cleanup = capture_cleanup, typing_cleanup = typing_cleanup, stage = stage, failure_stage = failure_stage, elapsed_ms = elapsed_ms });
+                capture_cleanup = capture_cleanup, stage = stage, failure_stage = failure_stage, elapsed_ms = elapsed_ms });
         } else {
             tracing::event!(target: TARGET, parent: &self.0.span, tracing::Level::INFO, { event.name = "native.audio.finished",
                 entrypoint = self.0.entrypoint, diagnostic_id = self.0.id, invocation_id, bytes_received, bytes_received_scope = "selected_stream_payload", outcome = outcome, category = primary,
-                capture_cleanup = capture_cleanup, typing_cleanup = typing_cleanup, stage = stage, failure_stage = failure_stage, elapsed_ms = elapsed_ms });
+                capture_cleanup = capture_cleanup, stage = stage, failure_stage = failure_stage, elapsed_ms = elapsed_ms });
         }
     }
 }
@@ -367,16 +344,8 @@ pub const fn capture_category(error: capture::Error) -> &'static str {
         capture::Error::Cancelled => "cancelled",
     }
 }
-const fn typing_category(error: waltr_desktop::typing::Error) -> &'static str {
-    use waltr_desktop::typing::Error as E;
-    match error {
-        E::Unsupported => "typing_unsupported",
-        E::Cancelled => "typing_guard_or_cancelled",
-        E::Control => "typing_control",
-        E::Limit => "typing_limit",
-        E::Revision => "typing_revision",
-        E::Backend => "typing_backend",
-    }
+fn capture_cleanup_failed(category: &str) -> bool {
+    !matches!(category, "ok" | "not_needed" | "cancelled")
 }
 const fn classify(error: Error) -> &'static str {
     use waltr_desktop::command::CommandError as C;
@@ -386,7 +355,6 @@ const fn classify(error: Error) -> &'static str {
         Error::Cancelled => "cancelled",
         Error::Capture(error) => capture_category(error),
         Error::Interaction => "interaction",
-        Error::Typing(error) => typing_category(error),
         Error::Command(error) => match error {
             C::Invalid(_) => "command_invalid",
             C::InputLimit => "command_input_limit",
@@ -693,9 +661,6 @@ mod tests {
         ))));
         observer.emit(Diagnostic::Stage(Stage::Cleanup));
         observer.emit(Diagnostic::CaptureCleanup(Err(capture::Error::Backend)));
-        observer.emit(Diagnostic::TypingCleanup(Err(
-            waltr_desktop::typing::Error::Backend,
-        )));
         observer.emit(Diagnostic::Primary(Err(Error::Interaction)));
         operation.finish();
         let snapshot = operation.lock();
@@ -703,6 +668,5 @@ mod tests {
         assert_eq!(snapshot.failure_stage, "capture_ready");
         assert_eq!(snapshot.stage, "cleanup");
         assert_eq!(snapshot.capture_cleanup, "capture_backend");
-        assert_eq!(snapshot.typing_cleanup, "typing_backend");
     }
 }

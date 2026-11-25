@@ -466,6 +466,7 @@ struct State {
     active: usize,
     finishing: bool,
     finished: bool,
+    final_tool_started: bool,
 }
 #[derive(Clone)]
 enum Resource {
@@ -635,7 +636,7 @@ impl MediaHost {
         {
             return Err(waltr_script::Error::Identity);
         }
-        if state.finishing || state.finished {
+        if state.finishing || (state.finished && request.operation != "tools.execute") {
             return Err(waltr_script::Error::Denied);
         }
         state.engine = Some(context.invocation());
@@ -1693,10 +1694,11 @@ impl MediaHost {
                     .finish()
                     .await
                     .map_err(|_| waltr_script::Error::Cleanup)?;
-                self.state
+                let mut state = self.state
                     .lock()
-                    .map_err(|_| waltr_script::Error::Cleanup)?
-                    .finished = true;
+                    .map_err(|_| waltr_script::Error::Cleanup)?;
+                state.finishing = false;
+                state.finished = true;
                 json!({"status":"completed"})
             }
             "media.upload" => {
@@ -2274,9 +2276,17 @@ impl HostDispatcher for MediaHost {
                     .state
                     .lock()
                     .map_err(|_| waltr_script::Error::Cleanup)?;
-                if state.finishing || state.finished || state.cleaned || this.cancel.is_cancelled()
-                {
+                if state.finishing || state.cleaned || this.cancel.is_cancelled() {
                     return Err(waltr_script::Error::Denied);
+                }
+                if state.finished {
+                    if state.active != 0
+                        || state.final_tool_started
+                        || !args.mcp.as_ref().is_some_and(|call| call.result.is_none())
+                    {
+                        return Err(waltr_script::Error::Denied);
+                    }
+                    state.final_tool_started = true;
                 }
                 state.active += 1;
             }

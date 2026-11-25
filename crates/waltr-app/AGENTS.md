@@ -65,12 +65,10 @@ Fence starts with selection tickets. Require the current generation for dispatch
 
 Share one nonqueued audio reservation across chat and holds. Keep PCM and credentials outside IPC.
 Use the desktop `interaction` driver for capture, Accepted-gated audio upload, concurrent output, cancellation, and native joins in both consumers.
-Keep chat status/preview and desktop typing/commands as separate output consumers, not shortcut-shaped chat bindings.
+Keep chat status and preview separate from desktop shortcut actions.
 Retain the app's process-owned shortcut registrar, ingress epochs, and permission tickets across runtime generations; the caller-driven desktop Actor is not its replacement.
 Recheck generation, access, cancellation, and credential revision before capture, RPC, and output-action effects.
-Require the same guards immediately before each actual native text batch.
-Keep live external text with suffix revisions separate from native chat preview.
-Require exactly one command, `typing`, or `playback` action; never add a fallback, retry, replay, clipboard path, or automatic submission.
+Terminal-only shortcuts omit the local output port and action. Do not add a local fallback, retry, replay, or automatic submission.
 Use the shared CPAL playback owner for shortcut PCM output. Recheck hold cancellation, generation, access, and credential revision at physical output.
 Prefer exact playback formats; permit only bounded 24 kHz mono to 48 kHz stereo adaptation when exact output is unavailable.
 Keep conversion history across packets, retain source credits through converted playback, and calculate tail drain from device frames.
@@ -96,7 +94,7 @@ Preserve explicit dismissal, success clearing, and the existing transient tray b
 Publish only validated Accepted UUIDs and selected-stream payload receipt counts in native spans and finished logs, never metric labels.
 Keep the tray optional and its menu limited to status, Open Waltr, and Quit.
 Preserve normal window-close and exit behavior.
-See [external text](../../docs/architecture/clients.md#live-external-text) and [platform prerequisites](../../docs/deployment.md#desktop-tray-and-external-text) for canonical constraints.
+See [external text](../../docs/architecture/clients.md#computer-use-text-output) and [platform prerequisites](../../docs/deployment.md#desktop-tray-and-external-text) for canonical constraints.
 
 Start the embedded entry server for every client view. Changing view destination does not stop that server. Do not expose its bearer or outbound Remote credentials through IPC or logs.
 

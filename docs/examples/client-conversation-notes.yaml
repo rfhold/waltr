@@ -1,4 +1,4 @@
-# macOS clipboard-only example; does not type or paste into another application.
+# Copy final notes through Computer Use MCP on the preview worker.
 version: 1
 keybinds:
   - id: conversation-notes-copy
@@ -9,12 +9,8 @@ keybinds:
       name: audio-conversation-notes
       trigger: record-notes
       input: audio
-      output: notes
+      destination: home
     audio:
       device: default
       sampleRateHz: 24000
       channels: 1
-    command:
-      argv: [/usr/bin/pbcopy]
-      stdin: '{{ text }}'
-      timeoutSeconds: 10

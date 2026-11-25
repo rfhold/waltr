@@ -1,16 +1,24 @@
 apiVersion: waltr.routine/v1
 kind: Routine
 name: audio-transcribe-cleanup
-description: single-collect speech cleanup with one normal helper
+description: Clean up the transcript and copy the final text through Computer Use.
 spec:
   source: |
     export default async function () {
       const transcript = await host.call('media.collect', {port: 'audio', cap: 1048576, speech: {from: 'defaults'}});
       const helper = await host.call('helper.run', {selection: {kind: 'named', name: 'routine-cleanup'}, inference: {from: 'defaults'}, input: {text: true, maxBytes: 8388608}, content: [{type: 'text', text: 'Clean the attached transcript and capture the clean text in chosen.'}], capture: 'clean-text', maxTurns: 3, deadlineMs: 120000, responseBytes: 65536, completionBytes: 4194304}, null, null, transcript);
       const clean = await host.call('media.select', {field: '/chosen'}, null, null, helper);
+      const text = await host.call('media.readText', {max: 16384}, null, null, clean);
+      if (!text.trim()) throw new Error('no cleaned transcript to copy');
       await host.call('media.publish', {name: 'clean-text'}, null, null, clean);
-      await host.call('media.emit', {output: 'clean-text'}, null, null, clean);
       await host.call('media.finish', {});
+      const copied = await host.call('tools.execute', {
+        target: {server: 'computer-use', tool: 'clipboard_copy'},
+        arguments: {text}, workspace: {machine: 'preview'}
+      });
+      if (copied.status !== 'completed' || copied.result?.is_error !== false) {
+        throw new Error('Computer Use clipboard copy failed');
+      }
       return {completed: true};
     }
   entrypoints:
@@ -33,9 +41,12 @@ spec:
       - completed
   capabilities:
   - media.execute
+  - tools.execute
   - helper.run
   - helper.named.routine-cleanup
   - helper.capture.clean-text
+  mcpTools:
+  - {server: computer-use, tool: clipboard_copy}
   captures:
     clean-text:
       selection: {kind: named, name: routine-cleanup}
@@ -60,10 +71,3 @@ spec:
       maxBytes: 268435456
       formats:
       - pcm16le-24000-mono
-    clean-text:
-      direction: output
-      media: text
-      required: true
-      maxBytes: 1048576
-      formats:
-      - utf8

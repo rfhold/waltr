@@ -18,7 +18,7 @@ use waltr_desktop::{
     host::{Error, Observer},
     interaction::{Consumer, Progress},
     media::{self, BinaryInput, Frame, OutputSink},
-    typing::{Guard, LocalFuture},
+    effect::{Guard, LocalFuture},
 };
 #[allow(
     unused_imports,
@@ -1104,7 +1104,7 @@ async fn capture_plus_finite_input_joins_both_and_preserves_empty_capture_no_rpc
                 waltr_desktop::interaction::Selection {
                     invocation: &invocation,
                     input: "audio",
-                    output: "clean-text",
+                    output: Some("clean-text"),
                     max_capture_seconds: None,
                 },
                 &mut [input],
@@ -1259,7 +1259,7 @@ async fn invalid_binary_preflight(capture: bool) {
                 waltr_desktop::interaction::Selection {
                     invocation: &invocation,
                     input: "audio",
-                    output: "clean-text",
+                    output: Some("clean-text"),
                     max_capture_seconds: None,
                 },
                 &mut inputs,
@@ -1359,7 +1359,7 @@ async fn capture_request_invalidation_closes_finite_source_without_opening_devic
         waltr_desktop::interaction::Selection {
             invocation: &invocation,
             input: "audio",
-            output: "clean-text",
+            output: Some("clean-text"),
             max_capture_seconds: None,
         },
         &mut [input],

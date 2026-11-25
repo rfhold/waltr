@@ -619,7 +619,7 @@ The desktop tray reports only [client-owned Routine activity](architecture/clien
 Its menu contains status, Open Waltr, and Quit; normal window-close and exit behavior do not change.
 Tray creation is optional and nonfatal.
 macOS requires main-thread tray ownership and uses template icons.
-Android supplies neither a tray nor the desktop external-text action.
+Android supplies no desktop tray or shortcut registrar.
 
 The pinned Tauri 2.10.1 and `tray-icon` 0.21.3 Linux path uses GTK/AppIndicator, not a native `ksni` backend.
 At runtime, it loads `libayatana-appindicator3.so.1` or `libappindicator3.so.1` and requires a compatible panel host.
@@ -628,36 +628,11 @@ A headless session or absent panel host provides no tray acceptance evidence.
 Wayland alone does not guarantee tray support.
 Use the Open Waltr menu item; Linux icon-click behavior supplies no portable window-open contract.
 
-`typing: {}` requires an authorized native backend; schema acceptance and fake-backend tests do not establish installed-platform support.
-The core returns `Unsupported` when the host supplies no backend.
-The following requirements define platform acceptance, not a compile or live-delivery claim.
-
-| Platform | External-text requirements and limits |
-| --- | --- |
-| macOS | CoreGraphics Unicode events require Accessibility trust; trust checks must not trigger an automatic permission prompt. |
-| Wayland Linux | RemoteDesktop portal keyboard consent, a ready/resumed EI device, and EI text capability are mandatory. |
-| Android | No desktop external-text action. Native chat dictation remains separate. |
-
-If macOS reports no trust, grant Waltr access manually under System Settings → Privacy & Security → Accessibility.
-CoreGraphics event posts provide best-effort delivery; applications can ignore Unicode events or interpret keycodes differently.
-The action provides no held-modifier release or exact insertion guarantee.
-Live hypotheses arrive before provider commitment; macOS replaces revised suffixes with unmodified physical Backspace key pairs.
-The host counts extended graphemes, but target applications need not delete exactly one grapheme per Backspace pair.
-A focus or cursor change can redirect deletions away from this hold's prior text.
-
-Wayland backend acceptance requires `ashpd` RemoteDesktop portal consent and `reis` EI text delivery.
-Native EI text batches permit at most 254 UTF-8 bytes.
-Wayland supports append-only live output; revisions return `Unsupported` before any deletion or replacement.
-The EI text interface exposes keysyms but no backward-text deletion API; the backend adds no keysym fallback.
-Absent EI text capability must return `Unsupported`; no X11, keysym, clipboard, or `uinput` fallback exists.
-The portal session belongs to one hold and retains no persistent consent; the portal can request consent again on later holds.
-The portal parent window identifies the consent request, not an injection target.
-Neither backend pins keyboard focus; focus changes can redirect later batches.
-No backend adds Enter, Tab, paste, shortcuts, or automatic submission.
-
-Compile checks cannot prove Accessibility delivery, portal negotiation, panel behavior, or application insertion.
-Perform live checks only with explicit authority for OS consent, input effects, capture, and any server traffic.
-See [platform acceptance gates](testing.md#platform-acceptance-gates) for the separate checks.
+Desktop dictation and clipboard shortcuts use Computer Use MCP on the authorized worker.
+Grant any OS permissions to the Computer Use backend, not to Waltr for text output.
+The examples address worker `preview` through Remote `home`. Update the Routine's worker selection if your machine ID differs.
+Replace the old `typing` and clipboard-command bindings together with the server Routines. There is no local fallback or automatic retry.
+See the [desktop text examples](examples/routines/audio-interactions.md#desktop-text-shortcuts) and [platform acceptance gates](testing.md#platform-acceptance-gates).
 
 ## Client Observability
 

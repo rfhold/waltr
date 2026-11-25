@@ -341,7 +341,10 @@ impl Fake {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
         let fake = self.clone();
-        let mut prefix = vec![accepted(), output_open()];
+        let mut prefix = vec![accepted()];
+        if !open.routine.starts_with("terminal-") {
+            prefix.push(output_open());
+        }
         let early_audio_answer = fake.early_audio_answer.load(Ordering::SeqCst);
         if open.routine == "audio-answer" {
             prefix = vec![accepted()];
@@ -368,13 +371,6 @@ impl Fake {
                     stream_id: "speaker".into(),
                     next_sequence: 1,
                 })),
-            ]);
-        }
-        if open.routine.starts_with("typing") {
-            prefix.extend([
-                text_event(0, "one", "draft", false),
-                text_event(1, "one", "first\r", true),
-                text_event(2, "two", "draft", false),
             ]);
         }
         let delay = if open.routine.starts_with("delay-accepted-") {
@@ -439,7 +435,7 @@ impl Fake {
                 ]);
                 return Ok(events);
             }
-            if open.routine == "failed" || open.routine == "typing-failed" {
+            if open.routine == "failed" {
                 return Err(RpcStatus::data_loss("static failure"));
             }
             Ok(final_events(&open.routine))
@@ -1404,7 +1400,7 @@ async fn small_frames_survive_delayed_open_and_accepted_with_exact_pcm_after_rel
 struct ChatConsumer(AtomicUsize);
 #[tokio::test]
 async fn production_capture_formats_reach_capture_and_transport() {
-    use waltr_desktop::{interaction, typing::Guard};
+    use waltr_desktop::{interaction, effect::Guard};
     let (transport, fake, stop, server) = fixture().await;
     let mut invocation = support::invocation("test");
     invocation.limits.definition.ports[0].formats = vec!["pcm16le-24000-mono".into()];
@@ -1433,7 +1429,7 @@ async fn production_capture_formats_reach_capture_and_transport() {
             interaction::Selection {
                 invocation: &invocation,
                 input: "audio",
-                output: "clean-text",
+                output: Some("clean-text"),
                 max_capture_seconds: None,
             },
             &release,
@@ -1473,8 +1469,8 @@ impl waltr_desktop::media::OutputSink for NativeConsumer {
     fn write<'a>(
         &'a self,
         frame: waltr_desktop::media::Frame<'a>,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        guard: &'a waltr_desktop::effect::Guard<'_>,
+    ) -> waltr_desktop::effect::LocalFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             guard.check().map_err(|_| Error::Cancelled)?;
             if let waltr_desktop::media::Frame::Stream(event) = frame {
@@ -1502,8 +1498,8 @@ impl waltr_desktop::media::OutputSink for NativeConsumer {
     fn finish<'a>(
         &'a self,
         success: bool,
-        _guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        _guard: &'a waltr_desktop::effect::Guard<'_>,
+    ) -> waltr_desktop::effect::LocalFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             assert!(self.finished.replace(Some(success)).is_none());
             if self.fail_finish {
@@ -1524,8 +1520,8 @@ impl waltr_desktop::interaction::Consumer for NativeConsumer {
         _: &'a waltr_client::interaction::InteractionOutput,
         _: &'a str,
         _: Option<&'a str>,
-        _: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        _: &'a waltr_desktop::effect::Guard<'_>,
+    ) -> waltr_desktop::effect::LocalFuture<'a, Result<(), Error>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -1551,7 +1547,7 @@ fn repeated_binding() -> config::Keybind {
     let mut binding = binding(std::path::Path::new("unused"), "repeated");
     binding.command = None;
     binding.playback = Some(config::PlaybackSpec {});
-    binding.routine.output = "speaker".into();
+    binding.routine.output = Some("speaker".into());
     let mut invocation = support::invocation("pcm");
     invocation.selection.routine = "repeated".into();
     invocation.limits.definition.routine_name = "repeated".into();
@@ -1597,17 +1593,12 @@ fn standalone_actor_rejects_playback_before_device_access() {
         ),
         Err(ActorError::Unsupported)
     ));
-    let (_hold, control) = Hold::press(&AudioAdmission::default()).unwrap();
     assert!(matches!(
-        Actor::with_effects(
+        Actor::with_guard(
             config(),
             transport,
             Arc::new(MockFactory(mock.clone())),
             AudioAdmission::default(),
-            std::rc::Rc::new(TypingFactory {
-                state: std::rc::Rc::new(Typed::default()),
-                control,
-            }),
             std::rc::Rc::new(|| true),
         ),
         Err(ActorError::Unsupported)
@@ -1689,7 +1680,6 @@ async fn press_to_talk_preserves_onset_and_flushes_before_playback_without_keyup
         Arc::new(SpeechFactory(source.clone())),
         &generation,
         &|| true,
-        None,
         Some(&sink),
     );
     let drive = async {
@@ -1757,7 +1747,6 @@ async fn press_to_talk_silence_then_missing_frames_times_out_without_rpc() {
             Arc::new(SpeechFactory(source.clone())),
             &CancellationToken::new(),
             &|| true,
-            None,
             Some(&sink),
         ),
     )
@@ -1794,7 +1783,6 @@ async fn toggle_ignores_keyup_and_silence_and_single_stop_flushes_to_playback() 
         Arc::new(SpeechFactory(source.clone())),
         &generation,
         &|| true,
-        None,
         Some(&sink),
     );
     let drive = async {
@@ -1849,7 +1837,6 @@ async fn toggle_flushes_capture_when_playback_has_already_started() {
         Arc::new(SpeechFactory(source.clone())),
         &generation,
         &|| true,
-        None,
         Some(&sink),
     );
     let drive = async {
@@ -1897,7 +1884,6 @@ async fn toggle_limit_disarms_stop_tap_before_capture_join() {
         Arc::new(SpeechFactory(source.clone())),
         &generation,
         &|| true,
-        None,
         Some(&sink),
     );
     let drive = async {
@@ -1948,7 +1934,6 @@ async fn toggle_native_completion_disarms_stop_tap_while_admission_is_retained()
         Arc::new(SpeechFactory(source.clone())),
         &generation,
         &valid,
-        None,
         Some(&sink),
     );
     let drive = async {
@@ -2074,7 +2059,6 @@ async fn repeated_holds_share_rpc_playback_and_join_sequential_microphones() {
                     factory.clone(),
                     &generation,
                     &|| true,
-                    None,
                     Some(&sink)
                 ),
                 drive
@@ -2156,7 +2140,6 @@ async fn repeated_initial_empty_capture_without_followup_opens_no_rpc() {
             Arc::new(MockFactory(source.clone())),
             &CancellationToken::new(),
             &|| true,
-            None,
             Some(&sink),
         )
         .await;
@@ -2170,7 +2153,7 @@ async fn repeated_initial_empty_capture_without_followup_opens_no_rpc() {
 
 #[tokio::test]
 async fn typed_pcm_sink_is_explicit_and_finishes_after_validated_streams() {
-    use waltr_desktop::{interaction, typing::Guard};
+    use waltr_desktop::{interaction, effect::Guard};
     let (transport, fake, stop, server) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let binding = binding(&dir.path().join("never"), "pcm");
@@ -2187,7 +2170,7 @@ async fn typed_pcm_sink_is_explicit_and_finishes_after_validated_streams() {
     let selection = || interaction::Selection {
         invocation: binding.resolved.as_ref().unwrap(),
         input: "audio",
-        output: "clean-text",
+        output: Some("clean-text"),
         max_capture_seconds: None,
     };
     assert!(matches!(
@@ -2229,7 +2212,7 @@ async fn typed_pcm_sink_is_explicit_and_finishes_after_validated_streams() {
 
 #[tokio::test]
 async fn rpc_input_failure_revokes_queued_pcm_before_blocked_remote_cleanup() {
-    use waltr_desktop::{interaction, typing::Guard};
+    use waltr_desktop::{interaction, effect::Guard};
     let (transport, fake, stop, server) = fixture().await;
     let mut invocation = support::invocation("playback-failure");
     let pcm = support::invocation("pcm");
@@ -2262,7 +2245,7 @@ async fn rpc_input_failure_revokes_queued_pcm_before_blocked_remote_cleanup() {
         interaction::Selection {
             invocation: &invocation,
             input: "audio",
-            output: "clean-text",
+            output: Some("clean-text"),
             max_capture_seconds: None,
         },
         &release,
@@ -2318,7 +2301,7 @@ async fn audio_only_hold_release_joins_sink_and_rejects_cancel_revocation_source
         let mut binding = binding(&dir.path().join("never"), "audio-answer");
         binding.command = None;
         binding.playback = Some(config::PlaybackSpec {});
-        binding.routine.output = "speaker".into();
+        binding.routine.output = Some("speaker".into());
         let ports = &mut binding.resolved.as_mut().unwrap().limits.definition.ports;
         ports.retain(|p| p.direction != waltr_client::RoutineDirection::Output);
         ports.push(waltr_client::RoutinePort {
@@ -2347,7 +2330,6 @@ async fn audio_only_hold_release_joins_sink_and_rejects_cancel_revocation_source
             Arc::new(MockFactory(mock.clone())),
             &generation,
             &valid_fn,
-            None,
             Some(&sink),
         );
         let steer = async {
@@ -2394,8 +2376,8 @@ impl waltr_desktop::interaction::Consumer for ChatConsumer {
         _: &'a waltr_client::interaction::InteractionOutput,
         _: &'a str,
         final_text: Option<&'a str>,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), Error>> {
+        guard: &'a waltr_desktop::effect::Guard<'_>,
+    ) -> waltr_desktop::effect::LocalFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             guard.check().map_err(|_| Error::Cancelled)?;
             if final_text.is_some() {
@@ -2408,7 +2390,7 @@ impl waltr_desktop::interaction::Consumer for ChatConsumer {
 
 #[tokio::test]
 async fn shared_chat_consumer_releases_or_cancels_with_small_frames_before_admission() {
-    use waltr_desktop::{host::Observer, interaction, typing::Guard};
+    use waltr_desktop::{host::Observer, interaction, effect::Guard};
     for cancel_before_acceptance in [false, true] {
         let (transport, fake, stop, server) = fixture().await;
         let dir = tempfile::tempdir().unwrap();
@@ -2448,7 +2430,7 @@ async fn shared_chat_consumer_releases_or_cancels_with_small_frames_before_admis
                     interaction::Selection {
                         invocation: binding.resolved.as_ref().unwrap(),
                         input: "audio",
-                        output: "clean-text",
+                        output: Some("clean-text"),
                         max_capture_seconds: None,
                     },
                     &release,
@@ -2563,81 +2545,21 @@ async fn actor_routes_command_capture(mode: config::Mode) {
     server.await.unwrap();
 }
 
-#[tokio::test]
-async fn actor_requires_explicit_typing_capability_and_delivers_with_current_fence() {
-    use waltr_desktop::{
-        actor::{Actor, ActorError},
-        shortcut::{Effective, Router},
-    };
-    let (transport, fake, stop, server) = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let make_config = || config::Config {
-        version: 1,
-        keybinds: vec![typing_binding(&dir.path().join("never"), "typing")],
-    };
-    let mock = Arc::new(Mock::default());
-    assert!(matches!(
-        Actor::new(
-            make_config(),
-            transport.clone(),
-            Arc::new(MockFactory(mock.clone())),
-            AudioAdmission::default()
-        ),
-        Err(ActorError::Unsupported)
-    ));
-    assert!(!mock.started.load(Ordering::SeqCst));
-    let state = std::rc::Rc::new(Typed::default());
-    let (_dummy, control) = Hold::press(&AudioAdmission::default()).unwrap();
-    let valid = std::rc::Rc::new(std::cell::Cell::new(true));
-    let fence = valid.clone();
-    let (actor, mut status) = Actor::with_effects(
-        make_config(),
-        transport,
-        Arc::new(MockFactory(mock.clone())),
-        AudioAdmission::default(),
-        std::rc::Rc::new(TypingFactory {
-            state: state.clone(),
-            control,
-        }),
-        std::rc::Rc::new(move || fence.get()),
-    )
-    .unwrap();
-    let (router, mut events) = Router::channel();
-    router
-        .effective(vec![Effective {
-            id: "test".into(),
-            trigger: "Space".into(),
-        }])
-        .unwrap();
-    let generation = CancellationToken::new();
-    let drive = async {
-        router.edge("s", "s", "test", true);
-        state.entered.notified().await;
-        router.edge("s", "s", "test", false);
-        while !matches!(*status.borrow(), Status::Finished(_)) {
-            status.changed().await.unwrap();
-        }
-        assert_eq!(*status.borrow(), Status::Finished(Ok(())));
-        assert_eq!(&*state.text.borrow(), "first second 界");
-        assert!(state.closed.get());
-        assert!(mock.joined.load(Ordering::SeqCst));
-        valid.set(false);
-        router.edge("s", "s", "test", true);
-        // Wait for the next hold result rather than accepting the previous terminal snapshot.
-        status.changed().await.unwrap();
-        while !matches!(*status.borrow(), Status::Finished(Err(Error::Cancelled))) {
-            status.changed().await.unwrap();
-        }
-        assert_eq!(fake.admissions.load(Ordering::SeqCst), 1);
-        generation.cancel();
-    };
-    let (result, ()) = tokio::join!(actor.run(&mut events, &generation), drive);
-    assert_eq!(result, Err(ActorError::Cancelled));
-    stop.cancel();
-    server.await.unwrap();
-}
-
 fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
+    if name.starts_with("terminal-") {
+        if name == "terminal-missing" {
+            return Vec::new();
+        }
+        return vec![event(Event::Terminal(wire::InteractionTerminal {
+            status: if name == "terminal-failed" {
+                wire::InvocationStatus::Failed
+            } else {
+                wire::InvocationStatus::Succeeded
+            } as i32,
+            cleanup_complete: name != "terminal-unclean",
+            ..Default::default()
+        }))];
+    }
     if name == "hour-notes" {
         let text = "x".repeat(512 * 1024 - 64);
         let mut events: Vec<_> = text
@@ -2671,20 +2593,6 @@ fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
         ]);
         return events;
     }
-    if name.starts_with("typing") {
-        return vec![
-            text_event(3, "two", "\nsecond\t界", true),
-            event(Event::Close(wire::StreamClose {
-                stream_id: "out".into(),
-                next_sequence: 4,
-            })),
-            event(Event::Terminal(wire::InteractionTerminal {
-                status: wire::InvocationStatus::Succeeded as i32,
-                cleanup_complete: true,
-                ..Default::default()
-            })),
-        ];
-    }
     let mut events = vec![
         event(Event::Chunk(wire::StreamChunk {
             stream_id: "out".into(),
@@ -2716,121 +2624,55 @@ fn final_events(name: &str) -> Vec<Result<wire::InteractResponse, RpcStatus>> {
     events
 }
 
-fn text_event(
-    sequence: u64,
-    id: &str,
-    text: &str,
-    committed: bool,
-) -> Result<wire::InteractResponse, RpcStatus> {
-    event(Event::Chunk(wire::StreamChunk {
-        stream_id: "out".into(),
-        sequence,
-        payload: Some(wire::stream_chunk::Payload::Text(wire::TextRevision {
-            segment_id: id.into(),
-            text: text.into(),
-            mutation: 2,
-            committed,
-        })),
-    }))
+#[tokio::test]
+async fn terminal_only_holds_require_clean_success_without_a_local_action() {
+    let (transport, fake, stop, server) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("never-written");
+    for name in [
+        "terminal-success",
+        "terminal-failed",
+        "terminal-unclean",
+        "terminal-missing",
+    ] {
+        fake.completed.store(false, Ordering::SeqCst);
+        let mut binding = binding(&path, name);
+        binding.command = None;
+        binding.routine.output = None;
+        binding
+            .resolved
+            .as_mut()
+            .unwrap()
+            .limits
+            .definition
+            .ports
+            .retain(|p| p.direction == waltr_client::RoutineDirection::Input);
+        let gate = AudioAdmission::default();
+        let (hold, control) = Hold::press(&gate).unwrap();
+        let mock = Arc::new(Mock::default());
+        control.release();
+        let result = hold
+            .run(
+                &binding,
+                &transport,
+                Arc::new(MockFactory(mock.clone())),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            result,
+            if name == "terminal-success" { Ok(()) } else { Err(Error::Interaction) },
+            "{name}"
+        );
+        assert!(fake.completed.load(Ordering::SeqCst));
+        assert!(mock.joined.load(Ordering::SeqCst));
+        assert!(gate.reserve().is_ok());
+        assert!(!path.exists());
+    }
+    stop.cancel();
+    server.await.unwrap();
 }
 
-#[derive(Default)]
-struct Typed {
-    text: std::cell::RefCell<String>,
-    first_text: std::cell::RefCell<Option<String>>,
-    entered: tokio::sync::Notify,
-    close_entered: tokio::sync::Notify,
-    close_allowed: tokio::sync::Notify,
-    closed: std::cell::Cell<bool>,
-    block: bool,
-    fail_after: Option<usize>,
-    writes: std::cell::Cell<usize>,
-}
-struct TypingFactory {
-    state: std::rc::Rc<Typed>,
-    control: waltr_desktop::host::HoldControl,
-}
-struct TypingSink {
-    state: std::rc::Rc<Typed>,
-    control: waltr_desktop::host::HoldControl,
-}
-impl waltr_desktop::typing::Factory for TypingFactory {
-    fn create(
-        &self,
-    ) -> Result<Box<dyn waltr_desktop::typing::Session>, waltr_desktop::typing::Error> {
-        Ok(Box::new(TypingSink {
-            state: self.state.clone(),
-            control: self.control.clone(),
-        }))
-    }
-}
-impl waltr_desktop::typing::Session for TypingSink {
-    fn open<'a>(
-        &'a mut self,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), waltr_desktop::typing::Error>> {
-        Box::pin(async move { guard.check() })
-    }
-    fn write<'a>(
-        &'a mut self,
-        text: &'a str,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), waltr_desktop::typing::Error>> {
-        Box::pin(async move {
-            self.state.entered.notify_one();
-            if self.state.block {
-                std::future::pending::<()>().await;
-            }
-            guard.check()?;
-            if self.state.fail_after == Some(self.state.writes.get()) {
-                return Err(waltr_desktop::typing::Error::Backend);
-            }
-            if self.state.writes.get() == 0 {
-                *self.state.first_text.borrow_mut() = Some(text.into());
-            }
-            self.state.writes.set(self.state.writes.get() + 1);
-            self.state.text.borrow_mut().push_str(text);
-            self.control.release();
-            Ok(())
-        })
-    }
-    fn supports_backspace(&self) -> bool {
-        true
-    }
-    fn backspace<'a>(
-        &'a mut self,
-        count: usize,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), waltr_desktop::typing::Error>> {
-        Box::pin(async move {
-            use unicode_segmentation::UnicodeSegmentation;
-            guard.check()?;
-            let mut text = self.state.text.borrow_mut();
-            let keep = text.graphemes(true).count() - count;
-            let end: usize = text.graphemes(true).take(keep).map(str::len).sum();
-            text.truncate(end);
-            Ok(())
-        })
-    }
-    fn finish<'a>(
-        &'a mut self,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), waltr_desktop::typing::Error>> {
-        Box::pin(async move { guard.check() })
-    }
-    fn close(
-        &mut self,
-    ) -> waltr_desktop::typing::LocalFuture<'_, Result<(), waltr_desktop::typing::Error>> {
-        Box::pin(async move {
-            self.state.close_entered.notify_one();
-            if self.state.block {
-                self.state.close_allowed.notified().await;
-            }
-            self.state.closed.set(true);
-            Ok(())
-        })
-    }
-}
 #[tokio::test]
 async fn preaccepted_disconnect_or_rejection_never_uploads_or_runs_an_action() {
     for routine in ["disconnect-before-accepted", "early-rejected"] {
@@ -2861,55 +2703,6 @@ async fn preaccepted_disconnect_or_rejection_never_uploads_or_runs_an_action() {
         stop.cancel();
         server.await.unwrap();
     }
-}
-
-#[tokio::test]
-async fn delayed_acceptance_typing_drains_all_pcm_and_closes_its_backend() {
-    let (transport, fake, stop, server) = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("never-command");
-    let binding = typing_binding(&path, "delay-accepted-5000");
-    let gate = AudioAdmission::default();
-    let (hold, control) = Hold::press(&gate).unwrap();
-    let state = std::rc::Rc::new(Typed::default());
-    let factory = TypingFactory {
-        state: state.clone(),
-        control: control.clone(),
-    };
-    let mock = Arc::new(Mock {
-        small_chunks: AtomicBool::new(true),
-        ..Default::default()
-    });
-    let generation = CancellationToken::new();
-    let run = hold.run_guarded_with_typing(
-        &binding,
-        &transport,
-        Arc::new(MockFactory(mock.clone())),
-        &generation,
-        &|| true,
-        Some(&factory),
-    );
-    let clock = async {
-        while !fake.delay_waiting.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-        assert!(state.text.borrow().is_empty());
-        control.release();
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::time::resume();
-    };
-    let (result, ()) = tokio::join!(run, clock);
-    assert_eq!(result, Ok(()));
-    let expected: Vec<u8> = (0..120u8).rev().flat_map(|value| vec![value; 96]).collect();
-    assert_eq!(*fake.pcm.lock().unwrap(), expected);
-    assert!(!state.text.borrow().is_empty());
-    assert!(state.closed.get());
-    assert!(mock.joined.load(Ordering::SeqCst));
-    assert!(gate.reserve().is_ok());
-    assert!(!path.exists());
-    stop.cancel();
-    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -3081,218 +2874,6 @@ async fn accepted_capture_can_outlive_startup_deadline_then_release_cleanly() {
     assert_eq!(fake.uploads.load(Ordering::SeqCst), 100);
     assert!(mock.joined.load(Ordering::SeqCst));
     assert!(path.exists());
-    assert!(gate.reserve().is_ok());
-    stop.cancel();
-    server.await.unwrap();
-}
-
-fn typing_binding(path: &std::path::Path, name: &str) -> config::Keybind {
-    let mut binding = binding(path, name);
-    binding.command = None;
-    binding.typing = Some(config::TypingSpec {});
-    binding
-}
-
-#[tokio::test]
-async fn press_to_talk_finishes_on_quiet_and_delivers_typing() {
-    let (transport, rpc, stop, server) = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let mut binding = typing_binding(&dir.path().join("unused"), "typing");
-    binding.mode = config::Mode::PressToTalk;
-    let gate = AudioAdmission::default();
-    let (hold, control) = Hold::press(&gate).unwrap();
-    let state = std::rc::Rc::new(Typed::default());
-    let factory = TypingFactory {
-        state: state.clone(),
-        control,
-    };
-    let source = Arc::new(SpeechSource::default());
-    source.frames.lock().unwrap().extend(
-        std::iter::once(speech_window(1_000)).chain(std::iter::repeat_n(speech_window(0), 50)),
-    );
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        hold.run_guarded_with_typing(
-            &binding,
-            &transport,
-            Arc::new(SpeechFactory(source.clone())),
-            &CancellationToken::new(),
-            &|| true,
-            Some(&factory),
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(rpc.input_closed.load(Ordering::SeqCst));
-    assert!(source.stopped.load(Ordering::SeqCst));
-    assert!(source.joined.load(Ordering::SeqCst));
-    assert_eq!(*state.text.borrow(), "first second 界");
-    assert!(state.closed.get());
-    assert!(gate.reserve().is_ok());
-    stop.cancel();
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn interim_typing_precedes_release_and_keeps_input_alive_without_final_duplication() {
-    for name in ["typing", "typing-failed"] {
-        let (transport, rpc, stop, server) = fixture().await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("must-not-run");
-        let binding = typing_binding(&path, name);
-        let gate = AudioAdmission::default();
-        let (hold, control) = Hold::press(&gate).unwrap();
-        let state = std::rc::Rc::new(Typed::default());
-        let factory = TypingFactory {
-            state: state.clone(),
-            control,
-        };
-        let mock = Arc::new(Mock::default());
-        let result = hold
-            .run_guarded_with_typing(
-                &binding,
-                &transport,
-                Arc::new(MockFactory(mock.clone())),
-                &CancellationToken::new(),
-                &|| true,
-                Some(&factory),
-            )
-            .await;
-        if name == "typing" {
-            assert_eq!(result, Ok(()));
-            assert_eq!(*state.text.borrow(), "first second 界");
-        } else {
-            assert_eq!(result, Err(Error::Interaction));
-            assert_eq!(
-                *state.text.borrow(),
-                "first draft",
-                "earlier effects survive failure"
-            );
-        }
-        assert_eq!(state.first_text.borrow().as_deref(), Some("draft"));
-        assert_eq!(rpc.uploads.load(Ordering::SeqCst), 100);
-        assert!(state.closed.get());
-        assert!(mock.joined.load(Ordering::SeqCst));
-        assert!(!path.exists());
-        assert!(gate.reserve().is_ok());
-        stop.cancel();
-        server.await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn backend_failure_stops_without_retry_and_preserves_already_delivered_text() {
-    let (transport, _, stop, server) = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let binding = typing_binding(&dir.path().join("never"), "typing");
-    let gate = AudioAdmission::default();
-    let (hold, control) = Hold::press(&gate).unwrap();
-    let state = std::rc::Rc::new(Typed {
-        fail_after: Some(1),
-        ..Default::default()
-    });
-    let factory = TypingFactory {
-        state: state.clone(),
-        control,
-    };
-    let mock = Arc::new(Mock::default());
-    let result = hold
-        .run_guarded_with_typing(
-            &binding,
-            &transport,
-            Arc::new(MockFactory(mock.clone())),
-            &CancellationToken::new(),
-            &|| true,
-            Some(&factory),
-        )
-        .await;
-    assert_eq!(
-        result,
-        Err(Error::Typing(waltr_desktop::typing::Error::Backend))
-    );
-    assert_eq!(
-        *state.text.borrow(),
-        "",
-        "revision deletion is not retried or rolled back"
-    );
-    assert_eq!(state.writes.get(), 1);
-    assert!(state.closed.get());
-    assert!(mock.joined.load(Ordering::SeqCst));
-    assert!(gate.reserve().is_ok());
-    stop.cancel();
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn typing_without_backend_is_unsupported_without_capture_rpc_or_command() {
-    let (transport, rpc, stop, server) = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("never");
-    let binding = typing_binding(&path, "typing");
-    let gate = AudioAdmission::default();
-    let (hold, control) = Hold::press(&gate).unwrap();
-    let status = control.status();
-    let mock = Arc::new(Mock::default());
-    let result = hold
-        .run(
-            &binding,
-            &transport,
-            Arc::new(MockFactory(mock.clone())),
-            &CancellationToken::new(),
-        )
-        .await;
-    assert_eq!(result, Err(Error::Unsupported));
-    assert_eq!(*status.borrow(), Status::Finished(result));
-    assert!(!mock.started.load(Ordering::SeqCst));
-    assert_eq!(rpc.admissions.load(Ordering::SeqCst), 0);
-    assert!(!path.exists());
-    assert!(gate.reserve().is_ok());
-    stop.cancel();
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn cancellation_drops_blocked_write_then_joins_cleanup_before_admission_release() {
-    let (transport, _, stop, server) = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let binding = typing_binding(&dir.path().join("never"), "typing");
-    let gate = AudioAdmission::default();
-    let (hold, control) = Hold::press(&gate).unwrap();
-    let state = std::rc::Rc::new(Typed {
-        block: true,
-        ..Default::default()
-    });
-    let factory = TypingFactory {
-        state: state.clone(),
-        control: control.clone(),
-    };
-    let mock = Arc::new(Mock::default());
-    let drive = async {
-        state.entered.notified().await;
-        assert!(gate.reserve().is_err());
-        control.cancel();
-        state.close_entered.notified().await;
-        assert!(mock.joined.load(Ordering::SeqCst));
-        assert!(gate.reserve().is_err());
-        assert!(!state.closed.get());
-        state.close_allowed.notify_one();
-    };
-    let generation = CancellationToken::new();
-    let (result, ()) = tokio::join!(
-        hold.run_guarded_with_typing(
-            &binding,
-            &transport,
-            Arc::new(MockFactory(mock.clone())),
-            &generation,
-            &|| true,
-            Some(&factory)
-        ),
-        drive
-    );
-    assert_eq!(result, Err(Error::Cancelled));
-    assert!(state.text.borrow().is_empty());
-    assert!(state.closed.get());
     assert!(gate.reserve().is_ok());
     stop.cancel();
     server.await.unwrap();

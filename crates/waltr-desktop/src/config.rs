@@ -153,7 +153,6 @@ impl Config {
                 &binding.routine.name,
                 &binding.routine.trigger,
                 &binding.routine.input,
-                &binding.routine.output,
             ] {
                 field(value)?;
             }
@@ -177,14 +176,17 @@ impl Config {
             {
                 return Err(ConfigError::Invalid("invalid PCM_S16LE audio format"));
             }
-            match (&binding.command, &binding.typing, &binding.playback) {
-                (Some(command), None, None) => command
+            if let Some(output) = &binding.routine.output {
+                field(output)?;
+            }
+            match (&binding.command, &binding.playback, &binding.routine.output) {
+                (Some(command), None, Some(_)) => command
                     .validate()
                     .map_err(|_| ConfigError::Invalid("invalid command or template"))?,
-                (None, Some(_), None) | (None, None, Some(_)) => (),
+                (None, Some(_), Some(_)) | (None, None, None) => (),
                 _ => {
                     return Err(ConfigError::Invalid(
-                        "exactly one command, typing, or playback is required",
+                        "routine output requires exactly one command or playback action",
                     ));
                 }
             }
@@ -289,9 +291,6 @@ pub struct Keybind {
     /// Trusted local command, to be invoked only after successful completion.
     #[serde(default, deserialize_with = "present_action")]
     pub command: Option<CommandSpec>,
-    /// Stream live text hypotheses to the current keyboard focus. Exclusive with command.
-    #[serde(default, deserialize_with = "present_action")]
-    pub typing: Option<TypingSpec>,
     /// Play the selected PCM output on the native default output device.
     #[serde(default, deserialize_with = "present_action")]
     pub playback: Option<PlaybackSpec>,
@@ -304,10 +303,6 @@ fn present_action<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
         .ok_or_else(|| serde::de::Error::custom("action must not be null"))
 }
 
-/// Version-one typing policy has no configurable fallback or draft controls.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TypingSpec {}
 /// Native playback has no device conversion or fallback policy.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -336,12 +331,18 @@ pub struct Routine {
     /// Input port identifier.
     #[serde(deserialize_with = "crate::bounded::string::<_, MAX_FIELD_BYTES>")]
     pub input: String,
-    /// Final text output port identifier.
-    #[serde(deserialize_with = "crate::bounded::string::<_, MAX_FIELD_BYTES>")]
-    pub output: String,
+    /// Output port for a local command or playback; omitted for terminal-only shortcuts.
+    #[serde(default, deserialize_with = "output_port")]
+    pub output: Option<String>,
     /// Exact Remote name. Omission or `local` uses the embedded server.
     #[serde(default, deserialize_with = "destination")]
     pub destination: Option<String>,
+}
+
+fn output_port<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    crate::bounded::string::<_, MAX_FIELD_BYTES>(deserializer).map(Some)
 }
 
 fn destination<'de, D: serde::Deserializer<'de>>(

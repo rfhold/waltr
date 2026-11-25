@@ -41,15 +41,6 @@ keybinds:
     .unwrap();
     Arc::new(config.keybinds.remove(0))
 }
-struct NeverTyping;
-impl waltr_desktop::typing::Factory for NeverTyping {
-    fn create(
-        &self,
-    ) -> Result<Box<dyn waltr_desktop::typing::Session>, waltr_desktop::typing::Error> {
-        panic!("command bindings must not construct typing sessions")
-    }
-}
-
 fn host() -> Arc<Host> {
     let host = Arc::new(Host::default());
     host.bind(1);
@@ -1098,11 +1089,10 @@ async fn hold_keyup_during_permission_and_capture_start_finishes_the_pinned_comm
         tx.send(()).unwrap();
     };
     tokio::join!(
-        held.run_with_typing(
+        held.run(
             &transport,
             &permission,
             Arc::new(MockFactory(mock.clone())),
-            &NeverTyping
         ),
         release
     );
@@ -1447,108 +1437,6 @@ async fn shortcut_ingress_epoch_rejects_queued_profile_and_access_replay() {
         server.await.unwrap();
     }
 }
-#[tokio::test]
-async fn typing_hold_uses_guarded_factory_and_remains_active_through_owned_close() {
-    use waltr_desktop::typing::{Error, Factory as TypingFactory, Guard, LocalFuture, Session};
-    #[derive(Clone)]
-    struct Sink {
-        text: Arc<Mutex<String>>,
-        closing: Arc<AtomicBool>,
-        closed: CancellationToken,
-        revoke: Option<waltr_client::NativeCredentialProvider>,
-    }
-    impl TypingFactory for Sink {
-        fn create(&self) -> Result<Box<dyn Session>, Error> {
-            Ok(Box::new(self.clone()))
-        }
-    }
-    impl Session for Sink {
-        fn open<'a>(&'a mut self, guard: &'a Guard<'_>) -> LocalFuture<'a, Result<(), Error>> {
-            Box::pin(async move { guard.check() })
-        }
-        fn write<'a>(
-            &'a mut self,
-            text: &'a str,
-            guard: &'a Guard<'_>,
-        ) -> LocalFuture<'a, Result<(), Error>> {
-            Box::pin(async move {
-                tokio::task::yield_now().await;
-                if let Some(provider) = self.revoke.take() {
-                    let _lease = provider.clear_bearer_token();
-                }
-                guard.check()?;
-                self.text.lock().unwrap().push_str(text);
-                Ok(())
-            })
-        }
-        fn finish<'a>(&'a mut self, guard: &'a Guard<'_>) -> LocalFuture<'a, Result<(), Error>> {
-            Box::pin(async move { guard.check() })
-        }
-        fn close(&mut self) -> LocalFuture<'_, Result<(), Error>> {
-            Box::pin(async move {
-                self.closing.store(true, Ordering::SeqCst);
-                self.closed.cancelled().await;
-                Ok(())
-            })
-        }
-    }
-    let (transport, _fake, stop, server) = fixture().await;
-    for revoke in [false, true] {
-        let host = host();
-        let mut snapshot = support::snapshot("test");
-        snapshot.routines.definitions.definitions[0]
-            .capabilities
-            .push("media.inputs".into());
-        host.audio.observe(&snapshot);
-        let provider = waltr_client::NativeCredentialProvider::new();
-        host.credentials(provider.clone());
-        let mut binding = Arc::try_unwrap(binding()).unwrap();
-        binding.command = None;
-        binding.typing = Some(waltr_desktop::config::TypingSpec {});
-        let (held, control) = host.audio.hold(Arc::new(binding)).unwrap();
-        assert!(
-            !control.repeats_enabled(),
-            "capability-bearing text typing remains one-shot"
-        );
-        control.release();
-        let mock = Arc::new(Mock::default());
-        let sink = Sink {
-            text: Arc::default(),
-            closing: Arc::default(),
-            closed: CancellationToken::new(),
-            revoke: revoke.then_some(provider),
-        };
-        let permission = AudioPermissions::new(1, true, Arc::new(Grant));
-        let cleanup = async {
-            until(|| sink.closing.load(Ordering::SeqCst)).await;
-            assert!(mock.joined.load(Ordering::SeqCst));
-            assert!(host.audio.gate.reserve().is_err());
-            assert_eq!(
-                host.audio.activity.phase(std::time::Instant::now()),
-                crate::activity::Phase::Working
-            );
-            sink.closed.cancel();
-        };
-        tokio::join!(
-            held.run_with_typing(
-                &transport,
-                &permission,
-                Arc::new(MockFactory(mock.clone())),
-                &sink
-            ),
-            cleanup
-        );
-        assert_eq!(sink.text.lock().unwrap().is_empty(), revoke);
-        assert!(host.audio.gate.reserve().is_ok());
-        assert_eq!(
-            host.audio.activity.phase(std::time::Instant::now()),
-            crate::activity::Phase::Idle
-        );
-    }
-    stop.cancel();
-    server.await.unwrap();
-}
-
 #[test]
 fn native_ipc_and_lifecycle_source_contracts() {
     let chat = include_str!("dictation.rs");

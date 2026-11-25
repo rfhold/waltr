@@ -1073,8 +1073,7 @@ mod tests {
                                 _ => unreachable!(),
                             }
                             operation.stage(Stage::Cleanup);
-                            operation.capture_cleanup(Ok(()));
-                            observer.emit(Diagnostic::TypingCleanup(if case >= 5 { Err(waltr_desktop::typing::Error::Backend) } else { Ok(()) }));
+                            operation.capture_cleanup(if case >= 5 { Err(waltr_desktop::capture::Error::Backend) } else { Ok(()) });
                         }
                     }.instrument(operation.span()).await;
                     // Production finishes after the instrumented future, sometimes under another scope.
@@ -1110,7 +1109,7 @@ mod tests {
             "permission_denied",
             "cancelled",
             "command_invalid",
-            "typing_backend",
+            "capture_backend",
             "succeeded",
             "failed",
             "capture_ready",
@@ -1168,10 +1167,10 @@ mod tests {
         assert!(
             terminal
                 .iter()
-                .any(|log| log.contains("command_invalid") && log.contains("typing_backend"))
+                .any(|log| log.contains("command_invalid") && log.contains("capture_backend"))
         );
         assert!(terminal.iter().any(|log| log.contains("none")
-            && log.contains("typing_backend")
+            && log.contains("capture_backend")
             && log.contains("failed")));
         assert_eq!(
             emitted

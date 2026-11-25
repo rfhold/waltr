@@ -20,6 +20,15 @@ fn authority() -> RoutineAuthority {
 }
 fn resources(root: &std::path::Path, endpoint: &str, diarization: bool) {
     seed(root);
+    // These scenarios use text streams to exercise transport backpressure and cancellation
+    // without granting desktop effects. The shipped shortcuts use terminal-only Routines.
+    for (name, source) in [
+        ("audio-transcribe", include_str!("../../../../../tests/fixtures/routines/media-stream-contracts/audio-transcribe.yaml")),
+        ("audio-transcribe-cleanup", include_str!("../../../../../tests/fixtures/routines/media-stream-contracts/audio-transcribe-cleanup.yaml")),
+        ("audio-conversation-notes", include_str!("../../../../../tests/fixtures/routines/media-stream-contracts/audio-conversation-notes.yaml")),
+    ] {
+        std::fs::write(root.join(format!(".waltr/resources/routines/{name}.yaml")), source).unwrap();
+    }
     speech_defaults(root, if diarization { Some(("media-stt", "stream")) } else { None });
     let mirror = serde_json::json!({"apiVersion":"waltr.routine/v1","kind":"Routine","name":"blob-mirror","description":"Production binary port fixture","spec":{"source":"export default async function(){const value=await host.call('media.upload',{port:'source'});await host.call('media.lease',{output:'copy'},null,null,value);await host.call('media.finish',{});return {completed:true};}","entrypoints":{"run":{"trigger":"interactive"}},"parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"object","properties":{},"required":[]}},"result":{"schemaVersion":"waltr.value/v1","schema":{"type":"object","properties":{"completed":{"type":"boolean"}},"required":["completed"]}},"capabilities":["media.execute"],"ports":{"source":{"direction":"input","media":"file","required":true,"maxBytes":67108864,"formats":["blob"]},"copy":{"direction":"output","media":"file","required":true,"maxBytes":67108864,"formats":["blob"]}}}});
     std::fs::write(

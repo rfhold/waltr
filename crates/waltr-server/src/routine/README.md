@@ -415,7 +415,10 @@ Every operation retains its worker until join. Cleanup cancels and joins transpo
 | `media.publish` | Immutable selected UTF-8 object with SQL owner/quota/reference; descriptor-only reply |
 | `media.emit` | Committed text output after helper acceptance |
 | `media.lease` | Authenticated binary output transfer before teardown, with a declared output name |
-| `media.finish` | Seal dispatch and prove required transport completion |
+| `media.finish` | Seal media dispatch and prove required transport completion |
+
+After `media.finish` succeeds, an interactive Routine can make one declared installed `tools.execute` call with an inline result.
+The host denies all other calls after finish. An effect does not roll back if terminal persistence later fails.
 
 JS receives opaque, engine-bound resources, not payload-sized JSON or ownership grants.
 `media.read` returns response bytes from a helper handle. Use `media.readText` to read bounded UTF-8 directly without per-byte JavaScript decoding. It preserves the complete string or fails; structured-value limits still apply.

@@ -2,7 +2,7 @@
 //!
 //! A finite selection uses an already authorized local handle:
 //! ```no_run
-//! # async fn finite<T: waltr_client::RoutineInteractionTransport>(transport: &T, invocation: &waltr_desktop::interaction::Invocation, source: Box<dyn waltr_desktop::media::Source>, bytes: u64, guard: &waltr_desktop::typing::Guard<'_>, consumer: &dyn waltr_desktop::interaction::Consumer) -> Result<(), waltr_desktop::host::Error> {
+//! # async fn finite<T: waltr_client::RoutineInteractionTransport>(transport: &T, invocation: &waltr_desktop::interaction::Invocation, source: Box<dyn waltr_desktop::media::Source>, bytes: u64, guard: &waltr_desktop::effect::Guard<'_>, consumer: &dyn waltr_desktop::interaction::Consumer) -> Result<(), waltr_desktop::host::Error> {
 //! use waltr_client::interaction::wire;
 //! use waltr_desktop::{host::Observer, media::{self, BinaryInput}};
 //! let mut inputs = [BinaryInput {
@@ -20,7 +20,7 @@
 //! ```
 use crate::{
     host::Error,
-    typing::{Guard, LocalFuture},
+    effect::{Guard, LocalFuture},
 };
 use waltr_client::{
     RoutineBlobDescriptor, RoutinePort,
@@ -187,7 +187,7 @@ impl<'a> Producer<'a> {
 pub struct Output {
     /// Accepted invocation identity.
     pub invocation: String,
-    /// Selected final text, if requested. No command or typing fallback is selected here.
+    /// Selected final text, if requested. No command fallback is selected here.
     pub text: Option<String>,
 }
 impl std::fmt::Debug for Output {

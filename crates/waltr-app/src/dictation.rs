@@ -425,7 +425,7 @@ impl Job {
             sample_rate_hz: 24_000,
             channels: 1,
         };
-        let guard = waltr_desktop::typing::Guard {
+        let guard = waltr_desktop::effect::Guard {
             cancel: &self.cancel,
             generation: &self.cancel,
             valid: &|| self.valid(),
@@ -447,7 +447,7 @@ impl Job {
             waltr_desktop::interaction::Selection {
                 invocation: &self.invocation,
                 input: &self.selection.input,
-                output: &self.selection.output,
+                output: Some(&self.selection.output),
                 max_capture_seconds: None,
             },
             &self.finish,
@@ -492,8 +492,8 @@ impl waltr_desktop::interaction::Consumer for Job {
         output: &'a waltr_client::interaction::InteractionOutput,
         port: &'a str,
         final_text: Option<&'a str>,
-        guard: &'a waltr_desktop::typing::Guard<'_>,
-    ) -> waltr_desktop::typing::LocalFuture<'a, Result<(), waltr_desktop::host::Error>> {
+        guard: &'a waltr_desktop::effect::Guard<'_>,
+    ) -> waltr_desktop::effect::LocalFuture<'a, Result<(), waltr_desktop::host::Error>> {
         Box::pin(async move {
             guard
                 .check()

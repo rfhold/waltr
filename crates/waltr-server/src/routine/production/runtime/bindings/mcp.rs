@@ -390,6 +390,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Invocation<S> {
                 Some(worker),
             )
         } else {
+            if request.workspace.is_some() {
+                return Err(PortError::Denied);
+            }
             (None, None, None)
         };
         let key = (target.server().to_owned(), selection);

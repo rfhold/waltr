@@ -423,9 +423,8 @@ keybinds:
  - id: test
    key: Ctrl+Alt+Space
    mode: hold
-   routine: {name: test, trigger: dictate, input: audio, output: clean-text}
+   routine: {name: test, trigger: dictate, input: audio}
    audio: {device: default, sampleRateHz: 24000, channels: 1}
-   typing: {}
 "#,
         )
         .unwrap();

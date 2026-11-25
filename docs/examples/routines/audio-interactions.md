@@ -4,9 +4,9 @@ These examples are strict JavaScript Routine envelopes, not task graphs. Resourc
 
 | Example | Entrypoint | Inputs and outputs |
 | --- | --- | --- |
-| [Transcription](audio-transcribe.yaml) | `dictate` | PCM audio to transcript text |
-| [Transcription and cleanup](audio-transcribe-cleanup.yaml) | `dictate` | Committed transcript to one normal named cleanup helper |
-| [Conversation notes](audio-conversation-notes.yaml) | `record-notes` | Speaker-labeled transcript, explicit deletion audit and final notes |
+| [Transcription](audio-transcribe.yaml) | `dictate` | Type the final transcript through Computer Use |
+| [Transcription and cleanup](audio-transcribe-cleanup.yaml) | `dictate` | Copy the cleanup helper's final text through Computer Use |
+| [Conversation notes](audio-conversation-notes.yaml) | `record-notes` | Retain transcript and audit, then copy only final notes through Computer Use |
 | [Synthesis](audio-synthesize.yaml) | `speak` | Committed UTF-8 text to PCM audio |
 | [Ask and speak](ask-and-speak.yaml) | `ask` | Question parameter to a completed answer, text output and PCM audio |
 | [Audio ask and speak](audio-ask-and-speak.yaml) | `ask` | Recorded question to a completed answer and PCM audio |
@@ -70,7 +70,16 @@ The filter submits `_helper_capture` under the resource's `spec.captures` declar
 
 The JavaScript program validates the structured helper result before starting the next helper. It does not repair malformed JSON, retry an uncertain helper, truncate transcript content or invent a fallback summary. Provider context and output limits must fit the whole transcript, deletion audit and final notes; server byte bounds do not increase model capacity.
 
-The [desktop conversation-notes example](../client-conversation-notes.yaml) selects the same resource, entrypoint and ports. Retained transcript, notes and deletion audit use separate durable text results. Sensitive transcript, helper and result data retain their ordinary persistence and access rules.
+Retained transcript, notes and deletion audit use separate durable text results. Sensitive transcript, helper and result data retain their ordinary persistence and access rules.
+
+## Desktop Text Shortcuts
+
+Use the [dictation and cleanup example](../client.yaml) and the [conversation-notes example](../client-conversation-notes.yaml).
+They route through Remote `home`; the Routines select Computer Use MCP on worker `preview`.
+The shortcuts omit `routine.output` and any local output action.
+The Routines send at most 16 KiB of final UTF-8 text, subject to the encoded request limit.
+Dictation makes one `type_text` call. Cleanup and notes each make one `clipboard_copy` call.
+There is no interim insertion, clipboard paste, local fallback, or automatic retry.
 
 ## Coordinated Cutover
 

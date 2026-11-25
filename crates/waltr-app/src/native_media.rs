@@ -21,7 +21,7 @@ use waltr_client::{
 use waltr_desktop::{
     host::Error,
     media::{OutputSink, Source},
-    typing::{Guard, LocalFuture},
+    effect::{Guard, LocalFuture},
 };
 #[cfg(test)]
 pub(crate) mod tests;

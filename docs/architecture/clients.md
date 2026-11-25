@@ -148,7 +148,6 @@ Hosts can select tighter limits; native chat and default desktop holds retain at
 Desktop holds with `maxCaptureSeconds` retain at most 512 KiB of text and segment IDs, with a 512 KiB encoded chunk bound.
 Direct commands accept at most 512 KiB of final text.
 The combined command argv/stdin expansion budget is one MiB; templates and command stdout/stderr keep their separate bounds.
-Live external typing keeps its separate 128 KiB work budget.
 `committed_prefix(port)` exposes only contiguous frozen segments in first-appearance order, up to the first draft segment.
 The accessor rejects ambiguous selected-port streams; it supplies no terminal-success guarantee.
 `live_text(port)` applies the same selected-stream validation and exposes the current hypothesis, including drafts.
@@ -204,7 +203,7 @@ Toggle mode uses one capture even when the Routine declares `media.inputs`.
 Both tap modes retain the audio reservation through RPC completion, output delivery, and cleanup. Taps after capture ends do not start future captures while that reservation remains active.
 
 The native app permits repeated captures only for hold-mode playback bindings with the exact pinned `media.inputs` capability and a selected PCM audio output.
-Capability-bearing text bindings retain their one-shot typing or command behavior.
+Terminal-only and command bindings retain one-shot capture.
 Each physical press after release targets the same active keybind and ingress epoch, through the current generation, access, and credential fences.
 The first press reserves one interaction and playback owner through terminal cleanup.
 Later presses enqueue fresh release tokens in a bounded lane, not new interactions or helper sessions.
@@ -223,10 +222,7 @@ Unrelated keybinds and chat microphone operations remain busy throughout the ret
 The server Routine controls helper-session selection and ordinary queued followup messages; the native client controls only capture and transport ownership.
 
 Command mode waits for clean EOF, successful final-text validation, capture cleanup, and current guards before one command execution.
-Typing mode delivers each current hypothesis while duplex input continues, even before provider commitment.
-Repeated hypotheses and identical final text add no duplicate output.
-Revisions replace only the changed suffix of this hold's sanitized output through Backspace events.
-Both modes require clean EOF, `SUCCEEDED`, and exact selected-stream validation for terminal success.
+Terminal-only bindings require completed input, `SUCCEEDED`, cleanup proof, and clean EOF. They do not run a local action.
 The desktop host PCM backlog holds at most 30 target-rate seconds of PCM16 mono in one byte-bounded ring.
 At 24 kHz, its capacity is 1,440,000 bytes; at the supported maximum of 48 kHz, it is 2,880,000 bytes.
 The ring has no per-frame metadata queue: two-byte fragments consume two bytes.
@@ -256,7 +252,7 @@ Expiration reports the fixed `AcceptanceTimeout` diagnostic (`rpc_acceptance_tim
 Accepted disarms this deadline; it does not limit hold duration, output processing, model runtime, or native cleanup.
 Default native capture retains its independent 300-second sample ceiling; sample overflow remains an error, not a successful stop.
 An optional keybind-level `maxCaptureSeconds` accepts integer values from 1 through 3600; omission preserves default hold and chat policies.
-The [conversation-notes example](../examples/client-conversation-notes.yaml) opts into 3600 seconds and a final clipboard command.
+The [conversation-notes example](../examples/client-conversation-notes.yaml) opts into 3600 seconds and one final clipboard MCP call.
 The timer starts when the capture factory returns a ready source and counts wall-clock time, even during silence.
 During startup, the same duration also bounds the wait before the host requests a normal stop.
 A stop request during startup remains effective when the source opens; OS initialization and teardown still lack portable hard deadlines.
@@ -264,8 +260,8 @@ The timer requests the same idempotent stop as key release; it does not cancel t
 The native sample ceiling permits the selected capture duration plus 60 seconds for stop/drain, with a library maximum of 3660 seconds.
 Queue sizes and backpressure remain unchanged; the allowance does not authorize extra retained audio or silent truncation.
 The host drains all accepted audio, sends successful `InputClosed` then `InputCompleted`, and awaits final output with the RPC open.
-The notes Routine can then finish diarization and both helper agents before one successful clipboard command.
-Earlier release stops capture normally; a release after automatic completion cannot repeat the command.
+The notes Routine can then finish diarization and both helper agents before one `clipboard_copy` call.
+Earlier release stops capture normally; a release after automatic completion cannot repeat the copy.
 Cancellation, access loss, and shutdown still suppress output actions and take precedence over normal stop.
 Local limits do not guarantee one-hour provider acceptance, remote processing time, or live microphone and clipboard behavior.
 No timeout or failure automatically retries or replays dispatched remote work.
@@ -280,34 +276,12 @@ The host closes the RPC and awaits capture joins plus output-action cleanup befo
 Normal release preserves the final audio flush and continued live output.
 Cancellation never rolls back text that already reached another application.
 
-#### Live External Text
+#### Computer Use Text Output
 
-[`typing`](../../crates/waltr-desktop/src/typing.rs) defines a local-capable asynchronous factory/session boundary, independent of any OS backend.
-The host awaits bounded writes directly, with no unbounded delivery queue.
-Each write contains at most 1 KiB of UTF-8.
-One hold permits 128 KiB of cumulative work: inserted UTF-8 bytes plus deleted graphemes.
-Each actual backend batch rechecks cancellation, generation, access, and credential revision immediately before its effect.
-The backend owns startup and cleanup; the host awaits cleanup even after a blocked write or failed startup.
-No backend means `Unsupported`, never a command fallback.
-Errors use fixed categories; diagnostics expose no output text or raw backend messages.
-
-Text targets the current keyboard focus for each batch, not the application that had focus at key press.
-Focus changes can redirect later batches into another application.
-No target lock or application-level insertion acknowledgement exists.
-The action adds no Enter, Tab, shortcut, paste, clipboard, or automatic message submission.
-The action offers no draft controls, retry, replay, or final-text duplication.
-Revisions use the longest common prefix at an extended grapheme boundary and count deleted graphemes.
-Every replacement passes complete sanitization, capability checks, and cumulative work bounds before any deletion.
-A partial deletion or write failure stops the hold; the host never retries unknown target state.
-
-The sanitizer maps CR, LF, tab, U+2028, and U+2029 to spaces.
-CRLF produces one space, even across hypothesis updates.
-All other control characters, including DEL and C0/C1 controls, reject the entire hypothesis before any replacement effect.
-A later provider, stream, or backend failure leaves prior effects in place, including any partial revision deletion.
-macOS sends unmodified physical Backspace pairs for revisions; target applications need not match Unicode grapheme deletion behavior.
-Wayland supports append-only UTF-8 output and rejects revisions with `Unsupported` before any deletion or replacement.
-The EI text interface exposes keysyms but no backward-text deletion API; this backend deliberately adds no keysym fallback.
-Native chat preview and its draft-edit fences do not change.
+The Routine waits for final text and clean input completion before it invokes one exact Computer Use MCP target on the configured worker.
+`type_text` uses current focus, disallows clipboard fallback, and does not submit. `clipboard_copy` changes the clipboard without a paste.
+Waltr does not retry, replay, or roll back the MCP effect. A later terminal failure does not prove that the effect did not happen.
+Chat preview and ordinary composer copy and paste remain separate.
 
 macOS uses `global-hotkey` with main-thread construction and destruction, one process-wide dispatcher, and a bounded event queue.
 The host must supply a macOS run loop. No media-key or interception fallback exists.
@@ -327,8 +301,8 @@ Its `Held` adapter composes desktop audio holds, permission, and output actions.
 [`dictation::Host`](../../crates/waltr-app/src/dictation.rs) owns chat operation identities, status, preview, jobs, and IPC.
 Both consumers share one nonqueued `AudioAdmission` gate; this gate excludes only concurrent microphone operations.
 The desktop `interaction` driver below `Hold` owns capture startup, first-nonempty-frame admission, Accepted-gated audio input, concurrent output through EOF, cancellation, and capture joins for both consumers.
-Its typed output consumer seam separates chat preview/status from live external typing; chat does not construct a shortcut binding or command.
-Desktop `playback: {}` selects required PCM audio output instead of text. Startup validation requires exactly one command, typing, or playback action.
+Chat uses its own text consumer and does not construct a shortcut binding or command.
+Desktop `playback: {}` selects PCM audio. Terminal-only bindings omit both the local action and output port.
 `Hold::run_guarded_with_outputs` passes the explicit native sink through the same capture and RPC lifecycle.
 The app reuses its bounded CPAL owner with a hold-specific generation, access, credential, and cancellation fence at physical output.
 Success requires clean remote completion and verified playback-tail drain. Cancellation retains and joins the actual playback owner before admission release.
@@ -342,7 +316,7 @@ Four source credits remain attached to converted packets, each bounded to 256 Ki
 This first-order filter has limited image rejection; it does not replace the capture sinc filter.
 The same physical-output guards cover exact and converted samples. Other unsupported rate or channel combinations fail closed.
 Successful remote EOF before input completion fails the operation and joins cancelled capture without waiting for key-up; it cannot authorize a terminal command or chat final text.
-`Actor::new` accepts command-only configurations. `Actor::with_effects` also installs an explicit typing factory and synchronous effect fence, rejecting typing configurations without that capability before device access.
+`Actor::new` accepts terminal-only and command bindings. `Actor::with_guard` adds a synchronous effect fence.
 Both standalone Actor constructors reject playback; the native app supplies that capability directly to Hold.
 The app retains its process-owned shortcut registrar and ingress/permission adapter across runtime generations rather than replacing it with the caller-driven actor.
 The reservation covers permission, capture startup, RPC work, and cleanup.
@@ -391,7 +365,7 @@ Both consumers share the pre-admission byte queue and aggregate one-second retai
 
 Holds recheck generation, access, cancellation, and credential revision at capture, RPC, and output-action boundaries.
 The credential monitor provides cleanup, not effect authority.
-Final-text validation precedes the single configured command; live external text can precede terminal completion.
+Final-text validation precedes any configured local command. Routine-owned MCP effects can precede terminal completion.
 The host adds no replay or rollback of irreversible effects.
 The runtime owns audio jobs in a local `JoinSet` and drains them before exit or explicit logout credential deletion and reply.
 Desktop exit, WebView destruction, and reload callbacks request nonblocking retirement; they never join capture workers on the UI thread.

@@ -1400,7 +1400,7 @@ async fn vertical_with_recognition(
         tasks: tokio::sync::Mutex::new(Vec::new()),
         cancellation,
         joined: AtomicBool::new(false),
-        completed: AtomicBool::new(true),
+        completed: AtomicBool::new(!program.contains("name: media-failure-native-input-finish")),
         uncertain: AtomicBool::new(false),
     });
     let text = persistence.script_text_result_store();
@@ -1596,6 +1596,11 @@ async fn vertical_with_recognition(
             "{outcome:?}"
         );
         assert!(outcome.cleanup_complete);
+    } else if program.contains("name: media-failure-native-input-finish") {
+        assert_eq!(outcome.status, Some(Status::Uncertain), "{outcome:?}");
+        assert!(!outcome.cleanup_complete);
+    } else if program.contains("name: media-final-mcp-one-shot") {
+        assert_eq!(outcome.status, Some(Status::Uncertain), "{outcome:?}");
     } else if program.contains("name: media-failure-native") {
         assert_eq!(outcome.status, Some(Status::Uncertain), "{outcome:?}");
         assert!(outcome.cleanup_complete);
@@ -1724,7 +1729,20 @@ async fn vertical_with_recognition(
         "media cleanup must drop queued capture readers"
     );
     let operations = journal.operations(handle.id.clone(), 0, 100).await.unwrap();
-    if let Some(plan) = &recognition {
+    if let Some(tool) = operations.iter().position(|op| op.name == "tools.execute") {
+        if matches!(
+            definition.envelope().name.as_str(),
+            "audio-transcribe" | "audio-transcribe-cleanup" | "audio-conversation-notes"
+                | "media-failure-mcp-typing" | "media-final-mcp-one-shot"
+        ) {
+            assert!(operations[..tool].iter().any(|op| {
+                op.name == "media.finish"
+                    && op.status == crate::routine::history::OperationStatus::Completed
+            }));
+            assert!(!format!("{operations:?}").contains("PRIVATE_DESKTOP_TOOL_RESPONSE"));
+        }
+    }
+    if let Some(plan) = recognition.as_ref().filter(|_| repeated) {
         let initial_valid = plan.transcripts[0]
             .as_ref()
             .is_ok_and(|text| !text.trim().is_empty());
@@ -1842,6 +1860,9 @@ async fn vertical_with_recognition(
             upload_dropped.load(Ordering::SeqCst),
             program.contains("media-upload-close-recovered")
         );
+    } else if program.contains("name: media-failure-native-input-finish") {
+        assert_eq!(service.shutdown().await, Err(PortError::Uncertain));
+        assert!(engine.shutdown().await.is_err());
     } else {
         service.shutdown().await.unwrap();
         engine.shutdown().await.unwrap();
@@ -1972,6 +1993,141 @@ impl RoutineMcpPort for ImageTool {
 
     fn cleanup(self: Arc<Self>) -> PortFuture<()> {
         Box::pin(async move { self.0.clear() })
+    }
+}
+
+struct DesktopTextTool {
+    results: super::super::authorized_tools::ToolResults,
+    tool: &'static str,
+    expected: &'static str,
+    reject: bool,
+    calls: AtomicUsize,
+}
+
+impl RoutineMcpPort for DesktopTextTool {
+    fn call(
+        self: Arc<Self>,
+        operation: String,
+        request: McpArguments,
+        _: CancellationToken,
+    ) -> PortFuture<ToolResult> {
+        Box::pin(async move {
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            assert_eq!(request.target.server(), "computer-use");
+            assert_eq!(request.target.tool(), self.tool);
+            assert_eq!(request.workspace.unwrap().machine, "preview");
+            let expected = if self.tool == "type_text" {
+                json!({"text":self.expected,"allow_clipboard":false})
+            } else {
+                json!({"text":self.expected})
+            };
+            assert_eq!(json!(request.arguments), expected);
+            let result = ToolResult::new(operation, self.tool, "PRIVATE_DESKTOP_TOOL_RESPONSE");
+            Ok(if self.reject { result.with_error() } else { result })
+        })
+    }
+
+    fn results(&self) -> &super::super::authorized_tools::ToolResults {
+        &self.results
+    }
+
+    fn cleanup(self: Arc<Self>) -> PortFuture<()> {
+        Box::pin(async move { self.results.clear() })
+    }
+}
+
+#[tokio::test]
+async fn desktop_text_routines_use_one_exact_mcp_effect_with_final_text() {
+    if isolated("desktop_text_routines_use_one_exact_mcp_effect_with_final_text") {
+        return;
+    }
+    let dictate = include_str!("../../../resources/routines/audio-transcribe.yaml");
+    let cleanup = include_str!("../../../resources/routines/audio-transcribe-cleanup.yaml");
+    let notes = include_str!("../../../resources/routines/audio-conversation-notes.yaml");
+    let rejected = dictate.replace("name: audio-transcribe", "name: media-failure-mcp-typing");
+    let incomplete = dictate.replace(
+        "name: audio-transcribe",
+        "name: media-failure-native-input-finish",
+    );
+    let one_shot = dictate
+        .replace("name: audio-transcribe", "name: media-final-mcp-one-shot")
+        .replace(
+            "return {completed: true};",
+            "await host.call('tools.execute', {
+               target: {server: 'computer-use', tool: 'type_text'},
+               arguments: {text, allow_clipboard: false}, workspace: {machine: 'preview'}
+             });
+             return {completed: true};",
+        );
+    for (program, tool, expected, reject, diarization, replies, published, calls) in [
+        (dictate, "type_text", "final words", false, false, vec![], &[][..], 1),
+        (
+            cleanup,
+            "clipboard_copy",
+            "cleaned",
+            false,
+            false,
+            vec![capture(json!({"chosen":"cleaned"})), response("accepted")],
+            &["clean-text"][..],
+            1,
+        ),
+        (
+            notes,
+            "clipboard_copy",
+            "notes",
+            false,
+            true,
+            vec![
+                capture(json!({"retained_transcript":"kept","deleted_items":"removed"})),
+                response("filtered"),
+                capture(json!({"chosen":"notes"})),
+                response("accepted"),
+            ],
+            &["deletion-audit", "notes", "retained-transcript"][..],
+            1,
+        ),
+        (rejected.as_str(), "type_text", "final words", true, false, vec![], &[][..], 1),
+        (incomplete.as_str(), "type_text", "final words", false, false, vec![], &[][..], 0),
+        (one_shot.as_str(), "type_text", "final words", false, false, vec![], &[][..], 1),
+    ] {
+        let engine = Engine::new(1).unwrap();
+        let definition = Definition::parse(program, &engine).unwrap();
+        engine.shutdown().await.unwrap();
+        let tools = Arc::new(DesktopTextTool {
+            results: super::super::authorized_tools::ToolResults::new(
+                ResultPool::principal(),
+                ResultPool::process(),
+            ),
+            tool,
+            expected,
+            reject,
+            calls: AtomicUsize::new(0),
+        });
+        let (chunks, _, results) = vertical_with_recognition(
+            program,
+            diarization,
+            replies,
+            definition
+                .envelope()
+                .spec
+                .captures
+                .iter()
+                .map(|(name, capture)| (name.clone(), capture.contract.clone()))
+                .collect(),
+            BTreeMap::from([("text".into(), input_capabilities())]),
+            None,
+            (tool == "type_text").then(|| RecognitionPlan {
+                transcripts: vec![Ok("final words")],
+                block_active: false,
+            }),
+            Some(tools.clone()),
+        )
+        .await;
+        assert!(chunks.is_empty());
+        assert_eq!(tools.calls.load(Ordering::SeqCst), calls);
+        let mut names = results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, published);
     }
 }
 

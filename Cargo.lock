@@ -182,7 +182,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.2",
  "serde",
- "serde_repr",
  "tokio",
  "zbus",
 ]
@@ -4704,16 +4703,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "macos-accessibility-client"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c33254f6f9b60b98eff934c3664530e5058ff7173e0c6b12419a17d5461e7145"
-dependencies = [
- "core-foundation",
- "core-foundation-sys",
-]
-
-[[package]]
 name = "markup5ever"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7131,19 +7120,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "reis"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b967ec6489a42067a20724f11987bb96178ea796873cbe1afd25fb93ee6f85f"
-dependencies = [
- "enumflags2",
- "futures-util",
- "log",
- "rustix",
- "tokio",
-]
 
 [[package]]
 name = "reqsign-aws-v4"
@@ -10548,13 +10524,9 @@ name = "waltr-desktop"
 version = "0.3.0"
 dependencies = [
  "ashpd",
- "core-graphics",
  "futures-util",
  "global-hotkey",
- "macos-accessibility-client",
  "objc2",
- "reis",
- "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -10562,7 +10534,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
- "unicode-segmentation",
  "waltr",
  "waltr-audio-io",
  "waltr-client",

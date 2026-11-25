@@ -77,7 +77,9 @@ const reply = await host.call('tools.execute', {
 });
 ```
 
-Stdio requires `workspace.machine`; omit `workingDirectory` to use the export root. The caller must own the live claim for a remote machine. The desktop origin never selects the target. The [exporter must allow the named stdio resource](../deployment.md#export-a-workspace-to-another-waltr-server). For Streamable HTTP, omit `workspace`: the connection stays on the server.
+Stdio requires `workspace.machine`; omit `workingDirectory` to use the export root. The caller must own the live claim for a remote machine. The desktop origin never selects the target. The [exporter must allow the named stdio resource](../deployment.md#export-a-workspace-to-another-waltr-server). Streamable HTTP denies a call with `workspace`. Without `workspace`, the HTTP connection stays on the server.
+
+After `media.finish` proves transport completion, an interactive Routine can call one declared MCP tool with an inline result. An effect cannot roll back if terminal persistence fails.
 
 Without a source chat, the Routine declaration authorizes the call. There is no session permission prompt or upstream elicitation route. With a verified source chat, its agent must also select the server; the normal source policy, caller ceiling, and middleware still apply. Worker stdio does not support upstream MCP elicitation in either case.
 

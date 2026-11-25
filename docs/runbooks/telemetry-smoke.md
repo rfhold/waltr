@@ -56,7 +56,7 @@ The private `native_audio_telemetry` module preserves the app target `waltr_app_
 | `native.audio.admission` | `entrypoint`: `hold` or `chat`; `outcome`: `admitted`, `busy`, `unavailable`, `stale`, or `duplicate`. Rejections do not create operation spans. |
 | `native.audio.permission` | `entrypoint`, process-local `diagnostic_id`, `category`, and `elapsed_ms`. Categories: `granted`, `permission_denied`, `permission_unavailable`, `permission_busy`, `cancelled`. |
 | `native.audio.milestone` | `entrypoint`, `diagnostic_id`, `stage`, and `elapsed_ms`. Each stage appears at most once per operation. |
-| `native.audio.finished` | One summary after owned cleanup: `entrypoint`, `diagnostic_id`, `outcome`, primary `category`, `capture_cleanup`, `typing_cleanup`, `stage`, `failure_stage`, and `elapsed_ms`. |
+| `native.audio.finished` | One summary after owned cleanup: `entrypoint`, `diagnostic_id`, `outcome`, primary `category`, `capture_cleanup`, `stage`, `failure_stage`, and `elapsed_ms`. |
 
 The span `native.audio.operation` covers permission, capture, RPC, output actions, and owned cleanup.
 It retains the summary fields and parents the native gRPC spans through async instrumentation.

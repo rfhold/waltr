@@ -52,8 +52,6 @@ pub enum Diagnostic {
     SourceCleanup(Result<(), Error>),
     /// Remote terminal and clean EOF proof, independent of the local capture join.
     RemoteCleanup(bool),
-    /// Typing cleanup result.
-    TypingCleanup(Result<(), crate::typing::Error>),
     /// Interaction failure boundary (the public error remains unchanged).
     RpcFailure(RpcFailure),
 }
@@ -154,8 +152,6 @@ pub enum Error {
     Interaction,
     /// Local command failed, including its explicit final-text bound.
     Command(crate::command::CommandError),
-    /// Bounded live-text delivery failure.
-    Typing(crate::typing::Error),
 }
 /// Independent stop/cancel lane; key-up must call release even during pending startup.
 #[derive(Clone, Debug)]
@@ -335,41 +331,8 @@ impl Hold {
         generation: &CancellationToken,
         valid: &dyn Fn() -> bool,
     ) -> Result<(), Error> {
-        self.run_guarded_with_typing(binding, transport, factory, generation, valid, None)
+        self.run_guarded_with_outputs(binding, transport, factory, generation, valid, None)
             .await
-    }
-    /// Execute with an optional local-capable typing backend. Command bindings ignore it.
-    /// The backend owns no effect until admitted by the supplied intent fence.
-    /// Cleanup is always awaited before this hold releases admission.
-    /// # Errors
-    /// Typing without an installed factory returns Unsupported, never a command fallback.
-    #[allow(
-        clippy::future_not_send,
-        reason = "native transports and typing may be Rc-owned"
-    )]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "additive backend injection preserves existing callers"
-    )]
-    pub async fn run_guarded_with_typing<T: RoutineInteractionTransport>(
-        self,
-        binding: &Keybind,
-        transport: &T,
-        factory: Arc<dyn capture::Factory>,
-        generation: &CancellationToken,
-        valid: &dyn Fn() -> bool,
-        typing_factory: Option<&dyn crate::typing::Factory>,
-    ) -> Result<(), Error> {
-        self.run_guarded_with_outputs(
-            binding,
-            transport,
-            factory,
-            generation,
-            valid,
-            typing_factory,
-            None,
-        )
-        .await
     }
     /// Execute with explicitly installed native output consumers; cleanup retains admission.
     /// # Errors
@@ -382,47 +345,14 @@ impl Hold {
         factory: Arc<dyn capture::Factory>,
         generation: &CancellationToken,
         valid: &dyn Fn() -> bool,
-        typing_factory: Option<&dyn crate::typing::Factory>,
         playback: Option<&dyn crate::media::OutputSink>,
     ) -> Result<(), Error> {
-        let setup = match (&binding.command, &binding.typing, &binding.playback) {
-            _ if binding.mode != Mode::Hold && self.control.repeated.is_some() => {
-                Err(Error::Unsupported)
-            }
-            _ if (binding.mode == Mode::Toggle) != self.control.toggle.is_some() => {
-                Err(Error::Unsupported)
-            }
-            (Some(_), None, None) => Ok(None),
-            (None, Some(_), None) => typing_factory
-                .ok_or(Error::Unsupported)
-                .and_then(|factory| factory.create().map(Some).map_err(Error::Typing)),
-            (None, None, Some(_)) if playback.is_some() => Ok(None),
-            _ => Err(Error::Unsupported),
-        };
-        let mut sink = match setup {
-            Ok(sink) => sink,
-            Err(error) => {
-                self.control
-                    .status
-                    .send_replace(Status::Finished(Err(error)));
-                return Err(error);
-            }
-        };
+        let playback = if binding.playback.is_some() { playback } else { None };
         let result = self
-            .execute(
-                binding, transport, factory, generation, valid, &mut sink, playback,
-            )
+            .execute(binding, transport, factory, generation, valid, playback)
             .await;
         self.observer.emit(Diagnostic::Primary(result));
         self.observer.emit(Diagnostic::Stage(Stage::Cleanup));
-        let cleanup = if let Some(sink) = &mut sink {
-            let cleanup = sink.close().await;
-            self.observer.emit(Diagnostic::TypingCleanup(cleanup));
-            cleanup.map_err(Error::Typing)
-        } else {
-            Ok(())
-        };
-        let result = result.and(cleanup);
         self.control.status.send_replace(Status::Finished(result));
         result
     }
@@ -442,30 +372,40 @@ impl Hold {
         factory: Arc<dyn capture::Factory>,
         generation: &CancellationToken,
         valid: &dyn Fn() -> bool,
-        sink: &mut Option<Box<dyn crate::typing::Session>>,
         playback: Option<&dyn crate::media::OutputSink>,
     ) -> Result<(), Error> {
-        let selected = binding
+        if (binding.mode != Mode::Hold && self.control.repeated.is_some())
+            || (binding.mode == Mode::Toggle) != self.control.toggle.is_some()
+        {
+            return Err(Error::Unsupported);
+        }
+        use waltr_client::RoutineMedia;
+        let expected = match (&binding.command, &binding.playback, &binding.routine.output) {
+            (Some(_), None, Some(_)) => Some(RoutineMedia::Text),
+            (None, Some(_), Some(_)) if playback.is_some() => Some(RoutineMedia::Audio),
+            (None, None, None) => None,
+            _ => return Err(Error::Unsupported),
+        };
+        let invocation = binding
             .resolved
             .as_ref()
-            .and_then(|i| {
-                i.limits
-                    .definition
-                    .ports
-                    .iter()
-                    .find(|p| p.name == binding.routine.output)
+            .filter(|invocation| {
+                invocation.selection.routine == binding.routine.name
+                    && invocation.selection.entrypoint == binding.routine.trigger
             })
             .ok_or(Error::Unsupported)?;
-        let expected = if binding.playback.is_some() {
-            waltr_client::RoutineMedia::Audio
-        } else {
-            waltr_client::RoutineMedia::Text
-        };
-        if selected.media != expected {
+        let output = binding.routine.output.as_deref();
+        if expected.is_some_and(|media| {
+            !invocation.limits.definition.ports.iter().any(|p| {
+                Some(p.name.as_str()) == output
+                    && p.direction == waltr_client::RoutineDirection::Output
+                    && p.media == media
+            })
+        }) {
             return Err(Error::Unsupported);
         }
         let cancel = self.control.cancel.clone();
-        let guard = crate::typing::Guard {
+        let guard = crate::effect::Guard {
             cancel: &cancel,
             generation,
             valid,
@@ -473,24 +413,15 @@ impl Hold {
         let consumer = HoldOutput {
             playback,
             status: &self.control.status,
-            observer: &self.observer,
-            typing: std::cell::RefCell::new((sink, crate::typing::Delivery::default(), false)),
         };
         let output = crate::interaction::run_hold(
             transport,
             factory,
             &binding.audio,
             crate::interaction::Selection {
-                invocation: binding
-                    .resolved
-                    .as_ref()
-                    .filter(|invocation| {
-                        invocation.selection.routine == binding.routine.name
-                            && invocation.selection.entrypoint == binding.routine.trigger
-                    })
-                    .ok_or(Error::Unsupported)?,
+                invocation,
                 input: &binding.routine.input,
-                output: &binding.routine.output,
+                output,
                 max_capture_seconds: binding.max_capture_seconds,
             },
             &self.control.release,
@@ -516,7 +447,7 @@ impl Hold {
         };
         self.control.status.send_replace(Status::Command);
         self.observer.emit(Diagnostic::Stage(Stage::Action));
-        guard.check().map_err(|_| Error::Cancelled)?;
+        guard.check()?;
         let command = crate::command::run(spec, &text, &invocation, &cancel);
         tokio::pin!(command);
         tokio::select! { biased;
@@ -543,12 +474,6 @@ impl Drop for Hold {
 struct HoldOutput<'a> {
     playback: Option<&'a dyn crate::media::OutputSink>,
     status: &'a tokio::sync::watch::Sender<Status>,
-    observer: &'a Observer,
-    typing: std::cell::RefCell<(
-        &'a mut Option<Box<dyn crate::typing::Session>>,
-        crate::typing::Delivery,
-        bool,
-    )>,
 }
 impl crate::interaction::Consumer for HoldOutput<'_> {
     fn sink(&self) -> Option<&dyn crate::media::OutputSink> {
@@ -558,48 +483,6 @@ impl crate::interaction::Consumer for HoldOutput<'_> {
         if progress == crate::interaction::Progress::Accepted {
             self.status.send_replace(Status::Streaming);
         }
-    }
-    fn output<'a>(
-        &'a self,
-        output: &'a waltr_client::interaction::InteractionOutput,
-        port: &'a str,
-        final_text: Option<&'a str>,
-        guard: &'a crate::typing::Guard<'_>,
-    ) -> crate::typing::LocalFuture<'a, Result<(), Error>> {
-        Box::pin(async move {
-            let mut state = self.typing.borrow_mut();
-            let (sink, delivery, action_observed) = &mut *state;
-            let Some(sink) = sink.as_mut() else {
-                return Ok(());
-            };
-            let prefix = match final_text {
-                Some(text) => Some(text.to_owned()),
-                None => output.live_text(port).map_err(|_| {
-                    self.observer
-                        .emit(Diagnostic::RpcFailure(RpcFailure::from_output(
-                            output.output_failure(),
-                        )));
-                    Error::Interaction
-                })?,
-            };
-            if let Some(prefix) = prefix {
-                if !*action_observed {
-                    *action_observed = true;
-                    self.observer.emit(Diagnostic::Stage(Stage::Action));
-                }
-                delivery
-                    .deliver(&prefix, sink.as_mut(), guard)
-                    .await
-                    .map_err(Error::Typing)?;
-            }
-            if final_text.is_some() {
-                delivery
-                    .finish(sink.as_mut(), guard)
-                    .await
-                    .map_err(Error::Typing)?;
-            }
-            Ok(())
-        })
     }
 }
 

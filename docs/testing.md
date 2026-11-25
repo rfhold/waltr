@@ -626,26 +626,22 @@ Native composition and platform capability flags do not establish acceptance of 
 
 - **Apple Silicon macOS:** Check signed audio-only permission denial and grant, usage text, the audio-input entitlement, and actual capture.
 - Check hold press/release, run-loop delivery, and main-thread registrar teardown in the normal app.
-- Check manual Accessibility denial/grant for external text, with no automatic trust prompt.
-- Check Unicode text in an authorized target application, focus changes between batches, held modifiers, and applications that ignore events.
-- Check normal release, blocked-write cancellation, access loss, cleanup, and no effects after guard revocation.
-- Confirm that line breaks and tabs become spaces, with no Enter, Tab, clipboard fallback, or automatic submission.
-- Confirm that late failure preserves earlier text and produces no replay.
+- Check Computer Use permissions and final Unicode text in an authorized target application.
+- Confirm one `type_text` call without clipboard fallback or submission and one `clipboard_copy` call per copy shortcut.
+- Deny the MCP effect and confirm no local fallback or retry. Do not infer rollback from a later Routine failure.
 - Check the idle tray, active animation, brief error state, Open Waltr, Quit, and normal window-close behavior.
 - An Apple Silicon compile check proves no permission delivery, microphone capture, shortcut acceptance, tray behavior, or external text insertion.
 - Intel macOS exposes no dictation capability; these checks establish no Intel package support.
 - Check final text only after clean EOF, command execution once, busy/repeat behavior, and cancellation during startup or profile changes.
 - **Wayland:** Build on Linux with ALSA development files, pkg-config, and the actual portal dependencies.
 - Check portal denial, accepted subsets, actual effective triggers, Activated/Deactivated/Changed events, session loss, and cleanup on the target compositor.
-- Check RemoteDesktop keyboard consent denial/grant, EI text capability, ready/resumed device state, pause, session loss, and cleanup.
-- Confirm that absent EI text capability returns `Unsupported`, with no X11, keysym, clipboard, or `uinput` fallback.
-- Check repeated per-hold consent and focus changes; the portal parent window must not act as a target lock.
+- Check separately that the authorized Computer Use worker supports the same typing and clipboard MCP calls.
 - Check GTK/AppIndicator runtime libraries and a compatible panel host, such as a GNOME extension or KDE panel.
 - Check status, Open Waltr, and Quit through the tray menu; do not assume Linux icon-click support.
 - A headless check proves no visible tray or compositor text delivery.
-- An isolated portal source/API harness proves no Linux cross-build, EI negotiation, or live portal compatibility.
+- An isolated portal source/API harness proves no Linux cross-build, Computer Use text delivery, or live portal compatibility.
 - **Android:** Verify the actual NDK/C++ package, installed permission denial/grant, foreground policy, default-device capture, and 48 kHz mono I16 support.
-- Android has no desktop tray or external-text action; native chat dictation acceptance does not establish either capability.
+- Android has no desktop tray or shortcut registrar.
 - Check permission-launch failure cleanup, pause during an OS dialog, stale grants, and cancellation before remote-runtime preservation.
 - Check cancellation across lifecycle changes and permission revocation; unsupported source formats must fail without application fallback.
 - Confirm that resume never restarts audio and that the app uses no microphone foreground service.

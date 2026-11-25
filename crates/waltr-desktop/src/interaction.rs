@@ -3,7 +3,7 @@ use crate::{
     capture,
     config::Audio,
     host::{Diagnostic, Error, Observer, RpcFailure, Stage},
-    typing::{Guard, LocalFuture},
+    effect::{Guard, LocalFuture},
 };
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -107,8 +107,8 @@ pub struct Selection<'a> {
     pub invocation: &'a Invocation,
     /// Audio input port.
     pub input: &'a str,
-    /// Text output port.
-    pub output: &'a str,
+    /// Selected text or audio output port, if consumed locally.
+    pub output: Option<&'a str>,
     /// Local opt-in capture deadline, in 1..=3600 seconds. None preserves default policy.
     pub max_capture_seconds: Option<u32>,
 }
@@ -131,7 +131,7 @@ fn validate_capture_selection(
 fn validate_capture_ports(
     ports: &[waltr_client::RoutinePort],
     input: &str,
-    output: &str,
+    output: Option<&str>,
     binary: &[wire::InputDeclaration],
 ) -> Result<(), Error> {
     use waltr_client::{RoutineDirection as D, RoutineMedia as M};
@@ -140,14 +140,14 @@ fn validate_capture_ports(
             && p.direction == D::Input
             && p.media == M::Audio
             && p.formats.iter().any(|f| f == "pcm16le-24000-mono")
-    }) || !ports.iter().any(|p| {
+    }) || output.is_some_and(|output| !ports.iter().any(|p| {
         p.name == output
             && p.direction == D::Output
             && ((p.media == M::Text && p.formats.iter().any(|f| f == "utf8"))
                 || (p.media == M::Audio
                     && p.formats.iter().all(|f| f == "pcm16le-24000-mono")
                     && !p.formats.is_empty()))
-    }) || ports.iter().any(|p| {
+    })) || ports.iter().any(|p| {
         p.required
             && p.direction == D::Input
             && p.name != input
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn production_capture_formats_pass_selection() {
         assert_eq!(
-            validate_capture_ports(&ports(), "audio", "transcript", &[]),
+            validate_capture_ports(&ports(), "audio", Some("transcript"), &[]),
             Ok(())
         );
     }
@@ -210,7 +210,7 @@ mod tests {
             ports[index].media = media;
             ports[index].formats = vec![format.into()];
             assert_eq!(
-                validate_capture_ports(&ports, "audio", "transcript", &[]),
+                validate_capture_ports(&ports, "audio", Some("transcript"), &[]),
                 Err(Error::Unsupported),
                 "{index} {direction:?} {media:?} {format}"
             );
@@ -224,7 +224,7 @@ mod tests {
         extra.name = "other-audio".into();
         ports.push(extra);
         assert_eq!(
-            validate_capture_ports(&ports, "audio", "transcript", &[]),
+            validate_capture_ports(&ports, "audio", Some("transcript"), &[]),
             Err(Error::Unsupported)
         );
     }
@@ -249,15 +249,17 @@ pub trait Consumer {
     /// Observe validated output state, including the terminal selected text at EOF.
     fn output<'a>(
         &'a self,
-        output: &'a InteractionOutput,
-        port: &'a str,
-        final_text: Option<&'a str>,
-        guard: &'a Guard<'_>,
-    ) -> LocalFuture<'a, Result<(), Error>>;
+        _output: &'a InteractionOutput,
+        _port: &'a str,
+        _final_text: Option<&'a str>,
+        _guard: &'a Guard<'_>,
+    ) -> LocalFuture<'a, Result<(), Error>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 /// Successful selected output after both halves and native cleanup complete.
 pub struct Output {
-    /// Validated successful final text.
+    /// Validated successful final text, empty if none was selected.
     pub text: String,
     /// Accepted invocation identity for command environment.
     pub invocation: String,
@@ -412,7 +414,8 @@ async fn run_owned<T: RoutineInteractionTransport>(
                     .ports
                     .iter()
                     .any(|p| {
-                        p.name == selection.output && p.media == waltr_client::RoutineMedia::Audio
+                        Some(p.name.as_str()) == selection.output
+                            && p.media == waltr_client::RoutineMedia::Audio
                     }))
         {
             return Err(Error::Unsupported);
@@ -710,7 +713,7 @@ async fn duplex(
                 }
             }
             match &event {
-                InteractionEvent::Open(open) if open.port == selection.output => {
+                InteractionEvent::Open(open) if Some(open.port.as_str()) == selection.output => {
                     selected_streams.insert(open.stream_id.clone());
                 }
                 InteractionEvent::Chunk(chunk) if selected_streams.contains(&chunk.stream_id) => {
@@ -757,36 +760,38 @@ async fn duplex(
                 };
                 sink.write(frame, guard).await?;
             }
-            consumer
-                .output(&session.output, selection.output, None, guard)
-                .await?;
+            if let Some(port) = selection.output {
+                consumer.output(&session.output, port, None, guard).await?;
+            }
         }
-        let audio_output = selection
-            .invocation
-            .limits
-            .definition
-            .ports
-            .iter()
-            .any(|p| p.name == selection.output && p.media == waltr_client::RoutineMedia::Audio);
-        let text = if audio_output {
+        let text_port = selection.output.filter(|port| {
+            selection
+                .invocation
+                .limits
+                .definition
+                .ports
+                .iter()
+                .any(|p| p.name == *port && p.media == waltr_client::RoutineMedia::Text)
+        });
+        let text = if let Some(port) = text_port {
+            session
+                .output
+                .final_text(port)
+                .map_err(|_| protocol(observer, &session.output))?
+        } else {
             if !session.output.succeeded() {
                 return Err(protocol(observer, &session.output));
             }
             String::new()
-        } else {
-            session
-                .output
-                .final_text(selection.output)
-                .map_err(|_| protocol(observer, &session.output))?
         };
         if !input_finished.get() {
             observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));
             return Err(Error::Interaction);
         }
         guard.check().map_err(|_| Error::Cancelled)?;
-        consumer
-            .output(&session.output, selection.output, Some(&text), guard)
-            .await?;
+        if let Some(port) = selection.output {
+            consumer.output(&session.output, port, Some(&text), guard).await?;
+        }
         observer.emit(Diagnostic::Stage(Stage::OutputFinished));
         let invocation = invocation.ok_or_else(|| {
             observer.emit(Diagnostic::RpcFailure(RpcFailure::Protocol));

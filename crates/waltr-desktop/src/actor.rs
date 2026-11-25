@@ -17,7 +17,6 @@ pub struct Actor<T> {
     factory: Arc<dyn capture::Factory>,
     gate: AudioAdmission,
     status: tokio::sync::watch::Sender<Status>,
-    typing: Option<std::rc::Rc<dyn crate::typing::Factory>>,
     valid: std::rc::Rc<dyn Fn() -> bool>,
 }
 impl<T> std::fmt::Debug for Actor<T> {
@@ -42,45 +41,23 @@ pub enum ActorError {
 impl<T: RoutineInteractionTransport> Actor<T> {
     /// Pin dependencies without device access. Share `gate` with future app-chat capture.
     /// # Errors
-    /// Rejects invalid config, explicit destinations, typing without a factory, and playback.
+    /// Rejects invalid config, explicit destinations, and playback.
     pub fn new(
         config: Config,
         transport: T,
         factory: Arc<dyn capture::Factory>,
         gate: AudioAdmission,
     ) -> Result<(Self, tokio::sync::watch::Receiver<Status>), ActorError> {
-        config.validate().map_err(|_| ActorError::Config)?;
-        if config.keybinds.iter().any(|binding| {
-            binding.routine.destination.is_some()
-                || binding.typing.is_some()
-                || binding.playback.is_some()
-        }) {
-            return Err(ActorError::Unsupported);
-        }
-        let (status, receiver) = tokio::sync::watch::channel(Status::Idle);
-        Ok((
-            Self {
-                config,
-                transport,
-                factory,
-                gate,
-                status,
-                typing: None,
-                valid: std::rc::Rc::new(|| true),
-            },
-            receiver,
-        ))
+        Self::with_guard(config, transport, factory, gate, std::rc::Rc::new(|| true))
     }
-    /// Pin explicit typing capability and a synchronous identity/credential effect fence.
-    /// The factory creates inert sessions; native backend authorization remains a runtime result.
+    /// Pin a synchronous identity/credential effect fence.
     /// # Errors
     /// Rejects invalid config, explicit destinations, and playback before microphone access.
-    pub fn with_effects(
+    pub fn with_guard(
         config: Config,
         transport: T,
         factory: Arc<dyn capture::Factory>,
         gate: AudioAdmission,
-        typing: std::rc::Rc<dyn crate::typing::Factory>,
         valid: std::rc::Rc<dyn Fn() -> bool>,
     ) -> Result<(Self, tokio::sync::watch::Receiver<Status>), ActorError> {
         config.validate().map_err(|_| ActorError::Config)?;
@@ -99,7 +76,6 @@ impl<T: RoutineInteractionTransport> Actor<T> {
                 factory,
                 gate,
                 status,
-                typing: Some(typing),
                 valid,
             },
             receiver,
@@ -146,13 +122,12 @@ impl<T: RoutineInteractionTransport> Actor<T> {
             hold.use_status(self.status.clone());
             let backend_generation = events.failure_token();
             let valid = || !generation.is_cancelled() && (self.valid)();
-            let operation = hold.run_guarded_with_typing(
+            let operation = hold.run_guarded(
                 binding,
                 &self.transport,
                 self.factory.clone(),
                 &backend_generation,
                 &valid,
-                self.typing.as_deref(),
             );
             tokio::pin!(operation);
             loop {

@@ -1,7 +1,7 @@
 apiVersion: waltr.routine/v1
 kind: Routine
 name: audio-conversation-notes
-description: diarized filtering, notes, and separate deletion audit
+description: Produce conversation notes and copy only the final notes through Computer Use.
 spec:
   source: |
     export default async function () {
@@ -12,11 +12,19 @@ spec:
       const conversation = await host.call('media.select', {}, null, null, filtered);
       const helper = await host.call('helper.run', {selection: {kind: 'named', name: 'routine-conversation-notes'}, inference: {from: 'defaults'}, input: {text: true, maxBytes: 8388608}, content: [{type: 'text', text: 'Write source-grounded notes from the attached retained_transcript and deleted_items. Capture final notes in chosen.'}], capture: 'conversation-notes', maxTurns: 3, deadlineMs: 120000, responseBytes: 65536, completionBytes: 4194304}, null, null, conversation);
       const notes = await host.call('media.select', {field: '/chosen'}, null, null, helper);
+      const text = await host.call('media.readText', {max: 16384}, null, null, notes);
+      if (!text.trim()) throw new Error('no conversation notes to copy');
       await host.call('media.publish', {name: 'retained-transcript'}, null, null, retained);
       await host.call('media.publish', {name: 'notes'}, null, null, notes);
       await host.call('media.publish', {name: 'deletion-audit'}, null, null, audit);
-      await host.call('media.emit', {output: 'notes'}, null, null, notes);
       await host.call('media.finish', {});
+      const copied = await host.call('tools.execute', {
+        target: {server: 'computer-use', tool: 'clipboard_copy'},
+        arguments: {text}, workspace: {machine: 'preview'}
+      });
+      if (copied.status !== 'completed' || copied.result?.is_error !== false) {
+        throw new Error('Computer Use clipboard copy failed');
+      }
       return {completed: true};
     }
   entrypoints:
@@ -39,11 +47,14 @@ spec:
       - completed
   capabilities:
   - media.execute
+  - tools.execute
   - helper.run
   - helper.named.routine-conversation-filter
   - helper.named.routine-conversation-notes
   - helper.capture.filtered-conversation
   - helper.capture.conversation-notes
+  mcpTools:
+  - {server: computer-use, tool: clipboard_copy}
   captures:
     filtered-conversation:
       selection: {kind: named, name: routine-conversation-filter}
@@ -78,10 +89,3 @@ spec:
       maxBytes: 268435456
       formats:
       - pcm16le-24000-mono
-    notes:
-      direction: output
-      media: text
-      required: true
-      maxBytes: 1048576
-      formats:
-      - utf8

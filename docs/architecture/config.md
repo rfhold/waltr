@@ -66,7 +66,7 @@ spec:
     provider: codex
     model: gpt-5.3
   sessionDictation:
-    routine: audio-transcribe
+    routine: composer-transcript
     trigger: dictate
     input: audio
     output: transcript
@@ -291,9 +291,9 @@ Desktop registration remains process-owned across runtime and credential changes
 
 The strict version-1 schema rejects unknown fields and duplicate IDs or chords.
 It permits at most 64 keybinds and a 256 KiB YAML file.
-Each keybind requires `id`, `key`, `mode`, `routine`, `audio`, and exactly one output action: `command`, `typing`, or `playback`.
-Absent actions, explicit nulls, unknown action fields, and multiple actions are invalid.
-Version 1 retains the legacy `command: { argv, stdin, timeoutSeconds }` syntax without implicit defaults between actions.
+Each keybind requires `id`, `key`, `mode`, `routine`, and `audio`.
+Omit both the local action and `routine.output` to wait for Routine completion only.
+Otherwise, supply `routine.output` and exactly one `command` or `playback` action. Explicit nulls and unknown fields are invalid.
 The capture mode applies to microphone input regardless of the output action.
 `mode: hold` records until key release.
 `mode: press-to-talk` starts on a tap and stops after about one second of quiet after speech.
@@ -312,53 +312,20 @@ This schema configures desktop audio shortcuts, not arbitrary native hooks or de
 Chords use unique modifiers in `Ctrl`, `Alt`, `Shift`, `Super` order, followed by a supported key.
 Native registration still depends on platform capabilities and user approval.
 
-The [client example](../examples/client.yaml) selects the real [cleanup Routine](../examples/routines/audio-transcribe-cleanup.yaml):
-`audio-transcribe-cleanup`, trigger `dictate`, input `audio`, output `clean-text`, with 24 kHz mono PCM.
-`dictate` names this speech example's ordinary typed interaction trigger; the server assigns it no special dictation semantics.
-The server must contain that Routine and compatible providers; the client file neither installs nor discovers them.
-The example selects `typing: {}` for live external text.
-That Routine collects its transcript before cleanup, so output need not appear while the shortcut remains down.
-Native backend capability and consent remain separate from schema validation.
-
-For legacy clipboard output, replace `typing: {}` with this command action:
-
-```yaml
-command:
-  argv: [pbcopy]
-  stdin: '{{ text }}'
-  timeoutSeconds: 10
-```
-
-On Wayland, use `argv: [wl-copy]` for the equivalent command example.
-These explicit commands copy final text; neither command inserts text into another application.
-Waltr never selects either command as a fallback for unavailable external typing.
+The [client example](../examples/client.yaml) routes dictation and cleanup through `home` without a local output action.
+Their Routines use Computer Use MCP on worker `preview` to type the final transcript or copy the cleaned text.
+The server needs those Routines, compatible speech providers, and the authorized MCP target.
+The client file does not install server resources or choose the MCP worker.
 
 | Section | Fields and contract |
 | --- | --- |
-| `routine` | Exact `name`, `trigger`, `input`, and `output` identifiers. |
+| `routine` | Exact `name`, `trigger`, and `input`; `output` only for a local action. |
 | `audio` | `device`, `sampleRateHz`, and `channels`; version 1 uses S16LE PCM. |
 | `command` | Fixed `argv`, optional `stdin`, and optional `timeoutSeconds`; final successful text only. |
-| `typing` | Empty mapping `{}`; live hypotheses to current keyboard focus, with Backspace suffix replacement where supported. |
 | `playback` | Empty mapping `{}`; plays the selected Routine's PCM audio output on the default device. |
 
-### External Text Action
-
-`typing: {}` accepts no options and grants no focus lock.
-Focus changes can redirect later batches to another application.
-The action delivers interim hypotheses immediately; identical updates and final text add no duplicate output.
-Revisions replace the changed suffix through Backspace events, with common-prefix and deletion counts at extended grapheme boundaries.
-The action permits 128 KiB of cumulative work per hold: inserted UTF-8 bytes plus deleted graphemes.
-Each awaited write contains at most 1 KiB.
-The source state retains 256 KiB by default, or 512 KiB when `maxCaptureSeconds` is configured; the separate 128 KiB typing-work limit is unchanged.
-
-CR, LF, tab, and Unicode line/paragraph separators become spaces; CRLF becomes one space.
-All other control characters, including DEL and C0/C1 controls, reject the complete hypothesis before any deletion or replacement.
-The action adds no Enter, Tab, clipboard, paste, shortcut, or automatic submission.
-It offers no retry, replay, rollback, or draft controls.
-Prior effects remain after failure, including any partial revision deletion.
-macOS supports Backspace revisions; target applications need not delete exactly one Unicode grapheme per key pair.
-Wayland remains append-only and returns `Unsupported` on revisions before any replacement effect.
-See [Clients](clients.md#live-external-text) for lifecycle guarantees and [Deployment](../deployment.md#desktop-tray-and-external-text) for platform requirements.
+The removed `typing` field is invalid. Replace old bindings and update their Routines before restarting an upgraded app.
+The bundled `audio-transcribe` Routine no longer provides a composer text stream. If a catalog points `sessionDictation` to it, remove that selection in the same update.
 
 ### Audio Selection
 

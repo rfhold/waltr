@@ -182,10 +182,6 @@ impl Host {
                     stdin: c.stdin.clone(),
                     timeout_seconds: c.timeout_seconds,
                 }),
-            typing: binding
-                .typing
-                .as_ref()
-                .map(|_| waltr_desktop::config::TypingSpec {}),
             playback: binding
                 .playback
                 .as_ref()
@@ -201,7 +197,7 @@ impl Host {
                     .iter()
                     .any(|c| c == "media.inputs")
                     && invocation.limits.definition.ports.iter().any(|port| {
-                        port.name == binding.routine.output
+                        Some(port.name.as_str()) == binding.routine.output.as_deref()
                             && port.direction == waltr_client::RoutineDirection::Output
                             && port.media == waltr_client::RoutineMedia::Audio
                             && !port.formats.is_empty()
@@ -445,7 +441,6 @@ impl Held {
             &transport,
             permissions,
             factory,
-            &waltr_desktop::typing::NativeFactory,
             preflight,
         )
         .await;
@@ -458,24 +453,7 @@ impl Held {
         permissions: &AudioPermissions,
         factory: Arc<dyn capture::Factory>,
     ) {
-        self.run_with_typing(
-            transport,
-            permissions,
-            factory,
-            &waltr_desktop::typing::NativeFactory,
-        )
-        .await;
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn run_with_typing<T: RoutineInteractionTransport>(
-        self,
-        transport: &T,
-        permissions: &AudioPermissions,
-        factory: Arc<dyn capture::Factory>,
-        typing: &dyn waltr_desktop::typing::Factory,
-    ) {
-        self.run_with_checks(transport, permissions, factory, typing, None)
+        self.run_with_checks(transport, permissions, factory, None)
             .await;
     }
 
@@ -484,14 +462,13 @@ impl Held {
         transport: &T,
         permissions: &AudioPermissions,
         factory: Arc<dyn capture::Factory>,
-        typing: &dyn waltr_desktop::typing::Factory,
         preflight: Option<&waltr_client::NativeGrpcTransport>,
     ) {
         let diagnostics = self.diagnostics.clone();
         let feedback = self.feedback.clone();
         let activity = self.host.activity.clone();
         let generation = self.generation;
-        self.run_inner(transport, permissions, factory, typing, preflight)
+        self.run_inner(transport, permissions, factory, preflight)
             .instrument(diagnostics.span())
             .await;
         feedback.complete(generation, &activity);
@@ -502,7 +479,6 @@ impl Held {
         transport: &T,
         permissions: &AudioPermissions,
         factory: Arc<dyn capture::Factory>,
-        typing: &dyn waltr_desktop::typing::Factory,
         preflight: Option<&waltr_client::NativeGrpcTransport>,
     ) {
         let release = (preflight.is_some() && self.binding.mode == waltr_desktop::config::Mode::Hold)
@@ -559,9 +535,9 @@ impl Held {
                 None => factory,
             };
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-            let playback = self.binding.playback.as_ref().map(|_| {
+            let playback = self.binding.playback.as_ref().and(self.binding.routine.output.as_ref()).map(|output| {
                 crate::native_media::hold_playback::Sink::new(
-                    self.binding.routine.output.clone(),
+                    output.clone(),
                     crate::native_media::hold_playback::Fence {
                         host: self.host.clone(),
                         generation: self.generation,
@@ -586,7 +562,6 @@ impl Held {
                     factory,
                     &self.token,
                     &valid,
-                    Some(typing),
                     playback,
                 )
                 .await;
@@ -599,15 +574,7 @@ impl Held {
                 result => result,
             };
             self.diagnostics.primary(result);
-            if result.is_err_and(|error| {
-                !matches!(
-                    error,
-                    waltr_desktop::host::Error::Cancelled
-                        | waltr_desktop::host::Error::Typing(
-                            waltr_desktop::typing::Error::Cancelled
-                        )
-                )
-            }) {
+            if result.is_err_and(|error| error != waltr_desktop::host::Error::Cancelled) {
                 self.activity.fail();
             }
         } else if matches!(

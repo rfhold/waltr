@@ -911,7 +911,7 @@ async fn session_dictation_defaults_validate_and_reload_atomically() {
     directory.resource("providers/speech.yaml", "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: speech\nspec:\n  transport: googleSpeechV2\n  url: http://localhost:50051\n  models:\n    dictation:\n      name: Dictation\n      type: 3\n      speech_capabilities:\n        unary: true\n        streaming: true\n      recognition:\n        recognizer: projects/test/locations/global/recognizers/_\n        model: chirp_3\n        language_codes: [en-US]\n        sample_rate_hz: 24000\n        channels: 1\n        interim_results: true\n        automatic_punctuation: true\n");
     let routine = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/examples/routines/audio-transcribe.yaml"
+        "/tests/fixtures/routines/media-stream-contracts/audio-transcribe.yaml"
     ));
     directory.resource("routines/audio-transcribe.yaml", routine);
     directory.resource("defaults/default.yaml", &defaults);

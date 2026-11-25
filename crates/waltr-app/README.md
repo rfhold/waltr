@@ -8,14 +8,14 @@ Remote sign-in restores native refresh credentials without exposing tokens or st
 
 ## Routine consumers
 
-Desktop holds accept `playback: {}` as an exclusive output action alongside `typing` and `command`.
+Desktop holds accept `playback: {}` or an explicit `command`, or omit both for terminal-only Routines.
 The selected output must require `pcm16le-24000-mono` audio.
 Playback prefers the exact source format on the default device.
 For 24 kHz mono sources only, it can adapt to supported 48 kHz stereo output.
 The shared CPAL owner checks hold cancellation, generation, access, and credential revision before physical output.
 Release ends capture, then waits for the answer and verified playback-tail drain.
 For a playback binding with the exact pinned `media.inputs` capability and selected PCM output, another press after release captures into the same interaction.
-Capability-bearing text bindings retain one-shot typing or command behavior.
+Terminal-only and command bindings use one capture.
 The shortcut adapter requires the same keybind and ingress epoch under the current generation, access, catalog, and credential fences.
 Each capture receives a fresh stream ID and release token; native workers run sequentially with a 16-capture lifetime limit.
 Per-capture release does not finish the global input lane.
@@ -25,7 +25,7 @@ Rejected opt-in capture presses publish a fixed diagnostic and the existing dism
 Cancellation joins capture, RPC cleanup, and playback before the hold releases its reservation.
 See the [audio question example](../../docs/examples/routines/audio-interactions.md#audio-question-shortcut).
 
-Chat dictation and desktop holds use the desktop interaction driver, the current shared definition catalog, and one nonqueued microphone reservation. Each operation pins its definition revision, limits, source session, and credential revision. Relevant catalog or access changes cancel and join the operation before replacement; unrelated snapshots do not cancel it. Chat preview is separate from shortcut typing and command effects.
+Chat dictation and desktop holds use the desktop interaction driver, the current shared definition catalog, and one nonqueued microphone reservation. Each operation pins its definition revision, limits, source session, and credential revision. Relevant catalog or access changes cancel and join the operation before replacement; unrelated snapshots do not cancel it. Chat preview is separate from shortcut MCP and command effects.
 
 The native media host uses `NativeGrpcTransport` and shared attachment, upload, output, and history readers. Admission validates the complete metadata before RPC. Binary uploads wait for Accepted, use negotiated chunks of at most 64 KiB, and commit quarantine before binding an input. Server validation remains authoritative.
 
@@ -68,4 +68,4 @@ Logout revokes effects before waiting. Unverified cleanup returns a fixed failur
 
 Durable text readers have a separate history lifetime, a 1 MiB result bound, and UTF-8 byte offsets. Access, credential, generation, and relevant selection changes revoke all affected effects before cleanup waits. UI lifecycle callbacks retire work through the existing background queue rather than joining threads directly. Native OS dialogs cannot be forcibly joined; stale callbacks cannot open files or install handles. Admission and first Accepted share one absolute 20-second deadline.
 
-Mobile native media is explicitly unsupported. Ordinary mobile chat dictation and hold policy remain separate. Automated tests use direct v2 fake services, temporary files, and a fake playback callback without activating physical devices. Backend compilation and these tests do not prove physical playback, microphone, typing, or live dialog behavior. Production service route composition belongs to the server, not this crate.
+Mobile native media is explicitly unsupported. Ordinary mobile chat dictation and hold policy remain separate. Automated tests use direct v2 fake services, temporary files, and a fake playback callback without activating physical devices. Backend compilation and these tests do not prove physical playback, microphone, Computer Use, or live dialog behavior. Production service route composition belongs to the server, not this crate.

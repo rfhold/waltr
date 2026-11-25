@@ -1,6 +1,6 @@
 # Native Routine consumer
 
-`waltr-desktop` owns native capture, shortcuts, hold lifecycle, text typing, and local command effects.
+`waltr-desktop` owns native capture, shortcuts, hold lifecycle, and local command effects.
 The shared client owns v2 protocol validation, credentials, stream bounds, and media authority.
 The app owns catalog discovery, source-context selection, platform playback, file destinations, and file pickers.
 
@@ -42,15 +42,15 @@ No v1 fallback exists.
 
 `interaction::Selection` now contains `invocation: &Invocation`, `input`, `output`, and `max_capture_seconds`.
 It no longer contains independent routine and trigger names.
-`interaction::run` requires an audio input and a selected text or PCM audio output from that descriptor.
+`interaction::run` requires an audio input. The local output selection is optional.
 Audio selection requires an explicit `media::OutputSink`; the shared transport validates required output closure and byte limits.
-`Hold::run_guarded_with_outputs` accepts optional typing and native output capabilities.
-Startup bindings require exactly one `command`, `typing: {}`, or `playback: {}` action.
+`Hold::run_guarded_with_outputs` accepts an optional native playback sink.
+Terminal-only bindings omit the local action and output port. Other bindings require one `command` or `playback: {}` action.
 The app supplies playback through its shared CPAL owner; the standalone Actor rejects playback without device access.
 Playback prefers the exact selected PCM format on the default device.
 The app permits one bounded adaptation: 24 kHz mono to supported 48 kHz stereo output.
 In hold mode, release closes capture.
-The [tap modes](../../docs/architecture/clients.md#desktop-host-and-shortcuts) work with all three output actions. Capture stops on quiet after speech (`press-to-talk`) or on the next press (`toggle`).
+The [tap modes](../../docs/architecture/clients.md#desktop-host-and-shortcuts) work with or without a local output action. Capture stops on quiet after speech (`press-to-talk`) or on the next press (`toggle`).
 All modes retain admission until the Routine, output delivery, and cleanup finish.
 For repeated captures in hold mode, the app uses `Hold::press_repeated` only after it pins the exact `media.inputs` capability and selected PCM output.
 `HoldControl::press_again` returns a fresh per-capture release control for the same interaction.
@@ -79,8 +79,7 @@ The shared client applies narrowed Accepted limits.
 Successful final text requires SUCCEEDED, clean EOF, cleanup proof, and exactly one closed committed selected stream.
 The host awaits local capture cleanup before command effects.
 The host rechecks the generation and credential guard immediately before effects.
-Live text retains grapheme-safe revisions and final deduplication.
-Partial typing failures never trigger retries or command fallback.
+Without a selected output, the host still requires successful terminal status, cleanup proof, and clean EOF.
 
 `maxCaptureSeconds` remains optional and bounded to 1–3600 seconds.
 Server input and invocation limits remain independent.
@@ -125,7 +124,7 @@ The app must supply those concrete platform effects.
 `media::run(transport, invocation, inputs, text_output, guard, observer, consumer)` runs finite or no-input workflows without activating a microphone.
 It returns `media::Output { invocation, text: Option<String> }` after successful terminal, clean EOF, and cleanup.
 Pass `Some(exact_text_port)` for final text or `None` for a media-only result.
-Text effects remain consumer-owned; this runner never selects a command, typing backend, or fallback.
+Text effects remain consumer-owned; this runner never selects a command or fallback.
 
 Construct each `media::BinaryInput { port, declaration, source }` from a trusted user selection.
 `declaration` is the v2 `BinaryInputDeclaration`, including exact finite size, display-only name, content type, optional digest, and file/image purpose.

@@ -15,9 +15,9 @@ There is no converter, runtime decoder or fallback.
 | [title](title.yaml) | Set an absent title from the first durable user message. | First-message origin and normal named `routine-title` helper. |
 | [compact-and-continue](compact-and-continue.yaml) | Summarize a completed source prefix and optionally continue. | Exact source snapshot, atomic pause/completion barrier, named `routine-compaction` helper. |
 | [fork](fork.yaml) | Create an ordinary destination from a completed source boundary. | Original-context fork authority and named `routine-fork` helper. |
-| [audio-transcribe](audio-transcribe.yaml) | Stream speech recognition revisions and committed text. | Explicit compatible recognition model and admitted audio/text ports. |
-| [audio-transcribe-cleanup](audio-transcribe-cleanup.yaml) | Collect all committed text, then run one cleanup helper. | Recognition model, named `routine-cleanup` agent and exact helper input capability. |
-| [audio-conversation-notes](audio-conversation-notes.yaml) | Retain substantive conversation, audit deletions, then produce notes. | Diarization-capable recognition, named filter/notes agents and declared capture contracts. |
+| [audio-transcribe](audio-transcribe.yaml) | Type the final transcript through Computer Use MCP. | Speech recognition and the exact `type_text` target. |
+| [audio-transcribe-cleanup](audio-transcribe-cleanup.yaml) | Clean up and copy final text through Computer Use MCP. | Speech recognition, the named cleanup agent and the exact `clipboard_copy` target. |
+| [audio-conversation-notes](audio-conversation-notes.yaml) | Retain conversation and deletion audit; copy only final notes. | Diarization, named filter and notes agents, and the exact `clipboard_copy` target. |
 | [audio-synthesize](audio-synthesize.yaml) | Synthesize committed text into PCM audio. | Explicit compatible synthesis model and admitted text/audio ports. |
 | [context-categorization](context-categorization.yaml) | Categorize an immutable source snapshot. | Generic metadata/history transactions, original-source authority and named `routine-categorization` helper. |
 | [context-management](context-management.yaml) | Plan category edits and await category-specific children. | Exact categorization coverage, child binding, named `routine-context-strategy` helper. |

@@ -10,7 +10,6 @@ workspace = true
 [dependencies]
 waltr.workspace = true
 waltr-client.workspace = true
-unicode-segmentation = "1.13.2"
 waltr-audio-io.workspace = true
 futures-util.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -20,15 +19,11 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "r
 tokio-util = { workspace = true, features = ["rt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics.workspace = true
-macos-accessibility-client.workspace = true
 global-hotkey.workspace = true
 objc2.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { workspace = true, features = ["remote_desktop", "screencast"] }
-reis.workspace = true
-rustix = { workspace = true, features = ["time"] }
+ashpd.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
