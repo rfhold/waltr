@@ -51,6 +51,67 @@ macro_rules! backend {
 }
 mod observation;
 
+impl SqlInvocationStore {
+    pub(crate) async fn reconcile_datastore_commits(
+        &self,
+        stores: &crate::datastore::DataStores,
+        now: i64,
+    ) -> Result<(), PortError> {
+        let mut cursor = 0i64;
+        loop {
+            let rows = backend!(self.pool.clone(), |pool, schema| {
+                let name = if schema.is_empty() {
+                    "json_extract(o.record, '$.name')"
+                } else {
+                    "(o.record::jsonb)->>'name'"
+                };
+                sqlx::query_as::<_, (i64, String, String)>(&format!(
+                    "SELECT o.cursor,o.id,o.invocation FROM {schema}script_operations o \
+                     JOIN {schema}script_invocations i ON i.id=o.invocation \
+                     WHERE o.cursor>$1 AND i.status='running' \
+                     AND o.status IN ('dispatched','completed','uncertain') \
+                     AND {name}='datastore.commit' ORDER BY o.cursor LIMIT 100"
+                ))
+                .bind(cursor)
+                .fetch_all(&pool)
+                .await
+                .map_err(sql_error)?
+            });
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for (next, operation, invocation) in rows {
+                cursor = next;
+                let committed = stores.commit_receipt(&invocation).await == Ok(true);
+                let evidence = committed.then(|| r#"{"commit":"confirmed"}"#.to_owned());
+                backend!(self.pool.clone(), |pool, schema| {
+                    let mut tx = pool.begin().await.map_err(sql_error)?;
+                    let changed = sqlx::query(&format!(
+                        "UPDATE {schema}script_invocations SET status='uncertain',updated_ms=$2 \
+                         WHERE id=$1 AND status='running'"
+                    ))
+                    .bind(&invocation).bind(now).execute(&mut *tx).await.map_err(sql_error)?
+                    .rows_affected();
+                    if changed == 1 {
+                        sqlx::query(&format!(
+                            "UPDATE {schema}script_operations SET status=$2,result=$3,updated_ms=$4 WHERE id=$1"
+                        ))
+                        .bind(&operation)
+                        .bind(if committed { "completed" } else { "uncertain" })
+                        .bind(&evidence).bind(now).execute(&mut *tx).await.map_err(sql_error)?;
+                        sqlx::query(&format!(
+                            "UPDATE {schema}script_operations SET status='uncertain',updated_ms=$2 \
+                             WHERE invocation=$1 AND status='dispatched'"
+                        ))
+                        .bind(&invocation).bind(now).execute(&mut *tx).await.map_err(sql_error)?;
+                    }
+                    tx.commit().await.map_err(sql_error)?;
+                });
+            }
+        }
+    }
+}
+
 fn sql_error(_: sqlx::Error) -> PortError {
     PortError::Unavailable
 }

@@ -210,6 +210,21 @@ impl DatabaseConfig {
         self.mcp.sqlite_path()
     }
 
+    pub(crate) fn validate_datastore_sqlite_path(&self, path: &Path) -> Result<(), PersistenceError> {
+        let normalized = normalized_absolute_path(path)?;
+        for target in [&self.waltr, &self.mcp] {
+            if let Some(other) = target.sqlite_path()
+                && (normalized_absolute_path(other)? == normalized
+                    || same_sqlite_inode(path, other))
+            {
+                return Err(PersistenceError::Configuration(
+                    "datastore must not use a Waltr or MCP SQLite file",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn from_optional_urls(
         waltr_url: &str,
         mcp_url: Option<&str>,
@@ -257,6 +272,18 @@ impl DatabaseConfig {
             sqlite_file_target(data_directory.join("mcp.sqlite3")),
         )
     }
+}
+
+#[cfg(unix)]
+fn same_sqlite_inode(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(left).ok().zip(std::fs::metadata(right).ok())
+        .is_some_and(|(left, right)| left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_sqlite_inode(_: &Path, _: &Path) -> bool {
+    false
 }
 
 /// An initialized, migrated server persistence backend.
@@ -790,7 +817,7 @@ fn expand_home(path: &Path, environment_name: &'static str) -> Result<PathBuf, P
     Ok(path.to_owned())
 }
 
-fn normalized_absolute_path(path: &Path) -> Result<PathBuf, PersistenceError> {
+pub(crate) fn normalized_absolute_path(path: &Path) -> Result<PathBuf, PersistenceError> {
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {

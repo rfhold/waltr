@@ -15,6 +15,7 @@ config:
   waltr:bucketStorageClass: default-bucket
   waltr:s3Endpoint: https://s3.pantheon.holdenitdown.net
   waltr:s3Prefix: production/sessions
+  waltr:datastoreS3Prefix: production/data-stores
   waltr:apiAudience: waltr-api
   waltr:apiScope: waltr:use
   waltr:mcpScope: mcp:use

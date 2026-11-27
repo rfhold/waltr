@@ -12,6 +12,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod config_service;
+mod datastore;
 pub mod embedded;
 mod http_lifecycle;
 mod local_admission;

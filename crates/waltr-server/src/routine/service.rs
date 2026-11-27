@@ -3,8 +3,8 @@ use super::{
     definition::{API_VERSION, Definition, Trigger, identifier},
     history::{Admission, Caller, Operation, OperationStatus, Origin, Ownership, Revision, Status},
     ports::{
-        Clock, HostFactory, InvocationStore, OperationPolicy, PortError, PreparedHost, Reservation,
-        ProviderRejection, SelectedEntrypoint,
+        Clock, HostFactory, InvocationStore, OperationPolicy, PortError, PreparedHost,
+        ProviderRejection, Reservation, SelectedEntrypoint, TerminalReceipt,
     },
 };
 use futures_util::FutureExt;
@@ -855,6 +855,9 @@ async fn run(
         Ok(pair) => pair,
         Err(_) => {
             super::telemetry::failure("execution", "panic");
+            if let Some(rollback) = prepared.reservation.settle(None, cancel.clone()) {
+                drop(AssertUnwindSafe(rollback).catch_unwind().await);
+            }
             (
                 Outcome {
                     id: id.clone(),
@@ -996,7 +999,7 @@ async fn execute(
         status = Status::Uncertain;
         result = None;
     }
-    let finalized = if cleanup {
+    let mut finalized = if cleanup {
         prepared
             .reservation
             .finalize(status != Status::Succeeded)
@@ -1010,11 +1013,92 @@ async fn execute(
         status = Status::Uncertain;
         result = None;
     }
-    let durable = shared
+    let mut settled = prepared.reservation.settle(result.as_ref(), cancel.clone());
+    let has_effect_settlement = settled.is_some();
+    let mut settlement_operation = None;
+    if has_effect_settlement && result.is_some() {
+        if cancel.is_cancelled() {
+            status = Status::Interrupted;
+            result = None;
+            settled = prepared.reservation.settle(None, cancel.clone());
+        } else {
+            // A crash between commit and the Routine outcome must not be mistaken
+            // for an ordinary interruption. This marker contains no guest data.
+            let operation = Operation {
+                version: 1,
+                cursor: 0,
+                id: uuid::Uuid::new_v4().to_string(),
+                invocation: id.into(),
+                name: "datastore.commit".into(),
+                status: OperationStatus::Dispatched,
+                arguments: serde_json::json!({}),
+                result: None,
+                updated_ms: shared.clock.now_ms(),
+            };
+            let operation_id = operation.id.clone();
+            if shared.store.dispatch_intent(operation).await.is_ok() {
+                settlement_operation = Some(operation_id);
+            } else {
+                status = Status::Uncertain;
+                result = None;
+                settled = prepared.reservation.settle(None, cancel.clone());
+            }
+        }
+    }
+    if let Some(settle) = settled
+        && let Err(error) = settle.await
+    {
+        result = None;
+        if matches!(error, PortError::Uncertain | PortError::Unavailable) {
+            finalized = false;
+            status = Status::Uncertain;
+        } else if status == Status::Succeeded {
+            status = if cancel.is_cancelled() || error == PortError::Denied {
+                Status::Interrupted
+            } else {
+                Status::Failed
+            };
+        }
+    }
+    if let Some(operation) = settlement_operation {
+        let operation_status = match status {
+            Status::Succeeded => OperationStatus::Completed,
+            Status::Uncertain => OperationStatus::Uncertain,
+            _ => OperationStatus::Failed,
+        };
+        if shared
+            .store
+            .operation_done(operation, operation_status, None, shared.clock.now_ms())
+            .await
+            .is_err()
+        {
+            status = Status::Uncertain;
+            result = None;
+        }
+    }
+    let mut durable = shared
         .store
         .terminal(id.into(), status, result.clone(), shared.clock.now_ms())
         .await
         .ok();
+    if durable.is_none() && has_effect_settlement {
+        // The effect owner has already returned commit proof (or a rollback outcome).
+        // Reconcile only the journal write; never repeat guest code or datastore effects.
+        if let Ok(Some(row)) = shared.store.get(id.into()).await {
+            if row.status == status && row.result == result {
+                durable = Some(TerminalReceipt {
+                    status,
+                    text_results: None,
+                });
+            } else if !row.status.terminal() {
+                durable = shared
+                    .store
+                    .terminal(id.into(), status, result.clone(), shared.clock.now_ms())
+                    .await
+                    .ok();
+            }
+        }
+    }
     if durable.is_none() {
         super::telemetry::failure("terminal", "persistence");
     }

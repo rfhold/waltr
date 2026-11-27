@@ -3,6 +3,7 @@
 | Path | Info |
 | --- | --- |
 | [crates/waltr-server/](crates/waltr-server/) | Server coordination layer. |
+| [crates/waltr-datastore/](crates/waltr-datastore/) | Object and relational storage adapters, schema validation, and transactions. |
 | [crates/waltr-script/](crates/waltr-script/) | Isolated JavaScript engine, host boundary, callbacks, and resources; not server policy. |
 | [crates/waltr-agent/](crates/waltr-agent/) | Isolated agent library. |
 | [docs/agent-host/](docs/agent-host/) | Server-owned tools, templates, middleware, Skills, permissions, and MCP guidance. |
@@ -21,6 +22,7 @@
 | [docs/architecture/agent.md](docs/architecture/agent.md) | Canonical agent, private worker reconnect, template tools, and provider tool dispatch-fence boundary. |
 | [docs/architecture/clients.md](docs/architecture/clients.md) | Canonical browser, TUI, and Tauri client boundaries and lifecycle. |
 | [docs/architecture/config.md](docs/architecture/config.md) | Canonical unified YAML resource catalog and administration contract. |
+| [docs/architecture/data-stores.md](docs/architecture/data-stores.md) | DataStore definitions, physical layout, authorization, and MCP. |
 | [docs/architecture/persistence.md](docs/architecture/persistence.md) | Canonical Waltr/MCP database ownership and durable OAuth state. |
 | [docs/architecture/routines.md](docs/architecture/routines.md) | Canonical Routine lifecycle, persistence, replay, restart, and client boundary. |
 | [docs/deployment.md](docs/deployment.md) | Database, standalone worker/Compose/Pulumi, OIDC, proxy, and native-client deployment. |

@@ -109,6 +109,7 @@ pub(super) fn validate_resource_source(
             | ResourceKind::Defaults
             | ResourceKind::Routine
             | ResourceKind::Remote
+            | ResourceKind::DataStore
     ) {
         let header: ResourceHeader = serde_yaml_ng::from_str(source).map_err(|source| {
             AgentDefinitionLoadError::ResourceYaml {
@@ -211,6 +212,7 @@ pub(super) fn validate_resource_path(
         "defaults" if name == "default" => ResourceKind::Defaults,
         "routines" => ResourceKind::Routine,
         "remotes" => ResourceKind::Remote,
+        "data-stores" if waltr_datastore::identifier(name).is_ok() => ResourceKind::DataStore,
         _ => {
             return Err(AgentDefinitionLoadError::InvalidResourcePath(
                 path.to_owned(),
@@ -238,6 +240,7 @@ fn parse_resource_kind(kind: &str) -> Option<ResourceKind> {
         "Defaults" => Some(ResourceKind::Defaults),
         "Routine" => Some(ResourceKind::Routine),
         "Remote" => Some(ResourceKind::Remote),
+        "DataStore" => Some(ResourceKind::DataStore),
         _ => None,
     }
 }
@@ -272,6 +275,21 @@ pub(super) fn discover_persisted_for(
         }
     }
 
+    let categories: &[&str] = if unified {
+        &[
+            "agents",
+            "features",
+            "permissions",
+            "providers",
+            "mcp-servers",
+            "defaults",
+            "routines",
+            "remotes",
+            "data-stores",
+        ]
+    } else {
+        &["agents", "features", "permissions"]
+    };
     for entry in
         fs::read_dir(resources_root).map_err(|source| AgentDefinitionLoadError::ReadDirectory {
             path: PathBuf::from(".waltr/resources"),
@@ -283,44 +301,13 @@ pub(super) fn discover_persisted_for(
             source,
         })?;
         let name = entry.file_name();
-        let allowed = if unified {
-            matches!(
-                name.to_str(),
-                Some(
-                    "agents"
-                        | "features"
-                        | "permissions"
-                        | "providers"
-                        | "mcp-servers"
-                        | "defaults"
-                        | "routines"
-                        | "remotes"
-                )
-            )
-        } else {
-            matches!(name.to_str(), Some("agents" | "features" | "permissions"))
-        };
-        if !allowed {
+        if !name.to_str().is_some_and(|name| categories.contains(&name)) {
             return Err(AgentDefinitionLoadError::UnsupportedResourcePath(
                 resource_error_path(resources_root, &entry.path()),
             ));
         }
     }
 
-    let categories: &[&str] = if unified {
-        &[
-            "agents",
-            "features",
-            "permissions",
-            "providers",
-            "mcp-servers",
-            "defaults",
-            "routines",
-            "remotes",
-        ]
-    } else {
-        &["agents", "features", "permissions"]
-    };
     let mut persisted = BTreeMap::new();
     for category in categories {
         let category_path = resources_root.join(category);

@@ -71,6 +71,7 @@ pub(super) struct McpResourceRegistry {
 }
 
 pub(super) struct McpServerRuntime {
+    private_self_transport: bool,
     name: String,
     endpoint: String,
     source: Option<String>,
@@ -190,7 +191,6 @@ impl McpServerRuntime {
             transport_options = transport_options.with_bearer_provider(provider);
         }
         let mut transport = config.transport;
-        #[cfg(target_os = "android")]
         let private = config.private_endpoint.is_some();
         if let Some(private_endpoint) = config.private_endpoint {
             if let mcp::client::McpTransportConfig::StreamableHttp { endpoint, .. } = &mut transport
@@ -275,6 +275,7 @@ impl McpServerRuntime {
             ),
         };
         let runtime = Arc::new(Self {
+            private_self_transport: private,
             name,
             endpoint,
             source,
@@ -556,6 +557,14 @@ impl McpServerRuntime {
         operation: Option<super::elicitation::McpOperation>,
         track_routine_send: bool,
     ) -> Result<McpAgentToolResult> {
+        if self.private_self_transport
+            && arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| crate::datastore::DataStores::handles(tool, action))
+        {
+            return Err(protocol_error("use the first-party datastore tool"));
+        }
         let span = tracing::info_span!(
             "mcp.agent.operation",
             mcp.server = %self.name,
@@ -658,6 +667,9 @@ impl McpServerRuntime {
         cancellation_token: CancellationToken,
         route: Option<super::elicitation::McpOperation>,
     ) -> Result<mcp::McpResourceResult> {
+        if self.private_self_transport && crate::datastore::is_resource(uri) {
+            return Err(protocol_error("use first-party datastore resource access"));
+        }
         if self.retired.load(Ordering::Acquire) {
             return Err(protocol_error("MCP runtime is retired"));
         }
@@ -701,6 +713,9 @@ impl McpServerRuntime {
         cancellation_token: CancellationToken,
         route: Option<super::elicitation::McpOperation>,
     ) -> Result<mcp::apps::UiResource> {
+        if self.private_self_transport && crate::datastore::is_resource(uri) {
+            return Err(protocol_error("use first-party datastore resource access"));
+        }
         if self.retired.load(Ordering::Acquire) {
             return Err(protocol_error("MCP runtime is retired"));
         }

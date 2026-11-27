@@ -154,6 +154,12 @@ The selected model must support image input. Waltr does not silently omit images
 
 `outputSchema` is preserved in the tool registry for future validation and presentation work. Waltr does not yet validate `structuredContent` against `outputSchema`.
 
+### First-Party Data Stores
+
+Agents use the normal grouped `waltr` tools and `read_mcp_resource` for [data stores](../architecture/data-stores.md).
+Waltr checks the agent's tool policy and uses the submitting user's identity for access and attribution.
+An upstream server named `waltr` cannot supply first-party datastore authority.
+
 ## Prompt Discovery
 
 For each configured server, the session MCP runtime also lists prompts when the server advertises prompt support. Prompt definitions are stored with their names, titles, descriptions, and argument metadata.

@@ -370,7 +370,7 @@ impl Fixture {
                 .unwrap();
         });
         let yaml = format!(
-            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: selected }}\nspec:\n  systemPrompt: Use only the code API.\n  features:\n    - codeMode: true\n    - mcp: {{ exposeTools: {expose}, defaultPermissions: true }}\n  permissions:\n    - {{ name: upstream__second, permission: {permission} }}\n"
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: selected }}\nspec:\n  systemPrompt: Use only the code API.\n  features:\n    - codeMode: true\n    - mcp: {{ exposeTools: {expose}, defaultPermissions: true }}\n  permissions:\n    - {{ name: upstream__second, permission: {permission} }}\n    - {{ name: query, permission: allow }}\n    - {{ name: create, permission: allow }}\n    - {{ name: resources.read, permission: allow }}\n"
         );
         let worker = format!(
             "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: worker }}\nspec:\n  systemPrompt: Perform one concrete operation then finish.\n  features:\n    - codeMode: {worker_code}\n    - mcp: {{ exposeTools: true, defaultPermissions: true, skills: {skills} }}\n  permissions:\n    - {{ name: upstream__second, permission: ask }}\n"
@@ -614,6 +614,252 @@ fn partial() -> &'static str {
     "await host.call('tools.execute',{target:{server:'upstream',tool:'effect'},callId:'effect',arguments:{}}); const second=await host.call('tools.execute',{target:{server:'upstream',tool:'second'},callId:'second',arguments:{}}); if(second.status!=='completed'||second.result?.is_error) throw new Error(second.status); return {selected:true};"
 }
 
+#[test]
+fn transaction_selector_is_closed_and_defaults_to_none() {
+    for (field, mode) in [
+        (None, CodeTransactionMode::None),
+        (Some("none"), CodeTransactionMode::None),
+        (Some("relational"), CodeTransactionMode::Relational),
+    ] {
+        let mut value = json!({"action":"execute","source":"return 1;"});
+        if let Some(field) = field {
+            value["transaction"] = json!(field);
+        }
+        assert!(
+            matches!(serde_json::from_value(value), Ok(CodeInput::Execute { transaction, .. }) if transaction == mode)
+        );
+    }
+    for value in [
+        json!({"action":"execute","source":"return 1;","transaction":null}),
+        json!({"action":"execute","source":"return 1;","transaction":"auto"}),
+        json!({"action":"discover","transaction":"none"}),
+        json!({"action":"schemas","targets":[],"transaction":"relational"}),
+    ] {
+        assert!(serde_json::from_value::<CodeInput>(value).is_err());
+    }
+}
+
+async fn install_fixture_stores(fixture: &Fixture) -> Arc<DataStores> {
+    let dir = fixture.dir.join("datastore-test");
+    let resources = dir.join(".waltr/resources");
+    std::fs::create_dir_all(resources.join("data-stores")).unwrap();
+    std::fs::create_dir_all(resources.join("mcp-servers")).unwrap();
+    std::fs::write(
+        resources.join("mcp-servers/waltr.yaml"),
+        "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {name: waltr}\nspec: {transport: streamableHttp, url: 'https://waltr.example/base', path: /mcp}\n",
+    ).unwrap();
+    std::fs::write(
+        resources.join("data-stores/notes.yaml"),
+        r#"
+apiVersion: waltr.dev/v1alpha1
+kind: DataStore
+metadata: {name: notes}
+spec:
+  type: relational
+  access: {scope: shared}
+  collections:
+    note:
+      fields:
+        title: {type: string, required: true}
+  relations:
+    related: {from: note, to: note, cardinality: many-to-many}
+"#,
+    )
+    .unwrap();
+    let materializer =
+        crate::catalog::CatalogMaterializer::load(&crate::test_support::default_catalog_loader())
+            .await
+            .unwrap();
+    let catalog =
+        crate::resource_catalog::AgentDefinitionState::load_unified(&dir, materializer).unwrap();
+    let stores = crate::datastore::Storage::local(&dir)
+        .await
+        .unwrap()
+        .bind(catalog);
+    fixture.host.install_data_stores(stores.clone()).unwrap();
+    stores
+}
+
+#[tokio::test]
+async fn public_relational_code_commits_note_and_link_or_rolls_back_caught_failure() {
+    let fixture = Fixture::new(true, "allow", "return null;").await;
+    let stores = install_fixture_stores(&fixture).await;
+    let reader = fixture.public_adapter().await;
+    let mut public = fixture.public_adapter().await;
+    Arc::get_mut(&mut public).unwrap().request_principal = AuthenticatedPrincipal::hosted_mcp(
+        fixture.principal.issuer(),
+        mcp::server::McpTokenAuthorization {
+            principal_id: fixture.principal.mcp_principal_id(),
+            scopes: [
+                "datastore:create:record.create".to_owned(),
+                "datastore:create:relation.link".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            expires_at: None,
+            revocation: None,
+        },
+    );
+    let create = r#"
+const run = (tool, callId, action, input) => host.call('tools.execute', {
+  target:{server:'waltr',tool}, callId, arguments:{action,input}
+});
+const newNote = (id) => run('create',id,'record.create',{
+  store:'notes',collection:'note',id,fields:{title:id}
+});
+"#;
+    let denied = reader.call(
+        CodeInput::Execute {
+            source: format!("{create}\nawait newNote('blocked'); return true;"),
+            transaction: CodeTransactionMode::Relational,
+        },
+        CancellationToken::new(),
+    ).await.unwrap();
+    assert_ne!(denied["status"], "succeeded", "{denied}");
+    assert_eq!(
+        stores.read(
+            &fixture.principal,
+            "waltr://data-stores/notes/collections/note/records/blocked",
+            None,
+        ).await,
+        Err(waltr_datastore::Error::NotFound)
+    );
+    let call = |source: String, transaction| {
+        public.call(
+            CodeInput::Execute {
+                source,
+                transaction,
+            },
+            CancellationToken::new(),
+        )
+    };
+    let output = call(format!(r#"{create}
+await newNote('first'); await newNote('second');
+await run('create','link','relation.link',{{store:'notes',relation:'related',from_id:'first',to_id:'second'}});
+const read = await host.call('resources.read', {{uri:'waltr://data-stores/notes/collections/note/records/second'}});
+return read.result.fields.title;
+"#), CodeTransactionMode::Relational).await.unwrap();
+    assert_eq!(output["status"], "succeeded", "{output}");
+    assert_eq!(output["result"], "second");
+    assert!(
+        stores
+            .relational
+            .has_receipt(output["invocationId"].as_str().unwrap())
+            .await
+            .unwrap()
+    );
+    let links = stores
+        .call(
+            &fixture.principal,
+            "query",
+            "relation.list",
+            json!({
+                "store":"notes","relation":"related","from_id":"first"
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(links["items"].as_array().unwrap().len(), 1);
+
+    let fail = format!(
+        r#"{create}
+await newNote('third');
+try {{ await newNote('first'); }} catch (_) {{}}
+return 1;
+"#
+    );
+    let rolled_back = call(fail.clone(), CodeTransactionMode::Relational)
+        .await
+        .unwrap();
+    assert_eq!(rolled_back["status"], "failed", "{rolled_back}");
+    assert_eq!(rolled_back["transactionError"], "conflict");
+    assert!(
+        !stores
+            .relational
+            .has_receipt(rolled_back["invocationId"].as_str().unwrap())
+            .await
+            .unwrap()
+    );
+    let uri = "waltr://data-stores/notes/collections/note/records/third";
+    assert_eq!(
+        stores.read(&fixture.principal, uri, None).await,
+        Err(waltr_datastore::Error::NotFound)
+    );
+
+    let script_failure = call(
+        format!("{create}\nawait newNote('unpublished');\nthrow new Error('no result');"),
+        CodeTransactionMode::Relational,
+    )
+    .await
+    .unwrap();
+    assert_eq!(script_failure["status"], "failed", "{script_failure}");
+    assert!(
+        !stores
+            .relational
+            .has_receipt(script_failure["invocationId"].as_str().unwrap())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        stores
+            .read(
+                &fixture.principal,
+                "waltr://data-stores/notes/collections/note/records/unpublished",
+                None
+            )
+            .await,
+        Err(waltr_datastore::Error::NotFound)
+    );
+
+    let independent = call(fail, CodeTransactionMode::None).await.unwrap();
+    assert_eq!(independent["status"], "succeeded", "{independent}");
+    assert_eq!(
+        stores.read(&fixture.principal, uri, None).await.unwrap()["fields"]["title"],
+        "third"
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn binding_rejects_mode_substitution_and_relational_mode_stops_external_effects() {
+    let fixture = Fixture::new(true, "allow", "return null;").await;
+    install_fixture_stores(&fixture).await;
+    let adapter = fixture.adapter().await;
+    let source = format!("try {{ {} }} catch (_) {{}}; return 1;", one_effect());
+    let none = CodeInput::Execute {
+        source: source.clone(),
+        transaction: CodeTransactionMode::None,
+    };
+    let relational = CodeInput::Execute {
+        source,
+        transaction: CodeTransactionMode::Relational,
+    };
+    let binding = adapter.prepare(&none, Origin::Inline).unwrap();
+    let changed = adapter.prepare(&relational, Origin::Inline).unwrap();
+    assert_ne!(binding.source_revision, changed.source_revision);
+    assert_eq!(
+        adapter
+            .run(
+                relational.clone(),
+                binding,
+                (Origin::Inline, "changed-mode".into()),
+                CancellationToken::new()
+            )
+            .await,
+        Err(PortError::Conflict)
+    );
+    let failed = adapter
+        .call_internal(relational, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["transactionError"], "denied");
+    assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+    assert!(!fixture.sessions.store().list().await.unwrap().is_empty());
+    fixture.finish().await;
+}
+
 #[tokio::test]
 async fn expanded_capability_limit_rejects_without_installing_or_replacing_authority() {
     let fixture = Fixture::new(true, "deny", one_effect()).await;
@@ -643,7 +889,11 @@ async fn expanded_capability_limit_rejects_without_installing_or_replacing_autho
         .unwrap();
     let installed = fixture.adapter().await;
     assert_eq!(installed.grant.capabilities().len(), 64);
-    assert!(installed.definition("return null;", Origin::Inline).is_ok());
+    assert!(
+        installed
+            .definition("return null;", Origin::Inline, CodeTransactionMode::None)
+            .is_ok()
+    );
     assert!(matches!(
         fixture
             .host
@@ -674,6 +924,7 @@ async fn stale_adapter_denies_every_action_after_session_delete_and_recreate() {
             targets: vec![ConcreteToolTarget::new("upstream", "effect").unwrap()],
         },
         CodeInput::Execute {
+            transaction: CodeTransactionMode::None,
             source: one_effect().into(),
         },
     ] {
@@ -708,6 +959,7 @@ async fn guest_schema_batch_limit_precedes_schema_reads_and_following_effect() {
     let output = adapter
         .call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into(),
             },
             CancellationToken::new(),
@@ -741,6 +993,7 @@ async fn exact_alias_collision_targets_both_execute_without_conflation() {
     let output = adapter
         .call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into(),
             },
             CancellationToken::new(),
@@ -759,6 +1012,7 @@ async fn reserved_admission_commit_with_lost_ack_never_starts_or_replays_source(
     fixture.admission_lost.store(true, Ordering::SeqCst);
     let adapter = fixture.adapter().await;
     let input = CodeInput::Execute {
+        transaction: CodeTransactionMode::None,
         source: one_effect().into(),
     };
     let binding = adapter.prepare(&input, Origin::Inline).unwrap();
@@ -838,6 +1092,7 @@ async fn public_code_named_helper_retains_internal_upstream_and_live_permission_
         PublicCodePort::call(
             &adapter,
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into()
             },
             CancellationToken::new()
@@ -878,6 +1133,7 @@ async fn stale_origin_cannot_approve_helper_effect(skills: bool, approve: bool) 
     let mut initial_reads = 0;
     let call = adapter.call_internal(
         CodeInput::Execute {
+            transaction: CodeTransactionMode::None,
             source: source.into(),
         },
         CancellationToken::new(),
@@ -953,6 +1209,7 @@ async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_cal
     let result = adapter
         .call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into(),
             },
             CancellationToken::new(),
@@ -968,6 +1225,7 @@ async fn helper_nesting_requires_independent_host_authority_and_keeps_parent_cal
     let result = adapter
         .call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into(),
             },
             CancellationToken::new(),
@@ -1011,6 +1269,7 @@ async fn helper_deadline_closes_pending_original_consent_without_effect_or_late_
         fixture.pending(),
         adapter.call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into()
             },
             CancellationToken::new()
@@ -1072,6 +1331,7 @@ async fn real_js_named_helper_keeps_skills_and_permission_consent_in_original_ru
         PublicCodePort::call(
             &adapter,
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: source.into()
             },
             CancellationToken::new()
@@ -1237,6 +1497,7 @@ async fn discovery_is_bounded_schema_on_demand_and_hidden_inventory_is_not_a_gra
     let output = adapter
         .call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: one_effect().into(),
             },
             CancellationToken::new(),
@@ -1253,6 +1514,7 @@ async fn sql_association_refuses_same_identity_and_different_revision_after_ack_
     let fixture = Fixture::new(true, "allow", one_effect()).await;
     let adapter = fixture.adapter().await;
     let input = CodeInput::Execute {
+        transaction: CodeTransactionMode::None,
         source: one_effect().into(),
     };
     let binding = adapter.prepare(&input, Origin::Inline).unwrap();
@@ -1278,6 +1540,7 @@ async fn sql_association_refuses_same_identity_and_different_revision_after_ack_
             .is_err()
     );
     let changed = CodeInput::Execute {
+        transaction: CodeTransactionMode::None,
         source: format!("{}\n// new revision", one_effect()),
     };
     let binding = adapter.prepare(&changed, Origin::Inline).unwrap();
@@ -1301,6 +1564,7 @@ async fn sql_association_refuses_same_identity_and_different_revision_after_ack_
         adapter
             .call_internal(
                 CodeInput::Execute {
+                    transaction: CodeTransactionMode::None,
                     source: one_effect().into()
                 },
                 CancellationToken::new()
@@ -1319,6 +1583,7 @@ async fn current_remote_declaration_revocation_blocks_the_pinned_concrete_tool()
     let output = adapter
         .call_internal(
             CodeInput::Execute {
+                transaction: CodeTransactionMode::None,
                 source: one_effect().into(),
             },
             CancellationToken::new(),
@@ -1336,6 +1601,7 @@ async fn sql_faults_before_admission_and_after_effects_never_authorize_replay() 
         let fixture = Fixture::new(true, "allow", one_effect()).await;
         let adapter = fixture.adapter().await;
         let input = CodeInput::Execute {
+            transaction: CodeTransactionMode::None,
             source: one_effect().into(),
         };
         let binding = adapter.prepare(&input, Origin::Inline).unwrap();
@@ -1407,6 +1673,7 @@ async fn cancellation_and_revocation_join_the_original_owner_without_replaying_e
             adapter
                 .call_internal(
                     CodeInput::Execute {
+                        transaction: CodeTransactionMode::None,
                         source: one_effect().into(),
                     },
                     cancelled,
@@ -1452,7 +1719,13 @@ async fn source_and_selected_schema_bounds_fail_before_any_effect() {
     ] {
         assert!(
             adapter
-                .call_internal(CodeInput::Execute { source }, CancellationToken::new())
+                .call_internal(
+                    CodeInput::Execute {
+                        source,
+                        transaction: CodeTransactionMode::None
+                    },
+                    CancellationToken::new()
+                )
                 .await
                 .is_err()
         );
@@ -1565,6 +1838,7 @@ async fn authenticated_bearer_expiry_cancels_the_actual_child_before_the_next_ef
         adapter
             .call_internal(
                 CodeInput::Execute {
+                    transaction: CodeTransactionMode::None,
                     source: partial().into(),
                 },
                 CancellationToken::new(),
@@ -1601,6 +1875,7 @@ async fn dropped_leased_waiter_leaves_service_owned_drain_and_never_replays_the_
     let fixture = Fixture::new(true, "allow", one_effect()).await;
     let adapter = fixture.adapter().await;
     let input = CodeInput::Execute {
+        transaction: CodeTransactionMode::None,
         source: one_effect().into(),
     };
     let binding = adapter.prepare(&input, Origin::Mcp).unwrap();
@@ -1769,6 +2044,7 @@ async fn session_replacement_during_an_effect_denies_the_next_dispatch() {
         adapter
             .call_internal(
                 CodeInput::Execute {
+                    transaction: CodeTransactionMode::None,
                     source: partial().into(),
                 },
                 CancellationToken::new(),

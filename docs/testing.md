@@ -70,6 +70,12 @@ cargo fmt -p waltr-script -- --check
 
 The ordinary suite launches its ignored adversarial fixtures through watched subprocesses. Do not run those fixtures directly. See the [crate boundary](../crates/waltr-script/README.md) and [artifact provenance](../crates/waltr-script/PROVENANCE.md).
 
+## Data Stores
+
+Run `cargo test -p waltr-datastore` for filesystem and SQLite contracts.
+The ignored [`postgres_contract`](../crates/waltr-datastore/tests/postgres_contract.rs) and [`s3_contract`](../crates/waltr-datastore/tests/s3_contract.rs) tests require disposable services. Their source lists the exact connection variables.
+Run `cargo test -p waltr-server --features test --lib datastore` for MCP, attribution, transfers, and restart recovery. The `routine::code_mode` filter covers explicit transaction behavior.
+
 ## Protobuf Toolchain
 
 [`scripts/check-protobuf-tools.sh`](../scripts/check-protobuf-tools.sh) defines the local generator contract. It requires `protoc-gen-prost` 0.5.0 and `protoc-gen-tonic` 0.5.0, not the Prost or Tonic runtime crate versions.

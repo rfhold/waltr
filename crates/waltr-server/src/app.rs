@@ -719,6 +719,13 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
     )?;
     let database =
         crate::persistence::DatabaseConfig::from_env().map_err(BuildAppError::Persistence)?;
+    let data_store_storage = crate::datastore::Storage::standalone(&database, &workspace_root)
+        .await
+        .map_err(|_| {
+            BuildAppError::Persistence(crate::persistence::PersistenceError::Configuration(
+                "datastore initialization failed",
+            ))
+        })?;
     let storage =
         session::SessionStorageConfig::from_env().map_err(BuildAppError::SessionStorage)?;
     let catalog_loader = CatalogLoader::from_env();
@@ -770,6 +777,7 @@ pub async fn build_app(options: BuildAppOptions) -> Result<ServerApplication, Bu
         |grpc_routes, input| session::add_storage_service(grpc_routes, storage, input),
         crate::self_mcp::public_resource_from_env(),
         machines,
+        Some(data_store_storage),
     )
     .await
     .map_err(|error| match error {
@@ -1053,6 +1061,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(
     clippy::too_many_lines,
     reason = "router assembly consumes initialized services and OAuth policy in dependency order"
@@ -1068,6 +1077,22 @@ where
     ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
 {
     assemble_app_with_self_mcp(services, add_session_service, None).await
+}
+
+pub(crate) async fn assemble_embedded_app<F>(
+    services: AppServices,
+    add_session_service: F,
+    data_stores: crate::datastore::Storage,
+) -> Result<ServerApplication, AppAssemblyError>
+where
+    F: FnOnce(
+        &mut RoutesBuilder,
+        session::SessionRegistrationInput,
+    ) -> Result<Arc<dyn session::SessionHost>, session::SessionStorageConfigError>,
+{
+    assemble_app_with_peers(
+        services, add_session_service, None, MachineRegistry::default(), Some(data_stores),
+    ).await
 }
 
 async fn assemble_app_with_self_mcp<F>(
@@ -1086,6 +1111,7 @@ where
         add_session_service,
         standalone_self_resource,
         MachineRegistry::default(),
+        None,
     )
     .await
 }
@@ -1095,6 +1121,7 @@ async fn assemble_app_with_peers<F>(
     add_session_service: F,
     standalone_self_resource: Option<url::Url>,
     machines: MachineRegistry,
+    data_store_storage: Option<crate::datastore::Storage>,
 ) -> Result<ServerApplication, AppAssemblyError>
 where
     F: FnOnce(
@@ -1118,6 +1145,16 @@ where
         routine_private_parent,
     } = services;
     let agent_state = agent_state.unwrap_or_else(|| config_service.state().clone());
+    let data_stores = data_store_storage.map(|storage| storage.bind(agent_state.clone()));
+    if let Some(stores) = &data_stores {
+        use crate::routine::ports::{Clock as _, SystemClock};
+        stores.install_catalog_validation().await
+            .map_err(|_| ResourceError::unavailable("DataStore catalog validation failed"))?;
+        persistence.script_invocation_store()
+            .reconcile_datastore_commits(stores, SystemClock.now_ms())
+            .await
+            .map_err(|_| ResourceError::unavailable("DataStore commit recovery failed"))?;
+    }
     let config = ConfigHandle::from_resources(agent_state.clone());
     let anonymous_mcp =
         local_admission.is_none() && !access_authenticator.enabled() && mcp_oauth.is_none();
@@ -1189,7 +1226,7 @@ where
     if let Some(oauth) = &mcp_oauth {
         let required_scopes = oauth.required_scopes().to_vec();
         let metadata = mcp::McpProtectedResourceMetadata::new(oauth.resource(), [oauth.issuer()])
-            .with_scopes(required_scopes.clone())
+            .with_scopes(oauth.supported_scopes())
             .with_resource_name("Waltr MCP");
         let hosted = oauth.authorization().clone();
         let authorization =
@@ -1262,6 +1299,18 @@ where
         waltr_mcp.with_hosted_origin(oauth.issuer(), routine_engine.clone())
     } else if anonymous_mcp {
         waltr_mcp.with_anonymous_disabled()
+    } else {
+        waltr_mcp
+    };
+    let waltr_mcp = if let Some(data_stores) = data_stores {
+        if routine_engine.code.install_data_stores(data_stores.clone()).is_err() {
+            drop(definition_watcher.shutdown().await);
+            let _ = routine_engine.shutdown().await;
+            session_host.shutdown().await;
+            sandbox.shutdown().await;
+            return Err(ResourceError::unavailable("datastore routing initialization failed").into());
+        }
+        waltr_mcp.with_data_stores(data_stores)
     } else {
         waltr_mcp
     };

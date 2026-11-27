@@ -32,6 +32,7 @@ mod semantic;
 mod tools;
 
 pub(crate) trait CodeComposition: Send + Sync {
+    fn install_data_stores(&self, stores: Arc<crate::datastore::DataStores>) -> Result<(), PortError>;
     fn public_enabled(&self, principal: &AuthenticatedPrincipal) -> bool;
     fn public_port(
         &self,
@@ -116,6 +117,10 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> Composition<S> {
     }
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> CodeComposition for Composition<S> {
+    fn install_data_stores(&self, stores: Arc<crate::datastore::DataStores>) -> Result<(), PortError> {
+        self.code.install_data_stores(stores)
+    }
+
     fn public_enabled(&self, principal: &AuthenticatedPrincipal) -> bool {
         !self.stopped.load(std::sync::atomic::Ordering::Acquire)
             && principal.access_ended().now_or_never().is_none()

@@ -44,6 +44,211 @@ async fn unified_state(directory: &TestDirectory) -> AgentDefinitionState {
     AgentDefinitionState::load_unified(&directory.0, materializer).unwrap()
 }
 
+const OBJECT_STORE: &str = "\
+apiVersion: waltr.dev/v1alpha1
+kind: DataStore
+metadata:
+  name: files
+spec:
+  type: object
+  access:
+    scope: principal
+";
+
+const RELATIONAL_STORE: &str = "\
+apiVersion: waltr.dev/v1alpha1
+kind: DataStore
+metadata:
+  name: notes
+spec:
+  type: relational
+  access:
+    scope: shared
+  collections:
+    note:
+      fields:
+        title: {type: string, indexed: true}
+  relations:
+    related: {from: note, to: note, cardinality: many-to-many}
+";
+
+#[tokio::test]
+async fn data_store_catalog_inspect_replace_watch_reset_and_recreation() {
+    let directory = TestDirectory::new("data-store-lifecycle");
+    let state = unified_state(&directory).await;
+    let mut updates = state.subscribe();
+    let path = "data-stores/files.yaml";
+    let absent = state.resource_inspections(Some(path)).unwrap().remove(0);
+    assert_eq!(absent.kind, resource_proto::ResourceKind::DataStore as i32);
+    assert!(absent.active.is_none());
+
+    let created = state
+        .replace(path, OBJECT_STORE.to_owned(), &absent.persisted_etag)
+        .await
+        .unwrap();
+    let initial = state.snapshot();
+    let store = initial.data_store("files").unwrap();
+    assert_eq!(store.definition().kind, waltr_datastore::Kind::Object);
+    assert_eq!(
+        store.definition().access.scope,
+        waltr_datastore::Scope::Principal
+    );
+    let activation = store.activation();
+    let catalog = updates.try_recv().unwrap().resource_catalog();
+    let resource = catalog
+        .resources
+        .iter()
+        .find(|item| item.path == path)
+        .unwrap();
+    assert_eq!(
+        resource.kind,
+        resource_proto::ResourceKind::DataStore as i32
+    );
+    assert_eq!(resource.active_source, OBJECT_STORE);
+    assert!(
+        resource
+            .effective_value
+            .as_ref()
+            .unwrap()
+            .fields
+            .contains_key("spec")
+    );
+
+    directory.resource("data-stores/notes.yaml", RELATIONAL_STORE);
+    state.reload_from_disk().await;
+    let with_notes = state.snapshot();
+    assert_eq!(
+        with_notes.data_store("files").unwrap().activation(),
+        activation
+    );
+    assert_eq!(with_notes.data_stores().len(), 2);
+    let notes = with_notes.data_store("notes").unwrap().definition();
+    assert_eq!(notes.kind, waltr_datastore::Kind::Relational);
+    assert_eq!(notes.access.scope, waltr_datastore::Scope::Shared);
+    assert_eq!(notes.relations["related"].from, "note");
+    updates.try_recv().unwrap();
+
+    let reformatted = format!("# format-only edit\n{OBJECT_STORE}");
+    let edited = state
+        .replace(path, reformatted, &created.persisted_etag)
+        .await
+        .unwrap();
+    assert_ne!(edited.persisted_etag, created.persisted_etag);
+    assert_eq!(
+        state.snapshot().data_store("files").unwrap().activation(),
+        activation
+    );
+    updates.try_recv().unwrap();
+
+    let removed = state.reset(path, &edited.persisted_etag).await.unwrap();
+    assert!(!removed.active);
+    assert!(state.snapshot().data_store("files").is_none());
+    assert!(
+        updates
+            .try_recv()
+            .unwrap()
+            .resource_catalog()
+            .resources
+            .iter()
+            .all(|item| item.path != path)
+    );
+
+    let incompatible = OBJECT_STORE.replace("scope: principal", "scope: shared");
+    assert!(
+        state
+            .replace(path, incompatible, &removed.persisted_etag)
+            .await
+            .is_err()
+    );
+    assert!(state.snapshot().data_store("files").is_none());
+    assert!(updates.try_recv().is_err());
+
+    state
+        .replace(path, OBJECT_STORE.to_owned(), &removed.persisted_etag)
+        .await
+        .unwrap();
+    assert_ne!(
+        state.snapshot().data_store("files").unwrap().activation(),
+        activation
+    );
+}
+
+#[tokio::test]
+async fn data_store_reset_reveals_a_compatible_bundled_definition() {
+    let directory = TestDirectory::new("data-store-bundled-fallback");
+    let path = "data-stores/files.yaml";
+    directory.resource(path, OBJECT_STORE);
+    let mut state = unified_state(&directory).await;
+    Arc::get_mut(&mut state.inner)
+        .unwrap()
+        .bundled
+        .insert(path.to_owned(), format!("# bundled\n{OBJECT_STORE}"));
+    let initial = state.snapshot();
+    let activation = initial.data_store("files").unwrap().activation();
+    let inspection = state.resource_inspections(Some(path)).unwrap().remove(0);
+
+    let fallback = state.reset(path, &inspection.persisted_etag).await.unwrap();
+    assert!(fallback.active);
+    assert!(!fallback.persisted);
+    assert_eq!(fallback.active_origin, Some(ResourceOrigin::Bundled));
+    assert_eq!(
+        state.snapshot().data_store("files").unwrap().activation(),
+        activation
+    );
+}
+
+#[tokio::test]
+async fn data_store_rejects_invalid_and_incompatible_reload() {
+    let directory = TestDirectory::new("data-store-reload");
+    let path = "data-stores/notes.yaml";
+    directory.resource(path, RELATIONAL_STORE);
+    let state = unified_state(&directory).await;
+    let initial = state.snapshot();
+
+    for invalid in [
+        RELATIONAL_STORE.replace("waltr.dev/v1alpha1", "waltr.dev/v1"),
+        RELATIONAL_STORE.replace("name: notes", "name: wrong-slot"),
+        RELATIONAL_STORE.replace("type: relational", "type: object"),
+        RELATIONAL_STORE.replace("    scope: shared", "    scope: shared\n    actor: other"),
+        RELATIONAL_STORE.replace("  access:", "  backend: sqlite\n  access:"),
+        RELATIONAL_STORE.replace("from: note", "from: missing"),
+        RELATIONAL_STORE.replace("kind: DataStore", "kind: DataStore\nextra: true"),
+    ] {
+        directory.resource(path, &invalid);
+        state.reload_from_disk().await;
+        assert!(state.reload_error().is_some(), "{invalid}");
+        assert!(Arc::ptr_eq(&state.snapshot(), &initial));
+    }
+    for incompatible in [
+        RELATIONAL_STORE.replace("scope: shared", "scope: principal"),
+        RELATIONAL_STORE.replace("type: string", "type: integer"),
+        RELATIONAL_STORE.replace("many-to-many", "one-to-one"),
+        RELATIONAL_STORE
+            .split("  collections:")
+            .next()
+            .unwrap()
+            .replace("type: relational", "type: object"),
+    ] {
+        directory.resource(path, &incompatible);
+        state.reload_from_disk().await;
+        assert!(
+            state.reload_error().unwrap().contains("offline migration"),
+            "{incompatible}"
+        );
+        assert!(Arc::ptr_eq(&state.snapshot(), &initial));
+        let inspection = state.resource_inspections(Some(path)).unwrap().remove(0);
+        assert_eq!(
+            inspection.persisted_source.as_deref(),
+            Some(incompatible.as_str())
+        );
+        assert_eq!(inspection.active_source.as_deref(), Some(RELATIONAL_STORE));
+    }
+    directory.resource(path, RELATIONAL_STORE);
+    state.reload_from_disk().await;
+    assert!(state.reload_error().is_none());
+    assert!(Arc::ptr_eq(&state.snapshot(), &initial));
+}
+
 #[tokio::test]
 async fn remotes_reload_atomically_and_reject_duplicate_claims() {
     let directory = TestDirectory::new("remotes");
@@ -1799,8 +2004,8 @@ fn stale_candidate_fingerprint_is_rejected_before_publication() {
     );
 }
 
-#[test]
-fn post_mutation_stabilization_builds_publication_from_actual_disk_tree() {
+#[tokio::test]
+async fn post_mutation_stabilization_builds_publication_from_actual_disk_tree() {
     let directory = TestDirectory::new("post-mutation-actual-tree");
     let state = AgentDefinitionState::load(&directory.0, &[], "coding").unwrap();
     let requested = agent("coding", "requested");
@@ -1823,7 +2028,7 @@ fn post_mutation_stabilization_builds_publication_from_actual_disk_tree() {
         precomputed.persisted_fingerprint(),
         stabilized.persisted_fingerprint()
     );
-    state.publish(stabilized);
+    state.publish(stabilized).await;
     assert!(state.snapshot().catalog().resolved("extra").is_some());
 }
 

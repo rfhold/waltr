@@ -26,6 +26,7 @@ pub struct HostRuntimeBuilder {
     mcp_source_revision: Option<String>,
     mcp_skills_runtime: Option<std::sync::Arc<crate::agent_host::mcp::McpClientRuntime>>,
     mcp_resources_runtime: Option<(Arc<crate::agent_host::mcp::McpClientRuntime>, bool)>,
+    data_store_resource: Option<Capability>,
     base: waltr_agent::AgentRuntimeBuilder,
     model: ModelRef,
     model_cost: Option<ModelCost>,
@@ -71,6 +72,11 @@ impl HostRuntimeBuilder {
         self.mcp_resources_runtime = Some((runtime, ordinary));
         self
     }
+
+    pub(super) fn with_data_store_resource(mut self, capability: Capability) -> Self {
+        self.data_store_resource = Some(capability);
+        self
+    }
     /// Create a builder for a model.
     #[must_use]
     pub fn new<P>(model: ModelRef, provider: Arc<P>) -> Self
@@ -92,6 +98,7 @@ impl HostRuntimeBuilder {
             mcp_source_revision: None,
             mcp_skills_runtime: None,
             mcp_resources_runtime: None,
+            data_store_resource: None,
             base,
             model,
             model_cost: None,
@@ -416,7 +423,10 @@ impl HostRuntimeBuilder {
                 },
             ));
         }
-        if self.mcp_resources_runtime.is_some() || self.mcp_skills_runtime.is_some() {
+        let local_data_store = self.data_store_resource.is_some();
+        if let Some(capability) = self.data_store_resource.take() {
+            self.tools.push(capability);
+        } else if self.mcp_resources_runtime.is_some() || self.mcp_skills_runtime.is_some() {
             let ordinary = self
                 .mcp_resources_runtime
                 .as_ref()
@@ -449,13 +459,18 @@ impl HostRuntimeBuilder {
         );
         middleware_chain.extend(self.middleware_chain);
         if let Some((runtime, ordinary)) = self.mcp_resources_runtime {
+            use crate::agent_host::middleware::mcp_resources::McpResourcesMiddleware;
             middleware_chain.push(if ordinary {
-            crate::agent_host::middleware::mcp_resources::McpResourcesMiddleware::new(runtime)
-        } else {
-            crate::agent_host::middleware::mcp_resources::McpResourcesMiddleware::skill_references(runtime)
-        });
+                McpResourcesMiddleware::new(runtime).with_local_data_store(local_data_store)
+            } else {
+                McpResourcesMiddleware::skill_references(runtime)
+                    .with_local_data_store(local_data_store)
+            });
         } else if let Some(runtime) = self.mcp_skills_runtime.clone() {
-            middleware_chain.push(crate::agent_host::middleware::mcp_resources::McpResourcesMiddleware::skill_references(runtime));
+            middleware_chain.push(
+                crate::agent_host::middleware::mcp_resources::McpResourcesMiddleware::skill_references(runtime)
+                    .with_local_data_store(local_data_store),
+            );
         }
         if !self.agents_prompt_configs.is_empty() || !self.agents_read_roots.is_empty() {
             middleware_chain.push(

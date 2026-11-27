@@ -55,6 +55,11 @@ Code does not reset fuel or add ambient imports, filesystem, environment, or net
 The outer JSON output has a 64 KiB limit.
 Code returns chosen business data; concrete tool results retain their original durable content.
 
+`execute` accepts `transaction: "relational"` to bind ordinary first-party [datastore calls](../../../../../docs/architecture/data-stores.md#code-mode) to one native SQL transaction.
+The default, `transaction: "none"`, leaves datastore calls independent.
+Public code requires the same mutation scope as a direct public MCP call.
+Transactional code cannot call upstream tools, object operations, or helpers.
+
 ## Durability and cancellation
 
 The neutral agent fence persists before the handler runs.

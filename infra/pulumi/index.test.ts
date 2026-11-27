@@ -34,6 +34,7 @@ before(async () => {
     "waltr:databaseStorageSize": "1Gi",
     "waltr:s3Endpoint": "https://s3.example.test",
     "waltr:s3Prefix": "test/sessions",
+    "waltr:datastoreS3Prefix": "test/data-stores",
     "waltr:apiAudience": "waltr-api",
     "waltr:apiScope": "waltr:use",
     "waltr:mcpScope": "mcp:use",
@@ -367,6 +368,47 @@ describe("hosted MCP OAuth deployment", () => {
         (mount: any) => mount.name === "postgres-ca" && mount.readOnly === true,
       ),
     );
+  });
+
+  test("uses a separate datastore database and prefix on the existing services", () => {
+    const values = environment();
+    const applicationUrl = new URL(values.WALTR_DATABASE_URL as string);
+    const datastoreUrl = new URL(values.WALTR_DATASTORE_DATABASE_URL as string);
+    assert.equal(applicationUrl.pathname, "/waltr");
+    assert.equal(datastoreUrl.pathname, "/waltr_datastore");
+    datastoreUrl.pathname = applicationUrl.pathname;
+    assert.equal(datastoreUrl.href, applicationUrl.href);
+
+    const database = resourceByName("waltr-datastore-database").inputs;
+    assert.equal(database.kind, "Database");
+    assert.deepEqual(database.spec, {
+      name: "waltr_datastore",
+      owner: "app",
+      cluster: { name: "waltr-postgres" },
+      databaseReclaimPolicy: "retain",
+    });
+    assert.equal(
+      (database.metadata as any).annotations["pulumi.com/waitFor"],
+      "jsonpath={.status.applied}=true",
+    );
+
+    assert.equal(values.WALTR_DATASTORE_OBJECT_STORE, "s3");
+    assert.equal(values.WALTR_SESSION_S3_PREFIX, "test/sessions");
+    assert.equal(values.WALTR_DATASTORE_S3_PREFIX, "test/data-stores");
+    for (const key of [
+      "ENDPOINT",
+      "REGION",
+      "BUCKET",
+      "ACCESS_KEY_ID",
+      "SECRET_ACCESS_KEY",
+      "FORCE_PATH_STYLE",
+    ]) {
+      assert.ok(values[`WALTR_DATASTORE_S3_${key}`]);
+      assert.equal(
+        values[`WALTR_DATASTORE_S3_${key}`],
+        values[`WALTR_SESSION_S3_${key}`],
+      );
+    }
   });
 
   test("exports telemetry with the Pulumi stack as the deployment environment", () => {
@@ -703,6 +745,7 @@ describe("hosted MCP OAuth deployment", () => {
       );
     }
     assert.match(preview, /^\s*waltr:protectData: false$/m);
+    assert.match(preview, /^\s*waltr:datastoreS3Prefix: preview\/data-stores$/m);
     assert.match(
       preview,
       /^\s*waltr:appsHostname: preview-waltr-apps\.holdenitdown\.net$/m,
@@ -712,6 +755,7 @@ describe("hosted MCP OAuth deployment", () => {
       /^\s*waltr:appsHostname: waltr-apps\.holdenitdown\.net$/m,
     );
     assert.match(production, /^\s*waltr:protectData: true$/m);
+    assert.match(production, /^\s*waltr:datastoreS3Prefix: production\/data-stores$/m);
     assert.match(
       preview,
       /^\s*waltr:androidNativeRedirectUri: dev\.waltr\.app:\/oauth2redirect$/m,

@@ -22,6 +22,7 @@ const workspaceStorageSize = config.require("workspaceStorageSize");
 const databaseStorageSize = config.require("databaseStorageSize");
 const s3Endpoint = config.require("s3Endpoint");
 const s3Prefix = config.require("s3Prefix");
+const datastoreS3Prefix = config.require("datastoreS3Prefix");
 const apiAudience = config.require("apiAudience");
 const apiScope = config.require("apiScope");
 const mcpScope = config.require("mcpScope");
@@ -216,6 +217,28 @@ const database = new k8s.apiextensions.CustomResource(
   { dependsOn: [databaseCluster] },
 );
 
+const datastoreDatabaseName = "waltr_datastore";
+const datastoreDatabase = new k8s.apiextensions.CustomResource(
+  "waltr-datastore-database",
+  {
+    apiVersion: "postgresql.cnpg.io/v1",
+    kind: "Database",
+    metadata: {
+      name: "waltr-datastore",
+      namespace: namespace.metadata.name,
+      labels,
+      annotations: { "pulumi.com/waitFor": "jsonpath={.status.applied}=true" },
+    },
+    spec: {
+      name: datastoreDatabaseName,
+      owner: "app",
+      cluster: { name: "waltr-postgres" },
+      databaseReclaimPolicy: "retain",
+    },
+  },
+  { dependsOn: [databaseCluster], protect: protectData },
+);
+
 const data = new k8s.core.v1.PersistentVolumeClaim(
   "waltr-data",
   {
@@ -337,12 +360,17 @@ const decodeBucketSecret = (key: string) =>
   bucketSecret.data.apply((values) =>
     Buffer.from(values[key], "base64").toString("utf8"),
   );
-const databaseUrl = pulumi
-  .all([decodeSecret("username"), decodeSecret("password")])
-  .apply(
-    ([username, password]) =>
-      `postgresql://${encodeURIComponent(username)}:${encodeURIComponent(password)}@waltr-postgres-rw.${namespaceName}.svc:5432/waltr?sslmode=verify-full&sslrootcert=${encodeURIComponent(postgresCaFile)}`,
-  );
+const databaseUrlFor = (name: string) =>
+  pulumi
+    .all([decodeSecret("username"), decodeSecret("password")])
+    .apply(
+      ([username, password]) =>
+        `postgresql://${encodeURIComponent(username)}:${encodeURIComponent(password)}@waltr-postgres-rw.${namespaceName}.svc:5432/${name}?sslmode=verify-full&sslrootcert=${encodeURIComponent(postgresCaFile)}`,
+    );
+const databaseUrl = databaseUrlFor("waltr");
+const s3BucketName = bucketConfig.data.apply((values) => values.BUCKET_NAME);
+const s3AccessKeyId = decodeBucketSecret("AWS_ACCESS_KEY_ID");
+const s3SecretAccessKey = decodeBucketSecret("AWS_SECRET_ACCESS_KEY");
 
 const wrappingKeys = wrappingKeyVersions.map((version) => ({
   version,
@@ -386,6 +414,7 @@ const appSecret = new k8s.core.v1.Secret(
     stringData: {
       WALTR_DATABASE_URL: databaseUrl,
       WALTR_MCP_DATABASE_URL: databaseUrl,
+      WALTR_DATASTORE_DATABASE_URL: databaseUrlFor(datastoreDatabaseName),
       WALTR_SANDBOX_SOCKET: sandboxSocket,
       WALTR_WORKSPACE_ROOT: workspaceRoot,
       WALTR_AUTH_MODE: "oidc",
@@ -419,19 +448,23 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_SESSION_STORE: "s3",
       WALTR_SESSION_S3_ENDPOINT: s3Endpoint,
       WALTR_SESSION_S3_REGION: "us-east-1",
-      WALTR_SESSION_S3_BUCKET: bucketConfig.data.apply(
-        (values) => values.BUCKET_NAME,
-      ),
+      WALTR_SESSION_S3_BUCKET: s3BucketName,
       WALTR_SESSION_S3_PREFIX: s3Prefix,
-      WALTR_SESSION_S3_ACCESS_KEY_ID: decodeBucketSecret("AWS_ACCESS_KEY_ID"),
-      WALTR_SESSION_S3_SECRET_ACCESS_KEY: decodeBucketSecret(
-        "AWS_SECRET_ACCESS_KEY",
-      ),
+      WALTR_SESSION_S3_ACCESS_KEY_ID: s3AccessKeyId,
+      WALTR_SESSION_S3_SECRET_ACCESS_KEY: s3SecretAccessKey,
       WALTR_SESSION_S3_FORCE_PATH_STYLE: "true",
       WALTR_SESSION_S3_WRITE_MODE: "single-writer",
+      WALTR_DATASTORE_OBJECT_STORE: "s3",
+      WALTR_DATASTORE_S3_ENDPOINT: s3Endpoint,
+      WALTR_DATASTORE_S3_REGION: "us-east-1",
+      WALTR_DATASTORE_S3_BUCKET: s3BucketName,
+      WALTR_DATASTORE_S3_PREFIX: datastoreS3Prefix,
+      WALTR_DATASTORE_S3_ACCESS_KEY_ID: s3AccessKeyId,
+      WALTR_DATASTORE_S3_SECRET_ACCESS_KEY: s3SecretAccessKey,
+      WALTR_DATASTORE_S3_FORCE_PATH_STYLE: "true",
     },
   },
-  { dependsOn: [database, data, browserApp, nativeApp] },
+  { dependsOn: [database, datastoreDatabase, data, browserApp, nativeApp] },
 );
 
 const deployment = new k8s.apps.v1.Deployment(

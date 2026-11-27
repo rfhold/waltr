@@ -6,6 +6,7 @@ use waltr_agent::*;
 mod builder;
 mod capability;
 mod context;
+mod datastore;
 pub mod definition;
 pub mod dispatcher;
 pub mod external_journal;

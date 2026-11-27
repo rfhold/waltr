@@ -215,12 +215,41 @@ impl AuthenticatedPrincipal {
         })
     }
 
+    pub(crate) async fn revalidate_datastore_access(&self) -> bool {
+        use futures_util::FutureExt as _;
+        if self.access_ended().now_or_never().is_some() {
+            return false;
+        }
+        if let Some(proof) = &self.hosted_mcp {
+            return matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), proof.is_active()).await,
+                Ok(true)
+            );
+        }
+        if let PrincipalLease::Browser {
+            store,
+            token_digest,
+            ..
+        } = &self.lease
+        {
+            return matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    store.is_browser_session_active(token_digest, SystemTime::now())
+                )
+                .await,
+                Ok(Ok(true))
+            ) && self.access_ended().now_or_never().is_none();
+        }
+        true
+    }
+
     /// Bind the exact hosted OAuth subject and its original validated credential.
     pub(crate) fn hosted_mcp(issuer: &str, proof: mcp::server::McpTokenAuthorization) -> Self {
         Self {
             issuer: issuer.to_owned(),
             subject: proof.principal_id.as_str().to_owned(),
-            scopes: BTreeSet::new(),
+            scopes: proof.scopes.clone(),
             method: AuthenticationMethod::BearerAccessToken,
             lease: proof
                 .expires_at
@@ -298,6 +327,27 @@ impl AuthenticatedPrincipal {
         McpPrincipalId::new(principal_id).expect("SHA-256 principal identifiers are always valid")
     }
 
+    /// Resolve the actor behind this access proof, independent of the transport.
+    pub(crate) fn datastore_actor(&self) -> Option<waltr_datastore::Actor> {
+        let key = match self.method {
+            AuthenticationMethod::AnonymousDisabled => return None,
+            // The partition also lives under the app profile's private storage roots.
+            AuthenticationMethod::LocalProcessBearer => "local-profile-v1".to_owned(),
+            _ => {
+                let id = self.hosted_mcp.as_ref().map_or_else(
+                    || self.mcp_principal_id(),
+                    |proof| proof.principal_id.clone(),
+                );
+                let id = id.as_str().strip_prefix("waltr-v1:")?;
+                if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
+                }
+                format!("user-v1-{id}")
+            }
+        };
+        waltr_datastore::Actor::from_trusted_key(key).ok()
+    }
+
     /// Return the validated bearer-token expiry, when this is bearer evidence.
     #[must_use]
     pub const fn bearer_expires_at(&self) -> Option<SystemTime> {
@@ -356,6 +406,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn datastore_hosted_lease_checks_revocation_without_notification() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let active = Arc::new(AtomicBool::new(true));
+        let status = active.clone();
+        let (_notify, notifications) = tokio::sync::watch::channel(0);
+        let principal = AuthenticatedPrincipal::hosted_mcp(
+            "https://issuer.example",
+            mcp::server::McpTokenAuthorization {
+                principal_id: mcp::McpPrincipalId::new("owner").unwrap(),
+                scopes: BTreeSet::new(),
+                expires_at: None,
+                revocation: Some(mcp::server::McpRevocationLease::new(
+                    move || {
+                        let valid = status.load(Ordering::Acquire);
+                        Box::pin(async move { Ok(valid) })
+                    },
+                    std::time::Duration::from_secs(60),
+                    notifications,
+                )),
+            },
+        );
+        assert!(principal.revalidate_datastore_access().await);
+        active.store(false, Ordering::Release);
+        assert!(!principal.revalidate_datastore_access().await);
+    }
+
+    #[tokio::test]
     async fn access_ended_browser_logout_and_store_revalidation_survive_waiter_drop() {
         use super::super::{BrowserSession, lease::RevocationRegistry};
         use std::{sync::Arc, time::Duration};
@@ -394,6 +474,7 @@ mod tests {
             );
             drop(principal.access_ended());
             assert!(!signal.is_cancelled());
+            assert!(principal.revalidate_datastore_access().await);
             let waiting = principal.access_ended();
             if immediate {
                 registry.cancel(&digest);
@@ -403,6 +484,7 @@ mod tests {
                     .await
                     .unwrap();
             }
+            assert!(!principal.revalidate_datastore_access().await);
             tokio::time::timeout(Duration::from_secs(2), waiting)
                 .await
                 .unwrap();

@@ -288,6 +288,7 @@ async fn owned_origin_retains_original_revocation_after_waiter_drop() -> mcp::Re
             Box::pin(async move {
                 McpHostedTokenValidation::Authorized(McpTokenAuthorization {
                     principal_id: McpPrincipalId::new("original-revocable-origin").unwrap(),
+                    scopes: Default::default(),
                     expires_at: None,
                     revocation: Some(McpRevocationLease::new(
                         || Box::pin(async { Ok(false) }),
@@ -626,6 +627,7 @@ async fn token_revocation_terminates_the_active_request_stream() -> mcp::Result<
             Box::pin(async move {
                 McpHostedTokenValidation::Authorized(McpTokenAuthorization {
                     principal_id: McpPrincipalId::new("revoked-spec").expect("principal"),
+                    scopes: Default::default(),
                     expires_at: None,
                     revocation: Some(McpRevocationLease::new(
                         || Box::pin(async { Ok(false) }),

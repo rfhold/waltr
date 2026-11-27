@@ -3,7 +3,7 @@
 use crate::{
     LocalBearer, ServerApplication,
     access_auth::AccessAuthenticator,
-    app::{AppServices, LocalAdmission, assemble_app},
+    app::{AppServices, LocalAdmission, assemble_embedded_app},
     auth::OutboundOAuthConfig,
     catalog::{CatalogLoader, CatalogMaterializer},
     config_service::ConfigService,
@@ -168,6 +168,8 @@ where
     tokio::fs::create_dir_all(&config.workspace_root)
         .await
         .map_err(|_| EmbeddedBuildError::Paths)?;
+    // Resolve aliases of the now-existing workspace before initializing storage.
+    validate_paths(&config)?;
     let self_mcp_source = self_mcp_resource(&self_mcp_url);
     provision_persisted_resource(
         &config.resources_root,
@@ -180,6 +182,11 @@ where
         config.mcp_database_path,
     )
     .map_err(|_| EmbeddedBuildError::Persistence)?;
+    let data_store_root = config.waltr_database_path.parent().ok_or(EmbeddedBuildError::Paths)?;
+    database.validate_datastore_sqlite_path(&data_store_root.join("datastore.sqlite3"))
+        .map_err(|_| EmbeddedBuildError::Paths)?;
+    let data_stores = crate::datastore::Storage::local(data_store_root).await
+        .map_err(|_| EmbeddedBuildError::Persistence)?;
     let object_root = config
         .waltr_database_path
         .parent()
@@ -216,7 +223,7 @@ where
     let session_root = config.session_root;
     let workspace_root = config.workspace_root;
     let bearer = config.local_bearer;
-    let application = assemble_app(
+    let application = assemble_embedded_app(
         AppServices {
             config_service,
             persistence,
@@ -239,6 +246,7 @@ where
                 .to_owned(),
         },
         move |routes, input| register(routes, input, session_root),
+        data_stores,
     )
     .await
     .map_err(|_| EmbeddedBuildError::Application)?;
@@ -271,6 +279,17 @@ fn validate_paths(config: &EmbeddedServerConfig) -> Result<(), EmbeddedBuildErro
     };
     if paths.iter().any(|path| !path.is_absolute()) || !catalog_path_absolute {
         return Err(EmbeddedBuildError::Paths);
+    }
+    let data_root = config
+        .waltr_database_path
+        .parent()
+        .ok_or(EmbeddedBuildError::Paths)?;
+    for name in ["datastore.sqlite3", "data-store-objects"] {
+        crate::datastore::Storage::validate_workspace_path(
+            &config.workspace_root,
+            &data_root.join(name),
+        )
+        .map_err(|_| EmbeddedBuildError::Paths)?;
     }
     Ok(())
 }

@@ -90,7 +90,9 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         mcp_metadata["authorization_servers"],
         json!(["https://waltr.example/oauth"])
     );
-    assert_eq!(mcp_metadata["scopes_supported"], json!(["mcp:use"]));
+    let scopes = mcp_metadata["scopes_supported"].as_array().unwrap();
+    assert!(scopes.contains(&json!("mcp:use")));
+    assert!(scopes.contains(&json!("datastore:destroy:object.delete")));
 
     let authorization_metadata = client
         .get(server.url("/.well-known/oauth-authorization-server/oauth"))

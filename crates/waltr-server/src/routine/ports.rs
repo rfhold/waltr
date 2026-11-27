@@ -6,6 +6,7 @@ use super::{
 };
 use serde_json::Value;
 use std::{future::Future, pin::Pin, sync::Arc};
+use tokio_util::sync::CancellationToken;
 use waltr_script::{HostContext, HostDispatcher, HostReply, HostRequest};
 
 /// Owned Send future for object-safe consumer ports.
@@ -159,6 +160,15 @@ pub trait Reservation: Send + Sync {
     }
     /// Verify owner/pause release after joined host cleanup.
     fn finalize(&self, interrupted: bool) -> PortFuture<()>;
+    /// Settle invocation-owned effects after cleanup, before publishing the terminal outcome.
+    /// A candidate result requests commit; absence requests rollback, even on cleanup failure.
+    fn settle(
+        &self,
+        _candidate: Option<&Value>,
+        _cancel: CancellationToken,
+    ) -> Option<PortFuture<()>> {
+        None
+    }
 }
 /// Supplied adapter owns exact operation schemas, current authorization and safe
 /// history projections. Unknown operations must be denied, never forwarded raw.

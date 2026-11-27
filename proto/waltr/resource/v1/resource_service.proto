@@ -24,6 +24,7 @@ enum ResourceKind {
   reserved 8;
   reserved "RESOURCE_KIND_WORKSPACE_BINDING";
   RESOURCE_KIND_REMOTE = 9;
+  RESOURCE_KIND_DATA_STORE = 10;
 }
 
 enum ResourceOrigin {

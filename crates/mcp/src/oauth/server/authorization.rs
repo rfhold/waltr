@@ -1796,6 +1796,7 @@ async fn validate_hosted_token(
     };
     match state.store.validate_access_token(validation.clone()).await {
         Ok(true) => {
+            let verified_scopes = validation.scopes.iter().cloned().collect();
             let notifications = state.revocations.subscribe();
             let interval = state.config.revocation_poll_interval;
             let store = state.store.clone();
@@ -1820,6 +1821,7 @@ async fn validate_hosted_token(
             );
             McpHostedTokenValidation::Authorized(McpTokenAuthorization {
                 principal_id,
+                scopes: verified_scopes,
                 expires_at: UNIX_EPOCH.checked_add(Duration::from_secs(claims.exp)),
                 revocation: Some(lease),
             })

@@ -226,6 +226,8 @@ Zero means no output bytes were admitted; positive values prove neither client r
 
 ## Code
 
+[DataStore transactions](data-stores.md#code-mode) use an explicit selector on `code.execute`.
+
 `spec.features: [{codeMode: true}]` opts a normal agent into the optional code tool. The host additionally configures the exact principal, durable session incarnation, profile and normal permission intersection. An absent feature adds no tool. No principal-scoped code adapter is shared globally across callers. Public MCP code exposure remains optional and is not enabled by default.
 
 For hosted MCP, the generic context carries the validated opaque subject and original token lifetime proof. Host configuration matches that subject and configured issuer; metadata cannot supply authority. `RoutineCodeGrant.public_mcp_session` may select one explicitly granted, opted-in durable session for public code. Discovery is principal-specific and calls bind a fresh adapter through that session's normal runtime. No guest session or profile selector is accepted. Ordinary admitted session create/send prompts are durable and do not inherit access-token expiry cancellation. Explicit code/helper/Routine leases retain exact cancellation and join ownership; concurrent origins do not replace each other's leases. Interrupted code retains sticky uncertainty, not success or replay.

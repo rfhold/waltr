@@ -42,6 +42,7 @@ pub(super) const fn proto_kind(kind: ResourceKind) -> resource_proto::ResourceKi
         ResourceKind::Defaults => resource_proto::ResourceKind::Defaults,
         ResourceKind::Routine => resource_proto::ResourceKind::Routine,
         ResourceKind::Remote => resource_proto::ResourceKind::Remote,
+        ResourceKind::DataStore => resource_proto::ResourceKind::DataStore,
     }
 }
 

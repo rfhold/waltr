@@ -379,11 +379,19 @@ S3 keys use `<prefix>/routine-objects/program/<sha256>` and `<prefix>/routine-ob
 
 Backup and retention cover both SQL references and payload objects. Failed publication can leave retained unreferenced objects; no collector exists. Migration 0016 rejects populated incompatible Routine state before destructive schema changes. No automatic conversion or wipe exists. Use the [cutover runbook](runbooks/server-capability-cutover.md) for separate archive/reset approval boundaries. See [persistence](architecture/persistence.md#routine-payload-objects) for integrity and publication ordering.
 
+## DataStore Backends
+
+Standalone and embedded servers include DataStore support. See [DataStore deployment](architecture/data-stores.md#deployment) for backend variables and backup scope.
+Use a separate SQLite file or the datastore-owned PostgreSQL schema. Keep filesystem roots and S3 prefixes separate from workspace and session storage.
+The Preview and Prod Pulumi stacks create a separate `waltr_datastore` database on each stack's PostgreSQL cluster. The deployment waits for CloudNativePG to apply the database before it supplies the connection URL to Waltr.
+Each stack reuses its own session bucket. Preview uses `preview/data-stores/` and Prod uses `production/data-stores/`. These prefixes do not change session or PostgreSQL backup paths. Verify backup and restore coverage for DataStore objects and receipts separately.
+Before you publish a definition, verify that every server and catalog reader accepts `DataStore`. Test object create-only behavior on the selected S3-compatible service.
+
 ## Resource Catalog
 
 The server embeds one YAML catalog under [`crates/waltr-server/resources`](../crates/waltr-server/resources/). Persisted overrides live under `.waltr/resources` at the server root.
 
-The catalog uses `agents`, `features`, `permissions`, `providers`, `mcp-servers`, `defaults`, and `routines`. Only `defaults/default.yaml` is valid in the defaults category.
+The catalog uses `agents`, `features`, `permissions`, `providers`, `mcp-servers`, `defaults`, `routines`, and `data-stores`. Only `defaults/default.yaml` is valid in the defaults category.
 
 Each persisted file contains one strict YAML document. Its category, `kind`, filename stem, and identity must agree. Routine identity is top-level `name` under `apiVersion: waltr.routine/v1`; other resources use `metadata.name`.
 

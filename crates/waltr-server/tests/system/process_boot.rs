@@ -474,6 +474,13 @@ fn isolated_server_command(
     command
         .env("WALTR_SERVER_ADDR", addr.to_string())
         .env("WALTR_DATABASE_URL", database_url)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env(
+            "WALTR_DATASTORE_DATABASE_URL",
+            format!("sqlite:{}", root.join("data/datastore.sqlite3").display()),
+        )
+        .env("WALTR_DATASTORE_OBJECT_STORE", "filesystem")
+        .env("WALTR_DATASTORE_OBJECT_ROOT", root.join("data/datastore-objects"))
         .env("WALTR_MODELS_DEV_PATH", catalog_path)
         .env_remove("WALTR_MCP_DATABASE_URL")
         .env("WALTR_SESSION_STORE", "memory")

@@ -156,6 +156,7 @@ pub enum ResourceKind {
     Defaults = 6,
     Routine = 7,
     Remote = 9,
+    DataStore = 10,
 }
 impl ResourceKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -173,6 +174,7 @@ impl ResourceKind {
             Self::Defaults => "RESOURCE_KIND_DEFAULTS",
             Self::Routine => "RESOURCE_KIND_ROUTINE",
             Self::Remote => "RESOURCE_KIND_REMOTE",
+            Self::DataStore => "RESOURCE_KIND_DATA_STORE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -187,6 +189,7 @@ impl ResourceKind {
             "RESOURCE_KIND_DEFAULTS" => Some(Self::Defaults),
             "RESOURCE_KIND_ROUTINE" => Some(Self::Routine),
             "RESOURCE_KIND_REMOTE" => Some(Self::Remote),
+            "RESOURCE_KIND_DATA_STORE" => Some(Self::DataStore),
             _ => None,
         }
     }

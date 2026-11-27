@@ -39,6 +39,8 @@ The catalog accepts direct, regular, nonsymlink files with the exact `.yaml` suf
 
 Bundled resources supply the base catalog. A persisted file replaces the bundled resource at the same exact path. A reset removes that override and reveals the bundle.
 
+[`DataStore`](data-stores.md) definitions use `data-stores/<name>.yaml`. A catalog reset does not delete datastore contents.
+
 A persisted path without a bundled counterpart adds a resource. Reset removes that resource from the effective catalog.
 
 Waltr does not merge resource fields. Waltr does not support aggregate patches, TOML configuration, automatic import, or compatibility configuration APIs.

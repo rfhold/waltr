@@ -364,6 +364,7 @@ pub struct ServerAgentRuntimeFactory {
     restriction: Option<PermissionPolicy>,
     concrete_only: bool,
     self_mcp: Arc<std::sync::OnceLock<crate::self_mcp::SelfMcpBinding>>,
+    data_stores: Option<super::datastore::BoundDataStores>,
     pub(crate) run_events: Option<Arc<dyn crate::agent_host::SessionEventSink>>,
     pub(crate) run_completion: Option<Arc<dyn super::SessionCompletionCoordinationHandler>>,
 }
@@ -495,6 +496,15 @@ impl ServerAgentRuntimeFactory {
         );
     }
 
+    pub(crate) fn with_data_stores(
+        mut self,
+        stores: Arc<crate::datastore::DataStores>,
+        principal: crate::access_auth::AuthenticatedPrincipal,
+    ) -> Self {
+        self.data_stores = Some(super::datastore::BoundDataStores::new(stores, principal));
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn self_mcp_test_binding(&self) -> Option<crate::self_mcp::SelfMcpBinding> {
         self.self_mcp.get().cloned()
@@ -597,6 +607,7 @@ impl ServerAgentRuntimeFactory {
             restriction: None,
             concrete_only: false,
             self_mcp: Arc::new(std::sync::OnceLock::new()),
+            data_stores: None,
             run_events: None,
             run_completion: None,
         }
@@ -1154,6 +1165,35 @@ impl ServerAgentRuntimeFactory {
                 );
             }
         }
+        let local_mcp = definition
+            .features
+            .mcp
+            .as_ref()
+            .filter(|mcp| match &mcp.servers {
+                McpServerSelection::Include(names) => names.contains(super::datastore::SERVER),
+                McpServerSelection::Exclude(names) => !names.contains(super::datastore::SERVER),
+            });
+        let data_stores = factory
+            .data_stores
+            .as_ref()
+            .filter(|_| !factory.concrete_only && routine.is_none());
+        let mut datastore_groups = Vec::new();
+        if let (Some(_), Some(mcp)) = (data_stores, local_mcp) {
+            if mcp.expose_tools && definition.features.code_mode != Some(true) {
+                for group in super::datastore::GROUPS {
+                    let alias = super::datastore::group_alias(group, &mcp_tool_names);
+                    mcp_tool_names.push(alias.clone());
+                    datastore_groups.push((group, alias));
+                }
+            }
+            if mcp.resources
+                && !mcp_tool_names
+                    .iter()
+                    .any(|name| name == "read_mcp_resource")
+            {
+                mcp_tool_names.push("read_mcp_resource".into());
+            }
+        }
         let mut policy =
             factory.definition_permission_policy(&definition, builder.model(), &mcp_tool_names);
         if let Some(restriction) = &factory.restriction {
@@ -1162,6 +1202,22 @@ impl ServerAgentRuntimeFactory {
         let dispatch_policy = routine
             .map(|policy| policy as Arc<dyn super::dispatcher::CapabilityPolicy>)
             .unwrap_or_else(|| factory.policy.clone());
+        if let (Some(stores), Some(mcp)) = (data_stores, local_mcp) {
+            for (group, alias) in datastore_groups {
+                if let Some(tool) =
+                    stores.group(group, alias, policy.clone(), dispatch_policy.clone())
+                {
+                    builder = builder.with_tool(tool);
+                }
+            }
+            if mcp.resources {
+                builder = builder.with_data_store_resource(stores.resource(
+                    super::middleware::mcp_resources::McpResourcesMiddleware::definition(true),
+                    policy.clone(),
+                    dispatch_policy.clone(),
+                ));
+            }
+        }
         let mut builder = builder
             .with_permission_policy(policy)
             .with_dispatch_context(Some(record.id.clone()), dispatch_policy);

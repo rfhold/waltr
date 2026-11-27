@@ -19,6 +19,7 @@ use waltr::grpc::waltr::resource::v1 as resource_proto;
 pub use super::error::AgentDefinitionLoadError;
 use super::{
     agent::compile_catalog,
+    data_store::ActiveDataStore,
     materialize::{
         invalid_value, materialize_defaults, materialize_mcp_server, materialize_provider,
         materialized_snapshot_etag, proto_kind, proto_resource, yaml_json,
@@ -222,6 +223,8 @@ pub enum ResourceKind {
     Routine,
     /// Outbound remote.
     Remote,
+    /// Logical object or relational datastore.
+    DataStore,
 }
 
 impl fmt::Display for ResourceKind {
@@ -235,6 +238,7 @@ impl fmt::Display for ResourceKind {
             Self::Defaults => "Defaults",
             Self::Routine => "Routine",
             Self::Remote => "Remote",
+            Self::DataStore => "DataStore",
         })
     }
 }
@@ -317,6 +321,7 @@ pub struct AgentDefinitionSnapshot {
     routine_incarnations: BTreeMap<String, Uuid>,
     remotes: BTreeMap<String, Remote>,
     remote_incarnations: BTreeMap<String, Uuid>,
+    data_stores: BTreeMap<String, ActiveDataStore>,
     etag: String,
 }
 
@@ -373,6 +378,18 @@ impl AgentDefinitionSnapshot {
         self.remote_incarnations.get(key).copied()
     }
 
+    /// Look up one validated DataStore in this snapshot.
+    #[must_use]
+    pub fn data_store(&self, name: &str) -> Option<&ActiveDataStore> {
+        self.data_stores.get(name)
+    }
+
+    /// List the active DataStores by resource name.
+    #[must_use]
+    pub const fn data_stores(&self) -> &BTreeMap<String, ActiveDataStore> {
+        &self.data_stores
+    }
+
     /// Return the materialized aggregate snapshot `ETag`.
     #[must_use]
     pub fn etag(&self) -> &str {
@@ -427,6 +444,10 @@ pub(super) struct AgentDefinitionStateInner {
     default_agent: String,
     published: RwLock<PublishedState>,
     maintenance: tokio::sync::Mutex<()>,
+    // Keep the last admitted contract after removal so a new activation cannot reinterpret it.
+    data_store_contracts: RwLock<BTreeMap<String, Arc<waltr_datastore::Definition>>>,
+    data_store_storage: std::sync::OnceLock<waltr_datastore::relational::Relational>,
+    data_store_publication: tokio::sync::RwLock<()>,
     bundled: BTreeMap<String, String>,
     materializer: Option<CatalogMaterializer>,
     updates: tokio::sync::broadcast::Sender<PublishedState>,
@@ -465,6 +486,7 @@ impl AgentDefinitionState {
             None,
         )?;
         let (updates, _) = tokio::sync::broadcast::channel(32);
+        let data_store_contracts = RwLock::new(data_store_contracts(&snapshot));
         Ok(Self {
             inner: Arc::new(AgentDefinitionStateInner {
                 resources_root,
@@ -476,6 +498,9 @@ impl AgentDefinitionState {
                     persisted: Arc::new(persisted),
                 }),
                 maintenance: tokio::sync::Mutex::new(()),
+                data_store_storage: std::sync::OnceLock::new(),
+                data_store_publication: tokio::sync::RwLock::new(()),
+                data_store_contracts,
                 bundled,
                 materializer: None,
                 updates,
@@ -509,6 +534,7 @@ impl AgentDefinitionState {
             Some(&materializer),
         )?;
         let (updates, _) = tokio::sync::broadcast::channel(32);
+        let data_store_contracts = RwLock::new(data_store_contracts(&snapshot));
         Ok(Self {
             inner: Arc::new(AgentDefinitionStateInner {
                 resources_root,
@@ -520,6 +546,9 @@ impl AgentDefinitionState {
                     persisted: Arc::new(persisted),
                 }),
                 maintenance: tokio::sync::Mutex::new(()),
+                data_store_storage: std::sync::OnceLock::new(),
+                data_store_publication: tokio::sync::RwLock::new(()),
+                data_store_contracts,
                 bundled,
                 materializer: Some(materializer),
                 updates,
@@ -550,6 +579,7 @@ impl AgentDefinitionState {
             Some(&materializer),
         )?;
         let (updates, _) = tokio::sync::broadcast::channel(32);
+        let data_store_contracts = RwLock::new(data_store_contracts(&snapshot));
         Ok(Self {
             inner: Arc::new(AgentDefinitionStateInner {
                 resources_root,
@@ -561,6 +591,9 @@ impl AgentDefinitionState {
                     persisted: Arc::new(persisted),
                 }),
                 maintenance: tokio::sync::Mutex::new(()),
+                data_store_storage: std::sync::OnceLock::new(),
+                data_store_publication: tokio::sync::RwLock::new(()),
+                data_store_contracts,
                 bundled,
                 materializer: Some(materializer),
                 updates,
@@ -668,6 +701,17 @@ impl AgentDefinitionState {
                         incarnation.map(|incarnation| (key.clone(), incarnation))
                     })
                     .collect();
+                for (name, store) in &mut snapshot.data_stores {
+                    if let Some(active) = previous.data_store(name) {
+                        store.activation = active.activation();
+                        store.definition = Arc::clone(&active.definition);
+                    }
+                }
+                self.inner
+                    .data_store_contracts
+                    .write()
+                    .expect("datastore contract lock poisoned")
+                    .extend(data_store_contracts(&snapshot));
                 published.snapshot = Arc::new(snapshot);
             }
             if let Some(persisted) = persisted {
@@ -834,12 +878,13 @@ impl AgentDefinitionState {
         }
         let observed_fingerprint = tree_fingerprint(&persisted);
         persisted.insert(path.to_owned(), source.clone());
-        drop(self.build_candidate(&persisted)?);
+        self.verify_data_stores(&self.build_candidate(&persisted)?, false).await?;
         self.ensure_tree_unchanged(&observed_fingerprint)?;
         atomic_write(&self.inner.resources_root, path, source.as_bytes())?;
         let candidate = self
             .stabilize_after_mutation(path, PersistedSlotPostcondition::Exact(source.as_str()))?;
-        self.publish(candidate);
+        self.verify_data_stores(&candidate, true).await.map_err(|e| self.recorded_error(e))?;
+        self.publish(candidate).await;
         self.inspect_detail(path)
     }
 
@@ -863,7 +908,7 @@ impl AgentDefinitionState {
         check_expected_etag(path, persisted.get(path), expected_etag)?;
         let observed_fingerprint = tree_fingerprint(&persisted);
         persisted.remove(path);
-        drop(self.build_candidate(&persisted)?);
+        self.verify_data_stores(&self.build_candidate(&persisted)?, false).await?;
         self.ensure_tree_unchanged(&observed_fingerprint)?;
         let target = resource_disk_path(&self.inner.resources_root, path);
         match fs::remove_file(&target) {
@@ -877,21 +922,68 @@ impl AgentDefinitionState {
             }
         }
         let candidate = self.stabilize_after_mutation(path, PersistedSlotPostcondition::Absent)?;
-        self.publish(candidate);
+        self.verify_data_stores(&candidate, true).await.map_err(|e| self.recorded_error(e))?;
+        self.publish(candidate).await;
         self.inspect_detail(path)
+    }
+
+    pub(crate) async fn install_data_store_storage(
+        &self,
+        storage: waltr_datastore::relational::Relational,
+    ) -> Result<(), AgentDefinitionLoadError> {
+        let _maintenance = self.inner.maintenance.lock().await;
+        let snapshot = self.snapshot();
+        storage.ensure_definitions(data_store_definitions(&snapshot))
+            .await.map_err(data_store_storage_error)?;
+        self.inner.data_store_storage.set(storage)
+            .map_err(|_| invalid_value("data-stores", "DataStore backend already initialized".into()))
+    }
+
+    async fn verify_data_stores(
+        &self,
+        candidate: &AgentDefinitionSnapshot,
+        register: bool,
+    ) -> Result<(), AgentDefinitionLoadError> {
+        let Some(storage) = self.inner.data_store_storage.get() else { return Ok(()) };
+        let snapshot = self.snapshot();
+        if data_store_definitions(candidate).eq(data_store_definitions(&snapshot)) {
+            return Ok(());
+        }
+        if register {
+            storage.ensure_definitions(data_store_definitions(candidate)).await
+        } else {
+            storage.check_definitions(data_store_definitions(candidate)).await
+        }.map_err(data_store_storage_error)
     }
 
     fn build_candidate(
         &self,
         persisted: &BTreeMap<String, String>,
     ) -> Result<AgentDefinitionSnapshot, AgentDefinitionLoadError> {
-        build_snapshot(
+        let candidate = build_snapshot(
             self.inner.bundled.clone(),
             persisted,
             &self.inner.external_sources,
             &self.inner.default_agent,
             self.inner.materializer.as_ref(),
-        )
+        )?;
+        let contracts = self
+            .inner
+            .data_store_contracts
+            .read()
+            .expect("datastore contract lock poisoned");
+        for (name, store) in candidate.data_stores() {
+            if contracts
+                .get(name)
+                .is_some_and(|definition| definition != &store.definition)
+            {
+                return Err(invalid_value(
+                    &format!("data-stores/{name}.yaml"),
+                    "DataStore type, scope, or schema changes require an offline migration".into(),
+                ));
+            }
+        }
+        Ok(candidate)
     }
 
     fn discover_persisted(&self) -> Result<BTreeMap<String, String>, AgentDefinitionLoadError> {
@@ -947,7 +1039,12 @@ impl AgentDefinitionState {
         Err(self.recorded_error(AgentDefinitionLoadError::ConcurrentFilesystemChange))
     }
 
-    fn publish(&self, snapshot: AgentDefinitionSnapshot) {
+    pub(crate) async fn fence_data_store_commit(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.inner.data_store_publication.read().await
+    }
+
+    async fn publish(&self, snapshot: AgentDefinitionSnapshot) {
+        let _fence = self.inner.data_store_publication.write().await;
         let persisted = self.discover_persisted().ok();
         self.update_publication(Some(snapshot), persisted, None);
     }
@@ -994,7 +1091,11 @@ impl AgentDefinitionState {
             if tree_fingerprint(&current) != fingerprint {
                 continue;
             }
-            self.publish(candidate);
+            if let Err(error) = self.verify_data_stores(&candidate, true).await {
+                self.record_reload_error_with_persisted(error.to_string(), persisted);
+                return;
+            }
+            self.publish(candidate).await;
             return;
         }
         self.record_reload_error(
@@ -1019,6 +1120,16 @@ impl AgentDefinitionState {
         self.record_reload_error(error.to_string());
         error
     }
+}
+
+fn data_store_definitions(
+    snapshot: &AgentDefinitionSnapshot,
+) -> impl Iterator<Item = (&str, &waltr_datastore::Definition)> {
+    snapshot.data_stores().iter().map(|(name, store)| (name.as_str(), store.definition()))
+}
+
+fn data_store_storage_error(error: waltr_datastore::Error) -> AgentDefinitionLoadError {
+    invalid_value("data-stores", format!("DataStore backend rejected the catalog: {error}"))
 }
 
 /// JSON-ready inspection result.
@@ -1184,6 +1295,16 @@ fn unified_bundled_resources() -> BTreeMap<String, String> {
         .collect()
 }
 
+fn data_store_contracts(
+    snapshot: &AgentDefinitionSnapshot,
+) -> BTreeMap<String, Arc<waltr_datastore::Definition>> {
+    snapshot
+        .data_stores()
+        .iter()
+        .map(|(name, store)| (name.clone(), Arc::clone(&store.definition)))
+        .collect()
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "snapshot construction keeps cross-kind materialization and atomic validation together"
@@ -1206,6 +1327,7 @@ fn build_snapshot(
     let mut configuration = config_proto::Configuration::default();
     let mut scripts = BTreeMap::new();
     let mut remotes = BTreeMap::new();
+    let mut data_stores = BTreeMap::new();
     let mut workspace_claims = BTreeMap::new();
     let script_engine = waltr_script::Engine::new(1)
         .map_err(|_| invalid_value("routines", "script validation engine unavailable".into()))?;
@@ -1239,6 +1361,10 @@ fn build_snapshot(
                 let value = binding.effective_value();
                 remotes.insert(key.name.clone(), binding);
                 value
+            }
+            ResourceKind::DataStore => {
+                data_stores.insert(key.name.clone(), ActiveDataStore::parse(&source, &path)?);
+                yaml_json(&source, &path)?
             }
             ResourceKind::Provider => {
                 let provider = materialize_provider(&source, &path, materializer)?;
@@ -1404,6 +1530,7 @@ fn build_snapshot(
         routine_incarnations,
         remotes,
         remote_incarnations: BTreeMap::new(),
+        data_stores,
         etag,
     })
 }

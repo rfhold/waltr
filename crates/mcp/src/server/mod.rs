@@ -907,6 +907,8 @@ enum HttpTokenAuthorizer {
 pub struct McpTokenAuthorization {
     /// Stable session owner.
     pub principal_id: McpPrincipalId,
+    /// Scopes verified for this exact credential, not just endpoint requirements.
+    pub scopes: std::collections::BTreeSet<String>,
     /// Credential expiry.
     pub expires_at: Option<SystemTime>,
     /// Active revocation and authoritative revalidation lease.
@@ -925,6 +927,20 @@ impl std::fmt::Debug for McpTokenAuthorization {
 }
 
 impl McpTokenAuthorization {
+    /// Recheck this exact credential against its authoritative lease, if one exists.
+    pub async fn is_active(&self) -> bool {
+        let unexpired = || self.expires_at.is_none_or(|expiry| SystemTime::now() < expiry);
+        if !unexpired() {
+            return false;
+        }
+        if let Some(lease) = &self.revocation
+            && !lease.validate().await
+        {
+            return false;
+        }
+        unexpired()
+    }
+
     /// Wait for this original credential's expiry or authoritative revocation.
     ///
     /// Independent clones retain the same validator and notification source. This
@@ -1796,6 +1812,7 @@ async fn authorize_http_request(
                 expires_at,
             } => McpHostedTokenValidation::Authorized(McpTokenAuthorization {
                 principal_id,
+                scopes: Default::default(),
                 expires_at,
                 revocation: None,
             }),
@@ -1814,18 +1831,10 @@ async fn authorize_http_request(
         HttpTokenAuthorizer::Hosted(authorizer) => authorizer(token, context).await,
     };
     match validation {
-        McpHostedTokenValidation::Authorized(McpTokenAuthorization {
-            principal_id,
-            expires_at,
-            revocation,
-        }) => Ok(AuthorizedHttpRequest {
-            authorization: Some(McpTokenAuthorization {
-                principal_id,
-                expires_at,
-                revocation: revocation.clone(),
-            }),
-            expires_at,
-            revocation,
+        McpHostedTokenValidation::Authorized(proof) => Ok(AuthorizedHttpRequest {
+            expires_at: proof.expires_at,
+            revocation: proof.revocation.clone(),
+            authorization: Some(proof),
         }),
         McpHostedTokenValidation::Unavailable => {
             Err(StatusCode::SERVICE_UNAVAILABLE.into_response())

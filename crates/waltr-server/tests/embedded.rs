@@ -46,18 +46,45 @@ async fn embedded_server_rejects_relative_workspace_root() {
 }
 
 #[tokio::test]
-async fn embedded_server_starts_with_storage_inside_default_workspace() {
+async fn embedded_server_rejects_datastore_inside_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path(), "one-generation-secret");
+    config.workspace_root = root.path().to_owned();
+    let error = build_embedded_server(config).await.unwrap_err();
+    assert!(matches!(error, waltr_server::embedded::EmbeddedBuildError::Paths));
+    assert!(!root.path().join("data").exists());
+}
+
+#[tokio::test]
+async fn embedded_server_rejects_a_fresh_workspace_case_alias() {
+    let root = tempfile::tempdir().unwrap();
+    let probe = root.path().join("Probe");
+    std::fs::create_dir(&probe).unwrap();
+    if !root.path().join("probe").is_dir() {
+        return;
+    }
+    let mut config = config(root.path(), "one-generation-secret");
+    config.workspace_root = root.path().join("Workspace");
+    config.waltr_database_path = root.path().join("workspace/waltr.sqlite3");
+    let error = build_embedded_server(config).await.unwrap_err();
+    assert!(matches!(error, waltr_server::embedded::EmbeddedBuildError::Paths));
+    assert!(!root.path().join("workspace/datastore.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn embedded_server_starts_with_app_private_datastore() {
     if !waltr_server::test_support::isolated_process_test(
-        "embedded_server_starts_with_storage_inside_default_workspace",
+        "embedded_server_starts_with_app_private_datastore",
     ) {
         return;
     }
     let root = waltr_server::test_support::temp_root();
-    let mut config = config(&root, "one-generation-secret");
-    config.workspace_root = root.clone();
+    let config = config(&root, "one-generation-secret");
     let server = build_embedded_server(config.clone()).await.unwrap();
     assert!(config.waltr_database_path.is_file());
     assert!(config.mcp_database_path.is_file());
+    assert!(root.join("data/datastore.sqlite3").is_file());
+    assert!(root.join("data/data-store-objects").is_dir());
     assert!(
         config
             .resources_root

@@ -7,6 +7,7 @@ members = [
     "crates/waltr-audio",
     "crates/waltr-audio-io",
     "crates/waltr-client",
+    "crates/waltr-datastore",
     "crates/waltr-desktop",
     "crates/waltr-file-acl",
     "crates/waltr-server",

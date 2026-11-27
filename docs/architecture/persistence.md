@@ -6,6 +6,8 @@ Waltr server persistence initializes separately owned Waltr and MCP database tar
 
 This database is separate from agent session storage selected by `WALTR_SESSION_STORE`.
 
+[Data stores](data-stores.md) own separate SQL migrations and a separate pool. SQLite uses a separate file from the Routine journal and MCP OAuth state.
+
 Agent session JSON retains a public complete-record `revision` and a separate durable `execution_sequence`. Legacy JSON with an incarnation seeds an absent sequence from the stored public revision; reads never rewrite retained records. The next authorized write persists the field. Records without a durable incarnation remain readable/listable, but execution-token creation fails with `ExecutionCompatibility`. No SQL migration, historical migration edit, store scan or automatic reset accompanies this change. Each session store requires one coordinated writer version; mixed old/new complete-record writers are unsupported. See [session storage compatibility](../agent/storage.md#stored-record-compatibility).
 
 Embedded Tauri composition does not read these environment defaults. The host supplies explicit absolute app-private paths for every durable store.

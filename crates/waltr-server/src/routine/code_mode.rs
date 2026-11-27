@@ -12,6 +12,7 @@ use super::{
     service::{ChildInvocation, InvocationService},
 };
 use crate::access_auth::AuthenticatedPrincipal;
+use crate::datastore::DataStores;
 use crate::{
     agent_host::{
         Capability,
@@ -29,13 +30,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tokio_util::sync::CancellationToken;
 use waltr_agent::{
     AgentRuntime, AgentSessionRuntimeError, AgentTool, HostDispatchBinding, SessionCoordinator,
     SessionCreateRequest, SessionId, SessionRecord, SessionStore,
 };
+
+mod datastore;
+use datastore::{CodeDataStores, CodeTransaction};
 
 /// Immutable association committed before invocation admission. No field is guest authority.
 #[derive(Clone, Debug)]
@@ -146,6 +150,7 @@ pub struct CodeModeHost<S: SessionStore + Clone + Send + Sync + 'static> {
     sessions: SessionCoordinator<S>,
     helpers: Arc<AgentSessionRuntimeFactory>,
     catalog: Option<crate::resource_catalog::AgentDefinitionState>,
+    data_stores: OnceLock<Arc<DataStores>>,
     grants: Mutex<BTreeMap<(String, String), Grant>>,
     stopped: std::sync::atomic::AtomicBool,
 }
@@ -190,13 +195,22 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeHost<S> {
             sessions,
             helpers,
             catalog: None,
+            data_stores: OnceLock::new(),
             grants: Mutex::new(BTreeMap::new()),
             stopped: std::sync::atomic::AtomicBool::new(false),
         }
     }
-    pub(crate) fn with_catalog(mut self, catalog: crate::resource_catalog::AgentDefinitionState) -> Self {
+    pub(crate) fn with_catalog(
+        mut self,
+        catalog: crate::resource_catalog::AgentDefinitionState,
+    ) -> Self {
         self.catalog = Some(catalog);
         self
+    }
+    pub(crate) fn install_data_stores(&self, stores: Arc<DataStores>) -> Result<(), PortError> {
+        self.data_stores
+            .set(stores)
+            .map_err(|_| PortError::Conflict)
     }
     /// Bind one authenticated principal and actual session incarnation to an operator profile.
     /// Replacing or revoking a grant cancels its active executions; request metadata grants nothing.
@@ -364,14 +378,19 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeHost<S> {
             public_only: false,
         }))
     }
-    /// Install actual normal-session runtime composition for a host-bound principal.
-    /// Only definitions with `codeMode: true` call this provider; each session still needs a grant.
+    /// Install normal-session runtime composition for a host-bound principal.
+    /// Datastore access is independent of the Code Mode tool grant.
     pub fn install(
         self: &Arc<Self>,
         factory: AgentSessionRuntimeFactory,
         principal: AuthenticatedPrincipal,
     ) -> AgentSessionRuntimeFactory {
         let host = self.clone();
+        let factory = if let Some(stores) = self.data_stores.get() {
+            factory.with_data_stores(stores.clone(), principal.clone())
+        } else {
+            factory
+        };
         factory
             .with_workspace_account(WorkspaceAccount::from_principal(&principal))
             .with_code_tool_provider(move |record, runtime, dispatcher| {
@@ -394,6 +413,9 @@ pub enum CodeInput {
     Execute {
         /// JavaScript body; no imports or ambient filesystem/environment/network.
         source: String,
+        /// Explicit invocation-owned transaction, disabled by default.
+        #[serde(default)]
+        transaction: CodeTransactionMode,
     },
     /// Schema-free bounded exact-target discovery.
     Discover {
@@ -407,11 +429,22 @@ pub enum CodeInput {
         targets: Vec<ConcreteToolTarget>,
     },
 }
+/// A closed, server-interpreted Code Mode transaction selector.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeTransactionMode {
+    /// Ordinary per-operation commit.
+    #[default]
+    None,
+    /// One lazy relational database transaction.
+    Relational,
+}
+
 impl CodeInput {
     /// Bounded model/public schema, without eagerly publishing MCP tool schemas.
     pub fn schema() -> Value {
         json!({"oneOf":[
-            {"type":"object","properties":{"action":{"const":"execute"},"source":{"type":"string","maxLength":32768}},"required":["action","source"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"execute"},"source":{"type":"string","maxLength":32768},"transaction":{"type":"string","enum":["none","relational"],"default":"none"}},"required":["action","source"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"discover"},"after":{"type":"object","properties":{"server":{"type":"string","maxLength":256},"tool":{"type":"string","maxLength":256}},"required":["server","tool"],"additionalProperties":false}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"schemas"},"targets":{"type":"array","maxItems":8,"items":{"type":"object","properties":{"server":{"type":"string","maxLength":256},"tool":{"type":"string","maxLength":256}},"required":["server","tool"],"additionalProperties":false}}},"required":["action","targets"],"additionalProperties":false}
         ]})
@@ -454,7 +487,21 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
             Ok(())
         }
     }
-    fn definition(&self, source: &str, origin: Origin) -> Result<Arc<Definition>, PortError> {
+    fn invocation_grant(&self, transaction: CodeTransactionMode) -> Grant {
+        let mut grant = self.grant.clone();
+        if transaction == CodeTransactionMode::Relational {
+            grant.profile.targets.clear();
+            grant.profile.helpers.clear();
+        }
+        grant
+    }
+
+    fn definition(
+        &self,
+        source: &str,
+        origin: Origin,
+        transaction: CodeTransactionMode,
+    ) -> Result<Arc<Definition>, PortError> {
         self.check()?;
         if source.is_empty() || source.len() > 32768 {
             return Err(PortError::Invalid);
@@ -463,12 +510,24 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
         let source = format!(
             "export default async function() {{ const result = await (async () => {{\n{source}\n}})(); return JSON.stringify(result === undefined ? null : result); }}"
         );
-        self.host.service.code_definition(&json!({"apiVersion":"waltr.routine/v1","kind":"Routine","name":"code-mode","description":"Host-bound inline code call","spec":{"source":source,"entrypoints":{"run":{"trigger":if origin==Origin::Mcp {"mcp"}else{"inline"}}},"parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"null"}},"result":{"schemaVersion":"waltr.value/v1","schema":{"type":"string","maxLength":60000}},"capabilities":self.grant.capabilities()}}).to_string())
+        let description = match transaction {
+            CodeTransactionMode::None => "Host-bound inline code call",
+            CodeTransactionMode::Relational => {
+                "Host-bound inline code call (relational transaction)"
+            }
+        };
+        self.host.service.code_definition(&json!({"apiVersion":"waltr.routine/v1","kind":"Routine","name":"code-mode","description":description,"spec":{"source":source,"entrypoints":{"run":{"trigger":if origin==Origin::Mcp {"mcp"}else{"inline"}}},"parameters":{"schemaVersion":"waltr.value/v1","schema":{"type":"null"}},"result":{"schemaVersion":"waltr.value/v1","schema":{"type":"string","maxLength":60000}},"capabilities":self.invocation_grant(transaction).capabilities()}}).to_string())
     }
     fn prepare(&self, input: &CodeInput, origin: Origin) -> Result<HostDispatchBinding, PortError> {
         self.check()?;
         let revision = match input {
-            CodeInput::Execute { source } => self.definition(source, origin)?.revision().to_owned(),
+            CodeInput::Execute {
+                source,
+                transaction,
+            } => self
+                .definition(source, origin, *transaction)?
+                .revision()
+                .to_owned(),
             _ => "code-discovery-v1".into(),
         };
         Ok(HostDispatchBinding {
@@ -509,28 +568,54 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
         match input {
             CodeInput::Discover { after } => {
                 let allowed: Vec<_> = self.grant.profile.targets.values().cloned().collect();
-                let items = self
+                let mut items = self
                     .dispatcher
                     .concrete_tool_page(&allowed, after.as_ref(), 16)
-                    .map_err(|_| PortError::Denied)?;
+                    .map_err(|_| PortError::Denied)?
+                    .into_iter()
+                    .map(|item| (item.target.clone(), item))
+                    .collect::<BTreeMap<_, _>>();
+                if self.host.data_stores.get().is_some() {
+                    for item in datastore::summaries(&self.dispatcher.permission_policy()) {
+                        if after.as_ref().is_none_or(|after| item.target > *after) {
+                            items.insert(item.target.clone(), item);
+                        }
+                    }
+                }
+                let items = items.into_values().take(16).collect::<Vec<_>>();
                 let next = items.last().map(|item| item.target.clone());
                 bounded(json!({"tools":items,"after":next}))
             }
             CodeInput::Schemas { targets } => {
-                if targets.len() > 8
-                    || targets.iter().any(|target| {
-                        !self
+                if targets.len() > 8 {
+                    return Err(PortError::Denied);
+                }
+                let mut local = Vec::new();
+                let mut upstream = Vec::new();
+                for target in targets {
+                    if self.host.data_stores.get().is_some()
+                        && datastore::is_grouped_target(&target)
+                    {
+                        local.push(datastore::schema(
+                            &self.dispatcher.permission_policy(),
+                            &target,
+                            false,
+                        )?);
+                    } else if !self.public_only
+                        && self
                             .grant
                             .profile
                             .targets
                             .values()
-                            .any(|configured| configured == target)
-                    })
-                {
-                    return Err(PortError::Denied);
+                            .any(|configured| configured == &target)
+                    {
+                        upstream.push(target);
+                    } else {
+                        return Err(PortError::Denied);
+                    }
                 }
-                if self.public_only {
-                    return bounded(json!({"schemas":[]}));
+                if upstream.is_empty() {
+                    return bounded(json!({"schemas":local}));
                 }
                 let executor = self.executor().await?;
                 let result = tokio::select! { biased;
@@ -538,17 +623,36 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                     ()=self.grant.live.cancelled()=>Err(PortError::Denied),
                     ()=self.grant.principal.access_ended()=>Err(PortError::Denied),
                     ()=self.request_principal.access_ended()=>Err(PortError::Denied),
-                    result=executor.schemas(targets,cancel.clone())=>result.map_err(|_|PortError::Denied)
+                    result=executor.schemas(upstream,cancel.clone())=>result.map_err(|_|PortError::Denied)
                 };
                 executor.cleanup().await.map_err(|_| PortError::Uncertain)?;
                 self.live().check().await?;
-                bounded(json!({"schemas":result?}))
+                local.extend(result?);
+                bounded(json!({"schemas":local}))
             }
-            CodeInput::Execute { source } => {
-                let definition = self.definition(&source, origin)?;
+            CodeInput::Execute {
+                source,
+                transaction,
+            } => {
+                let definition = self.definition(&source, origin, transaction)?;
                 if binding.source_revision != definition.revision() {
                     return Err(PortError::Conflict);
                 }
+                let data_stores = self.host.data_stores.get().cloned();
+                let relational = transaction == CodeTransactionMode::Relational;
+                if relational && data_stores.is_none() {
+                    return Err(PortError::UnsupportedCapability);
+                }
+                let data_stores = data_stores.map(|stores| {
+                    Arc::new(CodeDataStores::new(
+                        stores,
+                        self.request_principal.clone(),
+                        self.dispatcher.permission_policy(),
+                        definition.limits().clone(),
+                        relational,
+                        self.public_only,
+                    ))
+                });
                 let dispatch = CodeDispatch {
                     principal: super::rpc::principal_id(&self.grant.principal),
                     session_id: self.grant.session.as_str().into(),
@@ -564,6 +668,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                 }
                 let factory = Arc::new(CodeHostFactory {
                     live: self.live(),
+                    data_stores: data_stores.clone(),
+                    request_cancel: cancel.clone(),
                     inner: RoutineAgentHostFactory {
                         bindings: Arc::new(CodeBindings {
                             live: self.live(),
@@ -571,8 +677,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                             helpers: Arc::new(self.workspace_helpers()),
                             runtime: self.runtime.clone(),
                             record: current,
-                            grant: self.grant.clone(),
-                            public_only: self.public_only,
+                            grant: self.invocation_grant(transaction),
+                            public_only: self.public_only || relational,
                             catalog: self.host.catalog.as_ref().map(|state| state.snapshot()),
                         }),
                     },
@@ -608,9 +714,19 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeModeAdapter<S> {
                     .as_ref()
                     .and_then(Value::as_str)
                     .and_then(|result| serde_json::from_str::<Value>(result).ok());
-                let output = bounded(
+                let mut output = bounded(
                     json!({"invocationId":dispatch.invocation_id,"status":outcome.status,"cleanupComplete":outcome.cleanup_complete,"result":result,"admissionError":admitted.err().map(|error|format!("{error:?}"))}),
                 ).map_err(|_| PortError::Uncertain)?;
+                if let Some(error) = data_stores
+                    .as_ref()
+                    .and_then(|stores| stores.transaction.as_ref())
+                    .and_then(|transaction| transaction.error())
+                {
+                    output["transactionError"] = json!(error);
+                }
+                if relational && outcome.status.is_none() {
+                    return Err(PortError::Uncertain);
+                }
                 self.host
                     .dispatches
                     .complete(dispatch, output.clone())
@@ -680,7 +796,7 @@ fn agent_error(error: PortError) -> waltr_agent::LlmError {
 impl<S: SessionStore + Clone + Send + Sync + 'static> PublicCodePort for Arc<CodeModeAdapter<S>> {
     fn call(&self, input: CodeInput, cancellation: CancellationToken) -> PortFuture<Value> {
         let mut grant = self.grant.clone();
-        // Concrete targets identify upstream MCP tools, never Waltr's own capabilities.
+        // Profile targets identify upstream MCP tools; the first-party route is separate.
         grant.profile.targets.clear();
         let adapter = CodeModeAdapter {
             host: self.host.clone(),
@@ -733,6 +849,8 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> CodeLive<S> {
 struct CodeHostFactory<S: SessionStore + Clone + Send + Sync + 'static> {
     inner: RoutineAgentHostFactory,
     live: CodeLive<S>,
+    data_stores: Option<Arc<CodeDataStores>>,
+    request_cancel: CancellationToken,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::HostFactory
     for CodeHostFactory<S>
@@ -744,6 +862,7 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::HostFactory
         selected: SelectedEntrypoint,
         caller: Caller,
     ) -> PortFuture<super::ports::PreparedHost> {
+        let invocation = binding.id().to_owned();
         let pending = super::ports::HostFactory::preflight(
             &self.inner,
             binding,
@@ -752,20 +871,27 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::HostFactory
             caller,
         );
         let live = self.live.clone();
+        let stores = self.data_stores.clone();
+        let request_cancel = self.request_cancel.clone();
         Box::pin(async move {
             live.check().await?;
             let mut prepared = pending.await?;
             prepared.policy = Arc::new(CodePolicy {
                 inner: prepared.policy,
                 live: live.clone(),
+                stores: stores.clone(),
             });
             prepared.dispatcher = Arc::new(CodeDispatcher {
                 inner: prepared.dispatcher,
                 live: live.clone(),
+                stores: stores.clone(),
             });
             prepared.reservation = Box::new(CodeReservation {
                 inner: prepared.reservation,
                 live,
+                transaction: stores.and_then(|stores| stores.transaction.clone()),
+                invocation,
+                request_cancel,
             });
             Ok(prepared)
         })
@@ -774,6 +900,9 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::HostFactory
 struct CodeReservation<S: SessionStore + Clone + Send + Sync + 'static> {
     inner: Box<dyn super::ports::Reservation>,
     live: CodeLive<S>,
+    transaction: Option<Arc<CodeTransaction>>,
+    invocation: String,
+    request_cancel: CancellationToken,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::Reservation
     for CodeReservation<S>
@@ -801,10 +930,48 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::Reservation
     fn validate_success(&self) -> Result<(), PortError> {
         self.inner.validate_success()
     }
+    fn settle(&self, commit: Option<&Value>, cancel: CancellationToken) -> Option<PortFuture<()>> {
+        let transaction = self.transaction.clone()?;
+        let requested = commit.is_some();
+        let output = commit.cloned();
+        let live = self.live.clone();
+        let invocation = self.invocation.clone();
+        let request_cancel = self.request_cancel.clone();
+        Some(Box::pin(async move {
+            let eligibility = if let Some(output) = output {
+                async {
+                    // The Routine contract validates the encoded string; validate the decoded
+                    // Code Mode result and transport bound before committing any data.
+                    let result = output.as_str().ok_or(PortError::Invalid)?;
+                    let result: Value = serde_json::from_str(result).map_err(|_| PortError::Invalid)?;
+                    bounded(json!({"invocationId":invocation,"status":"succeeded","cleanupComplete":true,"result":result,"admissionError":null}))?;
+                    live.check().await?;
+                    if cancel.is_cancelled() || request_cancel.is_cancelled() {
+                        return Err(PortError::Denied);
+                    }
+                    Ok(())
+                }.await
+            } else {
+                Ok(())
+            };
+            let commit = eligibility.is_ok()
+                && requested
+                && !cancel.is_cancelled()
+                && !request_cancel.is_cancelled();
+            transaction.finish(&invocation, commit).await?;
+            eligibility?;
+            if requested && !commit {
+                return Err(PortError::Denied);
+            }
+            Ok(())
+        }))
+    }
 }
+
 struct CodePolicy<S: SessionStore + Clone + Send + Sync + 'static> {
     inner: Arc<dyn super::ports::OperationPolicy>,
     live: CodeLive<S>,
+    stores: Option<Arc<CodeDataStores>>,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::OperationPolicy
     for CodePolicy<S>
@@ -824,7 +991,11 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::OperationPol
         {
             return Box::pin(async { Err(PortError::Invalid) });
         }
-        let pending = self.inner.before(request, context);
+        let pending = self
+            .stores
+            .as_ref()
+            .and_then(|stores| stores.before(request))
+            .unwrap_or_else(|| self.inner.before(request, context));
         Box::pin(async move {
             live.check().await?;
             pending.await
@@ -835,12 +1006,16 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> super::ports::OperationPol
         name: &str,
         reply: &waltr_script::HostReply,
     ) -> Result<Option<Value>, PortError> {
+        if let Some(projection) = datastore::project_result(reply) {
+            return Ok(Some(projection));
+        }
         self.inner.project_result(name, reply)
     }
 }
 struct CodeDispatcher<S: SessionStore + Clone + Send + Sync + 'static> {
     inner: Arc<dyn waltr_script::HostDispatcher>,
     live: CodeLive<S>,
+    stores: Option<Arc<CodeDataStores>>,
 }
 impl<S: SessionStore + Clone + Send + Sync + 'static> waltr_script::HostDispatcher
     for CodeDispatcher<S>
@@ -852,10 +1027,16 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> waltr_script::HostDispatch
     ) -> waltr_script::HostFuture {
         let inner = self.inner.clone();
         let live = self.live.clone();
+        let stores = self.stores.clone();
         Box::pin(async move {
             live.check()
                 .await
                 .map_err(|_| waltr_script::Error::Denied)?;
+            if let Some(stores) = stores
+                && let Some(reply) = stores.dispatch(&request).await?
+            {
+                return Ok(reply);
+            }
             inner.dispatch(request, context).await
         })
     }
@@ -905,7 +1086,12 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 request.inference_settings = Some(inference.clone());
                 request.agent_definition = record.agent_definition.clone();
                 let id = helpers
-                    .create_with_workspace(&sessions, request, None, record.agent_definition.as_ref())
+                    .create_with_workspace(
+                        &sessions,
+                        request,
+                        None,
+                        record.agent_definition.as_ref(),
+                    )
                     .await
                     .map_err(|_| PortError::Unavailable)?
                     .id()
@@ -940,7 +1126,11 @@ impl<S: SessionStore + Clone + Send + Sync + 'static> InvocationAdapterFactory f
                 caller.principal.clone(),
             )?
             .with_image_principal(&grant.principal)
-            .with_source_definition(if public_only { None } else { record.agent_definition.clone() })
+            .with_source_definition(if public_only {
+                None
+            } else {
+                record.agent_definition.clone()
+            })
             .with_permission_restriction(grant.profile.restriction.clone())
             .with_origin_guard(move || {
                 let live = live.clone();

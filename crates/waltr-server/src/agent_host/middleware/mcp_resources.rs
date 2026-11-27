@@ -48,6 +48,7 @@ pub(crate) fn resource_selector(ctx: &ToolCallContext<'_>) -> Result<ResourceSel
 pub(crate) struct McpResourcesMiddleware {
     runtime: Arc<McpClientRuntime>,
     ordinary: bool,
+    local_data_store: bool,
 }
 
 impl McpResourcesMiddleware {
@@ -55,6 +56,7 @@ impl McpResourcesMiddleware {
         Self {
             runtime,
             ordinary: true,
+            local_data_store: false,
         }
     }
 
@@ -62,7 +64,13 @@ impl McpResourcesMiddleware {
         Self {
             runtime,
             ordinary: false,
+            local_data_store: false,
         }
+    }
+
+    pub(crate) const fn with_local_data_store(mut self, enabled: bool) -> Self {
+        self.local_data_store = enabled;
+        self
     }
 }
 
@@ -92,6 +100,15 @@ impl AgentMiddleware for McpResourcesMiddleware {
             return Ok(HookOutcome::Continue);
         }
         let ResourceSelector { server, uri } = resource_selector(ctx)?;
+        if self.local_data_store && crate::agent_host::datastore::local_resource(&server, &uri) {
+            if !McpSkillsMiddleware::resource_manifests(ctx, &server, &uri)?.is_empty() {
+                return Err(LlmError::Protocol {
+                    provider: "mcp-resources",
+                    message: "a first-party datastore URI cannot serve as a held skill file".into(),
+                });
+            }
+            return Ok(HookOutcome::Continue);
+        }
         if let Some(outcome) = resource_input_permission(ctx).await? {
             return Ok(outcome);
         }
@@ -300,7 +317,9 @@ impl AgentMiddleware for McpResourcesMiddleware {
         let TemplateReference::Resource { server, uri, .. } = reference else {
             return Ok(TemplateReferenceRender::Continue);
         };
-        if !self.runtime.has_server(server) {
+        let local =
+            self.local_data_store && crate::agent_host::datastore::local_resource(server, uri);
+        if !local && !self.runtime.has_server(server) {
             return Ok(TemplateReferenceRender::Continue);
         }
         if reqwest::Url::parse(uri).is_err() {
@@ -309,7 +328,8 @@ impl AgentMiddleware for McpResourcesMiddleware {
                 "invalid read_mcp_resource selector values",
             )));
         }
-        if !self.runtime.has_resource(server, uri).await
+        if !local
+            && !self.runtime.has_resource(server, uri).await
             && !self.runtime.has_resource_template_match(server, uri).await
         {
             return Ok(TemplateReferenceRender::Continue);

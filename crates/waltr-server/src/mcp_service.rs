@@ -214,7 +214,7 @@ fn apply_text_edits(source: &str, edits: &[TextEdit]) -> ServerResult<String> {
     Ok(output)
 }
 
-fn encode_component(value: &str) -> String {
+pub(crate) fn encode_component(value: &str) -> String {
     let mut output = String::new();
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
@@ -227,7 +227,7 @@ fn encode_component(value: &str) -> String {
     output
 }
 
-fn decode_component(value: &str) -> ServerResult<String> {
+pub(crate) fn decode_component(value: &str) -> ServerResult<String> {
     let invalid = || ServerError::invalid_params("invalid canonical Waltr URI");
     let mut bytes = Vec::new();
     let mut input = value.bytes();
@@ -286,6 +286,61 @@ pub struct WaltrMcpServer {
     catalog: Arc<mcp::SkillCatalog>,
     readiness: Option<crate::readiness::Readiness>,
     code: Option<Arc<dyn crate::routine::code_mode::PublicCodePort>>,
+    data_stores: Option<Arc<crate::datastore::DataStores>>,
+}
+
+fn datastore_unavailable() -> ServerError {
+    datastore_error(waltr_datastore::Error::Unavailable)
+}
+
+pub(crate) const DATASTORE_MUTATION_SCOPES: &[&str] = &[
+    "datastore:create:object.create",
+    "datastore:create:object.upload",
+    "datastore:create:record.create",
+    "datastore:create:relation.link",
+    "datastore:execute:object.replace",
+    "datastore:execute:object.upload_chunk",
+    "datastore:execute:record.update",
+    "datastore:destroy:object.delete",
+    "datastore:destroy:record.delete",
+    "datastore:destroy:relation.unlink",
+];
+
+pub(crate) fn public_datastore_action_allowed(
+    principal: &crate::access_auth::AuthenticatedPrincipal,
+    group: &str,
+    action: &str,
+) -> bool {
+    use crate::access_auth::AuthenticationMethod;
+
+    match (group, action) {
+        ("query", "object.list" | "object.download_chunk" | "record.find" | "relation.list")
+        | ("create", "object.download")
+        | ("destroy", "object.close_transfer") => true,
+        _ => {
+            let Some(scope) = DATASTORE_MUTATION_SCOPES.iter().find(|scope| {
+                scope
+                    .strip_prefix("datastore:")
+                    .and_then(|key| key.split_once(':'))
+                    == Some((group, action))
+            }) else {
+                return false;
+            };
+            principal.datastore_actor().is_some()
+                && (principal.method() == AuthenticationMethod::LocalProcessBearer
+                    || principal.has_scope(scope))
+        }
+    }
+}
+
+fn datastore_error(error: waltr_datastore::Error) -> ServerError {
+    use waltr_datastore::Error;
+    match error {
+        Error::Invalid | Error::Limit | Error::NotFound | Error::Conflict => {
+            ServerError::invalid_params(error.to_string())
+        }
+        Error::Unavailable | Error::Uncertain => ServerError::internal(error.to_string()),
+    }
 }
 
 impl std::fmt::Debug for WaltrMcpServer {
@@ -395,11 +450,17 @@ impl WaltrMcpServer {
             catalog: Arc::new(catalog),
             readiness: None,
             code: None,
+            data_stores: None,
         })
     }
 
     pub(crate) fn with_readiness(mut self, readiness: crate::readiness::Readiness) -> Self {
         self.readiness = Some(readiness);
+        self
+    }
+
+    pub(crate) fn with_data_stores(mut self, data_stores: Arc<crate::datastore::DataStores>) -> Self {
+        self.data_stores = Some(data_stores);
         self
     }
 
@@ -444,6 +505,32 @@ impl WaltrMcpServer {
             issuer,
             proof.clone(),
         ))
+    }
+
+    fn datastore_origin(
+        &self,
+        context: &mcp::server::ServerContext,
+    ) -> ServerResult<crate::access_auth::AuthenticatedPrincipal> {
+        // The private standalone self-MCP route has a host credential, not a user.
+        if self.anonymous_disabled {
+            return Ok(crate::access_auth::AuthenticatedPrincipal::anonymous_disabled());
+        }
+        self.origin(context)
+    }
+
+    fn authorize_datastore_action(
+        &self,
+        context: &mcp::server::ServerContext,
+        group: &str,
+        action: &str,
+    ) -> ServerResult<crate::access_auth::AuthenticatedPrincipal> {
+        let principal = self.datastore_origin(context)?;
+        if !public_datastore_action_allowed(&principal, group, action) {
+            return Err(ServerError::invalid_params(
+                "datastore action is not authorized",
+            ));
+        }
+        Ok(principal)
     }
 
     /// Install an explicitly authenticated, principal-scoped code port. Default servers expose none.
@@ -811,15 +898,15 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
             let mut list = mcp::McpToolList {
                 tools: vec![
                     status_app::tool(&context),
-                    tool!("create", "Create a session or an absent persisted resource slot (including a bundled override).", "session.create" => CreateInput, "resource.create" => ResourceCreateInput),
+                    tool!("create", "Create a session, resource override, or datastore item.", "session.create" => CreateInput, "resource.create" => ResourceCreateInput, "object.create" => crate::datastore::ObjectWrite, "object.upload" => crate::datastore::TransferOpen, "object.download" => crate::datastore::TransferOpen, "record.create" => crate::datastore::RecordCreate, "relation.link" => crate::datastore::Link),
                     tool_definition(
                         "edit",
                         "Apply ordered atomic text edits to effective YAML guarded by its revision.",
                         json_schema_for::<TextEditInput>(),
                     ),
-                    tool!("destroy", "Remove a persisted override, restoring bundled fallback if present, or explicitly wipe ALL sessions.", "resource.destroy" => ResourceDestroyInput, "session.wipe" => WipeInput),
-                    tool!("execute", "Control hosted sessions.", "session.send" => SendInput, "session.interrupt" => SessionIdInput),
-                    tool!("query", "Wait for a bounded jq condition on a hosted session.", "session.wait" => WaitInput),
+                    tool!("destroy", "Remove datastore items or persisted overrides, or explicitly wipe ALL sessions.", "resource.destroy" => ResourceDestroyInput, "session.wipe" => WipeInput, "object.delete" => crate::datastore::ObjectKey, "object.close_transfer" => crate::datastore::TransferHandle, "record.delete" => crate::datastore::RecordKey, "relation.unlink" => crate::datastore::Link),
+                    tool!("execute", "Control hosted sessions or update datastore items.", "session.send" => SendInput, "session.interrupt" => SessionIdInput, "object.replace" => crate::datastore::ObjectWrite, "object.upload_chunk" => crate::datastore::TransferChunk, "record.update" => crate::datastore::RecordUpdate),
+                    tool!("query", "Find datastore items or wait for a hosted session condition.", "session.wait" => WaitInput, "object.list" => crate::datastore::ObjectList, "object.download_chunk" => crate::datastore::TransferHandle, "record.find" => crate::datastore::RecordFind, "relation.list" => crate::datastore::RelationList),
                 ],
                 next_cursor: None,
             };
@@ -920,6 +1007,23 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                 return mcp::progressive::tool_result(output, None);
             }
             let request = mcp::progressive::parse_arguments(&call.name, call.arguments)?;
+            if crate::datastore::DataStores::handles(&call.name, &request.action) {
+                let stores = server
+                    .data_stores
+                    .as_ref()
+                    .ok_or_else(datastore_unavailable)?;
+                let principal =
+                    server.authorize_datastore_action(&context, &call.name, &request.action)?;
+                let call = stores.call(
+                    &principal,
+                    &call.name,
+                    &request.action,
+                    request.input.unwrap_or(Value::Null),
+                    None,
+                );
+                let output = call.await.map_err(datastore_error)?;
+                return mcp::progressive::tool_result(output, request.filter.as_deref());
+            }
             macro_rules! input {
                 () => {
                     mcp::progressive::deserialize_action_input(&request.action, request.input)?
@@ -952,6 +1056,7 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
         _cursor: Option<String>,
         context: mcp::server::ServerContext,
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceList>> {
+        let datastores = self.data_stores.is_some() && self.origin(&context).is_ok();
         Box::pin(async move {
             let mut list = mcp::McpResourceList {
                 resources: vec![
@@ -968,6 +1073,13 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                 ],
                 next_cursor: None,
             };
+            if datastores {
+                list.resources.push(mcp::progressive::action_resource_definition(
+                    "waltr://data-stores",
+                    "data-stores",
+                    "Active datastore descriptions and canonical resource URIs.",
+                ));
+            }
             list.resources.extend(
                 served_apps::RESOURCES
                     .iter()
@@ -981,16 +1093,17 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
     fn list_resource_templates(
         &self,
         _cursor: Option<String>,
-        _context: mcp::server::ServerContext,
+        context: mcp::server::ServerContext,
     ) -> mcp::server::BoxFuture<ServerResult<mcp::McpResourceTemplateList>> {
-        Box::pin(async {
+        let datastores = self.data_stores.is_some() && self.origin(&context).is_ok();
+        Box::pin(async move {
             let mut source = mcp::progressive::action_resource_template_definition(
                 "waltr://resources/{path}/source",
                 "resource.source",
                 "Exact effective YAML. Path is one canonically percent-encoded component.",
             );
             source.mime_type = Some("application/yaml".to_owned());
-            Ok(mcp::McpResourceTemplateList {
+            let mut list = mcp::McpResourceTemplateList {
                 resource_templates: vec![
                     mcp::progressive::action_resource_template_definition(
                         "waltr://resources/{path}",
@@ -1005,7 +1118,17 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
                     ),
                 ],
                 next_cursor: None,
-            })
+            };
+            if datastores {
+                for (suffix, name, description) in crate::datastore::RESOURCE_TEMPLATES {
+                    list.resource_templates.push(mcp::progressive::action_resource_template_definition(
+                        &format!("waltr://data-stores/{suffix}"),
+                        name,
+                        description,
+                    ));
+                }
+            }
+            Ok(list)
         })
     }
 
@@ -1025,7 +1148,17 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
             if let Some(result) = server.catalog.read(&uri) {
                 return Ok(result);
             }
-            let value = if uri == "waltr://resources" {
+            let value = if crate::datastore::is_resource(&uri) {
+                let stores = server.data_stores.as_ref().ok_or_else(datastore_unavailable)?;
+                let principal = server.datastore_origin(&context)?;
+                stores.read(&principal, &uri, None).await.map_err(|error| {
+                    if error == waltr_datastore::Error::NotFound {
+                        ServerError::resource_not_found(uri.clone())
+                    } else {
+                        datastore_error(error)
+                    }
+                })?
+            } else if uri == "waltr://resources" {
                 let mut catalog = server.inspect_resources(InspectResourcesInput { path: None })?;
                 if let Some(entries) = catalog["entries"].as_array_mut() {
                     for entry in entries {
@@ -1551,6 +1684,160 @@ mod tests {
         fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>> {
             Box::pin(tokio_stream::empty())
         }
+    }
+
+    async fn public_datastore_fixture() -> (tempfile::TempDir, WaltrMcpServer) {
+        let root = tempfile::tempdir().unwrap();
+        let resources = root.path().join(".waltr/resources");
+        std::fs::create_dir_all(resources.join("data-stores")).unwrap();
+        std::fs::write(resources.join("data-stores/files.yaml"),
+            "apiVersion: waltr.dev/v1alpha1\nkind: DataStore\nmetadata: {name: files}\nspec: {type: object, access: {scope: shared}}\n",
+        ).unwrap();
+        std::fs::create_dir_all(resources.join("mcp-servers")).unwrap();
+        std::fs::write(resources.join("mcp-servers/waltr.yaml"),
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata: {name: waltr}\nspec: {transport: streamableHttp, url: 'https://waltr.example', path: /mcp}\n",
+        ).unwrap();
+        let materializer = crate::catalog::CatalogMaterializer::load(
+            &crate::test_support::default_catalog_loader(),
+        )
+        .await
+        .unwrap();
+        let state = AgentDefinitionState::load_unified(root.path(), materializer).unwrap();
+        let stores = crate::datastore::Storage::local(root.path())
+            .await
+            .unwrap()
+            .bind(state.clone());
+        let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost::default()), state)
+            .unwrap()
+            .with_data_stores(stores);
+        (root, server)
+    }
+
+    #[tokio::test]
+    async fn public_datastore_http_reads_external_content_and_denies_anonymous_writes() {
+        let (root, server) = public_datastore_fixture().await;
+        let router =
+            mcp::server::streamable_http_router(Arc::new(server.with_anonymous_disabled()));
+        let listed = mcp_request(
+            &router,
+            json!({"jsonrpc":"2.0","id":1,"method":"resources/list"}),
+        )
+        .await;
+        assert!(
+            listed["result"]["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["uri"] == crate::datastore::ROOT)
+        );
+        let physical = root.path().join("data-store-objects/object/files/shared/a");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(physical.join("b"), b"outside").unwrap();
+        let query = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"query","arguments":{"action":"object.list","input":{"store":"files"}}
+        }});
+        let found = mcp_request(&router, query.clone()).await;
+        assert_eq!(
+            found["result"]["structuredContent"]["items"][0]["key"],
+            "a/b"
+        );
+        let opened = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"create","arguments":{"action":"object.download","input":{"store":"files","key":"a/b"}}
+        }})).await;
+        let transfer = opened["result"]["structuredContent"]["transfer"]
+            .as_str()
+            .unwrap_or_else(|| panic!("anonymous download did not open: {opened}"));
+        let closed = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"destroy","arguments":{"action":"object.close_transfer","input":{"store":"files","transfer":transfer}}
+        }})).await;
+        assert_eq!(closed["result"]["structuredContent"]["closed"], true);
+        let denied = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"destroy","arguments":{"action":"object.delete","input":{"store":"files","key":"a/b"}}
+        }})).await;
+        assert!(denied.get("error").is_some(), "{denied}");
+        std::fs::remove_file(physical.join("b")).unwrap();
+        let empty = mcp_request(&router, query).await;
+        assert_eq!(empty["result"]["structuredContent"]["items"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn public_datastore_http_requires_the_exact_mutation_scope() {
+        use mcp::server::{
+            McpHostedTokenValidation, McpTokenAuthorization, StreamableHttpAuthorization,
+            StreamableHttpOptions,
+        };
+
+        let (root, mut server) = public_datastore_fixture().await;
+        let issuer = "https://waltr.example/oauth";
+        let resource = "https://waltr.example/mcp";
+        server.hosted_issuer = Some(issuer.to_owned());
+        let endpoint_scope = "mcp:use";
+        let delete_scope = "datastore:destroy:object.delete";
+        let principal = crate::access_auth::AuthenticatedPrincipal::apps_test_principal("reader")
+            .mcp_principal_id();
+        let metadata = mcp::McpProtectedResourceMetadata::new(resource, [issuer]).with_scopes([
+            endpoint_scope,
+            delete_scope,
+            "datastore:destroy:record.delete",
+        ]);
+        let authorization = StreamableHttpAuthorization::hosted(metadata, move |token, context| {
+            let principal = principal.clone();
+            Box::pin(async move {
+                assert_eq!(context.required_scopes, [endpoint_scope]);
+                let extra = match token.0.as_str() {
+                    "read-only" => None,
+                    "wrong-action" => Some("datastore:destroy:record.delete"),
+                    "delete-object" => Some(delete_scope),
+                    _ => {
+                        return McpHostedTokenValidation::Unauthorized {
+                            error_description: None,
+                        };
+                    }
+                };
+                McpHostedTokenValidation::Authorized(McpTokenAuthorization {
+                    principal_id: principal,
+                    expires_at: None,
+                    revocation: None,
+                    scopes: [Some(endpoint_scope), extra]
+                        .into_iter()
+                        .flatten()
+                        .map(str::to_owned)
+                        .collect(),
+                })
+            })
+        })
+        .unwrap()
+        .with_required_scopes([endpoint_scope]);
+        let router = mcp::server::streamable_http_router_with_options(
+            Arc::new(server),
+            StreamableHttpOptions::default().with_authorization(authorization),
+        );
+        let physical = root.path().join("data-store-objects/object/files/shared/a");
+        std::fs::create_dir_all(&physical).unwrap();
+        let file = physical.join("b");
+        std::fs::write(&file, b"outside").unwrap();
+        let query = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"query","arguments":{"action":"object.list","input":{"store":"files"}}
+        }});
+        let found = mcp_request_with_bearer(&router, query, Some("read-only")).await;
+        assert_eq!(
+            found["result"]["structuredContent"]["items"][0]["key"],
+            "a/b"
+        );
+        let delete = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"destroy","arguments":{"action":"object.delete","input":{"store":"files","key":"a/b"}}
+        }});
+        for bearer in ["read-only", "wrong-action"] {
+            let denied = mcp_request_with_bearer(&router, delete.clone(), Some(bearer)).await;
+            assert_eq!(
+                denied["error"]["message"],
+                "datastore action is not authorized"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"outside");
+        }
+        let allowed = mcp_request_with_bearer(&router, delete, Some("delete-object")).await;
+        assert!(allowed.get("result").is_some(), "{allowed}");
+        assert!(!file.exists());
     }
 
     #[tokio::test]
@@ -2627,7 +2914,15 @@ mod tests {
         }
     }
 
-    async fn mcp_request(router: &Router, mut body: Value) -> Value {
+    async fn mcp_request(router: &Router, body: Value) -> Value {
+        mcp_request_with_bearer(router, body, None).await
+    }
+
+    async fn mcp_request_with_bearer(
+        router: &Router,
+        mut body: Value,
+        bearer: Option<&str>,
+    ) -> Value {
         body["params"] = body.get("params").cloned().unwrap_or_else(|| json!({}));
         if body["params"].get("_meta").is_none() {
             body["params"]["_meta"] = json!({
@@ -2644,6 +2939,9 @@ mod tests {
             .header("content-type", "application/json")
             .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
             .header("mcp-method", method);
+        if let Some(bearer) = bearer {
+            request = request.header("authorization", format!("Bearer {bearer}"));
+        }
         if method == "tools/call" {
             request = request.header("mcp-name", body["params"]["name"].as_str().unwrap());
         } else if method == "resources/read" {

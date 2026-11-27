@@ -1,6 +1,7 @@
 //! Unified resource catalog state, persistence, materialization, and watcher lifecycle.
 
 mod agent;
+mod data_store;
 mod error;
 mod materialize;
 mod remote;
@@ -10,6 +11,7 @@ mod state;
 mod store;
 mod watcher;
 
+pub use data_store::ActiveDataStore;
 pub use remote::{Remote, RemoteBinding};
 pub use state::{
     AgentDefinitionInspection, AgentDefinitionLoadError, AgentDefinitionSnapshot,
