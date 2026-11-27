@@ -64,7 +64,11 @@ Hosted sign-in defaults to object create and replace, record create and update, 
 | `execute` | `object.replace`, `object.upload_chunk`, `record.update` |
 | `destroy` | `object.delete`, `object.close_transfer`, `record.delete`, `relation.unlink` |
 
-An action takes an `input` object with `store`. Object create and replace take `key` and either inline `content_base64` or an upload `transfer`. For larger content, open `object.upload` with `key` and `size`, then send `object.upload_chunk` with contiguous byte offsets. Create or replace consumes the completed upload. For downloads, open `object.download` with `key` and use `object.download_chunk` until `eof`. Transfer handles expire after 30 seconds and never grant access to another user or store.
+An action takes an `input` object with `store`. Object create and replace take `key` and exactly one of `content_text`, `content_base64`, or `transfer`. Use `content_text` for plain text, Markdown, or other UTF-8 content. Inline writes allow up to 32 KiB of object bytes.
+
+Read an object's `text_uri` for native MCP text, up to 32 KiB. This resource rejects invalid UTF-8. The existing `content_uri` still returns base64 for any object within the same limit.
+
+For larger content, open `object.upload` with `key` and `size`, then send `object.upload_chunk` with contiguous byte offsets. Create or replace consumes the completed upload. For downloads, open `object.download` with `key` and use `object.download_chunk` until `eof`. Transfer handles expire after 30 seconds and never grant access to another user or store.
 
 Records use logical collection names, IDs, and typed fields. Record queries accept equality filters in `where`, typed predicates in `filters_by`, and an optional sort. Pass the returned `next_cursor` back with the same query. Later pages outside a transaction read fresh data.
 

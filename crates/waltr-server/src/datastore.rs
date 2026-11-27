@@ -18,6 +18,8 @@ use tokio::sync::Mutex;
 use waltr_datastore::{Actor, Definition, Error, Kind, Namespace, object, relational};
 
 pub(crate) const ROOT: &str = "waltr://data-stores";
+pub(crate) const OBJECT_TEXT_SUFFIX: &str = "{store}/objects/{key}/text";
+pub(crate) const OBJECT_TEXT_MIME: &str = "text/plain; charset=utf-8";
 pub(crate) const RESOURCE_TEMPLATES: &[(&str, &str, &str)] = &[
     ("{store}", "data-store", "Logical datastore and its schema."),
     (
@@ -28,8 +30,9 @@ pub(crate) const RESOURCE_TEMPLATES: &[(&str, &str, &str)] = &[
     (
         "{store}/objects/{key}/content",
         "data-object-content",
-        "Bounded object content.",
+        "Bounded object content encoded as base64.",
     ),
+    (OBJECT_TEXT_SUFFIX, "data-object-text", "Bounded UTF-8 object text."),
     (
         "{store}/collections/{collection}",
         "data-collection",
@@ -61,7 +64,11 @@ pub(crate) struct ObjectKey {
 pub(crate) struct ObjectWrite {
     store: String,
     key: String,
+    /// Inline UTF-8 text. Supply exactly one of content_text, content_base64, or transfer.
+    content_text: Option<String>,
+    /// Inline base64 for binary data.
     content_base64: Option<String>,
+    /// A completed upload for the same object key.
     transfer: Option<String>,
 }
 
@@ -356,7 +363,15 @@ fn object_uri(store: &str, key: &str) -> String {
 fn object_value(store: &str, info: object::ObjectInfo) -> Value {
     let uri = object_uri(store, &info.key);
     json!({"key":info.key,"size":info.size,"uri":uri,"content_uri":format!("{uri}/content"),
+        "text_uri":format!("{uri}/text"),
         "attribution":info.attribution,"last_known_waltr_write":info.last_known_waltr_write})
+}
+
+pub(crate) fn resource_result(uri: String, value: Value) -> mcp::McpResourceResult {
+    match value {
+        Value::String(text) => mcp::McpResourceResult::text(uri, OBJECT_TEXT_MIME, text),
+        value => mcp::progressive::json_resource_result(uri, value),
+    }
 }
 
 fn object_cursor_scope(selected: &Selected, prefix: &str) -> [u8; 32] {
@@ -601,11 +616,17 @@ impl DataStores {
                 }
                 let actor = selected.actor.as_ref().ok_or(Error::NotFound)?;
                 let body: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
-                    match (request.content_base64, request.transfer) {
-                        (Some(content), None) => {
+                    match (request.content_text, request.content_base64, request.transfer) {
+                        (Some(text), None, None) => {
+                            if text.len() > INLINE_BYTES {
+                                return Err(Error::Limit);
+                            }
+                            Box::new(std::io::Cursor::new(text.into_bytes()))
+                        }
+                        (None, Some(content), None) => {
                             Box::new(std::io::Cursor::new(decode_inline(&content)?))
                         }
-                        (None, Some(id)) => Box::new(
+                        (None, None, Some(id)) => Box::new(
                             self.transfers
                                 .take_upload(
                                     uuid::Uuid::parse_str(&id).map_err(|_| Error::Invalid)?,
@@ -783,7 +804,7 @@ impl DataStores {
                     self.objects.stat(&selected.namespace, &key).await?,
                 ))
             }
-            [_, "objects", key, "content"] if tx.is_none() => {
+            [_, "objects", key, format @ ("content" | "text")] if tx.is_none() => {
                 use base64::{Engine as _, engine::general_purpose::STANDARD};
                 use tokio::io::AsyncReadExt as _;
                 let key = decode(key)?;
@@ -800,6 +821,9 @@ impl DataStores {
                     .map_err(|_| Error::Unavailable)?;
                 if object.info.size != bytes.len() as u64 {
                     return Err(Error::Conflict);
+                }
+                if *format == "text" {
+                    return String::from_utf8(bytes).map(Value::String).map_err(|_| Error::Invalid);
                 }
                 Ok(
                     json!({"key":key,"mime_type":"application/octet-stream","content_base64":STANDARD.encode(bytes)}),

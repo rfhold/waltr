@@ -205,7 +205,7 @@ impl BoundDataStores {
                 let result = bound.stores.read(&bound.principal, &uri, None).await.map(|value| {
                     json!({
                         "server": server, "uri": uri,
-                        "data": {"contents": [{"uri": uri, "mimeType":"application/json", "text":value.to_string()}]},
+                        "data": datastore::resource_result(uri.clone(), value).raw,
                         "verified_skill_origins": []
                     })
                 });

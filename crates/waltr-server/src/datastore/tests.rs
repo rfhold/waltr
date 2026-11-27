@@ -113,6 +113,42 @@ async fn datastore_principal_scope_and_transfer_authority() {
         data.read(&alice, uri, None).await.unwrap()["content_base64"],
         "AAH/"
     );
+    assert_eq!(
+        data.read(&alice, created["text_uri"].as_str().unwrap(), None).await,
+        Err(Error::Invalid)
+    );
+}
+
+#[tokio::test]
+async fn datastore_inline_text_writes_preserve_utf8_bytes() {
+    let (_root, data) = fixture().await;
+    let alice = AuthenticatedPrincipal::apps_test_principal("alice");
+    let bob = AuthenticatedPrincipal::apps_test_principal("bob");
+    let key = "dir/notes.md";
+    for (value, error) in [
+        (json!({"store":"files","key":key}), Error::Invalid),
+        (json!({"store":"files","key":key,"content_text":"x","content_base64":"eA=="}), Error::Invalid),
+        (json!({"store":"files","key":key,"content_text":"x","transfer":"unused"}), Error::Invalid),
+        (json!({"store":"files","key":key,"content_text":"é".repeat(INLINE_BYTES / 2 + 1)}), Error::Limit),
+    ] {
+        assert_eq!(data.call(&alice, "create", "object.create", value, None).await, Err(error));
+    }
+    let created = data.call(
+        &alice, "create", "object.create", json!({"store":"files","key":key,"content_text":""}), None,
+    ).await.unwrap();
+    let uri = created["text_uri"].as_str().unwrap();
+    assert_eq!(data.read(&alice, uri, None).await.unwrap(), "");
+    assert_eq!(data.read(&bob, uri, None).await, Err(Error::NotFound));
+    let text = "# Café\r\n";
+    let replaced = data.call(
+        &alice, "execute", "object.replace", json!({"store":"files","key":key,"content_text":text}), None,
+    ).await.unwrap();
+    assert_eq!(replaced["size"], text.len());
+    assert_eq!(data.read(&alice, uri, None).await.unwrap(), text);
+    assert_eq!(
+        data.read(&alice, created["content_uri"].as_str().unwrap(), None).await.unwrap()["content_base64"],
+        "IyBDYWbDqQ0K"
+    );
 }
 
 #[tokio::test]

@@ -1121,11 +1121,15 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
             };
             if datastores {
                 for (suffix, name, description) in crate::datastore::RESOURCE_TEMPLATES {
-                    list.resource_templates.push(mcp::progressive::action_resource_template_definition(
+                    let mut template = mcp::progressive::action_resource_template_definition(
                         &format!("waltr://data-stores/{suffix}"),
                         name,
                         description,
-                    ));
+                    );
+                    if *suffix == crate::datastore::OBJECT_TEXT_SUFFIX {
+                        template.mime_type = Some(crate::datastore::OBJECT_TEXT_MIME.into());
+                    }
+                    list.resource_templates.push(template);
                 }
             }
             Ok(list)
@@ -1148,17 +1152,19 @@ impl mcp::server::ServerHandler for WaltrMcpServer {
             if let Some(result) = server.catalog.read(&uri) {
                 return Ok(result);
             }
-            let value = if crate::datastore::is_resource(&uri) {
+            if crate::datastore::is_resource(&uri) {
                 let stores = server.data_stores.as_ref().ok_or_else(datastore_unavailable)?;
                 let principal = server.datastore_origin(&context)?;
-                stores.read(&principal, &uri, None).await.map_err(|error| {
+                let value = stores.read(&principal, &uri, None).await.map_err(|error| {
                     if error == waltr_datastore::Error::NotFound {
                         ServerError::resource_not_found(uri.clone())
                     } else {
                         datastore_error(error)
                     }
-                })?
-            } else if uri == "waltr://resources" {
+                })?;
+                return Ok(crate::datastore::resource_result(uri, value));
+            }
+            let value = if uri == "waltr://resources" {
                 let mut catalog = server.inspect_resources(InspectResourcesInput { path: None })?;
                 if let Some(entries) = catalog["entries"].as_array_mut() {
                     for entry in entries {
@@ -1741,6 +1747,15 @@ mod tests {
             found["result"]["structuredContent"]["items"][0]["key"],
             "a/b"
         );
+        let text_uri = found["result"]["structuredContent"]["items"][0]["text_uri"]
+            .as_str()
+            .unwrap();
+        let text = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"resources/read",
+            "params":{"uri":text_uri}
+        })).await;
+        assert_eq!(text["result"]["contents"], json!([{
+            "uri": text_uri, "mimeType": "text/plain; charset=utf-8", "text": "outside"
+        }]));
         let opened = mcp_request(&router, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
             "name":"create","arguments":{"action":"object.download","input":{"store":"files","key":"a/b"}}
         }})).await;
