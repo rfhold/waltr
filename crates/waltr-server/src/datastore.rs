@@ -936,10 +936,19 @@ impl Storage {
                     get("WALTR_DATASTORE_S3_SECRET_ACCESS_KEY")?,
                     force_path_style,
                 );
-                object::Objects::s3(
+                let replace_policy =
+                    match var("WALTR_DATASTORE_S3_ALLOW_STALE_OVERWRITE").as_deref() {
+                        Ok("true") => object::S3ReplacePolicy::AllowStaleOverwrite,
+                        Ok("false") | Err(VarError::NotPresent) => {
+                            object::S3ReplacePolicy::Conditional
+                        }
+                        _ => return Err(Error::Invalid),
+                    };
+                object::Objects::s3_with_replace_policy(
                     client,
                     get("WALTR_DATASTORE_S3_BUCKET")?,
                     get("WALTR_DATASTORE_S3_PREFIX")?,
+                    replace_policy,
                 )?
             }
             other => {

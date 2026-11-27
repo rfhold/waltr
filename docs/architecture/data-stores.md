@@ -97,4 +97,11 @@ Embedded servers use filesystem and SQLite with app-private paths. Standalone se
 
 Keep the filesystem root and SQLite file outside the agent workspace. The server rejects overlapping paths at startup.
 
+S3 datastore replacement normally uses `If-Match`. For gateways that reject conditional PUTs,
+set `WALTR_DATASTORE_S3_ALLOW_STALE_OVERWRITE=true` on the standalone server and restart it.
+This skips `If-Match` for replacement content and updates to its existing receipt.
+Replacement still checks that the object exists first. A concurrent write can be lost,
+or a concurrent delete can be undone. Create-only writes and deletes keep their conditions.
+Unset the variable or set it to `false` to restore conditional replacement.
+
 Back up SQL data and object bytes with their receipts. Ship server and catalog reader binaries before publishing a `DataStore` definition to them. Do not share active definitions with older binaries that cannot parse the new kind.

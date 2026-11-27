@@ -83,6 +83,101 @@ async fn fake_empty_list() -> &'static str {
 }
 
 #[tokio::test]
+async fn datastore_s3_stale_overwrite_is_opt_in_and_replace_only() {
+    use waltr_datastore::object::{Objects, S3ReplacePolicy};
+    use waltr_datastore::{Access, Actor, Definition, Error, Kind, Namespace, Scope};
+
+    async fn put(
+        State(state): State<FakeState>,
+        Path((bucket, key)): Path<(String, String)>,
+        headers: HeaderMap,
+        bytes: Bytes,
+    ) -> Response {
+        if headers.contains_key("if-match") {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+        let bytes = if headers.contains_key("x-amz-decoded-content-length") {
+            let line_end = bytes.windows(2).position(|pair| pair == b"\r\n").unwrap();
+            let length = std::str::from_utf8(&bytes[..line_end])
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            let length = usize::from_str_radix(length, 16).unwrap();
+            let end = line_end + 2 + length;
+            assert!(bytes[end..].starts_with(b"\r\n0"));
+            bytes.slice(line_end + 2..end)
+        } else {
+            bytes
+        };
+        if headers.contains_key("if-none-match") {
+            return fake_put(State(state), Path((bucket, key)), headers, bytes).await;
+        }
+        assert!(state.lock().unwrap().insert(key, bytes.to_vec()).is_some());
+        StatusCode::OK.into_response()
+    }
+
+    async fn delete(headers: HeaderMap) -> StatusCode {
+        assert!(headers.contains_key("if-match"));
+        StatusCode::PRECONDITION_FAILED
+    }
+
+    let state: FakeState = Arc::default();
+    let app = Router::new()
+        .route("/{bucket}/{*key}", get(fake_get).put(put).delete(delete))
+        .route("/{bucket}/", get(fake_empty_list))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = crate::session::storage::s3_client(
+        endpoint, "test".into(), "test".into(), "test".into(), true,
+    );
+    let strict = Objects::s3(client.clone(), "bucket", "test").unwrap();
+    let relaxed = Objects::s3_with_replace_policy(
+        client, "bucket", "test", S3ReplacePolicy::AllowStaleOverwrite,
+    )
+    .unwrap();
+    let ns = Namespace::resolve(
+        "files",
+        &Definition {
+            kind: Kind::Object,
+            access: Access { scope: Scope::Shared },
+            collections: Default::default(),
+            relations: Default::default(),
+        },
+        None,
+    )
+    .unwrap();
+    let actor = Actor::from_trusted_key("alice".into()).unwrap();
+    let key = "sample";
+    assert_eq!(
+        relaxed.replace(&ns, key, &actor, &b"missing"[..]).await,
+        Err(Error::NotFound)
+    );
+    relaxed.create(&ns, key, &actor, &b"first"[..]).await.unwrap();
+    assert_eq!(
+        relaxed.create(&ns, key, &actor, &b"duplicate"[..]).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        strict.replace(&ns, key, &actor, &b"strict"[..]).await,
+        Err(Error::Conflict)
+    );
+    let replacement = relaxed.replace(&ns, key, &actor, &b"next"[..]).await.unwrap();
+    assert!(replacement.last_known_waltr_write.is_some());
+    assert_eq!(
+        relaxed.stat(&ns, key).await.unwrap().last_known_waltr_write,
+        replacement.last_known_waltr_write,
+    );
+    assert_eq!(relaxed.delete(&ns, key, &actor).await, Err(Error::Conflict));
+    let physical = format!("test/{}/{key}", ns.as_str());
+    assert_eq!(state.lock().unwrap()[&physical], b"next");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn fake_s3_roundtrip_routine_and_image_objects() {
     let state: FakeState = Arc::default();
     let app = Router::new().route("/{bucket}/{*key}", get(fake_get).put(fake_put)).route("/{bucket}/", get(fake_empty_list)).with_state(state.clone());

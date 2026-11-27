@@ -281,6 +281,16 @@ fn under_prefix(key: &str, prefix: Option<&str>) -> bool {
     })
 }
 
+/// Concurrency policy for replacing existing S3 datastore objects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum S3ReplacePolicy {
+    /// Reject a replacement if the stored ETag changes.
+    #[default]
+    Conditional,
+    /// Allow a replacement to overwrite a concurrent write.
+    AllowStaleOverwrite,
+}
+
 impl Objects {
     /// Initialize the configured root. Its parent path is trusted configuration.
     pub fn filesystem(root: impl AsRef<Path>) -> Result<Self, Error> {
@@ -303,10 +313,21 @@ impl Objects {
         bucket: impl Into<String>,
         prefix: impl Into<String>,
     ) -> Result<Self, Error> {
+        Self::s3_with_replace_policy(client, bucket, prefix, S3ReplacePolicy::Conditional)
+    }
+
+    /// Configure S3 replacement semantics without changing create or delete.
+    pub fn s3_with_replace_policy(
+        client: aws_sdk_s3::Client,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        replace_policy: S3ReplacePolicy,
+    ) -> Result<Self, Error> {
         Ok(Self::new(Backend::S3(s3::S3::new(
             client,
             bucket.into(),
             prefix.into(),
+            replace_policy,
         )?)))
     }
 

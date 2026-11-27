@@ -23,6 +23,8 @@ const databaseStorageSize = config.require("databaseStorageSize");
 const s3Endpoint = config.require("s3Endpoint");
 const s3Prefix = config.require("s3Prefix");
 const datastoreS3Prefix = config.require("datastoreS3Prefix");
+const datastoreS3AllowStaleOverwrite =
+  config.getBoolean("datastoreS3AllowStaleOverwrite") ?? false;
 const apiAudience = config.require("apiAudience");
 const apiScope = config.require("apiScope");
 const mcpScope = config.require("mcpScope");
@@ -459,6 +461,7 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_DATASTORE_S3_REGION: "us-east-1",
       WALTR_DATASTORE_S3_BUCKET: s3BucketName,
       WALTR_DATASTORE_S3_PREFIX: datastoreS3Prefix,
+      WALTR_DATASTORE_S3_ALLOW_STALE_OVERWRITE: String(datastoreS3AllowStaleOverwrite),
       WALTR_DATASTORE_S3_ACCESS_KEY_ID: s3AccessKeyId,
       WALTR_DATASTORE_S3_SECRET_ACCESS_KEY: s3SecretAccessKey,
       WALTR_DATASTORE_S3_FORCE_PATH_STYLE: "true",

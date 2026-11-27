@@ -35,6 +35,7 @@ before(async () => {
     "waltr:s3Endpoint": "https://s3.example.test",
     "waltr:s3Prefix": "test/sessions",
     "waltr:datastoreS3Prefix": "test/data-stores",
+    "waltr:datastoreS3AllowStaleOverwrite": "true",
     "waltr:apiAudience": "waltr-api",
     "waltr:apiScope": "waltr:use",
     "waltr:mcpScope": "mcp:use",
@@ -395,6 +396,7 @@ describe("hosted MCP OAuth deployment", () => {
     assert.equal(values.WALTR_DATASTORE_OBJECT_STORE, "s3");
     assert.equal(values.WALTR_SESSION_S3_PREFIX, "test/sessions");
     assert.equal(values.WALTR_DATASTORE_S3_PREFIX, "test/data-stores");
+    assert.equal(values.WALTR_DATASTORE_S3_ALLOW_STALE_OVERWRITE, "true");
     for (const key of [
       "ENDPOINT",
       "REGION",
@@ -746,6 +748,7 @@ describe("hosted MCP OAuth deployment", () => {
     }
     assert.match(preview, /^\s*waltr:protectData: false$/m);
     assert.match(preview, /^\s*waltr:datastoreS3Prefix: preview\/data-stores$/m);
+    assert.match(preview, /^\s*waltr:datastoreS3AllowStaleOverwrite: "true"$/m);
     assert.match(
       preview,
       /^\s*waltr:appsHostname: preview-waltr-apps\.holdenitdown\.net$/m,
@@ -756,6 +759,7 @@ describe("hosted MCP OAuth deployment", () => {
     );
     assert.match(production, /^\s*waltr:protectData: true$/m);
     assert.match(production, /^\s*waltr:datastoreS3Prefix: production\/data-stores$/m);
+    assert.match(production, /^\s*waltr:datastoreS3AllowStaleOverwrite: "true"$/m);
     assert.match(
       preview,
       /^\s*waltr:androidNativeRedirectUri: dev\.waltr\.app:\/oauth2redirect$/m,

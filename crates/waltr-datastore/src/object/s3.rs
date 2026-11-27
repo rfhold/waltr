@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, retry::RetryConfig};
+use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::EncodingType;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -11,8 +12,8 @@ use uuid::Uuid;
 
 use super::{
     Actor, Attribution, Error, Namespace, OPERATION_TIME, ObjectInfo, ObjectOperation,
-    RECEIPT_BYTES, RECEIPT_VERSION, RECEIPTS, Reader, Receipt, SCAN_LIMIT, object_info, object_key,
-    receipt_name, spool,
+    RECEIPT_BYTES, RECEIPT_VERSION, RECEIPTS, Reader, Receipt, S3ReplacePolicy, SCAN_LIMIT,
+    object_info, object_key, receipt_name, spool,
 };
 
 const TOKEN_METADATA: &str = "waltr-datastore-token";
@@ -23,6 +24,7 @@ pub(super) struct S3 {
     client: Client,
     bucket: String,
     prefix: String,
+    replace_policy: S3ReplacePolicy,
 }
 
 #[derive(Default)]
@@ -39,7 +41,12 @@ struct Existing {
 }
 
 impl S3 {
-    pub(super) fn new(client: Client, bucket: String, prefix: String) -> Result<Self, Error> {
+    pub(super) fn new(
+        client: Client,
+        bucket: String,
+        prefix: String,
+        replace_policy: S3ReplacePolicy,
+    ) -> Result<Self, Error> {
         if bucket.is_empty()
             || (!prefix.is_empty() && object_key(&prefix).is_err())
             || prefix.len() > 44
@@ -55,6 +62,7 @@ impl S3 {
             client,
             bucket,
             prefix,
+            replace_policy,
         })
     }
 
@@ -177,6 +185,7 @@ impl S3 {
         physical: &str,
         old: StoredReceipt,
         receipt: &Receipt,
+        policy: S3ReplacePolicy,
     ) -> Result<(), Error> {
         let put = self
             .client
@@ -185,11 +194,7 @@ impl S3 {
             .key(physical)
             .body(ByteStream::from(receipt.serialize()?))
             .content_type("application/json");
-        let put = if let Some(etag) = old.etag {
-            put.if_match(etag)
-        } else {
-            put.if_none_match("*")
-        };
+        let put = put_condition(put, old.etag.as_deref(), policy);
         put.customize()
             .config_override(no_retry())
             .send()
@@ -432,11 +437,16 @@ impl S3 {
             .content_length(i64::try_from(size).map_err(|_| Error::Limit)?)
             .content_type("application/octet-stream")
             .metadata(TOKEN_METADATA, &token);
-        let put = if let Some(old) = &prepared.old_object {
-            put.if_match(old.etag.as_ref().ok_or(Error::Unavailable)?)
+        let policy = if prepared.old_object.is_some() {
+            self.replace_policy
         } else {
-            put.if_none_match("*")
+            S3ReplacePolicy::Conditional
         };
+        let put = put_condition(
+            put,
+            prepared.old_object.as_ref().and_then(|old| old.etag.as_deref()),
+            policy,
+        );
         let result = put
             .customize()
             .config_override(no_retry())
@@ -447,7 +457,7 @@ impl S3 {
         let identity = identity(version, Some(&token));
         let previous = self.verified_previous(&prepared, version).await;
         let receipt = Receipt::new(operation, &actor, previous, identity.clone());
-        self.write_receipt(&prepared.receipt_key, prepared.stored, &receipt)
+        self.write_receipt(&prepared.receipt_key, prepared.stored, &receipt, policy)
             .await?;
         Ok(object_info(&key, size, identity.as_deref(), Some(receipt)))
     }
@@ -498,8 +508,13 @@ impl S3 {
             .verified_previous(&prepared, version(result.version_id()))
             .await;
         let receipt = Receipt::new(ObjectOperation::Delete, &actor, previous, None);
-        self.write_receipt(&prepared.receipt_key, prepared.stored, &receipt)
-            .await
+        self.write_receipt(
+            &prepared.receipt_key,
+            prepared.stored,
+            &receipt,
+            S3ReplacePolicy::Conditional,
+        )
+        .await
     }
 
     async fn verified_previous(
@@ -531,6 +546,18 @@ struct Prepared {
     old_object: Option<Existing>,
     receipt_key: String,
     stored: StoredReceipt,
+}
+
+fn put_condition(
+    put: PutObjectFluentBuilder,
+    etag: Option<&str>,
+    policy: S3ReplacePolicy,
+) -> PutObjectFluentBuilder {
+    match (etag, policy) {
+        (None, _) => put.if_none_match("*"),
+        (Some(etag), S3ReplacePolicy::Conditional) => put.if_match(etag),
+        (Some(_), S3ReplacePolicy::AllowStaleOverwrite) => put,
+    }
 }
 
 fn no_retry() -> Builder {
