@@ -55,6 +55,8 @@ Read `waltr://data-stores` to discover authorized stores. Resource templates ide
 
 Hosted MCP requires the exact `datastore:<tool>:<action>` OAuth scope for each mutation. For example, `datastore:destroy:object.delete` authorizes object deletion, not record deletion. The same check applies to public Code Mode. Read-only callers can query, read resources, and download authorized content.
 
+Hosted sign-in defaults to object create and replace, record create and update, and relation link, in addition to the endpoint scopes. Consent lists these permissions. Clients can request fewer scopes explicitly. Delete and upload scopes are not defaults. Current grants do not gain scopes on refresh; sign in again to authorize the new defaults.
+
 | Tool | Actions |
 | --- | --- |
 | `query` | `object.list`, `object.download_chunk`, `record.find`, `relation.list` |

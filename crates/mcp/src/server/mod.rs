@@ -1029,6 +1029,7 @@ pub struct McpAuthorizationContext {
 pub struct StreamableHttpAuthorization {
     metadata: McpProtectedResourceMetadata,
     required_scopes: Vec<String>,
+    challenge_scopes: Option<Vec<String>>,
     realm: Option<String>,
     validator: HttpTokenAuthorizer,
 }
@@ -1039,6 +1040,7 @@ impl std::fmt::Debug for StreamableHttpAuthorization {
             .debug_struct("StreamableHttpAuthorization")
             .field("metadata", &self.metadata)
             .field("required_scopes", &self.required_scopes)
+            .field("challenge_scopes", &self.challenge_scopes)
             .field("realm", &self.realm)
             .field("validator", &true)
             .finish()
@@ -1062,6 +1064,7 @@ impl StreamableHttpAuthorization {
         Ok(Self {
             metadata,
             required_scopes: Vec::new(),
+            challenge_scopes: None,
             realm: None,
             validator: HttpTokenAuthorizer::External(Arc::new(validator)),
         })
@@ -1086,18 +1089,29 @@ impl StreamableHttpAuthorization {
         Ok(Self {
             metadata,
             required_scopes: Vec::new(),
+            challenge_scopes: None,
             realm: None,
             validator: HttpTokenAuthorizer::Hosted(Arc::new(authorizer)),
         })
     }
 
-    /// Set scopes advertised in authorization challenges and passed to the validator.
+    /// Set endpoint scope requirements passed to the validator and used as fallback hints.
     #[must_use]
     pub fn with_required_scopes(
         mut self,
         scopes: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.required_scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Suggest scopes for sign-in without changing the endpoint's scope requirements.
+    #[must_use]
+    pub fn with_challenge_scopes(
+        mut self,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.challenge_scopes = Some(scopes.into_iter().map(Into::into).collect());
         self
     }
 
@@ -1922,7 +1936,12 @@ fn base_challenge(authorization: &StreamableHttpAuthorization) -> McpBearerChall
         protected_resource_metadata_urls(&authorization.metadata.resource)
             .into_iter()
             .next();
-    challenge.scope = scope_value(&authorization.required_scopes);
+    challenge.scope = scope_value(
+        authorization
+            .challenge_scopes
+            .as_deref()
+            .unwrap_or(&authorization.required_scopes),
+    );
     challenge
 }
 

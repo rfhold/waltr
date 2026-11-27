@@ -13,6 +13,7 @@ const CLIENT_ID: &str = "test-mcp-client";
 const CLIENT_REDIRECT: &str = "https://client.example/callback";
 const RESOURCE: &str = "https://waltr.example/mcp";
 const VERIFIER: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
+const DEFAULT_SCOPES: &str = "datastore:create:object.create datastore:create:record.create datastore:create:relation.link datastore:execute:object.replace datastore:execute:record.update mcp:use";
 
 #[tokio::test]
 async fn dynamic_registration_accepts_standard_native_loopback_redirects()
@@ -93,6 +94,20 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
     let scopes = mcp_metadata["scopes_supported"].as_array().unwrap();
     assert!(scopes.contains(&json!("mcp:use")));
     assert!(scopes.contains(&json!("datastore:destroy:object.delete")));
+    let unsigned = client
+        .post(server.url("/mcp"))
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&discover_body())
+        .send()
+        .await?;
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        unsigned.headers()[header::WWW_AUTHENTICATE]
+            .to_str()?
+            .contains(&format!("scope=\"{DEFAULT_SCOPES}\""))
+    );
 
     let authorization_metadata = client
         .get(server.url("/.well-known/oauth-authorization-server/oauth"))
@@ -118,7 +133,6 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
         ("redirect_uri", CLIENT_REDIRECT),
-        ("scope", "mcp:use"),
         ("state", "client-state"),
         ("code_challenge", &challenge),
         ("code_challenge_method", "S256"),
@@ -190,7 +204,10 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
     assert!(consent_html.contains("Test MCP Client"));
     assert!(consent_html.contains(CLIENT_ID));
     assert!(consent_html.contains(RESOURCE));
-    assert!(consent_html.contains("mcp:use"));
+    for scope in DEFAULT_SCOPES.split_ascii_whitespace() {
+        assert!(consent_html.contains(scope), "missing consent scope {scope}");
+    }
+    assert!(!consent_html.contains("datastore:destroy:object.delete"));
     let transaction_id = hidden_value(&consent_html, "transaction_id")?;
     let csrf = hidden_value(&consent_html, "csrf")?;
 
@@ -261,6 +278,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         .await?;
     assert_eq!(issued.status(), StatusCode::OK);
     let issued: Value = issued.json().await?;
+    assert_eq!(issued["scope"], DEFAULT_SCOPES);
     let access = issued["access_token"]
         .as_str()
         .ok_or("missing access token")?;
@@ -329,6 +347,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         .await?;
     assert_eq!(refreshed.status(), StatusCode::OK);
     let refreshed: Value = refreshed.json().await?;
+    assert_eq!(refreshed["scope"], DEFAULT_SCOPES);
     let refreshed_access = refreshed["access_token"]
         .as_str()
         .ok_or("missing refreshed access token")?;

@@ -1234,7 +1234,8 @@ where
                 hosted.authorize_token(token, context)
             })
             .expect("hosted OAuth should produce valid MCP metadata")
-            .with_required_scopes(required_scopes);
+            .with_required_scopes(required_scopes)
+            .with_challenge_scopes(oauth.default_scopes());
         mcp_options = mcp_options.with_authorization(authorization);
     }
     let mut grpc_routes = Routes::builder();

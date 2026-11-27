@@ -82,6 +82,8 @@ pub struct OAuthAuthorizationServerConfig {
     pub jwks_uri: String,
     /// Supported resources.
     pub resources: Vec<OAuthResource>,
+    /// Scopes to request at consent when `scope` is omitted, by exact resource URI.
+    pub default_scopes: BTreeMap<String, Vec<String>>,
     /// Authorization transaction lifetime.
     pub authorization_transaction_lifetime: Duration,
     /// Authorization code lifetime.
@@ -117,6 +119,7 @@ impl OAuthAuthorizationServerConfig {
             jwks_uri: format!("{base}/jwks.json"),
             issuer,
             resources,
+            default_scopes: BTreeMap::new(),
             authorization_transaction_lifetime: Duration::from_secs(10 * 60),
             authorization_code_lifetime: Duration::from_secs(5 * 60),
             access_token_lifetime: Duration::from_secs(5 * 60),
@@ -954,7 +957,7 @@ async fn authorize(
     if parameters.contains_key("transaction_id") {
         return resume_authorize(state, headers, parameters).await;
     }
-    let parsed = match parse_authorization(parameters) {
+    let parsed = match parse_authorization(parameters, &state.config.default_scopes) {
         Ok(value) => value,
         Err(error) => return local_authorization_error(StatusCode::BAD_REQUEST, error),
     };
@@ -1911,6 +1914,7 @@ struct ParsedAuthorization {
 }
 fn parse_authorization(
     mut p: BTreeMap<String, String>,
+    default_scopes: &BTreeMap<String, Vec<String>>,
 ) -> std::result::Result<ParsedAuthorization, &'static str> {
     if p.keys().any(|key| {
         ![
@@ -1943,13 +1947,16 @@ fn parse_authorization(
     {
         return Err("invalid_request");
     }
+    let scopes = match p.remove("scope") {
+        Some(scope) => canonical_scopes(&scope).map_err(|_| "invalid_scope")?,
+        None => default_scopes.get(&resource).cloned().unwrap_or_default(),
+    };
     Ok(ParsedAuthorization {
         client_id,
         redirect_uri,
         state,
         resource,
-        scopes: canonical_scopes(&p.remove("scope").unwrap_or_default())
-            .map_err(|_| "invalid_scope")?,
+        scopes,
         code_challenge: take_required(&mut p, "code_challenge")
             .filter(|value| valid_challenge(value))
             .ok_or("invalid_request")?,
@@ -1973,6 +1980,31 @@ fn validate_authorization_bindings(
     } else {
         Err("invalid_scope")
     }
+}
+
+#[cfg(test)]
+#[test]
+fn authorization_defaults_apply_only_when_scope_is_omitted() {
+    let resource = "https://server.example/mcp";
+    let defaults = BTreeMap::from([(resource.to_owned(), vec!["write".to_owned()])]);
+    let mut parameters = [
+        ("response_type", "code"),
+        ("client_id", "client"),
+        ("redirect_uri", "https://client.example/callback"),
+        ("scope", "read"),
+        ("state", "state"),
+        ("resource", resource),
+        ("code_challenge_method", "S256"),
+        ("code_challenge", "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect::<BTreeMap<_, _>>();
+    let explicit = parse_authorization(parameters.clone(), &defaults).unwrap();
+    assert_eq!(explicit.scopes, ["read"]);
+    parameters.remove("scope");
+    let omitted = parse_authorization(parameters, &defaults).unwrap();
+    assert_eq!(omitted.scopes, ["write"]);
 }
 
 fn validate_config(config: &OAuthAuthorizationServerConfig) -> Result<()> {
@@ -2033,6 +2065,13 @@ fn validate_config(config: &OAuthAuthorizationServerConfig) -> Result<()> {
         return Err(Error::protocol(
             "OAuth resources and scopes must be non-empty valid URLs",
         ));
+    }
+    if config.default_scopes.iter().any(|(uri, scopes)| {
+        !config.resources.iter().any(|resource| {
+            &resource.resource == uri && scopes.iter().all(|scope| resource.scopes.contains(scope))
+        })
+    }) {
+        return Err(Error::protocol("default OAuth scopes must be supported by their resource"));
     }
     if [
         config.authorization_transaction_lifetime,

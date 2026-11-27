@@ -287,6 +287,24 @@ impl McpOAuthEnabledConfig {
         scopes
     }
 
+    fn default_scopes(&self) -> Vec<String> {
+        let mut scopes = self.required_scopes.clone();
+        scopes.extend(
+            [
+                "datastore:create:object.create",
+                "datastore:execute:object.replace",
+                "datastore:create:record.create",
+                "datastore:execute:record.update",
+                "datastore:create:relation.link",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        scopes.sort_unstable();
+        scopes.dedup();
+        scopes
+    }
+
     /// Configure generic public-client discovery and registration policy.
     #[must_use]
     pub const fn with_client_registration(mut self, allow_dcr: bool, allow_cimd: bool) -> Self {
@@ -364,6 +382,9 @@ impl McpOAuthServer {
                 scopes: config.supported_scopes(),
             }],
         );
+        server_config
+            .default_scopes
+            .insert(config.resource.clone(), config.default_scopes());
         server_config.authorization_transaction_lifetime = AUTHORIZATION_TRANSACTION_TTL;
         server_config.authorization_code_lifetime = config.code_ttl;
         server_config.access_token_lifetime = config.access_token_ttl;
@@ -441,6 +462,12 @@ impl McpOAuthServer {
     #[must_use]
     pub fn supported_scopes(&self) -> Vec<String> {
         self.config.supported_scopes()
+    }
+
+    /// Scopes proposed at fresh sign-in for clients without an explicit selection.
+    #[must_use]
+    pub fn default_scopes(&self) -> Vec<String> {
+        self.config.default_scopes()
     }
 
     /// Compose generic OAuth routes and Waltr's browser-login bridge.

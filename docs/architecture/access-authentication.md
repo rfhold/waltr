@@ -252,7 +252,7 @@ Waltr configures the generic MCP Streamable HTTP authorization hooks as follows:
 
 Missing, invalid, expired, or revoked credentials return `401`; insufficient scopes return `403` with `insufficient_scope`; store failures fail closed. Expiry and same-process revocation terminate request-scoped response streams at their observed boundary. Ordinary admitted session create/send prompts are durable and are not canceled by later token expiry; explicit Routine/helper/code leases retain their cancellation contract. Other replicas recheck durable revocation at most every five seconds, plus scheduling and database latency. Waltr has no browser MCP client: absent Origin is accepted and every present Origin is denied.
 
-Configuration and agent-definition actions are both published through public `/mcp` and use this same hosted-resource scope policy. Waltr does not assign separate action-level scopes.
+Configuration and agent-definition actions use the hosted endpoint scope policy. [Datastore mutations](data-stores.md#mcp) also require exact action scopes. A fresh sign-in suggests the datastore create, edit, and link scopes if the client does not choose scopes. These suggestions do not change the endpoint requirements or expand current grants.
 
 The cutover is intentionally clean: there is no direct-Authentik MCP validator, dual-issuer period, `WALTR_MCP_OIDC_*` compatibility surface, or special `self` client configuration. With access auth disabled, Waltr exposes neither the hosted OAuth routes nor an MCP challenge and keeps local `/mcp` unauthenticated. OIDC mode without an initialized hosted server fails `/mcp` closed.
 
